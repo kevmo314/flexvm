@@ -98,7 +98,7 @@ jobs:
       - name: Root networking unit tests
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends iproute2
+          sudo apt-get install -y -q --no-install-recommends iproute2 strace
           sudo modprobe tun
           sudo -E "$(command -v cargo)" test -p flexvm -- --ignored
 

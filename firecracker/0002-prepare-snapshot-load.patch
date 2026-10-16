@@ -25,6 +25,54 @@
              _ => Err(RequestError::InvalidPathMethod(
                  format!("/snapshot/{}", request_type),
                  Method::Put,
+@@ -113,6 +122,7 @@
+         vsock_override: snapshot_config.vsock_override,
+         clock_realtime: snapshot_config.clock_realtime,
+         huge_pages: snapshot_config.huge_pages,
++        device_reference_path: snapshot_config.device_reference_path,
+     };
+ 
+     // Construct the `ParsedRequest` object.
+@@ -215,6 +225,7 @@
+             vsock_override: None,
+             clock_realtime: false,
+             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
++            device_reference_path: None,
+         };
+         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert!(
+@@ -248,6 +259,7 @@
+             vsock_override: None,
+             clock_realtime: false,
+             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
++            device_reference_path: None,
+         };
+         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert!(
+@@ -282,6 +294,7 @@
+             vsock_override: None,
+             clock_realtime: false,
+             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
++            device_reference_path: None,
+         };
+         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert!(
+@@ -324,6 +337,7 @@
+             vsock_override: None,
+             clock_realtime: false,
+             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
++            device_reference_path: None,
+         };
+         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert!(
+@@ -354,6 +368,7 @@
+             vsock_override: None,
+             clock_realtime: false,
+             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
++            device_reference_path: None,
+         };
+         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert_eq!(
 --- a/src/vmm/src/builder.rs
 +++ b/src/vmm/src/builder.rs
 @@ -419,15 +419,44 @@
@@ -178,12 +226,14 @@
              .rate_limiter
 --- a/src/vmm/src/persist.rs
 +++ b/src/vmm/src/persist.rs
-@@ -366,6 +366,146 @@
+@@ -366,6 +366,250 @@
      GuestMemory(#[from] RestoreFromSnapshotGuestMemoryError),
      /// Failed to build microVM from snapshot: {0}
      Build(#[from] BuildMicrovmFromSnapshotError),
 +    /// The prepared microVM does not fit this snapshot: {0}
 +    Prepared(String),
++    /// The snapshot's devices are not the ones prepared: {0}
++    Devices(String),
 +}
 +
 +/// flexvm: what `PrepareSnapshot` set up: a KVM VM with its vCPUs and memory slots for the layout
@@ -275,6 +325,108 @@
 +    }
 +}
 +
++/// flexvm: the devices restoring `state` sets up, in order, each with what identifies it and the
++/// host files it opens (pmem). Tap names and the vsock socket are left out: `check_devices`
++/// requires the load's overrides to name them. None for the PCI transport, which is not checked.
++fn device_set(state: &MicrovmState) -> Option<Vec<String>> {
++    let VirtioDevicesState::Mmio(mmio) = &state.device_states.virtio_state else {
++        return None;
++    };
++    let mut set = Vec::new();
++    for d in &mmio.block_devices {
++        set.push(format!("block {:?} at {:?}", d.device_id, d.device_info));
++    }
++    for d in &mmio.net_devices {
++        set.push(format!(
++            "net {:?} (interface {:?}) at {:?}",
++            d.device_id, d.device_state.id, d.device_info
++        ));
++    }
++    if let Some(d) = &mmio.vsock_device {
++        set.push(format!(
++            "vsock {:?} (cid {}) at {:?}",
++            d.device_id, d.device_state.frontend.cid, d.device_info
++        ));
++    }
++    if let Some(d) = &mmio.balloon_device {
++        set.push(format!("balloon {:?} at {:?}", d.device_id, d.device_info));
++    }
++    if let Some(d) = &mmio.entropy_device {
++        set.push(format!("entropy {:?} at {:?}", d.device_id, d.device_info));
++    }
++    for d in &mmio.pmem_devices {
++        let (c, cs) = (&d.device_state.config, &d.device_state.config_space);
++        set.push(format!(
++            "pmem {:?} ({:?}, read only {}, root {}, guest {:#x}+{:#x}) at {:?}",
++            d.device_id,
++            c.path_on_host,
++            c.read_only,
++            c.root_device,
++            cs.start,
++            cs.size,
++            d.device_info
++        ));
++    }
++    if let Some(d) = &mmio.memory_device {
++        set.push(format!(
++            "virtio-mem {:?} at {:?}",
++            d.device_id, d.device_info
++        ));
++    }
++    if mmio.mmds.is_some() {
++        set.push("mmds".into());
++    }
++    if state.device_states.serial_state.is_some() {
++        set.push("serial".into());
++    }
++    Some(set)
++}
++
++/// flexvm: refuses a load of `state` unless its devices are exactly those of `reference` (what
++/// flexvm prepared), none is a block device, and every tap and the vsock socket come from the
++/// load's overrides, so no host resource a restore opens is named by `state`. Runs before
++/// anything is opened for the load.
++fn check_devices(
++    reference: &MicrovmState,
++    state: &MicrovmState,
++    params: &LoadSnapshotParams,
++) -> Result<(), RestoreFromSnapshotError> {
++    let refuse = |why: String| Err(RestoreFromSnapshotError::Devices(why));
++    let (Some(want), Some(have)) = (device_set(reference), device_set(state)) else {
++        return refuse("only the MMIO transport can be checked".into());
++    };
++    let VirtioDevicesState::Mmio(mmio) = &state.device_states.virtio_state else {
++        unreachable!("device_set checked the transport");
++    };
++    if let Some(d) = mmio.block_devices.first() {
++        return refuse(format!("block device {:?} is never restored", d.device_id));
++    }
++    if let Some(d) = have.iter().find(|d| !want.contains(d)) {
++        return refuse(format!("{d} was not prepared"));
++    }
++    if let Some(d) = want.iter().find(|d| !have.contains(d)) {
++        return refuse(format!("{d} is missing"));
++    }
++    if want != have {
++        return refuse("devices differ in number or order".into());
++    }
++    for d in &mmio.net_devices {
++        let named = params.network_overrides.iter().any(|o| {
++            o.iface_id == d.device_state.id && o.host_dev_name == d.device_state.tap_if_name
++        });
++        if !named {
++            return refuse(format!(
++                "net {:?} has no tap given by the load",
++                d.device_state.id
++            ));
++        }
++    }
++    if mmio.vsock_device.is_some() && params.vsock_override.is_none() {
++        return refuse("vsock has no socket given by the load".into());
++    }
++    Ok(())
++}
++
 +/// Whether the VM prepared from `p` can take `state`, loaded with `params`: everything prepared
 +/// from the other snapshot must be what this one would have set up, or devices would collide
 +/// with it (a second KVM slot over the pmem range, a second bind of the vsock socket).
@@ -325,7 +477,7 @@
  }
  /// Sub-Error type for [`restore_from_snapshot`] to contain either [`GuestMemoryFromFileError`] or
  /// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
-@@ -384,6 +524,7 @@
+@@ -384,6 +628,7 @@
      seccomp_filters: &BpfThreadMap,
      params: &LoadSnapshotParams,
      vm_resources: &mut VmResources,
@@ -333,7 +485,24 @@
  ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
      let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
      for entry in &params.network_overrides {
-@@ -453,6 +594,23 @@
+@@ -428,6 +673,16 @@
+             .clone_from(&vsock_override.uds_path);
+     }
+ 
++    // flexvm: before anything is opened for the load: its devices, and the host resources they
++    // open, are the reference's (the prepared snapshot's) and the overrides', never its own.
++    match (&prepared, &params.device_reference_path) {
++        (Some(p), _) => check_devices(&p.state, &microvm_state, params)?,
++        (None, Some(path)) => {
++            check_devices(&snapshot_state_from_file(path)?, &microvm_state, params)?
++        }
++        (None, None) => {}
++    }
++
+     let track_dirty_pages = params.track_dirty_pages;
+ 
+     let vcpu_count = microvm_state
+@@ -453,6 +708,23 @@
      // Some sanity checks before building the microvm.
      snapshot_state_sanity_check(&microvm_state)?;
  
@@ -357,7 +526,7 @@
      let mem_backend_path = &params.mem_backend.backend_path;
      let mem_state = &microvm_state.vm_state.memory;
  
-@@ -487,6 +645,7 @@
+@@ -487,6 +759,7 @@
          instance_info,
          event_manager,
          microvm_state,
@@ -365,6 +534,114 @@
          guest_memory,
          uffd,
          seccomp_filters,
+@@ -794,6 +1067,107 @@
+         assert_eq!(restored_mmio, mmio)
+     }
+ 
++    // flexvm: a load's devices must be exactly the prepared ones, never naming host resources.
++    #[test]
++    fn test_check_devices() {
++        let vmm = default_vmm_with_devices();
++        let state = |edit: &dyn Fn(&mut crate::device_manager::persist::DeviceStates)| {
++            let mut device_states = vmm.device_manager.save();
++            let VirtioDevicesState::Mmio(mmio) = &mut device_states.virtio_state else {
++                panic!("expected MMIO virtio device state");
++            };
++            mmio.block_devices.clear();
++            edit(mmio);
++            MicrovmState {
++                device_states,
++                ..Default::default()
++            }
++        };
++        let reference = state(&|_| {});
++        let overridden = |mmio: &mut crate::device_manager::persist::DeviceStates| {
++            mmio.net_devices[0].device_state.tap_if_name = "tap-flexvm".into();
++        };
++        let params = |net: &[(&str, &str)], vsock: bool| LoadSnapshotParams {
++            snapshot_path: "vmstate".into(),
++            mem_backend: crate::vmm_config::snapshot::MemBackendConfig {
++                backend_path: "uffd.sock".into(),
++                backend_type: MemBackendType::Uffd,
++            },
++            track_dirty_pages: false,
++            resume_vm: false,
++            network_overrides: net
++                .iter()
++                .map(|(id, tap)| crate::vmm_config::snapshot::NetworkOverride {
++                    iface_id: id.to_string(),
++                    host_dev_name: tap.to_string(),
++                })
++                .collect(),
++            vsock_override: vsock.then(|| crate::vmm_config::snapshot::VsockOverride {
++                uds_path: "v.sock".into(),
++            }),
++            clock_realtime: false,
++            huge_pages: Default::default(),
++            device_reference_path: None,
++        };
++        let good = params(&[("netif", "tap-flexvm")], true);
++        let refused =
++            |state: &MicrovmState, params: &LoadSnapshotParams, why: &str| match check_devices(
++                &reference, state, params,
++            ) {
++                Err(RestoreFromSnapshotError::Devices(e)) => assert!(e.contains(why), "{e}"),
++                other => panic!("expected a refusal for {why}, got {other:?}"),
++            };
++
++        check_devices(&reference, &state(&overridden), &good).unwrap();
++        // An extra block device, even one at the place of a prepared device.
++        let mut with_block = state(&overridden);
++        let VirtioDevicesState::Mmio(mmio) = &mut with_block.device_states.virtio_state else {
++            unreachable!()
++        };
++        mmio.block_devices = vmm_block_devices(&vmm);
++        refused(&with_block, &good, "block device");
++        // A net device naming a tap the load did not give.
++        refused(&state(&|_| {}), &good, "no tap given");
++        refused(&state(&overridden), &params(&[], true), "no tap given");
++        // An extra net device, or one fewer.
++        let extra = |mmio: &mut crate::device_manager::persist::DeviceStates| {
++            overridden(mmio);
++            let mut net = mmio.net_devices[0].clone();
++            net.device_id = "extra".into();
++            mmio.net_devices.push(net);
++        };
++        refused(&state(&extra), &good, "was not prepared");
++        refused(&state(&|m| m.net_devices.clear()), &good, "is missing");
++        // A vsock socket the load did not give.
++        refused(
++            &state(&overridden),
++            &params(&[("netif", "tap-flexvm")], false),
++            "vsock",
++        );
++        // Another device kind than prepared.
++        refused(
++            &state(&|m| {
++                overridden(m);
++                m.balloon_device = None
++            }),
++            &good,
++            "balloon",
++        );
++    }
++
++    fn vmm_block_devices(
++        vmm: &Vmm,
++    ) -> Vec<
++        crate::device_manager::persist::VirtioDeviceState<
++            crate::devices::virtio::block::persist::BlockState,
++        >,
++    > {
++        let VirtioDevicesState::Mmio(mmio) = vmm.device_manager.save().virtio_state else {
++            panic!("expected MMIO virtio device state");
++        };
++        mmio.block_devices
++    }
++
+     #[test]
+     fn test_create_guest_memory() {
+         let mem_state = GuestMemoryState {
 --- a/src/vmm/src/rpc_interface.rs
 +++ b/src/vmm/src/rpc_interface.rs
 @@ -96,6 +96,12 @@
@@ -397,16 +674,16 @@
          }
      }
  
-@@ -476,6 +485,9 @@
-             InsertNetworkDevice(config) => self.insert_net_device(config),
+@@ -477,6 +486,9 @@
              LoadSnapshot(config) => self
                  .load_snapshot(&config)
-+                .map_err(VmmActionError::LoadSnapshot),
+                 .map_err(VmmActionError::LoadSnapshot),
 +            PrepareSnapshot(config) => self
 +                .prepare_snapshot(&config)
-                 .map_err(VmmActionError::LoadSnapshot),
++                .map_err(VmmActionError::LoadSnapshot),
              PatchMMDS(value) => mmds_patch_data(
                  self.vm_resources
+                     .locked_mmds_or_default()
 @@ -638,6 +650,24 @@
          .map_err(VmmActionError::StartMicrovm)
      }
@@ -448,6 +725,37 @@
              | PutCpuConfiguration(_)
              | SetBalloonDevice(_)
              | SetVsockDevice(_)
+@@ -1337,6 +1369,7 @@
+                 vsock_override: None,
+                 clock_realtime: false,
+                 huge_pages: SnapshotLoadHugePageConfig::Snapshot,
++                device_reference_path: None,
+             },
+         )));
+         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(
+--- a/src/vmm/src/vmm_config/snapshot.rs
++++ b/src/vmm/src/vmm_config/snapshot.rs
+@@ -125,6 +125,10 @@
+     pub clock_realtime: bool,
+     /// Selects the huge-page configuration to use for the restored microVM.
+     pub huge_pages: SnapshotLoadHugePageConfig,
++    /// flexvm: a trusted snapshot whose devices the loaded one must have exactly, with the host
++    /// files they open taken from it and the overrides (unless the load was prepared, when the
++    /// prepared snapshot is that reference).
++    pub device_reference_path: Option<PathBuf>,
+ }
+ 
+ /// Stores the configuration for loading a snapshot that is provided by the user.
+@@ -163,6 +167,9 @@
+     /// Selects the huge-page configuration to use for the restored microVM.
+     #[serde(default)]
+     pub huge_pages: SnapshotLoadHugePageConfig,
++    /// flexvm: see `LoadSnapshotParams::device_reference_path`.
++    #[serde(default)]
++    pub device_reference_path: Option<PathBuf>,
+ }
+ 
+ /// Stores the configuration used for managing snapshot memory.
 --- a/src/vmm/src/vstate/vm.rs
 +++ b/src/vmm/src/vstate/vm.rs
 @@ -83,17 +83,40 @@
@@ -499,12 +807,10 @@
              #[cfg(test)]
              fail_set_user_memory_region_in: AtomicU32::new(0),
          })
-@@ -513,6 +537,149 @@
-         ));
- 
+@@ -515,6 +539,149 @@
          self.register_memory_region(arcd_region)
-+    }
-+
+     }
+ 
 +    /// flexvm: binds the vsock backend's socket and maps the pmem files of `devices` into KVM,
 +    /// for the devices restored by the coming snapshot load to take (MMIO transport only).
 +    pub fn prepare_devices(
@@ -646,6 +952,34 @@
 +            }
 +        }
 +        Ok(())
-     }
- 
++    }
++
      /// Register a list of new memory regions to this [`KvmVm`].
+     ///
+     /// Note: regions and state.regions need to be in the same order.
+--- a/src/vmm/tests/integration_tests.rs
++++ b/src/vmm/tests/integration_tests.rs
+@@ -319,6 +319,7 @@
+             vsock_override: None,
+             clock_realtime: false,
+             huge_pages,
++            device_reference_path: None,
+         }))
+         .unwrap();
+ 
+@@ -391,6 +392,7 @@
+             vsock_override: None,
+             clock_realtime: false,
+             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
++            device_reference_path: None,
+         }))
+         .unwrap_err();
+ 
+@@ -464,6 +466,7 @@
+         vsock_override: None,
+         clock_realtime: false,
+         huge_pages: SnapshotLoadHugePageConfig::Snapshot,
++        device_reference_path: None,
+     });
+     let err = preboot_api_controller.handle_preboot_request(req);
+     assert!(

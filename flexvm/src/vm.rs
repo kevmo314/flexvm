@@ -1039,7 +1039,7 @@ impl Prepared {
         }
         // Before the request: Firecracker connects to the pager during it.
         self.pager.expect_seed(true);
-        match self.firecracker().load_snapshot(&self.template.vmstate(), &self.firecracker().tap, None, wait) {
+        match self.firecracker().load_snapshot(&self.template.vmstate(), &self.template.vmstate(), &self.firecracker().tap, None, wait) {
             Ok(_) => Ok(true),
             Err(e) if e.to_string().contains("Invalid request method and/or path") => {
                 self.pager.expect_seed(false);
@@ -1122,7 +1122,7 @@ impl Prepared {
             let neighbour = self.neighbour.then(|| std::thread::spawn(move || crate::net::neighbour(ip, &tap)));
             // Before `left` is read: the deadline covers it too.
             fc.join_cgroup();
-            let loaded = fc.load_snapshot(&path, &fc.tap, Some(clock_realtime), left(API_TIMEOUT));
+            let loaded = fc.load_snapshot(&path, &self.template.vmstate(), &fc.tap, Some(clock_realtime), left(API_TIMEOUT));
             if matches!(vmstate, Snapshot::Bytes(_)) {
                 let _ = std::fs::remove_file(&path);
             }

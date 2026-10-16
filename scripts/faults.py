@@ -3000,7 +3000,8 @@ def fc_prepare():
 
     def mismatch(put, load):
         code, body = put("/snapshot/load", load(other))
-        check("fc prepare: a snapshot of another layout is refused", code == 400 and "differs" in body, (code, body))
+        # Its devices sit elsewhere in guest memory, which the device check (#548) sees first.
+        check("fc prepare: a snapshot of another layout is refused", code == 400 and ("differs" in body or "not the ones prepared" in body), (code, body))
 
     def config_between(put, load):
         put("/boot-source", {"kernel_image_path": "/nonexistent"})
@@ -3010,6 +3011,117 @@ def fc_prepare():
     run_fc("twice", twice)
     run_fc("mismatch", mismatch)
     run_fc("config", config_between)
+
+
+def forged_vmstate():
+    """#548: a vmstate whose devices are not the template's (an extra block
+    device on a host file, an extra net device naming another tap) is refused
+    by Firecracker before it opens either, whether the load was prepared or
+    not, and an arrival that sends one is refused with nothing left."""
+    if not subprocess.run(["sh", "-c", "command -v strace"], capture_output=True).stdout:
+        raise Skip("no strace, to see what Firecracker opens")
+    fc = os.path.join(A.state, "artifacts", "firecracker")
+    tpl = os.path.join(A.state, "templates", args.template, "vmstate")
+    work = tempfile.mkdtemp(prefix="fvf", dir="/tmp")
+    # What the forged devices name: a host file and a tap of no one's here.
+    disk, tap = f"{work}/disk", f"fvf{os.getpid() % 100000}"
+    with open(disk, "wb") as f:
+        f.write(b"\0" * (1 << 20))
+
+    def start_fc(d, *wrap):
+        p = subprocess.Popen([*wrap, fc, "--api-sock", f"{d}/api.sock", "--level", "Warn"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        wait_for(lambda: os.path.exists(f"{d}/api.sock"), 5)
+
+        def api(method, path, body):
+            r = subprocess.run(["curl", "-s", "-o", "/dev/stderr", "-w", "%{http_code}", "--unix-socket",
+                                f"{d}/api.sock", "-X", method, f"http://x{path}", "-d", json.dumps(body)],
+                               capture_output=True, text=True, timeout=30)
+            return int(r.stdout or 0), r.stderr
+        return p, api
+
+    def forge(label, extra):
+        """The vmstate of a VM with a vsock, eth0 and `extra`'s devices, as a peer could send."""
+        d = f"{work}/{label}"
+        os.makedirs(d)
+        p, api = start_fc(d)
+        try:
+            for path, body in [("/machine-config", {"vcpu_count": 1, "mem_size_mib": 128}),
+                               ("/boot-source", {"kernel_image_path": os.path.join(A.state, "artifacts", "vmlinux"),
+                                                 "boot_args": "console=ttyS0 reboot=k panic=1"}),
+                               ("/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": tap + "a"}),
+                               ("/vsock", {"guest_cid": 3, "uds_path": f"{d}/v.sock"}), *extra,
+                               ("/actions", {"action_type": "InstanceStart"})]:
+                code, body = api("PUT", path, body)
+                assert code == 204, (label, path, code, body)
+            assert api("PATCH", "/vm", {"state": "Paused"})[0] == 204
+            code, body = api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": f"{d}/vmstate", "mem_file_path": ""})
+            assert code == 204, (label, code, body)
+        finally:
+            p.kill()
+            p.wait()
+        return f"{d}/vmstate"
+
+    forged = [("block", forge("block", [("/drives/disk", {"drive_id": "disk", "path_on_host": disk, "is_root_device": False,
+                                                           "is_read_only": False})]), "block device"),
+              ("net", forge("net", [("/network-interfaces/eth1", {"iface_id": "eth1", "host_dev_name": tap})]), "net")]
+    # Its atime set back, a read would move it (relatime).
+    os.utime(disk, (0, os.stat(disk).st_mtime))
+
+    def load(label, vmstate, why, prepare):
+        d = tempfile.mkdtemp(prefix="fvt", dir="/tmp")
+        uffd = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        uffd.bind(f"{d}/u.sock")
+        uffd.listen(1)
+        held = []
+        threading.Thread(target=lambda: held.append(uffd.accept()), daemon=True).start()
+        trace = f"{d}/trace"
+        p, api = start_fc(d, "strace", "--kill-on-exit", "-f", "-qq", "-s", "4096", "-e", "trace=open,openat,openat2,creat", "-o", trace)
+        body = lambda path: {"snapshot_path": path, "mem_backend": {"backend_type": "Uffd", "backend_path": f"{d}/u.sock"},
+                             "vsock_override": {"uds_path": f"{d}/v.sock"}, "network_overrides": [{"iface_id": "eth0", "host_dev_name": "fvt0"}],
+                             "device_reference_path": tpl}
+        try:
+            if prepare:
+                code, out = api("PUT", "/snapshot/prepare", body(tpl))
+                if code == 400 and "Invalid request" in out:
+                    raise Skip("Firecracker without the prepare patch")
+                check(f"forged vmstate {label}: prepared", code == 204, (code, out))
+            code, out = api("PUT", "/snapshot/load", body(vmstate))
+            check(f"forged vmstate {label}: refused", code == 400 and "not the ones prepared" in out and why in out, (code, out))
+        finally:
+            p.kill()
+            p.wait()
+            opened = open(trace).read() if os.path.exists(trace) else ""
+            subprocess.run(["rm", "-rf", d])
+        check(f"forged vmstate {label}: the load ran traced", f'"{vmstate}"' in opened, opened[-300:])
+        check(f"forged vmstate {label}: never opened the host file or a tap", disk not in opened and "/dev/net/tun" not in opened,
+              [l for l in opened.splitlines() if disk in l or "/dev/net/tun" in l])
+
+    try:
+        for kind, vmstate, why in forged:
+            load(f"{kind}, prepared", vmstate, why, True)
+            load(f"{kind}, not prepared", vmstate, why, False)
+        # Through an arrival: the target's load (and its retry on a fresh Firecracker) refuses it.
+        tid = source_vm()
+        for kind, vmstate, why in forged:
+            n, ip = f"ft-forged-{kind}-dev", spare(B, 3)
+            scenario_vms.add(n)
+            s, r, _ = migrate_in_raw(B, n, ip, tid)
+            check(f"forged vmstate arrival {kind}: target prepared", r.get("ok"), r)
+            bad = open(vmstate, "rb").read()
+            s.sendall((json.dumps({"runs": [], "vmstate_len": len(bad), "preload": [], "paused": False, "app_log": 0}) + "\n").encode() + bad)
+            s.settimeout(60)
+            try:
+                reply = s.recv(65536)
+            except OSError as e:
+                reply = str(e).encode()
+            s.close()
+            check(f"forged vmstate arrival {kind}: refused", b'"ok":false' in reply and b"not the ones prepared" in reply, reply[:400])
+            nothing_left(f"forged vmstate arrival {kind}", n, ip)
+        check("forged vmstate: the host file was never read", os.stat(disk).st_atime == 0, os.stat(disk).st_atime)
+        check("forged vmstate: no tap of the forged name", not os.path.exists(f"/sys/class/net/{tap}"))
+    finally:
+        subprocess.run(["rm", "-rf", work])
 
 
 def slow_preload():
@@ -9013,7 +9125,7 @@ SCENARIOS = dict(
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
-    fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
+    fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, quarantine_reboot_ls=quarantine_reboot_ls, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,

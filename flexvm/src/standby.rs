@@ -660,7 +660,7 @@ fn load(idle: Firecracker, template: Arc<Template>) -> Result<Prepared> {
     let p = Vm::prepare(idle, template, &mut Phases::new())?;
     p.pager.learn_load_set();
     let fc = p.firecracker();
-    fc.load_snapshot(&p.template().vmstate(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
+    fc.load_snapshot(&p.template().vmstate(), &p.template().vmstate(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
     // Only an API pause stops the devices writing guest memory.
     fc.pause(API_TIMEOUT)?;
     p.pager.wait_ready(Duration::from_secs(5))?;

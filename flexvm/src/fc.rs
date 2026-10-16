@@ -117,10 +117,14 @@ impl Firecracker {
     }
 
     /// With no `clock_realtime`, only prepares the load (`firecracker/0002-*.patch`).
-    pub fn load_snapshot(&self, vmstate: &Path, tap: &str, clock_realtime: Option<bool>, timeout: Duration) -> Result<Value> {
+    /// `template` is the vmstate of the template the VM was made from: Firecracker refuses a
+    /// `vmstate` with devices other than it has, and takes no host resource (tap, socket, file)
+    /// from `vmstate` (#548).
+    pub fn load_snapshot(&self, vmstate: &Path, template: &Path, tap: &str, clock_realtime: Option<bool>, timeout: Duration) -> Result<Value> {
         self.join_cgroup();
         let mut body = serde_json::json!({
             "snapshot_path": vmstate,
+            "device_reference_path": template,
             "mem_backend": {"backend_type": "Uffd", "backend_path": self.sockets.uffd},
             "vsock_override": {"uds_path": self.sockets.vsock},
             "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
