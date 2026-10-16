@@ -3035,6 +3035,29 @@ mod tests {
         assert_eq!(l.wanted.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn migrate_in_refuses_peer_ip_before_preparing_anything() {
+        let (p, _root) = test_proc("incoming-peer", None);
+        let ip = "10.98.0.1";
+        p.host
+            .clone()
+            .configure(|cfg| {
+                cfg.peers = vec![format!("{ip}:7000")];
+                Ok(())
+            })
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut source = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let conn = listener.accept().unwrap().0;
+        let e = p.migrate_in(&json!({"ip": ip, "mig": 7, "gen": 99, "name": "forged"}), conn).unwrap_err();
+        assert!(e.to_string().contains("not a vm's address"), "{e}");
+        let reply = crate::util::recv_json(&mut std::io::BufReader::new(&mut source)).unwrap().unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(!p.host.vms("forged", "lock").unwrap().exists());
+        assert!(!p.host.state.join("addrs").join(ip).exists());
+        assert!(std::fs::read_dir(p.host.state.join("migs")).unwrap().next().is_none());
+    }
+
     /// A VM process with no VM, holding `name` if given.
     fn test_proc(tag: &str, name: Option<&str>) -> (Arc<Proc>, crate::test_util::TempDir) {
         let root = crate::test_util::TempDir::new(&format!("fv-proc-{tag}"));

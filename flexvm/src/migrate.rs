@@ -509,7 +509,7 @@ impl Proc {
             }
             Ok(())
         };
-        let prepared = match self.prepare_in(req, mig, &mut prep, by, &going) {
+        let prepared = match self.prepare_in(req, mig, w.peer_addr()?.ip(), &mut prep, by, &going) {
             Ok(p) => p,
             Err(e) => {
                 send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?;
@@ -753,10 +753,13 @@ impl Proc {
         &self,
         req: &Value,
         mig: u64,
+        from: std::net::IpAddr,
         t: &mut Phases,
         until: Instant,
         going: &dyn Fn() -> Result<()>,
     ) -> Result<(crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>)> {
+        let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
+        crate::listen::check_vm_ip(&self.host, ip, Some(from), until)?;
         crate::util::check_kvm()?;
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let regions = serde_json::from_value::<Vec<_>>(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?;
@@ -766,7 +769,6 @@ impl Proc {
         let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig, regions };
         self.set_name(self.host.take_name(&name, false)?);
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
-        let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
         going()?;

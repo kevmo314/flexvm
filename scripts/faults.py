@@ -6592,6 +6592,14 @@ def forged_peer():
     recorded, a huge vmstate, too many preloaded pages, an endless request
     line, a huge page request; page-server refusals reach the client."""
     tid = source_vm()
+    # #549: a valid generation must never route a peer's underlay into a guest.
+    peer_ip = A.addr.rsplit(":", 1)[0]
+    n = "ft-forged-peer-ip"
+    scenario_vms.add(n)
+    s, r, _ = migrate_in_raw(B, n, peer_ip, tid)
+    s.close()
+    check("forged peer ip: arrival refused", not r.get("ok") and "not a vm's address" in r.get("error", ""), r)
+    check("forged peer ip: no guest or tap prepared", n not in vms(B), vms(B).get(n))
     n, ip = "ft-forged-gen", spare(B, 2)
     scenario_vms.add(n)
     s, r, _ = migrate_in_raw(B, n, ip, tid, gen=0)

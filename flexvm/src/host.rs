@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -486,8 +486,14 @@ impl Host {
             format!("{}: {e}{hint}", d.display())
         };
         let root = |e| named(state, e);
-        let held = std::fs::create_dir_all(state).and_then(|()| std::fs::File::open(state)).map_err(root)?;
-        let _held = Flock::new(held, libc::LOCK_EX).map_err(root)?;
+        std::fs::create_dir_all(state).map_err(root)?;
+        // Readers of an initialized state need no lock: they cannot change its binding
+        // or repair it. Never flock the publicly readable directory itself.
+        let _held = match private_dir(&state.join(".lockdir")).and_then(|()| private_file(&state.join(".lockdir/open"))) {
+            Ok(f) => Some(Flock::new(f, libc::LOCK_EX).map_err(root)?),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(e) => return Err(root(e).into()),
+        };
         if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
             let _ = std::fs::remove_file(&marker);
             dirs.iter()
@@ -566,7 +572,7 @@ impl Host {
     }
 
     fn worker_flock(&self) -> Option<Flock> {
-        let f = File::options().create(true).truncate(false).write(true).open(self.state.join("evict.worker.lock")).ok()?;
+        let f = private_file(&self.state.join("evict.worker.lock")).ok()?;
         Flock::new(f, libc::LOCK_EX | libc::LOCK_NB).ok()
     }
 
@@ -601,7 +607,7 @@ impl Host {
         let threads = THREADS.take(deadline).ok_or_else(busy)?;
         let f = match deadline {
             None => {
-                let f = File::options().create(true).truncate(false).write(true).open(self.state.join("lock"))?;
+                let f = private_file(&self.state.join("lock"))?;
                 flock(&f, libc::LOCK_EX).map(|()| f)?
             }
             Some(d) => flock_by(&self.state.join("lock"), d).map_err(|e| if e.kind() == std::io::ErrorKind::WouldBlock { busy() } else { e })?,
@@ -687,7 +693,7 @@ impl Host {
     /// exclusively while garbage collection decides on one and removes it.
     /// Never a name's lock, which a start takes without waiting.
     pub fn logs_lock(&self, how: i32) -> Result<Flock> {
-        Ok(Flock::new(File::create(self.run.join(".logs.lock"))?, how)?)
+        Ok(Flock::new(private_file(&self.run.join(".logs.lock"))?, how)?)
     }
 
     pub fn alive(&self, name: &str) -> bool {
@@ -723,7 +729,16 @@ impl Host {
             .into_iter()
             .flatten()
             .flatten()
-            .filter_map(|e| self.entry(e.file_name().to_str()?.strip_suffix(".json")?).ok())
+            .filter_map(|e| {
+                let file_name = e.file_name();
+                let name = file_name.to_str()?.strip_suffix(".json")?;
+                if File::open(self.vms(name, "lock").ok()?).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
+                    // Display only: operations still require entry()'s lock verification.
+                    let entry = load::<Entry>(&e.path()).ok()??;
+                    return (entry.ident.liveness() != Liveness::Gone).then_some(entry);
+                }
+                self.entry(name).ok()
+            })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
@@ -1276,9 +1291,9 @@ impl Host {
             false => None,
             true => {
                 let dir = self.run.join("holds");
-                std::fs::create_dir_all(&dir)?;
+                private_dir(&dir)?;
                 let (tmp, path) = (dir.join(format!(".{id}")), dir.join(format!("{id}-{mib}")));
-                let f = File::create(&tmp)?;
+                let f = private_file(&tmp)?;
                 if let Err(e) = flock(&f, libc::LOCK_EX | libc::LOCK_NB).and_then(|()| std::fs::rename(&tmp, &path)) {
                     let _ = std::fs::remove_file(&tmp);
                     return Err(e.into());
@@ -1513,7 +1528,7 @@ impl Host {
         mut done: impl FnMut(&str, u64),
         mut withdrawn: impl FnMut(Ipv4Addr, u64),
     ) {
-        let Ok(lock) = File::create(self.run.join(".owed.lock")) else { return };
+        let Ok(lock) = private_file(&self.run.join(".owed.lock")) else { return };
         let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
         self.owed_debris();
         let cursor = self.run.join(".owed.next");
@@ -1646,7 +1661,7 @@ impl Host {
     }
 
     fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, &Ident) -> Result<bool>) {
-        let Ok(lock) = File::create(self.run.join(".retire.lock")) else { return };
+        let Ok(lock) = private_file(&self.run.join(".retire.lock")) else { return };
         let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
         // Migration writers hold the host lock; never sweep an in-progress write.
         if let Ok(_l) = self.lock() {
@@ -2416,7 +2431,7 @@ impl Host {
 
     /// False if another process was delivering (it, or the next sweep, delivers these too).
     fn deliver_withdrawals_with(&self, budget: usize, now: u64, tell: impl Fn(&str, &serde_json::Value) -> Result<()> + Sync) -> bool {
-        let Ok(lock) = File::create(self.run.join(".withdrawals.lock")) else { return false };
+        let Ok(lock) = private_file(&self.run.join(".withdrawals.lock")) else { return false };
         let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return false };
         self.write_debris("withdrawals");
         let peers = self.config_now().peers;
@@ -2614,6 +2629,23 @@ pub fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Lock inodes must not be readable by other users: Linux permits an exclusive
+/// flock even on a read-only descriptor. Repair modes of existing files as well.
+pub fn private_file(path: &Path) -> std::io::Result<File> {
+    let f = File::options().create(true).truncate(false).read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "lock file must be a regular file owned by this user"));
+    }
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(f)
+}
+
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
 pub fn flock(f: &File, how: i32) -> std::io::Result<()> {
     crate::util::eintr(|| unsafe { libc::flock(f.as_raw_fd(), how) }).map(drop)
 }
@@ -2638,7 +2670,7 @@ static FLOCK_HELPERS: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
 /// one that times out only stops waiting. Once the helper has the lock, a caller still waiting
 /// takes it over; with none left it is let go of at once.
 fn flock_by(path: &Path, deadline: std::time::Instant) -> std::io::Result<File> {
-    let open = || File::options().create(true).truncate(false).write(true).open(path);
+    let open = || private_file(path);
     let mut waits = FLOCK_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let map = waits.get_or_insert_with(HashMap::new);
@@ -2707,7 +2739,7 @@ pub fn probe(f: &File, how: i32) -> std::io::Result<()> {
 /// A holder may unlink the file just before we lock: retry until it is the path's.
 fn lock_path(path: &Path, how: i32) -> std::io::Result<File> {
     loop {
-        let f = File::options().create(true).truncate(false).read(true).write(true).open(path)?;
+        let f = private_file(path)?;
         flock(&f, how)?;
         if std::fs::metadata(path).is_ok_and(|m| f.metadata().is_ok_and(|n| n.ino() == m.ino())) {
             return Ok(f);
@@ -2855,6 +2887,55 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_inodes_are_private_and_existing_modes_are_repaired() {
+        let (_root, h) = host("private-locks");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&h.state.join(".lockdir")), 0o700);
+        assert_eq!(mode(&h.state.join(".lockdir/open")), 0o600);
+        let path = h.state.join("lock");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(h.lock().unwrap());
+        assert_eq!(mode(&path), 0o600);
+        let name = h.take_name("private", false).unwrap();
+        assert_eq!(mode(&h.vms("private", "lock").unwrap()), 0o600);
+        drop(h.logs_lock(libc::LOCK_SH).unwrap());
+        assert_eq!(mode(&h.run.join(".logs.lock")), 0o600);
+        drop(h.worker_flock().unwrap());
+        assert_eq!(mode(&h.state.join("evict.worker.lock")), 0o600);
+        drop(name);
+    }
+
+    #[test]
+    fn readers_can_open_and_list_without_access_to_lock_inodes() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_root, h) = host("readonly-locks");
+        let name = h.take_name("visible", false).unwrap();
+        name.publish(&Entry { name: "visible".into(), ident: Ident::me(), ..Entry::default() }).unwrap();
+        let init = h.state.join(".lockdir/open");
+        let vm_lock = h.vms("visible", "lock").unwrap();
+        for p in [&init, &vm_lock] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let reopened = Host::open(&h.state, &h.run).unwrap();
+        assert_eq!(reopened.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["visible"]);
+        assert!(reopened.entry("visible").is_err(), "operations still require the private lock");
+        for p in [&init, &vm_lock] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        drop(name);
+    }
+
+    #[test]
+    fn locking_the_readable_state_directory_does_not_block_open() {
+        let (_root, h) = host("directory-flock");
+        let _held = Flock::new(File::open(&h.state).unwrap(), libc::LOCK_EX).unwrap();
+        Host::open(&h.state, &h.run).unwrap();
+    }
 
     #[test]
     fn name_paths_refuse_bad_names() {

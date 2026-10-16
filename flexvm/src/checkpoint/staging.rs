@@ -88,9 +88,11 @@ impl Staging {
         ensure!(crate::util::stat_at(pfd.as_raw_fd(), &base).is_none(), "{} already exists; checkpoints are never overwritten", dest.display());
         // Ancestors need durability only at publication. Walk once in commit, using
         // the pinned directory's then-current ancestry (it may move during the write).
-        check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_EX) })?;
-        // Let go of on the error paths too, before `pfd` closes; on success, handed to the staging lock below.
-        let _parent_lock = Unlock(pfd.as_raw_fd());
+        let parent_lock = crate::host::private_file(&PathBuf::from(format!("/proc/self/fd/{}/.checkpoint.lock", pfd.as_raw_fd())))?;
+        check(unsafe { libc::flock(parent_lock.as_raw_fd(), libc::LOCK_EX) })?;
+        // Let go on error paths too, before the descriptor closes; on success,
+        // the private staging directory takes over exclusion below.
+        let _parent_lock = Unlock(parent_lock.as_raw_fd());
         clear_stale_fd(&pfd);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
@@ -98,7 +100,7 @@ impl Staging {
         let outer = open_dir_at(pfd.as_raw_fd(), &outer_name).inspect_err(|_| remove_staging(pfd.as_raw_fd(), &outer_name, -1, None))?;
         let ck = (|| -> Result<_> {
             check(unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX) })?;
-            check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_UN) })?;
+            check(unsafe { libc::flock(parent_lock.as_raw_fd(), libc::LOCK_UN) })?;
             ensure!(private_dir(outer.as_raw_fd()), "staging directory in {} was replaced", parent_path.display());
             check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
             Ok(open_dir_at(outer.as_raw_fd(), c"ck")?)

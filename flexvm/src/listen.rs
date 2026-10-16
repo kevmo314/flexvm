@@ -20,7 +20,8 @@ use crate::util::{send_json, Result, Slot};
 
 /// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+const MAX_ACTIVE_FROM: usize = MAX_ACTIVE / 2;
+static ACTIVE: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM));
 /// Of those, requests that take the host lock (`route`, `lend`, `migration`); more are
 /// refused as busy. The rest stay for requests that need none, page handoffs above all,
 /// however long the lock's holder keeps it (a stalled disk, a stopped VM process).
@@ -168,7 +169,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         // peer just added, a peer by name back on a new address).
         let waiting = match peers.check(&host.config_now().peers, from) {
             Admission::Peer => {
-                let Some(slot) = Slot::take(&ACTIVE, MAX_ACTIVE) else { continue };
+                let Some(slot) = ACTIVE.take(from) else { continue };
                 let (host, peers) = (host.clone(), peers.clone());
                 std::thread::spawn(move || serve(&host, &peers, conn, slot, deadline));
                 continue;
@@ -185,7 +186,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         std::thread::spawn(move || {
             let admitted = peers.admit_by(&host, from, Instant::now() + ADMIT_WAIT);
             drop(waiting);
-            match admitted.then(|| Slot::take(&ACTIVE, MAX_ACTIVE)).flatten() {
+            match admitted.then(|| ACTIVE.take(from)).flatten() {
                 Some(slot) => serve(&host, &peers, conn, slot, deadline),
                 None if !admitted => not_a_peer(conn, from),
                 None => {}
@@ -195,7 +196,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     Ok(())
 }
 
-fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Slot, deadline: Instant) {
+fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Wait, deadline: Instant) {
     let _ = conn.set_nodelay(true);
     if let Err(e) = handle(host, peers, conn, deadline) {
         crate::log!("peer request: {e}");
@@ -456,7 +457,9 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) ->
         "route" => peers
             .all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT)
             .and_then(|p| route(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat())),
-        "lend" => lend(host, &req),
+        "lend" => peers
+            .all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT)
+            .and_then(|p| lend(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat())),
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
             .map_err(|e| format!("bad ident: {e}").into())
@@ -543,7 +546,10 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
     // listener counts it, by its peer (`earlier_arrivals`).
     let n = ARRIVAL.fetch_add(1, Ordering::Relaxed);
     let log_path = host.run.join("vms").join(format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, std::process::id()));
-    let log = std::fs::OpenOptions::new().create_new(true).append(true).open(&log_path)?;
+    let log = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&log_path)?
+    };
     crate::host::flock(&log, libc::LOCK_SH)?;
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
     let (done, told) = std::os::unix::net::UnixStream::pair()?;
@@ -638,8 +644,9 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
     Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay().map(|u| u.to_string())}))
 }
 
-fn lend(host: &Host, req: &Value) -> Result<Value> {
+fn lend(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
+    routable(ip, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
     let gen = host.lend_new(&host_lock(host)?, ip)?;
     Ok(json!({"ip": ip.to_string(), "gen": gen}))
 }
@@ -680,6 +687,16 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
     Ok(json!({"ip": ip.to_string(), "local": local}))
 }
 
+/// Validate addresses from migrations and checkpoints before preparing or claiming them.
+pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, from: Option<IpAddr>, by: Instant) -> Result<()> {
+    static PEERS: std::sync::LazyLock<Peers> = std::sync::LazyLock::new(Peers::default);
+    let cfg = host.config_now();
+    PEERS.refresh(&cfg.peers);
+    let mut peers = PEERS.all_addrs(&cfg.peers, by)?;
+    peers.extend(from);
+    routable(ip, &cfg, &peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
+}
+
 /// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).
 fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr]) -> Result<()> {
     let peer = is_peer(peers, IpAddr::V4(ip));
@@ -693,6 +710,32 @@ fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admitted_connections_leave_half_the_slots_for_other_peers() {
+        let active = Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM);
+        let one = "10.9.0.1".parse().unwrap();
+        let two = "10.9.0.2".parse().unwrap();
+        let mut held: Vec<_> = (0..MAX_ACTIVE_FROM).map(|_| active.take(one).unwrap()).collect();
+        assert!(active.take(one).is_none());
+        assert!(active.take("::ffff:10.9.0.1".parse().unwrap()).is_none());
+        let others: Vec<_> = (0..MAX_ACTIVE_FROM).map(|_| active.take(two).unwrap()).collect();
+        assert!(active.take("10.9.0.3".parse().unwrap()).is_none());
+        held.pop();
+        assert!(active.take(one).is_some());
+        drop((held, others));
+        assert!(active.held.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lend_refuses_peer_addresses_without_creating_a_record() {
+        let root = crate::test_util::TempDir::new("lend-peer");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let ip = "10.9.0.1";
+        let e = lend(&host, &json!({"ip": ip}), &[ip.parse().unwrap()]).unwrap_err();
+        assert!(e.to_string().contains("not a vm's address"));
+        assert!(!host.state.join("addrs").join(ip).exists());
+    }
 
     /// In a child started with a descriptor on fd 3, as systemd would: none of this one's is touched.
     #[test]

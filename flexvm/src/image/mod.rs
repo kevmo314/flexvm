@@ -244,7 +244,9 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
     crate::util::create_dir_durably(dir, 0o777)?;
     sweep_temporaries(dir)?;
     // Never unlink the lock: waiters must all lock the same inode.
-    let lock = File::options().write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
+    let lock = File::options().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
+    use std::os::unix::fs::PermissionsExt;
+    lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     if let Err(e) = flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
         if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(e.into());
@@ -363,13 +365,14 @@ pub(super) fn replace(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) 
 fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> std::io::Result<T>) -> Result<T> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension(format!("part{}", random_hex(8)?));
-    let dir = File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+    let dir = crate::host::private_file(&path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).join(".publish.lock"))?;
     // Every lock is let go explicitly (`Flock`), not by close: a child another thread forks
     // shares the descriptor until it execs, and would hold the lock on after we return.
-    // A part is created and locked under the directory's lock, so `registry::sweep_parts` takes one it can lock for dead.
+    // A part is created and locked under the private publication lock, so
+    // `registry::sweep_parts` takes one it can lock for dead.
     let (mut f, part) = {
         let _dir = Flock::new(dir, libc::LOCK_EX)?;
-        let f = File::options().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+        let f = File::options().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
         // A clone shares the open file, and so the lock.
         let part = f.try_clone().and_then(|c| Flock::new(c, libc::LOCK_EX)).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
@@ -384,6 +387,11 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     // The name is ours alone: gone if renamed, else a failed write's.
     let _ = std::fs::remove_file(&tmp);
     drop(part);
+    if res.is_ok() {
+        // Published data remains readable; only temporary parts are ever flocked.
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    }
     res
 }
 
@@ -716,9 +724,9 @@ mod tests {
             Ok(f.write_all(b"ours")?)
         })
         .unwrap();
-        // The renamed part is the blob's inode, and the directory is the directory.
+        // The renamed part and the private publication lock are both released.
         flock(&File::open(&path).unwrap(), libc::LOCK_EX | libc::LOCK_NB).expect("the part's lock is let go");
-        flock(&File::open(&*dir).unwrap(), libc::LOCK_EX | libc::LOCK_NB).expect("the directory's lock is let go");
+        flock(&File::open(dir.join(".publish.lock")).unwrap(), libc::LOCK_EX | libc::LOCK_NB).expect("the publication lock is let go");
         drop(shared);
     }
 

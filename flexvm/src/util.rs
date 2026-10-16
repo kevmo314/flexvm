@@ -2310,7 +2310,9 @@ pub mod output {
     pub fn append_capped(log: &Path, data: &[u8], cap: u64) -> bool {
         let deadline = Instant::now() + STALL;
         let (f, locked) = loop {
-            let Ok(f) = File::options().create(true).append(true).open(log) else { return false };
+            // Rotation creates a new inode, which must also be private: writers flock it.
+            use std::os::unix::fs::OpenOptionsExt;
+            let Ok(f) = File::options().create(true).append(true).mode(0o600).open(log) else { return false };
             // Waited for only while it is the file at `log`: once rotated or
             // removed, again at the one there now (written unlocked past the bound).
             let locked = loop {

@@ -155,7 +155,7 @@ pub fn maintain(host: Host) {
 /// `STATE/standby.stop.lock`: relief holds it exclusively while it lists and
 /// signals standby VMs, a refill shared from a grant until its standby is listed.
 pub fn stop_lock(host: &Host) -> std::io::Result<File> {
-    File::options().create(true).truncate(false).write(true).open(host.state.join("standby.stop.lock"))
+    crate::host::private_file(&host.state.join("standby.stop.lock"))
 }
 
 /// Touched when memory pressure stops standby VMs.
@@ -178,7 +178,7 @@ pub fn refill(host: &Host, template: &str) -> Result<usize> {
 /// Only a count set by hand (`set`) starts them regardless.
 fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<usize> {
     let d = create_dir(host, template)?;
-    let lock = File::create(d.join(".refill"))?;
+    let lock = crate::host::private_file(&d.join(".refill"))?;
     let _lock = match Flock::new(lock, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
         Ok(lock) => lock,
         Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(0),
@@ -189,7 +189,9 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<
         return Ok(0);
     }
     let mut ready = Vec::new();
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
+    let log_path = d.join("standby.log");
+    drop(crate::host::private_file(&log_path)?);
+    let log = std::fs::OpenOptions::new().append(true).open(log_path)?;
     let mib = grant_mib(host, template);
     // A failed start ends the round, but those started before it are still waited for.
     let mut failed = None;
@@ -369,7 +371,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         std::thread::sleep(Duration::from_millis(50));
     }
     let tmp = d.join(format!(".{id}.lock"));
-    let lock = File::create(&tmp)?;
+    let lock = crate::host::private_file(&tmp)?;
     crate::host::flock(&lock, libc::LOCK_EX)?;
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     std::fs::rename(&tmp, &lock_path)?;
@@ -385,7 +387,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     *p.standby.lock().unwrap() = Some(ready);
     save_load_set(host, &tpl);
     // Under the dir's `.publish`, a lock (not `*.lock`, which names a standby) a sweep holds: none finds this pid's socket stale and unlinks it after the bind.
-    let publish = crate::host::Flock::new(File::create(d.join(".publish"))?, libc::LOCK_EX)?;
+    let publish = crate::host::Flock::new(crate::host::private_file(&d.join(".publish"))?, libc::LOCK_EX)?;
     let _ = std::fs::remove_file(&sock); // A previous process with this pid may have left it.
     let listener = UnixListener::bind(&sock)?;
     // A claimer refused by a dead standby of this pid may unlink the path after this bind.
@@ -435,7 +437,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             continue;
         }
         // Locked until the claim succeeds or rolls back (dropped): relief does not count it stopped.
-        let claiming = File::options().create(true).truncate(false).write(true).open(&claim_path)?;
+        let claiming = crate::host::private_file(&claim_path)?;
         crate::host::flock(&claiming, libc::LOCK_EX)?;
         // Not yet `claiming`, so the claimer tries another.
         if let Some(code) = p.stop_requested() {
@@ -582,7 +584,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             // and only the socket refused, not one a standby of a reused pid has bound since.
             Err(e) => {
                 if e.raw_os_error() == Some(libc::ECONNREFUSED) {
-                    let publish = File::create(sock.with_file_name(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB));
+                    let publish = crate::host::private_file(&sock.with_file_name(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB));
                     if publish.is_ok() && ino.is_some() && std::fs::metadata(&sock).map(|m| m.ino()).ok() == ino {
                         let _ = std::fs::remove_file(&sock);
                     }
@@ -632,7 +634,7 @@ fn try_take(sock: &std::path::Path) -> Option<Option<File>> {
     let Some(id) = stem.parse().ok().and_then(Ident::of).map(|id| id.key()) else {
         return Some(None);
     };
-    let Ok(f) = File::options().create(true).truncate(false).write(true).open(sock.with_file_name(format!("{id}.take"))) else { return Some(None) };
+    let Ok(f) = crate::host::private_file(&sock.with_file_name(format!("{id}.take"))) else { return Some(None) };
     match flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
         Ok(()) => Some(Some(f)),
         Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => None,
@@ -958,7 +960,7 @@ mod tests {
         assert_eq!(templates(&host), vec!["default"]);
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
-        let lock = File::create(d.join(".refill")).unwrap();
+        let lock = crate::host::private_file(&d.join(".refill")).unwrap();
         let lock = Flock::new(lock, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         drop(lock);

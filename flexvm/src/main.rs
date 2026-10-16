@@ -520,7 +520,9 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     // Opened and marked written holding the logs lock (shared): garbage
     // collection removes only a quiet log, holding it exclusively.
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    let f = std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log")?)?;
+    let path = host.vms(name, "log")?;
+    drop(host::private_file(&path)?);
+    let f = std::fs::OpenOptions::new().append(true).open(path)?;
     f.set_modified(std::time::SystemTime::now())?;
     Ok(f)
 }

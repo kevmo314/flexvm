@@ -409,7 +409,7 @@ impl Template {
         if self.meta.verify(paths, &self.fixed, cache)? {
             // Into what is there now, so stamps other processes wrote back are kept; locked, so
             // none is lost to a concurrent write-back.
-            let _dir = crate::host::Flock::new(File::open(&self.fixed)?, libc::LOCK_EX)?;
+            let _dir = crate::host::Flock::new(crate::host::private_file(&self.fixed.join(".verify.lock"))?, libc::LOCK_EX)?;
             let mut meta = Meta::read(&self.fixed).ok().filter(|m| m.id == self.meta.id).unwrap_or_else(|| self.meta.clone());
             for (name, stamp) in cache.iter() {
                 if let Some(c) = meta.components.get_mut(name).filter(|c| c.hash == self.meta.components[name].hash) {
@@ -669,7 +669,7 @@ pub fn interrupted() -> Result<()> {
 /// Held shared while a build makes its staging directory and while it publishes, exclusive
 /// while one sweeps: a staging directory without a lock, or a link, seen under it is dead.
 fn templates_lock(paths: &Paths, how: i32) -> Result<crate::host::Flock> {
-    let f = File::options().create(true).truncate(false).read(true).write(true).open(paths.templates.join(".lock"))?;
+    let f = crate::host::private_file(&paths.templates.join(".lock"))?;
     Ok(crate::host::Flock::new(f, how)?)
 }
 
@@ -692,7 +692,7 @@ impl Staging {
         let _l = templates_lock(paths, libc::LOCK_SH)?;
         let dir = paths.templates.join(format!(".{name}.new-{}", crate::util::random_hex(8)?));
         std::fs::create_dir(&dir)?;
-        let lock = File::create(dir.join("lock"))?;
+        let lock = crate::host::private_file(&dir.join("lock"))?;
         crate::host::flock(&lock, libc::LOCK_EX)?;
         Ok(Staging { dir, _lock: lock })
     }

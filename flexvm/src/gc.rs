@@ -59,7 +59,7 @@ pub fn sweep(host: &Host) {
 
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
-    let Ok(lock) = File::create(host.run.join(".gc.lock")) else { return };
+    let Ok(lock) = crate::host::private_file(&host.run.join(".gc.lock")) else { return };
     let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     if let Err(e) = host.collect_garbage() {
         crate::log!("garbage collection: {e}");
@@ -131,7 +131,7 @@ fn vm_files(host: &Host) {
 fn standby_sockets(dir: &Path) {
     // Held while a standby replaces its socket (`standby::serve`): a reused pid's new socket is seen with its lock held.
     // Not waited for: a standby stopped holding it would stall every sweep.
-    let Ok(_publish) = File::create(dir.join(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB)) else { return };
+    let Ok(_publish) = crate::host::private_file(&dir.join(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB)) else { return };
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
