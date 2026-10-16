@@ -43,18 +43,14 @@ pub const PLUG_MIB: u64 = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
-    #[serde(default)]
-    pub compatibility: Option<crate::compat::Compat>,
+    pub compatibility: crate::compat::Compat,
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
-    #[serde(default)]
     pub plugged_mib: u64,
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
-    #[serde(default)]
     pub id: String,
-    #[serde(default)]
     components: BTreeMap<String, Component>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageMeta>,
@@ -174,7 +170,8 @@ fn content_id(components: &BTreeMap<String, Component>, image: Option<&ImageMeta
 
 impl Meta {
     fn read(dir: &Path) -> Result<Meta> {
-        Ok(serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?)
+        serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
+            .map_err(|e| format!("template {}: {e}; rebuild it with `flexvm template`", dir.display()).into())
     }
 
     fn files(&self, paths: &Paths, dir: &Path) -> [(&'static str, PathBuf); 5] {
@@ -401,7 +398,7 @@ impl Template {
     }
 
     pub fn check_id(&self, id: &str) -> Result<()> {
-        if self.meta.id.is_empty() || self.meta.id != id {
+        if self.meta.id != id {
             bail!("template {:?} id mismatch: local {}, source {id}", self.name, self.meta.id);
         }
         Ok(())
@@ -548,7 +545,7 @@ fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<Socket
     let fc = p.firecracker();
     // Like VM restores: stepping the clock touches pages of its own.
     fc.load_snapshot(&tpl.vmstate(), tap, Some(true), crate::fc::API_TIMEOUT)?;
-    fc.resume()?;
+    fc.resume(crate::fc::API_TIMEOUT)?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;
     if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
@@ -559,7 +556,7 @@ fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<Socket
     if guest::exec(&fc.sockets.vsock, "true", EXEC_TIMEOUT).is_err() {
         guest::ping(&fc.sockets.vsock)?;
     }
-    fc.pause()?;
+    fc.pause(crate::fc::API_TIMEOUT)?;
     let runs = pad_runs(p.pager.present_runs(), crate::uffd::FAULT_AROUND as u64);
     drop(p);
     let _ = std::fs::remove_dir_all(&run);
@@ -669,7 +666,7 @@ impl Staging {
         std::fs::create_dir_all(&paths.templates)?;
         sweep(paths)?;
         let _l = templates_lock(paths, libc::LOCK_SH)?;
-        let dir = paths.templates.join(format!(".{name}.new-{}", crate::util::nonce()?));
+        let dir = paths.templates.join(format!(".{name}.new-{}", crate::util::random_hex(8)?));
         std::fs::create_dir(&dir)?;
         let lock = File::create(dir.join("lock"))?;
         crate::host::flock(&lock, libc::LOCK_EX)?;
@@ -742,7 +739,7 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
         r => r?,
     }
     let live = paths.templates.join(name);
-    let tmp = paths.templates.join(format!(".{name}.link-{}", crate::util::nonce()?));
+    let tmp = paths.templates.join(format!(".{name}.link-{}", crate::util::random_hex(8)?));
     std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
     crate::util::sync_dir(&gens)?;
     std::fs::rename(&tmp, &live)?;
@@ -803,7 +800,7 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
              plugged); VMs will report the rest after restore, at some RSS each"
         );
     }
-    fc.pause()?;
+    fc.pause(crate::fc::API_TIMEOUT)?;
     fc.request_within(
         "PUT",
         "/snapshot/create",
@@ -821,7 +818,7 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
     let _ = std::fs::remove_dir_all(&run);
 
     let mut meta = Meta {
-        compatibility: Some(compatibility),
+        compatibility,
         vcpus,
         mem_mib,
         max_mib: mem_mib + hotplug,
@@ -906,7 +903,7 @@ mod tests {
             let dir = crate::test_util::TempDir::new("template");
             let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), rootfs: dir.join("rootfs"), templates: dir.clone() };
             let mut meta = Meta {
-                compatibility: None,
+                compatibility: crate::compat::Compat { cpu: String::new(), firecracker: String::new(), features: BTreeMap::new(), xsave: BTreeMap::new() },
                 vcpus: 2,
                 mem_mib: 256,
                 max_mib: 1024,
@@ -946,6 +943,18 @@ mod tests {
 
         fn write_meta(&self, meta: &Meta, dir: &Path) {
             std::fs::write(dir.join("meta.json"), serde_json::to_vec(meta).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn incomplete_metadata_requires_a_rebuild() {
+        let f = Fixture::new();
+        for field in ["compatibility", "plugged_mib", "id", "components"] {
+            let mut meta = serde_json::to_value(&f.meta).unwrap();
+            meta.as_object_mut().unwrap().remove(field);
+            std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            let error = Meta::read(&f.dir).unwrap_err().to_string();
+            assert!(error.contains(field) && error.contains("rebuild it with `flexvm template`"), "{error}");
         }
     }
 

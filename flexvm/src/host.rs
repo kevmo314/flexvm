@@ -419,41 +419,40 @@ fn unwritable(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem)
 }
 
+/// Whether a directory's recorded binding exists and agrees with `want`.
+fn verify_binding(dir: &Path, name: &str, want: &Path) -> Result<bool> {
+    let path = dir.join(format!("{name}.json"));
+    let Some(saved) = load::<PathBuf>(&path)? else { return Ok(false) };
+    if saved != want {
+        let (kind, relation) = if name == "run" { ("state", "is bound to") } else { ("run", "belongs to") };
+        bail!(
+            "{kind} directory {} {relation} {name} directory {}; refusing --{name} {} (with no VM running, remove {} to rebind)",
+            dir.display(),
+            saved.display(),
+            want.display(),
+            path.display()
+        );
+    }
+    Ok(true)
+}
+
 /// Binds the run directory to one canonical state path in `RUN/state.json` (gone on reboot, as
 /// `STATE/run.json` still binds that side). Two state roots hold different flocks, so the first
 /// write is a hard link of a whole file, made under a random name, which only one of them can make;
 /// every opener then reads the winner. False if the run directory is unclaimed and this user cannot
 /// claim it (a non-root opener), so the caller leaves its state unbound too.
 fn claim_run(state: &Path, run: &Path) -> Result<bool> {
-    use std::io::ErrorKind::{AlreadyExists, NotFound};
+    use std::io::ErrorKind::AlreadyExists;
     let owner = run.join("state.json");
-    // Whether the owner names this state, or None while there is no owner.
-    let verify = || -> Result<Option<()>> {
-        let bytes = match std::fs::read(&owner) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == NotFound => return Ok(None),
-            Err(e) => bail!("{}: {e}", owner.display()),
-        };
-        let saved: PathBuf = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", owner.display()))?;
-        if saved != state {
-            bail!(
-                "run directory {} belongs to state directory {}; refusing --state {} (with no VM running, remove {} to rebind)",
-                run.display(),
-                saved.display(),
-                state.display(),
-                owner.display()
-            );
-        }
-        Ok(Some(()))
-    };
-    if verify()?.is_some() {
+    let verify = || verify_binding(run, "state", state);
+    if verify()? {
         return Ok(true);
     }
-    let tmp = run.join(format!(".state.json.{}.tmp", crate::util::nonce()?));
+    let tmp = run.join(format!(".state.json.{}.tmp", crate::util::random_hex(8)?));
     let made = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp);
     let linked = match made {
         // Another state may have claimed it since it was read.
-        Err(e) if unwritable(&e) => return Ok(verify()?.is_some()),
+        Err(e) if unwritable(&e) => return verify(),
         Err(e) => bail!("{}: {e}", tmp.display()),
         Ok(mut f) => {
             if let Err(e) = std::io::Write::write_all(&mut f, &serde_json::to_vec(state)?).and_then(|()| f.sync_all()) {
@@ -471,7 +470,7 @@ fn claim_run(state: &Path, run: &Path) -> Result<bool> {
         Err(e) => bail!("{}: {e}", owner.display()),
     }
     // Linked or not, the owner on disk decides.
-    Ok(verify()?.is_some())
+    verify()
 }
 
 impl Host {
@@ -504,23 +503,7 @@ impl Host {
         let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
         let (state, run) = (canon(state)?, canon(run)?);
         let binding = state.join("run.json");
-        let bound = match std::fs::read(&binding) {
-            Ok(bytes) => {
-                let saved: PathBuf = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", binding.display()))?;
-                if saved != run {
-                    bail!(
-                        "state directory {} is bound to run directory {}; refusing --run {} (with no VM running, remove {} to rebind)",
-                        state.display(),
-                        saved.display(),
-                        run.display(),
-                        binding.display()
-                    );
-                }
-                true
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => bail!("{}: {e}", binding.display()),
-        };
+        let bound = verify_binding(&state, "run", &run)?;
         let claimed = claim_run(&state, &run)?;
         // A user who cannot write the state root (a non-root `flexvm ls` of an unbound one) leaves it unbound,
         // as does one who could not claim the run directory: it is not bound to a directory it may not own.
@@ -725,7 +708,7 @@ impl Host {
     }
 
     pub fn alive(&self, name: &str) -> bool {
-        self.vms(name, "lock").is_ok_and(|l| File::open(l).is_ok_and(|f| probe(&f, libc::LOCK_SH).is_err()))
+        self.vms(name, "lock").is_ok_and(|l| crate::util::locked(&l, libc::LOCK_SH) == Some(true))
     }
 
     /// Whether `name`'s lock is held: None when that cannot be told (the
@@ -750,12 +733,6 @@ impl Host {
             return Some(false);
         }
         lock_holder(&self.vms(name, "lock").ok()?).ok()?.map(|h| h == *id)
-    }
-
-    /// Also requires the last holder's Firecrackers to have exited.
-    fn gone(&self, name: &str) -> bool {
-        self.name_locked(name) == Some(false)
-            && self.vms(name, "lock").and_then(|l| lock_holder(&l)).is_ok_and(|id| id.is_none_or(|id| reap(&self.run, &id).is_ok()))
     }
 
     pub fn entries(&self) -> Vec<Entry> {
@@ -813,17 +790,13 @@ impl Host {
     /// suspended here with this generation. Another instance of the same name
     /// (a restart after a SIGKILL) does not hold it.
     fn held(&self, a: &Addr) -> bool {
-        let Some(h) = a.holder.as_deref() else { return false };
-        let instance = match &a.holder_id {
-            // Written before instances were recorded.
-            None => !self.gone(h),
-            Some(id) => match id.liveness() {
-                // What cannot be read about its name keeps it held.
-                Liveness::Alive => self.held_by(h, id).unwrap_or(true),
-                // Until its Firecrackers are reaped.
-                Liveness::Gone => reap(&self.run, id).is_err(),
-                Liveness::Unknown => true,
-            },
+        let (Some(h), Some(id)) = (a.holder.as_deref(), &a.holder_id) else { return false };
+        let instance = match id.liveness() {
+            // What cannot be read about its name keeps it held.
+            Liveness::Alive => self.held_by(h, id).unwrap_or(true),
+            // Until its Firecrackers are reaped.
+            Liveness::Gone => reap(&self.run, id).is_err(),
+            Liveness::Unknown => true,
         };
         instance || self.suspended_with(h, a.held)
     }
@@ -831,7 +804,7 @@ impl Host {
     /// A suspended VM `name` with generation `gen` (or one whose generation was
     /// never recorded: quarantined, it keeps what it held).
     fn suspended_with(&self, name: &str, gen: u64) -> bool {
-        let recorded = || std::fs::read_to_string(self.suspended(name).ok()?.join("GEN")).ok().and_then(|g| g.trim().parse::<u64>().ok());
+        let recorded = || crate::lifecycle::read_gen(&self.suspended(name).ok()?);
         self.is_suspended(name) && recorded().is_none_or(|g| g == gen)
     }
 
@@ -1214,7 +1187,7 @@ impl Host {
         };
         let now = boottime_ms();
         let mut grants: Grants = load(&self.grants())?.unwrap_or_default();
-        // A stamp in the future is an older build's wall clock.
+        // Ignore future stamps so they cannot extend the cooldown indefinitely.
         grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
         // Fails closed: unread holds would leave out memory still to arrive.
         let held = self.holds(l).map_err(|e| {
@@ -2523,7 +2496,7 @@ pub fn fault(name: &str) -> bool {
     if c.as_ref().map(|c| Some(c.0)) != Some(mtime) {
         *c = mtime.map(|m| (m, load(&path).ok().flatten().unwrap_or_default()));
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let now = wall_ms();
     c.as_ref().is_some_and(|(_, armed)| armed.get(name).is_some_and(|&until| now < until))
 }
 
@@ -2565,7 +2538,7 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
     let _l = host.lock()?;
     let path = host.run.join("faults.json");
     let mut armed: HashMap<String, u64> = load(&path).ok().flatten().unwrap_or_default();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let now = wall_ms();
     armed.retain(|_, &mut until| until > now);
     match ms {
         0 => armed.remove(name),
@@ -2876,9 +2849,10 @@ mod tests {
     fn a_dead_holders_firecrackers_die_before_its_name_or_address_is_free() {
         let (_h_dir, h) = host("reap");
         let fc = Sleeper::new();
-        store(&h.vms("d", "lock").unwrap(), &dead_owner(&h, 999_999_901, &[&fc.1]), false).unwrap();
+        let dead = dead_owner(&h, 999_999_901, &[&fc.1]);
+        store(&h.vms("d", "lock").unwrap(), &dead, false).unwrap();
         let l = h.lock().unwrap();
-        h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("d".into()), ..Addr::default() }, false).unwrap();
+        h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("d".into()), holder_id: Some(dead), held: 1, ..Addr::default() }, false).unwrap();
         assert!(fc.1.alive());
         assert!(h.claim_new(&l, "x", Some(ip("10.9.0.1"))).unwrap().gen > 1 && fc.done());
         let fc = Sleeper::new();
@@ -2990,9 +2964,6 @@ mod tests {
         assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"));
         std::fs::write(h.suspended("s").unwrap().join("GEN"), "6").unwrap();
         assert_eq!(h.holder(&l, x).unwrap(), None, "suspended with another address");
-        // Records from before instances were recorded go by the name.
-        h.put_addr(x, &Addr { seen: 7, holder: Some("web".into()), held: 7, ..Addr::default() }, false).unwrap();
-        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("web"));
     }
 
     #[test]
@@ -3025,9 +2996,8 @@ mod tests {
         for f in ["manifest.json", "GEN", "STARTED", "QUARANTINE"] {
             std::fs::write(h.suspended("quarantined").unwrap().join(f), "4").unwrap();
         }
-        // Alive (this process, though it does not hold the name), and a record without its instance.
+        // Alive (this process, though it does not hold the name).
         claim(ips[7], "alive", Some(Ident::me()), 4, &|_| ());
-        claim(ips[8], "old", None, 4, &|_| ());
         // An older loan of this address, superseded by the dead VM's generation: freed with it.
         claim(ips[9], "older-loan", Some(dead(999_999_938)), 6, &|a| a.lent = Some(5));
         let ips: Vec<Ipv4Addr> = ips.into_iter().chain((11..=17).map(|i| ip(&format!("10.9.1.{i}")))).collect();
@@ -3499,12 +3469,10 @@ mod tests {
         let dead = dead_owner(&h, 999_999_922, &[]);
         std::fs::create_dir_all(dead.work_dir(&h.run).join("0/fc")).unwrap();
         assert!(reap(&h.run, &dead).is_err());
-        // A name whose lock cannot be read is not free, and its address stays held.
+        // A name whose lock cannot be read is not free.
         std::fs::write(h.vms("u", "lock").unwrap(), "{").unwrap();
         let l = h.lock().unwrap();
-        h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("u".into()), held: 1, ..Addr::default() }, false).unwrap();
-        assert!(h.take_name("u", false).is_err() && !h.gone("u"));
-        assert_eq!(h.holder(&l, ip("10.9.0.1")).unwrap().as_deref(), Some("u"));
+        assert!(h.take_name("u", false).is_err() && !h.holder_gone("u"));
         collect_owned(&h.run);
         assert!(h.vms("u", "lock").unwrap().exists(), "kept by the garbage collector too");
         // An empty lock (created, never written) is no holder.
@@ -4400,7 +4368,7 @@ mod tests {
         let mut other = Host::open(&h.state, &h.run).unwrap();
         other.cfg.reserve_mib = h.cfg.reserve_mib;
         assert!(grant_at(&other, 1, Floor::Reserve, false).is_err(), "another host handle sees the pending grant");
-        // A wall-clock stamp (an older build's, at any wall time) is in the future: dropped, not held forever.
+        // A future stamp is dropped rather than extending the cooldown indefinitely.
         let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         for t in [wall, wall - 3_600_000, u64::MAX] {
             store(&path, &vec![(t, 1000u64, 1u64)], false).unwrap();

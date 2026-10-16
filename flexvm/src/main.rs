@@ -74,49 +74,6 @@ fails, 124 when the VM dies
 
 const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "force", "help", "version"];
 
-const VALUE_FLAGS: &[&str] = &[
-    "state",
-    "run",
-    "template",
-    "ip",
-    "name",
-    "peer",
-    "vm-ips",
-    "underlay",
-    "announce-dev",
-    "dns",
-    "reserve",
-    "evict-at",
-    "vcpus",
-    "mem",
-    "max",
-    "plug",
-    "image",
-    "init",
-    "entrypoint",
-    "cmd",
-    "env",
-    "workdir",
-    "user",
-    "ready-port",
-    "ready-cmd",
-    "ready-timeout",
-    "max-download-mib",
-    "max-unpacked-mib",
-    "max-file-mib",
-    "max-entries",
-    "to",
-    "to-state",
-    "to-run",
-    "timeout",
-    "lifecycle",
-    "iterations",
-    "warmup",
-    "dirty-mib",
-    "settle-ms",
-    "ready-http",
-];
-
 /// `--flag value`s: last wins. `rest` follows `--` (or `exec NAME`).
 pub struct Args {
     positional: Vec<String>,
@@ -158,13 +115,12 @@ impl Args {
                 Some(f) => {
                     let value = if SWITCHES.contains(&f) {
                         "1".into()
-                    } else if VALUE_FLAGS.contains(&f) {
+                    } else if GLOBAL.contains(&f) || IMAGE_FLAGS.contains(&f) || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&f)) {
                         let value = it.next().ok_or_else(|| format!("--{f} needs a value"))?;
                         a.child_args.push(value.clone());
                         value
                     } else {
-                        let hint = if f == "listen" { "; the listen address is flexvm listen's" } else { " (see flexvm --help)" };
-                        bail!("unknown option --{f}{hint}");
+                        bail!("unknown option --{f} (see flexvm --help)");
                     };
                     a.flags.push((f.into(), value));
                 }
@@ -300,7 +256,6 @@ fn check_applies(args: &Args) -> Result<()> {
     if let Some(extra) = args.positional.get(most) {
         let hint = match cmd.as_str() {
             "run" => format!("; a command goes after --: flexvm run {} -- {extra} ...", args.positional[1]),
-            "config" => "; the listen address is flexvm listen's".into(),
             _ => " (see flexvm --help)".into(),
         };
         bail!("{cmd} does not take {extra:?}{hint}");
@@ -591,8 +546,6 @@ fn resume(host: &Host, name: &str) -> Result<bool> {
         match vmproc::call(host, name, json!({"op": "resume"}), None) {
             Ok(v) if v["suspending"] == true => {}
             Ok(_) => return Ok(true),
-            // A process from before the op: SIGCONT, as then.
-            Err(e) if e.to_string().contains("unknown op") => return Ok(host.signal(name, libc::SIGCONT).is_ok()),
             Err(_) if host.entry(name).is_err() => return Ok(false),
             Err(e) if std::time::Instant::now() >= deadline => return Err(e),
             Err(_) => {}
@@ -813,7 +766,7 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Result<Session> {
-        Ok(Session { id: guest::session_id()?, started: false, offset: 0, exit: None })
+        Ok(Session { id: util::random_hex(16)?, started: false, offset: 0, exit: None })
     }
 }
 
@@ -1103,14 +1056,8 @@ mod exec_tests {
     }
 
     #[test]
-    fn removed_listen_flag_points_to_the_listen_command() {
-        let error = Args::parse(["config", "--listen", "127.0.0.1:7070"].map(String::from)).err().unwrap();
-        assert_eq!(error.to_string(), "unknown option --listen; the listen address is flexvm listen's");
-    }
-
-    #[test]
     fn unknown_options_and_missing_values_are_errors() {
-        for option in ["--typo", "-x", "--detach=yes", "--keep-running"] {
+        for option in ["--typo", "--listen", "-x", "--detach=yes", "--keep-running"] {
             let error = Args::parse(["run", option, "web"].map(String::from)).err().unwrap();
             assert_eq!(error.to_string(), format!("unknown option {option} (see flexvm --help)"));
         }

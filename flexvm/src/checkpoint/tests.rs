@@ -94,7 +94,12 @@ fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
     let tdir = dir.join(".gen/a");
     fs::create_dir_all(&tdir).unwrap();
     std::os::unix::fs::symlink(".gen/a", dir.join("tpl")).unwrap();
-    fs::write(tdir.join("meta.json"), r#"{"vcpus": 1, "mem_mib": 1, "max_mib": 1, "kernel": "/k", "rootfs": "/r"}"#).unwrap();
+    let meta = json!({
+        "compatibility": {"cpu": "test", "firecracker": "test", "features": {}, "xsave": {}},
+        "vcpus": 1, "mem_mib": 1, "max_mib": 1, "plugged_mib": 0,
+        "kernel": "/k", "rootfs": "/r", "id": "a", "components": {}
+    });
+    fs::write(tdir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
     let mem = File::create(tdir.join("mem")).unwrap();
     mem.set_len((pages.len() * PAGE_SIZE) as u64).unwrap();
     for (i, b) in pages.iter().enumerate().filter_map(|(i, p)| Some((i, (*p)?))) {

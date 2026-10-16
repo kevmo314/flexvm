@@ -1153,7 +1153,7 @@ impl Proc {
     }
 
     fn debug(&self, req: &Value) -> Result<Value> {
-        if req["what"] != "status" && std::env::var("FLEXVM_FAULTS").ok().as_deref() != Some("1") {
+        if req["what"] != "status" && !crate::host::faults_on() {
             bail!("debug {} needs FLEXVM_FAULTS=1", req["what"]);
         }
         let vm = self.vm();

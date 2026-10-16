@@ -28,8 +28,8 @@
 //! `pull` brings the rest in, and `collapse` turns what was paged in into huge pages afterwards. `server` reads the
 //! paused source, and `wp` handles write tracking and COW.
 
-use std::io::{self, IoSliceMut};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -419,14 +419,12 @@ impl Pager {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     waiting("connected")?;
                     // Bounded, to notice a stop.
-                    let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-                    unsafe { libc::poll(&mut pfd, 1, 10) };
+                    let _ = crate::util::readable(listener, Duration::from_millis(10));
                 }
                 Err(e) => return Err(e.into()),
             }
         };
-        let mut pfd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        while unsafe { libc::poll(&mut pfd, 1, 10) } <= 0 {
+        while !crate::util::readable(&stream, Duration::from_millis(10)).unwrap_or(false) {
             waiting("sent its handshake")?;
         }
         stream.set_nonblocking(false)?;
@@ -1085,22 +1083,8 @@ fn remote_pages(runs: &Runs, mappings: &[Mapping]) -> Result<usize> {
 /// Receives Firecracker's handshake: a JSON body plus the uffd over SCM_RIGHTS.
 fn recv_with_fd(sock: RawFd) -> Result<(Vec<u8>, OwnedFd)> {
     let mut body = vec![0u8; 64 * 1024];
-    let mut cmsg = [0u8; 64];
-    let mut iov = [IoSliceMut::new(&mut body)];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = iov.as_mut_ptr().cast();
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg.len();
-    let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
-    if n <= 0 {
-        bail!("recvmsg: {}", io::Error::last_os_error());
-    }
-    let c = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if c.is_null() || unsafe { (*c).cmsg_type } != libc::SCM_RIGHTS {
-        bail!("handshake carried no file descriptor");
-    }
-    let fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const RawFd) };
-    body.truncate(n as usize);
-    Ok((body, unsafe { OwnedFd::from_raw_fd(fd) }))
+    let (n, fds) = crate::util::recvmsg_fds(sock, &mut body)?;
+    let fd = fds.into_iter().next().ok_or("handshake carried no file descriptor")?;
+    body.truncate(n);
+    Ok((body, fd))
 }

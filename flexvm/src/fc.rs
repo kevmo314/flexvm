@@ -131,12 +131,12 @@ impl Firecracker {
         self.request_within("PUT", "/snapshot/load", Some(body), timeout)
     }
 
-    pub fn pause(&self) -> Result<()> {
-        self.patch("/vm", serde_json::json!({"state": "Paused"})).map(|_| ())
+    pub fn pause(&self, timeout: Duration) -> Result<()> {
+        self.request_within("PATCH", "/vm", Some(serde_json::json!({"state": "Paused"})), timeout).map(|_| ())
     }
 
-    pub fn resume(&self) -> Result<()> {
-        self.patch("/vm", serde_json::json!({"state": "Resumed"})).map(|_| ())
+    pub fn resume(&self, timeout: Duration) -> Result<()> {
+        self.request_within("PATCH", "/vm", Some(serde_json::json!({"state": "Resumed"})), timeout).map(|_| ())
     }
 
     /// Every call has a deadline, so none can hold a VM's API lock forever.
@@ -467,7 +467,7 @@ impl Spawner {
         // Under test, each VM's Firecracker keeps its device metrics (`metrics.json` in its
         // directory, appended every 60 s and on `FlushMetrics`), so a test can see what a
         // device did (#149). Metrics can only be configured before a load.
-        if std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1") {
+        if crate::host::faults_on() {
             let path = dir.join("metrics.json");
             if let Err(e) = File::create(&path).map_err(Into::into).and_then(|_| fc.put("/metrics", serde_json::json!({"metrics_path": path}))) {
                 crate::log!("firecracker {}: no metrics: {e}", fc.pid());

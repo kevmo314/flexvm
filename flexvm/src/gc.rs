@@ -126,7 +126,7 @@ fn vm_files(host: &Host) {
     }
 }
 
-/// `PID.sock` (and legacy `KEY.PID-START.sock`), `PID-START.claim` and `PID-START.take` (a claimer's) of standbys whose locks are gone,
+/// `PID.sock`, `PID-START.claim` and `PID-START.take` (a claimer's) of standbys whose locks are gone,
 /// and `.PID-START.lock` (a lock not yet in place, unlocked at first) of standbys gone.
 fn standby_sockets(dir: &Path) {
     // Held while a standby replaces its socket (`standby::serve`): a reused pid's new socket is seen with its lock held.
@@ -137,7 +137,7 @@ fn standby_sockets(dir: &Path) {
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
         let tmp = n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock"));
         let socket_id = n.strip_suffix(".sock").and_then(|s| s.parse().ok()).map(|pid| Ident::of(pid).map(|id| id.key()).unwrap_or_else(|| format!("{pid}-0")));
-        let Some(id) = claim.or(tmp).or(socket_id.as_deref()).or_else(|| n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, id)| id)) else {
+        let Some(id) = claim.or(tmp).or(socket_id.as_deref()) else {
             continue;
         };
         let Some((pid, start)) = id.split_once('-') else { continue };
@@ -175,19 +175,7 @@ mod tests {
         File::create(d.join("2-1.lock")).unwrap();
         let claiming = File::create(d.join("4-1.claim")).unwrap();
         flock(&claiming, libc::LOCK_EX).unwrap();
-        for s in [
-            "key.1-1.sock",
-            "key.1-2.sock",
-            "key.2-1.sock",
-            "key.3-1.sock",
-            "key.x.sock",
-            "1-1.lock",
-            "3-1.claim",
-            "5-6.claim",
-            "5-7.claim",
-            "3-1.take",
-            "5-7.take",
-        ] {
+        for s in ["1-1.lock", "3-1.claim", "5-6.claim", "5-7.claim", "3-1.take", "5-7.take"] {
             File::create(d.join(s)).unwrap();
         }
         let other = File::create(d.join("5-7.lock")).unwrap();
@@ -207,13 +195,10 @@ mod tests {
         let left = |n: &str| d.join(n).exists();
         assert!(left(&live_sock));
         assert!(!left("999999990.sock"));
-        assert!(left("key.1-1.sock"), "its standby holds its lock");
         assert!(left("4-1.claim") && left("5-7.claim"), "a claim marker of a standby still here stays");
         assert!(!left("3-1.claim") && !left("5-6.claim"), "one unlocked goes once its lock is gone or names another process");
         assert!(!left("3-1.take") && left("5-7.take"), "a claimer's marker goes with its standby");
-        assert!(!left("key.1-2.sock"), "a reused pid keeps only its own socket");
-        assert!(!left("key.2-1.sock") && !left("key.3-1.sock"), "lock free or gone");
-        assert!(left("key.x.sock") && left("2-1.lock"));
+        assert!(left("2-1.lock"));
         assert!(!left(".999999999-1.lock") && left(&mine));
         std::fs::remove_dir_all(d).unwrap();
     }

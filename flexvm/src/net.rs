@@ -315,7 +315,7 @@ pub fn plug_tap(tap: &str) -> (bool, Result<()>) {
     let Ok(ifindex) = ifindex(tap) else { return (false, Err(format!("no tap {tap}").into())) };
     match request(libc::RTM_NEWQDISC, NLM_F_CREATE | NLM_F_REPLACE, &plug_msg(ifindex, TCQ_PLUG_BUFFER)) {
         Ok(()) => (true, Ok(())),
-        Err(Failed::Refused(e)) | Err(Failed::Unsent(e)) => (false, Err(e)),
+        Err(Failed::Unchanged(e)) => (false, Err(e)),
         Err(Failed::Unanswered(e)) => (true, Err(e)),
     }
 }
@@ -558,16 +558,14 @@ fn attr(buf: &mut Vec<u8>, kind: u16, data: &[u8]) {
     buf.resize(buf.len().next_multiple_of(4), 0);
 }
 
-/// Why a request failed: the kernel answered no (nothing changed), it was never sent, or its
-/// answer was lost after it was sent (the change may have been made).
+/// Whether a failed request left things unchanged or its answer was lost (the change may have been made).
 enum Failed {
-    Refused(crate::util::Error),
-    Unsent(crate::util::Error),
+    Unchanged(crate::util::Error),
     Unanswered(crate::util::Error),
 }
 
 fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
-    request(kind, flags, body).map_err(|(Failed::Refused(e) | Failed::Unsent(e) | Failed::Unanswered(e))| e)
+    request(kind, flags, body).map_err(|(Failed::Unchanged(e) | Failed::Unanswered(e))| e)
 }
 
 /// One socket per thread, so each recv is the ACK of the request just sent and a slow one
@@ -575,7 +573,7 @@ fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
 /// left for the next.
 fn request(kind: u16, flags: c_int, body: &[u8]) -> std::result::Result<(), Failed> {
     thread_local!(static FD: std::cell::Cell<Option<OwnedFd>> = const { std::cell::Cell::new(None) });
-    let sock = FD.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok).map_err(Failed::Unsent)?;
+    let sock = FD.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok).map_err(Failed::Unchanged)?;
     let mut ack = [0u8; 1024];
     let reply = exchange(&sock, kind, flags | NLM_F_ACK, body, &mut ack)?;
     if reply.len() < 20 {
@@ -585,7 +583,7 @@ fn request(kind: u16, flags: c_int, body: &[u8]) -> std::result::Result<(), Fail
     let kind = u16::from_ne_bytes([ack[4], ack[5]]);
     let code = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
     if kind == NLMSG_ERROR as u16 && code != 0 {
-        return Err(Failed::Refused(format!("netlink: {}", std::io::Error::from_raw_os_error(-code)).into()));
+        return Err(Failed::Unchanged(format!("netlink: {}", std::io::Error::from_raw_os_error(-code)).into()));
     }
     Ok(())
 }
@@ -597,7 +595,7 @@ fn exchange<'a>(sock: &OwnedFd, kind: u16, flags: c_int, body: &[u8], buf: &'a m
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as u16;
     if send_to(sock, &msg, &addr) < 0 {
-        return Err(Failed::Unsent(format!("netlink: {}", std::io::Error::last_os_error()).into()));
+        return Err(Failed::Unchanged(format!("netlink: {}", std::io::Error::last_os_error()).into()));
     }
     let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
     if n < 0 {

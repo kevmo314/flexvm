@@ -2302,7 +2302,7 @@ def arrival_with_peer_route(n, ip):
     assert r.get("ok"), r
     bad = os.urandom(4096)
     # A valid header (the preloaded page is a REMOTE one, as a source sends): only the vmstate is bad.
-    s.sendall((json.dumps({"runs": [[0, 1, 3]], "vmstate_len": len(bad), "preload": [0], "paused": False}) + "\n").encode() + bad)
+    s.sendall((json.dumps({"runs": [[0, 1, 3]], "vmstate_len": len(bad), "preload": [0], "paused": False, "app_log": 0}) + "\n").encode() + bad)
     return s, mig, gw, gen
 
 
@@ -5960,8 +5960,8 @@ def forged_peer():
         s.close()
         check(f"forged template {label}: refused", not r.get("ok") and "bad template" in r.get("error", ""), r)
         nothing_left(f"forged template {label}", n, ip)
-    for label, hdr in (("vmstate", {"runs": [], "vmstate_len": 1 << 40, "preload": []}),
-                       ("preload", {"runs": [], "vmstate_len": 0, "preload": list(range(5000))})):
+    for label, hdr in (("vmstate", {"runs": [], "vmstate_len": 1 << 40, "preload": [], "paused": False, "app_log": 0}),
+                       ("preload", {"runs": [], "vmstate_len": 0, "preload": list(range(5000)), "paused": False, "app_log": 0})):
         n = f"ft-forged-{label}"
         scenario_vms.add(n)
         s, r, _ = migrate_in_raw(B, n, ip, tid)

@@ -396,8 +396,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     }
     let mut checked = Instant::now();
     loop {
-        let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
+        if !crate::util::readable(&listener, Duration::from_millis(100)).unwrap_or(false) {
             if let Some(code) = p.stop_requested() {
                 p.finish(op, End::NotStarted, code, None);
             }
@@ -546,10 +545,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|e| e == "sock")
-                && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.parse::<u32>().is_ok() || s.starts_with(&format!("{key}.")))
-        })
+        .filter(|p| p.extension().is_some_and(|e| e == "sock") && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.parse::<u32>().is_ok()))
         .collect();
     socks.sort();
     let mut req = req.clone();
@@ -631,7 +627,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
 /// such name, a file it cannot create: tried anyway), None if another claimer holds it.
 fn try_take(sock: &std::path::Path) -> Option<Option<File>> {
     let Some(stem) = sock.file_stem().and_then(|s| s.to_str()) else { return Some(None) };
-    let Some(id) = stem.parse().ok().and_then(Ident::of).map(|id| id.key()).or_else(|| stem.rsplit_once('.').map(|(_, id)| id.to_owned())) else {
+    let Some(id) = stem.parse().ok().and_then(Ident::of).map(|id| id.key()) else {
         return Some(None);
     };
     let Ok(f) = File::options().create(true).truncate(false).write(true).open(sock.with_file_name(format!("{id}.take"))) else { return Some(None) };
@@ -664,16 +660,16 @@ fn load(idle: Firecracker, template: Arc<Template>) -> Result<Prepared> {
     let fc = p.firecracker();
     fc.load_snapshot(&p.template().vmstate(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
     // Only an API pause stops the devices writing guest memory.
-    fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
+    fc.pause(API_TIMEOUT)?;
     p.pager.wait_ready(Duration::from_secs(5))?;
-    let resumed = fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+    let resumed = fc.resume(API_TIMEOUT);
     p.pager.loaded();
     resumed?;
     wait_for_reseed(&fc.sockets.vsock)?;
     // Set the clock now so START at the claim can skip clock_settime (slow in big guests).
     let _ = guest::clock(&fc.sockets.vsock, guest::TIMEOUT);
     std::thread::sleep(SETTLE);
-    fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
+    fc.pause(API_TIMEOUT)?;
     Ok(p)
 }
 
@@ -682,7 +678,7 @@ fn load(idle: Firecracker, template: Arc<Template>) -> Result<Prepared> {
 fn resume(p: Prepared, name: &str, ip: Ipv4Addr, index: u32, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
     crate::net::route_dev(true, ip, index).map_err(|e| (e, false))?;
     t.mark("route");
-    let res = p.firecracker().request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+    let res = p.firecracker().resume(API_TIMEOUT);
     if kill {
         p.pager.kill_firecracker();
         return Err(("injected fault: firecracker killed after the resume was sent".into(), true));
@@ -818,8 +814,8 @@ mod tests {
         let paths = Paths::new(&root);
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
-        let stopped: Vec<_> = (0..2).map(|n| UnixListener::bind(d.join(format!("a.{n}.sock"))).unwrap()).collect();
-        let live = UnixListener::bind(d.join("a.2.sock")).unwrap();
+        let stopped = ["0", "00"].map(|n| UnixListener::bind(d.join(format!("{n}.sock"))).unwrap());
+        let live = UnixListener::bind(d.join(format!("{}.sock", Ident::me().pid))).unwrap();
         let live = std::thread::spawn(move || {
             let (c, _) = live.accept().unwrap();
             let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
@@ -848,7 +844,7 @@ mod tests {
         let paths = Paths::new(&root);
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
-        let listener = UnixListener::bind(d.join("a.1.sock")).unwrap();
+        let listener = UnixListener::bind(d.join(format!("{}.sock", Ident::me().pid))).unwrap();
         let peer = std::thread::spawn(move || {
             let (mut c, _) = listener.accept().unwrap();
             crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
@@ -885,8 +881,11 @@ mod tests {
         let paths = Paths::new(&root);
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
+        let mut pids = [Ident::me().pid, unsafe { libc::getppid() } as u32];
+        pids.sort_by_key(|pid| format!("{pid}.sock"));
+        let socks = pids.map(|pid| d.join(format!("{pid}.sock")));
         let serve = |n: u32| {
-            let l = UnixListener::bind(d.join(format!("a.{n}-1.sock"))).unwrap();
+            let l = UnixListener::bind(&socks[(n - 1) as usize]).unwrap();
             let (release, held) = std::sync::mpsc::channel::<()>();
             let thread = std::thread::spawn(move || {
                 let (c, _) = l.accept().unwrap();
@@ -901,15 +900,15 @@ mod tests {
         };
         let ((first, release_first), (second, release_second)) = (serve(1), serve(2));
         // Another claimer is trying the first: this one takes the second, at once.
-        let other = try_take(&d.join("a.1-1.sock")).unwrap().unwrap();
-        assert!(try_take(&d.join("a.1-1.sock")).is_none());
+        let other = try_take(&socks[0]).unwrap().unwrap();
+        assert!(try_take(&socks[0]).is_none());
         let start = Instant::now();
         let (v, _) = take(&host, &paths, "default", &json!({"name": "a"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!(2));
         assert!(start.elapsed() < HANDSHAKE_TIMEOUT, "{:?}", start.elapsed());
         // Only those others are trying are left: tried anyway.
-        assert!(try_take(&d.join("a.2-1.sock")).unwrap().is_some());
-        std::fs::remove_file(d.join("a.2-1.sock")).unwrap();
+        assert!(try_take(&socks[1]).unwrap().is_some());
+        std::fs::remove_file(&socks[1]).unwrap();
         let (v, _) = take(&host, &paths, "default", &json!({"name": "b"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!(1));
         drop(other);

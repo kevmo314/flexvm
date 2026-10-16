@@ -21,7 +21,7 @@ use crate::bail;
 use crate::guest;
 use crate::host::{flock, Flock};
 use crate::template::interrupted;
-use crate::util::{cpath, is_nonce, nonce, stat_at};
+use crate::util::{cpath, is_nonce, random_hex, stat_at};
 use crate::util::{ms, rename_noreplace, run_until, sync_dir, Result};
 use registry::sha256_hex;
 pub use unpack::Limits;
@@ -272,7 +272,7 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
     } else {
         // Never handed out without its marker, so a crashed build's leftovers can go.
         remove_leftovers(cached)?;
-        let tmp = cached.with_extension(format!("tmp{}", nonce()?));
+        let tmp = cached.with_extension(format!("tmp{}", random_hex(8)?));
         let res = build(&tmp).and_then(|conf| {
             interrupted()?;
             publish_rootfs(&tmp, cached, &conf, &sync)
@@ -362,7 +362,7 @@ pub(super) fn replace(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) 
 
 fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> std::io::Result<T>) -> Result<T> {
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension(format!("part{}", nonce()?));
+    let tmp = path.with_extension(format!("part{}", random_hex(8)?));
     let dir = File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     // Every lock is let go explicitly (`Flock`), not by close: a child another thread forks
     // shares the descriptor until it execs, and would hold the lock on after we return.
@@ -453,7 +453,7 @@ impl<'a> Work<'a> {
         let lock = staging_lock(staging)?;
         wait_lock(&lock, libc::LOCK_SH, interrupted)?;
         let _l = Flock::new(lock, libc::LOCK_SH | libc::LOCK_NB)?;
-        let name = format!("rootfs-{}", nonce()?);
+        let name = format!("rootfs-{}", random_hex(8)?);
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
         let lock: File = open_at(staging.as_raw_fd(), &cpath(Path::new(&format!("{name}.lock")))?, flags)?.into();
         flock(&lock, libc::LOCK_EX)?;
@@ -723,7 +723,7 @@ mod tests {
     }
 
     fn nonces(n: usize) -> Vec<String> {
-        (0..n).map(|_| nonce().unwrap()).collect()
+        (0..n).map(|_| random_hex(8).unwrap()).collect()
     }
 
     #[test]
@@ -750,7 +750,7 @@ mod tests {
     fn sweeps_never_wait_and_builds_wait_only_until_interrupted() {
         let d = tmpdir("staging-busy");
         let staging = open_at(libc::AT_FDCWD, &cpath(&d).unwrap(), libc::O_RDONLY | libc::O_DIRECTORY).unwrap();
-        let dead = format!("rootfs-{}", nonce().unwrap());
+        let dead = format!("rootfs-{}", random_hex(8).unwrap());
         std::fs::create_dir(d.join(&dead)).unwrap();
         // Another build sweeping.
         let sweeping = staging_lock(&staging).unwrap();
