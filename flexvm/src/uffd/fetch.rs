@@ -173,6 +173,8 @@ impl Pager {
                 fetch(off, buf, stop, &mut |data: &[u8]| {
                     if tail_fail && !held && data.len() > PAGE_SIZE {
                         held = true;
+                        // A fault has its run: the pullers go on (they waited for this, `pull_range`).
+                        let _ = self.tail_fail.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst);
                         let t = Instant::now();
                         while self.remote_left() > n && t.elapsed() < Duration::from_secs(5) {
                             thread::sleep(Duration::from_millis(1));

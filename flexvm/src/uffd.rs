@@ -249,7 +249,8 @@ pub struct Pager {
     /// Test fault: every other rescue during a copy fails after its claim, once a writer may be waiting on the page.
     pub rescue_fail: AtomicBool,
     rescue_tries: AtomicU32,
-    /// Test fault: copies of fault-fetched runs past their first page fail once more.
+    /// Test fault: copies of fault-fetched runs past their first page fail once more. 2: armed, and the
+    /// pullers wait until a fault has taken a run (then 1), so a fault, not a puller, meets the failure.
     pub tail_fail: AtomicU32,
     /// Test fault: from then on every copy of a fault-fetched run fails (ENOMEM), and the pullers wait.
     pub stuck_from: Mutex<Option<Instant>>,

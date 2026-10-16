@@ -739,7 +739,7 @@ impl Proc {
             prepared.pager.firecracker_gone();
         }
         if fault("fetch_tail_enomem") {
-            prepared.pager.tail_fail.store(1, Ordering::SeqCst);
+            prepared.pager.tail_fail.store(2, Ordering::SeqCst);
         }
         if fault("pull_enomem") {
             prepared.pager.pull_fail.store(40, Ordering::SeqCst);
