@@ -282,7 +282,17 @@ impl Holder {
             (false, Ok(())) => self.drain_switched(&e, &mut || {
                 self.give_queued(&e, sink, &mut stats);
             }),
-            (false, Err(_)) => self.hand_over(&e, sink, &mut stats),
+            (false, Err(_)) => {
+                self.hand_over(&e, sink, &mut stats);
+                // What the device took meanwhile, read here rather than left to the reader
+                // (which a busy host may not run for a while): read after `unhold`, it would be a
+                // straggler, counted as dropped (#539).
+                if refused.get() {
+                    self.drain(&mut || {
+                        self.give_queued(&e, sink, &mut stats);
+                    });
+                }
+            }
         }
         match switched {
             Ok(()) => self.unhold(ip, &e, true),
@@ -290,8 +300,10 @@ impl Holder {
             // Left to the TUN, the address would be dropped here until the caller's retry.
             Err(_) => self.unroute(ip, &e),
         }
-        // After `unhold`: a packet read since is a straggler, re-sent, not discarded here.
-        if !lost && switched.is_ok() {
+        // After `unhold`: a packet read since is a straggler, re-sent (or, refused, counted),
+        // not discarded here. Refused, the stream goes on, so what the reader queued after the
+        // last hand-over goes too (#539).
+        if !lost && (switched.is_ok() || refused.get()) {
             self.give_queued(&e, sink, &mut stats);
         }
         stats.dropped += e.q.lock().unwrap().discard();
@@ -377,6 +389,12 @@ impl Holder {
     /// `give`n before the next, up to its queue length, so no flood can make it more.
     fn drain_switched(&self, e: &Entry, give: &mut dyn FnMut()) {
         e.q.lock().unwrap().switched = true;
+        self.drain(give);
+    }
+
+    /// Reads the device a pass at a time, each `give`n before the next, until it is empty or up
+    /// to its queue length (a flood still routed here never holds it up longer).
+    fn drain(&self, give: &mut dyn FnMut()) {
         let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
         for read in (0..TXQ).step_by(PASS) {
             let pass = PASS.min(TXQ - read);
@@ -905,7 +923,12 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
         Some(r) => (stats.injected, stats.dropped_target) = (r["injected"].as_u64().unwrap_or(0), r["dropped"].as_u64().unwrap_or(0)),
         None => stats.dropped_target = stats.packets,
     }
-    let switched = switched.and_then(|()| switch.take().map_or(Ok(()), |f| f()));
+    // Refused, the target routes the address itself once the stream ends (or breaks): no route
+    // is owed here, nor retried (#539).
+    let switched = match switched {
+        Err(_) if refused.get() => Ok(()),
+        s => s.and_then(|()| switch.take().map_or(Ok(()), |f| f())),
+    };
     Some((stats, switched))
 }
 
@@ -1261,24 +1284,44 @@ mod tests {
 
     /// #512: a target that could not take the address over says so (`b'n'`): the handover fails,
     /// but the stream goes on, so nothing held is dropped, and the address is not let go of as
-    /// moved (its stragglers would be re-sent into the route that still leads here).
+    /// moved (its stragglers would be re-sent into the route that still leads here). It routes
+    /// the address itself: no route is owed here (#539). Packets on the device that no reader
+    /// took (a busy host's), more than one pass of them, go on the stream too, not dropped (#539).
     #[test]
     fn a_refused_switch_keeps_the_stream() {
+        const LATE: usize = PASS + 100;
         for (ack, took) in [(b'w', true), (b'n', false)] {
             let mut fds = [0; 2];
             assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
-            let (h, _w) = unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) };
+            let (h, w) = unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) };
             let ip = Ipv4Addr::new(10, 9, 0, 8);
             let q = Queue { packets: VecDeque::from(vec![udp_to(ip); 3]), bytes: 3 * 29, ..Queue::default() };
             h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
+            // More than a pass: refused, the device is read until it is empty, not one pass of it.
+            let late = [&vnet_hdr(0, 0, (0, 0))[..], &udp_to(ip)].concat();
+            let buf = 4i32 << 20;
+            unsafe { libc::setsockopt(w.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&buf as *const i32).cast(), 4) };
+            for _ in 0..LATE {
+                assert_eq!(unsafe { libc::write(w.as_raw_fd(), late.as_ptr().cast(), late.len()) }, late.len() as isize);
+            }
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = l.local_addr().unwrap();
             let target = fake_target(l, ack);
             let conn = TcpStream::connect(addr).unwrap();
-            let (stats, switched) = send(&h, ip, 1, &conn, true, || Ok(())).unwrap();
+            let switch = std::cell::Cell::new(false);
+            let (stats, switched) = send(&h, ip, 1, &conn, true, || {
+                switch.set(true);
+                Ok(())
+            })
+            .unwrap();
             let got = target.join().unwrap();
-            assert_eq!(switched.is_ok(), took, "{}", ack as char);
-            assert_eq!((got.len(), stats.packets, stats.injected, stats.dropped, stats.dropped_target), (3, 3, 3, 0, 0), "{}", ack as char);
+            assert!(switched.is_ok() && switch.get() == took, "{}: refused, nothing owed or routed here", ack as char);
+            assert_eq!(
+                (got.len(), stats.packets, stats.injected, stats.dropped, stats.dropped_target),
+                (3 + LATE, 3 + LATE as u64, 3 + LATE as u64, 0, 0),
+                "{}",
+                ack as char
+            );
             assert!(h.entry(ip).is_none(), "{}: no longer held", ack as char);
             let moved = h.gone.lock().unwrap().get(&ip).map(|g| g.moved);
             assert_eq!(moved, Some(took), "{}: stragglers re-sent only once it moved", ack as char);
