@@ -1332,6 +1332,14 @@ mod tests {
         assert_eq!(&got, b"\0\0\0\x03one\0\0\0\x05three");
     }
 
+    /// Reserve a distinct test address for as long as its UDP port remains bound.
+    /// All concurrent root test processes share this port allocator.
+    fn root_address() -> (std::net::UdpSocket, std::net::Ipv4Addr) {
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let [hi, lo] = reservation.local_addr().unwrap().port().to_be_bytes();
+        (reservation, std::net::Ipv4Addr::new(198, 18, hi, lo))
+    }
+
     /// Needs root: `sudo cargo test -- --ignored`. A TSO frame the kernel's TCP puts on a tap
     /// opened as Firecracker opens one (a 12-byte virtio-net header, checksum and TSO4 offload)
     /// is cut into segments that carry the stream as sent, each valid (#411). The test answers
@@ -1339,16 +1347,20 @@ mod tests {
     #[test]
     #[ignore]
     fn a_kernel_tso_frame_is_cut_into_valid_segments() {
-        let (tap, ip) = (format!("tso{:x}t0", std::process::id()), Ipv4Addr::new(10, 100, 254, 11));
+        let tap = format!("tso{:x}t0", std::process::id());
+        let (_address, ip) = root_address();
         crate::net::create_tap(&tap, "test").unwrap();
-        let fd = unsafe { OwnedFd::from_raw_fd(libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC)) };
+        let raw = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        assert!(raw >= 0, "open /dev/net/tun: {}", std::io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut req = crate::net::ifreq(&tap).unwrap();
         req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as libc::c_short;
         let hdr: libc::c_int = 12;
+        let ok = |what: &str, r: libc::c_int| assert_eq!(r, 0, "{what}: {}", std::io::Error::last_os_error());
         unsafe {
-            assert_eq!(libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req), 0);
-            assert_eq!(libc::ioctl(fd.as_raw_fd(), 0x4004_54d8 /* TUNSETVNETHDRSZ */, &hdr), 0);
-            assert_eq!(libc::ioctl(fd.as_raw_fd(), 0x4004_54d0 /* TUNSETOFFLOAD */, 0x3 as libc::c_ulong /* CSUM, TSO4 */), 0);
+            ok("TUNSETIFF", libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req));
+            ok("TUNSETVNETHDRSZ", libc::ioctl(fd.as_raw_fd(), 0x4004_54d8, &hdr));
+            ok("TUNSETOFFLOAD", libc::ioctl(fd.as_raw_fd(), 0x4004_54d0, 0x3 as libc::c_ulong /* CSUM, TSO4 */));
         }
         crate::net::set_link_up(&tap, true).unwrap();
         crate::net::attach(ip, &tap).unwrap();
@@ -1410,7 +1422,7 @@ mod tests {
     fn stragglers_follow_the_address() {
         let (a, b) =
             (Holder::new(&format!("tsa{:x}h", std::process::id())).unwrap().unwrap(), Holder::new(&format!("tsb{:x}h", std::process::id())).unwrap().unwrap());
-        let ip = Ipv4Addr::new(10, 100, 254, 9);
+        let (_address, ip) = root_address();
         a.hold(ip, 1).unwrap();
         let mut none = |_: &[u8]| true;
         let (_, switched) = a.release_local(ip, 1, &mut none, || b.hold(ip, 2), Duration::ZERO).unwrap();
@@ -1434,6 +1446,7 @@ mod tests {
         // siblings): counted as dropped instead. One with an ID is re-sent.
         let counts = |a: &Holder| a.gone.lock().unwrap().get(&ip).map(|g| (g.resent, g.dropped)).unwrap();
         let mut frag = [0x45u8, 0, 0, 28, 0, 0, 0x20, 0, 64, 17, 0, 0, 10, 100, 254, 1, 10, 100, 254, 9, 0, 1, 0, 9, 0, 8, 0, 0];
+        frag[16..20].copy_from_slice(&ip.octets());
         let before = counts(&a);
         a.straggler(ip, &mut frag);
         assert_eq!(counts(&a), (before.0, before.1 + 1));

@@ -475,6 +475,15 @@ struct SourceAddrs {
 
 impl SourceAddrs {
     fn connect(&mut self, name: &str, at: Instant) -> io::Result<TcpStream> {
+        self.connect_with(name, at, crate::util::connect_addrs)
+    }
+
+    fn connect_with(
+        &mut self,
+        name: &str,
+        at: Instant,
+        connect: impl FnOnce(&[std::net::SocketAddr], Instant) -> io::Result<TcpStream>,
+    ) -> io::Result<TcpStream> {
         if self.addrs.is_empty() {
             self.addrs = crate::util::resolve(name, at)?;
         } else if std::mem::take(&mut self.stale) {
@@ -483,7 +492,7 @@ impl SourceAddrs {
                 self.addrs = addrs;
             }
         }
-        let s = crate::util::connect_addrs(&self.addrs, at).inspect_err(|_| self.stale = true)?;
+        let s = connect(&self.addrs, at).inspect_err(|_| self.stale = true)?;
         s.set_nodelay(true)?;
         Ok(s)
     }
@@ -705,17 +714,20 @@ mod probe_tests {
     #[test]
     fn source_addresses_are_kept_and_looked_up_again_only_after_a_failed_connect() {
         let at = || Instant::now() + Duration::from_secs(2);
-        // `one` on a loopback address of its own: once dropped, no other test's 127.0.0.1 listener can answer there.
-        let (one, two) = (std::net::TcpListener::bind("127.94.20.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (one, two) = (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
         let (one_addr, two_addr) = (one.local_addr().unwrap(), two.local_addr().unwrap());
         let mut addrs = SourceAddrs::default();
         addrs.connect(&one_addr.to_string(), at()).unwrap();
         // Connected: a reconnect looks nothing up (this name would fail).
         addrs.connect("invalid address", at()).unwrap();
-        drop(one);
-        assert!(addrs.connect("invalid address", at()).is_err());
+        // Inject refusal: no freed port can be claimed by another test or wildcard listener.
+        let refused = |cached: &[std::net::SocketAddr], _: Instant| {
+            assert_eq!(cached, &[one_addr]);
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        };
+        assert!(addrs.connect_with("invalid address", at(), refused).is_err());
         // Its lookup fails: the old addresses are tried again.
-        assert!(addrs.connect("invalid address", at()).is_err());
+        assert!(addrs.connect_with("invalid address", at(), refused).is_err());
         assert_eq!(addrs.addrs, vec![one_addr]);
         // The name now resolves elsewhere.
         addrs.connect(&two_addr.to_string(), at()).unwrap();

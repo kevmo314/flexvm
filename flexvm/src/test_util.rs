@@ -12,9 +12,12 @@ pub struct TempDir(PathBuf);
 impl TempDir {
     pub fn new(name: &str) -> Self {
         static SWEEP: Once = Once::new();
-        let root = std::env::temp_dir();
-        SWEEP.call_once(|| sweep(&root));
-        Self::new_in(&root, name)
+        // Unix socket fixtures must fit sun_path regardless of TMPDIR.
+        let root = Path::new("/tmp");
+        // /tmp can be shared by PID namespaces: a live test elsewhere may look dead
+        // here. Never sweep another freshly started suite's fixtures.
+        SWEEP.call_once(|| sweep(root, std::time::Duration::from_secs(24 * 60 * 60)));
+        Self::new_in(root, name)
     }
 
     pub fn new_in(root: &Path, name: &str) -> Self {
@@ -49,10 +52,14 @@ impl Drop for TempDir {
     }
 }
 
-fn sweep(root: &Path) {
+fn sweep(root: &Path, minimum_age: std::time::Duration) {
     let Ok(entries) = fs::read_dir(root) else { return };
     for entry in entries.flatten() {
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|modified| modified.elapsed().ok());
+        if age.is_none_or(|age| age < minimum_age) {
             continue;
         }
         let name = entry.file_name();
@@ -113,6 +120,7 @@ fn sweep(root: &Path) {
 #[test]
 fn temporary_directories_are_unique_and_removed_on_unwind() {
     let first = TempDir::new("guard");
+    assert_eq!(first.parent(), Some(Path::new("/tmp")), "socket fixtures need a short root regardless of TMPDIR");
     let path = first.to_path_buf();
     let other = TempDir::new("guard");
     assert_ne!(*first, *other);
@@ -150,7 +158,9 @@ fn sweep_removes_dead_fixtures_and_preserves_live_and_unrelated_directories() {
     }
     let link = root.join(format!("flexvm-link-{dead}"));
     std::os::unix::fs::symlink(root.join(&kept[1]), &link).unwrap();
-    sweep(&root);
+    sweep(&root, std::time::Duration::from_secs(24 * 60 * 60));
+    assert!(gone.iter().all(|name| root.join(name).exists()), "fresh fixtures may belong to a live test in another PID namespace");
+    sweep(&root, std::time::Duration::ZERO);
     assert!(gone.iter().all(|name| !root.join(name).exists()));
     assert!(kept.iter().all(|name| root.join(name).exists()));
     assert!(link.is_symlink());

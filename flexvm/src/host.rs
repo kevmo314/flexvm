@@ -598,7 +598,17 @@ impl Host {
         }
         let past = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
         let threads = match deadline {
-            None => THREADS.lock().unwrap_or_else(|e| e.into_inner()),
+            None => {
+                #[cfg(test)]
+                if let Err(std::sync::TryLockError::WouldBlock) = THREADS.try_lock() {
+                    LOCK_WAITING.with(|waiting| {
+                        if let Some(tx) = waiting.borrow_mut().take() {
+                            tx.send(()).unwrap();
+                        }
+                    });
+                }
+                THREADS.lock().unwrap_or_else(|e| e.into_inner())
+            }
             Some(_) => loop {
                 match THREADS.try_lock() {
                     Ok(g) => break g,
@@ -1801,6 +1811,11 @@ impl Drop for Flock {
 }
 
 static THREADS: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+thread_local! {
+    // Fired only after this thread has observed actual host-lock contention.
+    pub(crate) static LOCK_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
 thread_local! {
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -3698,17 +3713,19 @@ mod tests {
         static RUNS: AtomicUsize = AtomicUsize::new(0);
         let peers = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<Vec<_>>();
         let (release, hung) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel();
         let start = std::time::Instant::now();
         let first = D.get(&peers(&["hung:1", "a:1"]), move |_| {
             RUNS.fetch_add(1, Ordering::SeqCst);
+            started.send(()).unwrap();
             hung.recv().ok();
             (Ok((Some("192.0.2.1".parse().unwrap()), None)), Vec::new())
         });
         assert_eq!(first, (None, None));
         assert!(start.elapsed() >= Duration::from_millis(100));
-        let again = std::time::Instant::now();
+        running.recv_timeout(Duration::from_secs(30)).expect("the hung derivation never started");
         assert_eq!(D.get(&peers(&["hung:1", "a:1"]), |_| unreachable!()), (None, None));
-        assert!(again.elapsed() < Duration::from_millis(50), "the first wait ran out: not waited for again");
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1, "the hung run was not started again");
         for p in ["b:1", "c:1", "d:1"] {
             let next = D.get(&peers(&["hung:1", p]), |_| {
                 RUNS.fetch_add(1, Ordering::SeqCst);
@@ -3720,8 +3737,23 @@ mod tests {
         assert_eq!(D.state.lock().unwrap().peers, peers(&["hung:1", "d:1"]), "only the current peers are kept");
         // It ends: its result, toward peers since replaced, is dropped, and the current peers' derivation runs.
         release.send(()).unwrap();
-        let now = D.get(&peers(&["hung:1", "e:1"]), |_| (Ok((Some("192.0.2.5".parse().unwrap()), None)), Vec::new()));
-        assert_eq!(now, (Some("192.0.2.5".parse().unwrap()), None));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut state = D.state.lock().unwrap();
+        while state.under_way {
+            let (next, timeout) = D.changed.wait_timeout(state, deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            assert!(!timeout.timed_out(), "the released derivation never ended");
+            state = next;
+        }
+        drop(state);
+        let expected = (Some("192.0.2.5".parse().unwrap()), None);
+        loop {
+            let result = expected.clone();
+            if D.get(&peers(&["hung:1", "e:1"]), move |_| (Ok(result), Vec::new())) == expected {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the new derivation never answered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// A tap is this host's by its alias alone, whatever its name: hosts
@@ -4153,6 +4185,16 @@ mod tests {
 
     #[test]
     fn a_pass_lets_go_of_its_lock_though_a_forked_child_shares_it() {
+        const CHILD: &str = "FLEXVM_TEST_RETIRE_FORK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::tests::a_pass_lets_go_of_its_lock_though_a_forked_child_shares_it"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "retirement fork child: {status}");
+            return;
+        }
         let (_h_dir, h) = host("retire-fork");
         released_migration(&h, 1, "reachable");
         let (forked, mut told) = std::os::unix::net::UnixStream::pair().unwrap();
