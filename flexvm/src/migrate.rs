@@ -236,6 +236,7 @@ impl Proc {
     }
 
     fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool) -> Result<(TcpStream, Value)> {
+        let msrs = crate::compat::local(vm.pid().ok_or("firecracker is gone")?)?.msrs;
         let (conn, prepared) = crate::util::rpc(
             to,
             Duration::from_secs(2),
@@ -256,7 +257,7 @@ impl Proc {
                 "plugged_mib": vm.hotplug_plugged(),
                 "regions": vm.pager.regions(),
                 // The MSRs its vmstate will hold: this host's, which may be more than the template's.
-                "msrs": vm.pid().and_then(|pid| crate::compat::local(pid).ok()).map(|c| c.msrs),
+                "msrs": msrs,
                 "evict": evict,
             }),
         )
@@ -795,10 +796,8 @@ impl Proc {
         t.mark("spawn");
         let load_set = crate::standby::load_set(&self.host, &tpl);
         let vm = Vm::prepare(idle, tpl, t)?;
-        // An older source sends none: the template's set, checked above, is all there is.
-        if let Ok(saved) = serde_json::from_value(req["msrs"].clone()) {
-            crate::compat::check_msrs(&saved, &crate::compat::local(vm.firecracker().pid())?.msrs)?;
-        }
+        let saved = serde_json::from_value(req["msrs"].clone()).map_err(|e| format!("bad msrs: {e}"))?;
+        crate::compat::check_msrs(&saved, &crate::compat::local(vm.firecracker().pid())?.msrs)?;
         // All of routing the address here but the route itself, which waits for the commit.
         crate::net::neighbour(ip, &vm.firecracker().tap)?;
         t.mark("neighbour");
