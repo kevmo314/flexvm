@@ -122,7 +122,7 @@ impl Args {
                     let value = if SWITCHES.contains(&f) {
                         "1".into()
                     } else if GLOBAL.contains(&f) || IMAGE_FLAGS.contains(&f) || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&f)) {
-                        let value = it.next().ok_or_else(|| {
+                        let value = it.next().filter(|v| !v.starts_with("--")).ok_or_else(|| {
                             if f == "force" {
                                 "--force needs a generation; run flexvm reclaim IP to see GEN".to_string()
                             } else {
@@ -1318,6 +1318,18 @@ mod exec_tests {
         }
         let error = Args::parse(["run", "web", "--ip"].map(String::from)).err().unwrap();
         assert_eq!(error.to_string(), "--ip needs a value");
+    }
+
+    #[test]
+    fn option_values_cannot_start_with_double_dash() {
+        for option in ["--state", "--run", "--ip", "--image", "--cmd"] {
+            for value in ["--run", "--unknown", "--"] {
+                let error = Args::parse([option, value, "X"].map(String::from)).err().unwrap();
+                assert_eq!(error.to_string(), format!("{option} needs a value"));
+            }
+        }
+        let error = Args::parse(["reclaim", "--force", "--state", "X"].map(String::from)).err().unwrap();
+        assert_eq!(error.to_string(), "--force needs a generation; run flexvm reclaim IP to see GEN");
     }
 
     #[test]
