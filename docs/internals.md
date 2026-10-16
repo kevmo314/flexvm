@@ -804,6 +804,13 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     machines on the LAN therefore follow a migrated VM without any
     configuration. Give VMs addresses from the LAN's subnet and they can use
     the LAN's normal gateway for internet access.
+  - Underlay and announce-device derivation uses the listener's last-known
+    peer addresses in `RUN/peers.json`, whatever their age, and IP literals
+    directly. VM processes never look up peer names or wait for DNS, including
+    at startup. If a peer elsewhere has no known IPv4 address, nothing is
+    derived and a diagnostic is logged (no peers, or all local, uses loopback).
+    Explicit `--underlay` and `--announce-dev` settings
+    override derivation (`--announce-dev none` disables announcements).
 - On migration, the target routes the address to its new tap at the commit,
   right before the VM resumes (its neighbour entry goes on the tap while it
   prepares): an arrival that fails or dies before leaves this host's route

@@ -270,7 +270,8 @@ struct PeersInner {
 }
 
 /// `RUN/peers.json`: {name: [address, ...]}, each peer name the listener looked up with its
-/// last-known addresses (none for one that never resolved), for restores and resumes.
+/// last-known addresses (none for one that never resolved), for restores, resumes and
+/// underlay/announce-device derivation in other processes.
 ///
 /// Who asks decides how fresh peer addresses must be. A peer is the attacker #549 guards
 /// against: what a peer asks for (arrival, route, lend) is checked by the listener against
@@ -281,7 +282,7 @@ struct PeersInner {
 const PEER_CACHE: &str = "peers.json";
 
 #[derive(Clone, Default, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
-struct Cached {
+pub(crate) struct Cached {
     names: HashMap<String, Vec<IpAddr>>,
 }
 
@@ -791,21 +792,33 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
 /// no entry for is refused at once.
 pub fn known_peers(host: &Host) -> Result<Vec<IpAddr>> {
     let names = host.config_now().peers;
-    let cache: Cached = match names.iter().any(|n| n.parse::<SocketAddr>().is_err()) {
-        true => crate::util::trusted_file(&host.run.join(PEER_CACHE))
-            .and_then(|f| serde_json::from_reader(std::io::BufReader::new(f).take(1 << 20)).ok())
-            .unwrap_or_default(),
-        false => Cached::default(),
-    };
+    let cache = Cached::read(&host.run, &names);
     let mut addrs = Vec::new();
     for n in &names {
-        match (n.parse::<SocketAddr>(), cache.names.get(n)) {
-            (Ok(a), _) => addrs.push(a.ip()),
-            (_, Some(a)) => addrs.extend(a),
-            _ => bail!("peer {n} has not been looked up by this host's listener yet, so its addresses are unknown; try again once flexvm listen runs"),
-        }
+        addrs.extend(cache.addrs(n)?);
     }
     Ok(addrs)
+}
+
+impl Cached {
+    pub fn read(run: &std::path::Path, names: &[String]) -> Self {
+        match names.iter().any(|n| n.parse::<SocketAddr>().is_err()) {
+            true => crate::util::trusted_file(&run.join(PEER_CACHE))
+                .and_then(|f| serde_json::from_reader(std::io::BufReader::new(f).take(1 << 20)).ok())
+                .unwrap_or_default(),
+            false => Self::default(),
+        }
+    }
+
+    pub fn addrs(&self, name: &str) -> std::io::Result<Vec<IpAddr>> {
+        match (name.parse::<SocketAddr>(), self.names.get(name)) {
+            (Ok(a), _) => Ok(vec![a.ip()]),
+            (_, Some(a)) => Ok(a.clone()),
+            _ => Err(std::io::Error::other(format!(
+                "peer {name} has not been looked up by this host's listener yet, so its addresses are unknown; try again once flexvm listen runs"
+            ))),
+        }
+    }
 }
 
 /// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).
@@ -815,8 +828,7 @@ fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways:
 
 fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr], local: impl FnOnce(Ipv4Addr) -> Result<bool>) -> Result<()> {
     let peer = is_peer(peers, IpAddr::V4(ip));
-    // Do not call cfg.underlay(): its first derivation can wait for DNS. A derived
-    // underlay is an interface's source address, covered by is_local_addr below.
+    // A derived underlay is an interface's source address, covered by is_local_addr below.
     let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
     let underlay = cfg.underlay == Some(ip) || listen == Some(IpAddr::V4(ip));
     let special = ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || underlay || gateways.contains(&ip);
