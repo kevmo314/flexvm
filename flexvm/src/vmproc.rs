@@ -495,7 +495,9 @@ impl Proc {
     }
 
     pub fn keep_addr(&self) {
-        if let Some(a) = self.addr.lock().unwrap().take() {
+        // Taken out first: keep() may take the host lock, which a revision retry holds while it waits for addr.
+        let a = self.addr.lock().unwrap().take();
+        if let Some(a) = a {
             a.keep();
         }
     }
