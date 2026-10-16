@@ -511,6 +511,7 @@ impl Host {
         let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
         let (state, run) = (canon(state)?, canon(run)?);
         let binding = state.join("run.json");
+        reserved_run(&state, &run, Path::new(DEFAULT_STATE), Path::new(DEFAULT_RUN))?;
         let bound = verify_binding(&state, "run", &run)?;
         let claimed = claim_run(&state, &run)?;
         // A user who cannot write the state root (a non-root `flexvm ls` of an unbound one) leaves it unbound,
@@ -2332,6 +2333,22 @@ pub fn default_run(state: &Path) -> Result<PathBuf> {
     }
 }
 
+/// `/run/flexvm` (`default_run`) is only ever the default state's: any other state is refused it,
+/// bound or claimed, so no order of opens after a reboot hands it to another (#556).
+fn reserved_run(state: &Path, run: &Path, default_state: &Path, default_run: &Path) -> Result<()> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if canon(run) == canon(default_run) && canon(state) != canon(default_state) {
+        bail!(
+            "run directory {} is the default state directory {}'s only; state directory {} takes one of its own (--run, or without it {})",
+            run.display(),
+            default_state.display(),
+            state.display(),
+            default_run_of(state).display()
+        );
+    }
+    Ok(())
+}
+
 fn default_run_of(state: &Path) -> PathBuf {
     let default = Path::new(DEFAULT_STATE);
     if state == default || default.canonicalize().is_ok_and(|d| d == state) {
@@ -2470,7 +2487,7 @@ impl Host {
             .filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok())
             .filter(|&ip| self.read_addr(ip).ok().and_then(|a| a.holder_id).is_some_and(|id| id.liveness() == Liveness::Gone))
             .collect();
-        let mut withdrawn = Vec::new();
+        let (mut withdrawn, mut unrecorded) = (Vec::new(), None);
         if candidates.is_empty() {
             return Ok(withdrawn);
         }
@@ -2518,6 +2535,7 @@ impl Host {
             }
             if let Err(e) = if lost { self.record_lost(name, ip, gen) } else { Ok(()) } {
                 crate::log!("withdrawing {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
+                unrecorded.get_or_insert(e);
                 continue;
             }
             if let Err(e) = self.withdraw_noted(&l, ip, gen) {
@@ -2529,7 +2547,11 @@ impl Host {
             crate::net::unroute(ip);
             withdrawn.push((name.to_string(), ip, gen));
         }
-        Ok(withdrawn)
+        // A lost VM not recorded keeps the boot's recovery from completing: it is tried again.
+        match unrecorded {
+            Some(e) => Err(e),
+            None => Ok(withdrawn),
+        }
     }
 
     /// Withdraws `gen` of `ip` here (`observe`), a notice for the peers
@@ -4403,7 +4425,8 @@ mod tests {
         let lost = h.vms("db", "lost").unwrap();
         std::fs::create_dir(&lost).unwrap();
         std::fs::write(lost.join("x"), "").unwrap();
-        assert!(h.collect_garbage().unwrap().is_empty());
+        assert!(h.collect_garbage().is_err(), "a failure, so the pass does not complete");
+        assert_eq!(h.after_boot_with("boot-x", |_, _| Ok(())).unwrap(), Some(false));
         assert!(!h.addr(&h.lock().unwrap(), ip).unwrap().withdrawn, "kept until it is recorded");
         std::fs::remove_dir_all(&lost).unwrap();
         assert_eq!(h.collect_garbage().unwrap(), vec![("db".to_string(), ip, 2)]);
@@ -4497,6 +4520,13 @@ mod tests {
         Host::open(&a, &run).unwrap();
         let e = default_run(&a).unwrap_err().to_string();
         assert!(e.contains(&format!("give --run {}", run.canonicalize().unwrap().display())), "{e}");
+        // The default run directory is the default state's alone, whoever opens first.
+        let (dstate, drun) = (base.join("default-state"), base.join("default-run"));
+        std::fs::create_dir_all(&drun).unwrap();
+        let e = reserved_run(&b, &drun, &dstate, &drun).unwrap_err().to_string();
+        assert!(e.contains("takes one of its own") && e.contains("/run/flexvm-"), "{e}");
+        reserved_run(&dstate, &drun, &dstate, &drun).unwrap();
+        reserved_run(&b, &run, &dstate, &drun).unwrap();
     }
 
     /// Six bytes, `f` and base-36 digits, and apart for separate state directories.

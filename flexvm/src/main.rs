@@ -69,7 +69,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
 options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs), --run DIR (/run/flexvm, or
          /run/flexvm-PREFIX for another --state), --version
 Each state directory is bound to its first run directory; a different --run is refused (and so is
-none, if it is bound to another than its default).
+none, if it is bound to another than its default); /run/flexvm is /var/lib/flexvm's alone.
 run, resume and restore exit with the VM's command's status, 128+signal, 125 when flexvm
 fails, 124 when the VM dies
 ";

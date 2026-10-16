@@ -133,6 +133,7 @@ A different `--run` for the same state directory is refused, including after a r
 Without `--run`, a state's run directory follows from its path alone (`/run/flexvm` for the default
 state, `/run/flexvm-PREFIX`, its tap prefix, for any other), so no state defaults into a run directory
 another may own; one bound to another run directory (`run.json`) is refused without that `--run`.
+`/run/flexvm` is the default state's alone: any other state is refused it, bound or claimed (`reserved_run`).
 
 ```
 STATE (default /var/lib/flexvm, on disk)

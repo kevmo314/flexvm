@@ -314,7 +314,8 @@ path in `run.json`, and the run directory records its state in `state.json`; usi
 either with a different partner is refused. Without `--run`, the run directory follows
 from the state's path alone (`/run/flexvm` for `/var/lib/flexvm`, `/run/flexvm-PREFIX` for
 any other), so after a reboot no state defaults into another's; a state bound to any other
-run directory must be given it.
+run directory must be given it. `/run/flexvm` belongs to `/var/lib/flexvm` alone: any other state is
+refused it, even with `--run`.
 `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 
