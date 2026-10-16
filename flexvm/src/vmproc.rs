@@ -940,6 +940,8 @@ impl Proc {
         if learn {
             crate::standby::save_load_set(&self.host, &tpl);
         }
+        // The netlink socket opened before the fence: the host lock covers only the route request (#541).
+        crate::net::ready();
         let still = self.host.fence(ip, self.gen()).inspect_err(|_| vm.kill())?;
         // Routed under the fence (the load leaves the route alone, #534).
         vm.route().inspect_err(|_| vm.kill())?;

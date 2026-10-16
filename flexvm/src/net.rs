@@ -555,11 +555,19 @@ fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
     request(kind, flags, body).map_err(|(Failed::Unchanged(e) | Failed::Unanswered(e))| e)
 }
 
+thread_local!(static FD: std::cell::Cell<Option<OwnedFd>> = const { std::cell::Cell::new(None) });
+
+/// Opens this thread's netlink socket now, if it has none: before a lock its first request is made under.
+pub fn ready() {
+    if let Some(sock) = FD.take().or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket").ok()) {
+        FD.set(Some(sock));
+    }
+}
+
 /// One socket per thread, so each recv is the ACK of the request just sent and a slow one
 /// (a tap's teardown) holds up no other thread; any failure drops it, so no stale ACK is
 /// left for the next.
 fn request(kind: u16, flags: c_int, body: &[u8]) -> std::result::Result<(), Failed> {
-    thread_local!(static FD: std::cell::Cell<Option<OwnedFd>> = const { std::cell::Cell::new(None) });
     let sock = FD.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok).map_err(Failed::Unchanged)?;
     let mut ack = [0u8; 1024];
     let reply = exchange(&sock, kind, flags | NLM_F_ACK, body, &mut ack)?;
