@@ -20,7 +20,8 @@ checked against its digest (layers while unpacking into private staging,
 and their uncompressed contents against the config's `diff_ids`, all before
 publishing the root filesystem), and builds are bounded: `--max-download-mib`
 (8192, all layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
-`--max-entries` (1,000,000), plus 4 MiB per manifest or config and 1 MiB per
+`--max-entries` (1,000,000, applied both to tar entries read and to files and
+directories created, implicit parents included), plus 4 MiB per manifest or config and 1 MiB per
 tar entry's metadata (PAX records and GNU long names together, one of each).
 Readiness commands run as the app does (same user and restrictions) in a
 cgroup of their own that is killed and checked empty when the check ends; a
