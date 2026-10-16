@@ -2229,10 +2229,10 @@ fn parse_tap_alias(alias: &str) -> Option<(Ident, &str)> {
 /// owner. A tap without such an alias (another host's, an earlier build's, anyone's) is
 /// never this host's.
 fn taps_of(run: &Path) -> Vec<(String, u32, Ident)> {
-    taps_of_at(run, Path::new("/sys/class/net"))
+    taps_of_at(run, Path::new("/sys/class/net"), false)
 }
 
-fn taps_of_at(run: &Path, net: &Path) -> Vec<(String, u32, Ident)> {
+fn taps_of_at(run: &Path, net: &Path, orphaned: bool) -> Vec<(String, u32, Ident)> {
     let run = run.to_string_lossy();
     let mut taps = Vec::new();
     for e in std::fs::read_dir(net).into_iter().flatten().flatten() {
@@ -2241,11 +2241,19 @@ fn taps_of_at(run: &Path, net: &Path) -> Vec<(String, u32, Ident)> {
         let Some(index) = read("ifindex").and_then(|i| i.trim().parse().ok()) else { continue };
         let Some(alias) = read("ifalias") else { continue };
         let Some((owner, of)) = parse_tap_alias(alias.strip_suffix('\n').unwrap_or(&alias)) else { continue };
-        if of == run && dir.join("tun_flags").exists() {
+        // Only NotFound proves the other run directory is gone; permission and I/O
+        // errors leave its taps alone. The owner must still be proven dead by GC.
+        let missing = || Path::new(of).metadata().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if (of == run || (orphaned && missing())) && dir.join("tun_flags").exists() {
             taps.push((e.file_name().to_string_lossy().into_owned(), index, owner));
         }
     }
     taps
+}
+
+/// GC also collects taps from deleted private/test run directories, once their owner is gone.
+fn dead_taps_at(run: &Path, net: &Path) -> Vec<(String, u32, Ident)> {
+    taps_of_at(run, net, true).into_iter().filter(|(_, _, owner)| owner.liveness() == Liveness::Gone).collect()
 }
 
 /// A detached VM process's own cgroup (`vm-PID-START`, `util::spawn_self`)
@@ -2445,7 +2453,7 @@ impl Host {
 
     /// What dead processes left: taps (a template build's too), cgroups, work
     /// directories and names. Only proof of death (`Liveness::Gone`) frees any.
-    /// Taps are this host's by their alias (`taps_of`), whatever their name.
+    /// Taps belong here by alias, or name a run directory that no longer exists.
     /// Until this boot's recovery is complete, the dead VMs it withdraws are recorded as lost first.
     pub fn collect_garbage(&self) -> Result<Vec<Withdrawn>> {
         self.collect_garbage_with(!self.recovered(boot_id()))
@@ -2453,10 +2461,8 @@ impl Host {
 
     fn collect_garbage_with(&self, lost: bool) -> Result<Vec<Withdrawn>> {
         // Deleted by index and name: a tap made since under a dead one's name is another.
-        for (name, index, owner) in taps_of(&self.run) {
-            if owner.liveness() == Liveness::Gone {
-                crate::net::delete_link(index, &name);
-            }
+        for (name, index, _owner) in dead_taps_at(&self.run, Path::new("/sys/class/net")) {
+            crate::net::delete_link(index, &name);
         }
         collect_owned(&self.run);
         // What a write killed midway left of the per-boot records: unsynced-claim markers
@@ -4756,6 +4762,7 @@ mod tests {
         assert_eq!(parse_tap_alias("flexvm 1 2 /run/a b").map(|(o, r)| (o.pid, o.start, r)), Some((1, 2, "/run/a b")));
         let net = h.run.join("net");
         let other = h.run.join("other");
+        std::fs::create_dir(&other).unwrap();
         let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
         let dev = |name: &str, index: u32, alias: &str, tun: bool| {
             let d = net.join(name);
@@ -4773,12 +4780,35 @@ mod tests {
         dev("fq21a2ct0", 13, &tap_alias(&other, &dead), true);
         dev("fq1t0", 14, "", true);
         dev("fq2t0", 15, &tap_alias(&h.run, &dead), false);
-        let mut got = taps_of_at(&h.run, &net);
+        let mut got = taps_of_at(&h.run, &net, false);
         got.sort_by_key(|t| t.1);
         assert_eq!(got, vec![("fq3e7t0".into(), 10, dead.clone()), ("fqx3e7".into(), 11, me.clone())]);
-        let mut theirs = taps_of_at(&other, &net);
+        let mut theirs = taps_of_at(&other, &net, false);
         theirs.sort_by_key(|t| t.1);
         assert_eq!(theirs, vec![("fq21a2bt0".into(), 12, me), ("fq21a2ct0".into(), 13, dead)]);
+    }
+
+    #[test]
+    fn gc_collects_taps_from_deleted_run_dirs_only_after_the_owner_is_gone() {
+        let d = crate::test_util::TempDir::new("orphan-taps");
+        let run = d.join("run");
+        let other = d.join("private run");
+        let net = d.join("net");
+        std::fs::create_dir(&other).unwrap();
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        for (name, index, owner, tun) in [("dead", 10, dead.clone(), true), ("live", 11, Ident::me(), true), ("not-tun", 12, dead.clone(), false)] {
+            let dev = net.join(name);
+            std::fs::create_dir_all(&dev).unwrap();
+            std::fs::write(dev.join("ifindex"), format!("{index}\n")).unwrap();
+            std::fs::write(dev.join("ifalias"), format!("{}\n", tap_alias(&other, &owner))).unwrap();
+            if tun {
+                std::fs::write(dev.join("tun_flags"), "0x1802\n").unwrap();
+            }
+        }
+        assert!(dead_taps_at(&run, &net).is_empty(), "another existing host's taps stay");
+        std::fs::remove_dir(&other).unwrap();
+        assert_eq!(dead_taps_at(&run, &net), vec![("dead".into(), 10, dead)]);
+        assert!(taps_of_at(&run, &net, false).is_empty(), "pid-reuse cleanup still only selects this host's taps");
     }
 
     /// A VM process's own cgroup goes only once empty, whatever its pid

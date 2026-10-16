@@ -66,7 +66,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
           "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash ckpt_dir_moved "
-          "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked restore_route_fence "
+          "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log warm_ready forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked restore_route_fence "
           "resume_outcome exec_recovery_instance")
 # The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
@@ -945,7 +945,7 @@ COST = {"faults/exec_background": 110, "faults/reboot": 40, "faults/mem_refused_
         "faults/fetch_tail_enomem": 9, "faults/plug_storm": 9, "faults/unknown": 9, "faults/fetch_enomem_stuck": 8,
         "faults/rx_stall": 8, "faults/signals": 8, "faults/spoof_filter": 8, "faults/suspend_overlap": 8,
         "faults/app_log": 7, "faults/checkpoint_corrupt": 7, "faults/ckpt_failed_stop": 7, "faults/ckpt_hot": 7,
-        "faults/guest_calls": 7, "faults/resume_slow_guest": 7, "faults/suspend_cmd": 7, "faults/suspend_resume": 7,
+        "faults/warm_ready": 7, "faults/guest_calls": 7, "faults/resume_slow_guest": 7, "faults/suspend_cmd": 7, "faults/suspend_resume": 7,
         "faults/bad_app_log": 6, "faults/checkpoint_hotplug": 6, "faults/exec_race": 6, "faults/fc_died_busy": 6,
         "faults/pause_cmd_start": 6, "faults/reconcile_announce": 6, "faults/resume_unpause_fail": 6,
         "faults/same_host_hold_route_fail": 6, "faults/standby_lock_timeout": 6, "faults/standby_refill_race": 6,
