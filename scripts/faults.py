@@ -253,7 +253,8 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail",
+          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail")
 
 
 def disarm():
@@ -1349,6 +1350,258 @@ def abort_superseded():
     check("abort superseded: the address routes to the replacement, not the hold", f"via {gw}" in route, route)
     check("abort superseded: the source put that route back itself", f"put back route {ip} via {gw} (generation {gen + 1})" in log(A, n), log(A, n)[-300:])
     subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+
+
+# --- migration failure boundaries (#460) ---------------------------------------
+
+
+def taps(host):
+    """`host`'s taps (by its prefix), as the kernel has them."""
+    prefix = ok(cli_json(host, "config"))["derived"]["prefix"]
+    return {d for d in os.listdir("/sys/class/net") if d.startswith(prefix)}
+
+
+def arrivals(host):
+    """`host`'s arrivals still going (each has its listener's `.incoming-*` log until it ends)."""
+    return {f for f in os.listdir(os.path.join(host.run, "vms")) if f.startswith(".incoming-")}
+
+
+def migs_of(host):
+    return set(os.listdir(os.path.join(host.state, "migs")))
+
+
+def boundary(host):
+    """What `host` has before a migration to it: its taps and migration records."""
+    return taps(host), migs_of(host)
+
+
+def one_owner(label, n, m, owner, ip, gen, before, lent=None, leaving=False):
+    """After a migration that failed at a boundary: `n` runs on `owner` only with its memory
+    intact, its address held there by generation `gen` (`lent` and `leaving` as given: a loan
+    and a leaving mark that could not be undone stay, never the address freed). The other host
+    has none of it left (as of `before`, from `boundary`): no process, arrival, name lock, claim,
+    tap or migration record."""
+    other = B if owner is A else A
+    check(f"{label}: running on {owner} only", where(n) == {owner: "running"}, where(n))
+    check(f"{label}: md5 intact", md5(owner, n) == m)
+    a = addr(owner, ip)
+    check(f"{label}: the address is held there by its generation",
+          a.get("holder") == n and a.get("held") == gen and a.get("seen") == gen and not a.get("withdrawn"), a)
+    check(f"{label}: lent {lent}, {'still' if leaving else 'no longer'} leaving", a.get("lent") == lent and bool(a.get("leaving")) == leaving, a)
+    lock = os.path.join(other.run, "vms", f"{n}.lock")
+    left = lambda: (n in vms(other), os.path.exists(lock), arrivals(other), taps(other) - before[0], addr(other, ip).get("holder"))
+    check(f"{label}: nothing of it left on {other}", wait_for(lambda: left() == (False, False, set(), set(), None), 15), left())
+    # A record left (its arrival killed, say) reads aborted, and goes once asked about.
+    made = lambda: migs_of(other) - before[1]
+    told = {mig: peer(other, {"op": "migration", "mig": int(mig)}).get("result", {}).get("outcome") for mig in made()}
+    check(f"{label}: no migration record of it left on {other}", set(told.values()) <= {"aborted"} and wait_for(lambda: not made(), 10), (told, made()))
+
+
+def hit(host, f, n):
+    """Whether `n`'s process on `host` got to test fault `f` (`host::tripped`)."""
+    return vm_pid(host, n) in reached(host, f)
+
+
+def leave_fail():
+    """#460: leaving fails right after the address was lent (`leave_fail`): the VM, never paused,
+    runs on; its loan and leaving mark are undone in one write and the prepared target gives up.
+    If undoing them fails too (`unlend_fail`), the address stays lent and marked leaving (never
+    free while that is unsure); the next migration goes, and the VM's end there frees the loan."""
+    n = "ft-leave-fail"
+    m = setup(n, mib=20)
+    v = vms(A)[n]
+    ip, gen = v["ip"], v["gen"]
+    before = boundary(B)
+    fault(A, "leave_fail", 60000)
+    r = migrate(A, n, B)
+    fault(A, "leave_fail", 0)
+    check("leave fail: reached", hit(A, "leave_fail", n), reached(A, "leave_fail"))
+    check("leave fail: migrate refused, saying why", not r["ok"] and "leaving failed" in r["error"], r)
+    one_owner("leave fail", n, m, A, ip, gen, before)
+    clear_gate(A, "leave_fail")
+    before = boundary(B)
+    seen = len(log(A, n))
+    fault(A, "leave_fail", 60000)
+    fault(A, "unlend_fail", 60000)
+    r = migrate(A, n, B)
+    fault(A, "leave_fail", 0)
+    fault(A, "unlend_fail", 0)
+    check("leave and stay fail: reached", hit(A, "leave_fail", n), reached(A, "leave_fail"))
+    check("leave and stay fail: migrate refused", not r["ok"] and "leaving failed" in r["error"], r)
+    check("leave and stay fail: says the loan stays",
+          "undoing its loan after a refused migration: injected fault" in log(A, n)[seen:], log(A, n)[seen:][-500:])
+    one_owner("leave and stay fail", n, m, A, ip, gen, before, lent=gen, leaving=True)
+    r = migrate(A, n, B)
+    st = wait_released(B, n)
+    check("leave and stay fail: the next migration goes", r["ok"] and st["released"] and where(n) == {B: "running"}, (r, st, where(n)))
+    check("leave and stay fail: md5 intact on B", md5(B, n) == m)
+    kill(B, n)
+    check("leave and stay fail: its end frees the loan", wait_for(lambda: not addr(A, ip).get("lent") and not addr(A, ip).get("holder"), 10), addr(A, ip))
+
+
+def capture_fail():
+    """#460: the source fails after it became one, before its target has a state: parking the
+    balloon (`park_fail`, still running), reading the captured vmstate (`capture_fail`, paused)
+    or the preloaded pages (`preload_read_fail`). Each time it runs here again intact, its address
+    held by its generation with no loan or leaving mark, a revision past the one its target took;
+    the target, which never got a state, leaves nothing behind. Then a migration goes."""
+    n = "ft-capture-fail"
+    m = setup(n, mib=20)
+    for f, why in (("park_fail", "parking the balloon failed"), ("capture_fail", "reading the vmstate failed"),
+                   ("preload_read_fail", "reading the preloaded pages failed")):
+        label = f"capture fail ({f})"
+        v = vms(A)[n]
+        ip, gen, rev = v["ip"], v["gen"], addr(A, v["ip"]).get("rev", 0)
+        before = boundary(B)
+        fault(A, f, 60000)
+        r = migrate(A, n, B)
+        fault(A, f, 0)
+        check(f"{label}: reached", hit(A, f, n), reached(A, f))
+        check(f"{label}: migrate refused, saying why", not r["ok"] and why in r["error"], r)
+        one_owner(label, n, m, A, ip, gen, before)
+        check(f"{label}: a revision past its target's", addr(A, ip).get("rev", 0) == rev + 2, (rev, addr(A, ip)))
+    r = migrate(A, n, B)
+    st = wait_released(B, n)
+    check("capture fail: a later migration goes", r["ok"] and st["released"] and where(n) == {B: "running"}, (r, st, where(n)))
+    check("capture fail: md5 intact on B", md5(B, n) == m)
+    cleanup(n)
+
+
+def abort_gen_fail():
+    """#460: an abort (the target refused a bad preload page) that cannot read its address's
+    record (`abort_gen_fail`) cannot tell whether the address went to another VM: the source
+    never runs on it again, its vCPUs stay paused, it says it failed and `flexvm resume` does not
+    run it; its loan stays (the address never free meanwhile) and the target has nothing. A kill
+    ends it, freeing the address for a new VM."""
+    n = "ft-abort-gen"
+    setup(n, mib=20)
+    v = vms(A)[n]
+    ip, gen = v["ip"], v["gen"]
+    before = boundary(B)
+    fault(A, "bad_preload", 60000)
+    fault(A, "abort_gen_fail", 60000)
+    r = migrate(A, n, B)
+    fault(A, "bad_preload", 0)
+    fault(A, "abort_gen_fail", 0)
+    check("abort gen fail: reached", hit(A, "abort_gen_fail", n), reached(A, "abort_gen_fail"))
+    check("abort gen fail: migrate fails, saying it cannot tell", not r["ok"] and "cannot be told" in r["error"], r)
+    check("abort gen fail: failed on A, nowhere running", where(n) == {A: "failed"}, where(n))
+    check("abort gen fail: its vCPUs stay paused", fc_api(api_sock(A, n), "GET", "/")["state"] == "Paused")
+    a = addr(A, ip)
+    check("abort gen fail: the address stays its, lent", a.get("holder") == n and a.get("held") == gen and a.get("lent") == gen, a)
+    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    left = lambda: (n in vms(B), os.path.exists(lock), arrivals(B), taps(B) - before[0], addr(B, ip).get("holder"))
+    check("abort gen fail: nothing of it left on B", wait_for(lambda: left() == (False, False, set(), set(), None), 15), left())
+    code, out, err = cli(A, "resume", n)
+    check("abort gen fail: flexvm resume does not run it",
+          where(n) == {A: "failed"} and fc_api(api_sock(A, n), "GET", "/")["state"] == "Paused", (code, out, err, where(n)))
+    ok(kill(A, n))
+    check("abort gen fail: a kill frees the address", wait_for(lambda: not addr(A, ip).get("holder") and not addr(A, ip).get("lent"), 10), addr(A, ip))
+    n2 = "ft-abort-gen-2"
+    r = run(A, n2, ip=ip)
+    check("abort gen fail: a new vm takes the address", r["ok"] and vms(A)[n2]["gen"] > gen, (r, vms(A).get(n2)))
+    kill(A, n2)
+
+
+def children(pid):
+    """Pids of `pid`'s child processes."""
+    out = []
+    for c in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if int(open(f"/proc/{c}/stat").read().rsplit(")", 1)[1].split()[1]) == pid:
+                out.append(int(c))
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def commit_fail():
+    """#460: the target's commit fails right before ownership moves (`commit_fail`, after the
+    route it installs when it does not share its source's routes). Its VM, loaded and never run
+    (its Firecracker paused at `commit_gate`), goes with its arrival; the source, refused, runs on
+    intact, the address still routed to its tap and held by its generation; the target has no
+    process, tap, claim or record of it left. Then a migration goes."""
+    n = "ft-commit-fail"
+    m = setup(n, mib=20)
+    v = vms(A)[n]
+    ip, gen, tap = v["ip"], v["gen"], v["tap"]
+    check("commit fail: routed to its tap", f"dev {tap}" in peer_route(ip), peer_route(ip))
+    before = boundary(B)
+    fault(B, "commit_gate", 60000)
+    fault(B, "commit_fail", 60000)
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=migrate(A, n, B)))
+    t.start()
+    try:
+        check("commit fail: the arrival got to its commit", wait_for(lambda: reached(B, "commit_gate"), 30), reached(B, "commit_gate"))
+        pid = (reached(B, "commit_gate") or [0])[0]
+        fcs = [c for c in children(pid) if b"--api-sock" in open(f"/proc/{c}/cmdline", "rb").read()]
+        sock = lambda c: (lambda a: a[a.index(b"--api-sock") + 1].decode())(open(f"/proc/{c}/cmdline", "rb").read().split(b"\0"))
+        states = [fc_api(sock(c), "GET", "/")["state"] for c in fcs]
+        check("commit fail: the arrival's vm is loaded, never run", states == ["Paused"], (fcs, states))
+        check("commit fail: the source is paused, waiting", vms(A)[n]["state"] == "source", vms(A)[n])
+    finally:
+        fault(B, "commit_gate", 0)
+        t.join(90)
+    fault(B, "commit_fail", 0)
+    r = res.get("r", {})
+    check("commit fail: reached", pid in reached(B, "commit_fail"), reached(B, "commit_fail"))
+    check("commit fail: migrate refused, saying why", not r.get("ok") and "committing failed" in r.get("error", ""), r)
+    check("commit fail: the arrival and its firecracker are gone", wait_for(lambda: not any(alive(p) for p in [pid, *fcs]), 15), [pid, *fcs])
+    one_owner("commit fail", n, m, A, ip, gen, before)
+    check("commit fail: the address routes to its tap still", f"dev {tap}" in peer_route(ip), peer_route(ip))
+    r = migrate(A, n, B)
+    st = wait_released(B, n)
+    check("commit fail: a later migration goes", r["ok"] and st["released"] and where(n) == {B: "running"}, (r, st, where(n)))
+    check("commit fail: md5 intact on B", md5(B, n) == m)
+    cleanup(n)
+
+
+def abort_stay_fail():
+    """#460: an abort (the target refused a bad preload page) runs the source here again, then
+    marking it here again (`abort_stay_fail`) and recording its revision (`advance_fail`, after it moved on)
+    fail. It is the one owner, its address held by its generation (still lent and marked leaving:
+    never free while that is unsure). Its announcement, past the revision its target took, stands
+    on the target's host, where the target's revision is stale; here a stale one leaves the route
+    on its tap. The next migration goes, and the VM's end there frees the loan."""
+    n = "ft-abort-stay"
+    m = setup(n, mib=20)
+    v = vms(A)[n]
+    ip, gen, tap = v["ip"], v["gen"], v["tap"]
+    rev = addr(A, ip).get("rev", 0)
+    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    before = boundary(B)
+    seen = len(log(A, n))
+    faults = ("bad_preload", "abort_stay_fail", "advance_fail")
+    for f in faults:
+        fault(A, f, 60000)
+    r = migrate(A, n, B)
+    for f in faults:
+        fault(A, f, 0)
+    check("abort stay fail: reached", hit(A, "abort_stay_fail", n) and hit(A, "advance_fail", n), os.listdir(os.path.join(A.run, "gates")))
+    check("abort stay fail: migrate refused", not r["ok"] and "target refused" in r["error"], r)
+    said = log(A, n)[seen:]
+    check("abort stay fail: says what it could not record",
+          "after an aborted migration: injected fault" in said and "recording its revision: injected fault" in said, said[-800:])
+    one_owner("abort stay fail", n, m, A, ip, gen, before, lent=gen, leaving=True)
+    try:
+        check("abort stay fail: B took its announcement, past the target's revision",
+              wait_for(lambda: addr(B, ip).get("rev") == rev + 2 and addr(B, ip).get("via") == "127.0.0.1", 10), addr(B, ip))
+        late = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
+        check("abort stay fail: the target's revision is stale on B", late.get("ok") and late["result"].get("stale"), late)
+        late = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
+        check("abort stay fail: on A it leaves the route on its tap",
+              late.get("ok") and (late["result"].get("stale") or late["result"].get("local")) and f"dev {tap}" in peer_route(ip), (late, peer_route(ip)))
+        check("abort stay fail: still the one owner", where(n) == {A: "running"} and addr(A, ip).get("holder") == n, (where(n), addr(A, ip)))
+    finally:
+        if f"via {gw}" in peer_route(ip):
+            subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+    r = migrate(A, n, B)
+    st = wait_released(B, n)
+    check("abort stay fail: the next migration goes", r["ok"] and st["released"] and where(n) == {B: "running"}, (r, st, where(n)))
+    check("abort stay fail: md5 intact on B", md5(B, n) == m)
+    kill(B, n)
+    check("abort stay fail: its end frees the loan", wait_for(lambda: not addr(A, ip).get("lent") and not addr(A, ip).get("holder"), 10), addr(A, ip))
 
 
 def same_host_order():
@@ -7931,6 +8184,7 @@ SCENARIOS = dict(
     resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
+    leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood,
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, quarantine_reboot_ls=quarantine_reboot_ls, kill_source=kill_source,

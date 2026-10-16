@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::bail;
 use crate::hold::{self, Holder};
-use crate::host::fault;
+use crate::host::{fault, tripped};
 use crate::template::Template;
 use crate::uffd::{Origin, Runs, Source, MAX_PRELOAD};
 use crate::util::{ms, recv_json, send_json, By, Error, Phases, Result};
@@ -111,7 +111,12 @@ impl Proc {
         self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen, mig, to)?, Ordering::SeqCst);
         self.drop_held_in();
         self.set_leaving(true);
-        if let Err(e) = vm.leave(State::Source(mig)) {
+        // Test fault `leave_fail`: leaving fails once the address is lent.
+        let left = match tripped("leave_fail") {
+            true => Err("injected fault: leaving failed".into()),
+            false => vm.leave(State::Source(mig)),
+        };
+        if let Err(e) = left {
             self.set_leaving(false);
             // Leaving and its own loan undone in one write.
             let unlend = self.lent_here.load(Ordering::SeqCst).then_some(gen);
@@ -122,7 +127,12 @@ impl Proc {
             return Err(e);
         }
         self.publish();
-        if let Err(e) = vm.park_balloon() {
+        // Test fault `park_fail`: parking the balloon fails, the VM still running as the source.
+        let parked = match tripped("park_fail") {
+            true => Err("injected fault: parking the balloon failed".into()),
+            false => vm.park_balloon(),
+        };
+        if let Err(e) = parked {
             return Err(self.abort(&op, &vm, mig, e));
         }
         let mut t = Phases::new();
@@ -132,9 +142,16 @@ impl Proc {
             let saved = vm.save_state(&vmstate, false, false, hold, &mut t).and_then(|r| Ok((r, t.total(), std::fs::read(&vmstate)?)));
             let _ = std::fs::remove_file(&vmstate);
             let (runs, paused, state) = saved?;
+            // Test faults `capture_fail` and `preload_read_fail`: paused, its state captured, reading it fails.
+            if tripped("capture_fail") {
+                bail!("injected fault: reading the vmstate failed");
+            }
             t.mark("read_state");
             let pages = crate::uffd::remote_among(&runs, wanted);
             let mut data = vec![0u8; pages.len() * crate::util::PAGE_SIZE];
+            if tripped("preload_read_fail") {
+                bail!("injected fault: reading the preloaded pages failed");
+            }
             vm.pager.read_preload(&pages, &mut data)?;
             t.mark("read_preload");
             Ok((runs, paused, state, pages, data))
@@ -255,7 +272,12 @@ impl Proc {
         // the resume's balloon unpark must not wait on Firecracker throttled at it.
         let _lifted = vm.limit.lift(vm.pid());
         let gen = self.gen();
-        let l = match self.host.lock().and_then(|l| Ok((self.host.current(&l, vm.ip, gen)?, l))) {
+        // Test fault `abort_gen_fail`: the address's record cannot be read.
+        let checked = self.host.lock().and_then(|l| match tripped("abort_gen_fail") {
+            true => Err("injected fault: reading the address's generation failed".into()),
+            false => Ok((self.host.current(&l, vm.ip, gen)?, l)),
+        });
+        let l = match checked {
             Ok((true, l)) => l,
             Ok((false, l)) => {
                 drop(l);
@@ -291,7 +313,12 @@ impl Proc {
         // Leaving and its own loan undone in one write: a crash leaves both (settled
         // through its target, `withdraw_dead`) or neither.
         let unlend = self.lent_here.load(Ordering::SeqCst).then_some(gen);
-        match self.host.stay(&l, vm.ip, unlend) {
+        // Test fault `abort_stay_fail`: resumed here, recording so fails.
+        let stayed = match tripped("abort_stay_fail") {
+            true => Err("injected fault: marking it here again failed".into()),
+            false => self.host.stay(&l, vm.ip, unlend),
+        };
+        match stayed {
             Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
             Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after an aborted migration: {r}", vm.name),
         }
@@ -788,6 +815,8 @@ impl Proc {
             (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
             _ => before_commit.take().map_or(Ok(Ok(())), |f| f()).and_then(|r| r).and_then(|()| {
+                // Test gate `commit_gate`: a test looks at the loaded, never-run VM here.
+                crate::host::gate("commit_gate");
                 // The ownership boundary (refused if fenced).
                 let l = self.host.lock_by(Some(deadline))?;
                 if Instant::now() >= deadline {
@@ -800,6 +829,10 @@ impl Proc {
                 if !shared {
                     crate::net::route_dev(true, ip, crate::net::ifindex(&vm.tap)?)?;
                     t.mark("route");
+                }
+                // Test fault `commit_fail`: the durable commit fails, its route (if any) installed.
+                if tripped("commit_fail") {
+                    bail!("injected fault: committing failed");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
                 // Only now its revision outranks the source's (`claim_arrival`).
