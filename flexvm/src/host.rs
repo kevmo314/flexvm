@@ -2448,7 +2448,17 @@ impl Host {
                     continue;
                 }
             };
-            let Some(via) = a.via.filter(|&via| !a.withdrawn && !self.held(&a) && self.route_allowed(ip, via)) else { continue };
+            let Some(via) = a.via.filter(|_| !a.withdrawn && !self.held(&a)) else { continue };
+            // Peers never announce again what they delivered (#553): one not checkable yet is tried again.
+            match self.route_check(ip, via) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    crate::log!("after boot: route {ip} via {via}: {e}; tried again on the next open");
+                    ok = false;
+                    continue;
+                }
+            }
             match route(ip, via) {
                 Ok(()) => crate::log!("after boot: put back route {ip} via {via} (generation {})", a.seen),
                 Err(e) => {
@@ -4528,6 +4538,28 @@ mod tests {
         // A new VM of the name clears the record.
         drop(h.take_name("web", false).unwrap());
         assert!(!h.vms("web", "lost").unwrap().exists());
+    }
+
+    /// Review of #594: a peer by name no listener has looked up since the boot (`RUN/peers.json` is
+    /// gone with it) leaves its saved routes uncheckable, so the pass is not complete and tries
+    /// again, never dropping them for good.
+    #[test]
+    fn after_a_boot_routes_wait_for_named_peers_to_be_known() {
+        let (_h_dir, mut h) = host("after-boot-named");
+        h.cfg.cluster_ips = Some("10.9.0.0/16".into());
+        h.cfg.peers = vec!["peer.invalid:7070".into()];
+        let (peer, via) = (ip("10.9.5.1"), ip("192.0.2.7"));
+        h.put_addr(peer, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+        let routes = std::cell::RefCell::new(Vec::new());
+        let route = |ip, via| {
+            routes.borrow_mut().push((ip, via));
+            Ok(())
+        };
+        assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(false));
+        assert!(routes.borrow().is_empty());
+        crate::util::write_file(&h.run, "peers.json", br#"{"names": {"peer.invalid:7070": ["192.0.2.7"]}}"#, false).unwrap();
+        assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(true));
+        assert_eq!(*routes.borrow(), vec![(peer, via)]);
     }
 
     /// Review of #565: a lost VM is recorded before its address is withdrawn (a crash between
