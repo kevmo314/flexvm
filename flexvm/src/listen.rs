@@ -116,13 +116,30 @@ impl Drop for Wait {
 
 pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()> {
     let local = listener.local_addr()?;
+    // Bounded: this runs under the host lock. Seeds `PEER_CACHE` before the advertised
+    // address is derived from it (a wildcard listener's underlay): at a first start or
+    // after a boot, nothing else has looked the peers up yet.
+    let by = Instant::now() + Duration::from_secs(2);
+    let found: Vec<Option<Vec<IpAddr>>> = cfg.peers.iter().map(|p| crate::util::resolve(p, by).ok().map(|a| a.iter().map(SocketAddr::ip).collect())).collect();
+    if let Some(run) = &cfg.run {
+        let mut c = Cached::read(run, &cfg.peers);
+        c.names.retain(|n, _| cfg.peers.contains(n));
+        for (n, a) in cfg.peers.iter().zip(&found).filter(|(n, _)| n.parse::<SocketAddr>().is_err()) {
+            match a {
+                Some(a) => drop(c.names.insert(n.clone(), a.clone())),
+                // One that failed keeps what it had, else has none.
+                None => {
+                    c.names.entry(n.clone()).or_default();
+                }
+            }
+        }
+        c.write(&run.join(PEER_CACHE));
+    }
     if let Some(e) = unreachable_at(local, v6only(listener), cfg.advertise()?.as_deref()) {
         bail!("{e}");
     }
-    // Bounded: this runs under the host lock.
-    let by = Instant::now() + Duration::from_secs(2);
-    let resolve = |p: &String| crate::util::resolve(p, by).map(|a| a.iter().map(SocketAddr::ip).collect()).unwrap_or_default();
-    let toward = || crate::host::toward(&cfg.peers.iter().map(resolve).collect::<Vec<_>>(), |a| crate::net::is_local_addr(a).unwrap_or(false));
+    let toward =
+        || crate::host::toward(&found.iter().map(|a| a.clone().unwrap_or_default()).collect::<Vec<_>>(), |a| crate::net::is_local_addr(a).unwrap_or(false));
     if let Some(e) = loopback_with_remote(local, toward) {
         bail!("{e}");
     }
@@ -293,9 +310,15 @@ const LOOKUP_EVERY: Duration = Duration::from_secs(2);
 const ADMIT_WAIT: Duration = Duration::from_millis(1500);
 
 impl Peers {
+    /// The listener's, from what `validate` seeded or an earlier listener left: a first
+    /// lookup to end writes the others' entries back, not only its own.
+    fn listener(host: &Host) -> Peers {
+        let cache = Some((host.run.join(PEER_CACHE), Mutex::new(Cached::read(&host.run, &host.config_now().peers))));
+        Peers(Arc::new(PeersInner { cache, ..Default::default() }))
+    }
+
     fn watch(host: Host) -> Peers {
-        let cache = Some((host.run.join(PEER_CACHE), Mutex::default()));
-        let peers = Peers(Arc::new(PeersInner { cache, ..Default::default() }));
+        let peers = Peers::listener(&host);
         let p = peers.clone();
         std::thread::spawn(move || loop {
             let names = host.config_now().peers;
@@ -342,14 +365,7 @@ impl Peers {
         let Some((path, cached)) = &self.0.cache else { return };
         let mut c = cached.lock().unwrap();
         change(&mut c);
-        let (dir, name) = (path.parent().unwrap(), path.file_name().unwrap().to_str().unwrap());
-        if let Err(e) = serde_json::to_vec(&*c).map_err(std::io::Error::from).and_then(|b| crate::util::write_file(dir, name, &b, false)) {
-            let gone = match std::fs::remove_file(path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => format!("; cannot remove it either: {e}"),
-                _ => String::new(),
-            };
-            crate::log!("{}: {e}{gone}", path.display());
-        }
+        c.write(path);
     }
 
     /// The addresses of `names`; a name not resolved yet is looked up.
@@ -810,6 +826,18 @@ impl Cached {
         }
     }
 
+    /// One that cannot be written is removed, never left to answer for addresses since changed.
+    fn write(&self, path: &std::path::Path) {
+        let (dir, name) = (path.parent().unwrap(), path.file_name().unwrap().to_str().unwrap());
+        if let Err(e) = serde_json::to_vec(self).map_err(std::io::Error::from).and_then(|b| crate::util::write_file(dir, name, &b, false)) {
+            let gone = match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => format!("; cannot remove it either: {e}"),
+                _ => String::new(),
+            };
+            crate::log!("{}: {e}{gone}", path.display());
+        }
+    }
+
     pub fn addrs(&self, name: &str) -> std::io::Result<Vec<IpAddr>> {
         match (name.parse::<SocketAddr>(), self.names.get(name)) {
             (Ok(a), _) => Ok(vec![a.ip()]),
@@ -969,6 +997,45 @@ mod tests {
         let cfg = host.config_now();
         routable_by("10.200.0.7".parse().unwrap(), &cfg, &known, &[], |_| Ok(false)).unwrap();
         assert!(routable_by("10.200.0.7".parse().unwrap(), &cfg, &known, &[], |_| Ok(true)).is_err());
+    }
+
+    /// At a first start or after a boot nothing has looked the peers up: the listener does
+    /// before deriving the underlay it advertises for a wildcard address (#579), and its own
+    /// lookups then keep the others' entries.
+    #[test]
+    fn a_wildcard_listener_derives_its_underlay_from_its_own_lookups() {
+        let root = crate::test_util::TempDir::new("listen-seed");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        host.configure(|cfg| {
+            cfg.listen = Some("0.0.0.0:7106".into());
+            cfg.peers = vec!["localhost:7107".into()];
+            assert_eq!(cfg.advertise().ok().flatten(), None, "nothing looked up yet");
+            validate(&listener, cfg)?;
+            assert_eq!(cfg.advertise()?.as_deref(), Some("127.0.0.1:7106"));
+            Ok(())
+        })
+        .unwrap();
+        // Seeded even when refused: a name that does not resolve gets an empty entry, the others keep theirs.
+        let e = host.configure(|cfg| {
+            cfg.peers = vec!["localhost:7107".into(), "never.invalid:7107".into(), "10.98.0.1:7107".into()];
+            validate(&listener, cfg)
+        });
+        assert!(e.is_err(), "a loopback listener with a peer elsewhere");
+        let peers = ["localhost:7107".to_string(), "never.invalid:7107".into()];
+        let seeded = Cached::read(&host.run, &peers);
+        assert!(seeded.addrs("localhost:7107").unwrap().iter().any(|a| a.is_loopback()), "{seeded:?}");
+        assert_eq!(seeded.addrs("never.invalid:7107").unwrap(), Vec::<IpAddr>::new());
+        assert_eq!(seeded.names.len(), 2, "names only: {seeded:?}");
+        // The listener's own first lookup to end keeps the others' entries.
+        host.configure(|cfg| {
+            cfg.peers = peers.to_vec();
+            Ok(())
+        })
+        .unwrap();
+        Peers::listener(&host).cache(|c| drop(c.names.insert("never.invalid:7107".into(), vec!["10.93.0.1".parse().unwrap()])));
+        let after = Cached::read(&host.run, &peers);
+        assert!(after.addrs("localhost:7107").unwrap().iter().any(|a| a.is_loopback()), "{after:?}");
     }
 
     #[test]
