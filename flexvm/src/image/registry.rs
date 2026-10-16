@@ -110,14 +110,36 @@ fn is_public(ip: std::net::IpAddr) -> bool {
                 && a != 0
                 && !(a == 100 && b & 0xc0 == 64)
         }
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        // IPv4-mapped, or NAT64's well-known prefix (RFC 6052): as the IPv4 address it stands for.
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped().or_else(|| nat64_well_known(v6)) {
             Some(v4) => is_public(IpAddr::V4(v4)),
+            // NAT64's local-use prefix (RFC 8215) may translate to anything, private addresses included.
+            None if is_nat64(v6) => false,
             None => {
                 let s0 = v6.segments()[0];
                 !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80)
             }
         },
     }
+}
+
+/// The IPv4 address embedded in an address under NAT64's well-known prefix, 64:ff9b::/96.
+fn nat64_well_known(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]).then(|| std::net::Ipv4Addr::from(u128::from(v6) as u32))
+}
+
+/// Under a NAT64 prefix: the well-known 64:ff9b::/96 or the local-use 64:ff9b:1::/48.
+fn is_nat64(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    nat64_well_known(v6).is_some() || s[..3] == [0x64, 0xff9b, 1]
+}
+
+/// Whether a registry at `ip` is local: a loopback, link-local or private address, but never one reached through
+/// NAT64, which translates to an address this host cannot see and need not be its own network's. (A network-specific
+/// NAT64 prefix, such as a ULA /96, cannot be told from a native address without the host's translation config.)
+fn local_address(ip: std::net::IpAddr) -> bool {
+    !is_public(ip) && !matches!(ip, std::net::IpAddr::V6(v6) if is_nat64(v6))
 }
 
 /// Connects as ureq's `TcpConnector` does, trying each resolved address in turn, and records the connected socket's
@@ -453,7 +475,7 @@ impl Registry {
                 // name answering with a private address sends flexvm to that host, whose answer (the realm or the
                 // redirect included) the name's owner does not write; and what counts is the peer of the socket the
                 // answer came over (never pooled, so this request's own), not any address DNS also answered.
-                local = self.local() || peer.lock().unwrap().take().is_some_and(|p| !is_public(p.ip()));
+                local = self.local() || peer.lock().unwrap().take().is_some_and(|p| local_address(p.ip()));
             }
             let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
             match resp.status().as_u16() {
@@ -496,7 +518,7 @@ impl Registry {
     /// private address. (`get` also finds one local by the address it answers from.)
     fn local(&self) -> bool {
         let host = self.r.host();
-        host.eq_ignore_ascii_case("localhost") || host.parse().is_ok_and(|ip| !is_public(ip))
+        host.eq_ignore_ascii_case("localhost") || host.parse().is_ok_and(local_address)
     }
 
     /// Answers `challenge` for a registry that is `local` or not: a local registry's token service may be anywhere,
@@ -830,6 +852,30 @@ pub(super) mod tests {
         let reg = Registry::new(Reference::parse("203.0.113.7/test").unwrap());
         let err = reg.authenticate(r#"Bearer REALM="http://auth.example/t""#, Instant::now() + Duration::from_secs(5), false).unwrap_err().to_string();
         assert!(err.contains("not HTTPS"), "{err}");
+    }
+
+    /// NAT64 addresses are public as the IPv4 address they embed (well-known prefix) or never (local-use prefix), and
+    /// never make a registry local.
+    #[test]
+    fn nat64_addresses() {
+        use std::net::IpAddr;
+        for (ip, public, local) in [
+            ("64:ff9b::808:808", true, false),
+            ("64:ff9b::a00:5", false, false),
+            ("64:ff9b::7f00:1", false, false),
+            ("64:ff9b::a9fe:a9fe", false, false),
+            ("64:ff9b:1::808:808", false, false),
+            ("64:ff9b:1:ffff::1", false, false),
+            ("64:ff9b:2::1", true, false),
+            ("fd00::1", false, true),
+            ("10.0.0.5", false, true),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!((is_public(ip), local_address(ip)), (public, local), "{ip}");
+        }
+        for host in ["[64:ff9b::a00:5]:5000", "[64:ff9b:1::1]", "[64:ff9b::7f00:1]:5000"] {
+            assert!(!Registry::new(Reference::parse(&format!("{host}/x")).unwrap()).local(), "{host}");
+        }
     }
 
     #[test]
