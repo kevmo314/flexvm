@@ -144,7 +144,7 @@ STATE (default /var/lib/flexvm, on disk)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
                          (pid, start time) and generation, the route a peer announced for the newest generation
                          and the newest revision of it (where the VM is within the generation)
-  addrs/.gens            generation high-water mark, reserved 1024 at a time, with the boot id
+  addrs/.gens            generation high-water mark, reserved 1024 at a time: fsynced, written only then
   addrs/.next            where the next automatic allocation starts looking (a hint, wrapping around)
   suspended/NAME/        a suspended VM's checkpoint, GEN (its address's generation) published with it,
                          + STARTED, DISCARDED, QUARANTINE markers; without a manifest, or STARTED or
@@ -163,6 +163,10 @@ RUN (default /run/flexvm, tmpfs)
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc, .gc.lock          when garbage was last swept periodically; one sweep at a time
+  claims/IP              the boot id, written before an address record is written without fsync (a fresh start's
+                         claim), removed once a durable write replaces it
+  .gens.next             the next generation, with the boot id and the synced mark it is under; trusted only while
+                         addrs/.gens holds that mark, else the next generation reserves and syncs a new one
   .logs.lock             logs are opened holding it shared, swept holding it exclusively
   holds/ID-MIB           memory admitted to a live process, flocked by it (`.ID` while being made)
   grants-BOOTID          recent grants not yet held, counted against the reserve
@@ -277,9 +281,13 @@ restart after a SIGKILL) does not hold it, and an instance releases only its
 own claim.
 All of this is decided under the host lock, in one critical section with the
 claim. Records with a new generation, a loan or a withdrawal are fsynced
-before acting; a live holder change is not (a crash loses the VM too, and the
-high-water mark already orders generations). A record that cannot be read or
-parsed is an error, never a free address.
+before acting; a fresh start's claim is not (a crash loses the VM too, and the
+high-water mark already orders generations). After a power loss that claim
+may be empty (#554): written before this boot (no `RUN/claims/IP` with this
+boot's id), it reads as withdrawn at the high-water mark, so the address is free
+and its generations still only rise. One written in this boot may be a live
+VM's; it, and any other record that cannot be read or parsed, is an error,
+never a free address.
 
 - **Borrowing.** A restore keeping another host's address (its checkpoint's,
   or `--ip`) asks the peers to `lend` it: the home host checks it is free
