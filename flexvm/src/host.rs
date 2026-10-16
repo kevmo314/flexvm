@@ -599,10 +599,12 @@ impl Host {
         }
         let busy = || std::io::Error::new(std::io::ErrorKind::WouldBlock, "the host lock is busy");
         let threads = THREADS.take(deadline).ok_or_else(busy)?;
-        let f = File::options().create(true).truncate(false).write(true).open(self.state.join("lock"))?;
         let f = match deadline {
-            None => flock(&f, libc::LOCK_EX).map(|()| f)?,
-            Some(d) => flock_by(f, libc::LOCK_EX, d).map_err(|e| if e.kind() == std::io::ErrorKind::WouldBlock { busy() } else { e })?,
+            None => {
+                let f = File::options().create(true).truncate(false).write(true).open(self.state.join("lock"))?;
+                flock(&f, libc::LOCK_EX).map(|()| f)?
+            }
+            Some(d) => flock_by(&self.state.join("lock"), d).map_err(|e| if e.kind() == std::io::ErrorKind::WouldBlock { busy() } else { e })?,
         };
         DEPTH.with(|d| d.set(1));
         Ok(Locked(Some((f, threads))))
@@ -2556,46 +2558,81 @@ pub fn flock(f: &File, how: i32) -> std::io::Result<()> {
     crate::util::eintr(|| unsafe { libc::flock(f.as_raw_fd(), how) }).map(drop)
 }
 
-/// `f`'s flock (`how`), had by `deadline` or refused with `WouldBlock`. Waited for blocked, on
-/// a helper thread `f` moves to, so it is had as soon as the holder lets go rather than at the
-/// next poll, and the caller still returns at the deadline. The helper then outlives the wait:
-/// what it gets after is let go of at once (`f` was its own, so no lock of the caller's goes too).
-fn flock_by(f: File, how: i32, deadline: std::time::Instant) -> std::io::Result<File> {
-    match flock(&f, how | libc::LOCK_NB) {
-        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {}
-        r => return r.map(|()| f),
-    }
-    enum Wait {
-        Waiting,
-        Done(std::io::Result<File>),
-        Abandoned,
-    }
-    let wait = Arc::new((Mutex::new(Wait::Waiting), std::sync::Condvar::new()));
-    let theirs = wait.clone();
-    std::thread::Builder::new().name("flock-wait".into()).spawn(move || {
-        let got = flock(&f, how);
-        let mut w = theirs.0.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(*w, Wait::Abandoned) {
-            if got.is_ok() {
-                let _ = flock(&f, libc::LOCK_UN); // Unlocked, not only closed: see `Flock`.
-            }
-        } else {
-            *w = Wait::Done(got.map(|()| f));
-            theirs.1.notify_one();
-        }
-    })?;
-    let mut w = wait.0.lock().unwrap_or_else(|e| e.into_inner());
+/// One blocked flock per lock file in this process, shared by every bounded wait for it
+/// (`flock_by`): the helper thread waiting in it, how many callers wait on it now, and what it got.
+#[derive(Default)]
+struct FlockWait {
+    waiters: usize,
+    got: Option<std::io::Result<File>>,
+}
+
+static FLOCK_WAITS: Mutex<Option<HashMap<PathBuf, FlockWait>>> = Mutex::new(None);
+static FLOCK_DONE: std::sync::Condvar = std::sync::Condvar::new();
+#[cfg(test)]
+static FLOCK_HELPERS: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+/// The exclusive flock of the file at `path` (made if missing), had by `deadline` or refused
+/// with `WouldBlock`. Waited for blocked, not polled: had as soon as the holder lets go, while
+/// the caller still returns at the deadline. The blocking flock is a helper thread's, one per
+/// file however many waits time out: a wait that finds one under way waits for the same, and
+/// one that times out only stops waiting. Once the helper has the lock, a caller still waiting
+/// takes it over; with none left it is let go of at once.
+fn flock_by(path: &Path, deadline: std::time::Instant) -> std::io::Result<File> {
+    let open = || File::options().create(true).truncate(false).write(true).open(path);
+    let mut waits = FLOCK_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Wait::Done(_) = &*w {
-            let Wait::Done(got) = std::mem::replace(&mut *w, Wait::Abandoned) else { unreachable!() };
-            return got;
-        }
-        match deadline.checked_duration_since(std::time::Instant::now()).filter(|left| !left.is_zero()) {
-            Some(left) => w = wait.1.wait_timeout(w, left).unwrap_or_else(|e| e.into_inner()).0,
-            None => {
-                *w = Wait::Abandoned;
-                return Err(std::io::ErrorKind::WouldBlock.into());
+        let map = waits.get_or_insert_with(HashMap::new);
+        match map.get_mut(path) {
+            Some(w) if w.got.is_some() => {
+                let got = map.remove(path).unwrap().got.unwrap();
+                // This caller's count went with the entry; any other waiting starts again.
+                FLOCK_DONE.notify_all();
+                return got;
             }
+            Some(_) => {}
+            None => {
+                let f = open()?;
+                match flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
+                    Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {}
+                    r => return r.map(|()| f),
+                }
+                let key = path.to_path_buf();
+                map.insert(key.clone(), FlockWait::default());
+                #[cfg(test)]
+                {
+                    *FLOCK_HELPERS.lock().unwrap().get_or_insert_with(HashMap::new).entry(key.clone()).or_default() += 1;
+                }
+                let spawned = std::thread::Builder::new().name("flock-wait".into()).spawn(move || {
+                    let got = flock(&f, libc::LOCK_EX).map(|()| f);
+                    let mut waits = FLOCK_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+                    let map = waits.get_or_insert_with(HashMap::new);
+                    match map.get_mut(&key) {
+                        Some(w) if w.waiters > 0 => {
+                            w.got = Some(got);
+                            FLOCK_DONE.notify_all();
+                        }
+                        _ => {
+                            map.remove(&key);
+                            if let Ok(f) = got {
+                                let _ = flock(&f, libc::LOCK_UN); // Unlocked, not only closed: see `Flock`.
+                            }
+                        }
+                    }
+                });
+                if let Err(e) = spawned {
+                    map.remove(path);
+                    return Err(e);
+                }
+                continue;
+            }
+        }
+        let left = deadline.checked_duration_since(std::time::Instant::now()).filter(|left| !left.is_zero());
+        let Some(left) = left else { return Err(std::io::ErrorKind::WouldBlock.into()) };
+        map.get_mut(path).unwrap().waiters += 1;
+        waits = FLOCK_DONE.wait_timeout(waits, left).unwrap_or_else(|e| e.into_inner()).0;
+        // Counted again on the next turn, if still waiting.
+        if let Some(w) = waits.get_or_insert_with(HashMap::new).get_mut(path) {
+            w.waiters -= 1;
         }
     }
 }
@@ -5004,15 +5041,15 @@ mod tests {
             drop(held);
             tx.send(()).unwrap();
         });
-        let got = flock_by(open(), libc::LOCK_EX, start + Duration::from_secs(30)).unwrap();
+        let got = flock_by(&path, start + Duration::from_secs(30)).unwrap();
         let had = start.elapsed();
         rx.recv().unwrap();
         releaser.join().unwrap();
         assert!(had >= Duration::from_millis(100) && had < Duration::from_secs(5), "had once let go of, not at the deadline: {had:?}");
         assert!(probe(&open(), libc::LOCK_EX).is_err(), "the lock returned is held");
-        // Held past the deadline: refused then, and what the abandoned helper gets later it lets go of.
+        // Held past the deadline: refused then, and what the helper gets later with no one waiting it lets go of.
         let start = std::time::Instant::now();
-        let err = flock_by(open(), libc::LOCK_EX, start + Duration::from_millis(50)).unwrap_err();
+        let err = flock_by(&path, start + Duration::from_millis(50)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         assert!(start.elapsed() >= Duration::from_millis(50) && start.elapsed() < Duration::from_secs(5));
         flock(&got, libc::LOCK_UN).unwrap();
@@ -5026,5 +5063,32 @@ mod tests {
             }
         };
         assert!(free, "the abandoned wait let go of the lock it got");
+    }
+
+    #[test]
+    fn timed_out_flock_waits_share_one_helper() {
+        let base = crate::test_util::TempDir::new("flock-by-shared");
+        let path = base.join("lock");
+        let open = || File::options().create(true).truncate(false).write(true).open(&path).unwrap();
+        let held = Flock::new(open(), libc::LOCK_EX).unwrap();
+        let helpers = || FLOCK_HELPERS.lock().unwrap().as_ref().and_then(|m| m.get(&path).copied()).unwrap_or(0);
+        for _ in 0..20 {
+            let err = flock_by(&path, std::time::Instant::now() + Duration::from_millis(5)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(helpers(), 1, "repeated timeouts leave one helper blocked in flock");
+        // A later wait takes over that helper's lock as soon as the holder lets go.
+        let start = std::time::Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        let got = flock_by(&path, start + Duration::from_secs(30)).unwrap();
+        let had = start.elapsed();
+        releaser.join().unwrap();
+        assert!(had < Duration::from_secs(5), "had once let go of: {had:?}");
+        assert_eq!(helpers(), 1, "the waiting helper's lock was handed over, no new one started");
+        assert!(probe(&open(), libc::LOCK_EX).is_err(), "the lock handed over is held");
+        flock(&got, libc::LOCK_UN).unwrap();
     }
 }
