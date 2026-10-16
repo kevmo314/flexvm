@@ -1275,8 +1275,16 @@ mod tests {
         assert!(reply["error"].as_str().unwrap().contains("not the source"), "{reply}");
         drop(full);
         drop(held);
-        // Lent once free (other tests' hosts share this process's lock threads: a few tries).
-        let reply = (0..5).map(|_| ask(requests[0].clone()).0).find(|r| r["error"] != BUSY).expect("lent");
+        // Lent once free (other tests' hosts share this process's lock threads and slot budget).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reply = loop {
+            let reply = ask(requests[0].clone()).0;
+            if reply["error"] != BUSY {
+                break reply;
+            }
+            assert!(Instant::now() < deadline, "not lent before deadline: {reply}");
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(reply["result"]["ip"], "10.200.0.7", "{reply}");
     }
 
