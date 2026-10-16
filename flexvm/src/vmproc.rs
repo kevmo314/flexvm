@@ -1747,7 +1747,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
         }
     };
     // Starved only when the host refused it: at its own ceiling, moving it cannot help.
-    let starved = plan.short && refused;
+    let starved = plan.starved(vm.starved.load(Ordering::SeqCst), refused);
     if vm.starved.swap(starved, Ordering::SeqCst) != starved {
         match starved {
             true if host.config_now().peers.is_empty() => {
@@ -1837,6 +1837,21 @@ struct Plan {
     charge: u64,
     /// The guest has less free than its headroom.
     short: bool,
+    /// Balloon statistics inside the post-resize delay cannot establish recovery.
+    stale: bool,
+}
+
+impl Plan {
+    fn starved(&self, was: bool, refused: bool) -> bool {
+        // A fresh guest request can be refused before the next controller tick.
+        // That tick must not clear the refusal just because stale statistics
+        // suppress its growth (charge = 0): the guest's next retry would log it again.
+        if self.stale {
+            was
+        } else {
+            self.short && refused
+        }
+    }
 }
 
 impl Sizes {
@@ -1868,7 +1883,7 @@ impl Sizes {
         } else {
             plugged
         };
-        Some(Plan { settle, new, charge: new.saturating_sub(requested.max(plugged)), short })
+        Some(Plan { settle, new, charge: new.saturating_sub(requested.max(plugged)), short, stale })
     }
 }
 
@@ -3127,10 +3142,10 @@ mod tests {
     #[test]
     fn memory_hints_only_grow() {
         for avail in [7800, 99999999 >> 10, u64::MAX] {
-            assert_eq!(SIZES.plan(8192, 8192, avail, secs(11), true, false), Some(Plan { settle: false, new: 8192, charge: 0, short: false }));
+            assert_eq!(SIZES.plan(8192, 8192, avail, secs(11), true, false), Some(Plan { settle: false, new: 8192, charge: 0, short: false, stale: false }));
         }
         // Balloon statistics still reclaim surplus memory.
-        assert_eq!(SIZES.plan(8192, 8192, 7800, secs(11), false, false), Some(Plan { settle: false, new: 4736, charge: 0, short: false }));
+        assert_eq!(SIZES.plan(8192, 8192, 7800, secs(11), false, false), Some(Plan { settle: false, new: 4736, charge: 0, short: false, stale: false }));
         // A fresh hint bypasses the statistics delay and grows promptly.
         let p = SIZES.plan(8192, 8192, 0, Duration::ZERO, true, false).unwrap();
         assert!(p.new > 8192 && p.charge == p.new - 8192 && p.short, "{p:?}");
@@ -3143,7 +3158,7 @@ mod tests {
         assert_eq!(SIZES.plan(5248, 4096, 512, secs(5), false, false), None);
         // Stalled: settled at what is plugged; a tick right after (stale stats) does not grow.
         let p = SIZES.plan(5248, 4096, 512, secs(11), false, false).unwrap();
-        assert_eq!(p, Plan { settle: true, new: 4096, charge: 0, short: true });
+        assert_eq!(p, Plan { settle: true, new: 4096, charge: 0, short: true, stale: true });
         // The guest asking grows from what is plugged, charging the growth once.
         let p = SIZES.plan(5248, 4096, 512, secs(11), true, false).unwrap();
         assert!(p.settle && p.new > 4096 && p.charge == p.new - 4096, "{p:?}");
@@ -3157,9 +3172,9 @@ mod tests {
         // Shrink 8192 -> 4736 outstanding, plenty free: busy.
         assert_eq!(SIZES.plan(4736, 8192, 7800, secs(5), false, false), None);
         // Stalled: settled at 8192, and the shrink delay restarts (no new target yet).
-        assert_eq!(SIZES.plan(4736, 8192, 7800, secs(11), false, false), Some(Plan { settle: true, new: 8192, charge: 0, short: false }));
+        assert_eq!(SIZES.plan(4736, 8192, 7800, secs(11), false, false), Some(Plan { settle: true, new: 8192, charge: 0, short: false, stale: true }));
         // 10 s later the shrink is chosen again, from what is plugged.
-        assert_eq!(SIZES.plan(8192, 8192, 7800, secs(11), false, false), Some(Plan { settle: false, new: 4736, charge: 0, short: false }));
+        assert_eq!(SIZES.plan(8192, 8192, 7800, secs(11), false, false), Some(Plan { settle: false, new: 4736, charge: 0, short: false, stale: false }));
     }
 
     #[test]
@@ -3177,6 +3192,44 @@ mod tests {
         assert_eq!(Resized::of(false, true, false, true), Resized::Refused);
         assert_eq!(Resized::of(false, false, false, true), Resized::Same);
         assert_eq!(Resized::of(true, true, false, false), Resized::Grew);
+    }
+
+    #[test]
+    fn refused_growth_stays_starved_across_stale_ticks_and_retries() {
+        let (mut starved, mut logged) = (false, 0);
+        let mut observe = |plan: Plan, refused| {
+            let next = plan.starved(starved, refused);
+            logged += usize::from(next && !starved);
+            starved = next;
+            next
+        };
+        // A plug just completed. A fresh guest hint is refused before balloon
+        // statistics leave the 1.5 s delay; ticks in that window charge nothing.
+        let hint = || SIZES.plan(8192, 8192, 0, Duration::from_millis(250), true, false).unwrap();
+        assert!(observe(hint(), true));
+        for ms in [500, 1000, 1499] {
+            // Both short and apparently recovered stale statistics must preserve it.
+            for avail in [0, 7800] {
+                let tick = SIZES.plan(8192, 8192, avail, Duration::from_millis(ms), false, false).unwrap();
+                assert_eq!(tick.charge, 0);
+                assert!(observe(tick, false));
+                assert!(observe(hint(), true));
+            }
+        }
+        // Once the delay ends, a tick asks admission too. Refusal (including
+        // backoff) is still the same episode, however many times it retries.
+        for ms in [1500, 2000, 5000, 15000] {
+            let tick = SIZES.plan(8192, 8192, 0, Duration::from_millis(ms), false, false).unwrap();
+            assert!(tick.charge > 0);
+            assert!(observe(tick, true));
+        }
+        // A granted step really ends the refusal; another refusal starts a new episode.
+        assert!(!observe(hint(), false));
+        assert!(observe(hint(), true));
+        // Fresh evidence of enough headroom also ends it.
+        let recovered = SIZES.plan(8192, 8192, 7800, secs(2), false, false).unwrap();
+        assert!(!observe(recovered, false));
+        assert_eq!(logged, 2, "one log per episode, including all retries");
     }
 
     #[test]
