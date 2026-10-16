@@ -15,22 +15,32 @@ cd "$root"
 # A fixed default: a commit that leaves the image inputs alone keeps the same rootfs hash.
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1700000000}
 
-target=${CARGO_TARGET_DIR:-$root/target}
-RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p flexvm-init --target x86_64-unknown-linux-gnu
+# Where cargo puts the build, passed explicitly, so flexvm-init is taken from
+# the directory just built into and never a stale one elsewhere.
+target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p flexvm-init --target x86_64-unknown-linux-gnu --target-dir "$target"
 # Also injected into templates built from container images (flexvm template --image).
 sudo install -D -m 755 "$target"/x86_64-unknown-linux-gnu/release/flexvm-init "$out/flexvm-init"
 
-work=$root/build/rootfs
-sudo rm -rf "$work"
-mkdir -p "$(dirname "$work")"
+# Unpacked as root, setuid binaries and device nodes included: only inside a
+# fresh root-only (0700) directory beside the artifacts (on disk, not a tmpfs),
+# removed however this script ends.
+# Earlier versions unpacked into the checkout; that is removed too.
+sudo rm -rf -- "$root/build/rootfs"
+stage=$(sudo mktemp -d -p "$out" .rootfs.XXXXXX)
+tmp=
+trap 'rm -f -- "$tmp"; sudo rm -rf -- "$stage"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+work=$stage/rootfs
 sudo unsquashfs -q -d "$work" "$out/base.squashfs"
 sudo install -m 755 "$target"/x86_64-unknown-linux-gnu/release/flexvm-init "$work/sbin/flexvm-init"
 
 # Size to the content plus headroom, rounded up to 2 MiB as virtio-pmem requires.
 kib=$(sudo du -sk "$work" | cut -f1)
 mib=$(( (kib * 12 / 10 / 1024 + 64 + 1) / 2 * 2 ))
+mkdir -p "$root/build"
 tmp=$root/build/rootfs.$$.ext4
-trap 'rm -f "$tmp"' EXIT
 truncate -s "${mib}M" "$tmp"
 # mkfs copies source timestamps, including the freshly installed init and directories.
 # Do not follow symlinks: normalize the links themselves and stay inside the work tree.
@@ -50,7 +60,7 @@ sudo find "$work" -printf '%P\0' | while IFS= read -r -d '' path; do
   printf 'set_inode_field "/%s" ctime @%s\n' "$path" "$SOURCE_DATE_EPOCH"
 done | sudo E2FSPROGS_FAKE_TIME=1 debugfs -w -f - "$tmp" > /dev/null
 sudo chown "$(id -u):$(id -g)" "$tmp"
-sudo rm -rf "$work"
+sudo rm -rf -- "$stage"
 img=rootfs-$(sha256sum "$tmp" | cut -c1-12).ext4
 sudo test -e "$out/$img" || { sudo install -m 644 "$tmp" "$out/.$img" && sudo mv -T "$out/.$img" "$out/$img"; }
 sudo ln -sfn "$img" "$out/.rootfs.link" && sudo mv -T "$out/.rootfs.link" "$out/rootfs.ext4"

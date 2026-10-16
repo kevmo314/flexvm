@@ -204,7 +204,7 @@ impl Proc {
                 delete_consumed(&vm.name, &dir);
             }
             // What an earlier removal of it left (its address is this VM's).
-            let dir = self.host.suspended(&vm.name);
+            let dir = self.host.suspended(&vm.name)?;
             if dir.exists() && !self.host.is_suspended(&vm.name) {
                 remove_durably(&dir).map_err(|e| format!("removing what is left of {}: {e}", dir.display()))?;
             }
@@ -261,7 +261,7 @@ impl Proc {
                 let data = (m.data_pages * PAGE_SIZE as u64) >> 20;
                 crate::log!(
                     "{}",
-                    json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()})
+                    json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name).ok(), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()})
                 );
                 self.finish(&op, End::Suspended, 128 + libc::SIGTERM, None)
             }
@@ -277,7 +277,7 @@ impl Proc {
         let mut t = Phases::new();
         self.set_name(self.host.take_name(name, true)?);
         // Taking the name removed what an interrupted suspend, resume or discard left.
-        let dir = self.host.suspended(name);
+        let dir = self.host.suspended(name)?;
         if !dir.exists() {
             bail!("no vm named {name:?}");
         }
@@ -979,7 +979,7 @@ fn remove_durably(dir: &Path) -> std::io::Result<()> {
 /// removes it and lets go of its address here, without withdrawing its
 /// generation: a consumed checkpoint's VM may run on elsewhere.
 pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
-    let dir = host.suspended(name);
+    let dir = host.suspended(name)?;
     let ip = manifest(&dir).map(|m| m.ip);
     remove_durably(&dir).map_err(|e| format!("vm {name}: removing what is left of its suspended checkpoint {}: {e}", dir.display()))?;
     if let Some(ip) = ip {
@@ -994,7 +994,7 @@ pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
 /// but freeing its address failed (a later `kill` or the address's next
 /// claim finishes that).
 pub fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
-    let dir = host.suspended(name);
+    let dir = host.suspended(name)?;
     let (ip, gen) = (manifest(&dir).map(|m| m.ip), read_gen(&dir));
     mark_durably(&dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
     delete_consumed(name, &dir);
@@ -1032,7 +1032,7 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     if !host.is_suspended(name) {
         return None;
     }
-    let dir = host.suspended(name);
+    let dir = host.suspended(name).ok()?;
     let m = manifest(&dir)?;
     // A quarantine from an earlier boot no longer holds (`resume_suspended` drops it).
     let held = std::fs::read_to_string(dir.join(QUARANTINE)).is_ok_and(|q| quarantined(&q, crate::host::boot_id()).is_some());

@@ -288,7 +288,10 @@ impl Proc {
     }
 
     pub fn set_name(&self, n: NameLock) {
-        crate::util::output::fall_back_to(self.host.vms(&n.name, "log"));
+        // Checked when taken.
+        if let Ok(log) = self.host.vms(&n.name, "log") {
+            crate::util::output::fall_back_to(log);
+        }
         *self.name.lock().unwrap() = Some(n);
     }
 
@@ -587,7 +590,9 @@ impl Proc {
             (End::Gone | End::Died, Some(a)) if !source_runs => self.withdraw(a),
             (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
             (End::Moved(to), _) => {
-                let _ = std::fs::write(self.host.vms(&self.name(), "moved"), &to);
+                if let Ok(moved) = self.host.vms(&self.name(), "moved") {
+                    let _ = std::fs::write(moved, &to);
+                }
                 crate::log!("vm {}: moved to {to}", self.name());
             }
             // Never ran here, or (`Owed`) may run at its target: a peer's route for it comes back, any loan stays.
@@ -853,7 +858,10 @@ impl Proc {
         if *serving {
             return;
         }
-        let sock = self.host.sock(&self.name());
+        let sock = match self.host.sock(&self.name()) {
+            Ok(sock) => sock,
+            Err(e) => return crate::log!("vm {}: no control socket: {e}", self.name()),
+        };
         let _ = std::fs::remove_file(&sock);
         let l = match UnixListener::bind(&sock) {
             Ok(l) => l,
@@ -1057,7 +1065,7 @@ impl Proc {
         let (vm, source) = (self.vm(), req["mig"].as_u64().map(State::Source));
         if source != Some(vm.state()) {
             drop(slot);
-            return refuse_pages(s, &format!("vm {} is not the source of migration {}", vm.name, req["mig"]));
+            return refuse_not_source(s, &vm.name, &req["mig"]);
         }
         if fault("pages") {
             drop(slot);
@@ -1190,7 +1198,9 @@ impl Proc {
         let vm = self.vm();
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         crate::log!("vm {}: died: {why}", vm.name);
-        let _ = std::fs::write(self.host.vms(&vm.name, "failed"), &why);
+        if let Ok(failed) = self.host.vms(&vm.name, "failed") {
+            let _ = std::fs::write(failed, &why);
+        }
         self.finish(op, End::Died, DIED, None)
     }
 
@@ -1580,7 +1590,11 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
             let res = p.migrate_in(&req, unsafe { std::net::TcpStream::from_raw_fd(3) });
             if let Some(log) = log {
                 match crate::listen::finish_incoming_log(&p.host, &p.name(), &log, res.is_ok()) {
-                    Ok(()) if res.is_ok() => crate::util::output::published(&p.host.vms(&p.name(), "log")),
+                    Ok(()) if res.is_ok() => {
+                        if let Ok(log) = p.host.vms(&p.name(), "log") {
+                            crate::util::output::published(&log)
+                        }
+                    }
                     Ok(()) => {}
                     Err(e) => crate::log!("arrival log {}: {e}", log.display()),
                 }
@@ -2300,6 +2314,13 @@ fn tell(peer: &str, req: Value) -> Result<Value> {
 
 /// Refuses a page-server request on no page slot: draining for at most `PAGE_REFUSAL` in all while fewer than
 /// `MAX_PAGES` refusals do, otherwise without waiting on the client.
+/// The one refusal of a page request not for a source here, sent by the
+/// listener (no such VM) and by a VM (not the source) alike: a peer cannot
+/// tell from it which VMs run here.
+pub fn refuse_not_source(s: std::net::TcpStream, name: &str, mig: &Value) {
+    refuse_pages(s, &format!("vm {name:?} is not the source of migration {mig}"));
+}
+
 fn refuse_pages(s: std::net::TcpStream, why: &str) {
     let draining = Slot::take(&PAGE_REFUSALS, MAX_PAGES);
     crate::listen::refuse(s, why, draining.as_ref().map(|_| PAGE_REFUSAL));
@@ -2307,11 +2328,12 @@ fn refuse_pages(s: std::net::TcpStream, why: &str) {
 
 /// Connects and sends `req` by `at`; the stream's reads and writes then block.
 pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant) -> Result<UnixStream> {
+    let (sock, log) = (host.sock(name)?, host.vms(name, "log")?);
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
-    let c = crate::util::send_unix(&host.sock(name), &line, fds, at).map_err(|e| {
+    let c = crate::util::send_unix(&sock, &line, fds, at).map_err(|e| {
         if host.alive(name) {
-            format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready, or see {}: {e}", host.vms(name, "log").display())
+            format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready, or see {}: {e}", log.display())
         } else if host.is_suspended(name) {
             format!("vm {name:?} is suspended; use flexvm resume {name} first")
         } else {

@@ -117,7 +117,9 @@ fn vm_files(host: &Host) {
         if logs.is_none() || age(&path).is_none_or(|a| a <= ORPHAN_LOG_TTL) {
             continue;
         }
-        let orphan = host.holder_gone(name) && !host.suspended(name).exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).exists());
+        // Not a VM's name: never one of its logs.
+        let Ok(suspended) = host.suspended(name) else { continue };
+        let orphan = host.holder_gone(name) && !suspended.exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
         if orphan {
             let _ = std::fs::remove_file(&path);
         }
@@ -245,7 +247,7 @@ mod tests {
     }
 
     fn store_holder(host: &Host, name: &str, id: &crate::host::Ident) {
-        crate::host::store(&host.vms(name, "lock"), id, false).unwrap();
+        crate::host::store(&host.vms(name, "lock").unwrap(), id, false).unwrap();
     }
 
     #[test]
@@ -254,7 +256,7 @@ mod tests {
         let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
         let retirement = File::create(host.run.join(".retire.lock")).unwrap();
         flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).unwrap();
-        let marker = host.vms("gone", "moved");
+        let marker = host.vms("gone", "moved").unwrap();
         File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
         sweep(&host);
         assert!(!marker.exists());
@@ -268,14 +270,14 @@ mod tests {
     fn suspended_vms_keep_both_logs_until_the_snapshot_goes() {
         let d = dir("suspended-logs");
         let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
-        std::fs::create_dir_all(host.suspended("sleeping")).unwrap();
-        let logs = [host.vms("sleeping", "log"), host.vms("sleeping", "log.1")];
+        std::fs::create_dir_all(host.suspended("sleeping").unwrap()).unwrap();
+        let logs = [host.vms("sleeping", "log").unwrap(), host.vms("sleeping", "log.1").unwrap()];
         for path in &logs {
             File::create(path).unwrap().set_modified(SystemTime::now() - ORPHAN_LOG_TTL - Duration::from_secs(60)).unwrap();
         }
         vm_files(&host);
         assert!(logs.iter().all(|p| p.exists()), "a suspended VM has no live holder but keeps its logs");
-        std::fs::remove_dir_all(host.suspended("sleeping")).unwrap();
+        std::fs::remove_dir_all(host.suspended("sleeping").unwrap()).unwrap();
         vm_files(&host);
         assert!(logs.iter().all(|p| !p.exists()), "without its snapshot the old logs are orphaned");
     }

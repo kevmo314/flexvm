@@ -540,16 +540,17 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     // Opened and marked written holding the logs lock (shared): garbage
     // collection removes only a quiet log, holding it exclusively.
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    let f = std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?;
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log")?)?;
     f.set_modified(std::time::SystemTime::now())?;
     Ok(f)
 }
 
 fn spawn_detached(host: &Host, name: &str, args: &Args, log: &std::fs::File) -> Result<()> {
+    let log_path = host.vms(name, "log")?;
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
     util::spawn_self(&args.child_args, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
     drop(w);
-    let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", host.vms(name, "log").display()))?;
+    let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", log_path.display()))?;
     if reply["ok"] != json!(true) {
         return Err(reply["error"].as_str().unwrap_or("failed").to_string().into());
     }
@@ -607,32 +608,32 @@ fn kill(host: &Host, name: &str) -> Result<()> {
     }
     if let Ok(vm) = host.signal(name, libc::SIGINT) {
         if !vm.wait(Duration::from_secs(30)) {
-            return Err(format!("vm {name} is still there; see {}", host.vms(name, "log").display()).into());
+            return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
         }
         // A suspend that finished first is undone: the kill wins.
-        if !host.suspended(name).exists() {
+        if !host.suspended(name)?.exists() {
             return Ok(());
         }
     }
-    if host.suspended(name).exists() {
+    if host.suspended(name)?.exists() {
         let _lock = host.take_name(name, true)?;
         // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
-        if !host.suspended(name).exists() {
+        if !host.suspended(name)?.exists() {
             return Ok(());
         }
         return lifecycle::revoke(host, name)?;
     }
-    if !host.alive(name) && std::fs::remove_file(host.vms(name, "failed")).is_ok() {
+    if !host.alive(name) && std::fs::remove_file(host.vms(name, "failed")?).is_ok() {
         return Ok(());
     }
     if host.alive(name) {
         return Err(format!(
             "vm {name:?} is starting or its registry is unavailable; retry flexvm kill {name} once it is ready, or see {}",
-            host.vms(name, "log").display()
+            host.vms(name, "log")?.display()
         )
         .into());
     }
-    match std::fs::read_to_string(host.vms(name, "moved")) {
+    match std::fs::read_to_string(host.vms(name, "moved")?) {
         Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
         Err(_) => Err(format!("no vm named {name:?}").into()),
     }
@@ -677,7 +678,8 @@ fn list(host: &Host, as_json: bool) -> Result<()> {
     let names = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned());
     vms.extend(names(host.state.join("suspended")).filter(|n| !n.starts_with('.') && !host.alive(n)).filter_map(|n| lifecycle::describe_suspended(host, &n)));
     for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".failed").map(String::from)).filter(|n| !host.alive(n)) {
-        vms.push(json!({"name": n, "state": "failed", "error": std::fs::read_to_string(host.vms(&n, "failed")).unwrap_or_default()}));
+        let Ok(failed) = host.vms(&n, "failed") else { continue };
+        vms.push(json!({"name": n, "state": "failed", "error": std::fs::read_to_string(failed).unwrap_or_default()}));
     }
     if as_json {
         return print(json!(vms));
@@ -904,10 +906,10 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
                     deadline = Instant::now() + Duration::from_secs(30);
                 }
                 if !host.alive(name) {
-                    if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")) {
+                    if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
                         return Err(format!("vm {name} moved to {to}; the command keeps running there (session {id})").into());
                     }
-                    if !started || !host.suspended(name).is_dir() {
+                    if !started || !host.suspended(name)?.is_dir() {
                         return Err(e);
                     }
                 }
@@ -1244,7 +1246,7 @@ mod exec_tests {
         let mut child = child.arg("60").spawn().unwrap();
         let mut entry = host::Entry { name: "moving".into(), ident: host::Ident::of(child.id()).unwrap(), state: "source".into(), ..host::Entry::default() };
         // Hold the name on the child's behalf, with its identity in both records.
-        std::fs::write(host.vms("moving", "lock"), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
+        std::fs::write(host.vms("moving", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
         name.publish(&entry).unwrap();
         let refused = kill(&host, "moving").unwrap_err().to_string();
         assert_eq!(refused, "vm moving is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)");
