@@ -779,11 +779,16 @@ pub(super) mod tests {
         }
         drop(fd);
         let root = open_dir_at(libc::AT_FDCWD, &cpath(&s.root).unwrap()).unwrap();
-        // In a child with 32 descriptors at most, so the limit holds whatever this process's is.
+        // Keep only stdio and the root in the child: parallel tests' inherited sockets/files
+        // must not consume the descriptor budget intended for the removal.
         let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
         if pid == 0 {
             let limit = libc::rlimit { rlim_cur: 32, rlim_max: 32 };
-            let ok = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 && remove_at(root.as_raw_fd(), c"d").is_ok();
+            let ok = unsafe { libc::dup2(root.as_raw_fd(), 3) } == 3
+                && unsafe { libc::close_range(4, u32::MAX, 0) } == 0
+                && unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0
+                && remove_at(3, c"d").is_ok();
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
         let mut status = 0;
