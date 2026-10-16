@@ -7981,6 +7981,66 @@ def revoked_publication():
     check("revoked: resumes, md5 intact", md5(A, n) == m)
 
 
+def warm_ready():
+    """A warm image's ready command uses USER app:group, including its group list."""
+    import hashlib, io, shutil, tarfile
+
+    n, tpl = "ft-warm-ready", args.template + "-warm-ready"
+    # A local OCI fixture needs no registry: a shell, id and sleep from this Linux
+    # host, with their loader/libraries, plus users that distinguish explicit-group
+    # semantics from the passwd primary and supplementary groups.
+    with tempfile.TemporaryDirectory(prefix="fv-warm-ready-") as image:
+        layer = io.BytesIO()
+        with tarfile.open(fileobj=layer, mode="w", dereference=True) as tar:
+            files = set()
+            for tool in ("sh", "id", "sleep"):
+                binary = shutil.which(tool)
+                assert binary, f"missing {tool}"
+                files.add(binary)
+                deps = subprocess.run(["ldd", binary], capture_output=True, text=True)
+                files.update(re.findall(r"/[^\s()]+", deps.stdout))
+                # Commands use /bin even on hosts whose PATH prefers /usr/bin.
+                tar.add(binary, arcname=f"bin/{tool}")
+            for path in sorted(files):
+                tar.add(path, arcname=path.lstrip("/"))
+            for path, text in (("etc/passwd", "app:x:1000:1000::/tmp:/bin/sh\n"),
+                               ("etc/group", "primary:x:1000:app\ngroup:x:2000:\nextra:x:42:app\n")):
+                data = text.encode()
+                entry = tarfile.TarInfo(path)
+                entry.size, entry.mode = len(data), 0o644
+                tar.addfile(entry, io.BytesIO(data))
+            entry = tarfile.TarInfo("tmp")
+            entry.type, entry.mode = tarfile.DIRTYPE, 0o1777
+            tar.addfile(entry)
+
+        def blob(data):
+            digest = hashlib.sha256(data).hexdigest()
+            path = os.path.join(image, "blobs", "sha256", digest)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            return {"digest": "sha256:" + digest, "size": len(data)}
+
+        ld = blob(layer.getvalue())
+        identity = 'test "$(id -u)" = 1000 && test "$(id -g)" = 2000 && test "$(id -G)" = 2000'
+        cmd = ["/bin/sh", "-c", identity + " && echo app-ready > /tmp/app-ready && exec sleep 10000"]
+        conf = blob(json.dumps({"architecture": "amd64", "os": "linux", "config": {
+            "User": "app:group", "Env": ["PATH=/bin:/usr/bin"], "Cmd": cmd},
+            "rootfs": {"type": "layers", "diff_ids": [ld["digest"]]}}).encode())
+        manifest = blob(json.dumps({"schemaVersion": 2, "config": conf, "layers": [ld]}).encode())
+        with open(os.path.join(image, "index.json"), "w") as f:
+            json.dump({"schemaVersion": 2, "manifests": [manifest]}, f)
+        with open(os.path.join(image, "oci-layout"), "w") as f:
+            json.dump({"imageLayoutVersion": "1.0.0"}, f)
+        ready = identity + " && test -f /tmp/app-ready"
+        code, out, err = cli(A, "template", tpl, "--image", image, "--vcpus", "2", "--max", "2048",
+                             "--warm", "--ready-cmd", ready, "--ready-timeout", "10", timeout=600)
+        check("warm ready: template passes the credential check", code == 0, err or out)
+    ok(run(A, n, template=tpl))
+    code, out, err = cli(A, "exec", n, "test -f /tmp/app-ready")
+    check("warm ready: restored app passed its credential check", code == 0, err or out)
+
+
 def app_template():
     """A template whose app floods its log past the guest's 1 MiB ring, then
     prints numbered lines (built from --image)."""
@@ -8832,7 +8892,7 @@ SCENARIOS = dict(
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,
     revoked_publication=revoked_publication,
-    app_log=app_log, bad_app_log=bad_app_log,
+    app_log=app_log, bad_app_log=bad_app_log, warm_ready=warm_ready,
     source_unpublished=source_unpublished,
     source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,

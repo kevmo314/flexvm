@@ -198,7 +198,8 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
 }
 
 fn read_conf(path: impl AsRef<std::path::Path>) -> io::Result<Conf> {
-    let text = std::fs::read_to_string(path).map_err(|e| io::Error::new(e.kind(), format!("{CONF}: {e}")))?;
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
     parse_conf(&text)
 }
 
@@ -655,6 +656,7 @@ mod tests {
         let dir = crate::test_util::TempDir::new("cached-app-error");
         let path = dir.join("app.conf");
         let cached = LazyLock::new(|| read_conf(&path));
+        assert!(cached.as_ref().err().unwrap().to_string().starts_with(&format!("{}: ", path.display())));
         assert_eq!(cached.as_ref().err().unwrap().kind(), io::ErrorKind::NotFound);
         std::fs::write(&path, "arg /bin/app\nuid 0\n").unwrap();
         assert!(read_conf(&path).is_ok());

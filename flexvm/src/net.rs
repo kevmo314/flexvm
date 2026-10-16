@@ -850,7 +850,14 @@ mod tests {
         let tap = format!("tw4p{:x}", std::process::id());
         let tc = |args: &str| std::process::Command::new("tc").args(args.split(' ')).output().unwrap();
         let root = || String::from_utf8_lossy(&tc(&format!("qdisc show dev {tap} root")).stdout).into_owned();
+        struct TapGuard<'a>(&'a str);
+        impl Drop for TapGuard<'_> {
+            fn drop(&mut self) {
+                delete_tap(self.0);
+            }
+        }
         create_tap(&tap, "flexvm 1 2 /run/x").unwrap();
+        let _tap = TapGuard(&tap);
         let alias = std::fs::read_to_string(format!("/sys/class/net/{tap}/ifalias")).unwrap();
         assert_eq!(alias.trim_end(), "flexvm 1 2 /run/x");
         assert!(tc(&format!("qdisc add dev {tap} root handle 1: fq_codel")).status.success());
@@ -874,7 +881,6 @@ mod tests {
             let f = filters();
             assert!(f.matches("direct-action").count() == 1 && f.contains(&format!(" {},", u32::from(ip))), "{f}");
         }
-        delete_tap(&tap);
     }
 
     /// `source_filter`'s verdict on `frame` (with a VLAN tag stripped or not), by a classic BPF
