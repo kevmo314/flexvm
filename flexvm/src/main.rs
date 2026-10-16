@@ -55,11 +55,14 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm reclaim IP [--force GEN]    take back an address lent out with a VM that migrated away,
                                      once its target is gone for good (without --force: say what)
-  flexvm config [--peer HOST:PORT]... [--vm-ips CIDR|FIRST-LAST] [--dns IP] [--underlay IP]
-                [--cluster-ips CIDR|FIRST-LAST] [--announce-dev IFACE|none] [--reserve MIB] [--evict-at MIB]
+  flexvm config [--peer HOST:PORT]... [--peer-underlay HOST:PORT=IP[,IP]]... [--vm-ips CIDR|FIRST-LAST]
+                [--dns IP] [--underlay IP] [--cluster-ips CIDR|FIRST-LAST] [--announce-dev IFACE|none]
+                [--reserve MIB] [--evict-at MIB]
                                      set this host's settings, live (no flags: show them and what is
                                      derived for those unset); --peer replaces the list, '' unsets
                                      --cluster-ips holds every host's VM range (unset: only --vm-ips)
+                                     --peer-underlay: a peer's next hops on another network than its
+                                     --peer address (its --underlay); replaces them all
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
   flexvm recover                     sweep and refill standby VMs now, as root (at boot, without a listener)
   flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
@@ -285,10 +288,14 @@ fn state(args: &Args) -> Result<PathBuf> {
 /// listener and `recover` the rest after this; any other command all of it here.
 pub fn open_host(args: &Args) -> Result<Host> {
     let host = open_host_only(args)?;
-    let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
-    if let Err(e) = gc::after_boot(&host, !partly) {
-        if gc::first_boot_warning(&host, host::boot_id()) {
-            crate::log!("flexvm: recovering after boot: {e}");
+    let cmd = args.positional.first().map(String::as_str);
+    // Not `config`: it may be fixing the configuration recovery goes by.
+    if cmd != Some("config") {
+        let partly = matches!(cmd, Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
+        if let Err(e) = gc::after_boot(&host, !partly) {
+            if gc::first_boot_warning(&host, host::boot_id()) {
+                crate::log!("flexvm: recovering after boot: {e}");
+            }
         }
     }
     Ok(host)
@@ -301,7 +308,11 @@ fn open_host_only(args: &Args) -> Result<Host> {
         Some(run) => PathBuf::from(run),
         None => host::default_run(&state)?,
     };
-    Host::open(&state, &run)
+    // `config` is how a host.json with invalid ranges is fixed: it validates what it saves.
+    match args.positional.first().map(String::as_str) {
+        Some("config") => Host::open_unvalidated(&state, &run),
+        _ => Host::open(&state, &run),
+    }
 }
 
 fn paths(args: &Args) -> Result<Paths> {
@@ -378,9 +389,7 @@ fn real_main(args: &Args) -> Result<()> {
             if CONFIG_FLAGS.iter().any(|f| args.has(f)) {
                 host.configure(|c| configure(c, args))?;
             }
-            let c = &host.cfg;
-            let derived = json!({"prefix": host.tap_prefix(), "underlay": c.underlay(), "announce_dev": c.announce_dev(), "reserve_mib": c.reserve(), "evict_at_mib": c.evict_at()});
-            print(json!({"set": c, "derived": derived}))
+            print(config_output(&host))
         }
         Some("standby") if name.is_empty() => print(standby::show(&open_host(args)?)),
         Some("standby") => {
@@ -413,6 +422,12 @@ fn real_main(args: &Args) -> Result<()> {
     }
 }
 
+fn config_output(host: &Host) -> Value {
+    let c = &host.cfg;
+    let derived = json!({"prefix": host.tap_prefix(), "cluster_ips": c.effective_cluster_ips(), "underlay": c.underlay(), "announce_dev": c.announce_dev(), "reserve_mib": c.reserve(), "evict_at_mib": c.evict_at()});
+    json!({"set": c, "derived": derived})
+}
+
 /// Bind and validate before publishing any host configuration.
 fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std::net::TcpListener>) -> Result<std::net::TcpListener> {
     let mut listener = None;
@@ -439,6 +454,9 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
         listener = Some(bound);
         Ok(())
     })?;
+    if let Some(warning) = host.cfg.cluster_warning() {
+        crate::log!("{warning}");
+    }
     Ok(listener.unwrap())
 }
 
@@ -465,7 +483,7 @@ fn takes(local: std::net::SocketAddr, v6only: bool, ip: std::net::IpAddr) -> boo
 }
 
 /// What `configure` sets.
-const CONFIG_FLAGS: &[&str] = &["peer", "vm-ips", "cluster-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at"];
+const CONFIG_FLAGS: &[&str] = &["peer", "peer-underlay", "vm-ips", "cluster-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at"];
 
 /// Flags not given keep their configured values; an empty one unsets it
 /// (derived again where used). --peers replace the list (`--peer ''` empties
@@ -477,6 +495,24 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
             bail!("bad --peer {p:?}: give HOST:PORT, a peer's flexvm listen address");
         }
     }
+    if args.has("peer-underlay") {
+        c.peer_underlays.clear();
+        for entry in args.all("peer-underlay").into_iter().filter(|e| !e.is_empty()) {
+            let bad = || format!("bad --peer-underlay {entry:?}: give HOST:PORT=IP[,IP...], a --peer and its data-plane addresses");
+            let (peer, ips) = entry.rsplit_once('=').ok_or_else(bad)?;
+            let ips: Vec<std::net::Ipv4Addr> = ips.split(',').map(|i| i.trim().parse()).collect::<std::result::Result<_, _>>().map_err(|_| bad())?;
+            if !c.peers.iter().any(|p| p == peer) {
+                bail!("--peer-underlay {entry:?}: {peer} is not a --peer");
+            }
+            if let Some(ip) = ips.iter().find(|i| i.is_unspecified() || i.is_broadcast() || i.is_multicast() || net::is_local_addr(**i).unwrap_or(true)) {
+                bail!("--peer-underlay {entry:?}: {ip} is local or not unicast");
+            }
+            c.peer_underlays.entry(peer.into()).or_default().extend(ips);
+        }
+    }
+    // A peer no longer configured takes its underlays with it.
+    let peers = c.peers.clone();
+    c.peer_underlays.retain(|p, _| peers.contains(p));
     if let Some(r) = args.get("vm-ips") {
         c.vm_ips = if r.is_empty() { host::Config::default().vm_ips } else { r.into() };
         net::IpRange::parse(&c.vm_ips)?;
@@ -484,11 +520,7 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
     if let Some(r) = args.get("cluster-ips") {
         c.cluster_ips = (!r.is_empty()).then(|| r.into());
     }
-    if let Some(r) = &c.cluster_ips {
-        if !net::IpRange::parse(r)?.contains_range(&c.range()?) {
-            bail!("--vm-ips {} is not inside --cluster-ips {r}", c.vm_ips);
-        }
-    }
+    c.validate_ranges()?;
     if let Some(u) = args.get("underlay") {
         c.underlay = (!u.is_empty()).then(|| u.parse()).transpose().map_err(|_| format!("bad --underlay {u:?}"))?;
     }
@@ -516,8 +548,8 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
     if !c.peers.is_empty() && c.vm_ips == host::Config::default().vm_ips {
         crate::log!("flexvm: warning: --vm-ips is the default {}; each peer needs a range of its own", c.vm_ips);
     }
-    if !c.peers.is_empty() && c.cluster_ips.is_none() {
-        crate::log!("flexvm: warning: --cluster-ips is unset; peer VM addresses outside --vm-ips {} are refused", c.vm_ips);
+    if let Some(warning) = c.cluster_warning() {
+        crate::log!("{warning}");
     }
     Ok(())
 }
@@ -711,7 +743,8 @@ fn reclaim(host: &Host, ip: &str, force: Option<u64>) -> Result<()> {
         .into());
     };
     let (gen, forgot) = host.reclaim(ip, expected)?;
-    vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+    // The operator's word that no host runs it: past whichever peer it is routed via there.
+    vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": u64::MAX}));
     util::log_line(format!(
         "WARNING: {ip} reclaimed (generation {gen} withdrawn, lent with {whom}); if that vm still runs anywhere, it shares {ip} with the next vm given it"
     ));
@@ -1121,6 +1154,41 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn peer_underlays_are_set_per_configured_peer() {
+        let mut c = host::Config::default();
+        let set = |c: &mut host::Config, flags: &[&str]| configure(c, &parse(flags));
+        set(&mut c, &["--peer", "192.0.2.7:7070", "--peer", "b.example:7070", "--peer-underlay", "192.0.2.7:7070=198.51.100.7,198.51.100.8"]).unwrap();
+        assert_eq!(c.underlays_of("192.0.2.7:7070"), ["198.51.100.7".parse::<std::net::Ipv4Addr>().unwrap(), "198.51.100.8".parse().unwrap()]);
+        // Replaced whole.
+        set(&mut c, &["--peer-underlay", "b.example:7070=198.51.100.9"]).unwrap();
+        assert!(c.underlays_of("192.0.2.7:7070").is_empty() && c.underlays_of("b.example:7070").len() == 1);
+        for bad in ["c.example:7070=198.51.100.9", "b.example:7070", "b.example:7070=x", "b.example:7070=127.0.0.1", "b.example:7070=224.0.0.1"] {
+            assert!(set(&mut c.clone(), &["--peer-underlay", bad]).is_err(), "{bad}");
+        }
+        // A peer dropped takes its underlays with it; '' clears them all.
+        set(&mut c, &["--peer", "192.0.2.7:7070"]).unwrap();
+        assert!(c.peer_underlays.is_empty());
+        set(&mut c, &["--peer", "192.0.2.7:7070", "--peer-underlay", "192.0.2.7:7070=198.51.100.7"]).unwrap();
+        set(&mut c, &["--peer-underlay", ""]).unwrap();
+        assert!(c.peer_underlays.is_empty());
+    }
+
+    #[test]
+    fn config_output_shows_the_effective_allowlist() {
+        let root = crate::test_util::TempDir::new("config-allowlist");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let output = config_output(&host);
+        assert!(output["set"]["cluster_ips"].is_null());
+        assert_eq!(output["derived"]["cluster_ips"], host.cfg.vm_ips);
+        host.configure(|c| {
+            c.cluster_ips = Some("10.200.0.0/15".into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(config_output(&host)["derived"]["cluster_ips"], "10.200.0.0/15");
     }
 
     #[test]

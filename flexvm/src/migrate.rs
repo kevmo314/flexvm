@@ -413,11 +413,14 @@ impl Proc {
     /// A failed route is retried in the background: the target owns the VM either way.
     fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>, switch: bool) -> (Option<hold::Stats>, Result<()>) {
         let ip = self.vm().ip;
-        let Some(via) = target["underlay"].as_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else {
-            if let Some(h) = self.holder() {
-                h.forget(ip, mig);
+        let via = match target_via(&self.host, target, conn) {
+            Ok(via) => via,
+            Err(e) => {
+                if let Some(h) = self.holder() {
+                    h.forget(ip, mig);
+                }
+                return (None, Err(e));
             }
-            return (None, Err("target sent no underlay".into()));
         };
         let (mut held, mut res) = (None, None);
         if let Some(h) = self.holder().filter(|h| h.holding_for(ip, mig)) {
@@ -927,6 +930,17 @@ impl Proc {
     }
 }
 
+/// Check the target before forwarding held packets or changing any route.
+fn target_via(host: &crate::host::Host, target: &Value, conn: Option<&TcpStream>) -> Result<Ipv4Addr> {
+    let via = target["underlay"].as_str().ok_or("target sent no underlay")?.parse()?;
+    let mut peers = crate::listen::known_peers(host)?;
+    if let Some(conn) = conn {
+        peers.push(conn.peer_addr()?.ip());
+    }
+    crate::listen::check_via(via, &peers)?;
+    Ok(via)
+}
+
 /// An arrival's (MiB to page in, guest size) from what its source sent: the
 /// pages it pulls, and its boot memory plus what is plugged (all of the
 /// hotplug region from a source that does not say).
@@ -1061,6 +1075,29 @@ fn unplug(vm: &Vm) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_underlay_must_be_a_known_peer() {
+        let root = crate::test_util::TempDir::new("target-via");
+        let mut host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        host.configure(|c| {
+            c.peers = vec!["192.0.2.7:7070".into(), "127.0.0.1:7070".into()];
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), None).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
+        // A peer sharing this network namespace: the handoff goes by its local underlay.
+        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), None).unwrap(), Ipv4Addr::LOCALHOST);
+        for target in [json!({}), json!({"underlay": "192.0.2.8"}), json!({"underlay": "127.0.0.2"})] {
+            assert!(target_via(&host, &target, None).is_err());
+        }
+        host.configure(|c| {
+            c.peers.push("unseen.invalid:7070".into());
+            Ok(())
+        })
+        .unwrap();
+        assert!(target_via(&host, &json!({"underlay": "192.0.2.7"}), None).is_err());
+    }
 
     /// A refused arrival reads what its source still sends, so the source, still writing, gets the reason, not a reset.
     #[test]

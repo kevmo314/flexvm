@@ -64,6 +64,10 @@ pub struct Config {
     pub run: Option<PathBuf>,
     pub listen: Option<String>,
     pub peers: Vec<String>,
+    /// A peer's data-plane addresses besides those it is reached by (`--peer-underlay`): next hops
+    /// it may report for its VMs, as its own `--underlay` on another network. Only a configured peer's count.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub peer_underlays: std::collections::BTreeMap<String, Vec<Ipv4Addr>>,
     /// Disjoint across hosts.
     pub vm_ips: String,
     /// Every host's VM addresses. None: only this host's `vm_ips`.
@@ -86,6 +90,7 @@ impl Default for Config {
             run: None,
             listen: None,
             peers: Vec::new(),
+            peer_underlays: Default::default(),
             vm_ips: "10.200.0.0/16".into(),
             cluster_ips: None,
             underlay: None,
@@ -190,7 +195,36 @@ impl Config {
 
     /// The only addresses a peer's VM may have here (#584): `cluster_ips`, else this host's `vm_ips`.
     pub fn cluster(&self) -> Result<IpRange> {
-        IpRange::parse(self.cluster_ips.as_deref().unwrap_or(&self.vm_ips))
+        IpRange::parse(self.effective_cluster_ips())
+    }
+
+    pub fn validate_ranges(&self) -> Result<()> {
+        if !self.cluster()?.contains_range(&self.range()?) {
+            bail!("--vm-ips {} is not inside --cluster-ips {}", self.vm_ips, self.effective_cluster_ips());
+        }
+        Ok(())
+    }
+
+    /// `peer`'s configured underlays (`--peer-underlay`), none unless it is a configured peer.
+    pub fn underlays_of(&self, peer: &str) -> &[Ipv4Addr] {
+        match self.peers.iter().any(|p| p == peer) {
+            true => self.peer_underlays.get(peer).map_or(&[], Vec::as_slice),
+            false => &[],
+        }
+    }
+
+    /// Every configured peer's configured underlays.
+    pub fn peer_underlay_addrs(&self) -> Vec<IpAddr> {
+        self.peers.iter().flat_map(|p| self.underlays_of(p)).map(|&u| IpAddr::V4(u)).collect()
+    }
+
+    pub fn effective_cluster_ips(&self) -> &str {
+        self.cluster_ips.as_deref().unwrap_or(&self.vm_ips)
+    }
+
+    pub fn cluster_warning(&self) -> Option<String> {
+        (!self.peers.is_empty() && self.cluster_ips.is_none())
+            .then(|| format!("flexvm: warning: --cluster-ips is unset; peer VM addresses outside --vm-ips {} are refused", self.vm_ips))
     }
 
     /// Never a wildcard address. Unset: the listen address, else the source
@@ -441,7 +475,16 @@ impl Host {
     /// and the run directory to that state root (`claim_run`).
     /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
     /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
+    /// A `host.json` whose ranges do not validate is refused (see `open_unvalidated`).
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
+        let host = Self::open_unvalidated(state, run)?;
+        host.cfg.validate_ranges().map_err(|e| format!("{}: {e}; fix it with flexvm config", host.state.join("host.json").display()))?;
+        Ok(host)
+    }
+
+    /// `open`, taking `host.json` whatever its ranges: for `flexvm config`, which is how they are
+    /// fixed (`configure` validates what it saves).
+    pub fn open_unvalidated(state: &Path, run: &Path) -> Result<Host> {
         let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("owed", 0o700), ("withdrawals", 0o700), ("suspended", 0o700)];
         let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
         let named = |d: &Path, e: std::io::Error| {
@@ -498,6 +541,7 @@ impl Host {
         let mut cfg: Config = load(&path)?.unwrap_or_default();
         cfg.run = Some(self.run.clone());
         change(&mut cfg)?;
+        cfg.validate_ranges()?;
         store(&path, &cfg, true)?;
         self.cfg = cfg;
         self.cfg_stamp = stamp(&path);
@@ -516,7 +560,7 @@ impl Host {
     /// The configuration as it is now: `flexvm listen` may have changed the
     /// reserve, the eviction mark or the peers since this process started.
     /// host.json is read again once its mtime or inode changed (then cached by both).
-    /// While it cannot be read whole (mid-write, missing), the newest one that was read
+    /// While it cannot be read whole and validated (mid-write, missing, invalid ranges), the newest one that was read
     /// stands, never an older one: a peer revoked since is not let back in.
     pub fn config_now(&self) -> Config {
         let path = self.state.join("host.json");
@@ -529,7 +573,7 @@ impl Host {
         if let Some((_, cfg)) = last.as_ref().filter(|(t, _)| Some(*t) == now) {
             return cfg.clone();
         }
-        if let Some(mut cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten()) {
+        if let Some(mut cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten().filter(|c| c.validate_ranges().is_ok())) {
             cfg.run = Some(self.run.clone());
             *seen = Some((now.unwrap(), cfg.clone()));
             return cfg;
@@ -1157,7 +1201,7 @@ impl Host {
         let a = self.addr(l, ip)?;
         let dying = dead.is_some() && a.holder_id.as_ref() == dead;
         let Some(via) = a.via.filter(|_| !a.withdrawn && (dying || !self.held(&a))) else { return Ok(false) };
-        if !self.in_cluster(ip, via) {
+        if !self.route_allowed(ip, via) {
             return Ok(false);
         }
         crate::net::route_via(ip, via)?;
@@ -1165,14 +1209,29 @@ impl Host {
         Ok(true)
     }
 
-    /// A peer's route comes back from its record only for an address the local allowlist still
-    /// holds: a record from before #584, or from a wider `cluster_ips`, is left out.
-    fn in_cluster(&self, ip: Ipv4Addr, via: Ipv4Addr) -> bool {
-        let ok = self.config_now().cluster().is_ok_and(|c| c.contains(ip));
-        if !ok {
-            crate::log!("route {ip} via {via}: not put back, outside this host's configured VM ranges");
+    /// Recheck saved routes against current configuration, without DNS or a wait under the lock.
+    fn route_allowed(&self, ip: Ipv4Addr, via: Ipv4Addr) -> bool {
+        self.route_check(ip, via).unwrap_or_else(|e| {
+            crate::log!("route {ip} via {via}: not put back: {e}");
+            false
+        })
+    }
+
+    /// Whether the saved route may be put back (a refusal for good is logged): an error while that
+    /// cannot be told yet, to try again later. A next hop that is no peer's known address while a
+    /// peer by name has none known (a name no listener has looked up since a boot, or whose lookup
+    /// failed) may be that peer's.
+    fn route_check(&self, ip: Ipv4Addr, via: Ipv4Addr) -> Result<bool> {
+        let peers = crate::listen::known_peers(self)?;
+        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::via_by(via, &peers));
+        if let Err(e) = &checked {
+            let unknown = crate::listen::unknown_peers(self);
+            if !unknown.is_empty() && !peers.iter().any(|p| p.to_canonical() == IpAddr::V4(via)) {
+                bail!("{e}, while no address of peer {} is known yet", unknown.join(", "));
+            }
+            crate::log!("route {ip} via {via}: not put back: {e}");
         }
-        ok
+        Ok(checked.is_ok())
     }
 
     pub fn current(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
@@ -2421,7 +2480,17 @@ impl Host {
                     continue;
                 }
             };
-            let Some(via) = a.via.filter(|&via| !a.withdrawn && !self.held(&a) && self.in_cluster(ip, via)) else { continue };
+            let Some(via) = a.via.filter(|_| !a.withdrawn && !self.held(&a)) else { continue };
+            // Peers never announce again what they delivered (#553): one not checkable yet is tried again.
+            match self.route_check(ip, via) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    crate::log!("after boot: route {ip} via {via}: {e}; tried again on the next open");
+                    ok = false;
+                    continue;
+                }
+            }
             match route(ip, via) {
                 Ok(()) => crate::log!("after boot: put back route {ip} via {via} (generation {})", a.seen),
                 Err(e) => {
@@ -2570,14 +2639,24 @@ impl Host {
     /// recorded first: the one way a withdrawal is made, so each reaches the
     /// peers (`deliver_withdrawals`) whatever dies or is down meanwhile.
     /// A notice of an older generation is replaced; a newer one is kept.
+    /// A notice of the same generation and an older revision is replaced too.
     pub fn withdraw_noted(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
         let peers = self.config_now().peers;
         let path = self.notice_path(ip);
-        if !peers.is_empty() && load::<Notice>(&path).ok().flatten().is_none_or(|n| n.gen < gen) {
+        let rev = self.withdrawal_rev(l, ip, gen);
+        if !peers.is_empty() && load::<Notice>(&path).ok().flatten().is_none_or(|n| (n.gen, n.rev) < (gen, rev)) {
             let peers = peers.into_iter().map(|peer| Unheard { peer, tries: 0, next_ms: 0 }).collect();
-            store(&path, &Notice { gen, peers }, true)?;
+            store(&path, &Notice { gen, rev, peers }, true)?;
         }
         self.observe(l, ip, gen, 0, None)
+    }
+
+    /// The latest revision of generation `gen` of `ip` here: the record's, or what the VM that
+    /// held it published (`RUN/live/IP`, ahead of a record that trails, #533), dead or not.
+    pub fn withdrawal_rev(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> u64 {
+        let recorded = self.addr(l, ip).ok().filter(|a| a.seen == gen).map_or(0, |a| a.rev);
+        let live = load::<Live>(&self.live_path(ip)).ok().flatten().filter(|v| v.gen == gen).map_or(0, |v| v.rev);
+        recorded.max(live)
     }
 
     /// Migration `mig`'s outcome settled (`o`): a `leaving` claim of it by its
@@ -2668,24 +2747,24 @@ impl Host {
             .filter_map(|ip| Some((ip, load::<Notice>(&self.notice_path(ip)).ok()??)))
             .collect();
         // Due calls, the longest waiting (never asked: 0) first.
-        let mut due: Vec<(u64, u32, Ipv4Addr, u64, String)> = notices
+        let mut due: Vec<(u64, u32, Ipv4Addr, GenRev, String)> = notices
             .iter()
             .flat_map(|(ip, n)| {
-                n.peers.iter().filter(|u| u.next_ms <= now && peers.contains(&u.peer)).map(|u| (u.next_ms, u.tries, *ip, n.gen, u.peer.clone()))
+                n.peers.iter().filter(|u| u.next_ms <= now && peers.contains(&u.peer)).map(|u| (u.next_ms, u.tries, *ip, (n.gen, n.rev), u.peer.clone()))
             })
             .collect();
         due.sort();
         due.truncate(budget);
         // At once: one slow or down peer holds up no other.
-        let answers: Vec<(Ipv4Addr, u64, String, Result<()>)> = std::thread::scope(|scope| {
+        let answers: Vec<(Ipv4Addr, GenRev, String, Result<()>)> = std::thread::scope(|scope| {
             let calls: Vec<_> = due
                 .into_iter()
-                .filter_map(|(_, _, ip, gen, peer)| {
+                .filter_map(|(_, _, ip, (gen, rev), peer)| {
                     let tell = &tell;
                     std::thread::Builder::new()
                         .spawn_scoped(scope, move || {
-                            let r = tell(&peer, &serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
-                            (ip, gen, peer, r)
+                            let r = tell(&peer, &serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": rev}));
+                            (ip, (gen, rev), peer, r)
                         })
                         .inspect_err(|e| crate::log!("withdraw {ip}: cannot start peer call: {e}"))
                         .ok()
@@ -2706,7 +2785,7 @@ impl Host {
                 }
                 kept
             });
-            for (_, _, peer, r) in answers.iter().filter(|a| a.0 == ip && a.1 == n.gen) {
+            for (_, _, peer, r) in answers.iter().filter(|a| a.0 == ip && a.1 == (n.gen, n.rev)) {
                 let Some(i) = n.peers.iter().position(|u| &u.peer == peer) else { continue };
                 match r {
                     Ok(()) => drop(n.peers.remove(i)),
@@ -2753,8 +2832,15 @@ fn released_ip(m: &Mig) -> Option<Ipv4Addr> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Notice {
     gen: u64,
+    /// The latest revision of `gen` here (the VM's, as it migrated in): a peer that routes `gen`
+    /// via the host it had before takes the withdrawal by it (`listen::route`).
+    #[serde(default)]
+    rev: u64,
     peers: Vec<Unheard>,
 }
+
+/// A withdrawal's generation and revision.
+type GenRev = (u64, u64);
 
 /// A peer yet to hear a withdrawal: its failed tries, and the wall-clock ms before which it is not asked again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3277,6 +3363,59 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_defaults_are_visible_and_warn_with_peers() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.effective_cluster_ips(), cfg.vm_ips);
+        assert!(cfg.cluster_warning().is_none());
+        cfg.peers.push("192.0.2.7:7070".into());
+        assert!(cfg.cluster_warning().unwrap().contains(&cfg.vm_ips));
+        cfg.cluster_ips = Some("10.200.0.0/15".into());
+        assert_eq!(cfg.effective_cluster_ips(), "10.200.0.0/15");
+        assert!(cfg.cluster_warning().is_none());
+    }
+
+    #[test]
+    fn invalid_ranges_are_refused_on_open_and_reload() {
+        let (_dir, h) = host("invalid-ranges");
+        let path = h.state.join("host.json");
+        for (vm, cluster) in [("10.200.0.0/16", Some("10.201.0.0/16")), ("bad", None), ("10.200.0.0/16", Some("bad"))] {
+            let cfg = Config { vm_ips: vm.into(), cluster_ips: cluster.map(String::from), ..Config::default() };
+            store(&path, &cfg, true).unwrap();
+            assert!(Host::open(&h.state, &h.run).is_err());
+            assert_eq!(h.config_now().vm_ips, h.cfg.vm_ips);
+            assert_eq!(h.config_now().cluster_ips, h.cfg.cluster_ips);
+            // `flexvm config` still opens it, and saves only a fix.
+            let mut fixing = Host::open_unvalidated(&h.state, &h.run).unwrap();
+            assert!(fixing.configure(|_| Ok(())).is_err());
+            fixing
+                .configure(|c| {
+                    (c.vm_ips, c.cluster_ips) = ("10.200.0.0/16".into(), None);
+                    Ok(())
+                })
+                .unwrap();
+            Host::open(&h.state, &h.run).unwrap();
+        }
+    }
+
+    #[test]
+    fn saved_routes_recheck_peer_gateway_and_local_refusals() {
+        let (_dir, mut h) = host("saved-route-check");
+        h.cfg.cluster_ips = Some("0.0.0.0-255.255.255.255".into());
+        h.cfg.peers = vec!["192.0.2.7:7070".into(), "10.9.5.1:7070".into()];
+        let via = ip("192.0.2.7");
+        assert!(h.route_allowed(ip("10.9.5.2"), via));
+        for dest in [ip("10.9.5.1"), ip("127.0.0.1")] {
+            assert!(!h.route_allowed(dest, via));
+            h.put_addr(dest, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+            assert!(!h.reinstall(&h.lock().unwrap(), dest, None).unwrap());
+        }
+        for gateway in crate::net::gateways(&std::fs::read_to_string("/proc/net/route").unwrap()) {
+            assert!(!h.route_allowed(gateway, via));
+        }
+        assert!(!h.route_allowed(ip("10.9.5.2"), ip("192.0.2.99")));
+    }
 
     #[test]
     fn locks_are_in_directories_only_root_may_enter() {
@@ -4216,7 +4355,7 @@ mod tests {
         h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }, false).unwrap();
         h.withdraw_dead(false).unwrap();
         let notice = |h: &Host| load::<Notice>(&h.notice_path(x)).unwrap();
-        assert_eq!(notice(&h), Some(Notice { gen: 4, peers: unheard(&["p1", "p2"]) }), "recorded with the withdrawal");
+        assert_eq!(notice(&h), Some(Notice { gen: 4, rev: 0, peers: unheard(&["p1", "p2"]) }), "recorded with the withdrawal");
         // p2 is down: p1 is told, p2 asked again only after its backoff.
         assert_eq!(deliver(&h, 8, 1000, &["p2"]), ["p1", "p2"]);
         let n = notice(&h).unwrap();
@@ -4226,12 +4365,12 @@ mod tests {
         assert_eq!(deliver(&h, 8, next, &[]), ["p2"]);
         assert_eq!(notice(&h), None, "every peer has it");
         // A notice left by a process that died before telling anyone is delivered by the next pass.
-        store(&h.notice_path(x), &Notice { gen: 4, peers: unheard(&["p1"]) }, false).unwrap();
+        store(&h.notice_path(x), &Notice { gen: 4, rev: 0, peers: unheard(&["p1"]) }, false).unwrap();
         assert_eq!(deliver(&h, 8, 0, &[]), ["p1"]);
         assert_eq!(notice(&h), None);
         // A newer withdrawal recorded during a delivery is kept whole; an older one does not replace it.
-        store(&h.notice_path(x), &Notice { gen: 4, peers: unheard(&["p1"]) }, false).unwrap();
-        let newer = Notice { gen: 9, peers: unheard(&["p1", "p2"]) };
+        store(&h.notice_path(x), &Notice { gen: 4, rev: 0, peers: unheard(&["p1"]) }, false).unwrap();
+        let newer = Notice { gen: 9, rev: 0, peers: unheard(&["p1", "p2"]) };
         while !h.deliver_withdrawals_with(8, 0, |_, _| store(&h.notice_path(x), &newer, false)) {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -4242,6 +4381,37 @@ mod tests {
         h.cfg.peers = vec!["p1".into()];
         assert_eq!(deliver(&h, 8, 0, &[]), ["p1"]);
         assert_eq!(notice(&h), None);
+    }
+
+    /// Review of #594: the VM migrated in (a newer revision than its old host announced) and ended
+    /// here before a peer heard of it: the withdrawal, retries too, carries that revision, as the
+    /// VM published it ahead of its record (#533), so the peer takes it from this host.
+    #[test]
+    fn a_withdrawal_carries_the_latest_revision_of_its_generation() {
+        let (_h_dir, mut h) = host("notice-rev");
+        h.cfg.peers = vec!["p1".into()];
+        let x = ip("10.9.1.1");
+        let gone = dead_owner(&h, 999_999_954, &[]);
+        h.put_addr(x, &Addr { seen: 4, rev: 2, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }, false).unwrap();
+        h.publish_live(&h.lock().unwrap(), x, 4, 3).unwrap();
+        h.withdraw_dead(false).unwrap();
+        assert_eq!(load::<Notice>(&h.notice_path(x)).unwrap().map(|n| (n.gen, n.rev)), Some((4, 3)));
+        let sent = Mutex::new(Vec::new());
+        for now in [0, 1 << 40] {
+            while !h.deliver_withdrawals_with(8, now, |_, req| {
+                sent.lock().unwrap().push(req.clone());
+                bail!("down")
+            }) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let sent = sent.into_inner().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|r| r["gen"] == 4 && r["rev"] == 3), "{sent:?}");
+        // One of the same generation and a newer revision replaces it.
+        h.publish_live(&h.lock().unwrap(), x, 4, 5).unwrap();
+        h.withdraw_noted(&h.lock().unwrap(), x, 4).unwrap();
+        assert_eq!(load::<Notice>(&h.notice_path(x)).unwrap().map(|n| (n.gen, n.rev)), Some((4, 5)));
     }
 
     #[test]
@@ -4415,6 +4585,7 @@ mod tests {
         h.cfg.cluster_ips = Some("10.9.0.0/16".into());
         let (peer, gone, mine, withdrawn) = (ip("10.9.5.1"), ip("10.9.5.2"), ip("10.9.5.3"), ip("10.9.5.4"));
         let via = ip("192.0.2.7");
+        h.cfg.peers = vec![format!("{via}:7070")];
         let dead = dead_owner(&h, 999_999_946, &[]);
         {
             let l = h.lock().unwrap();
@@ -4457,6 +4628,34 @@ mod tests {
         // A new VM of the name clears the record.
         drop(h.take_name("web", false).unwrap());
         assert!(!h.vms("web", "lost").unwrap().exists());
+    }
+
+    /// Review of #594: a peer by name no listener has looked up since the boot (`RUN/peers.json` is
+    /// gone with it) leaves its saved routes uncheckable, so the pass is not complete and tries
+    /// again, never dropping them for good.
+    #[test]
+    fn after_a_boot_routes_wait_for_named_peers_to_be_known() {
+        let (_h_dir, mut h) = host("after-boot-named");
+        h.cfg.cluster_ips = Some("10.9.0.0/16".into());
+        h.cfg.peers = vec!["peer.invalid:7070".into()];
+        let (peer, via) = (ip("10.9.5.1"), ip("192.0.2.7"));
+        h.put_addr(peer, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+        let routes = std::cell::RefCell::new(Vec::new());
+        let route = |ip, via| {
+            routes.borrow_mut().push((ip, via));
+            Ok(())
+        };
+        // Never a peer's next hop: skipped for good once every peer is known.
+        h.put_addr(ip("10.9.5.2"), &Addr { seen: 3, via: Some(ip("192.0.2.99")), ..Addr::default() }, true).unwrap();
+        assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(false));
+        assert!(routes.borrow().is_empty());
+        // The listener's lookup at its start failed (DNS timed out): an empty entry, still not known.
+        crate::util::write_file(&h.run, "peers.json", br#"{"names": {"peer.invalid:7070": []}}"#, false).unwrap();
+        assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(false));
+        assert!(routes.borrow().is_empty());
+        crate::util::write_file(&h.run, "peers.json", br#"{"names": {"peer.invalid:7070": ["192.0.2.7"]}}"#, false).unwrap();
+        assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(true));
+        assert_eq!(*routes.borrow(), vec![(peer, via)]);
     }
 
     /// Review of #565: a lost VM is recorded before its address is withdrawn (a crash between

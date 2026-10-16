@@ -872,7 +872,7 @@ impl Proc {
         let (ip, gen) = (a.ip, a.gen);
         let Ok(l) = self.host.lock() else {
             // Nothing recorded: told at least once, as before.
-            return tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+            return tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": self.rev()}));
         };
         let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
         // Recorded before the claim goes: the claim is what a sweep finds it by otherwise.

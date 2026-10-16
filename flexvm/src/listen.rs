@@ -386,6 +386,21 @@ impl Peers {
         c.write(path);
     }
 
+    /// The asking peer's confirmed addresses: `from`, and those of each configured peer it is one of
+    /// (as `all_addrs` just waited for), with that peer's configured underlays.
+    fn sender(&self, cfg: &crate::host::Config, from: IpAddr) -> Vec<IpAddr> {
+        let r = self.0.resolved.read().unwrap();
+        let mut out = vec![from];
+        for n in &cfg.peers {
+            let addrs = n.parse::<SocketAddr>().map_or_else(|_| r.get(n).cloned().unwrap_or_default(), |a| vec![a.ip()]);
+            if is_peer(&addrs, from) {
+                out.extend(addrs);
+                out.extend(cfg.underlays_of(n).iter().map(|&u| IpAddr::V4(u)));
+            }
+        }
+        out
+    }
+
     /// The addresses of `names`; a name not resolved yet is looked up.
     fn addrs(&self, names: &[String]) -> Vec<IpAddr> {
         let r = self.0.resolved.read().unwrap();
@@ -568,9 +583,15 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
         _ if matches!(locking, Some(None)) => Err(BUSY.into()),
         "migration" => migration(host, &req),
         // Its peers by address, those configured by name too, and the one asking.
-        "route" => peers
-            .all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT)
-            .and_then(|p| route(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat())),
+        // And their configured underlays; a withdrawal goes by the asking peer's own (`Peers::sender`).
+        "route" => {
+            let (cfg, from) = (host.config_now(), conn.peer_addr().ok().map(|a| a.ip()));
+            peers.all_addrs(&cfg.peers, Instant::now() + ADMIT_WAIT).and_then(|mut all| {
+                all.extend(from);
+                all.extend(cfg.peer_underlay_addrs());
+                route(host, &req, &all, &from.map(|f| peers.sender(&cfg, f)).unwrap_or_default())
+            })
+        }
         "lend" => peers
             .all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT)
             .and_then(|p| lend(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat())),
@@ -778,18 +799,24 @@ fn lend(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
 /// Stale generations and revisions (see `host::Addr`) are ignored; an
 /// address a VM here holds keeps its local route.
 /// Test fault `route_refuse`: refused, as by a listener that is down.
-fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
+/// `sender`: the asking peer's own addresses; only the peer a generation is routed via withdraws it.
+fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Result<Value> {
     if fault("route_refuse") {
         bail!("injected fault: route messages refused");
     }
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-    routable(ip, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;
     let via: Option<Ipv4Addr> = req["via"].as_str().map(|v| v.parse()).transpose()?;
+    if let Some(via) = via {
+        check_vm_ip(host, ip, peers)?;
+        check_via(via, peers)?;
+    }
     let rev = match via {
         Some(_) => req["rev"].as_u64().ok_or("route announcements carry the location's revision")?,
         None => 0,
     };
+    // A withdrawal's: the latest revision of the generation its sender knows (none: 0).
+    let withdrawn_rev = req["rev"].as_u64().unwrap_or(0);
     if let Some(via) = via.filter(|_| fault("route_stall")) {
         // Test hook: an announcement held up (as by a slow network) while armed.
         crate::log!("route {ip} via {via}: held up (injected fault)");
@@ -798,6 +825,18 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
         }
     }
     let l = host_lock(host)?;
+    if via.is_none() {
+        let a = host.addr(&l, ip)?;
+        // A recorded generation remains withdrawable after the allowlist narrows, including retries.
+        if a.seen == 0 {
+            check_vm_ip(host, ip, peers)?;
+        }
+        // Not by another peer, unless it had the VM later: a newer generation, or a newer revision
+        // (the VM migrated on to it and ended there before its announcement got here).
+        if let Some(owner) = a.via.filter(|&o| gen == a.seen && !a.withdrawn && withdrawn_rev <= a.rev && !is_peer(sender, IpAddr::V4(o))) {
+            bail!("{ip} generation {gen} is routed via {owner} at revision {}, not via the asking peer: only that peer, or one with a newer revision, withdraws it", a.rev);
+        }
+    }
     if !host.observe(&l, ip, gen, rev, via)? {
         return Ok(json!({"ip": ip.to_string(), "stale": true}));
     }
@@ -822,17 +861,42 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     routable(ip, &cfg, &known, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
 }
 
+/// A next hop is the connection's peer or a configured peer (its addresses or `--peer-underlay`),
+/// never a non-unicast address: a cluster VM's route to a peer's own address sends its traffic to
+/// that peer only, which any peer may claim by announcing the VM moved to it.
+/// Callers include the connection address in `peers`; named peers come from strict listener lookup.
+/// A peer's local address (hosts sharing a network namespace, loopback included) is taken:
+/// `net::route_via` installs nothing for it, and a migration's handoff relies on it.
+pub fn check_via(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
+    via_by(via, peers)
+}
+
+pub(crate) fn via_by(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
+    if !is_peer(peers, IpAddr::V4(via)) || via.is_unspecified() || via.is_broadcast() || via.is_multicast() {
+        bail!("{via} is not a peer next hop: not a peer's address, or not unicast");
+    }
+    Ok(())
+}
+
 /// The configured peers' addresses for a restore or resume (root's own, see `PEER_CACHE`):
 /// as the listener last knew them, whatever their age, never looked up here. A name it has
 /// no entry for is refused at once.
 pub fn known_peers(host: &Host) -> Result<Vec<IpAddr>> {
-    let names = host.config_now().peers;
-    let cache = Cached::read(&host.run, &names);
-    let mut addrs = Vec::new();
-    for n in &names {
+    let cfg = host.config_now();
+    let cache = Cached::read(&host.run, &cfg.peers);
+    let mut addrs = cfg.peer_underlay_addrs();
+    for n in &cfg.peers {
         addrs.extend(cache.addrs(n)?);
     }
     Ok(addrs)
+}
+
+/// The configured peers by name the listener knows no address of (yet: a lookup failed or not
+/// made since a boot), as `known_peers` reads them.
+pub fn unknown_peers(host: &Host) -> Vec<String> {
+    let names = host.config_now().peers;
+    let cache = Cached::read(&host.run, &names);
+    names.into_iter().filter(|n| cache.addrs(n).map_or(true, |a| a.is_empty())).collect()
 }
 
 impl Cached {
@@ -878,7 +942,7 @@ fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gatewa
     if !cfg.cluster()?.contains(ip) {
         bail!("{ip} is not a vm's address: outside this host's configured VM ranges");
     }
-    let peer = is_peer(peers, IpAddr::V4(ip));
+    let peer = is_peer(peers, IpAddr::V4(ip)) || is_peer(&cfg.peer_underlay_addrs(), IpAddr::V4(ip));
     // A derived underlay is an interface's source address, covered by is_local_addr below.
     let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
     let underlay = cfg.underlay == Some(ip) || listen == Some(IpAddr::V4(ip));
@@ -892,6 +956,85 @@ fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gatewa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_hops_are_known_peers_and_unicast() {
+        let via: Ipv4Addr = "192.0.2.7".parse().unwrap();
+        let peers = [IpAddr::V4(via), "::ffff:192.0.2.8".parse().unwrap(), "127.0.0.1".parse().unwrap()];
+        via_by(via, &peers).unwrap();
+        via_by("192.0.2.8".parse().unwrap(), &peers).unwrap();
+        // Peers sharing this network namespace route via a local address (net::route_via skips it).
+        via_by("127.0.0.1".parse().unwrap(), &peers).unwrap();
+        assert!(via_by("192.0.2.9".parse().unwrap(), &peers).is_err());
+        assert!(via_by("127.0.0.2".parse().unwrap(), &peers).is_err());
+        for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1"] {
+            let ip = ip.parse().unwrap();
+            assert!(via_by(ip, &[IpAddr::V4(ip)]).is_err());
+        }
+    }
+
+    #[test]
+    fn route_rejects_untrusted_next_hops_before_recording_and_withdraws_old_ranges() {
+        let root = crate::test_util::TempDir::new("route-via");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let ip: Ipv4Addr = "10.201.0.7".parse().unwrap();
+        for via in ["192.0.2.99", "127.0.0.2"] {
+            assert!(route(&host, &json!({"ip": "10.200.0.7", "gen": 3, "rev": 0, "via": via}), &["127.0.0.1".parse().unwrap()], &[]).is_err());
+            assert!(!host.state.join("addrs/10.200.0.7").exists());
+        }
+        // Held here, without a deadline, so `route` takes it again at once: another test holding
+        // the process-wide host lock past LOCK_WAIT would otherwise make it BUSY.
+        let l = host.lock().unwrap();
+        let (b, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        host.observe(&l, ip, 3, 0, Some("192.0.2.7".parse().unwrap())).unwrap();
+        let req = json!({"ip": ip.to_string(), "gen": 3});
+        // Routed via B: another peer (C) does not withdraw that generation.
+        let e = route(&host, &req, &[b, c], &[c]).unwrap_err().to_string();
+        assert!(e.contains("only that peer, or one with a newer revision, withdraws it"), "{e}");
+        assert!(!host.addr(&l, ip).unwrap().withdrawn);
+        // C, at B's revision or an older one, neither; at a newer one (the VM migrated on to C and
+        // ended there before C's announcement got here), it does.
+        let moved: Ipv4Addr = "10.201.0.9".parse().unwrap();
+        host.observe(&l, moved, 3, 2, Some("192.0.2.7".parse().unwrap())).unwrap();
+        for rev in [0, 2] {
+            assert!(route(&host, &json!({"ip": moved.to_string(), "gen": 3, "rev": rev}), &[b, c], &[c]).is_err(), "rev {rev}");
+        }
+        assert!(!host.addr(&l, moved).unwrap().withdrawn);
+        route(&host, &json!({"ip": moved.to_string(), "gen": 3, "rev": 3}), &[b, c], &[c]).unwrap();
+        assert!(host.addr(&l, moved).unwrap().withdrawn);
+        // B does, retries included.
+        route(&host, &req, &[b, c], &[b]).unwrap();
+        route(&host, &req, &[b, c], &[b]).unwrap();
+        assert!(host.addr(&l, ip).unwrap().withdrawn);
+        // A newer generation is a move: any peer's.
+        host.observe(&l, ip, 4, 0, Some("192.0.2.7".parse().unwrap())).unwrap();
+        route(&host, &json!({"ip": ip.to_string(), "gen": 5}), &[b, c], &[c]).unwrap();
+        assert_eq!(host.addr(&l, ip).unwrap().seen, 5);
+        assert!(route(&host, &json!({"ip": "10.201.0.8", "gen": 3}), &[], &[]).is_err());
+    }
+
+    /// A peer's configured underlays (`--peer-underlay`) are its next hops, and no VM's address;
+    /// a peer no longer configured has none.
+    #[test]
+    fn configured_peer_underlays_are_next_hops() {
+        let mut cfg = crate::host::Config { peers: vec!["192.0.2.7:7070".into()], ..Default::default() };
+        let data: Ipv4Addr = "198.51.100.7".parse().unwrap();
+        cfg.peer_underlays.insert("192.0.2.7:7070".into(), vec![data]);
+        cfg.peer_underlays.insert("192.0.2.9:7070".into(), vec!["198.51.100.9".parse().unwrap()]);
+        assert_eq!(cfg.peer_underlay_addrs(), [IpAddr::V4(data)]);
+        let known = [vec!["192.0.2.7".parse().unwrap()], cfg.peer_underlay_addrs()].concat();
+        via_by(data, &known).unwrap();
+        assert!(via_by("198.51.100.9".parse().unwrap(), &known).is_err(), "not a configured peer's");
+        // The asking peer's own addresses take in its underlays, never another peer's.
+        cfg.peers.push("192.0.2.10:7070".into());
+        cfg.peer_underlays.insert("192.0.2.10:7070".into(), vec!["198.51.100.10".parse().unwrap()]);
+        let sender = Peers::default().sender(&cfg, "192.0.2.7".parse().unwrap());
+        assert!(is_peer(&sender, IpAddr::V4(data)) && !is_peer(&sender, "198.51.100.10".parse().unwrap()), "{sender:?}");
+        cfg.cluster_ips = Some("198.51.100.0/24".into());
+        cfg.vm_ips = "198.51.100.0/25".into();
+        assert!(routable_by(data, &cfg, &[], &[], |_| Ok(false)).is_err());
+        routable_by("198.51.100.8".parse().unwrap(), &cfg, &[], &[], |_| Ok(false)).unwrap();
+    }
 
     #[test]
     fn admitted_connections_leave_half_the_slots_for_other_peers() {

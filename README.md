@@ -172,11 +172,25 @@ no default DNS server; configure one with `--dns IP`.
 Every host's `--vm-ips` must be disjoint and inside `--cluster-ips`, the
 same range on every host covering all of them: a peer's VM may have, route or
 borrow only an address in it (unset, only this host's `--vm-ips`, so
-migrations between hosts are refused). The hosts must list each other
+migrations between hosts are refused). Both `config` and `listen` warn when
+peers are configured without `--cluster-ips`; `config` shows the effective
+allowlist in `derived.cluster_ips`. Loading `host.json` validates that the
+whole `vm_ips` range fits inside it: until a hand edit that breaks this is
+fixed (`flexvm config` still runs, to fix it), other commands refuse to start,
+and a running process keeps its last valid configuration. Withdrawals of previously recorded
+addresses remain accepted after the allowlist narrows. A generation routed
+via a peer is withdrawn only by that peer (its addresses and
+`--peer-underlay`), or by one that had the VM later (a newer revision of the
+generation: it migrated on) or a newer generation. The hosts must list each other
 with `--peer HOST:PORT` (each peer's listen address): a listener serves its
-peers' addresses only, and tells any other it is not a peer. The default
-range, `10.200.0.0/16`, is the same on every host, so give each host its own
-once it has peers (`config` warns until then). `--peer` replaces the whole
+peers' addresses only, and tells any other it is not a peer. A reported route
+next hop (including a migration target's underlay) must be the connection's
+peer address or a configured peer's known address (or `--peer-underlay`), and
+unicast. A peer's
+address local to this host, as with hosts sharing a network namespace, is
+taken but installs no route. Saved routes are checked again before
+reinstalling them. The default range, `10.200.0.0/16`, is the same on every
+host, so give each host its own once it has peers (`config` warns until then). `--peer` replaces the whole
 list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
 `flexvm config` alone prints what is set and what is derived for the rest:
 
@@ -184,7 +198,17 @@ list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
   address, or for a wildcard one the source address of the kernel's route
   toward the first peer not on this machine (`ip route get`, policy routing
   included). With every peer on this machine (loopback, or one of its
-  addresses) it is loopback; with peers elsewhere, never.
+  addresses) it is loopback; with peers elsewhere, never. Peers take it as
+  one of the addresses they know this host by (its `--peer` address, or one
+  its name resolves to); an underlay on another network than that address
+  (a separate data-plane network) is listed on each peer with
+  `--peer-underlay`.
+- `--peer-underlay HOST:PORT=IP[,IP]`, repeated: a peer's next hops besides
+  its `--peer` address, its `--underlay` on another network. Only these, set
+  here, are trusted: never an address because it is on-link. Each must be
+  unicast and not this host's.
+  It replaces every entry (`''` clears them); a peer dropped from `--peer`
+  takes its entry with it.
 - `--announce-dev IFACE`, where the host answers ARP for its VMs
   (`proxy_arp`) and announces a VM that arrives: that route's device, none
   for peers on this machine. `--announce-dev none` turns this off, for
