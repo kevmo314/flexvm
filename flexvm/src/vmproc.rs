@@ -2362,7 +2362,15 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
                 return;
             }
             crate::log!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
-            match call(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true, "evict": true}), Some(deadline)) {
+            let mut replaced = false;
+            let mut check = |c: &UnixStream| {
+                if Ident::of(crate::util::peer_pid(c)?).as_ref() != Some(&vm.ident) {
+                    replaced = true;
+                    bail!("vm {:?} was replaced", vm.name);
+                }
+                Ok(())
+            };
+            match call_checked(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true, "evict": true}), Some(deadline), Some(&mut check)) {
                 Ok(_) => {
                     backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
@@ -2375,8 +2383,8 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
                     }
                     return;
                 }
-                // This VM is busy here: the next one is tried. Any peer's refusal, whatever it says, backs off below.
-                Err(e) if e.is::<Busy>() => break,
+                // This VM is gone or busy here: the next one is tried. Any peer's refusal, whatever it says, backs off below.
+                Err(e) if replaced || e.is::<Busy>() => break,
                 // No answer is no refusal: the VM may still be migrating (busy to the next decider).
                 Err(e) if Instant::now() >= deadline => {
                     return crate::log!("vm {}: migrating to {peer}: no answer by the eviction's deadline: {e}", vm.name);
@@ -2663,7 +2671,11 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant, c
 
 /// With `at`, connected, sent and answered by then; otherwise only connecting and sending time out.
 pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<Value> {
-    let c = connect(host, name, &req, &[], at.unwrap_or_else(|| Instant::now() + Duration::from_secs(10)), None)?;
+    call_checked(host, name, req, at, None)
+}
+
+fn call_checked(host: &Host, name: &str, req: Value, at: Option<Instant>, check: Option<ConnectCheck<'_>>) -> Result<Value> {
+    let c = connect(host, name, &req, &[], at.unwrap_or_else(|| Instant::now() + Duration::from_secs(10)), check)?;
     let reply = match at {
         Some(at) => crate::util::recv_json(&mut BufReader::new(crate::util::By { s: c, at })),
         None => crate::util::recv_json(&mut BufReader::new(c)),
@@ -3682,6 +3694,37 @@ mod tests {
         assert_eq!(ranked[0].name, "b");
     }
 
+    /// #615: a new process taking a candidate's name never receives its eviction request.
+    #[test]
+    fn eviction_skips_a_replaced_candidate() {
+        let root = crate::test_util::TempDir::new("fv-evict-replaced");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let mut original = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let vm = Entry { name: "ev".into(), ident: Ident::of(original.id()).unwrap(), state: "running".into(), ..Entry::default() };
+        original.kill().unwrap();
+        original.wait().unwrap();
+        // The replacement's listener belongs to this process, not the saved candidate.
+        let sock = host.sock(&vm.name).unwrap();
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let stub = thread::spawn(move || {
+            let (c, _) = listener.accept().unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap();
+            // Let a regressed sender finish so the assertion reports the unwanted request.
+            if req.is_some() {
+                send_json(&mut &c, &control_reply(&Ok(json!({})))).unwrap();
+            }
+            assert!(req.is_none(), "the replacement received an eviction request: {req:?}");
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        evict(&host, &["p1".into(), "p2".into()], &[vm], 100, Instant::now() + Duration::from_secs(5));
+        let listener = stub.join().unwrap();
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "no further peers are tried for the replacement");
+        assert!(!host.run.join("evict.backoff").exists(), "a replaced candidate is skipped without backing off peers");
+    }
+
     /// #599: a peer answering every eviction with this host's busy text is a refusal
     /// like any other (backed off, the next peer tried); only the VM's own `busy`
     /// reply (a `Busy` error here) skips the rest of the peers.
@@ -3713,7 +3756,7 @@ mod tests {
                 }
             })
         };
-        let vm = Entry { name: "ev".into(), state: "running".into(), ..Entry::default() };
+        let vm = Entry { name: "ev".into(), ident: Ident::me(), state: "running".into(), ..Entry::default() };
         let at = || Instant::now() + Duration::from_secs(10);
         let backoff = || crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&host.run.join("evict.backoff")).unwrap().unwrap_or_default();
         evict(&host, &["p1".into(), "p2".into()], std::slice::from_ref(&vm), 100, at());
