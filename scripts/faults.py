@@ -1624,7 +1624,7 @@ def commit_fail_routed():
             os.makedirs(x.state)
             os.makedirs(x.run)
             for d in ("artifacts", "templates"):
-                os.symlink(os.path.join(os.path.abspath(args.state), d), os.path.join(x.state, d))
+                os.symlink(os.path.realpath(os.path.join(A.state, d)), os.path.join(x.state, d))
             nsjson(h, "config", "--peer", hosts[other].addr, "--vm-ips", x.ips, "--reserve", "512")
             lg = open(os.path.join(root, f"listen-{h}.log"), "a")
             # Its arrivals' Firecrackers get cgroups too: the hierarchy `ip netns exec`'s sysfs lacks.
@@ -1672,6 +1672,7 @@ def commit_fail_routed():
         for p in procs:
             p.terminate()
             p.wait()
+        gone = wait_for(lambda: not ours(), 10)
         pids = ours()
         for p in pids:
             seen.add((p, starttime_of(p)))
@@ -1680,7 +1681,7 @@ def commit_fail_routed():
                 os.kill(p, signal.SIGKILL)
             except OSError:
                 pass
-        check("commit fail routed: no process of either host left", not pids and wait_for(lambda: not ours(), 10), pids)
+        check("commit fail routed: no process of either host left", gone, pids)
         cgs = lambda: [c for p, start in seen for c in glob_idle(p, start)]
         check("commit fail routed: no cgroup left", wait_for(lambda: not cgs(), 10), cgs())
         for c in cgs():
