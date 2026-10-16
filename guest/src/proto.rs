@@ -11,6 +11,9 @@ pub const FRAME_EXIT: u8 = 3;
 pub const FRAME_MSG: u8 = 4;
 pub const FRAME_LOST: u8 = 5;
 
+/// Optional client acknowledgement after receiving FRAME_EXIT: release the finished session.
+pub const SESSION_DONE: u8 = b'd';
+
 pub const MAX_BODY: usize = 1024 * 1024;
 
 /// Free MiB kept plugged for `total` MiB: the host plugs more below it, the guest throttles past it.

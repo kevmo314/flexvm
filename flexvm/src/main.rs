@@ -858,10 +858,11 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
         util::raise_signal(sig);
     });
     let result = exec_session(host, name, cmd, session, false);
-    // On an error too (a closed stdout, as with `| head`): the command would run on, holding its slot.
-    // Best effort: the guest closes a session whose client left anyway, a minute after it finished
-    // (ten, if it still runs).
-    let _ = close();
+    // Completed sessions are acknowledged on their attachment. Errors (including a closed
+    // stdout, as with `| head`) still need CLOSE to stop a command that may be running.
+    if result.is_err() {
+        let _ = close();
+    }
     match result {
         Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) => Ok(0),
         result => result,
@@ -890,7 +891,13 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
         let at = Instant::now() + Duration::from_secs(5);
         let stream = vmproc::connect(host, name, &req, &[], at).and_then(|c| exec_stream(c, at));
         // Locked per write, never across a read: a checkpoint takes stdout's lock too.
-        match stream.map(|mut r| exec_frames(&mut r, session, &mut std::io::stdout(), &mut std::io::stderr(), &mut deadline)) {
+        match stream.map(|mut r| {
+            let result = exec_frames(&mut r, session, &mut std::io::stdout(), &mut std::io::stderr(), &mut deadline);
+            if !patient && matches!(result, Ok(StreamEnd::Exit(_))) {
+                let _ = r.get_mut().write_all(&[guest::SESSION_DONE]);
+            }
+            result
+        }) {
             Ok(Err(e)) => return Err(e),
             Ok(Ok(StreamEnd::Exit(code))) => return Ok(code),
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,

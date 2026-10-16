@@ -4,7 +4,7 @@
 //! Every operation, starting included, holds `op`; the process ends only
 //! through `finish`, which holds it too.
 
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,6 +24,22 @@ use crate::host::{fault, AddrClaim, Entry, Host, Ident, MigRecord, NameLock};
 use crate::template::{Paths, Template, STEP_MIB};
 use crate::util::{answer, ms, proc_kb, send_json, Error, Phases, Result, Slot};
 use crate::vm::{Snapshot, State, Vm};
+
+/// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
+/// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session.
+fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl crate::util::Timed + Write)) -> Result<()> {
+    while let Some((kind, data)) = guest::read_frame(guest)? {
+        client.write_all(&guest::frame(kind, &[&data]))?;
+        if kind == guest::FRAME_EXIT {
+            let mut ack = [0];
+            if (crate::util::By { s: client, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
+                guest.get_mut().write_all(&ack)?;
+            }
+            break;
+        }
+    }
+    Ok(())
+}
 
 /// A VM process's own exit statuses (`run -- CMD` passes CMD's through):
 /// 128 + the signal that ended it (130 SIGINT, 143 SIGTERM's suspend), and
@@ -1130,7 +1146,7 @@ impl Proc {
             // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             send_json(&mut w, &json!({"ok": true}))?;
-            std::io::copy(&mut g, &mut w)?;
+            relay_session(&mut g, &mut w)?;
             Ok(())
         })();
         vm.untrack_exec(id);
@@ -3170,5 +3186,51 @@ mod tests {
         let t = Instant::now();
         assert_eq!(req(b"MEM 1", false), None);
         assert!(t.elapsed() < MEM_REQUEST_DEADLINE * 2);
+    }
+}
+
+#[cfg(test)]
+mod session_relay_tests {
+    use super::*;
+    use std::io::{self, Cursor};
+
+    struct Duplex {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl Write for Duplex {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl crate::util::Timed for Duplex {
+        fn read_timeout(&self, _: Duration) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_timeout(&self, _: Duration) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exit_acknowledgement_uses_the_existing_attachment_and_is_optional() {
+        let out = guest::frame(guest::FRAME_STDOUT, &[&0u64.to_le_bytes()[..], b"hi"]);
+        let exit = [out, guest::frame(guest::FRAME_EXIT, &[&2u64.to_le_bytes()[..], &7i32.to_le_bytes()])].concat();
+        for ack in [vec![], vec![guest::SESSION_DONE], vec![b'?']] {
+            // The exit ends the relay, with the stream still open (vsock passes no half-close on).
+            let mut guest = BufReader::new(Duplex { input: Cursor::new([&exit[..], b"never read"].concat()), output: Vec::new() });
+            let mut client = Duplex { input: Cursor::new(ack.clone()), output: Vec::new() };
+            relay_session(&mut guest, &mut client).unwrap();
+            assert_eq!(client.output, exit);
+            assert_eq!(guest.get_ref().output, if ack == [guest::SESSION_DONE] { ack } else { vec![] });
+        }
     }
 }
