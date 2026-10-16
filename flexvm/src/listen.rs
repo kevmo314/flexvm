@@ -167,10 +167,10 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     // A sweep and a refill now, not after the first period: a listener started at boot is
     // what recovers a quiet host (#555).
     let first = host.clone();
-    std::thread::spawn(move || match crate::gc::after_boot(&first, true) {
-        Ok(false) => crate::gc::recover(&first),
-        Ok(true) => {}
-        Err(e) => crate::log!("flexvm: recovering after boot: {e}"),
+    std::thread::spawn(move || {
+        if let Err(e) = crate::gc::recover_after_boot(&first) {
+            crate::log!("flexvm: recovering after boot: {e}");
+        }
     });
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());

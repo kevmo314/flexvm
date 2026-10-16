@@ -119,7 +119,13 @@ impl Args {
                     let value = if SWITCHES.contains(&f) {
                         "1".into()
                     } else if GLOBAL.contains(&f) || IMAGE_FLAGS.contains(&f) || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&f)) {
-                        let value = it.next().ok_or_else(|| format!("--{f} needs a value"))?;
+                        let value = it.next().ok_or_else(|| {
+                            if f == "force" {
+                                "--force needs a generation; run flexvm reclaim IP to see GEN".to_string()
+                            } else {
+                                format!("--{f} needs a value")
+                            }
+                        })?;
                         a.child_args.push(value.clone());
                         value
                     } else {
@@ -281,7 +287,9 @@ pub fn open_host(args: &Args) -> Result<Host> {
     let host = open_host_only(args)?;
     let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
     if let Err(e) = gc::after_boot(&host, !partly) {
-        crate::log!("flexvm: recovering after boot: {e}");
+        if gc::first_boot_warning(&host, host::boot_id()) {
+            crate::log!("flexvm: recovering after boot: {e}");
+        }
     }
     Ok(host)
 }
@@ -356,10 +364,7 @@ fn real_main(args: &Args) -> Result<()> {
                 bail!("recover requires root");
             }
             let host = open_host_only(args)?;
-            if !gc::after_boot(&host, true)? {
-                gc::recover(&host);
-            }
-            Ok(())
+            gc::recover_after_boot(&host)
         }
         Some("listen") => {
             // Before any thread that would take these signals is started.
@@ -1252,7 +1257,7 @@ mod exec_tests {
     #[test]
     fn reclaim_force_requires_a_generation() {
         let error = Args::parse(["reclaim", "10.9.0.2", "--force"].map(String::from)).err().unwrap();
-        assert_eq!(error.to_string(), "--force needs a value");
+        assert_eq!(error.to_string(), "--force needs a generation; run flexvm reclaim IP to see GEN");
         let args = parse(&["reclaim", "10.9.0.2", "--force", "42"]);
         check_applies(&args).unwrap();
         assert_eq!(args.get("force"), Some("42"));

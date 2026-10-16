@@ -50,7 +50,17 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(false);
     }
-    let Some(local) = host.after_boot()? else { return Ok(false) };
+    let local = match host.after_boot() {
+        Ok(Some(local)) => local,
+        Ok(None) => return Ok(false),
+        // Retried on the next open; a full pass still sweeps and refills now.
+        Err(e) => {
+            if rest {
+                recover(host);
+            }
+            return Err(e);
+        }
+    };
     if !rest {
         if !local {
             bail!("local boot recovery incomplete; see earlier errors");
@@ -68,6 +78,21 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     }
     host.mark_recovered()?;
     Ok(true)
+}
+
+/// `after_boot` with the rest, or `recover` if it did not run: listener startup and `flexvm recover`.
+pub fn recover_after_boot(host: &Host) -> Result<()> {
+    if !after_boot(host, true)? {
+        recover(host);
+    }
+    Ok(())
+}
+
+/// Whether this is the first foreground warning in this boot (`RUN/.warned-BOOT`), so a failed
+/// boot recovery is retried on every open but reported once.
+pub fn first_boot_warning(host: &Host, boot: &str) -> bool {
+    let marker = host.run.join(format!(".warned-{boot}"));
+    boot.is_empty() || !matches!(std::fs::File::create_new(marker), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
 }
 
 /// A sweep now (the peers told of withdrawals, interrupted migrations settled and retired) and
@@ -229,6 +254,38 @@ mod tests {
 
     fn dir(tag: &str) -> crate::test_util::TempDir {
         crate::test_util::TempDir::new(&format!("gc-{tag}"))
+    }
+
+    #[test]
+    fn foreground_boot_warning_is_once_per_boot() {
+        let d = dir("boot-warning");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        assert!(first_boot_warning(&host, "boot-1"));
+        assert!(!first_boot_warning(&host, "boot-1"));
+        assert!(first_boot_warning(&host, "b2"));
+        assert!(first_boot_warning(&host, ""), "no boot id: always warn");
+        std::thread::scope(|scope| {
+            let warnings: Vec<_> = (0..8).map(|_| scope.spawn(|| first_boot_warning(&host, "boot-3"))).collect();
+            assert_eq!(warnings.into_iter().map(|warning| warning.join().unwrap()).filter(|&first| first).count(), 1);
+        });
+    }
+
+    #[test]
+    fn initial_recovery_sweeps_even_when_the_host_lock_cannot_open() {
+        let d = dir("boot-lock-error");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let lock = host.lock_file();
+        let _ = std::fs::remove_file(&lock);
+        std::fs::create_dir(&lock).unwrap();
+        assert!(!host.run.join(".gc").exists());
+        let result = recover_after_boot(&host);
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(result.is_err(), "root must report the failed boot recovery");
+        } else {
+            assert!(result.is_ok(), "non-root skips boot recovery");
+        }
+        assert!(host.run.join(".gc").exists(), "the initial sweep still ran");
+        assert!(!host.run.join(".boot").exists(), "failed recovery is retried");
     }
 
     #[test]
