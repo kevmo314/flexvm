@@ -61,7 +61,7 @@ pub struct Frozen {
     /// Pages dirtied since the previous checkpoint's pause.
     pub dirty: usize,
     /// The dirty bits taken, which a checkpoint that fails gives back (`Pager::unfreeze`).
-    taken: Vec<u64>,
+    taken: Arc<Vec<u64>>,
     pub protected: usize,
     pub protect: Duration,
     /// The hot pages copied during the pause (see `hot`), how many of them stay unprotected, how many were unchanged
@@ -185,7 +185,7 @@ impl Pager {
                 // Its pages dirty now and in the interval before the last pause. Regions are whole MiB: whole words.
                 let (mut n, mut was) = (0, 0);
                 for w in chunk / 64..(chunk + WP_CHUNK).min(to) / 64 {
-                    let k = kept.get(w).copied().unwrap_or(0);
+                    let k = kept.get(&w).copied().unwrap_or(0);
                     n += (dirty.get(w).map_or(0, |d| d.load(Ordering::Relaxed)) & !k).count_ones() as usize;
                     was += (before.get(w).copied().unwrap_or(0) & !k).count_ones() as usize;
                 }
@@ -339,7 +339,7 @@ impl Pager {
         }
         // No delta base now, nor hot pages.
         *self.hot_prev.lock().unwrap() = None;
-        self.hot_dirty.lock().unwrap().clear();
+        *self.hot_dirty.lock().unwrap() = Arc::default();
         self.hot_kept.lock().unwrap().clear();
         // In chunks: while the kernel changes a range, KVM retries guest faults anywhere in it, so one call over a
         // whole region would stall the vCPUs for as long as it takes.
@@ -400,7 +400,7 @@ impl Pager {
         let pages = self.pages();
         // A VM that stays paused for the write (and is then killed) keeps its dirty pages: if the checkpoint fails and
         // it runs on, they still tell what is unprotected. One that runs on starts a new interval.
-        let dirty = pages.dirty_bits(cow);
+        let dirty = Arc::new(pages.dirty_bits(cow));
         let ndirty = dirty.iter().map(|w| w.count_ones() as usize).sum();
         // Hot pages stay unprotected unless their block did not change since the last checkpoint.
         let prev = hot.as_mut().and_then(|h| h.prev.take());
@@ -418,7 +418,11 @@ impl Pager {
             // Range by range, not the whole region: a protect makes KVM drop its mappings of everything in the range
             // (see `WP_CHUNK`), so the guest would refault every page it uses there, clean ones too, after the resume.
             // That costs far more than the calls it spares (#281).
-            let dirty_here = set_bits(&dirty).filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && kept.binary_search(&p).is_err());
+            // Include both boundary words; the filter retains exactly this mapping's pages.
+            let first_word = from / 64;
+            let dirty_here = set_bits(&dirty[first_word..to.div_ceil(64)])
+                .map(|p| p + first_word * 64)
+                .filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && kept.binary_search(&p).is_err());
             protected += self.protect(protect_ranges(dirty_here, &kept), Some(&dirty))?;
         }
         let protect = start.elapsed();
@@ -442,9 +446,13 @@ impl Pager {
             }
         };
         if cow {
-            let mut bits = vec![0u64; dirty.len()];
-            kept.iter().for_each(|&p| bits[p / 64] |= 1 << (p % 64));
+            let mut bits = std::collections::BTreeMap::new();
+            kept.iter().for_each(|&p| *bits.entry(p / 64).or_insert(0) |= 1u64 << (p % 64));
+            // Only copied pages stay unprotected and are marked dirty again below before resume. The sparse map
+            // merely excludes those pages from the fault-growth heuristic; it does not replace dirty tracking.
             *self.hot_kept.lock().unwrap() = bits;
+            // Share the immutable snapshot instead of copying it during the pause. Frozen retains the same bits
+            // for rollback; writes after the take accumulate separately in Pages::dirty, so none can be lost.
             *self.hot_dirty.lock().unwrap() = dirty.clone();
         }
         let cow = cow.then(|| {
@@ -462,7 +470,7 @@ impl Pager {
             c.set_waker(fd);
         }
         *self.cow.lock().unwrap() = cow.clone();
-        let taken = if cow.is_some() { dirty } else { Vec::new() };
+        let taken = if cow.is_some() { dirty } else { Arc::default() };
         let (hot, held) = held.map_or((0, None), |(n, h)| (n, Some(h)));
         Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect, held, hot, hot_time, hot_unchanged, prev: Mutex::new(prev) })
     }

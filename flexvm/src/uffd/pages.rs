@@ -170,6 +170,17 @@ impl Pages {
         self.dirty.chunks(CHUNK / 64).enumerate().filter(|&(c, _)| self.touched(c * CHUNK)).map(|(c, words)| (c * (CHUNK / 64), words))
     }
 
+    /// Pages dirty now and before, reading only touched chunks and allocating no intersection bitmap.
+    pub(super) fn hot_pages<'a>(&'a self, before: &'a [u64]) -> impl Iterator<Item = usize> + 'a {
+        self.dirty_chunks().flat_map(move |(at, words)| {
+            words.iter().enumerate().flat_map(move |(i, w)| {
+                let bits = w.load(Ordering::SeqCst) & before.get(at + i).copied().unwrap_or(0);
+                std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0))
+                    .map(move |b| (at + i) * 64 + b.trailing_zeros() as usize)
+            })
+        })
+    }
+
     pub(super) fn dirty_count(&self) -> usize {
         self.dirty_chunks().flat_map(|(_, words)| words).map(|w| w.load(Ordering::Relaxed).count_ones() as usize).sum()
     }
@@ -409,6 +420,70 @@ impl Pages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_scan_reads_only_touched_chunks() {
+        // The 47 GiB template, with just three chunks touched, including a partial final chunk.
+        let pages = Pages::new((47 << 30) / crate::util::PAGE_SIZE + 1);
+        let last = pages.len() - 1;
+        for p in [7, CHUNK + 9, last] {
+            pages.mark_dirty(p);
+        }
+        let before = pages.dirty_bits(true);
+        for p in [7, 8, last] {
+            pages.mark_dirty(p);
+        }
+        assert_eq!(pages.hot_pages(&before).collect::<Vec<_>>(), [7, last]);
+        assert!(pages.hot_pages(&[]).next().is_none());
+        assert_eq!(pages.dirty_count(), 3, "candidate scanning must not consume dirty bits");
+        pages.restore_dirty(&before);
+        assert_eq!(set_bits(&pages.dirty_bits(false)).collect::<Vec<_>>(), [7, 8, CHUNK + 9, last], "rollback retains writes after the snapshot");
+        // Bound the words read by the hot scan independently of the template's maximum size.
+        let scanned: usize = pages.dirty_chunks().map(|(_, words)| words.len()).sum();
+        assert_eq!(scanned, 2 * (CHUNK / 64) + 1);
+        assert!(scanned * 1000 < pages.dirty.len());
+        // Poison untouched chunks: they must never enter the intersection, even with matching previous bits.
+        for (_, w) in pages.dirty.iter().enumerate().filter(|&(i, _)| !pages.touched(i * 64)) {
+            w.store(u64::MAX, Ordering::SeqCst);
+        }
+        assert_eq!(pages.hot_pages(&vec![u64::MAX; pages.dirty.len()]).collect::<Vec<_>>(), [7, 8, CHUNK + 9, last]);
+    }
+
+    #[test]
+    #[ignore = "manual pause bitmap microbenchmark; run with --release --ignored --nocapture"]
+    fn pause_bitmap_benchmark() {
+        use std::hint::black_box;
+        use std::sync::Arc;
+
+        let pages = Pages::new((47 << 30) / crate::util::PAGE_SIZE);
+        for p in [7, CHUNK + 9, pages.len() - 1] {
+            pages.mark_dirty(p);
+        }
+        let before = Mutex::new(Arc::new(pages.dirty_bits(false)));
+        let start = Instant::now();
+        for _ in 0..100 {
+            // The previous pause's whole-guest clones, intersection and kept bitmap allocation.
+            let before = before.lock().unwrap().as_ref().clone();
+            let intersect: Vec<u64> = pages.dirty_bits(false).iter().zip(&before).map(|(a, b)| a & b).collect();
+            let hot: Vec<_> = set_bits(&intersect).collect();
+            let dirty = pages.dirty_bits(false);
+            let next = dirty.clone();
+            let mut kept = vec![0u64; dirty.len()];
+            hot.iter().for_each(|&p| kept[p / 64] |= 1 << (p % 64));
+            black_box((hot, dirty, next, kept));
+        }
+        let old = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..100 {
+            let before = before.lock().unwrap();
+            let hot: Vec<_> = pages.hot_pages(&before).collect();
+            let dirty = Arc::new(pages.dirty_bits(false));
+            let mut kept = std::collections::BTreeMap::new();
+            hot.iter().for_each(|&p| *kept.entry(p / 64).or_insert(0) |= 1u64 << (p % 64));
+            black_box((hot, dirty.clone(), dirty, kept));
+        }
+        println!("47 GiB, three touched chunks, bitmap bookkeeping per pause: old {:?}, new {:?}", old / 100, start.elapsed() / 100);
+    }
 
     #[test]
     fn install_uses_full_capped_runs() {

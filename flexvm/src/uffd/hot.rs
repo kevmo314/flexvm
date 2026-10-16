@@ -15,7 +15,6 @@
 //! keep-running checkpoints holds up to twice `HOT_MIB` for this: the last checkpoint's copies and the memory for the
 //! next one's.
 
-use super::pages::set_bits;
 use super::{Mapping, Pager, PRESENT};
 use crate::bail;
 use crate::util::{Result, PAGE_SIZE};
@@ -154,13 +153,15 @@ impl Pager {
     pub(super) fn copy_hot(&self) -> Option<Hot> {
         let buf = self.hot_spare.lock().unwrap().take()?;
         // Written in two intervals in a row: one written once (a file being written, say) is better left to the writers.
-        let before = self.hot_dirty.lock().unwrap().clone();
-        let dirty: Vec<u64> = self.pages().dirty_bits(false).iter().zip(before.iter().chain(std::iter::repeat(&0))).map(|(a, b)| a & b).collect();
+        let before = self.hot_dirty.lock().unwrap();
+        // This is only a candidate scan: it clears no dirty bits. Freeze later takes the authoritative snapshot
+        // under the fault lock and protects every dirty page not copied here, including intervening writes.
         let pages = self.pages();
         let spans: Vec<(usize, usize)> = self.mappings().iter().map(|m| m.span()).collect();
         let eligible = |p: usize| pages.get(p) == PRESENT && spans.iter().any(|&(a, b)| (a..b).contains(&p));
         // One past what fits is enough to know they do not.
-        let hot: Vec<usize> = set_bits(&dirty).filter(|&p| eligible(p)).take(buf.pages() + 1).collect();
+        let hot: Vec<usize> = pages.hot_pages(&before).filter(|&p| eligible(p)).take(buf.pages() + 1).collect();
+        drop(before);
         if hot.len() > buf.pages() {
             self.recycle_buf(buf);
             return None;
