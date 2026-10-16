@@ -673,16 +673,12 @@ fn sweep(paths: &Paths) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, image: Option<ImageMeta>, tap: &str) -> Result<()> {
-    // `tap` is made by the caller and removed here.
-    let res = (|| {
-        // Running VMs map the old files, which must not be rewritten under them.
-        let staging = Staging::new(paths, name)?;
-        build(paths, &staging.dir, name, vcpus, mem_mib, max_mib, plug_mib, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
-        interrupted()?;
-        publish(paths, name, &staging.dir, interrupted)
-    })();
-    crate::net::delete_tap(tap);
-    res
+    // The caller owns `tap` through image preparation and the build.
+    // Running VMs map the old files, which must not be rewritten under them.
+    let staging = Staging::new(paths, name)?;
+    build(paths, &staging.dir, name, vcpus, mem_mib, max_mib, plug_mib, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
+    interrupted()?;
+    publish(paths, name, &staging.dir, interrupted)
 }
 
 /// Nothing is deleted: VMs and checkpoints refer to generations by content id, so old ones
@@ -724,18 +720,19 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
 fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, tap: &str, image: Option<ImageMeta>) -> Result<()> {
     let run = dir.join("boot");
     std::fs::create_dir_all(&run)?;
-    let sockets = SocketRoot::new(dir)?;
 
     // rootfs.ext4 is a symlink a rebuild repoints; the snapshot's page cache needs these bytes.
     let rootfs = std::fs::canonicalize(&paths.rootfs)
         .map_err(|e| format!("{}: {e} (build it: scripts/build-rootfs.sh, or give --image REF)", paths.rootfs.display()))?;
+    let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
+    let sockets = SocketRoot::new(dir)?;
     let start = Instant::now();
     let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
     let vsock = fc.sockets.vsock.clone();
     let metrics = run.join("metrics.json");
     File::create(&metrics)?;
     fc.put("/metrics", json!({"metrics_path": metrics}))?;
-    fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
+    fc.put("/boot-source", json!({"kernel_image_path": kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
     fc.put("/balloon", json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}))?;
@@ -840,6 +837,17 @@ mod tests {
     fn working_set_runs_are_padded_and_merged() {
         assert_eq!(pad_runs(vec![(3, 2), (17, 1), (20, 40), (100, 1)], 16), vec![(0, 64), (96, 16)]);
         assert_eq!(pad_runs(vec![], 16), vec![]);
+    }
+
+    #[test]
+    fn missing_kernel_names_the_fetch_script_before_spawning() {
+        let dir = crate::test_util::TempDir::new("kernel");
+        let paths = Paths::new(&dir);
+        std::fs::create_dir_all(paths.rootfs.parent().unwrap()).unwrap();
+        std::fs::write(&paths.rootfs, b"rootfs").unwrap();
+        let error = build(&paths, &dir.join("build"), "test", 1, 256, 256, 256, "unused", None).unwrap_err().to_string();
+        assert!(error.starts_with(&format!("{}:", paths.kernel.display())), "{error}");
+        assert!(error.contains("scripts/fetch.sh"), "{error}");
     }
 
     #[test]

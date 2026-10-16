@@ -59,9 +59,9 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                 [--announce-dev IFACE|none] [--reserve MIB] [--evict-at MIB]
                                      set this host's settings, live (no flags: show them and what is
                                      derived for those unset); --peer replaces the list, '' unsets
-  flexvm listen [ADDR]               take migrations from peers on ADDR
+  flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
   flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
-  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF ...]
+  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--init PATH] [--image REF ...]
                                      build a template (see README)
   flexvm bench ...                   latency benchmarks (see README)
 
@@ -162,7 +162,8 @@ impl Args {
                         a.child_args.push(value.clone());
                         value
                     } else {
-                        bail!("unknown option --{f} (see flexvm --help)");
+                        let hint = if f == "listen" { "; the listen address is flexvm listen's" } else { " (see flexvm --help)" };
+                        bail!("unknown option --{f}{hint}");
                     };
                     a.flags.push((f.into(), value));
                 }
@@ -278,7 +279,15 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
 /// Flags and words a command does not take are errors, never ignored.
 fn check_applies(args: &Args) -> Result<()> {
     let Some(cmd) = args.positional.first() else { return Ok(()) };
-    let Some(&(_, most, flags)) = COMMANDS.iter().find(|(c, ..)| c == cmd) else { return Ok(()) };
+    let Some(&(_, most, flags)) = COMMANDS.iter().find(|(c, ..)| c == cmd) else {
+        bail!("unknown command {cmd:?} (see flexvm --help)");
+    };
+    if matches!(cmd.as_str(), "run" | "resume" | "exec" | "kill" | "checkpoint" | "migrate" | "template")
+        && !(cmd == "run" && (args.has("standby") || args.has("incoming")))
+        && args.positional.get(1).is_none_or(|name| name.is_empty())
+    {
+        bail!("{cmd} needs NAME");
+    }
     let image = cmd == "template" && args.has("image");
     if let Some((f, _)) = args.flags.iter().find(|(f, _)| ![GLOBAL, flags, if image { IMAGE_FLAGS } else { &[] }].concat().contains(&f.as_str())) {
         if cmd == "template" && IMAGE_FLAGS.contains(&f.as_str()) {
@@ -709,6 +718,10 @@ fn template_vcpus(args: &Args) -> Result<u32> {
 fn build_template(args: &Args, name: &str) -> Result<()> {
     host::check_name(name)?;
     let cpus = template_vcpus(args)?;
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("run flexvm as root");
+    }
+    util::check_kvm()?;
     // Interrupted, the build stops at its next step and removes its tap and staging (gigabytes:
     // an image's unpacked tree and rootfs too); a second signal ends flexvm at once, and the next
     // build removes the staging. Blocked before the image's download threads start.
@@ -720,23 +733,27 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
         }
     });
     let mut paths = paths(args)?;
-    let image = image_options(args)?
-        .map(|opts| {
-            let init = args.get("init").map_or(paths.kernel.with_file_name("flexvm-init"), PathBuf::from);
-            let (rootfs, meta) = image::prepare(&state(args)?.join("images"), &init, &opts)?;
-            paths.rootfs = rootfs;
-            Ok::<_, util::Error>(meta)
-        })
-        .transpose()?;
+    let opts = image_options(args)?;
     let max = args.parse_or("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
     let (mem, plug) = (args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
     let host = open_host(args)?;
     let me = host::Ident::me();
     host::clear_taps(&host.run, &me);
     let tap = template::tap(&host.tap_prefix());
-    let root = if unsafe { libc::geteuid() } == 0 { "" } else { " (run flexvm as root)" };
-    net::create_tap(&tap, &host::tap_alias(&host.run, &me)).map_err(|e| format!("{e}{root}"))?;
-    template::create(&paths, name, cpus, mem, max, plug, image, &tap)
+    net::create_tap(&tap, &host::tap_alias(&host.run, &me))?;
+    let res = (|| {
+        let image = opts
+            .map(|opts| {
+                let init = args.get("init").map_or(paths.kernel.with_file_name("flexvm-init"), PathBuf::from);
+                let (rootfs, meta) = image::prepare(&state(args)?.join("images"), &init, &opts)?;
+                paths.rootfs = rootfs;
+                Ok::<_, util::Error>(meta)
+            })
+            .transpose()?;
+        template::create(&paths, name, cpus, mem, max, plug, image, &tap)
+    })();
+    net::delete_tap(&tap);
+    res
 }
 
 fn image_options(args: &Args) -> Result<Option<image::Options>> {
@@ -1054,6 +1071,29 @@ mod exec_tests {
     fn exec_drops_one_separator() {
         let args = parse(&["exec", "web", "--", "ls", "--", "-d"]);
         assert_eq!(args.rest, ["ls", "--", "-d"]);
+    }
+
+    #[test]
+    fn missing_or_empty_names_name_the_command() {
+        for cmd in ["run", "resume", "exec", "kill", "checkpoint", "migrate", "template"] {
+            for argv in [vec![cmd], vec![cmd, ""]] {
+                assert_eq!(real_main(&parse(&argv)).unwrap_err().to_string(), format!("{cmd} needs NAME"));
+            }
+        }
+        for flag in ["--standby", "--incoming"] {
+            check_applies(&parse(&["run", flag])).unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_command_names_the_bad_word() {
+        assert_eq!(real_main(&parse(&["rnu", "web"])).unwrap_err().to_string(), r#"unknown command "rnu" (see flexvm --help)"#);
+    }
+
+    #[test]
+    fn removed_listen_flag_points_to_the_listen_command() {
+        let error = Args::parse(["config", "--listen", "127.0.0.1:7070"].map(String::from)).err().unwrap();
+        assert_eq!(error.to_string(), "unknown option --listen; the listen address is flexvm listen's");
     }
 
     #[test]

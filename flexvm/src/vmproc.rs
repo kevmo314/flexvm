@@ -1532,6 +1532,7 @@ fn forget_stop(early: &mut Vec<i32>) {
 }
 
 pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::File>) -> Result<()> {
+    crate::util::check_kvm()?;
     // Blocked first: every thread from here on (the output relays too) inherits it.
     let signals = crate::util::block_signals(&SIGNALS);
     crate::util::output::guard()?;

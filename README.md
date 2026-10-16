@@ -1,6 +1,7 @@
 # flexvm
 
-Elastic Firecracker microVMs. A VM sees every host CPU and a memory ceiling of
+Elastic Firecracker microVMs. By default, a VM sees the host's CPUs, capped at
+32 and rounded down to even (1 on a single-CPU host), and a memory ceiling of
 host RAM, but only uses what it touches. It starts in about 5 ms, pauses,
 checkpoints and suspends to disk, and live-migrates to another host
 (post-copy) in tens of milliseconds, keeping its address and TCP connections.
@@ -18,9 +19,9 @@ artifacts (`artifacts/`), templates (`templates/`), pulled images
 ```sh
 ./scripts/build-firecracker.sh   # patched firecracker (needs musl-tools, libseccomp-dev)
 ./scripts/fetch.sh               # guest kernel 6.1, ubuntu 24.04 base (and stock firecracker, if none is built)
-./scripts/build-rootfs.sh        # rootfs.ext4, and flexvm-init for image templates
+./scripts/build-rootfs.sh        # rootfs.ext4, and flexvm-init for image templates (needs squashfs-tools, e2fsprogs)
 cargo build --release && sudo install target/release/flexvm /usr/local/bin/
-sudo flexvm template default     # cold-boot and snapshot a template (all CPUs, ceiling = host RAM, 4 GiB plugged)
+sudo flexvm template default     # cold-boot and snapshot a template (default CPUs, ceiling = host RAM, 4 GiB plugged)
 sudo flexvm run web
 ```
 
@@ -50,7 +51,7 @@ flexvm run web --ip 10.200.0.9 --template small
 
 ```sh
 flexvm ls                      # --json prints the list as JSON
-NAME             IP              TEMPLATE   STATE             PID VCPU  RSS MiB  MAX MiB
+NAME             IP              TEMPLATE   STATE             PID VCPU  RSS MiB  MAX MiB STARVED
 web              10.200.0.1      default    running        41522   24       27    32000
 ```
 
