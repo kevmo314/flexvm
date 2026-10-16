@@ -404,6 +404,10 @@ impl Proc {
                     p.vm().name
                 ),
             }
+            // Before the process ends: what reached its hold after it let go is in the log.
+            if let Some(h) = p.holder() {
+                h.report_now();
+            }
             p.finish(&op, End::Moved(to), 0, None)
         });
     }
@@ -605,19 +609,26 @@ impl Proc {
                 });
                 if let Err(e) = &took {
                     // Routed to the tap at once instead, a few tries well within the source's
-                    // wait. Plugged first: what the route sends waits there behind the source's
-                    // last held packets, injected past the plug, until the stream ends.
+                    // wait, but only once plugged: what the route sends then waits there behind
+                    // the source's last held packets, injected past the plug, until the stream
+                    // ends. Unplugged, it would overtake them: left to the stream's end then.
                     crate::log!("vm {}: taking over {}: {e}; routing it to its tap", vm.name, vm.ip);
-                    let (plug, res) = crate::net::plug_tap(&vm.tap);
+                    // Test fault `hold_plug_fail`: the tap's plug is refused.
+                    let (plug, res) = match tripped("hold_plug_fail") {
+                        true => (false, Err("injected fault: plugging the tap failed".into())),
+                        false => crate::net::plug_tap(&vm.tap),
+                    };
                     plugged = plug;
-                    if let Err(e) = res {
-                        crate::log!("vm {}: plugging its tap: {e}", vm.name);
-                    }
-                    for delay in [0, 20, 80] {
-                        thread::sleep(Duration::from_millis(delay));
-                        took = p.if_current(|| vm.route_here()).map(|r| r.map(|()| false));
-                        if took.is_ok() {
-                            break;
+                    match res {
+                        Err(e) => crate::log!("vm {}: plugging its tap: {e}; routing {} once the held packets are in", vm.name, vm.ip),
+                        Ok(()) => {
+                            for delay in [0, 20, 80] {
+                                thread::sleep(Duration::from_millis(delay));
+                                took = p.if_current(|| vm.route_here()).map(|r| r.map(|()| false));
+                                if took.is_ok() {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

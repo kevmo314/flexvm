@@ -251,6 +251,9 @@ impl Holder {
 
     /// Hands the queue to `sink` then `barrier`s (far end catching up), up to four rounds, then
     /// `switch`es and hands over the rest. `barrier` false: far end lost, but the route switches.
+    /// `refused` (set by a failed `switch`): the far end routes the address itself once it has
+    /// all, so the route here stays until then, what reaches it counted as dropped, never
+    /// removed (the address would go nowhere meanwhile) nor re-sent (it would come back).
     pub fn release(
         &self,
         ip: Ipv4Addr,
@@ -258,6 +261,7 @@ impl Holder {
         sink: &mut dyn FnMut(&[u8]) -> bool,
         barrier: &mut dyn FnMut() -> bool,
         switch: impl FnOnce() -> Result<()>,
+        refused: &std::cell::Cell<bool>,
     ) -> Option<(Stats, Result<()>)> {
         let e = self.releasing(ip, mig)?;
         let mut stats = Stats::default();
@@ -282,6 +286,7 @@ impl Holder {
         }
         match switched {
             Ok(()) => self.unhold(ip, &e, true),
+            Err(_) if refused.get() => self.unhold(ip, &e, false),
             // Left to the TUN, the address would be dropped here until the caller's retry.
             Err(_) => self.unroute(ip, &e),
         }
@@ -457,6 +462,13 @@ impl Holder {
             self.reading.store(false, Ordering::SeqCst);
             wait = self.report_stragglers();
         }
+    }
+
+    /// Logs every straggler counted and not reported yet, whenever the last report was: for a
+    /// process about to end, whose rate-limited reports would otherwise never come.
+    pub fn report_now(&self) {
+        self.gone.lock().unwrap().values_mut().for_each(|g| g.reported = None);
+        self.report_stragglers();
     }
 
     /// Logs the stragglers counted since an address's last report: the first report at once,
@@ -818,6 +830,9 @@ pub fn receive(
         return None;
     }
     let tap_dropped = inj.dropped();
+    // Closing a packet socket waits for an RCU grace period (tens of ms): not before the
+    // caller routes the address.
+    std::thread::spawn(move || drop(inj));
     let reply = json!({"injected": injected, "dropped": dropped + tap_dropped});
     write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| tap_dropped)
 }
@@ -858,6 +873,7 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
     // A handoff moves the route on the target; `switch` runs after the stragglers went, as
     // until they are injected, packets routed to the target overtake them.
     let mut switch = Some(switch);
+    let refused = std::cell::Cell::new(false);
     let handover = || match handoff {
         true => {
             let mut o = out.borrow_mut();
@@ -866,9 +882,10 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
             let answered = o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok();
             match ack[0] {
                 b'w' if answered => Ok(()),
-                // Its route failed: the rest still goes to it, which routes the address once
-                // the stream ends. Not re-sent from here, where the route still leads.
+                // It could not route the address yet: the rest still goes to it, which routes
+                // the address once the stream ends.
                 b'n' if answered => {
+                    refused.set(true);
                     crate::log!("hold {ip}: the target could not take the address over; it routes it after the held packets");
                     bail!("the target could not take {ip} over")
                 }
@@ -881,7 +898,7 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
         }
         false => switch.take().map_or(Ok(()), |f| f()),
     };
-    let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, handover)?;
+    let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, handover, &refused)?;
     let mut o = out.into_inner();
     o.buf.extend_from_slice(&0u32.to_be_bytes());
     match o.flush(Instant::now() + FLUSH_WAIT).then(|| read_reply(conn, Instant::now() + REPLY_WAIT)).flatten() {
