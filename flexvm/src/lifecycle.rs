@@ -391,6 +391,7 @@ impl Proc {
         let (vm, restore) = (|| -> Result<_> {
             let seed = Some((ck.runs, Origin::File(ck.file)));
             let prepared = Vm::prepare(self.spawner.take(None)?, tpl, t)?;
+            m.check_msrs(&crate::compat::local(prepared.firecracker().pid())?.msrs)?;
             // Test gate: its Firecracker is up, nothing loaded or paged in yet.
             crate::host::hold("restore_prepared_gate");
             prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)

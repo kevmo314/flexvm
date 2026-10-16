@@ -27,7 +27,7 @@ fn tmp(name: &str) -> crate::test_util::TempDir {
 fn manifest(guest_pages: usize, parent: Option<Parent>, files: serde_json::Value) -> Manifest {
     serde_json::from_value(json!({
         "format": if parent.is_some() { FORMAT_INCREMENTAL } else { FORMAT }, "created_unix_ms": 0, "name": "x",
-        "ip": "10.0.0.1", "template": "tpl", "template_id": "id", "vcpus": 1, "mem_mib": 1, "max_mib": 1,
+        "ip": "10.0.0.1", "template": "tpl", "template_id": "id", "saved_msrs": [], "vcpus": 1, "mem_mib": 1, "max_mib": 1,
         "hotplug_mib": 0, "guest_pages": guest_pages, "data_pages": 0, "zero_pages": 0, "parent": parent, "files": files,
     }))
     .unwrap()
@@ -46,6 +46,34 @@ fn link(dir: &Path, parent: Option<Parent>, edit: impl FnOnce(&mut Manifest)) ->
     let body = serde_json::to_vec(&m).unwrap();
     fs::write(dir.join("manifest.json"), [format!("{}\n", sum(&body)).as_bytes(), &body].concat()).unwrap();
     sum(&body)
+}
+
+#[test]
+fn saved_host_msrs_survive_manifest_roundtrip_and_are_checked() {
+    let dir = tmp("saved-msrs");
+    // Template host A has only TSC; host B added TSX_CTRL and XSS before saving.
+    let a = [0x10].into();
+    let b = [0x10, 0x122, 0xda0].into();
+    link(&dir, None, |m| m.saved_msrs = Some(b));
+    let ck = Checkpoint::open(&dir).unwrap();
+    let error = ck.manifest.check_msrs(&a).unwrap_err().to_string();
+    assert!(error.contains("saved MSRs 0x122, 0xda0"), "{error}");
+    ck.manifest.check_msrs(&[0x10, 0x122, 0xda0, 0x3b].into()).unwrap();
+
+    // Only the newest VM state is loaded; ancestor manifests supply memory only.
+    let child = dir.join("child");
+    link(&child, Some(Parent { path: dir.to_path_buf(), id: ck.id }), |m| m.saved_msrs = Some(a.clone()));
+    Checkpoint::open(&child).unwrap().manifest.check_msrs(&a).unwrap();
+}
+
+#[test]
+fn older_saved_vms_cannot_fall_back_to_template_msrs() {
+    let dir = tmp("missing-saved-msrs");
+    link(&dir, None, |m| m.saved_msrs = None);
+    let ck = Checkpoint::open(&dir).unwrap();
+    let error = ck.manifest.check_msrs(&[0x10, 0x122, 0xda0].into()).unwrap_err().to_string();
+    assert!(error.contains("checkpoint or suspended VM") && error.contains("older flexvm") && error.contains("cannot be restored"), "{error}");
+    assert!(!error.contains("rebuild"), "{error}");
 }
 
 #[test]
