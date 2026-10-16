@@ -682,6 +682,16 @@ pub fn send_unix(path: &std::path::Path, line: &[u8], fds: &[RawFd], at: Instant
     Ok(s)
 }
 
+/// The pid of the process that made the socket `s` is connected to (for a listener's, the one that listened).
+pub fn peer_pid(s: &UnixStream) -> io::Result<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred.pid as u32)
+}
+
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     let fd = eintr(|| unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) })?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })

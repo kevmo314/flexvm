@@ -380,10 +380,12 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
             c.listen = Some(a.into());
         }
         let bound = match activated {
-            // Without ADDR, an activated socket says where this host listens.
+            // Without ADDR, an activated socket says where this host listens; ADDR must be where it does.
             Some(l) => {
-                if addr.is_none() {
-                    c.listen = Some(l.local_addr()?.to_string());
+                let local = l.local_addr()?;
+                match addr {
+                    Some(a) => activated_at(a, local, listen::v6only(&l))?,
+                    None => c.listen = Some(local.to_string()),
                 }
                 l
             }
@@ -397,6 +399,28 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
         Ok(())
     })?;
     Ok(listener.unwrap())
+}
+
+/// An ADDR given with an activated socket is what peers are told (they fetch a
+/// migration's memory from it): one the socket does not listen on is refused.
+fn activated_at(addr: &str, local: std::net::SocketAddr, v6only: bool) -> Result<()> {
+    let at = |a: &std::net::SocketAddr| a.port() == local.port() && takes(local, v6only, a.ip());
+    let resolved = util::resolve(addr, Instant::now() + Duration::from_secs(2)).map_err(|e| format!("listen address {addr}: {e}"))?;
+    if !resolved.iter().any(at) {
+        bail!("the activated socket listens on {local}, not {addr}: run flexvm listen without ADDR, or give the socket's address");
+    }
+    Ok(())
+}
+
+/// Whether a socket bound at `local` takes connections to `ip`: its own address, or for a
+/// wildcard one any of its family (an IPv6 one IPv4 too, unless IPV6_V6ONLY).
+fn takes(local: std::net::SocketAddr, v6only: bool, ip: std::net::IpAddr) -> bool {
+    let (ip, bound) = (ip.to_canonical(), local.ip().to_canonical());
+    match (bound.is_unspecified(), local.ip()) {
+        (false, _) => ip == bound,
+        (true, std::net::IpAddr::V4(_)) => ip.is_ipv4(),
+        (true, std::net::IpAddr::V6(_)) => ip.is_ipv6() || !v6only,
+    }
 }
 
 /// What `configure` sets.
@@ -539,20 +563,39 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
 
 /// A running VM's process resumes it (true); a suspended one a new process. A
 /// suspend coming (a SIGTERM sent before) is waited out: the VM then runs here
-/// (it failed) or is suspended. Never true unless its process said so.
+/// (it failed) or is suspended. Never true unless its process said so, once the
+/// VM runs: a resume that fails, or a destroy meanwhile, is an error.
 fn resume(host: &Host, name: &str) -> Result<bool> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match vmproc::call(host, name, json!({"op": "resume"}), None) {
-            Ok(v) if v["suspending"] == true => {}
-            Ok(_) => return Ok(true),
+        let req = json!({"op": "resume"});
+        let reply = vmproc::connect(host, name, &req, &[], Instant::now() + Duration::from_secs(10))
+            .map(|c| recv_json(&mut BufReader::new(util::By { s: c, at: Instant::now() + RESUME_ANSWER })));
+        match reply {
+            Ok(Ok(Some(v))) if v["ok"] == true && v["result"]["suspending"] == true => {}
+            Ok(Ok(Some(v))) if v["ok"] == true => return Ok(true),
+            // Its control connections are all taken: asked again.
+            Ok(Ok(Some(v))) if v["error"] == "busy" && Instant::now() < deadline => {}
+            Ok(Ok(Some(v))) => return Err(v["error"].as_str().unwrap_or("resume refused").to_string().into()),
+            Ok(Err(e)) if host.alive(name) => return Err(format!("vm {name}: its resume was not confirmed: {e}").into()),
+            // It took the request: whatever ended it meanwhile ended the resume too.
+            Ok(_) => {
+                return Err(format!(
+                    "vm {name} ended before its resume was confirmed (killed or suspended meanwhile?); see {}",
+                    host.vms(name, "log")?.display()
+                )
+                .into())
+            }
             Err(_) if host.entry(name).is_err() => return Ok(false),
-            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+            Err(e) if Instant::now() >= deadline => return Err(e),
             Err(_) => {}
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// How long `resume` waits for the VM process's answer: longer than it waits for the resume.
+const RESUME_ANSWER: Duration = Duration::from_secs(75);
 
 fn kill(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
@@ -833,6 +876,8 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
     let id = session.lock().unwrap().id.clone();
     let mut error = String::new();
     let mut deadline = Instant::now() + Duration::from_secs(30);
+    // The VM the first request reached: only it is attached to, or asked to start the command again.
+    let mut vm = None;
     while Instant::now() < deadline {
         let (started, offset) = {
             let s = session.lock().unwrap();
@@ -843,9 +888,13 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
         };
         let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
         let at = Instant::now() + Duration::from_secs(5);
-        let stream = vmproc::connect(host, name, &req, &[], at).and_then(|c| exec_stream(c, at));
+        let stream = connect_same(host, name, &req, at, &mut vm).and_then(|c| exec_stream(c, at));
         // Locked per write, never across a read: a checkpoint takes stdout's lock too.
         match stream.map(|mut r| {
+            // Test fault `exec_lose_echo`: the connection is lost before the session id comes back (the guest has the command).
+            if !started && crate::host::tripped("exec_lose_echo") {
+                return Ok(StreamEnd::Disconnected("injected fault: lost before the session id".into()));
+            }
             let result = exec_frames(&mut r, session, &mut std::io::stdout(), &mut std::io::stderr(), &mut deadline);
             if !patient && matches!(result, Ok(StreamEnd::Exit(_))) {
                 let _ = r.get_mut().write_all(&[guest::SESSION_DONE]);
@@ -855,6 +904,7 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
             Ok(Err(e)) => return Err(e),
             Ok(Ok(StreamEnd::Exit(code))) => return Ok(code),
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
+            Err(e) if e.is::<Replaced>() => return Err(format!("{e} (session {id})").into()),
             Err(e) => {
                 // A new interactive command fails at once; a running one (or a VM's
                 // main command) waits for its VM to resume, or for a checkpoint (a
@@ -878,8 +928,78 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
             }
         }
         std::thread::sleep(Duration::from_millis(200));
+        // Test gate `exec_retry`: the next try waits while a test changes the VM under it.
+        if crate::host::fault("exec_retry") {
+            crate::host::gate("exec_retry");
+            deadline = Instant::now() + Duration::from_secs(30);
+        }
     }
     Err(format!("exec recovery timed out: {error}").into())
+}
+
+/// Which VM a command runs in: its address and that address's generation. A
+/// suspend and resume, or a migration, keeps both; a VM made again under the
+/// name (after a kill) has a new generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Instance {
+    ip: std::net::Ipv4Addr,
+    gen: u64,
+}
+
+/// The VM under the name is another than the one a command's request reached first.
+#[derive(Debug)]
+struct Replaced(String);
+
+impl std::fmt::Display for Replaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Replaced {}
+
+/// Connects to `name`'s VM process and sends `req` once it is known to run the
+/// VM `vm` names (recorded by the first connection): one made under the name
+/// since is refused (`Replaced`) before the request reaches it, and one that
+/// cannot be told yet (its registry entry not published) is an error retried.
+fn connect_same(host: &Host, name: &str, req: &Value, at: Instant, vm: &mut Option<Instance>) -> Result<std::os::unix::net::UnixStream> {
+    let c = util::connect_unix(&host.sock(name)?, at.saturating_duration_since(Instant::now())).map_err(|e| {
+        if host.alive(name) {
+            format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready: {e}")
+        } else if host.is_suspended(name) {
+            format!("vm {name:?} is suspended; use flexvm resume {name} first")
+        } else {
+            format!("no vm named {name:?}")
+        }
+    })?;
+    // The process that listens; a VM's own main command needs no check: no other takes the name while it holds it.
+    let pid = util::peer_pid(&c)?;
+    if pid != std::process::id() {
+        let now = host.entry(name).ok().filter(|e| e.ident.pid == pid && e.gen != 0).and_then(|e| Some(Instance { ip: e.ip?, gen: e.gen }));
+        same_instance(name, now.ok_or_else(|| format!("vm {name:?} is starting or its registry entry is unavailable; retry once it is ready"))?, vm)?;
+    }
+    let mut line = serde_json::to_vec(req)?;
+    line.push(b'\n');
+    util::send_with_fds(&c, &line, &[], at)?;
+    c.set_read_timeout(None)?;
+    c.set_write_timeout(None)?;
+    Ok(c)
+}
+
+/// Records the first VM reached; any later one must be it.
+fn same_instance(name: &str, now: Instance, vm: &mut Option<Instance>) -> Result<()> {
+    match vm {
+        None => *vm = Some(now),
+        Some(v) if *v == now => {}
+        Some(v) => {
+            return Err(Box::new(Replaced(format!(
+                "vm {name} was killed and made again since the command was sent ({} generation {}, now {} generation {}); \
+                 not starting it again in the new vm, it may have run in the old one",
+                v.ip, v.gen, now.ip, now.gen
+            ))))
+        }
+    }
+    Ok(())
 }
 
 /// Keeps frames read ahead with the reply, then switches from its deadline to heartbeat timeouts.
@@ -1183,6 +1303,29 @@ mod exec_tests {
         let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
         assert!(configure_listener(&mut host, None, Some(wildcard)).unwrap_err().to_string().contains("--underlay"));
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        // An ADDR other than the activated socket's is refused, saving nothing; its own is kept.
+        let before = std::fs::read(host.state.join("host.json")).unwrap();
+        let activated = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+        let e = configure_listener(&mut host, Some(&other), Some(activated)).unwrap_err().to_string();
+        assert!(e.contains("the activated socket listens on 127.0.0.1:") && e.contains(&other), "{e}");
+        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        let activated = TcpListener::bind("127.0.0.1:0").unwrap();
+        let own = activated.local_addr().unwrap().to_string();
+        drop(configure_listener(&mut host, Some(&own), Some(activated)).unwrap());
+        assert_eq!(host.cfg.listen.as_deref(), Some(own.as_str()));
+        // A wildcard socket listens on every address with its port.
+        let wildcard = std::net::SocketAddr::from(([0, 0, 0, 0], 7070));
+        assert!(activated_at("10.1.2.3:7070", wildcard, false).is_ok());
+        assert!(activated_at("10.1.2.3:7071", wildcard, false).is_err());
+        assert!(activated_at("127.0.0.1:7070", std::net::SocketAddr::from(([10, 1, 2, 3], 7070)), false).is_err());
+        // An IPv4 wildcard takes no IPv6 connections; an IPv6 one IPv4 ones only without IPV6_V6ONLY.
+        assert!(activated_at("[::1]:7070", wildcard, false).is_err());
+        let v6 = "[::]:7070".parse().unwrap();
+        assert!(activated_at("[::1]:7070", v6, true).is_ok());
+        assert!(activated_at("10.1.2.3:7070", v6, false).is_ok());
+        assert!(activated_at("10.1.2.3:7070", v6, true).is_err());
+        assert!(activated_at("[::ffff:10.1.2.3]:7070", wildcard, false).is_ok());
         // An IPv6 listener needs no IPv4 underlay.
         if let Ok(v6) = TcpListener::bind("[::1]:0") {
             drop(configure_listener(&mut host, None, Some(v6)).unwrap());
@@ -1296,6 +1439,38 @@ mod exec_tests {
         let error = exec_session(&host, "gone", "true", &session, false).unwrap_err();
         assert!(!error.to_string().contains("recovery timed out"), "{error}");
         assert!(start.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_a_vm_made_again_under_the_name() {
+        let ip = "10.0.0.2".parse().unwrap();
+        let mut vm = None;
+        same_instance("web", Instance { ip, gen: 7 }, &mut vm).unwrap();
+        // A suspend and resume, or a migration, keeps the address's generation.
+        same_instance("web", Instance { ip, gen: 7 }, &mut vm).unwrap();
+        let e = same_instance("web", Instance { ip, gen: 8 }, &mut vm).unwrap_err();
+        assert!(e.is::<Replaced>() && e.to_string().contains("generation 7, now 10.0.0.2 generation 8"), "{e}");
+        assert!(same_instance("web", Instance { ip: "10.0.0.3".parse().unwrap(), gen: 7 }, &mut vm).unwrap_err().is::<Replaced>());
+        assert_eq!(vm, Some(Instance { ip, gen: 7 }), "the first stays");
+    }
+
+    #[test]
+    fn a_vm_whose_registry_entry_is_not_its_listeners_is_not_sent_the_request() {
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+        let root = crate::test_util::TempDir::new("exec-same");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let _name = host.take_name("own", false).unwrap();
+        let l = UnixListener::bind(host.sock("own").unwrap()).unwrap();
+        // This process listens: a VM's own main command, sent without a check.
+        let mut vm = None;
+        let c = connect_same(&host, "own", &json!({"op": "x"}), Instant::now() + Duration::from_secs(5), &mut vm).unwrap();
+        assert_eq!(util::peer_pid(&c).unwrap(), std::process::id());
+        let mut line = String::new();
+        BufReader::new(l.accept().unwrap().0).read_line(&mut line).unwrap();
+        assert_eq!(line, "{\"op\":\"x\"}\n");
+        assert_eq!(vm, None);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -185,7 +185,7 @@ fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Slot, deadline: Ins
     }
 }
 
-fn v6only(l: &TcpListener) -> bool {
+pub fn v6only(l: &TcpListener) -> bool {
     let (mut v, mut len) = (0i32, std::mem::size_of::<i32>() as libc::socklen_t);
     let r = unsafe { libc::getsockopt(l.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &mut v as *mut i32 as *mut libc::c_void, &mut len) };
     r == 0 && v != 0

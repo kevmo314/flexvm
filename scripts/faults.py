@@ -254,7 +254,8 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail",
-          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail", "hold_route_fail", "hold_plug_fail")
+          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail", "hold_route_fail", "hold_plug_fail",
+          "exec_lose_echo", "exec_retry")
 
 
 def disarm():
@@ -3750,7 +3751,7 @@ def resume_readdress_fail():
         if paused:
             r = ok(restore(B, path, paused=True, ip="auto"))
             code, out, err = cli(B, "resume", n)
-            check(f"readdress fails ({what}): resume sent", code == 0, err)
+            check(f"readdress fails ({what}): resume reports it", code != 0 and "setting its address" in err, (code, err))
             check(f"readdress fails ({what}): logged", wait_for(lambda: sigcont_failed() == 1, 30), log(B, n)[-2000:])
         else:
             r = ok(restore(B, path, ip="auto"))
@@ -3763,7 +3764,8 @@ def resume_readdress_fail():
         # A SIGCONT is let through while the address is pending: it tries again.
         before = sigcont_failed()
         code, out, err = cli(B, "resume", n)
-        check(f"readdress fails ({what}): another resume tries again", code == 0 and wait_for(lambda: sigcont_failed() > before, 30), log(B, n)[-2000:])
+        check(f"readdress fails ({what}): another resume tries again, and says it failed",
+              code != 0 and "setting its address" in err and sigcont_failed() > before, (code, err, log(B, n)[-2000:]))
         check(f"readdress fails ({what}): the background retries too", wait_for(lambda: "trying again" in log(B, n), 30), log(B, n)[-2000:])
         fault(B, "readdress_fail", 0)
         check(f"readdress fails ({what}): set once it can be, unasked", wait_for(lambda: has(r["ip"]), 30), sh(B, n, "ip -4 -o addr show eth0"))
@@ -3832,6 +3834,25 @@ def resume_unsettled():
     check("unsettled: checkpoints again", r["ok"], r)
     cleanup(n)
     rm_ckpt(path)
+
+
+def resume_outcome():
+    """#517: `flexvm resume` answers once the VM's process has tried: a resume
+    that fails part way (`resume_partial`) exits non-zero with its error, the
+    VM still paused; one that succeeds exits 0 with the VM already running."""
+    n = "ft-resume-outcome"
+    m = setup(n, mib=20)
+    check("resume outcome: paused", pause(A, n))
+    fault(A, "resume_partial", 60000)
+    code, out, err = cli(A, "resume", n)
+    fault(A, "resume_partial", 0)
+    check("resume outcome: the fault was reached", "injected fault: firecracker PATCH /vm: 400 the resume failed part way" in log(A, n), log(A, n)[-1000:])
+    check("resume outcome: a failed resume exits non-zero, saying why", code != 0 and "resume failed part way" in err, (code, out, err))
+    check("resume outcome: still paused", vms(A).get(n, {}).get("state") == "paused", vms(A).get(n))
+    code, out, err = cli(A, "resume", n)
+    check("resume outcome: then it resumes, running when it exits 0", code == 0 and vms(A).get(n, {}).get("state") == "running", (code, err, vms(A).get(n)))
+    check("resume outcome: md5 intact", md5(A, n) == m)
+    cleanup(n)
 
 
 def abort_link_fail():
@@ -7927,6 +7948,56 @@ def resume_suspending():
     ok(kill(A, n))
 
 
+def exec_recovery_instance():
+    """#517: an exec whose connection is lost before the session id comes back
+    (`exec_lose_echo`: the guest has the command) tries again, only in the vm
+    it reached first. Killed and made again under the name meanwhile (gated at
+    `exec_retry`), the new one is refused and never runs the command; suspended
+    and resumed meanwhile, the same vm is reattached and the command ran once."""
+    n = "ft-exec-instance"
+    cmd = "echo x >> /tmp/ran; echo done"
+
+    def lost_and_held():
+        clear_gate(A, "exec_lose_echo")
+        clear_gate(A, "exec_retry")
+        fault(A, "exec_lose_echo", 60000)
+        fault(A, "exec_retry", 60000)
+        p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "exec", n, cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+        held = wait_for(lambda: p.pid in reached(A, "exec_retry"), 30)
+        fault(A, "exec_lose_echo", 0)
+        check("exec instance: the connection was lost before the session id", p.pid in reached(A, "exec_lose_echo"), reached(A, "exec_lose_echo"))
+        check("exec instance: its retry is held", held, reached(A, "exec_retry"))
+        return p
+
+    def finish(p):
+        fault(A, "exec_retry", 0)
+        try:
+            out, err = p.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, err = p.communicate()
+        return p.returncode, out, err
+
+    ok(run(A, n))
+    gen = vms(A)[n]["gen"]
+    p = lost_and_held()
+    ok(kill(A, n))
+    ok(run(A, n))
+    check("exec instance: made again, a new generation", vms(A)[n]["gen"] != gen, (gen, vms(A).get(n)))
+    code, out, err = finish(p)
+    check("exec instance: the new vm is refused", code != 0 and "killed and made again" in err and "done" not in out, (code, out, err))
+    code, out = sh(A, n, "test -e /tmp/ran && echo ran || echo never")
+    check("exec instance: the new vm never ran the command", code == 0 and out == "never", (code, out))
+    p = lost_and_held()
+    suspend(A, n)
+    ok(resume_suspended(A, n))
+    code, out, err = finish(p)
+    check("exec instance: across a suspend and resume, the same vm is reattached", code == 0 and out.strip() == "done", (code, out, err))
+    code, out = sh(A, n, "wc -l < /tmp/ran")
+    check("exec instance: the command ran once", code == 0 and out == "1", (code, out))
+    ok(kill(A, n))
+
+
 def quit_status():
     """Ctrl-\\ (SIGQUIT) destroys the VM as Ctrl-C does, but the exit status is 131 (128 + SIGQUIT)."""
     n = "ft-quit"
@@ -8799,7 +8870,7 @@ SCENARIOS = dict(
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
-    ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status,
+    ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status, resume_outcome=resume_outcome, exec_recovery_instance=exec_recovery_instance,
     ckpt_ancestor_corrupt=ckpt_ancestor_corrupt, resume_listener_restart=resume_listener_restart,
     resume_killed_marked=resume_killed_marked)
 # Measurements, not correctness checks (nothing they print has a threshold): run only when named.
