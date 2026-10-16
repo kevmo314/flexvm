@@ -61,6 +61,8 @@ impl Firecracker {
         use std::os::unix::process::CommandExt;
         let mut cmd = Command::new(bin);
         cmd.arg("--api-sock").arg(&sockets.api).arg("--level").arg("Warn").stdin(Stdio::null());
+        // Its output is a pipe now: its working directory is how tools find its directory.
+        cmd.current_dir(dir);
         // Firecracker never outlives its VM process (whose pager serves its memory). The
         // signal comes when the spawning *thread* exits, so spawn from the main thread.
         let parent = std::process::id() as i32;

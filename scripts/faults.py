@@ -1507,7 +1507,7 @@ def rx_state(host, name):
     try:
         sock = api_sock(host, name)
         fc_api(sock, "PUT", "/actions", {"action_type": "FlushMetrics"})
-        fc_dir = os.path.dirname(os.readlink(f"/proc/{fc_pid(host, name)}/fd/1"))  # its firecracker.log
+        fc_dir = os.readlink(f"/proc/{fc_pid(host, name)}/cwd")  # its directory
         lines = open(os.path.join(fc_dir, "metrics.json")).read().splitlines()
         # Each flush holds the counts since the previous one: add them up.
         net = {}
