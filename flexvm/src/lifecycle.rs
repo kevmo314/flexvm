@@ -426,6 +426,8 @@ impl Proc {
             (_, _, s) => Err(format!("vm is {} before resuming", s.name()).into()),
         };
         ready.map_err(|e| Restore::NotRun(kill(e)))?;
+        // Bound before it is published or runs (#569, as `start_guest`): failing, it never ran and its checkpoint stays.
+        self.serve_control().map_err(|e| Restore::NotRun(kill(e)))?;
         // Published paused, until SIGCONT (`flexvm resume`); `why`: a resume that failed.
         let keep_paused = |t: &mut Phases, why: Option<String>| {
             if ip != m.ip {

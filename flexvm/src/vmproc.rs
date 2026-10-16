@@ -754,10 +754,16 @@ impl Proc {
     /// For a pause or resume: refused once a destroy waits for `op` too.
     pub fn op_unless_destroyed(&self) -> Result<Op<'_>> {
         let op = self.op_within()?;
-        if self.destroy_code().is_some() {
-            bail!("vm {} is being destroyed", self.name());
-        }
+        self.not_destroyed()?;
         Ok(op)
+    }
+
+    /// Refused once a destroy waits for `op`: for an operation that already holds it.
+    pub fn not_destroyed(&self) -> Result<()> {
+        match self.destroy_code() {
+            Some(_) => bail!("vm {} is being destroyed", self.name()),
+            None => Ok(()),
+        }
     }
 
     fn try_destroy(&self, code: i32) -> Error {
@@ -772,6 +778,8 @@ impl Proc {
         }
         vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
         vm.pager.abort_copy();
+        // Test marker: a destroy waits for `op` (a migration still preparing gives up once it sees it).
+        crate::host::tripped("destroy_wait");
         let op = self.op();
         if let State::Source(mig) = vm.state() {
             // It became one while this waited (a migration that holds `op` until its outcome is unknown).
@@ -1119,11 +1127,9 @@ impl Proc {
                 Ok(())
             }),
             // Also through while a new address is pending (a resume that failed to set it): this one retries it.
-            libc::SIGCONT
-                if self.leaving.load(Ordering::SeqCst) || !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) =>
-            {
-                Ok(())
-            }
+            libc::SIGCONT if !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) => Ok(()),
+            // Not run here: `flexvm resume` is told so, not that it runs (#569).
+            libc::SIGCONT if self.leaving.load(Ordering::SeqCst) => Err(format!("vm {} is migrating away (or ending)", vm.name).into()),
             libc::SIGCONT => self.resume().map(drop),
             libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
                 crate::log!("vm {}: migrating away; it ends once the target has its memory", vm.name);
@@ -1165,6 +1171,10 @@ impl Proc {
         };
         let _ = c.set_read_timeout(None);
         let reply = match req["op"].as_str().unwrap_or("") {
+            // Bound before a resume or restore runs its VM (`restore_checkpoint`).
+            "exec" | "pages" | "checkpoint" | "migrate" | "debug" | "resume" if self.vm.get().is_none() => {
+                Err(format!("vm {} is starting", self.name()).into())
+            }
             "exec" => return self.exec(&req, c),
             "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
@@ -1441,9 +1451,11 @@ impl Proc {
         }
     }
 
+    /// Kept while the VM is away (a migration's source): an aborted migration runs it here again (#569).
     fn follow_app(self: Arc<Self>) {
         let vm = self.vm().clone();
-        while vm.state().local() {
+        while !vm.dead() {
+            // Refused while it is not running here.
             let got = vm.exec(|s| guest::start_logs(s, self.app_log.load(Ordering::SeqCst), true, guest::TIMEOUT));
             if let Ok((mut g, id)) = got {
                 let _ = g.get_ref().set_read_timeout(None);
@@ -3204,11 +3216,17 @@ mod tests {
         let inode = std::fs::metadata(&sock).unwrap().ino();
         p.serve_control().unwrap();
         assert_eq!(std::fs::metadata(&sock).unwrap().ino(), inode);
-        let mut c = UnixStream::connect(sock).unwrap();
+        let mut c = UnixStream::connect(&sock).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         send_json(&mut c, &json!({"op": "unknown"})).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
         assert_eq!(reply["error"], "unknown op \"unknown\"");
+        // Bound before a resume or restore has its VM: asked for it, the socket says it is starting.
+        let mut c = UnixStream::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        send_json(&mut c, &json!({"op": "debug", "what": "status"})).unwrap();
+        let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
+        assert_eq!(reply["error"], "vm bound is starting");
     }
 
     #[test]
