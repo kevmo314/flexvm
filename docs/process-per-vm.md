@@ -163,7 +163,8 @@ RUN (default /run/flexvm, tmpfs)
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc, .gc.lock          when garbage was last swept periodically; one sweep at a time
-  .gens.next             the next generation below the high-water mark, with the boot id; lost or damaged, it starts at the mark
+  .gens.next             the next generation, with the boot id and the synced mark it is under; trusted only while
+                         addrs/.gens holds that mark, else the next generation reserves and syncs a new one
   .logs.lock             logs are opened holding it shared, swept holding it exclusively
   holds/ID-MIB           memory admitted to a live process, flocked by it (`.ID` while being made)
   grants-BOOTID          recent grants not yet held, counted against the reserve
@@ -280,9 +281,11 @@ All of this is decided under the host lock, in one critical section with the
 claim. Records with a new generation, a loan or a withdrawal are fsynced
 before acting; a fresh start's claim is not (a crash loses the VM too, and the
 high-water mark already orders generations). After a power loss that claim
-may be empty (#554): it reads as withdrawn at the high-water mark, so the
-address is free and its generations still only rise. Any other record that
-cannot be read or parsed is an error, never a free address.
+may be empty (#554): written before this boot (its mtime before the boot
+time), it reads as withdrawn at the high-water mark, so the address is free
+and its generations still only rise. One written in this boot may be a live
+VM's; it, and any other record that cannot be read or parsed, is an error,
+never a free address.
 
 - **Borrowing.** A restore keeping another host's address (its checkpoint's,
   or `--ip`) asks the peers to `lend` it: the home host checks it is free

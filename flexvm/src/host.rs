@@ -755,13 +755,18 @@ impl Host {
 
     /// Records are replaced whole, so reading one needs no lock. Only `claim_new_in`
     /// writes one without fsync, so only that one can come back empty (a power loss after
-    /// another write synced the directory, #554). Its VM died with the host, and its
-    /// generation is below the durable high-water mark: as withdrawn at the mark, the
-    /// address is free and its generations still only rise. Anything else that cannot
-    /// be read or parsed is an error, never a free address.
+    /// another write synced the directory, #554). Written before this boot, its VM died
+    /// with the host, and its generation is below the durable high-water mark: as
+    /// withdrawn at the mark, the address is free and its generations still only rise.
+    /// One written in this boot may be a live VM's, so it is an error, as is anything
+    /// else that cannot be read or parsed: never a free address.
     fn read_addr(&self, ip: Ipv4Addr) -> Result<Addr> {
         let path = self.addr_path(ip);
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+        if let Some(m) = std::fs::metadata(&path).ok().filter(|m| m.len() == 0) {
+            let btime = std::fs::read_to_string("/proc/stat").ok().and_then(|s| s.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok()));
+            if !btime.is_some_and(|b| m.modified().is_ok_and(|t| t < UNIX_EPOCH + Duration::from_secs(b))) {
+                bail!("{}: empty, and not from before this boot: its VM may still run", path.display());
+            }
             let g = load::<Gens>(&self.gens_path())?.ok_or_else(|| format!("{}: empty, with no high-water mark to bound it", path.display()))?;
             return Ok(Addr { seen: g.reserved, withdrawn: true, ..Addr::default() });
         }
@@ -870,11 +875,14 @@ impl Host {
     }
 
     /// Monotonic across crashes and reboots: every generation handed out is below a
-    /// high-water mark (`addrs/.gens`) reserved `GEN_BLOCK` at a time, fsynced before
-    /// one at or above it is used, and never written otherwise (#554: a rewrite without
-    /// fsync could come back empty). The cursor below it (`RUN/.gens.next`) is per boot
-    /// and never synced, so a start pays no fsync for it: lost, damaged or from another
-    /// boot, it starts again at the mark.
+    /// high-water mark (`addrs/.gens`) reserved `GEN_BLOCK` at a time, fsynced with its
+    /// directory before one at or above it is used, and never written otherwise (#554:
+    /// a rewrite without fsync could come back empty). The cursor below it
+    /// (`RUN/.gens.next`) is per boot and never synced, so a start pays no fsync for it.
+    /// It names the mark it was written under, once that mark was synced: trusted only
+    /// while `.gens` still holds that mark. Otherwise (lost, damaged, another boot's, or a
+    /// mark renamed in by a process that died or failed before its directory fsync) the
+    /// mark is uncertain, so the next generation is at it, which reserves and syncs a new one.
     fn next_gen(&self, seen: u64) -> Result<u64> {
         const GEN_BLOCK: u64 = 1024;
         let cursor = self.run.join(".gens.next");
@@ -882,7 +890,7 @@ impl Host {
             bail!("cannot read the boot id: generations would not be ordered across a reboot");
         }
         let mut g = load::<Gens>(&self.gens_path())?.unwrap_or(Gens { next: 1, reserved: 0, boot: String::new() });
-        let at = std::fs::read(&cursor).ok().and_then(|b| serde_json::from_slice::<Gens>(&b).ok()).filter(|c| c.boot == boot_id());
+        let at = std::fs::read(&cursor).ok().and_then(|b| serde_json::from_slice::<Gens>(&b).ok()).filter(|c| c.boot == boot_id() && c.reserved == g.reserved);
         let gen = at.map_or(g.next.max(g.reserved), |c| c.next.max(g.next)).max(seen.saturating_add(1));
         (g.next, g.boot) = (gen + 1, boot_id().into());
         if gen >= g.reserved {
@@ -3214,8 +3222,17 @@ mod tests {
             std::fs::write(h.run.join(".gens.next"), cursor).unwrap();
             assert_eq!(h.next_gen(0).unwrap(), mark);
         }
+        // A mark renamed in by a process that died before its directory fsync: the cursor,
+        // written under the old one, is not trusted, and a new mark is synced above it.
+        let ahead = gens().reserved + 5000;
+        store(&h.gens_path(), &Gens { next: 1, reserved: ahead, boot: boot_id().into() }, false).unwrap();
+        assert_eq!(h.next_gen(0).unwrap(), ahead);
+        assert!(gens().reserved > ahead);
         let mark = gens().reserved;
+        // Emptied in this boot, its VM may still run.
         std::fs::write(h.addr_path(x), "").unwrap();
+        assert!(h.addr(&l, x).is_err() && h.claim_new(&l, "b", Some(x)).is_err());
+        File::options().write(true).open(h.addr_path(x)).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(1)).unwrap();
         let a = h.addr(&l, x).unwrap();
         assert!(a.seen == mark && a.withdrawn && a.holder.is_none() && a.lent.is_none());
         assert!(!h.observe(&l, x, gen, 0, Some(ip("192.0.2.1"))).unwrap(), "its old generation is stale");
@@ -3228,6 +3245,7 @@ mod tests {
         assert!(h.claim_new(&l, "b", Some(x)).unwrap().gen > mark);
         // Without a mark nothing bounds it.
         std::fs::write(h.addr_path(ip("10.9.0.2")), "").unwrap();
+        File::options().write(true).open(h.addr_path(ip("10.9.0.2"))).unwrap().set_modified(UNIX_EPOCH).unwrap();
         std::fs::remove_file(h.gens_path()).unwrap();
         assert!(h.addr(&l, ip("10.9.0.2")).is_err());
     }
