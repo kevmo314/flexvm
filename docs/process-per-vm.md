@@ -77,12 +77,12 @@ standby), `pages` (passed on by the listener) and `debug` (tests).
 
 | signal | effect |
 |---|---|
-| SIGTERM | suspend: checkpoint to `STATE/suspended/NAME`, free everything, exit 143. `flexvm resume NAME` restores it in a new process |
+| SIGTERM | suspend: checkpoint to `STATE/suspended/NAME`, free everything, exit 143. `flexvm resume NAME` restores it in a new process. An unclaimed standby VM has nothing to suspend: it is destroyed, exit 143 |
 | SIGTSTP | pause the vCPUs (the process keeps running and serving pages; Ctrl-Z works) |
 | SIGCONT | resume the vCPUs of a VM paused by SIGTSTP (ignored otherwise: the kernel sends it after any SIGSTOP, systemd after SIGTERM) |
 | SIGINT | destroy the VM, withdraw its address, exit 130 (Ctrl-C works) |
 | SIGQUIT | as SIGINT (Ctrl-\ destroys the VM rather than dumping core) |
-| SIGUSR1 | stop a standby VM (`flexvm standby`, memory pressure); a claimed VM ignores it, so a stop that lands after a claim started never destroys the VM the claim made |
+| SIGUSR1 | stop a standby VM (`flexvm standby`, memory pressure), exit 0; a claimed VM ignores it, so a stop that lands after a claim started never destroys the VM the claim made |
 | SIGSTOP | cannot be caught: freezes the pager, so the guest stalls. Unsupported |
 
 They (and SIGHUP, ignored: a closed terminal leaves the VM running) are
@@ -413,6 +413,13 @@ VMs it starts are ready (a minute at most each), so concurrent claims never over
 but not answered (the standby died, or hung up) is an uncertain outcome: the
 guest may have run, so `run` reports it (with the standby's socket, and
 whether the registry shows the VM) and starts nothing else.
+
+An unclaimed standby VM exits 0 only when it leaves the pool on purpose: the
+pool's stop (SIGUSR1), its template changed, the pool is over its target, or
+its socket is gone. SIGINT, SIGQUIT and SIGTERM destroy it with 128 + the
+signal (SIGTERM too: there is nothing worth suspending), and its Firecracker
+dying (or its memory lost) ends it with 124, as for any VM. A claim that
+fails and gives the VM up ends it with 125.
 
 ## Memory controller and eviction
 

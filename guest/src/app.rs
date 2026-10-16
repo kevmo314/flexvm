@@ -193,7 +193,22 @@ fn read_conf() -> io::Result<String> {
     std::fs::read_to_string(CONF).map_err(|e| io::Error::new(e.kind(), format!("{CONF}: {e}")))
 }
 
-/// Dropped without `cleanup` (an early return), it is still killed and removed.
+/// The check groups not yet removed of checks under way: a sweep leaves them be (one just created is empty).
+static CHECK_GROUPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Removes the `flexvm-check-*` groups under `parent` that no check under way holds: left behind
+/// when a killed task outlived both `cleanup` and the drop's retry (D state, say). One still
+/// populated stays (rmdir refuses it) for a later sweep. Under `live`, so none is created meanwhile.
+fn sweep_check_groups(parent: &str, live: &[String]) {
+    for e in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        let path = format!("{parent}/{}", e.file_name().to_string_lossy());
+        if e.file_name().to_string_lossy().starts_with("flexvm-check-") && e.file_type().is_ok_and(|t| t.is_dir()) && !live.contains(&path) {
+            let _ = std::fs::remove_dir(&path);
+        }
+    }
+}
+
+/// Dropped without `cleanup` (an early return, or a cleanup that failed), it is killed and removed.
 struct CheckGroup {
     dir: String,
     procs: CString,
@@ -210,23 +225,34 @@ impl CheckGroup {
         // Under the guest's memory mark, like the app (see mem.rs).
         let parent = if mem::work_procs().is_some() { mem::CGROUP } else { mem::CGROUP_ROOT };
         let dir = format!("{parent}/flexvm-check-{}", NEXT.fetch_add(1, Ordering::Relaxed));
-        std::fs::create_dir(&dir).map_err(|e| io::Error::other(format!("create {dir}: {e}")))?;
+        {
+            let mut live = CHECK_GROUPS.lock().unwrap();
+            sweep_check_groups(parent, &live);
+            std::fs::create_dir(&dir).map_err(|e| io::Error::other(format!("create {dir}: {e}")))?;
+            live.push(dir.clone());
+        }
         Self::from_dir(dir)
+    }
+
+    /// Done: removed, or left for a sweep.
+    fn finished(&mut self) {
+        self.done = true;
+        CHECK_GROUPS.lock().unwrap().retain(|d| *d != self.dir);
     }
 
     fn from_dir(dir: String) -> io::Result<CheckGroup> {
         let mut g = CheckGroup { procs: CString::new(format!("{dir}/cgroup.procs")).unwrap(), dir, done: false };
         // Needs cgroup.kill (Linux 5.14) to kill every task at once.
         if !std::path::Path::new(&format!("{}/cgroup.kill", g.dir)).exists() {
-            g.done = true;
+            g.finished();
             std::fs::remove_dir(&g.dir)?;
             return Err(io::Error::other("the kernel has no cgroup.kill"));
         }
         Ok(g)
     }
 
+    /// Done only once the group is removed: until then the drop tries again.
     fn cleanup(&mut self) -> io::Result<()> {
-        self.done = true;
         std::fs::write(format!("{}/cgroup.kill", self.dir), "1")?;
         // Reading through the polled fd rearms its POLLPRI, so a change after the read still wakes the poll.
         let mut events = File::open(format!("{}/cgroup.events", self.dir))?;
@@ -239,7 +265,9 @@ impl CheckGroup {
             let mut fd = libc::pollfd { fd: events.as_raw_fd(), events: libc::POLLPRI, revents: 0 };
             unsafe { libc::poll(&mut fd, 1, left.as_millis().max(1) as i32) };
         }
-        std::fs::remove_dir(&self.dir)
+        std::fs::remove_dir(&self.dir)?;
+        self.finished();
+        Ok(())
     }
 }
 
@@ -247,8 +275,9 @@ impl Drop for CheckGroup {
     fn drop(&mut self) {
         if !self.done {
             if let Err(e) = self.cleanup() {
-                let _ = writeln!(io::stderr(), "flexvm-init: readiness check group: {e}");
+                let _ = writeln!(io::stderr(), "flexvm-init: readiness check group: {e} (the next check removes it)");
             }
+            self.finished();
         }
     }
 }
@@ -398,6 +427,35 @@ mod tests {
         let dir = crate::test_util::TempDir::new("check-group");
         assert!(CheckGroup::from_dir(dir.to_str().unwrap().into()).err().unwrap().to_string().contains("cgroup.kill"));
         assert!(!dir.exists());
+    }
+
+    /// A cleanup that could not remove the group leaves it to the drop, which tries again.
+    #[test]
+    fn check_group_is_done_only_once_removed() {
+        let dir = crate::test_util::TempDir::new("check-group-left");
+        std::fs::write(dir.join("cgroup.kill"), "").unwrap();
+        std::fs::write(dir.join("cgroup.events"), "populated 0\n").unwrap();
+        let mut g = CheckGroup::from_dir(dir.to_str().unwrap().into()).unwrap();
+        // A plain directory with files in it: rmdir fails, as on a group a task still holds.
+        assert!(g.cleanup().is_err());
+        assert!(!g.done);
+        g.done = true;
+    }
+
+    #[test]
+    fn leftover_check_groups_are_swept() {
+        let dir = crate::test_util::TempDir::new("check-sweep");
+        let parent = dir.to_str().unwrap();
+        for d in ["flexvm-check-1", "flexvm-check-2", "flexvm-check-3", "other"] {
+            std::fs::create_dir(dir.join(d)).unwrap();
+        }
+        // Populated: rmdir refuses it.
+        std::fs::write(dir.join("flexvm-check-3/task"), "").unwrap();
+        sweep_check_groups(parent, &[format!("{parent}/flexvm-check-2")]);
+        assert!(!dir.join("flexvm-check-1").exists());
+        assert!(dir.join("flexvm-check-2").exists(), "a check under way keeps its group");
+        assert!(dir.join("flexvm-check-3").exists());
+        assert!(dir.join("other").exists());
     }
 
     #[test]
