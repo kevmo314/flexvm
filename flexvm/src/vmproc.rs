@@ -973,7 +973,7 @@ impl Proc {
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();
         }
-        if vm.template.meta.image.as_ref().is_some_and(|i| !i.warm) {
+        if vm.template.meta.image.as_ref().is_some_and(|i| i.starts_at_run()) {
             vm.start_app().map_err(|e| format!("{e} (see the vm's output)"))?;
             t.mark("app_start");
         }
@@ -1030,7 +1030,7 @@ impl Proc {
         spawn(Proc::controller);
         spawn(Proc::serve_memory);
         spawn(Proc::watch_memory);
-        if self.vm().template.meta.image.is_some() {
+        if self.vm().template.meta.image.as_ref().is_some_and(|i| i.has_app()) {
             spawn(Proc::follow_app);
         }
         if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten()) {

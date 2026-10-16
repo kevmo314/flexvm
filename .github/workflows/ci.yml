@@ -29,7 +29,7 @@ env:
   RUST_TOOLCHAIN: "1.88.0"
   # The e2e image-template case's image (pulled, then cached: see "Restore image").
   E2E_IMAGE: public.ecr.aws/docker/library/busybox:1.36
-  # Where the scripts install firecracker, the kernel and the rootfs (flexvm's default state).
+  # Where the scripts install firecracker, the kernel and the base rootfs (flexvm's default state).
   STATE: /var/lib/flexvm
   # No FC_VERSION / CI_VERSION / KERNEL overrides are set here. fetch.sh --urls resolves
   # them, and the cache keys below are built from its output, so setting one changes the keys.
@@ -115,7 +115,7 @@ jobs:
 
       # Cache keys: the build inputs in the repo, what fetch.sh resolves (versions and
       # URLs, plus the ETags of the unversioned S3 objects), and the build environment
-      # (runner image; flexvm's toolchain for the rootfs; Firecracker's toolchain is
+      # (runner image; Firecracker's toolchain is
       # pinned by its tag, which the URL list carries).
       - name: Cache keys
         id: keys
@@ -157,7 +157,7 @@ jobs:
           path: ${{ env.STATE }}/artifacts/firecracker
           key: ${{ steps.fc-cache.outputs.cache-primary-key }}
 
-      # Guest kernel and base root filesystem (fetch.sh skips the stock Firecracker: the patched one is there).
+      # Guest kernel and the test image's base root filesystem (fetch.sh skips the stock Firecracker: the patched one is there).
       - name: Restore downloads
         id: dl-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -180,33 +180,17 @@ jobs:
             ${{ env.STATE }}/artifacts/base.squashfs
           key: ${{ steps.dl-cache.outputs.cache-primary-key }}
 
-      # The default template's root filesystem with flexvm-init: rebuilt when the guest agent, the
-      # image recipe, the base image (by checksum) or the build environment change. Image templates
-      # need none of it: flexvm embeds flexvm-init.
-      - name: Restore rootfs
-        id: rootfs-cache
+      # The test image (scripts/test-image.py: the base root filesystem as an OCI layout), which
+      # e2e.py pulls its templates from; it makes it when the cache has none. flexvm embeds flexvm-init.
+      - name: Restore test image
+        id: test-image-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ${{ env.STATE }}/artifacts/rootfs-*.ext4
-            ${{ env.STATE }}/artifacts/rootfs.ext4
-          key: rootfs-${{ steps.keys.outputs.env }}-rust${{ env.RUST_TOOLCHAIN }}-base${{ steps.fetch.outputs.base }}-${{ hashFiles('guest/**', 'scripts/build-rootfs.sh', 'Cargo.lock', 'Cargo.toml') }}
-      - name: Build rootfs
-        if: steps.rootfs-cache.outputs.cache-hit != 'true'
-        # A target directory of its own: it builds while flexvm does.
-        env:
-          CARGO_TARGET_DIR: target/guest
-        run: |
-          command -v unsquashfs > /dev/null || { sudo apt-get update -q; sudo apt-get install -y -q --no-install-recommends squashfs-tools; }
-          ./scripts/build-rootfs.sh
-      - name: Save rootfs
-        if: steps.rootfs-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ${{ env.STATE }}/artifacts/rootfs-*.ext4
-            ${{ env.STATE }}/artifacts/rootfs.ext4
-          key: ${{ steps.rootfs-cache.outputs.cache-primary-key }}
+          path: ${{ runner.temp }}/test-image
+          key: test-image-base${{ steps.fetch.outputs.base }}-${{ hashFiles('scripts/test-image.py') }}
+      - name: squashfs-tools
+        if: steps.test-image-cache.outputs.cache-hit != 'true'
+        run: command -v unsquashfs > /dev/null || { sudo apt-get update -q; sudo apt-get install -y -q --no-install-recommends squashfs-tools; }
 
       - name: Build flexvm
         run: |
@@ -238,7 +222,17 @@ jobs:
           # "pr 2/4": shard pr, its second of four splits.
           set -- $SHARD
           jobs=4; if [ "$1" = heavy ]; then jobs=1; fi
-          sudo python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --log-dir "$RUNNER_TEMP/e2e-logs"
+          sudo python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "$RUNNER_TEMP/test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
+      - name: Test image made
+        id: test-image-made
+        if: always() && steps.test-image-cache.outputs.cache-hit != 'true'
+        run: if [ -e "$RUNNER_TEMP/test-image/index.json" ]; then echo "made=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Save test image
+        if: always() && steps.test-image-made.outputs.made == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/test-image
+          key: ${{ steps.test-image-cache.outputs.cache-primary-key }}
 
       - name: Image digest
         id: img-digest

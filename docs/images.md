@@ -1,19 +1,23 @@
-# Container image templates
+# Container images
 
 ```sh
-sudo flexvm template web --image nginx:1.27                    # any registry: Docker Hub, ghcr.io, gcr.io, ...
-sudo flexvm template app --image ./app.tar --env PORT=8080     # `docker save` output or an OCI archive
-sudo flexvm template py  --image ./oci-layout --cmd "python3 -m http.server 8000"
-sudo flexvm template web-warm --image nginx:1.27 --warm        # snapshot nginx running and ready
-flexvm run web1 --template web
+sudo flexvm pull nginx:1.27                                     # any registry: Docker Hub, ghcr.io, gcr.io, ...
+sudo flexvm pull ./app.tar --tag app --env PORT=8080            # `docker save` output or an OCI archive
+sudo flexvm pull ./oci-layout --tag py --cmd "python3 -m http.server 8000"
+sudo flexvm pull nginx:1.27 --tag web-warm --warm               # snapshot nginx running and ready
+flexvm run web1 --template nginx:1.27
 curl http://<ip>/
 ```
 
-`REF` is a registry reference (`nginx`, `ghcr.io/org/app@sha256:…`), an
-uncompressed `docker save` / OCI archive, or an OCI image layout directory.
-Overrides follow `docker run`: `--entrypoint` and `--cmd` (words, or a JSON
-array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
-`--workdir`, `--user name|uid[:group|gid]`.
+`IMAGE` is a registry reference (`nginx`, `ghcr.io/org/app@sha256:…`), an
+uncompressed `docker save` / OCI archive, or an OCI image layout directory
+(these two need `--tag NAME[:TAG]`: flexvm does not read the names inside).
+Names, pulling again, `images` and `rmi` are in the README
+([Images](../README.md#images)). Overrides follow `docker run`:
+`--entrypoint` and `--cmd` (words, or a JSON array; a new entrypoint drops
+the image's command), `--env K=V` (repeatable), `--workdir`,
+`--user name|uid[:group|gid]`. An image left with no entrypoint and no
+command has no app: its VMs idle (`--warm` refuses it).
 
 Images are untrusted input processed as root. Every document and blob is
 checked against its digest (layers while unpacking into private staging,
@@ -58,8 +62,9 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   it at `run`). `mkfs.ext4 -d` writes the read-only image. Built filesystems
   are cached in `STATE/images/rootfs/` by image config digest, flexvm-init
   and overrides, and templates attach the cached file in place, so templates of
-  one image share one copy in the page cache (it is never rewritten; deleting it
-  breaks those templates). Builds of the same cache key are serialized with
+  one image share one copy in the page cache (it is never rewritten; `rmi`
+  removes it once no template uses it, and deleting it by hand breaks those
+  templates). Builds of the same cache key are serialized with
   a lock; entries are published with fsync and no-replace rename, with their
   `.ok` marker last. Every reuse also fsyncs the cache directory under the
   lock; a failed fsync refuses the entry. Templates only ever get durably

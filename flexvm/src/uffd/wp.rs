@@ -590,7 +590,7 @@ mod tests {
         std::fs::File::create(dir.join("mem")).unwrap().set_len(PAGE_SIZE as u64).unwrap();
         let base = crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap();
         for incremental in [false, true] {
-            // The default template's 47 GiB plus a partial final chunk. No guest process or UFFD is needed: BASE and
+            // A template sized for a 47 GiB host plus a partial final chunk. No guest process or UFFD is needed: BASE and
             // ZERO pages must be counted and saved in deltas, but need no write-protect ioctl.
             let n = (47 << 30) / PAGE_SIZE + 1;
             let last = n - 1;

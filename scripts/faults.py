@@ -13,6 +13,11 @@ to --state's. Checkpoint scenarios write to --ckpt-dir. Without --a/--b, the
 listeners take two free loopback ports; without --a-dir/--b-dir and --ckpt-dir,
 directories of this run's own.
 
+--template names a template of the test image, whose guests have what the
+scenarios run (python3, socat, iproute2):
+    sudo scripts/test-image.py /var/tmp/test-image
+    sudo flexvm pull /var/tmp/test-image --tag small --vcpus 2 --max 2048
+
 Each scenario ends `ok`, `FAILED` or `SKIPPED` (this host lacks what it tests,
 or it restarts listeners it was not given: --no-listeners); --no-skips counts
 a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
@@ -8399,7 +8404,7 @@ def warm_ready():
         with open(os.path.join(image, "oci-layout"), "w") as f:
             json.dump({"imageLayoutVersion": "1.0.0"}, f)
         ready = identity + " && test -f /tmp/app-ready"
-        code, out, err = cli(A, "template", tpl, "--image", image, "--vcpus", "2", "--max", "2048",
+        code, out, err = cli(A, "pull", image, "--tag", tpl, "--vcpus", "2", "--max", "2048",
                              "--warm", "--ready-cmd", ready, "--ready-timeout", "10", timeout=600)
         check("warm ready: template passes the credential check", code == 0, err or out)
     ok(run(A, n, template=tpl))
@@ -8416,7 +8421,7 @@ def app_template():
     name = args.template + "-applog"
     if not os.path.isdir(os.path.join(A.state, "templates", name)):
         cmd = ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"]
-        code, out, err = cli(A, "template", name, "--image", args.image, "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd), timeout=600)
+        code, out, err = cli(A, "pull", args.image, "--tag", name, "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd), timeout=600)
         assert code == 0, err or out
     return name
 
@@ -8780,7 +8785,8 @@ def template_tap():
     name = f"ft-tpltap-{os.getpid()}"
     tdir = os.path.join(A.state, "templates")
     prefix = ok(cli_json(A, "config"))["derived"]["prefix"]
-    p = spawn_cli(A, "template", name, "--vcpus", "1", "--max", "512")
+    # Its tap is made before the image is read.
+    p = spawn_cli(A, "pull", args.image, "--tag", name, "--vcpus", "1", "--max", "512")
     tap = f"{prefix}x{p.pid:x}"
     def ifalias(dev):
         try:

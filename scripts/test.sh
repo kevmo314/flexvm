@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Root/KVM integration test. Build artifacts and the default template as in README.md first.
+# Root/KVM integration test. Build the artifacts as in README.md and pull the test image as
+# TEMPLATE (default small; see scripts/faults.py) first: the guest runs python3.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -143,7 +144,7 @@ sleep 0.5
 pass
 
 current=1
-addr=$(cli fvA "$host_A" run "$name" -d | run_ip)
+addr=$(cli fvA "$host_A" run "$name" --template "${TEMPLATE:-small}" -d | run_ip)
 listed fvA "$host_A" "$addr" || fail 'ls did not report the new VM and address.'
 [[ $(cli fvA "$host_A" exec "$name" 'printf flexvm-exec-ok') == flexvm-exec-ok ]] || fail 'Guest exec output mismatch.'
 if cli fvA "$host_A" exec "$name" 'exit 7'; then
@@ -155,7 +156,7 @@ fi
 cli fvA "$host_A" kill "$name"
 absent fvA "$host_A" || fail 'Killed VM is still listed.'
 # Reclaim the exact address, rather than assuming the allocator reuses its first slot.
-reclaimed=$(cli fvA "$host_A" run "$name" --ip "$addr" -d | run_ip)
+reclaimed=$(cli fvA "$host_A" run "$name" --template "${TEMPLATE:-small}" --ip "$addr" -d | run_ip)
 [[ $reclaimed == "$addr" ]] || fail 'Killed VM address was not released.'
 pass
 

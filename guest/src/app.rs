@@ -137,9 +137,6 @@ fn parse_conf(text: &str) -> io::Result<Conf> {
             _ => {}
         }
     }
-    if c.argv.is_empty() {
-        return Err(io::Error::other("the image has no entrypoint or command"));
-    }
     Ok(c)
 }
 
@@ -326,6 +323,9 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
         return Ok(pid);
     }
     let c = config()?;
+    if c.argv.is_empty() {
+        return Err(io::Error::other("the image has no entrypoint or command: there is no app"));
+    }
     let mut cmd = command(c, &c.argv);
     if let Some(work) = mem::work_procs() {
         mem::enter(&mut cmd, work, true);
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(c.argv, ["/bin/app", "a\nb\\c"]);
         assert_eq!(c.env, [("K".into(), "v=w".into()), ("BARE".into(), String::new())]);
         assert_eq!((c.cwd.as_str(), c.uid, c.gid, c.groups), ("/srv", 7, 8, vec![9, 10]));
-        assert!(parse_conf("cwd /").is_err());
+        assert!(parse_conf("cwd /").unwrap().argv.is_empty(), "no app");
         assert!(parse_conf("arg x\nuid root").is_err());
     }
 }

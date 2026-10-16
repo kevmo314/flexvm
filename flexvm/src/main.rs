@@ -41,8 +41,9 @@ use crate::vmproc::Start;
 const USAGE: &str = "\
 flexvm: elastic Firecracker microVMs with post-copy live migration
 
-  flexvm run NAME [--template T] [--ip IP] [-d] [-- CMD...]
+  flexvm run NAME [--template IMAGE] [--ip IP] [-d] [-- CMD...]
                                      start a VM; the process is the VM (-d: in the background)
+                                     (no --template: ubuntu:24.04, pulled if missing)
   flexvm ls [--json]                 list VMs (with their pids)
   flexvm exec NAME CMD...            run a shell command in a VM
   kill -TSTP PID / kill -CONT PID    pause / resume a VM (Ctrl-Z works in the foreground)
@@ -66,9 +67,13 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      --peer address (its --underlay); replaces them all
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
   flexvm recover                     sweep and refill standby VMs now, as root (at boot, without a listener)
-  flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
-  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF [--init PATH] ...]
-                                     build a template (see README)
+  flexvm standby [--template IMAGE] [N]
+                                     keep N VMs restored and paused, so run takes ~5 ms (no N: show)
+  flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] ...
+                                     pull an image and build its template (an archive or OCI layout
+                                     directory needs --tag; see README); again: rebuilt if it changed
+  flexvm images [--json]             list pulled images
+  flexvm rmi IMAGE|ID                remove an image no VM here uses
   flexvm bench ...                   latency benchmarks (see README)
 
 options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs), --run DIR (/run/flexvm, or
@@ -206,7 +211,7 @@ fn main() {
 /// Flags every command takes.
 const GLOBAL: &[&str] = &["state", "run", "help", "version"];
 
-/// What `template --image` takes.
+/// What `pull` takes besides the sizes.
 const IMAGE_FLAGS: &[&str] = &[
     "init",
     "entrypoint",
@@ -239,7 +244,9 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("recover", 1, &[]),
     ("config", 1, CONFIG_FLAGS),
     ("standby", 2, &["template"]),
-    ("template", 2, &["vcpus", "mem", "max", "plug", "image"]),
+    ("pull", 2, &["tag", "vcpus", "mem", "max", "plug"]),
+    ("images", 1, &["json"]),
+    ("rmi", 2, &[]),
     (
         "bench",
         1,
@@ -254,17 +261,14 @@ fn check_applies(args: &Args) -> Result<()> {
     let Some(&(_, most, flags)) = COMMANDS.iter().find(|(c, ..)| c == cmd) else {
         bail!("unknown command {cmd:?} (see flexvm --help)");
     };
-    if matches!(cmd.as_str(), "run" | "resume" | "exec" | "kill" | "checkpoint" | "migrate" | "template")
+    if matches!(cmd.as_str(), "run" | "resume" | "exec" | "kill" | "checkpoint" | "migrate" | "pull" | "rmi")
         && !(cmd == "run" && (args.has("standby") || args.has("incoming")))
         && args.positional.get(1).is_none_or(|name| name.is_empty())
     {
-        bail!("{cmd} needs NAME");
+        bail!("{cmd} needs {}", if matches!(cmd.as_str(), "pull" | "rmi") { "IMAGE" } else { "NAME" });
     }
-    let image = cmd == "template" && args.has("image");
+    let image = cmd == "pull";
     if let Some((f, _)) = args.flags.iter().find(|(f, _)| ![GLOBAL, flags, if image { IMAGE_FLAGS } else { &[] }].concat().contains(&f.as_str())) {
-        if cmd == "template" && IMAGE_FLAGS.contains(&f.as_str()) {
-            bail!("--{f} needs --image");
-        }
         bail!("--{f} does not apply to {cmd} (see flexvm --help)");
     }
     if let Some(extra) = args.positional.get(most) {
@@ -292,7 +296,7 @@ pub fn open_host(args: &Args) -> Result<Host> {
     let cmd = args.positional.first().map(String::as_str);
     // Not `config`: it may be fixing the configuration recovery goes by.
     if cmd != Some("config") {
-        let partly = matches!(cmd, Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
+        let partly = matches!(cmd, Some("run" | "resume" | "restore" | "listen" | "recover" | "pull"));
         if let Err(e) = gc::after_boot(&host, !partly) {
             if gc::first_boot_warning(&host, host::boot_id()) {
                 crate::log!("flexvm: recovering after boot: {e}");
@@ -330,10 +334,13 @@ fn real_main(args: &Args) -> Result<()> {
     check_applies(args)?;
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
-    let template = args.get("template").unwrap_or("default");
+    // An image reference, or a template's own name.
+    let template = &template::name_of(args.get("template").unwrap_or(template::DEFAULT_IMAGE))?;
     let call = |req: Value| print(vmproc::call(&open_host(args)?, name, req, None)?);
     match pos.first().copied() {
-        Some("template") => build_template(args, name),
+        Some("pull") => pull(args, name),
+        Some("images") => images(&paths(args)?, args.has("json")),
+        Some("rmi") => rmi(&open_host(args)?, &paths(args)?, name),
         Some("run") if args.has("standby") => vmproc::main(open_host(args)?, paths(args)?, Start::Standby { template: template.into() }, notify_fd()),
         Some("run") if args.has("incoming") => {
             let req: Value = serde_json::from_str(&std::env::var("FLEXVM_INCOMING").map_err(|_| "run --incoming is the listener's, for migrations")?)?;
@@ -558,10 +565,14 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
 /// Claims a standby VM if there is one, else becomes the VM.
 fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     let (host, paths) = (open_host(args)?, paths(args)?);
+    host::check_name(name)?;
+    // The default image, pulled the first time (a detached run's VM process finds it there).
+    if args.get("template").is_none() && std::fs::symlink_metadata(paths.templates.join(template)).is_err() {
+        pull_default(args)?;
+    }
     let ip = args.get("ip").filter(|&s| s != "auto");
     let ip: Option<std::net::Ipv4Addr> = ip.map(|s| s.parse().map_err(|_| format!("bad --ip {s:?}"))).transpose()?;
     let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
-    host::check_name(name)?;
     let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd});
     // A claimed standby VM writes where this process would, to opens made here (`own`).
     let log = args.has("detach").then(|| log_file(&host, name)).transpose()?;
@@ -752,7 +763,8 @@ fn reclaim(host: &Host, ip: &str, force: Option<u64>) -> Result<()> {
     print(json!({"ip": ip.to_string(), "withdrawn_gen": gen, "forgot_migrations": forgot.iter().map(|(id, _)| id).collect::<Vec<_>>()}))
 }
 
-fn list(host: &Host, as_json: bool) -> Result<()> {
+/// The VMs `ls` lists: registered, suspended, failed and lost.
+fn vms(host: &Host) -> Vec<Value> {
     let rss = |pid: Option<u32>| pid.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 20;
     let mut vms: Vec<Value> = host
         .entries()
@@ -776,6 +788,11 @@ fn list(host: &Host, as_json: bool) -> Result<()> {
             vms.push(json!({"name": n, "state": "lost", "error": std::fs::read_to_string(lost).unwrap_or_default()}));
         }
     }
+    vms
+}
+
+fn list(host: &Host, as_json: bool) -> Result<()> {
+    let vms = vms(host);
     if as_json {
         return print(json!(vms));
     }
@@ -814,8 +831,29 @@ fn template_vcpus(args: &Args) -> Result<u32> {
     Ok(cpus)
 }
 
-fn build_template(args: &Args, name: &str) -> Result<()> {
-    host::check_name(name)?;
+/// `run` without `--template`, the first time: `flexvm pull ubuntu:24.04`, its output on stderr.
+fn pull_default(args: &Args) -> Result<()> {
+    crate::log!("flexvm: pulling {} (the default image) first", template::DEFAULT_IMAGE);
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    for flag in ["state", "run"] {
+        if let Some(v) = args.get(flag) {
+            cmd.arg(format!("--{flag}")).arg(v);
+        }
+    }
+    let status = cmd.args(["pull", template::DEFAULT_IMAGE]).stdout(std::io::stderr()).status()?;
+    if !status.success() {
+        bail!("pulling {} failed ({status})", template::DEFAULT_IMAGE);
+    }
+    Ok(())
+}
+
+/// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date.
+fn pull(args: &Args, src: &str) -> Result<()> {
+    let name = match args.get("tag") {
+        Some(tag) => template::name_of(tag)?,
+        None if std::path::Path::new(src).exists() => bail!("{src} is a file or directory: name its image with --tag NAME[:TAG]"),
+        None => template::name_of(src)?,
+    };
     let cpus = template_vcpus(args)?;
     if unsafe { libc::geteuid() } != 0 {
         bail!("run flexvm as root");
@@ -831,35 +869,78 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
             std::thread::park();
         }
     });
-    let mut paths = paths(args)?;
-    let opts = image_options(args)?;
+    let paths = paths(args)?;
+    let opts = image_options(args, src)?;
     let max = args.parse_or("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
     let (mem, plug) = (args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
+    let size = template::Size { vcpus: cpus, mem_mib: mem, max_mib: max, plug_mib: plug };
     let host = open_host(args)?;
     let me = host::Ident::me();
     host::clear_taps(&host.run, &me);
     let tap = template::tap(&host.tap_prefix());
     net::create_tap(&tap, &host::tap_alias(&host.run, &me))?;
     let res = (|| {
-        let image = opts
-            .map(|opts| {
-                let init = args.get("init").map(PathBuf::from);
-                let (rootfs, meta) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
-                paths.rootfs = rootfs;
-                Ok::<_, util::Error>(meta)
-            })
-            .transpose()?;
-        template::create(&paths, name, cpus, mem, max, plug, image, &tap)
+        let init = args.get("init").map(PathBuf::from);
+        let (rootfs, meta) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
+        if let Some(id) = template::up_to_date(&paths, &name, size, &rootfs, &meta) {
+            return output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)));
+        }
+        template::create(&paths, &name, size, &rootfs, meta, &tap)
     })();
     net::delete_tap(&tap);
     res
 }
 
-fn image_options(args: &Args) -> Result<Option<image::Options>> {
-    let Some(src) = args.get("image") else {
-        // `check_applies` refused the image's flags.
-        return Ok(None);
+/// `images`: a row per image (`template::images`).
+fn images(paths: &Paths, as_json: bool) -> Result<()> {
+    let images = template::images(paths)?;
+    if as_json {
+        return print(json!(images));
+    }
+    let row = |c: [&str; 7]| output(format_args!("{:<32} {:<16} {:<16} {:>4} {:>8} {:>8} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6]));
+    row(["REPOSITORY", "TAG", "ID", "VCPU", "MAX MiB", "SIZE MiB", "CREATED"])?;
+    for v in &images {
+        let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
+        let created = v["created"].as_u64().map(|t| std::time::UNIX_EPOCH + Duration::from_secs(t)).and_then(|t| t.elapsed().ok());
+        let ago = created.map_or(String::new(), |d| match d.as_secs() {
+            s if s < 120 => format!("{s} seconds ago"),
+            s if s < 7200 => format!("{} minutes ago", s / 60),
+            s if s < 172800 => format!("{} hours ago", s / 3600),
+            s => format!("{} days ago", s / 86400),
+        });
+        let tag = s("tag");
+        let tag = if tag.starts_with("sha256:") { tag[..19].to_string() } else { tag };
+        row([&s("repository"), &tag, &s("id"), &s("vcpus"), &s("max_mib"), &s("size_mib"), &ago])?;
+    }
+    Ok(())
+}
+
+/// `rmi IMAGE|ID`: refused while a VM here (running, paused or suspended) or a standby count uses it.
+fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
+    let vms = vms(host);
+    let in_use: std::collections::BTreeSet<String> = vms.iter().filter_map(|v| v["template_id"].as_str().map(String::from)).collect();
+    let linked = template::name_of(what).ok().filter(|n| std::fs::symlink_metadata(paths.templates.join(n)).is_ok());
+    let Some(name) = linked else {
+        let id = template::generation_by_prefix(paths, what).map_err(|e| format!("{e} (see flexvm images)"))?;
+        return print(template::remove(paths, &host.state.join("images"), None, &id, &in_use)?);
     };
+    let users: Vec<&str> = vms.iter().filter(|v| v["template"].as_str() == Some(name.as_str())).filter_map(|v| v["name"].as_str()).collect();
+    if !users.is_empty() {
+        bail!("image {} is used by {}: kill them first", template::image_of(&name), users.join(", "));
+    }
+    let standby = (
+        standby::target(host, &name),
+        standby::show(host).as_array().into_iter().flatten().filter(|t| t["template"] == name.as_str()).map(|t| t["live"].as_u64().unwrap_or(0)).sum::<u64>(),
+    );
+    if standby != (0, 0) {
+        bail!("image {} keeps standby VMs (count {}, {} live): flexvm standby --template {0} 0 first", template::image_of(&name), standby.0, standby.1);
+    }
+    let _ = std::fs::remove_file(host.state.join("standby").join(&name));
+    let id = std::fs::read_link(paths.templates.join(&name))?.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    print(template::remove(paths, &host.state.join("images"), Some(&name), &id, &in_use)?)
+}
+
+fn image_options(args: &Args, src: &str) -> Result<image::Options> {
     let warm = args.has("warm");
     let ready = match (args.get("ready-port"), args.get("ready-cmd")) {
         (Some(_), Some(_)) => return Err("pass --ready-port or --ready-cmd, not both".into()),
@@ -873,7 +954,7 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
     let d = image::Limits::default();
     let bytes =
         |flag, default| -> Result<u64> { args.parse_or::<u64>(flag, default)?.checked_mul(1 << 20).ok_or_else(|| format!("--{flag} is too large").into()) };
-    Ok(Some(image::Options {
+    Ok(image::Options {
         image: src.into(),
         entrypoint: args.get("entrypoint").map(image::parse_argv).transpose()?,
         cmd: args.get("cmd").map(image::parse_argv).transpose()?,
@@ -890,7 +971,7 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
             file: bytes("max-file-mib", d.file >> 20)?,
             entries: args.parse_or("max-entries", d.entries)?,
         },
-    }))
+    })
 }
 
 /// A command's session in the guest: its id, whether the guest took it, and
@@ -1196,9 +1277,9 @@ mod exec_tests {
     fn numeric_flags_reject_overflow_and_invalid_cpu_counts() {
         for flag in ["max-download-mib", "max-unpacked-mib", "max-file-mib"] {
             for value in ["17592186044416", "18446744073709551615"] {
-                assert!(image_options(&parse(&["--image", "busybox", &format!("--{flag}"), value])).is_err(), "{flag}={value}");
+                assert!(image_options(&parse(&[&format!("--{flag}"), value]), "busybox").is_err(), "{flag}={value}");
             }
-            let opts = image_options(&parse(&["--image", "busybox", &format!("--{flag}"), "17592186044415"])).unwrap().unwrap();
+            let opts = image_options(&parse(&[&format!("--{flag}"), "17592186044415"]), "busybox").unwrap();
             let bytes = match flag {
                 "max-download-mib" => opts.limits.download,
                 "max-unpacked-mib" => opts.limits.unpacked,
@@ -1206,8 +1287,8 @@ mod exec_tests {
             };
             assert_eq!(bytes, (u64::MAX >> 20) << 20);
         }
-        assert!(image_options(&parse(&["--image", "busybox", "--ready-timeout", "18446744073709551615"])).is_err());
-        let opts = image_options(&parse(&["--image", "busybox", "--ready-timeout", "4294967295"])).unwrap().unwrap();
+        assert!(image_options(&parse(&["--ready-timeout", "18446744073709551615"]), "busybox").is_err());
+        let opts = image_options(&parse(&["--ready-timeout", "4294967295"]), "busybox").unwrap();
         assert_eq!(opts.ready_timeout.as_secs(), u32::MAX as u64);
         for value in ["0", "3", "33", "4294967296", "4294967297", "18446744073709551615"] {
             assert!(template_vcpus(&parse(&["--vcpus", value])).is_err(), "{value}");
@@ -1266,7 +1347,7 @@ mod exec_tests {
         let root = crate::test_util::TempDir::new("standby-zero");
         let args = parse(&["--state", root.join("state").to_str().unwrap(), "--run", root.join("run").to_str().unwrap(), "standby", "0"]);
         real_main(&args).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("state/standby/default")).unwrap(), "0");
+        assert_eq!(std::fs::read_to_string(root.join("state/standby/ubuntu:24.04")).unwrap(), "0");
         assert!(!root.join("state/artifacts").exists());
     }
 
@@ -1296,9 +1377,10 @@ mod exec_tests {
 
     #[test]
     fn missing_or_empty_names_name_the_command() {
-        for cmd in ["run", "resume", "exec", "kill", "checkpoint", "migrate", "template"] {
+        for cmd in ["run", "resume", "exec", "kill", "checkpoint", "migrate", "pull", "rmi"] {
+            let what = if matches!(cmd, "pull" | "rmi") { "IMAGE" } else { "NAME" };
             for argv in [vec![cmd], vec![cmd, ""]] {
-                assert_eq!(real_main(&parse(&argv)).unwrap_err().to_string(), format!("{cmd} needs NAME"));
+                assert_eq!(real_main(&parse(&argv)).unwrap_err().to_string(), format!("{cmd} needs {what}"));
             }
         }
         for flag in ["--standby", "--incoming"] {
@@ -1388,13 +1470,16 @@ mod exec_tests {
         assert!(err(&["resume", "web", "--ip", "10.0.0.1"]).is_some());
         assert!(err(&["restore", "/d", "--template", "t"]).is_some());
         assert!(err(&["kill", "web", "--", "x"]).is_some());
-        assert_eq!(err(&["template", "t", "--warm"]).unwrap(), "--warm needs --image");
-        assert_eq!(err(&["template", "t", "--init", "/x"]).unwrap(), "--init needs --image");
+        assert_eq!(err(&["run", "t", "--warm"]).unwrap(), "--warm does not apply to run (see flexvm --help)");
+        assert_eq!(err(&["images", "--tag", "x"]).unwrap(), "--tag does not apply to images (see flexvm --help)");
+        assert!(err(&["rmi", "a", "b"]).is_some());
         assert_eq!(err(&["listen", "1.2.3.4:7070", "--peer", "a:1"]).unwrap(), "--peer does not apply to listen (see flexvm --help)");
         for ok in [
             &["--state", "/s", "run", "web", "--template", "t", "-d", "--", "make", "test"][..],
             &["exec", "web", "ls", "-l"],
-            &["template", "t", "--image", "busybox", "--warm", "--ready-port", "80"],
+            &["pull", "busybox", "--tag", "t", "--vcpus", "2", "--warm", "--ready-port", "80"],
+            &["images", "--json"],
+            &["rmi", "ubuntu:24.04"],
             &["listen", "1.2.3.4:7070"],
             &["config", "--peer", "a:1", "--evict-at", ""],
             &["config"],

@@ -15,7 +15,7 @@
 # env: FLEXVM (binary), STATE (whose artifacts and templates to use), P (namespace prefix, default fv5), NET
 #      (default 192.168.155), ROUNDS (default 3), UDP_PPS (default 5000),
 #      MAX_UDP_LOSS (default 0), PORT (listeners, default 7070), WORK (keep logs under this
-#      directory, default /tmp), TEMPLATE (default default)
+#      directory, default /tmp), TEMPLATE (default small: the test image, see scripts/faults.py)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -126,7 +126,7 @@ wait_for test -f "$dir_A/state/host.json"
 wait_for test -f "$dir_B/state/host.json"
 sleep 0.5
 
-addr=$(cli "${P}A" "$dir_A" run "$name" --template "${TEMPLATE:-default}" -d | python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"])')
+addr=$(cli "${P}A" "$dir_A" run "$name" --template "${TEMPLATE:-small}" -d | python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"])')
 say "vm $name at $addr"
 
 cat > "$work/server.py" <<'PY'
