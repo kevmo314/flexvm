@@ -987,6 +987,16 @@ pub fn is_nonce(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// False if `path` exists.
+pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let (src, dest) = (std::ffi::CString::new(tmp.as_os_str().as_bytes())?, std::ffi::CString::new(path.as_os_str().as_bytes())?);
+    match eintr(|| unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) }) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        res => res.map(|_| true),
+    }
+}
+
 /// Durably: the file is fsynced before the rename, its directory after.
 pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
@@ -2324,7 +2334,7 @@ pub mod output {
             }
             written
         });
-        if let Some(l) = lock.filter(|_| locked) {
+        if let Some(l) = lock {
             // Unlocked, not only closed: see `host::Flock`.
             let _ = crate::host::flock(&l, libc::LOCK_UN);
         }

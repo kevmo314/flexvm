@@ -354,8 +354,7 @@ impl Template {
 
     fn open_dir_with_context(name: &str, dir: PathBuf, pinned: bool) -> Result<Arc<Template>> {
         // All reads, the vmstate Firecracker loads included, go through one directory handle.
-        let resolved = std::fs::canonicalize(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
-        let handle = File::from(crate::host::Directory::open(&resolved).map_err(|e| format!("template {name:?}: {e}"))?.fd);
+        let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
         let meta = Meta::read_from(&fixed, &dir, pinned).map_err(|e| format!("template {name:?}: {e}"))?;
         let file = File::open(fixed.join("mem"))?;
@@ -676,7 +675,7 @@ fn templates_lock(paths: &Paths, how: i32) -> Result<crate::host::Flock> {
 
 /// A lock on the templates directory's contents: in the host's lock directory
 /// (`host::host_locks`), named by `kind`, the directory's (dev, inode) and `rest`.
-/// Mutating callers use a pinned fd path in `paths.templates` throughout their work.
+/// Callers that change it pass `paths.templates` as a `host::Directory`'s path.
 fn template_lock(paths: &Paths, kind: &str, rest: &str) -> std::io::Result<File> {
     crate::host::open_lock(&crate::host::host_locks()?, template_lock_name(paths, kind, rest)?.as_ref())
 }
@@ -696,7 +695,7 @@ fn leftover(file: &str, kind: &str) -> bool {
 struct Staging {
     dir: PathBuf,
     lock: (String, File),
-    _parent: crate::host::Directory,
+    parent: crate::host::Directory,
 }
 
 impl Staging {
@@ -710,9 +709,8 @@ impl Staging {
         let lock_name = template_lock_name(paths, "template-new", &format!("-{file}"))?;
         let lock = crate::host::open_lock(&crate::host::host_locks()?, lock_name.as_ref())?;
         crate::host::flock(&lock, libc::LOCK_EX)?;
-        let staging = Staging { dir: paths.templates.join(&file), lock: (lock_name, lock), _parent: parent };
-        let file = std::ffi::CString::new(file)?;
-        crate::util::eintr(|| unsafe { libc::mkdirat(staging._parent.fd.as_raw_fd(), file.as_ptr(), 0o777) })?;
+        let staging = Staging { dir: paths.templates.join(&file), lock: (lock_name, lock), parent };
+        std::fs::create_dir(&staging.dir)?;
         Ok(staging)
     }
 }
@@ -731,8 +729,6 @@ impl Drop for Staging {
 /// Removes staging directories whose builds are gone (their lock free, or no lock) and
 /// leftover publish links: builds killed before they could clean up.
 fn sweep(paths: &Paths) -> Result<()> {
-    let parent = crate::host::Directory::open(&paths.templates)?;
-    let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
     let _l = templates_lock(paths, libc::LOCK_EX)?;
     let locks = crate::host::host_locks()?;
     let prefix = template_lock_name(paths, "template-new", "-")?;
@@ -772,28 +768,25 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64,
     let staging = Staging::new(paths, name)?;
     build(paths, &staging.dir, name, vcpus, mem_mib, max_mib, plug_mib, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
     interrupted()?;
-    let paths = &Paths { templates: staging._parent.path.clone(), ..paths.clone() };
+    let paths = &Paths { templates: staging.parent.path.clone(), ..paths.clone() };
     publish(paths, name, &staging.dir, interrupted)
 }
 
 /// Nothing is deleted: VMs and checkpoints refer to generations by content id, so old ones
 /// stay until an operator removes them.
 fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnce() -> Result<()>) -> Result<()> {
+    // Every name below is in the directories as opened here, whatever their paths name meanwhile.
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
+    let staged = &paths.templates.join(staged.file_name().ok_or("staging has no name")?);
     let meta = Meta::read(staged)?;
-    let gens = paths.templates.join(GENERATIONS);
-    match crate::util::eintr(|| unsafe { libc::mkdirat(parent.fd.as_raw_fd(), c".gen".as_ptr(), 0o777) }) {
+    match std::fs::create_dir(paths.templates.join(GENERATIONS)) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        result => {
-            result?;
-        }
+        r => r?,
     }
     crate::util::sync_dir(&paths.templates)?;
-    let generations = crate::host::Directory::open(&gens)?;
-    let gens = &generations.path;
-    let gen = std::ffi::CString::new(meta.id.as_str())?;
-    let staged_name = std::ffi::CString::new(staged.file_name().ok_or("staging has no name")?.as_encoded_bytes())?;
+    let gens = crate::host::Directory::open(&paths.templates.join(GENERATIONS))?;
+    let gen = gens.path.join(&meta.id);
     // Its files and their names are durable before the generation is published.
     for entry in std::fs::read_dir(staged)? {
         let entry = entry?;
@@ -804,19 +797,16 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
     let _l = templates_lock(paths, libc::LOCK_SH)?;
     crate::util::sync_dir(staged)?;
     check_interrupt()?;
-    match crate::util::eintr(|| unsafe { libc::renameat(parent.fd.as_raw_fd(), staged_name.as_ptr(), generations.fd.as_raw_fd(), gen.as_ptr()) }) {
+    match std::fs::rename(staged, &gen) {
         // An identical build published it already.
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) => {}
-        r => {
-            r?;
-        }
+        r => r?,
     }
-    let live = std::ffi::CString::new(name)?;
-    let tmp = std::ffi::CString::new(format!(".{name}.link-{}", crate::util::random_hex(8)?))?;
-    let target = std::ffi::CString::new(format!("{GENERATIONS}/{}", meta.id))?;
-    crate::util::eintr(|| unsafe { libc::symlinkat(target.as_ptr(), parent.fd.as_raw_fd(), tmp.as_ptr()) })?;
-    crate::util::sync_dir(gens)?;
-    crate::util::eintr(|| unsafe { libc::renameat(parent.fd.as_raw_fd(), tmp.as_ptr(), parent.fd.as_raw_fd(), live.as_ptr()) })?;
+    let live = paths.templates.join(name);
+    let tmp = paths.templates.join(format!(".{name}.link-{}", crate::util::random_hex(8)?));
+    std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
+    crate::util::sync_dir(&gens.path)?;
+    std::fs::rename(&tmp, &live)?;
     Ok(crate::util::sync_dir(&paths.templates)?)
 }
 

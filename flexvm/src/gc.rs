@@ -126,24 +126,14 @@ fn vm_files(host: &Host) {
         let Ok(suspended) = host.suspended(name) else { continue };
         let orphan = host.holder_gone(name) && !suspended.exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
         if orphan {
-            let log = host.run.join("vms").join(format!("{name}.log"));
-            let Ok(lock) = crate::util::output::log_lock(&log).and_then(|p| crate::host::lock_path(&p, libc::LOCK_EX | libc::LOCK_NB)) else { continue };
-            let Ok(_held) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { continue };
-            // Recheck after taking the writer's lock: it may have just appended.
-            if age(&path).is_some_and(|a| a > ORPHAN_LOG_TTL) {
-                let _ = std::fs::remove_file(&path);
-            }
-            if !log.exists() && !log.with_extension("log.1").exists() {
-                if let Ok(lock) = crate::util::output::log_lock(&log) {
-                    let _ = std::fs::remove_file(lock);
-                }
-            }
+            // Its writers' lock goes after (`orphan_log_locks`).
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
 
-/// Also collect locks whose log was removed externally or by an older flexvm.
-/// Writers check the lock inode after acquisition, so an already-open waiter retries.
+/// Writers' locks (`output::log_lock`) in `dir` with neither log there, removed while held:
+/// a writer that opened one before checks after locking that it is still the name's.
 fn orphan_log_locks(dir: &Path) {
     for entry in std::fs::read_dir(crate::host::locks(dir)).into_iter().flatten().flatten() {
         let name = entry.file_name();
@@ -327,6 +317,7 @@ mod tests {
         let lock = crate::util::output::log_lock(&log).unwrap();
         let writer = File::open(&lock).unwrap();
         vm_files(&host);
+        orphan_log_locks(&host.run.join("vms"));
         assert!(!log.exists() && !lock.exists(), "the log and its lock go");
         use std::os::unix::fs::MetadataExt;
         assert!(crate::util::output::append_capped(&log, b"new\n", 1 << 20));
