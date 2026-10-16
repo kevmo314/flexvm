@@ -842,7 +842,9 @@ impl Proc {
                     bail!("injected fault: committing failed");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
-                // Only now its revision outranks the source's (`claim_arrival`).
+                // Only now its revision outranks the source's (`claim_arrival`). Recorded before the
+                // source has its answer: a record behind it would take the source's late announcement
+                // as current and name the source as the way to the address (#499, #492).
                 if let Err(e) = self.advance(&l, 0) {
                     crate::log!("vm {name}: recording its revision: {e}");
                 }

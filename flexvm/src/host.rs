@@ -1714,6 +1714,10 @@ impl MigRecord {
     pub fn commit(&mut self, _: &Locked) -> Result<()> {
         let path = self.host.mig_path(self.id);
         match load(&path)? {
+            // Keep both fsyncs before running the VM or replying: the file fsync makes
+            // Committed's contents durable before rename; the migs directory fsync
+            // makes that replacement durable. Overlapping them could recover Pending
+            // (or an empty record) after the target has run and the source has left.
             Some(Mig::Pending { owner, .. }) if owner == Ident::me() => store(&path, &Mig::Committed { owner }, true)?,
             m => bail!("migration {} was fenced off meanwhile ({m:?})", self.id),
         }
@@ -4160,6 +4164,37 @@ mod tests {
         let free = flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_ok();
         spawner.unwrap().join().unwrap();
         assert!(free, "the pass let go of its lock, not only closed it");
+    }
+
+    #[test]
+    fn committed_arrival_does_not_need_its_routing_revision_for_recovery() {
+        let (_dir, h) = host("arrival-revision");
+        let x = ip("10.9.2.1");
+        let mut record = h.mig_begin(1, "", None, Some(x)).unwrap();
+        let l = h.lock().unwrap();
+        let claim = h.claim_arrival(&l, "target", x, 8, 2, 1).unwrap();
+        let before = h.addr(&l, x).unwrap();
+        assert_eq!(before.rev, 0, "the incoming revision must not outrank the source before commit");
+        record.commit(&l).unwrap();
+        drop(l);
+        assert_eq!(h.mig_status(1).unwrap(), "committed", "a live target owns it even without its revision recorded (advance is best effort)");
+        assert_eq!(h.addr(&h.lock().unwrap(), x).unwrap(), before);
+
+        // Model a crash before the revision is recorded: the durable claim and commit
+        // remain, with a dead owner. Recovery must clear that arrival before it
+        // tells the source it may resume; no routing revision is needed.
+        let dead = dead_owner(&h, 999_999_950, &[]);
+        let l = h.lock().unwrap();
+        let mut crashed = before.clone();
+        crashed.holder_id = Some(dead.clone());
+        h.put_addr(x, &crashed, true).unwrap();
+        store(&h.mig_path(1), &Mig::Committed { owner: dead }, true).unwrap();
+        drop(l);
+        assert_eq!(h.mig_status(1).unwrap(), "aborted");
+        let recovered = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(recovered.holder.is_none() && recovered.arriving.is_none());
+        assert_eq!((recovered.seen, recovered.rev), (8, 0));
+        claim.keep();
     }
 
     #[test]
