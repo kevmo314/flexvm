@@ -1,8 +1,8 @@
 use super::{
-    chain::{flatten, overlay, read_at, Link},
+    chain::{flatten, overlay, read_at, read_with_fallback, Link},
     format::{parse_pagemap, sum, Run, DATA, MAGIC, MAX_VMSTATE, TEMPLATE, ZERO},
     staging::STAGING_PREFIX,
-    write::{aligned, as_bytes, classify, write_pages, PagesFile},
+    write::{aligned, as_bytes, classify, direct, write_pages, PagesFile},
     *,
 };
 use crate::{
@@ -11,7 +11,14 @@ use crate::{
     util::{stat_at, Result, PAGE_SIZE},
 };
 use serde_json::json;
-use std::{fs, io::Write, os::fd::AsRawFd, os::unix::fs::FileExt, path::Path, sync::Arc};
+use std::{
+    fs,
+    io::Write,
+    os::fd::{AsRawFd, FromRawFd},
+    os::unix::fs::FileExt,
+    path::Path,
+    sync::Arc,
+};
 
 fn tmp(name: &str) -> crate::test_util::TempDir {
     crate::test_util::TempDir::new(name)
@@ -473,11 +480,12 @@ fn ancestor_vmstate_is_unused_but_metadata_and_pages_remain_checked() {
     let ck = Checkpoint::open(&head).unwrap();
     assert_eq!(ck.vmstate, b"s");
     assert_eq!(ck.meta_left, budget);
-    let mut restored = vec![0; PAGE_SIZE];
-    ck.file.read(0, &mut restored, false).unwrap();
-    assert_eq!(restored, page);
+    let mut storage = aligned(1).unwrap();
+    let restored = as_bytes(&mut storage);
+    ck.file.read(0, restored, false).unwrap();
+    assert_eq!(restored, page.as_slice());
     fs::write(base.join("pages"), vec![8; PAGE_SIZE]).unwrap();
-    assert_eq!(ck.file.read(0, &mut restored, false).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    assert_eq!(ck.file.read(0, restored, false).unwrap_err().kind(), io::ErrorKind::InvalidData);
     assert!(Checkpoint::open(&base).is_err(), "the head's VM state is still required");
     fs::write(head.join("vmstate"), b"x").unwrap();
     assert!(Checkpoint::open(&head).err().unwrap().to_string().contains("vmstate does not match"));
@@ -524,4 +532,84 @@ fn suspended_description_checks_manifest_and_saturates_sizes() {
     assert!(crate::lifecycle::describe_suspended(&host, "x").is_none());
     fs::write(dir.join("manifest.json"), vec![b' '; (1 << 20) + 1]).unwrap();
     assert!(crate::lifecycle::describe_suspended(&host, "x").is_none());
+}
+
+#[test]
+fn direct_page_reads_are_aligned_across_file_boundaries() {
+    let dir = tmp("direct-reads");
+    let (mut files, mut sums, mut buffered) = (Vec::new(), Vec::new(), false);
+    for i in 0..2 {
+        let path = dir.join(format!("pages{i}"));
+        // The stored run starts at a nonzero file offset.
+        let data = [page(0), page(i + 1), page(i + 2)].concat();
+        fs::write(&path, &data).unwrap();
+        let file = File::open(path).unwrap();
+        match direct(&file, true) {
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => buffered = true,
+            r => r.unwrap(),
+        }
+        files.push(file);
+        sums.push(data.chunks(PAGE_SIZE).map(|p| crate::crc32c::page(p).0).collect());
+    }
+    let (_, file) = flatten(&[vec![(0, 2, DATA, 0, 1), (2, 2, DATA, 1, 1)]], files, sums);
+    let mut storage = aligned(4).unwrap();
+    let bytes = as_bytes(&mut storage);
+    assert_eq!(bytes.as_ptr() as usize % PAGE_SIZE, 0);
+    assert_eq!(bytes[2 * PAGE_SIZE..].as_ptr() as usize % PAGE_SIZE, 0);
+    file.read(0, bytes, false).unwrap();
+    assert_eq!(bytes, [page(1), page(2), page(2), page(3)].concat());
+    // Only reads through the page cache are evicted.
+    assert_eq!(file.buffered(), buffered);
+}
+
+#[test]
+fn direct_read_falls_back_only_on_einval_and_propagates_retry_errors() {
+    let dir = tmp("direct-fallback");
+    let path = dir.join("pages");
+    fs::write(&path, page(7)).unwrap();
+    let file = File::open(path).unwrap();
+    let _ = direct(&file, true);
+    let mut calls = 0;
+    let mut buf = vec![0; PAGE_SIZE];
+    read_with_fallback(&file, || {
+        calls += 1;
+        if calls == 1 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_DIRECT, 0);
+        file.read_exact_at(&mut buf, 0)
+    })
+    .unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(buf, page(7));
+    for (first, expected_calls) in [(libc::EIO, 1), (libc::EINVAL, 2)] {
+        let mut calls = 0;
+        let err = read_with_fallback(&file, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(if calls == 1 { first } else { libc::EIO }))
+        })
+        .unwrap_err();
+        assert_eq!(calls, expected_calls);
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+}
+
+#[test]
+fn tmpfs_page_reads_work_without_direct_io_support() {
+    // A memfd is backed by tmpfs without needing a writable /dev/shm mount.
+    let fd = unsafe { libc::memfd_create(c"checkpoint-tmpfs".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "{}", io::Error::last_os_error());
+    let file = unsafe { File::from_raw_fd(fd) };
+    let data = page(9);
+    file.write_all_at(&data, 0).unwrap();
+    match direct(&file, true) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+        r => r.unwrap(),
+    }
+    let (_, file) = flatten(&[vec![(0, 1, DATA, 0, 0)]], vec![file], vec![vec![crate::crc32c::page(&data).0]]);
+    let mut storage = aligned(1).unwrap();
+    let bytes = as_bytes(&mut storage);
+    file.read(0, bytes, true).unwrap();
+    assert_eq!(bytes, data);
+    file.drop_cache();
 }

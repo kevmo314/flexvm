@@ -103,7 +103,7 @@ impl PagesFile {
     }
 }
 
-fn direct(file: &File, on: bool) -> io::Result<()> {
+pub(super) fn direct(file: &File, on: bool) -> io::Result<()> {
     let (fd, flag) = (file.as_raw_fd(), libc::O_DIRECT);
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     check(unsafe { libc::fcntl(fd, libc::F_SETFL, if on { flags | flag } else { flags & !flag }) })
@@ -136,16 +136,16 @@ fn pwritev_all(file: &File, mut iov: &mut [libc::iovec], mut off: u64) -> io::Re
 /// One page, aligned for O_DIRECT.
 #[derive(Clone)]
 #[repr(C, align(4096))]
-pub(super) struct Page([u8; PAGE_SIZE]);
+pub(crate) struct Page([u8; PAGE_SIZE]);
 
-pub(super) fn aligned(n: usize) -> io::Result<Vec<Page>> {
+pub(crate) fn aligned(n: usize) -> io::Result<Vec<Page>> {
     let mut v = Vec::new();
     v.try_reserve_exact(n).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"))?;
     v.resize(n, Page([0; PAGE_SIZE]));
     Ok(v)
 }
 
-pub(super) fn as_bytes(pages: &mut [Page]) -> &mut [u8] {
+pub(crate) fn as_bytes(pages: &mut [Page]) -> &mut [u8] {
     // `Page` is PAGE_SIZE initialized bytes with no padding.
     unsafe { std::slice::from_raw_parts_mut(pages.as_mut_ptr().cast(), std::mem::size_of_val(pages)) }
 }

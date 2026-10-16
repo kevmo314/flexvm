@@ -3,6 +3,7 @@ use super::{
     bail,
     format::{parse_pagemap, sum, Canon, Manifest, Run, DATA, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE, TEMPLATE},
     fstat, open_at, open_dir_at,
+    write::{aligned, as_bytes, direct},
 };
 use crate::{
     crc32c,
@@ -115,6 +116,9 @@ impl Link {
         );
         let (file, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
         ensure!(file.metadata()?.len() == data * PAGE_SIZE as u64, "{}", bad("pages has the wrong length".into()));
+        // This descriptor is dedicated to page data; metadata reads use separate files.
+        // Some filesystems reject O_DIRECT here (reads stay buffered); others reject it on the first read.
+        let _ = direct(&file, true);
         Ok(Link { dir, manifest, id, vmstate, map, file: Some(file), sums })
     }
 }
@@ -174,7 +178,8 @@ impl Checkpoint {
     }
 
     fn each_page(&self, drop_cache: bool, mut f: impl FnMut(usize, &[u8])) -> Result<()> {
-        let mut buf = vec![0u8; 256 * PAGE_SIZE];
+        let mut storage = aligned(256)?;
+        let buf = as_bytes(&mut storage);
         for &(first, count, state) in &self.runs {
             for p in (first as usize..(first + count) as usize).step_by(256) {
                 let n = ((first + count) as usize - p).min(256);
@@ -255,6 +260,7 @@ fn corrupt(why: String) -> io::Error {
 }
 
 impl PageFile {
+    /// Reads whole pages into a page-aligned buffer, evicting them after with `drop_cache` where reads are buffered.
     /// Errors are InvalidData, which the pager treats as fatal.
     pub fn read(&self, page: usize, buf: &mut [u8], drop_cache: bool) -> io::Result<()> {
         let n = buf.len() / PAGE_SIZE;
@@ -268,8 +274,8 @@ impl PageFile {
             };
             let (k, d) = (((first + count - p) as usize).min(n - done), d + p - first);
             let (out, off, file) = (&mut buf[done * PAGE_SIZE..(done + k) * PAGE_SIZE], d * PAGE_SIZE as u64, &self.files[f]);
-            file.read_exact_at(out, off).map_err(|e| corrupt(format!("read at {off}: {e}")))?;
-            if drop_cache {
+            read_with_fallback(file, || file.read_exact_at(out, off)).map_err(|e| corrupt(format!("read at {off}: {e}")))?;
+            if drop_cache && buffered(file) {
                 unsafe { libc::posix_fadvise(file.as_raw_fd(), off as i64, out.len() as i64, libc::POSIX_FADV_DONTNEED) };
             }
             for (i, page) in out.chunks(PAGE_SIZE).enumerate() {
@@ -283,9 +289,32 @@ impl PageFile {
         Ok(())
     }
 
+    /// Whether any file is read through the page cache (its filesystem refused O_DIRECT).
+    pub fn buffered(&self) -> bool {
+        self.files.iter().any(buffered)
+    }
+
+    /// Evicts the files read through the page cache.
     pub fn drop_cache(&self) {
-        for f in &self.files {
+        for f in self.files.iter().filter(|f| buffered(f)) {
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         }
+    }
+}
+
+fn buffered(file: &File) -> bool {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    flags & libc::O_DIRECT == 0
+}
+
+/// EINVAL can be reported on I/O even if enabling O_DIRECT succeeded (e.g. tmpfs).
+/// Disabling it on the shared descriptor also makes subsequent readers use the fallback.
+pub(super) fn read_with_fallback(file: &File, mut read: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    match read() {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            direct(file, false)?;
+            read()
+        }
+        r => r,
     }
 }

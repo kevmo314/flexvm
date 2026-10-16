@@ -21,7 +21,7 @@ mod write;
 pub use chain::{chain_ids, chain_meta_budget, parent_path, read_manifest, Checkpoint, PageFile, MAX_CHAIN};
 pub use format::{Canon, FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL};
 pub use staging::{CommitError, Staging};
-pub(crate) use write::GuestPages;
+pub(crate) use write::{aligned, as_bytes, GuestPages};
 
 fn create_at(dir: RawFd, name: &str) -> io::Result<File> {
     openat(dir, &cname(name), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW).map(File::from)
