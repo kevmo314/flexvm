@@ -8949,6 +8949,10 @@ def restore_route_fence():
             r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
             check(f"{label}: the newer generation is taken, routed via the peer",
                   r.get("ok") and not r["result"].get("stale") and not r["result"].get("local") and f"via {gw}" in peer_route(ip), (r, peer_route(ip)))
+            # B hears of it too (as every peer does): the restore's withdrawal of its own generation, told to B as it
+            # fails, is then stale there, and leaves the route both hosts share here alone.
+            r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+            check(f"{label}: and so is the peer's", r.get("ok") and not r["result"].get("stale"), r)
             release(A, gate)
             th.join(120)
             r = res.get("r") or {"ok": False, "error": "restore did not return"}
