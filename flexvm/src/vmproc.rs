@@ -25,13 +25,18 @@ use crate::template::{Paths, Template, STEP_MIB};
 use crate::util::{answer, ms, proc_kb, send_json, Error, Phases, Result, Slot};
 use crate::vm::{Snapshot, State, Vm};
 
-/// The guest half-closes after its exit. Only forward an acknowledgement from a client
-/// that received that exit; a lost stream leaves the guest session available for recovery.
+/// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
+/// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session.
 fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl crate::util::Timed + Write)) -> Result<()> {
-    std::io::copy(guest, client)?;
-    let mut ack = [0];
-    if (crate::util::By { s: client, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
-        guest.get_mut().write_all(&ack)?;
+    while let Some((kind, data)) = guest::read_frame(guest)? {
+        client.write_all(&guest::frame(kind, &[&data]))?;
+        if kind == guest::FRAME_EXIT {
+            let mut ack = [0];
+            if (crate::util::By { s: client, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
+                guest.get_mut().write_all(&ack)?;
+            }
+            break;
+        }
     }
     Ok(())
 }
@@ -3168,9 +3173,11 @@ mod session_relay_tests {
 
     #[test]
     fn exit_acknowledgement_uses_the_existing_attachment_and_is_optional() {
-        let exit = guest::frame(guest::FRAME_EXIT, &[&0u64.to_le_bytes()[..], &7i32.to_le_bytes()]);
+        let out = guest::frame(guest::FRAME_STDOUT, &[&0u64.to_le_bytes()[..], b"hi"]);
+        let exit = [out, guest::frame(guest::FRAME_EXIT, &[&2u64.to_le_bytes()[..], &7i32.to_le_bytes()])].concat();
         for ack in [vec![], vec![guest::SESSION_DONE], vec![b'?']] {
-            let mut guest = BufReader::new(Duplex { input: Cursor::new(exit.clone()), output: Vec::new() });
+            // The exit ends the relay, with the stream still open (vsock passes no half-close on).
+            let mut guest = BufReader::new(Duplex { input: Cursor::new([&exit[..], b"never read"].concat()), output: Vec::new() });
             let mut client = Duplex { input: Cursor::new(ack.clone()), output: Vec::new() };
             relay_session(&mut guest, &mut client).unwrap();
             assert_eq!(client.output, exit);

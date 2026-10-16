@@ -360,8 +360,7 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
     match open(body, conn, line, sessions, statuses) {
         Ok(Some((id, offset, (output, me)))) => {
             let result = msg(&mut w, id).and_then(|_| drain(&mut w, &output, offset, me));
-            // Half-close output so relays finish copying before forwarding the acknowledgement.
-            // Without it (a lost exit, or a client retaining the session), retries still work.
+            // Without an acknowledgement (a lost exit, or a client keeping the session), a retry still finds the exit.
             let acknowledged = matches!(result, Ok(true)) && acknowledge(&output, me);
             let mut table = sessions.lock().unwrap();
             let mut ring = output.0.lock().unwrap();
@@ -494,12 +493,10 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
     waited
 }
 
+/// SESSION_DONE from the client on attachment `me`, within 2 s of its exit frame (a newer attachment shuts it down).
 fn acknowledge(output: &Session, me: u64) -> bool {
     let conn = output.0.lock().unwrap().attached.as_ref().filter(|a| a.id == me).and_then(|a| a.conn.as_ref()).and_then(|c| c.try_clone().ok());
     let Some(mut conn) = conn else { return false };
-    if unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_WR) } < 0 {
-        return false;
-    }
     let mut ready = libc::pollfd { fd: conn.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     let mut ack = [0];
     (unsafe { libc::poll(&mut ready, 1, 2000) }) > 0 && conn.read(&mut ack).is_ok_and(|n| n == 1) && ack[0] == SESSION_DONE
@@ -1104,6 +1101,16 @@ mod tests {
         assert_eq!([0, n, n + 1].map(|o| tiny.chunks_from(o)), [MAX_CHUNKS, 1, 0]);
     }
 
+    fn read_to_exit(peer: &mut UnixStream) {
+        let (exit, mut wire) = (frame(FRAME_EXIT, &[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()]), Vec::new());
+        while !wire.ends_with(&exit) {
+            let mut buf = [0; 4096];
+            let n = peer.read(&mut buf).unwrap();
+            assert!(n > 0, "closed before its exit");
+            wire.extend_from_slice(&buf[..n]);
+        }
+    }
+
     #[test]
     fn only_an_acknowledged_exit_releases_the_session() {
         for acknowledge in [false, true] {
@@ -1114,10 +1121,8 @@ mod tests {
             let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
             let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
             let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), "ATTACH done 0", &sessions_, &statuses_));
-            // The exit is followed by a half-close, so a relay can forward the acknowledgement.
-            let mut wire = Vec::new();
-            peer.read_to_end(&mut wire).unwrap();
-            assert!(wire.ends_with(&[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()].concat()));
+            // The stream stays open after the exit (vsock passes no half-close on), for the acknowledgement.
+            read_to_exit(&mut peer);
             if acknowledge {
                 peer.write_all(&[SESSION_DONE]).unwrap();
             }
@@ -1146,7 +1151,7 @@ mod tests {
         let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
         let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
         let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), "ATTACH done 0", &sessions_, &statuses_));
-        peer.read_to_end(&mut Vec::new()).unwrap();
+        read_to_exit(&mut peer);
         // Replace the old attachment while its acknowledgement is in flight.
         attach(&output, 0, None);
         let _ = peer.write_all(&[SESSION_DONE]);
