@@ -1,7 +1,8 @@
 //! Snapshot compatibility preflight. A template records its build host's CPU model, the
 //! features KVM offered (passed through: no CPU template), XSAVE layout, TSC rate,
 //! saved MSR set and Firecracker;
-//! checkpoints and migrations pin their template, so this covers them too. Topology, cache
+//! checkpoints and migrations pin their template and also check the saving host's MSRs.
+//! Topology, cache
 //! and leaf-limit words are not compared: Firecracker rewrites the first, the rest do not
 //! change what the guest can run.
 use std::collections::{BTreeMap, BTreeSet};

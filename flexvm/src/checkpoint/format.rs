@@ -5,7 +5,10 @@ use crate::{
     util::{Result, PAGE_SIZE},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, net::Ipv4Addr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv4Addr,
+};
 
 pub const FORMAT: u64 = 2;
 pub const FORMAT_INCREMENTAL: u64 = 3;
@@ -30,6 +33,10 @@ pub struct Manifest {
     pub ip: Ipv4Addr,
     pub template: String,
     pub template_id: String,
+    /// MSRs selected by Firecracker on the host saving this VM state, not its template.
+    /// Missing in older checkpoints; never substitute the template's set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_msrs: Option<BTreeSet<u32>>,
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
@@ -45,6 +52,16 @@ pub struct Manifest {
     /// restore follows it from there, not from the start of the ring again.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub app_log: u64,
+}
+
+impl Manifest {
+    pub fn check_msrs(&self, host: &BTreeSet<u32>) -> Result<()> {
+        let saved = self
+            .saved_msrs
+            .as_ref()
+            .ok_or("this checkpoint or suspended VM was made with an older flexvm without a saving host MSR record and cannot be restored")?;
+        crate::compat::check_msrs(saved, host)
+    }
 }
 
 fn is_zero(n: &u64) -> bool {
