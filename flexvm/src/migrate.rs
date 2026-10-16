@@ -45,11 +45,8 @@ const ARRIVAL_WAIT: Duration = Duration::from_secs(10);
 struct Header<'a> {
     runs: Cow<'a, [(u64, u64, u8)]>,
     vmstate_len: u64,
-    #[serde(default)]
     preload: Cow<'a, [u64]>,
-    #[serde(default)]
     paused: bool,
-    #[serde(default)]
     app_log: u64,
 }
 

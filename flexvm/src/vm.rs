@@ -130,7 +130,7 @@ impl Vm {
     /// `kill` (test fault `resume_kill`) kills Firecracker right after the request is sent.
     pub fn start(&self, kill: bool) -> Result<()> {
         self.fc(|fc| {
-            let res = fc.resume();
+            let res = fc.resume(API_TIMEOUT);
             if kill {
                 self.pager.kill_firecracker();
                 bail!("injected fault: firecracker killed after the resume was sent");
@@ -285,7 +285,7 @@ impl Vm {
             go_on();
         }
         // Even if paused: only an API pause freezes device emulation.
-        self.fc(|fc| fc.pause())?;
+        self.fc(|fc| fc.pause(API_TIMEOUT))?;
         t.mark("pause");
         // Link-down waits for an RCU grace period; joined on every path so `resume` never races it.
         let tap = self.tap.clone();
@@ -470,7 +470,7 @@ impl Vm {
         // Kept paused, its frames stay queued on the tap (`tap_stuck`) until it runs again.
         let resumed = match self.was_paused.swap(false, Ordering::SeqCst) {
             true => Ok(State::Paused),
-            false => self.fc(|fc| fc.resume()).map(|()| State::Running),
+            false => self.fc(|fc| fc.resume(API_TIMEOUT)).map(|()| State::Running),
         };
         if matches!(resumed, Ok(State::Running)) {
             self.running_again();
@@ -539,7 +539,13 @@ impl Vm {
         }
         self.pager.hold_collapse(true);
         // Test fault `repause_fail`: the pause after it fails too.
-        let pause = || if crate::host::fault("repause_fail") { Err("injected fault: pausing it again failed".into()) } else { self.fc(|fc| fc.pause()) };
+        let pause = || {
+            if crate::host::fault("repause_fail") {
+                Err("injected fault: pausing it again failed".into())
+            } else {
+                self.fc(|fc| fc.pause(API_TIMEOUT))
+            }
+        };
         (0..2).any(|_| pause().is_ok()).then_some(State::Paused)
     }
 
@@ -593,7 +599,7 @@ impl Vm {
         // Test faults `pause_fail` and `resume_partial` (a resume some vCPUs missed: Firecracker still says Paused).
         let mut res = match crate::host::fault(if pausing { "pause_fail" } else { "resume_partial" }) {
             true => Err(format!("injected fault: firecracker PATCH /vm: 400 the {} failed part way", if pausing { "pause" } else { "resume" }).into()),
-            false => self.fc(|fc| if pausing { fc.pause() } else { fc.resume() }).map(drop),
+            false => self.fc(|fc| if pausing { fc.pause(API_TIMEOUT) } else { fc.resume(API_TIMEOUT) }).map(drop),
         };
         // Test fault `pause_lost`: the pause landed, but its answer is lost.
         if pausing && res.is_ok() && crate::host::fault("pause_lost") {
@@ -712,7 +718,7 @@ impl Vm {
             let (requested, plugged) = (hp["requested_size_mib"].as_u64(), hp["plugged_size_mib"].as_u64());
             if std::mem::take(&mut unpause) {
                 crate::log!("vm {}: injected fault: resuming its vCPUs at {plugged:?} of {requested:?} MiB plugged", self.name);
-                self.fc(|fc| fc.resume())?;
+                self.fc(|fc| fc.resume(API_TIMEOUT))?;
             }
             if requested.is_some() && requested == plugged {
                 return Ok(());
@@ -1097,7 +1103,7 @@ impl Prepared {
                 if hold {
                     self.pager.hold_collapse(true);
                     // Only an API pause holds device emulation.
-                    fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), left(API_TIMEOUT))?;
+                    fc.pause(left(API_TIMEOUT))?;
                     t.mark("hold_paused");
                 }
                 self.pager.wait_ready(left(Duration::from_secs(5)))

@@ -950,7 +950,7 @@ fn read_cmd(dir: &Path) -> Result<Option<(String, crate::Session)>> {
     Ok(Some((cmd, serde_json::from_value(v["session"].clone())?)))
 }
 
-fn read_gen(dir: &Path) -> Option<u64> {
+pub fn read_gen(dir: &Path) -> Option<u64> {
     std::fs::read_to_string(dir.join(GEN)).ok()?.trim().parse().ok()
 }
 

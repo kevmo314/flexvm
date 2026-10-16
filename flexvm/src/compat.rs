@@ -119,9 +119,7 @@ fn firecracker_id(path: &Path, run: Option<&Path>) -> Result<(Stamp, String)> {
 }
 
 pub fn check(template: &Template, pid: u32) -> Result<()> {
-    let record = template.meta.compatibility.as_ref();
-    let record = record.ok_or_else(|| format!("template {:?} has no compatibility record; rebuild it with `flexvm template`", template.name))?;
-    record.check(&local(pid)?)
+    template.meta.compatibility.check(&local(pid)?)
 }
 
 /// KVM_GET_SUPPORTED_CPUID as [function, index, eax, ebx, ecx, edx].

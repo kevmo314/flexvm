@@ -4,6 +4,7 @@ use super::pages::CHUNK;
 use super::server::capture_preload;
 use super::*;
 use std::io::{Read, Write};
+use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 
 fn pages(states: &[u8]) -> Pages {

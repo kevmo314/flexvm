@@ -107,12 +107,6 @@ pub fn untimed(r: &BufReader<UnixStream>) -> Result<()> {
     Ok(r.get_ref().set_write_timeout(None)?)
 }
 
-pub fn session_id() -> Result<String> {
-    let mut random = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
-}
-
 pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
     session_on(action, id, offset, cmd, |line| request_on(s, line, timeout))
 }
@@ -212,7 +206,7 @@ const CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// Drains all output, keeping at most `max_out` bytes; returns the close result separately. The
 /// session is closed however it ended (past the deadline, the command is stopped).
 pub fn run(s: UnixStream, uds: &Path, cmd: &str, deadline: Instant, max_out: usize) -> Result<(i32, String, Result<()>)> {
-    let id = session_id()?;
+    let id = crate::util::random_hex(16)?;
     let mut out = Vec::new();
     let code = session_on("start", &id, 0, cmd, |line| handshake(By { s, at: deadline }, line)).and_then(|mut r| {
         exec_output(&mut r, &id, |_, d| {

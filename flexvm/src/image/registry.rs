@@ -951,8 +951,8 @@ pub(super) mod tests {
         let dir = super::super::unpack::tests::tmpdir("parts");
         let hex = "a".repeat(64);
         let stale = dir.join(format!("{hex}.part2147483647"));
-        let live = dir.join(format!("{hex}.part{}", crate::util::nonce().unwrap()));
-        let dead = dir.join(format!("{hex}.part{}", crate::util::nonce().unwrap()));
+        let live = dir.join(format!("{hex}.part{}", crate::util::random_hex(8).unwrap()));
+        let dead = dir.join(format!("{hex}.part{}", crate::util::random_hex(8).unwrap()));
         let other = dir.join("unrelated.part2147483647");
         let blob = dir.join(&hex);
         for path in [&stale, &live, &dead, &other, &blob] {

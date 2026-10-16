@@ -900,15 +900,17 @@ pub fn run_until(cmd: &mut std::process::Command, stop: impl Fn() -> Result<()>)
     Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
 }
 
-/// 16 random hex digits for a temporary name, so that no two writers (other processes, other
-/// pid namespaces, other hosts sharing the directory) ever pick the same one.
-pub fn nonce() -> io::Result<String> {
-    let mut random = [0u8; 8];
-    io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut random)?;
+/// `n` random bytes, hex-encoded.
+pub fn random_hex(n: usize) -> io::Result<String> {
+    let mut random = vec![0u8; n];
+    let mut filled = 0;
+    while filled < n {
+        filled += eintr(|| unsafe { libc::getrandom(random[filled..].as_mut_ptr().cast(), n - filled, 0) })? as usize;
+    }
     Ok(random.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Whether `s` is a `nonce()`.
+/// Whether `s` is a temporary-name nonce (8 random bytes, hex-encoded).
 pub fn is_nonce(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -987,37 +989,45 @@ pub fn recv_with_fds(s: &UnixStream, max: usize, mut ready: impl FnMut() -> io::
         if line.len() > max {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "request line too long"));
         }
-        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-        let mut cbuf = [0u64; 32];
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
         ready()?;
-        let n = eintr(|| unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) })?;
-        unsafe {
-            let mut c = libc::CMSG_FIRSTHDR(&msg);
-            while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                    let n = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
-                    let data = libc::CMSG_DATA(c) as *const RawFd;
-                    for i in 0..n {
-                        fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
-                    }
-                }
-                c = libc::CMSG_NXTHDR(&msg, c);
-            }
-        }
-        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ancillary fds truncated"));
-        }
+        let (n, received) = recvmsg_fds(s.as_raw_fd(), &mut buf)?;
+        fds.extend(received);
         if n == 0 {
             break;
         }
-        line.extend_from_slice(&buf[..n as usize]);
+        line.extend_from_slice(&buf[..n]);
     }
     Ok((line, fds))
+}
+
+/// Receives one message and owns all SCM_RIGHTS descriptors, closing them on error.
+pub fn recvmsg_fds(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+    let mut fds = Vec::new();
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+    let mut cbuf = [0u64; 32];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
+    let n = eintr(|| unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) })?;
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let n = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
+                let data = libc::CMSG_DATA(c) as *const RawFd;
+                for i in 0..n {
+                    fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                }
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "ancillary fds truncated"));
+    }
+    Ok((n as usize, fds))
 }
 
 /// Also in threads started afterwards, so only `wait_signal` sees them.

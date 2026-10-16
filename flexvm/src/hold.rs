@@ -345,9 +345,7 @@ impl Holder {
         if switched.is_ok() {
             let end = Instant::now() + linger;
             while Instant::now() < end {
-                let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-                let wait = end.saturating_duration_since(Instant::now()).as_millis().max(1) as i32;
-                if unsafe { libc::poll(&mut pfd, 1, wait) } > 0 {
+                if crate::util::readable(&self.tun, end.saturating_duration_since(Instant::now())).unwrap_or(false) {
                     (0..PASS).take_while(|_| self.read_one(&mut buf)).count();
                 }
                 give(&mut o);
