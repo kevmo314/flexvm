@@ -1,7 +1,7 @@
 //! Snapshot compatibility preflight. A template records its build host's CPU model, the
 //! features KVM offered (passed through: no CPU template), XSAVE layout, TSC rate,
 //! saved MSR set and Firecracker;
-//! checkpoints and migrations pin their template and also check the saving host's MSRs.
+//! checkpoints and migrations pin their template and check the saving host's MSRs and effective TSC rate.
 //! Topology, cache
 //! and leaf-limit words are not compared: Firecracker rewrites the first, the rest do not
 //! change what the guest can run.
@@ -19,7 +19,7 @@ use crate::{bail, util::Result};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Compat {
     pub cpu: String,
-    /// Default vCPU TSC rate, inherited by snapshots from this template.
+    /// Default vCPU TSC rate used when building this template.
     pub tsc_khz: u32,
     /// Target KVM can scale a restored TSC rate.
     pub tsc_control: bool,
@@ -51,25 +51,19 @@ const REGS: [&str; 4] = ["eax", "ebx", "ecx", "edx"];
 
 impl Compat {
     pub fn check(&self, host: &Self) -> Result<()> {
+        self.check_saved(host, self.tsc_khz, &self.msrs)
+    }
+
+    /// Later snapshots save the effective vCPU rate and the saving host's MSRs.
+    pub fn check_saved(&self, host: &Self, tsc_khz: u32, msrs: &BTreeSet<u32>) -> Result<()> {
         let hints = ["every host needs the same CPU model", "copy one Firecracker binary to every host; templates built with another must be rebuilt"];
         for ((what, snapshot, here), hint) in [("CPU", &self.cpu, &host.cpu), ("Firecracker", &self.firecracker, &host.firecracker)].into_iter().zip(hints) {
             if snapshot != here {
                 bail!("snapshot incompatible with this host: {what} differs (snapshot: {snapshot}; host: {here}): {hint}");
             }
         }
-        if self.tsc_khz == 0 || host.tsc_khz == 0 {
-            bail!("snapshot incompatible with this host: missing TSC rate; rebuild the template");
-        }
-        // Match Firecracker's is_tsc_scaling_required: tolerance is relative to the snapshot.
-        let tolerance = u64::from(self.tsc_khz) * 250 / 1_000_000;
-        if u64::from(self.tsc_khz.abs_diff(host.tsc_khz)) > tolerance && !host.tsc_control {
-            bail!(
-                "snapshot incompatible with this host: TSC rate differs (snapshot: {} kHz; host: {} kHz), beyond 250 ppm and target lacks KVM TSC scaling",
-                self.tsc_khz,
-                host.tsc_khz
-            );
-        }
-        check_msrs(&self.msrs, &host.msrs)?;
+        check_tsc(tsc_khz, host)?;
+        check_msrs(msrs, &host.msrs)?;
         for (word, &want) in &self.features {
             let missing = want & !host.features.get(word).copied().unwrap_or(0);
             if missing != 0 {
@@ -149,6 +143,33 @@ fn firecracker_id(path: &Path, run: Option<&Path>) -> Result<(Stamp, String)> {
 
 pub fn check(template: &Template, pid: u32) -> Result<()> {
     template.meta.compatibility.check(&local(pid)?)
+}
+
+/// Match Firecracker's is_tsc_scaling_required: tolerance is relative to the saved rate.
+pub fn check_tsc(saved_khz: u32, host: &Compat) -> Result<()> {
+    if saved_khz == 0 || host.tsc_khz == 0 {
+        bail!("snapshot incompatible with this host: missing TSC rate; rebuild the template");
+    }
+    if tsc_scaling_required(saved_khz, host.tsc_khz) && !host.tsc_control {
+        bail!(
+            "snapshot incompatible with this host: TSC rate differs (snapshot: {} kHz; host: {} kHz), beyond 250 ppm and target lacks KVM TSC scaling",
+            saved_khz,
+            host.tsc_khz
+        );
+    }
+    Ok(())
+}
+
+/// Firecracker leaves the host default unchanged within 250 ppm; otherwise it scales
+/// to the saved rate. KVM_GET_TSC_KHZ on a duplicated Firecracker fd is not usable:
+/// KVM requires the caller to share the VM's address space.
+pub fn restored_tsc_khz(saved_khz: u32, host: &Compat) -> Result<u32> {
+    check_tsc(saved_khz, host)?;
+    Ok(if tsc_scaling_required(saved_khz, host.tsc_khz) { saved_khz } else { host.tsc_khz })
+}
+
+fn tsc_scaling_required(saved_khz: u32, host_khz: u32) -> bool {
+    u64::from(saved_khz.abs_diff(host_khz)) > u64::from(saved_khz) * 250 / 1_000_000
 }
 
 /// Firecracker saves the MSRs of the host that took the snapshot, not the template's: a VM
@@ -337,6 +358,49 @@ mod tests {
         let mut large = snapshot.clone();
         large.tsc_khz = u32::MAX;
         large.check(&large).unwrap();
+    }
+
+    #[test]
+    fn later_snapshot_uses_effective_rate_instead_of_template_rate() {
+        let template = host();
+        let mut source = template.clone();
+        source.tsc_khz = 1_999_600;
+        let mut target = template.clone();
+        target.tsc_khz = 2_000_400;
+        template.check(&source).unwrap();
+        template.check(&target).unwrap();
+        let saved = restored_tsc_khz(template.tsc_khz, &source).unwrap();
+        assert_eq!(saved, 1_999_600);
+        let error = template.check_saved(&target, saved, &source.msrs).unwrap_err().to_string();
+        assert!(error.contains("1999600") && error.contains("2000400"), "{error}");
+        for delta in [-500, -499, 499, 500] {
+            target.tsc_khz = (i64::from(saved) + delta) as u32;
+            assert_eq!(template.check_saved(&target, saved, &source.msrs).is_ok(), delta.abs() <= 499);
+        }
+        target.tsc_khz = 2_000_400;
+        target.tsc_control = true;
+        template.check_saved(&target, saved, &source.msrs).unwrap();
+        assert_eq!(restored_tsc_khz(saved, &target).unwrap(), saved);
+        target.tsc_control = false;
+        target.tsc_khz = 1_999_101;
+        assert!(template.check(&target).is_err());
+        template.check_saved(&target, saved, &source.msrs).unwrap();
+    }
+
+    #[test]
+    fn effective_rate_follows_scaling_rule_at_each_restore() {
+        let mut target = host();
+        for delta in [-501, -500, 0, 500, 501] {
+            target.tsc_khz = (2_000_000i64 + delta) as u32;
+            target.tsc_control = false;
+            assert_eq!(restored_tsc_khz(2_000_000, &target).is_ok(), delta.abs() <= 500);
+            target.tsc_control = true;
+            let want = if delta.abs() <= 500 { target.tsc_khz } else { 2_000_000 };
+            assert_eq!(restored_tsc_khz(2_000_000, &target).unwrap(), want);
+        }
+        assert!(restored_tsc_khz(0, &target).is_err());
+        target.tsc_khz = 0;
+        assert!(restored_tsc_khz(2_000_000, &target).is_err());
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub struct Manifest {
     /// Missing in older checkpoints; never substitute the template's set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_msrs: Option<BTreeSet<u32>>,
+    /// Effective vCPU rate in this VM state, which can differ from its template's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_tsc_khz: Option<u32>,
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
@@ -55,12 +58,17 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn check_msrs(&self, host: &BTreeSet<u32>) -> Result<()> {
-        let saved = self
+    pub fn check_compatibility(&self, template: &Template, host: &crate::compat::Compat) -> Result<u32> {
+        let rate = self
+            .saved_tsc_khz
+            .filter(|&khz| khz != 0)
+            .ok_or("this checkpoint or suspended VM was made with an older flexvm without an effective vCPU TSC rate record and cannot be restored")?;
+        let msrs = self
             .saved_msrs
             .as_ref()
             .ok_or("this checkpoint or suspended VM was made with an older flexvm without a saving host MSR record and cannot be restored")?;
-        crate::compat::check_msrs(saved, host)
+        template.meta.compatibility.check_saved(host, rate, msrs)?;
+        Ok(rate)
     }
 }
 

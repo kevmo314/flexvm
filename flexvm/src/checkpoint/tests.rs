@@ -27,7 +27,7 @@ fn tmp(name: &str) -> crate::test_util::TempDir {
 fn manifest(guest_pages: usize, parent: Option<Parent>, files: serde_json::Value) -> Manifest {
     serde_json::from_value(json!({
         "format": if parent.is_some() { FORMAT_INCREMENTAL } else { FORMAT }, "created_unix_ms": 0, "name": "x",
-        "ip": "10.0.0.1", "template": "tpl", "template_id": "id", "saved_msrs": [], "vcpus": 1, "mem_mib": 1, "max_mib": 1,
+        "ip": "10.0.0.1", "template": "tpl", "template_id": "id", "saved_msrs": [], "saved_tsc_khz": 2000000, "vcpus": 1, "mem_mib": 1, "max_mib": 1,
         "hotplug_mib": 0, "guest_pages": guest_pages, "data_pages": 0, "zero_pages": 0, "parent": parent, "files": files,
     }))
     .unwrap()
@@ -51,29 +51,68 @@ fn link(dir: &Path, parent: Option<Parent>, edit: impl FnOnce(&mut Manifest)) ->
 #[test]
 fn saved_host_msrs_survive_manifest_roundtrip_and_are_checked() {
     let dir = tmp("saved-msrs");
+    let tpl = template(&dir, &[None; 256]);
+    let mut host = tpl.meta.compatibility.clone();
     // Template host A has only TSC; host B added TSX_CTRL and XSS before saving.
-    let a = [0x10].into();
+    let a: std::collections::BTreeSet<u32> = [0x10].into();
+    host.msrs = a.clone();
     let b = [0x10, 0x122, 0xda0].into();
     link(&dir, None, |m| m.saved_msrs = Some(b));
     let ck = Checkpoint::open(&dir).unwrap();
-    let error = ck.manifest.check_msrs(&a).unwrap_err().to_string();
+    let error = ck.manifest.check_compatibility(&tpl, &host).unwrap_err().to_string();
     assert!(error.contains("saved MSRs 0x122, 0xda0"), "{error}");
-    ck.manifest.check_msrs(&[0x10, 0x122, 0xda0, 0x3b].into()).unwrap();
+    host.msrs = [0x10, 0x122, 0xda0, 0x3b].into();
+    ck.manifest.check_compatibility(&tpl, &host).unwrap();
 
     // Only the newest VM state is loaded; ancestor manifests supply memory only.
     let child = dir.join("child");
     link(&child, Some(Parent { path: dir.to_path_buf(), id: ck.id }), |m| m.saved_msrs = Some(a.clone()));
-    Checkpoint::open(&child).unwrap().manifest.check_msrs(&a).unwrap();
+    host.msrs = a;
+    Checkpoint::open(&child).unwrap().manifest.check_compatibility(&tpl, &host).unwrap();
 }
 
 #[test]
 fn older_saved_vms_cannot_fall_back_to_template_msrs() {
     let dir = tmp("missing-saved-msrs");
+    let tpl = template(&dir, &[None; 256]);
     link(&dir, None, |m| m.saved_msrs = None);
     let ck = Checkpoint::open(&dir).unwrap();
-    let error = ck.manifest.check_msrs(&[0x10, 0x122, 0xda0].into()).unwrap_err().to_string();
+    let error = ck.manifest.check_compatibility(&tpl, &tpl.meta.compatibility).unwrap_err().to_string();
     assert!(error.contains("checkpoint or suspended VM") && error.contains("older flexvm") && error.contains("cannot be restored"), "{error}");
     assert!(!error.contains("rebuild"), "{error}");
+}
+
+#[test]
+fn saved_tsc_survives_roundtrip_and_checks_only_newest_vmstate() {
+    let dir = tmp("saved-tsc");
+    let tpl = template(&dir, &[None; 256]);
+    let mut host = tpl.meta.compatibility.clone();
+    host.tsc_khz = 2_000_400;
+    tpl.meta.compatibility.check(&host).unwrap();
+    link(&dir.join("ck"), None, |m| m.saved_tsc_khz = Some(1_999_600));
+    let ck = Checkpoint::open(&dir.join("ck")).unwrap();
+    assert_eq!(ck.manifest.saved_tsc_khz, Some(1_999_600));
+    assert!(ck.manifest.check_compatibility(&tpl, &host).unwrap_err().to_string().contains("TSC rate differs"));
+    host.tsc_control = true;
+    assert_eq!(ck.manifest.check_compatibility(&tpl, &host).unwrap(), 1_999_600);
+    host.tsc_control = false;
+    let child = dir.join("child");
+    link(&child, Some(Parent { path: dir.join("ck"), id: ck.id }), |m| m.saved_tsc_khz = Some(host.tsc_khz));
+    Checkpoint::open(&child).unwrap().manifest.check_compatibility(&tpl, &host).unwrap();
+}
+
+#[test]
+fn older_saved_vms_cannot_fall_back_to_template_tsc_rate() {
+    let dir = tmp("missing-saved-tsc");
+    let tpl = template(&dir, &[None; 256]);
+    for rate in [None, Some(0)] {
+        let ckdir = dir.join(format!("ck-{rate:?}"));
+        link(&ckdir, None, |m| m.saved_tsc_khz = rate);
+        let ck = Checkpoint::open(&ckdir).unwrap();
+        let error = ck.manifest.check_compatibility(&tpl, &tpl.meta.compatibility).unwrap_err().to_string();
+        assert!(error.contains("checkpoint or suspended VM") && error.contains("cannot be restored") && error.contains("TSC rate"), "{error}");
+        assert!(!error.contains("rebuild"), "{error}");
+    }
 }
 
 #[test]
