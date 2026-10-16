@@ -829,13 +829,13 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     routable(ip, &cfg, &known, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
 }
 
-/// A next hop is the connection's peer or a configured peer, never a router (`net::routers`: not
-/// a peer that routes to its VMs go through already) or a non-unicast address.
+/// A next hop is the connection's peer or a configured peer, never a router (`net::routers`, any
+/// routing table's: not a peer that routes to its VMs go through already) or a non-unicast address.
 /// Callers include the connection address in `peers`; named peers come from strict listener lookup.
 /// A peer's local address (hosts sharing a network namespace, loopback included) is taken:
 /// `net::route_via` installs nothing for it, and a migration's handoff relies on it.
 pub fn check_via(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
-    via_by(via, peers, &crate::net::routers(&std::fs::read_to_string("/proc/net/route")?))
+    via_by(via, peers, &crate::net::routers()?)
 }
 
 fn via_by(via: Ipv4Addr, peers: &[IpAddr], routers: &[Ipv4Addr]) -> Result<()> {

@@ -818,7 +818,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   boot's pass tries again while a peer by name is not known yet.
   A route's `via` and a migration target's reported underlay must be the
   connection's peer address or one of the configured peers' known addresses,
-  never a router (a next hop of a route here wider than /32: not a peer whose VMs
+  never a router (a next hop of a route wider than /32 in any routing table: not a peer whose VMs
   are routed through it already) or a non-unicast address; one local to this network namespace
   (hosts sharing a machine) is taken and installs no route. Route requests use the
   listener's strict peer lookup; migration replies use its last-known peer
