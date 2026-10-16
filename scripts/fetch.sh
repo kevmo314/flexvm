@@ -43,23 +43,30 @@ download() {
   fi
 }
 
+# Installed beside its final path, then renamed into place: an interrupted
+# install never leaves a short file there for later runs to take as fetched.
+place() {
+  sudo install -m "$1" "$2" "$out/.$3.tmp"
+  sudo mv -T "$out/.$3.tmp" "$out/$3"
+}
+
 if ! sudo test -x "$out/firecracker"; then
   echo "fetching firecracker $FC_VERSION"
   download firecracker.tgz "$FC_URL"
   tar xzf "$work/firecracker.tgz" -C "$work"
-  sudo install -m 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" "$out/firecracker"
+  place 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
 fi
 
 if ! sudo test -f "$out/vmlinux"; then
   echo "fetching $KERNEL"
   download vmlinux "$CI/$KERNEL"
-  sudo install -m 644 "$work/vmlinux" "$out/vmlinux"
+  place 644 "$work/vmlinux" vmlinux
 fi
 
 if ! sudo test -f "$out/base.squashfs"; then
   echo "fetching ubuntu-24.04 rootfs"
   download base.squashfs "$CI/ubuntu-24.04.squashfs"
-  sudo install -m 644 "$work/base.squashfs" "$out/base.squashfs"
+  place 644 "$work/base.squashfs" base.squashfs
 fi
 
 sudo ls -lh "$out"

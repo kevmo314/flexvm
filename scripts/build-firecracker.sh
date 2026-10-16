@@ -36,6 +36,10 @@ ln -sfn /usr/include/x86_64-linux-gnu/asm "$kh/asm"
 export CFLAGS_x86_64_unknown_linux_musl="-idirafter $kh"
 
 cd "$src"
-cargo build --release --target x86_64-unknown-linux-musl -p firecracker
-sudo install -D -m 755 build/cargo_target/x86_64-unknown-linux-musl/release/firecracker "$state/artifacts/firecracker"
-build/cargo_target/x86_64-unknown-linux-musl/release/firecracker --version
+# Where cargo puts the build: the environment overrides Firecracker's own
+# .cargo/config.toml, so the binary is taken from the directory passed, never
+# a stale one left in build/cargo_target.
+target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-build/cargo_target}}
+cargo build --release --target x86_64-unknown-linux-musl --target-dir "$target" -p firecracker
+sudo install -D -m 755 "$target"/x86_64-unknown-linux-musl/release/firecracker "$state/artifacts/firecracker"
+"$target"/x86_64-unknown-linux-musl/release/firecracker --version
