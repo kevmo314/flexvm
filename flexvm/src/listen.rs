@@ -783,9 +783,12 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
         bail!("injected fault: route messages refused");
     }
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-    routable(ip, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;
     let via: Option<Ipv4Addr> = req["via"].as_str().map(|v| v.parse()).transpose()?;
+    if let Some(via) = via {
+        check_vm_ip(host, ip, peers)?;
+        check_via(host, via, peers)?;
+    }
     let rev = match via {
         Some(_) => req["rev"].as_u64().ok_or("route announcements carry the location's revision")?,
         None => 0,
@@ -798,6 +801,10 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
         }
     }
     let l = host_lock(host)?;
+    // A recorded generation remains withdrawable after the allowlist narrows, including retries.
+    if via.is_none() && host.addr(&l, ip)?.seen == 0 {
+        check_vm_ip(host, ip, peers)?;
+    }
     if !host.observe(&l, ip, gen, rev, via)? {
         return Ok(json!({"ip": ip.to_string(), "stale": true}));
     }
@@ -820,6 +827,29 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     let mut known = peers.to_vec();
     known.extend(cfg.peers.iter().filter_map(|p| p.parse::<SocketAddr>().ok().map(|a| a.ip())));
     routable(ip, &cfg, &known, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
+}
+
+/// A next hop is the connection's peer or a configured peer, never a local or gateway address.
+/// Callers include the connection address in `peers`; named peers come from strict listener lookup.
+pub fn check_via(host: &Host, via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
+    via_by(via, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?), crate::net::is_local_addr)
+}
+
+fn via_by(via: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr], local: impl FnOnce(Ipv4Addr) -> Result<bool>) -> Result<()> {
+    let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
+    if !is_peer(peers, IpAddr::V4(via))
+        || via.is_unspecified()
+        || via.is_loopback()
+        || via.is_broadcast()
+        || via.is_multicast()
+        || cfg.underlay == Some(via)
+        || listen == Some(IpAddr::V4(via))
+        || gateways.contains(&via)
+        || local(via)?
+    {
+        bail!("{via} is not a peer next hop: unknown, local, gateway or not unicast");
+    }
+    Ok(())
 }
 
 /// The configured peers' addresses for a restore or resume (root's own, see `PEER_CACHE`):
@@ -892,6 +922,45 @@ fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gatewa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_hops_are_known_peers_but_never_local_or_gateways() {
+        let mut cfg = crate::host::Config::default();
+        let via: Ipv4Addr = "192.0.2.7".parse().unwrap();
+        let peers = [IpAddr::V4(via), "::ffff:192.0.2.8".parse().unwrap()];
+        let check = |ip, cfg: &crate::host::Config, gateways: &[Ipv4Addr], local| via_by(ip, cfg, &peers, gateways, |_| Ok(local));
+        check(via, &cfg, &[], false).unwrap();
+        check("192.0.2.8".parse().unwrap(), &cfg, &[], false).unwrap();
+        assert!(check("192.0.2.9".parse().unwrap(), &cfg, &[], false).is_err());
+        assert!(check(via, &cfg, &[via], false).is_err());
+        assert!(check(via, &cfg, &[], true).is_err());
+        cfg.underlay = Some(via);
+        assert!(check(via, &cfg, &[], false).is_err());
+        cfg.underlay = None;
+        cfg.listen = Some(format!("{via}:7070"));
+        assert!(check(via, &cfg, &[], false).is_err());
+        for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1"] {
+            let ip = ip.parse().unwrap();
+            assert!(via_by(ip, &cfg, &[IpAddr::V4(ip)], &[], |_| Ok(false)).is_err());
+        }
+    }
+
+    #[test]
+    fn route_rejects_untrusted_next_hops_before_recording_and_withdraws_old_ranges() {
+        let root = crate::test_util::TempDir::new("route-via");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let ip: Ipv4Addr = "10.201.0.7".parse().unwrap();
+        for via in ["192.0.2.99", "127.0.0.1"] {
+            assert!(route(&host, &json!({"ip": "10.200.0.7", "gen": 3, "rev": 0, "via": via}), &["127.0.0.1".parse().unwrap()]).is_err());
+            assert!(!host.state.join("addrs/10.200.0.7").exists());
+        }
+        host.observe(&host.lock().unwrap(), ip, 3, 0, Some("192.0.2.7".parse().unwrap())).unwrap();
+        let req = json!({"ip": ip.to_string(), "gen": 3});
+        route(&host, &req, &[]).unwrap();
+        route(&host, &req, &[]).unwrap();
+        assert!(host.addr(&host.lock().unwrap(), ip).unwrap().withdrawn);
+        assert!(route(&host, &json!({"ip": "10.201.0.8", "gen": 3}), &[]).is_err());
+    }
 
     #[test]
     fn admitted_connections_leave_half_the_slots_for_other_peers() {

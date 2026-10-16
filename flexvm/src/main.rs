@@ -378,9 +378,7 @@ fn real_main(args: &Args) -> Result<()> {
             if CONFIG_FLAGS.iter().any(|f| args.has(f)) {
                 host.configure(|c| configure(c, args))?;
             }
-            let c = &host.cfg;
-            let derived = json!({"prefix": host.tap_prefix(), "underlay": c.underlay(), "announce_dev": c.announce_dev(), "reserve_mib": c.reserve(), "evict_at_mib": c.evict_at()});
-            print(json!({"set": c, "derived": derived}))
+            print(config_output(&host))
         }
         Some("standby") if name.is_empty() => print(standby::show(&open_host(args)?)),
         Some("standby") => {
@@ -413,6 +411,12 @@ fn real_main(args: &Args) -> Result<()> {
     }
 }
 
+fn config_output(host: &Host) -> Value {
+    let c = &host.cfg;
+    let derived = json!({"prefix": host.tap_prefix(), "cluster_ips": c.effective_cluster_ips(), "underlay": c.underlay(), "announce_dev": c.announce_dev(), "reserve_mib": c.reserve(), "evict_at_mib": c.evict_at()});
+    json!({"set": c, "derived": derived})
+}
+
 /// Bind and validate before publishing any host configuration.
 fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std::net::TcpListener>) -> Result<std::net::TcpListener> {
     let mut listener = None;
@@ -439,6 +443,9 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
         listener = Some(bound);
         Ok(())
     })?;
+    if let Some(warning) = host.cfg.cluster_warning() {
+        crate::log!("{warning}");
+    }
     Ok(listener.unwrap())
 }
 
@@ -484,11 +491,7 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
     if let Some(r) = args.get("cluster-ips") {
         c.cluster_ips = (!r.is_empty()).then(|| r.into());
     }
-    if let Some(r) = &c.cluster_ips {
-        if !net::IpRange::parse(r)?.contains_range(&c.range()?) {
-            bail!("--vm-ips {} is not inside --cluster-ips {r}", c.vm_ips);
-        }
-    }
+    c.validate_ranges()?;
     if let Some(u) = args.get("underlay") {
         c.underlay = (!u.is_empty()).then(|| u.parse()).transpose().map_err(|_| format!("bad --underlay {u:?}"))?;
     }
@@ -516,8 +519,8 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
     if !c.peers.is_empty() && c.vm_ips == host::Config::default().vm_ips {
         crate::log!("flexvm: warning: --vm-ips is the default {}; each peer needs a range of its own", c.vm_ips);
     }
-    if !c.peers.is_empty() && c.cluster_ips.is_none() {
-        crate::log!("flexvm: warning: --cluster-ips is unset; peer VM addresses outside --vm-ips {} are refused", c.vm_ips);
+    if let Some(warning) = c.cluster_warning() {
+        crate::log!("{warning}");
     }
     Ok(())
 }
@@ -1121,6 +1124,21 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn config_output_shows_the_effective_allowlist() {
+        let root = crate::test_util::TempDir::new("config-allowlist");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let output = config_output(&host);
+        assert!(output["set"]["cluster_ips"].is_null());
+        assert_eq!(output["derived"]["cluster_ips"], host.cfg.vm_ips);
+        host.configure(|c| {
+            c.cluster_ips = Some("10.200.0.0/15".into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(config_output(&host)["derived"]["cluster_ips"], "10.200.0.0/15");
     }
 
     #[test]

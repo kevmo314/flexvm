@@ -172,9 +172,17 @@ no default DNS server; configure one with `--dns IP`.
 Every host's `--vm-ips` must be disjoint and inside `--cluster-ips`, the
 same range on every host covering all of them: a peer's VM may have, route or
 borrow only an address in it (unset, only this host's `--vm-ips`, so
-migrations between hosts are refused). The hosts must list each other
+migrations between hosts are refused). Both `config` and `listen` warn when
+peers are configured without `--cluster-ips`; `config` shows the effective
+allowlist in `derived.cluster_ips`. Loading `host.json` validates that the
+whole `vm_ips` range fits inside it; a running process keeps its last valid
+configuration if a hand edit is invalid. Withdrawals of previously recorded
+addresses remain accepted after the allowlist narrows. The hosts must list each other
 with `--peer HOST:PORT` (each peer's listen address): a listener serves its
-peers' addresses only, and tells any other it is not a peer. The default
+peers' addresses only, and tells any other it is not a peer. A reported route
+next hop (including a migration target's underlay) must be the connection's
+peer address or a configured peer's known address, and cannot be local or a
+gateway. Saved routes are checked again before reinstalling them. The default
 range, `10.200.0.0/16`, is the same on every host, so give each host its own
 once it has peers (`config` warns until then). `--peer` replaces the whole
 list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.

@@ -190,7 +190,23 @@ impl Config {
 
     /// The only addresses a peer's VM may have here (#584): `cluster_ips`, else this host's `vm_ips`.
     pub fn cluster(&self) -> Result<IpRange> {
-        IpRange::parse(self.cluster_ips.as_deref().unwrap_or(&self.vm_ips))
+        IpRange::parse(self.effective_cluster_ips())
+    }
+
+    pub fn validate_ranges(&self) -> Result<()> {
+        if !self.cluster()?.contains_range(&self.range()?) {
+            bail!("--vm-ips {} is not inside --cluster-ips {}", self.vm_ips, self.effective_cluster_ips());
+        }
+        Ok(())
+    }
+
+    pub fn effective_cluster_ips(&self) -> &str {
+        self.cluster_ips.as_deref().unwrap_or(&self.vm_ips)
+    }
+
+    pub fn cluster_warning(&self) -> Option<String> {
+        (!self.peers.is_empty() && self.cluster_ips.is_none())
+            .then(|| format!("flexvm: warning: --cluster-ips is unset; peer VM addresses outside --vm-ips {} are refused", self.vm_ips))
     }
 
     /// Never a wildcard address. Unset: the listen address, else the source
@@ -488,6 +504,7 @@ impl Host {
         let _ = RUN_DIR.set(run.clone());
         let cfg_stamp = stamp(&state.join("host.json"));
         let mut cfg: Config = load(&state.join("host.json"))?.unwrap_or_default();
+        cfg.validate_ranges().map_err(|e| format!("{}: {e}", state.join("host.json").display()))?;
         cfg.run = Some(run.clone());
         Ok(Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)) })
     }
@@ -498,6 +515,7 @@ impl Host {
         let mut cfg: Config = load(&path)?.unwrap_or_default();
         cfg.run = Some(self.run.clone());
         change(&mut cfg)?;
+        cfg.validate_ranges()?;
         store(&path, &cfg, true)?;
         self.cfg = cfg;
         self.cfg_stamp = stamp(&path);
@@ -516,7 +534,7 @@ impl Host {
     /// The configuration as it is now: `flexvm listen` may have changed the
     /// reserve, the eviction mark or the peers since this process started.
     /// host.json is read again once its mtime or inode changed (then cached by both).
-    /// While it cannot be read whole (mid-write, missing), the newest one that was read
+    /// While it cannot be read whole and validated (mid-write, missing, invalid ranges), the newest one that was read
     /// stands, never an older one: a peer revoked since is not let back in.
     pub fn config_now(&self) -> Config {
         let path = self.state.join("host.json");
@@ -529,7 +547,7 @@ impl Host {
         if let Some((_, cfg)) = last.as_ref().filter(|(t, _)| Some(*t) == now) {
             return cfg.clone();
         }
-        if let Some(mut cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten()) {
+        if let Some(mut cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten().filter(|c| c.validate_ranges().is_ok())) {
             cfg.run = Some(self.run.clone());
             *seen = Some((now.unwrap(), cfg.clone()));
             return cfg;
@@ -1157,7 +1175,7 @@ impl Host {
         let a = self.addr(l, ip)?;
         let dying = dead.is_some() && a.holder_id.as_ref() == dead;
         let Some(via) = a.via.filter(|_| !a.withdrawn && (dying || !self.held(&a))) else { return Ok(false) };
-        if !self.in_cluster(ip, via) {
+        if !self.route_allowed(ip, via) {
             return Ok(false);
         }
         crate::net::route_via(ip, via)?;
@@ -1165,14 +1183,17 @@ impl Host {
         Ok(true)
     }
 
-    /// A peer's route comes back from its record only for an address the local allowlist still
-    /// holds: a record from before #584, or from a wider `cluster_ips`, is left out.
-    fn in_cluster(&self, ip: Ipv4Addr, via: Ipv4Addr) -> bool {
-        let ok = self.config_now().cluster().is_ok_and(|c| c.contains(ip));
-        if !ok {
-            crate::log!("route {ip} via {via}: not put back, outside this host's configured VM ranges");
+    /// Recheck saved routes against current configuration, without DNS or a wait under the lock.
+    fn route_allowed(&self, ip: Ipv4Addr, via: Ipv4Addr) -> bool {
+        let checked = crate::listen::known_peers(self).and_then(|peers| {
+            crate::listen::check_vm_ip(self, ip, &peers)?;
+            crate::listen::check_via(self, via, &peers)
+        });
+        if let Err(e) = checked {
+            crate::log!("route {ip} via {via}: not put back: {e}");
+            return false;
         }
-        ok
+        true
     }
 
     pub fn current(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
@@ -2421,7 +2442,7 @@ impl Host {
                     continue;
                 }
             };
-            let Some(via) = a.via.filter(|&via| !a.withdrawn && !self.held(&a) && self.in_cluster(ip, via)) else { continue };
+            let Some(via) = a.via.filter(|&via| !a.withdrawn && !self.held(&a) && self.route_allowed(ip, via)) else { continue };
             match route(ip, via) {
                 Ok(()) => crate::log!("after boot: put back route {ip} via {via} (generation {})", a.seen),
                 Err(e) => {
@@ -3277,6 +3298,49 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_defaults_are_visible_and_warn_with_peers() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.effective_cluster_ips(), cfg.vm_ips);
+        assert!(cfg.cluster_warning().is_none());
+        cfg.peers.push("192.0.2.7:7070".into());
+        assert!(cfg.cluster_warning().unwrap().contains(&cfg.vm_ips));
+        cfg.cluster_ips = Some("10.200.0.0/15".into());
+        assert_eq!(cfg.effective_cluster_ips(), "10.200.0.0/15");
+        assert!(cfg.cluster_warning().is_none());
+    }
+
+    #[test]
+    fn invalid_ranges_are_refused_on_open_and_reload() {
+        let (_dir, h) = host("invalid-ranges");
+        let path = h.state.join("host.json");
+        for (vm, cluster) in [("10.200.0.0/16", Some("10.201.0.0/16")), ("bad", None), ("10.200.0.0/16", Some("bad"))] {
+            let cfg = Config { vm_ips: vm.into(), cluster_ips: cluster.map(String::from), ..Config::default() };
+            store(&path, &cfg, true).unwrap();
+            assert!(Host::open(&h.state, &h.run).is_err());
+            assert_eq!(h.config_now().vm_ips, h.cfg.vm_ips);
+            assert_eq!(h.config_now().cluster_ips, h.cfg.cluster_ips);
+        }
+    }
+
+    #[test]
+    fn saved_routes_recheck_peer_gateway_and_local_refusals() {
+        let (_dir, mut h) = host("saved-route-check");
+        h.cfg.cluster_ips = Some("0.0.0.0-255.255.255.255".into());
+        h.cfg.peers = vec!["192.0.2.7:7070".into(), "10.9.5.1:7070".into()];
+        let via = ip("192.0.2.7");
+        assert!(h.route_allowed(ip("10.9.5.2"), via));
+        for dest in [ip("10.9.5.1"), ip("127.0.0.1")] {
+            assert!(!h.route_allowed(dest, via));
+            h.put_addr(dest, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+            assert!(!h.reinstall(&h.lock().unwrap(), dest, None).unwrap());
+        }
+        for gateway in crate::net::gateways(&std::fs::read_to_string("/proc/net/route").unwrap()) {
+            assert!(!h.route_allowed(gateway, via));
+        }
+        assert!(!h.route_allowed(ip("10.9.5.2"), ip("192.0.2.99")));
+    }
 
     #[test]
     fn locks_are_in_directories_only_root_may_enter() {
@@ -4415,6 +4479,7 @@ mod tests {
         h.cfg.cluster_ips = Some("10.9.0.0/16".into());
         let (peer, gone, mine, withdrawn) = (ip("10.9.5.1"), ip("10.9.5.2"), ip("10.9.5.3"), ip("10.9.5.4"));
         let via = ip("192.0.2.7");
+        h.cfg.peers = vec![format!("{via}:7070")];
         let dead = dead_owner(&h, 999_999_946, &[]);
         {
             let l = h.lock().unwrap();

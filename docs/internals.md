@@ -801,19 +801,29 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   VM range; each host's `--vm-ips` must fit entirely inside it. Only addresses
   in this locally configured allowlist may arrive, be routed or lent. Unset
   (or reset with `--cluster-ips ''`), it allows only this host's `--vm-ips`;
-  peers configured without it produce a warning. A peer's report of its own
-  range never authorizes an address here.
+  peers configured without it produce a warning from both `config` and `listen`.
+  `config` reports the effective allowlist as `derived.cluster_ips`. Loading or
+  reloading `host.json` validates range syntax and containment of `vm_ips`;
+  an invalid reload leaves the last valid configuration in use. A peer's report
+  of its own range never authorizes an address here. Withdrawals of recorded
+  generations remain accepted, including retries, after the allowlist narrows.
   No VM gets a local, peer, underlay or gateway address (#549), even inside
   `--cluster-ips`. What a peer
   asks for (arrival, route, lend) is checked against the listener's own peer
   lookups, briefly waiting for one under way; a restore or resume, root's own,
   against the listener's last-known peer addresses (`RUN/peers.json`) whatever
-  their age, with no DNS wait.
+  their age, with no DNS wait. Reinstall and boot recovery repeat these checks
+  and the next-hop check against current configuration, with no DNS wait.
+  A route's `via` and a migration target's reported underlay must be the
+  connection's peer address or one of the configured peers' known addresses,
+  never a local, gateway or non-unicast address. Route requests use the
+  listener's strict peer lookup; migration replies use its last-known peer
+  addresses plus the target connection's address.
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
-    Routes via an address local to the host's network namespace (including
-    loopback) are skipped, so test hosts sharing a machine keep each other's
-    tap routes; the first skip is logged.
+    Peer-supplied next hops local to this network namespace (including
+    loopback) are refused before route state is saved. The low-level route
+    helper also skips local next hops for internal callers.
   - **The LAN** (the announce device: the device of the route toward the
     peers, or `flexvm config --announce-dev`): the host answers ARP for its VMs
     (proxy ARP) and sends a gratuitous ARP whenever a VM arrives. Other
