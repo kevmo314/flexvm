@@ -101,14 +101,20 @@ impl Compat {
     }
 }
 
-/// Identity of the host probe, including module reloads within a boot. Directory
-/// inodes/ctimes change on reload even if a static /dev/kvm node survives it.
+/// Identity of the host probe: this boot, this flexvm and Firecracker, and the KVM device
+/// and modules by (device, inode), which a module reload changes and a ctime touch does not.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct HostKey {
     boot_id: String,
+    flexvm: Stamp,
     firecracker: Stamp,
-    kvm: Stamp,
-    modules: [Option<Stamp>; 3],
+    kvm: (u64, u64),
+    modules: [Option<(u64, u64)>; 3],
+}
+
+fn node(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
 }
 
 impl HostKey {
@@ -120,18 +126,18 @@ impl HostKey {
         let mut modules = [None, None, None];
         for (slot, name) in modules.iter_mut().zip(["kvm", "kvm_intel", "kvm_amd"]) {
             match std::fs::metadata(format!("/sys/module/{name}")) {
-                Ok(m) => *slot = Some(Stamp::of(&m)),
+                Ok(m) => *slot = Some(node(&m)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(Self { boot_id, firecracker, kvm: Stamp::of(&std::fs::metadata("/dev/kvm")?), modules })
+        let flexvm = Stamp::of(&std::fs::metadata("/proc/self/exe")?);
+        Ok(Self { boot_id, flexvm, firecracker, kvm: node(&std::fs::metadata("/dev/kvm")?), modules })
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct HostCache {
-    version: u32,
     key: HostKey,
     compat: Compat,
 }
@@ -140,12 +146,12 @@ struct HostCache {
 /// so a future change to the CPUID/MSR selection can invalidate older results.
 fn host_compat(run: Option<&Path>, key: Option<&HostKey>, probe: impl FnOnce() -> Result<Compat>) -> Result<Compat> {
     let read = run.and_then(|d| std::fs::read(d.join("compat.json")).ok()).and_then(|b| serde_json::from_slice::<HostCache>(&b).ok());
-    if let Some(cached) = read.filter(|c| c.version == 1 && Some(&c.key) == key) {
+    if let Some(cached) = read.filter(|c| Some(&c.key) == key) {
         return Ok(cached.compat);
     }
     let compat = probe()?;
     if let (Some(run), Some(key)) = (run, key) {
-        let cached = HostCache { version: 1, key: key.clone(), compat: compat.clone() };
+        let cached = HostCache { key: key.clone(), compat: compat.clone() };
         let _ = crate::util::write_file(run, "compat.json", &serde_json::to_vec(&cached)?, false);
     }
     Ok(compat)
@@ -370,8 +376,9 @@ mod tests {
     }
 
     fn host_key(root: &Path) -> HostKey {
-        let stamp = Stamp::of(&std::fs::metadata(root).unwrap());
-        HostKey { boot_id: "boot-a".into(), firecracker: stamp.clone(), kvm: stamp.clone(), modules: [Some(stamp), None, None] }
+        let m = std::fs::metadata(root).unwrap();
+        let stamp = Stamp::of(&m);
+        HostKey { boot_id: "boot-a".into(), flexvm: stamp.clone(), firecracker: stamp, kvm: node(&m), modules: [Some(node(&m)), None, None] }
     }
 
     #[test]
@@ -397,15 +404,17 @@ mod tests {
         // A different inode provides a distinct stamp without relying on clock resolution.
         let replacement = root.join("replacement");
         std::fs::write(&replacement, b"replacement").unwrap();
-        let stamp = Stamp::of(&std::fs::metadata(replacement).unwrap());
-        let mut keys = vec![key.clone(); 7];
+        let m = std::fs::metadata(replacement).unwrap();
+        let (stamp, inode) = (Stamp::of(&m), node(&m));
+        let mut keys = vec![key.clone(); 8];
         keys[0].boot_id = "boot-b".into();
         keys[1].firecracker = stamp.clone();
-        keys[2].kvm = stamp.clone();
-        keys[3].modules[0] = Some(stamp.clone());
-        keys[4].modules[1] = Some(stamp.clone());
-        keys[5].modules[2] = Some(stamp);
+        keys[2].kvm = inode;
+        keys[3].modules[0] = Some(inode);
+        keys[4].modules[1] = Some(inode);
+        keys[5].modules[2] = Some(inode);
         keys[6].modules[0] = None;
+        keys[7].flexvm = stamp;
         for changed in keys {
             host_compat(Some(&root), Some(&key), || Ok(host())).unwrap();
             let calls = std::cell::Cell::new(0);
@@ -420,10 +429,19 @@ mod tests {
     }
 
     #[test]
-    fn host_cache_reprobes_corrupt_incomplete_and_old_entries() {
+    fn a_ctime_change_alone_keeps_the_node_identity() {
+        let root = crate::test_util::TempDir::new("host-compat-ctime");
+        let before = node(&std::fs::metadata(&root).unwrap());
+        // chmod changes the ctime, not the device or inode.
+        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        assert_eq!(node(&std::fs::metadata(&root).unwrap()), before);
+    }
+
+    #[test]
+    fn host_cache_reprobes_corrupt_and_incomplete_entries() {
         let root = crate::test_util::TempDir::new("host-compat-invalid");
         let key = host_key(&root);
-        let cached = HostCache { version: 1, key: key.clone(), compat: host() };
+        let cached = HostCache { key: key.clone(), compat: host() };
         let valid = serde_json::to_value(&cached).unwrap();
         let mut invalid = vec![b"broken".to_vec(), b"{}".to_vec()];
         for field in ["tsc_khz", "tsc_control", "msrs", "features", "xsave", "cpu", "firecracker"] {
@@ -431,9 +449,6 @@ mod tests {
             value["compat"].as_object_mut().unwrap().remove(field);
             invalid.push(serde_json::to_vec(&value).unwrap());
         }
-        let mut old = valid.clone();
-        old["version"] = serde_json::json!(0);
-        invalid.push(serde_json::to_vec(&old).unwrap());
         for bytes in invalid {
             std::fs::write(root.join("compat.json"), bytes).unwrap();
             let calls = std::cell::Cell::new(0);
