@@ -24,18 +24,26 @@ fi
 out=$state/artifacts
 sudo mkdir -p "$out"
 work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
+placing=
+trap 'rm -rf -- "$work"; [ -z "$placing" ] || sudo rm -f -- "$placing"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# The pinned SHA256 of a URL.
+pinned() {
+  local checksum
+  checksum=$(awk -v url="$1" '$2 == url {print $1}' "$root/scripts/checksums.sha256")
+  if [[ ! $checksum =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "No pinned SHA256 for $1; update scripts/checksums.sha256" >&2
+    return 1
+  fi
+  echo "$checksum"
+}
 
 # A download into $work, checked against its pinned SHA256.
 download() {
   local target=$work/$1 url=$2 checksum
-  checksum=$(awk -v url="$url" '$2 == url {print $1}' "$root/scripts/checksums.sha256")
-  if [[ ! $checksum =~ ^[[:xdigit:]]{64}$ ]]; then
-    echo "No pinned SHA256 for $url; update scripts/checksums.sha256" >&2
-    return 1
-  fi
+  checksum=$(pinned "$url") || return 1
   curl -fsSL -o "$target" "$url"
   if ! printf '%s  %s\n' "$checksum" "$target" | sha256sum --check --status; then
     echo "SHA256 mismatch for $url" >&2
@@ -43,11 +51,26 @@ download() {
   fi
 }
 
-# Installed beside its final path, then renamed into place: an interrupted
-# install never leaves a short file there for later runs to take as fetched.
+# Whether $out/NAME is there and matches URL's pinned SHA256; one that does
+# not (cut short by an older fetch, say) is fetched again.
+fetched() {
+  local checksum
+  checksum=$(pinned "$2") || return 1
+  sudo test -f "$out/$1" || return 1
+  if ! printf '%s  %s\n' "$checksum" "$out/$1" | sudo sha256sum --check --status; then
+    echo "$out/$1 does not match its pinned SHA256; fetching it again"
+    return 1
+  fi
+}
+
+# Installed to a temporary file of this run's own beside its final path, then
+# renamed into place: an interrupted install never leaves a short file there,
+# and concurrent fetches never rename each other's.
 place() {
-  sudo install -m "$1" "$2" "$out/.$3.tmp"
-  sudo mv -T "$out/.$3.tmp" "$out/$3"
+  placing=$(sudo mktemp -p "$out" ".$3.XXXXXX")
+  sudo install -m "$1" "$2" "$placing"
+  sudo mv -T "$placing" "$out/$3"
+  placing=
 }
 
 if ! sudo test -x "$out/firecracker"; then
@@ -57,13 +80,13 @@ if ! sudo test -x "$out/firecracker"; then
   place 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
 fi
 
-if ! sudo test -f "$out/vmlinux"; then
+if ! fetched vmlinux "$CI/$KERNEL"; then
   echo "fetching $KERNEL"
   download vmlinux "$CI/$KERNEL"
   place 644 "$work/vmlinux" vmlinux
 fi
 
-if ! sudo test -f "$out/base.squashfs"; then
+if ! fetched base.squashfs "$CI/ubuntu-24.04.squashfs"; then
   echo "fetching ubuntu-24.04 rootfs"
   download base.squashfs "$CI/ubuntu-24.04.squashfs"
   place 644 "$work/base.squashfs" base.squashfs
