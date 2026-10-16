@@ -21,6 +21,10 @@ use crate::util::{send_json, Result, Slot};
 /// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// Arrival processes from their start until they commit or are refused (or end); more
+/// arrivals are refused at once, before their source pauses anything.
+const MAX_ARRIVALS: usize = 8;
+static ARRIVALS: AtomicUsize = AtomicUsize::new(0);
 /// Unknown addresses held while a peer's name with no addresses yet is
 /// looked up, in all and from any one address (a peer's restart backlog can
 /// hold a few of its requests); more are refused at once. One source cannot
@@ -469,7 +473,9 @@ fn read_line_by(conn: &TcpStream, deadline: Instant) -> Result<Vec<u8>> {
     bail!("request line too long")
 }
 
-/// Spawns the incoming VM process with the connection as fd 3; it answers the source.
+/// Spawns the incoming VM process with the connection as fd 3; it answers the source. Its
+/// arrival slot is held, by the shared reaper, until it says it committed or was refused
+/// (on its fd 4, `FLEXVM_NOTIFY_FD`) or it ends.
 fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let refuse = |mut c: &TcpStream, e: String| send_json(&mut c, &json!({"ok": false, "error": e}));
@@ -477,6 +483,11 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
         refuse(&conn, e.to_string())?;
         return Ok(());
     }
+    // Refused before anything is made: the source has paused nothing yet, and its VM runs on.
+    let Some(slot) = Slot::take(&ARRIVALS, MAX_ARRIVALS) else {
+        refuse(&conn, format!("{MAX_ARRIVALS} migrations are arriving here already; try again later"))?;
+        return Ok(());
+    };
     // Each arrival owns its log until accepted; refusing a duplicate name
     // must not remove the running VM's log.
     static ARRIVAL: AtomicUsize = AtomicUsize::new(0);
@@ -486,14 +497,21 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
     let log = std::fs::OpenOptions::new().create_new(true).append(true).open(&log_path)?;
     crate::host::flock(&log, libc::LOCK_SH)?;
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
-    if let Err(e) = crate::util::spawn_self(
+    let (done, told) = std::os::unix::net::UnixStream::pair()?;
+    let spawned = crate::util::spawn_self_child(
         &args,
         &log,
         conn.as_raw_fd(),
-        &[("FLEXVM_INCOMING", std::str::from_utf8(line)?), ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?)],
-    ) {
-        let _ = std::fs::remove_file(log_path);
-        refuse(&conn, format!("cannot start the vm process: {e}"))?;
+        Some(told.as_raw_fd()),
+        &[("FLEXVM_INCOMING", std::str::from_utf8(line)?), ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?), ("FLEXVM_NOTIFY_FD", "4")],
+    );
+    drop(told);
+    match spawned {
+        Ok(child) => crate::util::reap_later(child, Some((done.into(), Box::new(slot)))),
+        Err(e) => {
+            let _ = std::fs::remove_file(log_path);
+            refuse(&conn, format!("cannot start the vm process: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -681,6 +699,26 @@ mod tests {
         assert!(!arrival.exists());
         assert_eq!(std::fs::read(&existing).unwrap(), b"accepted");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arrivals_past_the_bound_are_refused_at_once_starting_nothing() {
+        let root = crate::test_util::TempDir::new("arrivals-full");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let held: Vec<Slot> = std::iter::from_fn(|| Slot::take(&ARRIVALS, MAX_ARRIVALS)).collect();
+        assert_eq!(held.len(), MAX_ARRIVALS);
+        let (client, server) = pair();
+        let line = br#"{"op":"migrate_in","name":"web"}"#;
+        let start = Instant::now();
+        incoming(&host, &serde_json::from_slice(line).unwrap(), line, server).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("arriving here already"), "{reply}");
+        let logs = std::fs::read_dir(host.run.join("vms")).unwrap().count();
+        assert_eq!(logs, 0, "no arrival log made");
+        drop(held);
+        assert_eq!(ARRIVALS.load(Ordering::SeqCst), 0);
     }
 
     #[test]

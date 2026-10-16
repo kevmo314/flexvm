@@ -274,13 +274,13 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
             "--template".as_ref(),
             template.as_ref(),
         ];
-        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, &[("FLEXVM_NOTIFY_FD", "3")])?;
         drop(w);
         let mut r = BufReader::new(r);
         wait_locked(&mut r, &mut child, by)?;
         Ok((r, child))
     })();
-    let (r, mut child) = match started {
+    let (r, child) = match started {
         Ok(started) => started,
         Err(e) => {
             release(stop);
@@ -288,7 +288,7 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
         }
     };
     drop(stop);
-    std::thread::spawn(move || child.wait());
+    crate::util::reap_later(child, None);
     Ok(Some(r))
 }
 

@@ -1059,13 +1059,19 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
 /// reach of whatever stops the caller's: a systemd unit's restart or stop
 /// (`KillMode=control-group`), logind's `KillUserProcesses`.
 pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<()> {
-    let mut child = spawn_self_child(args, log, fd3, env)?;
-    std::thread::spawn(move || child.wait());
+    reap_later(spawn_self_child(args, log, fd3, None, env)?, None);
     Ok(())
 }
 
-/// Like `spawn_self`, but the caller owns termination and reaping.
-pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<std::process::Child> {
+/// Like `spawn_self`, but the caller owns termination and reaping (`reap_later`).
+/// `fd4`, if any, is the child's fd 4 as well.
+pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(
+    args: &[S],
+    log: &std::fs::File,
+    fd3: RawFd,
+    fd4: Option<RawFd>,
+    env: &[(&str, &str)],
+) -> io::Result<std::process::Child> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     let cgroups = crate::vmproc::cgroup_root().map(|r| r.join("vm-").as_os_str().as_bytes().to_vec());
@@ -1080,12 +1086,94 @@ pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::Fi
                     libc::write(2, warn.as_ptr().cast(), warn.len());
                 }
             }
+            // Copied out of the way first: it may be fd 3 now, and fd3 fd 4.
+            let fd4 = match fd4 {
+                Some(fd) => {
+                    let k = libc::fcntl(fd, libc::F_DUPFD, 10);
+                    check(k)?;
+                    Some(k)
+                }
+                None => None,
+            };
             // dup2 onto itself would leave it close-on-exec.
             let moved = if fd3 == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd3, 3) };
-            check(moved)
+            check(moved)?;
+            if let Some(k) = fd4 {
+                check(libc::dup2(k, 4))?;
+                libc::close(k);
+            }
+            Ok(())
         });
     }
     cmd.spawn()
+}
+
+/// A child `reap_later` waits for, and what it holds meanwhile.
+struct Reaping {
+    child: std::process::Child,
+    /// None (pidfd_open failed): tried every `REAP_POLL` instead.
+    pidfd: Option<OwnedFd>,
+    /// Dropped once `.0` reads ready (written to, or closed by every holder, its process ended
+    /// with it) or the child is reaped, whichever is first.
+    hold: Option<(OwnedFd, Box<dyn Send>)>,
+}
+
+static REAPING: std::sync::Mutex<Vec<Reaping>> = std::sync::Mutex::new(Vec::new());
+const REAP_POLL: Duration = Duration::from_secs(1);
+
+/// Reaps `child` once it exits, from one thread shared by all the process's children rather
+/// than one each; drops `hold`'s value then, or once its fd reads ready if sooner.
+pub fn reap_later(child: std::process::Child, hold: Option<(OwnedFd, Box<dyn Send>)>) {
+    let pidfd = pidfd_open(child.id()).ok();
+    REAPING.lock().unwrap().push(Reaping { child, pidfd, hold });
+    // Started once; a failure to start it is retried with the next child (none is lost meanwhile).
+    static WAKE: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
+    let mut wake = WAKE.lock().unwrap();
+    if wake.is_none() {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return crate::log!("reaping children: eventfd: {}", io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let raw = fd.as_raw_fd();
+        // Never closed: the thread polls it for good.
+        match std::thread::Builder::new().name("reaper".into()).spawn(move || reaper(raw)) {
+            Ok(_) => *wake = Some(fd),
+            Err(e) => return crate::log!("reaping children: {e}"),
+        }
+    }
+    let one = 1u64;
+    unsafe { libc::write(wake.as_ref().unwrap().as_raw_fd(), (&one as *const u64).cast(), 8) };
+}
+
+fn reaper(wake: RawFd) {
+    loop {
+        // Entries are only appended meanwhile, and removed only here: `fds[1 + 2i..]` stays entry i's.
+        let (mut fds, timeout) = {
+            let r = REAPING.lock().unwrap();
+            let fd = |f: Option<&OwnedFd>| libc::pollfd { fd: f.map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 };
+            let mut fds = vec![libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 }];
+            fds.extend(r.iter().flat_map(|e| [fd(e.pidfd.as_ref()), fd(e.hold.as_ref().map(|h| &h.0))]));
+            (fds, if r.iter().any(|e| e.pidfd.is_none()) { REAP_POLL.as_millis() as i32 } else { -1 })
+        };
+        if eintr(|| unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) }).is_err() {
+            std::thread::sleep(REAP_POLL);
+        }
+        if fds[0].revents != 0 {
+            let mut n = 0u64;
+            unsafe { libc::read(wake, (&mut n as *mut u64).cast(), 8) };
+        }
+        let mut i = 0;
+        REAPING.lock().unwrap().retain_mut(|e| {
+            let (exited, done) = fds.get(1 + 2 * i..3 + 2 * i).map_or((false, false), |f| (f[0].revents != 0, f[1].revents != 0));
+            i += 1;
+            if done {
+                e.hold = None;
+            }
+            // Gone once waited for (or never to be: an error).
+            !((exited || e.pidfd.is_none()) && !matches!(e.child.try_wait(), Ok(None)))
+        });
+    }
 }
 
 /// `PREFIX` `PID` `-` `START` `SUFFIX` NUL in `buf`, without allocating
@@ -1186,6 +1274,40 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn within(t: Duration, cond: impl Fn() -> bool) -> bool {
+        let end = Instant::now() + t;
+        while !cond() {
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[test]
+    fn a_reaped_child_holds_its_slot_only_until_it_says_so_and_is_reaped_once_it_exits() {
+        static HELD: AtomicUsize = AtomicUsize::new(0);
+        let gone = |pid: u32| !Path::new(&format!("/proc/{pid}")).exists();
+        let (done, told) = UnixStream::pair().unwrap();
+        let child = std::process::Command::new("sleep").arg("1").spawn().unwrap();
+        let pid = child.id();
+        reap_later(child, Some((done.into(), Box::new(Slot::take(&HELD, 1).unwrap()))));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(Slot::take(&HELD, 1).is_none(), "held while the child has not said");
+        drop(told);
+        assert!(within(Duration::from_secs(2), || HELD.load(Ordering::SeqCst) == 0), "let go once told");
+        assert!(!gone(pid), "the child runs on");
+        assert!(within(Duration::from_secs(5), || gone(pid)), "reaped once it exited");
+        // One that ends without saying lets go too, whoever else holds its fd.
+        let (done, told) = UnixStream::pair().unwrap();
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        reap_later(child, Some((done.into(), Box::new(Slot::take(&HELD, 1).unwrap()))));
+        assert!(within(Duration::from_secs(5), || HELD.load(Ordering::SeqCst) == 0 && gone(pid)));
+        drop(told);
+    }
 
     #[test]
     fn only_a_trusted_file_is_read() {

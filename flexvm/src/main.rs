@@ -341,7 +341,8 @@ fn real_main(args: &Args) -> Result<()> {
         Some("run") if args.has("incoming") => {
             let req: Value = serde_json::from_str(&std::env::var("FLEXVM_INCOMING").map_err(|_| "run --incoming is the listener's, for migrations")?)?;
             unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) };
-            vmproc::main(open_host(args)?, paths(args)?, Start::Incoming { req }, None)
+            // Told once committed or refused: the listener holds an arrival slot until then.
+            vmproc::main(open_host(args)?, paths(args)?, Start::Incoming { req }, notify_fd())
         }
         Some("run") => run(args, name, template),
         Some("resume") if resume(&open_host(args)?, name)? => Ok(()),
