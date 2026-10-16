@@ -8890,6 +8890,92 @@ def resume_killed_marked():
     check("killed marked: nothing left once killed", n not in vms(A), vms(A).get(n))
 
 
+class RouteWatch:
+    """The kernel's route changes for `ip`, as `ip monitor` reports them, from
+    the first change it is shown on: `sync` proves it has seen every change
+    made before it (by one of its own to a marker address)."""
+
+    def __init__(self, ip, marker, via):
+        self.ip, self.marker, self.via, self.lines, self.seq = ip, marker, via, [], 0
+        self.proc = subprocess.Popen(["ip", "-o", "monitor", "route"], stdout=subprocess.PIPE, text=True)
+        self.reader = threading.Thread(target=lambda: self.lines.extend(iter(self.proc.stdout.readline, "")), daemon=True)
+        self.reader.start()
+        # `ip monitor` subscribes some time after it starts: a marker seen proves it has.
+        end = time.time() + 10
+        while not self.sync(0.5):
+            if time.time() > end:
+                raise RuntimeError("ip monitor never reported a route change")
+
+    def sync(self, timeout=10):
+        self.seq += 1
+        metric = 100 + self.seq
+        subprocess.run(["ip", "route", "add", f"{self.marker}/32", "via", self.via, "metric", str(metric)], check=True)
+        subprocess.run(["ip", "route", "del", f"{self.marker}/32", "via", self.via, "metric", str(metric)], check=True)
+        mark = re.compile(rf"^Deleted {re.escape(self.marker)} via .* metric {metric}\b")
+        return wait_for(lambda: any(mark.match(l) for l in list(self.lines)), timeout)
+
+    def to_tap(self):
+        """The routes of `ip` to a device of its own (a tap), not via a peer, that were installed."""
+        return [l.strip() for l in list(self.lines) if re.match(rf"^{re.escape(self.ip)} dev ", l)]
+
+    def close(self):
+        self.proc.kill()
+        self.proc.wait()
+
+
+def restore_route_fence():
+    """#534: a restore installs its address's route only under its generation
+    fence, paused (--paused) or not. Held at restore_prepared_gate (Firecracker
+    up, nothing loaded), the address moves on to a newer generation routed via
+    a peer; let go, the restore fails at the fence, and the newer route is
+    never replaced by one to the restore's tap, then or as it exits."""
+    n, path = "ft-route-fence", ckpt_path("ft-route-fence")
+    setup(n, mib=8)
+    ip = vms(A)[n]["ip"]
+    ok(checkpoint(A, n, path, stop=True))
+    check("route fence: checkpointed, the vm gone", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
+    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    marker = A.ips.split("-")[1].rsplit(".", 1)[0] + ".249"
+    gate = "restore_prepared_gate"
+    for paused in (False, True):
+        label = f"route fence{' (paused)' if paused else ''}"
+        watch, gen = RouteWatch(ip, marker, gw), 0
+        try:
+            check(f"{label}: watching route changes", watch.sync(), watch.lines[-5:])
+            clear_gate(A, gate)
+            fault(A, gate, 600000)
+            res = {}
+            th = threading.Thread(target=lambda: res.update(r=restore(A, path, paused=paused)))
+            th.start()
+            check(f"{label}: the restore parked at {gate}, its address claimed",
+                  wait_for(lambda: len(reached(A, gate)) == 1, 60), reached(A, gate))
+            gen = addr(A, ip).get("held", 0)
+            check(f"{label}: the restore holds a generation of {ip}", gen > 0 and addr(A, ip).get("holder") == n, addr(A, ip))
+            r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+            check(f"{label}: the newer generation is taken, routed via the peer",
+                  r.get("ok") and not r["result"].get("stale") and not r["result"].get("local") and f"via {gw}" in peer_route(ip), (r, peer_route(ip)))
+            # B hears of it too (as every peer does): the restore's withdrawal of its own generation, told to B as it
+            # fails, is then stale there, and leaves the route both hosts share here alone.
+            r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+            check(f"{label}: and so is the peer's", r.get("ok") and not r["result"].get("stale"), r)
+            release(A, gate)
+            th.join(120)
+            r = res.get("r") or {"ok": False, "error": "restore did not return"}
+            check(f"{label}: the restore fails at the fence", not r["ok"] and "withdrawn or given out again" in r.get("error", ""), r)
+            check(f"{label}: it runs nowhere", wait_for(lambda: where(n) == {}, 30), where(n))
+            check(f"{label}: all route changes seen", watch.sync(), watch.lines[-5:])
+            check(f"{label}: the address was never routed to the restore's tap", not watch.to_tap(), watch.to_tap())
+            check(f"{label}: the newer route survives", f"via {gw}" in peer_route(ip), peer_route(ip))
+            check(f"{label}: the newer generation stays recorded", addr(A, ip).get("seen") == gen + 1, addr(A, ip))
+        finally:
+            watch.close()
+            disarm()
+            kill(A, n)
+            if gen:
+                forget_peer_route(ip, gen + 1)
+    rm_ckpt(path)
+
+
 SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
@@ -8935,7 +9021,7 @@ SCENARIOS = dict(
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status, resume_outcome=resume_outcome, exec_recovery_instance=exec_recovery_instance,
     ckpt_ancestor_corrupt=ckpt_ancestor_corrupt, resume_listener_restart=resume_listener_restart,
-    resume_killed_marked=resume_killed_marked)
+    resume_killed_marked=resume_killed_marked, restore_route_fence=restore_route_fence)
 # Measurements, not correctness checks (nothing they print has a threshold): run only when named.
 BENCHMARKS = dict(ckpt_stall=ckpt_stall)
 del SCENARIOS["ckpt_stall"]

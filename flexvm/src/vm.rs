@@ -933,7 +933,9 @@ pub struct Prepared {
     fc: Option<Firecracker>,
     pub pager: Arc<Pager>,
     template: Arc<Template>,
-    /// Routes the VM's /32 to its tap while loading; a migration target does it at commit.
+    /// Readies its tap for the address (`net::neighbour`) while loading. The route itself is
+    /// never installed by the load: the caller does it under its generation fence (#534).
+    /// False when the caller readied the tap itself (a migration target, routed at commit).
     route: bool,
 }
 
@@ -953,7 +955,7 @@ impl Prepared {
         self.fc.as_ref().unwrap()
     }
 
-    /// The load leaves the address's route alone (a migration target routes it at commit).
+    /// The load leaves the tap alone too: the caller readied it (a migration target routes it at commit).
     pub fn unrouted(mut self) -> Prepared {
         self.route = false;
         self
@@ -1091,7 +1093,8 @@ impl Prepared {
             };
             let fc = self.firecracker();
             let tap = fc.tap.clone();
-            let route = self.route.then(|| std::thread::spawn(move || crate::net::attach(ip, &tap)));
+            // All of routing the address here but the route, alongside the load: the route waits for the fence.
+            let neighbour = self.route.then(|| std::thread::spawn(move || crate::net::neighbour(ip, &tap)));
             // Before `left` is read: the deadline covers it too.
             fc.join_cgroup();
             let loaded = fc.load_snapshot(&path, &fc.tap, Some(clock_realtime), left(API_TIMEOUT));
@@ -1112,10 +1115,10 @@ impl Prepared {
                 }
                 self.pager.wait_ready(left(Duration::from_secs(5)))
             });
-            let routed = route.map_or(Ok(Ok(())), |r| r.join()).map_err(|_| "route thread panicked")?;
+            let readied = neighbour.map_or(Ok(Ok(0)), |r| r.join()).map_err(|_| "neighbour thread panicked")?;
             held?;
-            routed?;
-            t.mark("route_wait");
+            readied?;
+            t.mark("neighbour_wait");
             Ok(took)
         })();
         match loaded {
