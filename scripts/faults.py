@@ -2881,9 +2881,10 @@ def arrival_with_peer_route(n, ip):
 
 def forget_peer_route(ip, gen):
     """Withdraws generation `gen` of `ip` on both hosts (so its home host hands
-    the address out only with a newer one) and removes its route."""
+    the address out only with a newer one) and removes its route: as a newer
+    generation, since only the peer a generation is routed via withdraws that one."""
     for h in (A, B):
-        peer(h, {"op": "route", "ip": ip, "gen": gen})
+        peer(h, {"op": "route", "ip": ip, "gen": gen + 1})
     subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 

@@ -55,11 +55,14 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm reclaim IP [--force GEN]    take back an address lent out with a VM that migrated away,
                                      once its target is gone for good (without --force: say what)
-  flexvm config [--peer HOST:PORT]... [--vm-ips CIDR|FIRST-LAST] [--dns IP] [--underlay IP]
-                [--cluster-ips CIDR|FIRST-LAST] [--announce-dev IFACE|none] [--reserve MIB] [--evict-at MIB]
+  flexvm config [--peer HOST:PORT]... [--peer-underlay HOST:PORT=IP[,IP]]... [--vm-ips CIDR|FIRST-LAST]
+                [--dns IP] [--underlay IP] [--cluster-ips CIDR|FIRST-LAST] [--announce-dev IFACE|none]
+                [--reserve MIB] [--evict-at MIB]
                                      set this host's settings, live (no flags: show them and what is
                                      derived for those unset); --peer replaces the list, '' unsets
                                      --cluster-ips holds every host's VM range (unset: only --vm-ips)
+                                     --peer-underlay: a peer's next hops on another network than its
+                                     --peer address (its --underlay); replaces them all
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
   flexvm recover                     sweep and refill standby VMs now, as root (at boot, without a listener)
   flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
@@ -285,10 +288,14 @@ fn state(args: &Args) -> Result<PathBuf> {
 /// listener and `recover` the rest after this; any other command all of it here.
 pub fn open_host(args: &Args) -> Result<Host> {
     let host = open_host_only(args)?;
-    let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
-    if let Err(e) = gc::after_boot(&host, !partly) {
-        if gc::first_boot_warning(&host, host::boot_id()) {
-            crate::log!("flexvm: recovering after boot: {e}");
+    let cmd = args.positional.first().map(String::as_str);
+    // Not `config`: it may be fixing the configuration recovery goes by.
+    if cmd != Some("config") {
+        let partly = matches!(cmd, Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
+        if let Err(e) = gc::after_boot(&host, !partly) {
+            if gc::first_boot_warning(&host, host::boot_id()) {
+                crate::log!("flexvm: recovering after boot: {e}");
+            }
         }
     }
     Ok(host)
@@ -476,7 +483,7 @@ fn takes(local: std::net::SocketAddr, v6only: bool, ip: std::net::IpAddr) -> boo
 }
 
 /// What `configure` sets.
-const CONFIG_FLAGS: &[&str] = &["peer", "vm-ips", "cluster-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at"];
+const CONFIG_FLAGS: &[&str] = &["peer", "peer-underlay", "vm-ips", "cluster-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at"];
 
 /// Flags not given keep their configured values; an empty one unsets it
 /// (derived again where used). --peers replace the list (`--peer ''` empties
@@ -488,6 +495,24 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
             bail!("bad --peer {p:?}: give HOST:PORT, a peer's flexvm listen address");
         }
     }
+    if args.has("peer-underlay") {
+        c.peer_underlays.clear();
+        for entry in args.all("peer-underlay").into_iter().filter(|e| !e.is_empty()) {
+            let bad = || format!("bad --peer-underlay {entry:?}: give HOST:PORT=IP[,IP...], a --peer and its data-plane addresses");
+            let (peer, ips) = entry.rsplit_once('=').ok_or_else(bad)?;
+            let ips: Vec<std::net::Ipv4Addr> = ips.split(',').map(|i| i.trim().parse()).collect::<std::result::Result<_, _>>().map_err(|_| bad())?;
+            if !c.peers.iter().any(|p| p == peer) {
+                bail!("--peer-underlay {entry:?}: {peer} is not a --peer");
+            }
+            if let Some(ip) = ips.iter().find(|i| i.is_unspecified() || i.is_broadcast() || i.is_multicast() || net::is_local_addr(**i).unwrap_or(true)) {
+                bail!("--peer-underlay {entry:?}: {ip} is local or not unicast");
+            }
+            c.peer_underlays.entry(peer.into()).or_default().extend(ips);
+        }
+    }
+    // A peer no longer configured takes its underlays with it.
+    let peers = c.peers.clone();
+    c.peer_underlays.retain(|p, _| peers.contains(p));
     if let Some(r) = args.get("vm-ips") {
         c.vm_ips = if r.is_empty() { host::Config::default().vm_ips } else { r.into() };
         net::IpRange::parse(&c.vm_ips)?;
@@ -1128,6 +1153,26 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn peer_underlays_are_set_per_configured_peer() {
+        let mut c = host::Config::default();
+        let set = |c: &mut host::Config, flags: &[&str]| configure(c, &parse(flags));
+        set(&mut c, &["--peer", "192.0.2.7:7070", "--peer", "b.example:7070", "--peer-underlay", "192.0.2.7:7070=198.51.100.7,198.51.100.8"]).unwrap();
+        assert_eq!(c.underlays_of("192.0.2.7:7070"), ["198.51.100.7".parse::<std::net::Ipv4Addr>().unwrap(), "198.51.100.8".parse().unwrap()]);
+        // Replaced whole.
+        set(&mut c, &["--peer-underlay", "b.example:7070=198.51.100.9"]).unwrap();
+        assert!(c.underlays_of("192.0.2.7:7070").is_empty() && c.underlays_of("b.example:7070").len() == 1);
+        for bad in ["c.example:7070=198.51.100.9", "b.example:7070", "b.example:7070=x", "b.example:7070=127.0.0.1", "b.example:7070=224.0.0.1"] {
+            assert!(set(&mut c.clone(), &["--peer-underlay", bad]).is_err(), "{bad}");
+        }
+        // A peer dropped takes its underlays with it; '' clears them all.
+        set(&mut c, &["--peer", "192.0.2.7:7070"]).unwrap();
+        assert!(c.peer_underlays.is_empty());
+        set(&mut c, &["--peer", "192.0.2.7:7070", "--peer-underlay", "192.0.2.7:7070=198.51.100.7"]).unwrap();
+        set(&mut c, &["--peer-underlay", ""]).unwrap();
+        assert!(c.peer_underlays.is_empty());
     }
 
     #[test]

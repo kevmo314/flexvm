@@ -808,6 +808,16 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   an invalid reload leaves the last valid configuration in use. A peer's report
   of its own range never authorizes an address here. Withdrawals of recorded
   generations remain accepted, including retries, after the allowlist narrows.
+  A generation routed via a peer is withdrawn (same generation) only by that
+  peer: the asking connection's address, and the addresses and
+  `--peer-underlay` of each configured peer it is one of. A newer generation, or
+  a newer revision of the same one (a migration), may come from any peer.
+  Configured `--peer-underlay` addresses count as that peer's next hops (and are
+  no VM's address); nothing is trusted for being on-link. Routers are read from
+  every routing table (a netlink dump). Boot recovery stays incomplete, and the
+  listener's periodic sweep tries it again, while a saved next hop is no known
+  peer address and a peer by name has none known yet; `flexvm config` runs no
+  recovery.
   No VM gets a local, peer, underlay or gateway address (#549), even inside
   `--cluster-ips`. What a peer
   asks for (arrival, route, lend) is checked against the listener's own peer

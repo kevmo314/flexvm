@@ -35,6 +35,11 @@ pub fn periodic(host: Host) {
     std::thread::spawn(move || loop {
         let jitter = Duration::from_millis(std::process::id() as u64 % 5000);
         std::thread::sleep(EVERY + jitter);
+        // A boot's recovery left incomplete (a saved route not checkable yet: a peer's name not
+        // looked up) is tried again, not only by the next command.
+        if let Err(e) = after_boot(&host, true) {
+            crate::log!("flexvm: recovering after boot: {e}");
+        }
         sweep_due(&host);
     });
 }

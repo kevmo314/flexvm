@@ -64,6 +64,10 @@ pub struct Config {
     pub run: Option<PathBuf>,
     pub listen: Option<String>,
     pub peers: Vec<String>,
+    /// A peer's data-plane addresses besides those it is reached by (`--peer-underlay`): next hops
+    /// it may report for its VMs, as its own `--underlay` on another network. Only a configured peer's count.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub peer_underlays: std::collections::BTreeMap<String, Vec<Ipv4Addr>>,
     /// Disjoint across hosts.
     pub vm_ips: String,
     /// Every host's VM addresses. None: only this host's `vm_ips`.
@@ -86,6 +90,7 @@ impl Default for Config {
             run: None,
             listen: None,
             peers: Vec::new(),
+            peer_underlays: Default::default(),
             vm_ips: "10.200.0.0/16".into(),
             cluster_ips: None,
             underlay: None,
@@ -198,6 +203,19 @@ impl Config {
             bail!("--vm-ips {} is not inside --cluster-ips {}", self.vm_ips, self.effective_cluster_ips());
         }
         Ok(())
+    }
+
+    /// `peer`'s configured underlays (`--peer-underlay`), none unless it is a configured peer.
+    pub fn underlays_of(&self, peer: &str) -> &[Ipv4Addr] {
+        match self.peers.iter().any(|p| p == peer) {
+            true => self.peer_underlays.get(peer).map_or(&[], Vec::as_slice),
+            false => &[],
+        }
+    }
+
+    /// Every configured peer's configured underlays.
+    pub fn peer_underlay_addrs(&self) -> Vec<IpAddr> {
+        self.peers.iter().flat_map(|p| self.underlays_of(p)).map(|&u| IpAddr::V4(u)).collect()
     }
 
     pub fn effective_cluster_ips(&self) -> &str {
@@ -1199,12 +1217,19 @@ impl Host {
         })
     }
 
-    /// Whether the saved route may be put back (a refusal is logged); an error while the peers'
-    /// addresses are not known yet (a name no listener has looked up since a boot), to try again later.
+    /// Whether the saved route may be put back (a refusal for good is logged): an error while that
+    /// cannot be told yet, to try again later. A next hop that is no peer's known address while a
+    /// peer by name has none known (a name no listener has looked up since a boot, or whose lookup
+    /// failed) may be that peer's; the routers unknown (netlink failed) the same.
     fn route_check(&self, ip: Ipv4Addr, via: Ipv4Addr) -> Result<bool> {
         let peers = crate::listen::known_peers(self)?;
-        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::check_via(via, &peers));
+        let routers = crate::net::routers()?;
+        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::via_by(via, &peers, &routers));
         if let Err(e) = &checked {
+            let unknown = crate::listen::unknown_peers(self);
+            if !unknown.is_empty() && !peers.iter().any(|p| p.to_canonical() == IpAddr::V4(via)) {
+                bail!("{e}, while no address of peer {} is known yet", unknown.join(", "));
+            }
             crate::log!("route {ip} via {via}: not put back: {e}");
         }
         Ok(checked.is_ok())
@@ -4573,6 +4598,12 @@ mod tests {
             routes.borrow_mut().push((ip, via));
             Ok(())
         };
+        // Never a peer's next hop: skipped for good once every peer is known.
+        h.put_addr(ip("10.9.5.2"), &Addr { seen: 3, via: Some(ip("192.0.2.99")), ..Addr::default() }, true).unwrap();
+        assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(false));
+        assert!(routes.borrow().is_empty());
+        // The listener's lookup at its start failed (DNS timed out): an empty entry, still not known.
+        crate::util::write_file(&h.run, "peers.json", br#"{"names": {"peer.invalid:7070": []}}"#, false).unwrap();
         assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(false));
         assert!(routes.borrow().is_empty());
         crate::util::write_file(&h.run, "peers.json", br#"{"names": {"peer.invalid:7070": ["192.0.2.7"]}}"#, false).unwrap();
