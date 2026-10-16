@@ -8409,7 +8409,8 @@ def template_tap():
     process's periodic sweep may be first, so it is not looked for in
     between). A sweep goes by a tap's alias, never its name: one whose owner
     lives is kept, as are another host's (#193) and a tap with no owner,
-    whatever their names read as."""
+    whatever their names read as; a dead owner's tap whose run directory is
+    gone is swept (#581)."""
     name = f"ft-tpltap-{os.getpid()}"
     tdir = os.path.join(A.state, "templates")
     prefix = ok(cli_json(A, "config"))["derived"]["prefix"]
@@ -8430,11 +8431,14 @@ def template_tap():
     check("template tap: its alias names the build and this host", alias == f"flexvm {p.pid} {start} {run}", alias)
     me = f"{os.getpid()} {starttime_of(os.getpid())}"
     dead = f"{p.pid} 1"
-    # (name, alias, kept): this script lives; another host's and an unowned tap read as dead pids here.
+    # (name, alias, kept): this script lives; another host's (its run dir exists) and an unowned
+    # tap read as dead pids here; a dead owner's tap whose run dir is gone is swept (#581).
+    other = tempfile.mkdtemp(prefix="fvci-other-")
     made = [(f"{prefix}x{os.getpid():x}", f"flexvm {me} {run}", True),
-            (f"{prefix}1t0", f"flexvm {dead} {run}.other", True),
+            (f"{prefix}1t0", f"flexvm {dead} {other}", True),
             (f"{prefix}2t0", "", True),
-            (f"{prefix}3t0", f"flexvm {dead} {run}", False)]
+            (f"{prefix}3t0", f"flexvm {dead} {run}", False),
+            (f"{prefix}4t0", f"flexvm {dead} {run}.gone", False)]
     try:
         for dev, al, _ in made:
             subprocess.run(["ip", "tuntap", "add", "dev", dev, "mode", "tap"], check=True)
@@ -8448,7 +8452,7 @@ def template_tap():
         for dev, _, _ in made:
             subprocess.run(["ip", "link", "del", dev], capture_output=True)
         subprocess.run(["ip", "link", "del", tap], capture_output=True)
-        subprocess.run(["rm", "-rf", os.path.join(tdir, f".{name}.new-{p.pid}")])
+        subprocess.run(["rm", "-rf", os.path.join(tdir, f".{name}.new-{p.pid}"), other])
 
 
 def starttime_of(pid):
