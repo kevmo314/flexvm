@@ -411,7 +411,7 @@ fn test_hosts() -> Option<std::collections::HashMap<String, Addrs>> {
 
 /// `path` opened, if it is a regular file (not through a symlink) owned by root or this process's user and writable
 /// by no one else.
-fn trusted_file(path: &Path) -> Option<std::fs::File> {
+pub fn trusted_file(path: &Path) -> Option<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
     let m = f.metadata().ok()?;

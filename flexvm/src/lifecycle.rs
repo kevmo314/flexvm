@@ -293,7 +293,8 @@ impl Proc {
         let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
         t.mark("verify_checkpoint");
         let ip = ck.manifest.ip;
-        crate::listen::check_vm_ip(&self.host, ip, None, Instant::now() + crate::listen::PREPARE_WAIT)?;
+        // Checked again, as a restore's is: safe when suspended, it may be a peer's or local now.
+        crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         let claim = {
             let l = self.host.lock()?;
@@ -352,7 +353,7 @@ impl Proc {
             None => Some(ck.manifest.ip),
         };
         if let Some(ip) = want {
-            crate::listen::check_vm_ip(&self.host, ip, None, Instant::now() + crate::listen::PREPARE_WAIT)?;
+            crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         }
         self.set_name(self.host.take_name(&name, false)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
