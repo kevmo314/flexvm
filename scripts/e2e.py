@@ -29,7 +29,7 @@ Shards (CI runs pr in four splits side by side, heavy on a schedule):
 A scenario that finds this host lacks what it tests ends SKIP, not PASS; with
 --no-skips (CI) a SKIP fails the run.
 """
-import argparse, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, traceback
+import argparse, glob, hashlib, ipaddress, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -177,7 +177,9 @@ class Host:
             raise AssertionError(f"port {self.port} is in use; pick other ports with --port-a")
         os.makedirs(self.run_dir, exist_ok=True)
         shared_state(self.state_dir)
-        cfg = self.cli("config", "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60", "--reserve", "256")
+        nets = sorted((args.net_a, args.net_b), key=lambda n: ipaddress.IPv4Address(f"{n}.0"))
+        cfg = self.cli("config", "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60",
+                       "--cluster-ips", f"{nets[0]}.2-{nets[-1]}.254", "--reserve", "256")
         self.prefix = json.loads(cfg.stdout)["derived"]["prefix"]
         cmd = [BIN, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr]
         self.proc = subprocess.Popen(cmd, stdout=open(self.log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,

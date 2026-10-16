@@ -66,6 +66,8 @@ pub struct Config {
     pub peers: Vec<String>,
     /// Disjoint across hosts.
     pub vm_ips: String,
+    /// Every host's VM addresses. None: only this host's `vm_ips`.
+    pub cluster_ips: Option<String>,
     /// None: derived (`underlay`).
     pub underlay: Option<Ipv4Addr>,
     /// None: derived (`announce_dev`); `none`: no announcements.
@@ -85,6 +87,7 @@ impl Default for Config {
             listen: None,
             peers: Vec::new(),
             vm_ips: "10.200.0.0/16".into(),
+            cluster_ips: None,
             underlay: None,
             announce_dev: None,
             dns: None,

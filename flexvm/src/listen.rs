@@ -874,6 +874,10 @@ fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways:
 }
 
 fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr], local: impl FnOnce(Ipv4Addr) -> Result<bool>) -> Result<()> {
+    // Only local configuration authorizes a VM address; a peer's range is untrusted.
+    if !crate::net::IpRange::parse(cfg.cluster_ips.as_deref().unwrap_or(&cfg.vm_ips))?.contains(ip) {
+        bail!("{ip} is not a vm's address: outside this host's configured VM ranges");
+    }
     let peer = is_peer(peers, IpAddr::V4(ip));
     // A derived underlay is an interface's source address, covered by is_local_addr below.
     let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
@@ -1078,7 +1082,7 @@ mod tests {
 
     #[test]
     fn peers_route_only_vm_addresses() {
-        let cfg = crate::host::Config {
+        let mut cfg = crate::host::Config {
             peers: vec!["10.98.0.1:7000".into(), "peer.example:7000".into()],
             underlay: Some("10.97.0.1".parse().unwrap()),
             ..Default::default()
@@ -1104,11 +1108,34 @@ mod tests {
         p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), Some(Instant::now()));
         let peers = [p.all_addrs(&cfg.peers, soon()).unwrap(), vec!["10.95.0.1".parse().unwrap()]].concat();
         assert!(peers.contains(&"10.94.0.1".parse().unwrap()) && !peers.contains(&"10.94.0.2".parse().unwrap()));
-        let check = |ip: &str| routable(ip.parse().unwrap(), &cfg, &peers, &[gw]);
-        for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "10.98.0.1", "10.94.0.1", "10.97.0.1", "10.96.0.1", "10.95.0.1"] {
-            assert!(check(ip).is_err(), "{ip} is refused");
+        let check = |ip: &str, cfg: &crate::host::Config| routable_by(ip.parse().unwrap(), cfg, &peers, &[gw], |ip| Ok(ip.is_loopback()));
+        for ip in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "10.98.0.1",
+            "10.94.0.1",
+            "10.97.0.1",
+            "10.96.0.1",
+            "10.95.0.1",
+            "169.254.169.254",
+            "10.96.0.53",
+            "10.96.0.42",
+        ] {
+            assert!(check(ip, &cfg).is_err(), "{ip} is refused");
         }
-        check("10.200.0.7").unwrap();
+        check("10.200.0.7", &cfg).unwrap();
+        // A peer's own VM range grants nothing; only local configuration can allow it.
+        assert!(check("10.201.0.7", &cfg).is_err());
+        cfg.cluster_ips = Some("10.200.0.0/15".into());
+        check("10.201.0.7", &cfg).unwrap();
+        // Even an overlapping cluster range cannot authorize our network's addresses.
+        cfg.cluster_ips = Some("0.0.0.0-255.255.255.255".into());
+        for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "10.98.0.1", "10.94.0.1", "10.97.0.1", "10.96.0.1", "10.95.0.1"] {
+            assert!(check(ip, &cfg).is_err(), "{ip} is refused even inside cluster_ips");
+        }
+        assert!(routable_by("10.201.0.7".parse().unwrap(), &cfg, &peers, &[gw], |_| Ok(true)).is_err());
     }
 
     #[test]
