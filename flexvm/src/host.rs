@@ -951,13 +951,20 @@ impl Host {
 
     /// Lets go of `holder`'s claim; with `id`, only that instance's.
     /// Durable: a claim let go after an outcome was settled must stay gone across a crash.
+    /// Its published revision (`publish_live`) goes with it.
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
+        let mut released = None;
         self.update(l, ip, true, |a| {
             let by = |h: &Ident| id.is_none_or(|id| id == h);
             if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
-                (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, None);
+                released = a.holder_id.take();
+                (a.holder, a.arriving, a.leaving) = (None, None, None);
             }
-        })
+        })?;
+        if let Some(id) = id.or(released.as_ref()) {
+            self.unpublish(l, ip, id);
+        }
+        Ok(())
     }
 
     /// True if this made the loan (only then may its maker undo it). The
@@ -1060,6 +1067,45 @@ impl Host {
         let path = self.live_path(ip);
         std::fs::create_dir_all(path.parent().ok_or("no directory")?)?;
         store(&path, &Live { id: Ident::me(), gen, rev }, false)
+    }
+
+    /// Removes `ip`'s published revision if `id` published it (and no other instance since).
+    pub fn unpublish(&self, _: &Locked, ip: Ipv4Addr, id: &Ident) {
+        let path = self.live_path(ip);
+        if load::<Live>(&path).ok().flatten().is_some_and(|live| live.id == *id) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// `RUN/live` entries no live process will remove: published by a dead process the record no
+    /// longer names (one it names goes with its claim, `withdraw_dead`), unreadable ones, and a
+    /// dead writer's temporary files (`.IP.PID.tmp`, from `util::write_file`).
+    fn sweep_live(&self) -> Result<()> {
+        let dir = self.run.join("live");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => bail!("cannot read {}: {e}", dir.display()),
+        };
+        let l = self.lock()?;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stale = match name.strip_prefix('.') {
+                Some(tmp) => {
+                    let pid = tmp.strip_suffix(".tmp").and_then(|t| t.rsplit_once('.')).and_then(|(_, pid)| pid.parse::<u32>().ok());
+                    pid.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists())
+                }
+                None => match (name.parse::<Ipv4Addr>(), load::<Live>(&e.path())) {
+                    (Ok(ip), Ok(Some(live))) => live.id.liveness() == Liveness::Gone && self.addr(&l, ip)?.holder_id.as_ref() != Some(&live.id),
+                    (Ok(_), Ok(None)) => false,
+                    _ => true,
+                },
+            };
+            if stale {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        Ok(())
     }
 
     /// The revision of the newest generation of `ip` its holder here runs at, as it published it:
@@ -1699,8 +1745,12 @@ pub struct AddrClaim {
 }
 
 impl AddrClaim {
+    /// Kept past this process (suspended): its published revision goes with the process.
     pub fn keep(mut self) {
         self.kept = true;
+        if let Ok(l) = self.host.lock() {
+            self.host.unpublish(&l, self.ip, &self.id);
+        }
     }
 
     pub fn release(mut self, l: &Locked) -> Result<()> {
@@ -2120,7 +2170,12 @@ impl Host {
             }
         }
         collect_owned(&self.run);
-        self.withdraw_dead()
+        let withdrawn = self.withdraw_dead();
+        // After the sweep of dead holders, whose claims took their published revisions with them.
+        if let Err(e) = self.sweep_live() {
+            crate::log!("garbage collection: {e}");
+        }
+        withdrawn
     }
 
     /// Addresses whose holder died without withdrawing them (SIGKILLed, or a
@@ -4370,6 +4425,52 @@ mod tests {
         store(&h.live_path(gone), &Live { id: dead, gen: 7, rev: 5 }, false).unwrap();
         assert_eq!(h.live(&l, gone).unwrap(), None);
         assert!(h.observe(&l, gone, 7, 0, a).unwrap());
+    }
+
+    /// #533: a published revision goes with its claim (released, withdrawn or kept past the
+    /// process), only if that instance published it; gc sweeps what dead processes left.
+    #[test]
+    fn published_revisions_go_with_their_claims_and_dead_writers() {
+        let (_dir, h) = host("live-gc");
+        let (x, y, z) = (ip("10.9.6.1"), ip("10.9.6.2"), ip("10.9.6.3"));
+        let me = Ident::me();
+        let l = h.lock().unwrap();
+        let _n = h.take_name("n", false).unwrap();
+        let exists = |ip: Ipv4Addr| h.live_path(ip).exists();
+        let claim = h.claim_incoming(&l, "n", x, 7, None).unwrap();
+        h.publish_live(&l, x, 7, 1).unwrap();
+        claim.release(&l).unwrap();
+        assert!(!exists(x), "released, its revision goes");
+        let claim = h.claim_incoming(&l, "n", x, 7, None).unwrap();
+        h.publish_live(&l, x, 7, 2).unwrap();
+        claim.keep();
+        assert!(!exists(x), "kept past the process (suspended), it goes");
+        h.release(&l, x, "n", None).unwrap();
+        // Another instance's (published since) stays when this one lets go.
+        let claim = h.claim_incoming(&l, "n", y, 7, None).unwrap();
+        store(&h.live_path(y), &Live { id: Ident { start: me.start + 1, ..me.clone() }, gen: 7, rev: 3 }, false).unwrap();
+        drop(claim);
+        assert!(exists(y), "another instance's stays");
+        std::fs::remove_file(h.live_path(y)).unwrap();
+        // What dead processes left: a writer the record no longer names, unreadable files and
+        // dead writers' temporary files go; a named dead writer's waits for its claim's sweep.
+        let (gone, named) = (dead_owner(&h, 999_999_930, &[]), dead_owner(&h, 999_999_931, &[]));
+        store(&h.live_path(x), &Live { id: gone, gen: 7, rev: 4 }, false).unwrap();
+        let held = Addr { seen: 7, held: 7, holder: Some("m".into()), holder_id: Some(named.clone()), ..Default::default() };
+        h.put_addr(y, &held, false).unwrap();
+        store(&h.live_path(y), &Live { id: named, gen: 7, rev: 4 }, false).unwrap();
+        let _claim = h.claim_incoming(&l, "n", z, 7, None).unwrap();
+        h.publish_live(&l, z, 7, 1).unwrap();
+        let live = h.run.join("live");
+        std::fs::write(live.join("10.9.6.4"), b"{").unwrap();
+        std::fs::write(live.join(".10.9.6.5.999999930.tmp"), b"").unwrap();
+        let mine = format!(".10.9.6.5.{}.tmp", std::process::id());
+        std::fs::write(live.join(&mine), b"").unwrap();
+        drop(l);
+        h.sweep_live().unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&live).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, [mine, y.to_string(), z.to_string()]);
     }
 
     #[test]

@@ -515,19 +515,18 @@ impl Proc {
         self.addr.lock().unwrap().as_ref().map_or(0, |a| a.rev)
     }
 
-    /// Moves the VM's revision `by` on, published (`Host::publish_live`) and recorded here too. If
-    /// recording it fails, a thread tries again until it is recorded, so this host's record catches
-    /// up with the revision its VM announces (#499); meanwhile the published one keeps a late
-    /// announcement of an older revision (an aborted target's) stale here (#533).
+    /// Moves the VM's revision `by` on, published (`Host::publish_live`) and recorded here too:
+    /// an error only if neither shows it. Either failing, a thread tries both again until they
+    /// go through, so this host's record catches up with the revision its VM announces (#499);
+    /// meanwhile whichever went through keeps a late announcement of an older revision (an
+    /// aborted target's) stale here (#533).
     pub fn advance(&self, l: &crate::host::Locked, by: u64) -> Result<()> {
         if let Some(a) = self.addr.lock().unwrap().as_mut() {
             a.rev = a.rev.saturating_add(by);
         }
-        if let Err(e) = self.publish_rev(l) {
-            crate::log!("vm {}: publishing its revision: {e}", self.name());
-        }
-        let r = self.record_rev(l).map(drop);
-        if r.is_err() && !self.recording.swap(true, Ordering::SeqCst) {
+        let published = self.publish_rev(l);
+        let recorded = self.record_rev(l).map(drop);
+        if (published.is_err() || recorded.is_err()) && !self.recording.swap(true, Ordering::SeqCst) {
             let me = self.me.clone();
             let spawned = thread::Builder::new().name("record-rev".into()).spawn(move || {
                 retry_record(|| Some(me.upgrade()?.record_again()), |d| thread::sleep(d + jitter(d)));
@@ -537,17 +536,24 @@ impl Proc {
                 crate::log!("vm {}: no thread to record its revision again: {e}", self.name());
             }
         }
-        r.map_err(|e| format!("{e}; trying again").into())
+        match (published, recorded) {
+            (Err(p), Err(r)) => bail!("recording its revision: {r}; publishing it: {p}; trying both again"),
+            (Err(p), Ok(())) => crate::log!("vm {}: publishing its revision: {p}; recorded, trying again", self.name()),
+            (Ok(()), Err(r)) => crate::log!("vm {}: recording its revision: {r}; published, trying again", self.name()),
+            (Ok(()), Ok(())) => {}
+        }
+        Ok(())
     }
 
-    /// One try of `advance`'s retry. Lock order: the host lock, then `addr`
-    /// (as `advance`'s callers have it); nothing takes the host lock holding `addr`.
+    /// One try of `advance`'s retry: publishing and recording. Lock order: the host lock, then
+    /// `addr` (as `advance`'s callers have it); nothing takes the host lock holding `addr`.
     fn record_again(&self) -> Result<()> {
         let l = self.host.lock()?;
         #[cfg(test)]
         if let Some(hook) = self.record_hook.lock().unwrap().as_ref() {
             hook();
         }
+        self.publish_rev(&l)?;
         if self.record_rev(&l)? {
             crate::log!("vm {}: recorded its revision {} after all", self.name(), self.rev());
         }
@@ -565,17 +571,18 @@ impl Proc {
     }
 
     /// An arrival's commit, under the host lock: from it on, its revision outranks its source's
-    /// (`claim_arrival`), published before the lock is let go and recorded only after the reply
-    /// and handoff (`migrate_in`), off the downtime. Unpublished, it is recorded at once instead.
+    /// (`claim_arrival`), recorded only after the reply and handoff (`migrate_in`), off the
+    /// downtime. Published first, so the commit never comes without it: unpublished, there is
+    /// no commit (its source keeps the VM); a commit that fails takes it back.
     pub fn commit_arrival(&self, l: &crate::host::Locked) -> Result<()> {
-        self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(l)?;
-        if let Err(e) = self.publish_rev(l) {
-            crate::log!("vm {}: publishing its revision: {e}; recording it now", self.name());
-            if let Err(e) = self.advance(l, 0) {
-                crate::log!("vm {}: recording its revision: {e}", self.name());
+        self.publish_rev(l).map_err(|e| format!("publishing its revision: {e}"))?;
+        let committed = self.arrived.lock().unwrap().as_mut().ok_or("no migration record").map_err(Error::from).and_then(|r| r.commit(l));
+        if committed.is_err() {
+            if let Some(ip) = self.addr.lock().unwrap().as_ref().map(|a| a.ip) {
+                self.host.unpublish(l, ip, &self.ident);
             }
         }
-        Ok(())
+        committed
     }
 
     /// Records the VM's revision (as it is now, which only changes under the host lock) here.
@@ -3080,7 +3087,7 @@ mod tests {
 
     /// #533: an aborted migration's source runs again past its target's revision; its record
     /// write fails, so the record trails, but the revision it published keeps the target's late
-    /// announcement stale, with no process asked.
+    /// announcement stale, with no process asked, and lets the abort go on.
     #[test]
     fn an_advance_whose_record_write_fails_is_published_still() {
         let (p, _root) = test_proc("live-abort");
@@ -3089,15 +3096,69 @@ mod tests {
         let gen = claim.gen;
         let ip = p.set_addr(claim);
         // The record's write fails: its temporary file's name is taken.
-        let blocker = p.host.state.join("addrs").join(format!(".{ip}.{}.tmp", std::process::id()));
-        std::fs::create_dir(&blocker).unwrap();
+        let blocker = block_write(&p.host.state.join("addrs"), &ip.to_string());
         {
             let l = p.host.lock().unwrap();
-            assert!(p.advance(&l, 2).is_err());
+            assert!(p.advance(&l, 2).is_ok(), "published: in force here");
             assert_eq!((p.host.addr(&l, ip).unwrap().rev, p.host.live(&l, ip).unwrap()), (0, Some(2)));
             assert!(!p.host.observe(&l, ip, gen, 1, Some("10.1.0.1".parse().unwrap())).unwrap(), "the target's late announcement");
         }
         std::fs::remove_dir(&blocker).unwrap();
+    }
+
+    /// The temporary file `util::write_file` makes for `dir/name`, taken by a directory: writing it fails.
+    fn block_write(dir: &std::path::Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let blocker = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+        std::fs::create_dir(&blocker).unwrap();
+        blocker
+    }
+
+    /// #533: a revision neither published nor recorded is an error (the abort then leaves the VM
+    /// paused, failed); the retry publishes and records it once the writes go through.
+    #[test]
+    fn an_advance_neither_published_nor_recorded_fails_and_is_tried_again() {
+        let (p, _root) = test_proc("live-both");
+        p.set_name(p.host.take_name("both", false).unwrap());
+        let claim = p.host.claim_new(&p.host.lock().unwrap(), "both", None).unwrap();
+        let ip = p.set_addr(claim);
+        let blockers = [block_write(&p.host.state.join("addrs"), &ip.to_string()), block_write(&p.host.run.join("live"), &ip.to_string())];
+        {
+            let l = p.host.lock().unwrap();
+            let e = p.advance(&l, 2).unwrap_err();
+            assert!(e.to_string().contains("publishing it"), "{e}");
+            assert_eq!((p.host.addr(&l, ip).unwrap().rev, p.host.live(&l, ip).unwrap()), (0, None));
+        }
+        for b in blockers {
+            std::fs::remove_dir(b).unwrap();
+        }
+        let end = Instant::now() + Duration::from_secs(30);
+        let both = || {
+            let l = p.host.lock().unwrap();
+            (p.host.addr(&l, ip).unwrap().rev, p.host.live(&l, ip).unwrap())
+        };
+        while both() != (2, Some(2)) && Instant::now() < end {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(both(), (2, Some(2)), "published and recorded by the retry");
+    }
+
+    /// #533: an arrival whose revision cannot be published is not committed: its source keeps the VM.
+    #[test]
+    fn an_arrival_whose_revision_cannot_be_published_is_not_committed() {
+        let (p, _root) = test_proc("live-refused");
+        p.set_name(p.host.take_name("refused", false).unwrap());
+        let x: Ipv4Addr = "10.9.5.2".parse().unwrap();
+        *p.arrived.lock().unwrap() = Some(p.host.mig_begin(6, "", None, Some(x)).unwrap());
+        let blocker = block_write(&p.host.run.join("live"), &x.to_string());
+        let l = p.host.lock().unwrap();
+        p.set_addr(p.host.claim_arrival(&l, "refused", x, 8, 2, 6).unwrap());
+        let e = p.commit_arrival(&l).unwrap_err();
+        assert!(e.to_string().contains("publishing its revision"), "{e}");
+        assert_eq!(p.host.live(&l, x).unwrap(), None);
+        drop(l);
+        assert_ne!(p.host.mig_status(6).unwrap(), "committed");
+        std::fs::remove_dir(blocker).unwrap();
     }
 
     /// #533: an arrival's revision is its own from its commit, recorded only after its reply and

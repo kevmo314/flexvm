@@ -262,7 +262,10 @@ delayed announcement never takes a route back from its target (#256). The
 record can trail the revision its VM runs at (the target's, until recorded; a
 failed write, until retried), so a VM process publishes its revision in
 `RUN/live/IP` (tmpfs, replaced atomically, never synced) under the host lock as
-it changes, before the record's write: an arrival at its commit. Under the same
+it changes, before the record's write: an arrival right before its commit (not
+committed if it cannot), a source that runs again after an abort before it does
+(left paused, failed if neither the file nor the record takes it). The file
+goes with the claim, and gc sweeps those dead processes left. Under the same
 lock, an announcement of the generation a VM here holds is judged against the
 newer of the record and that file, believed only from the record's holder
 instance while it is alive (after a crash the record decides); recording a

@@ -303,6 +303,14 @@ impl Proc {
                 return format!("{e}; and whether its address went to another vm cannot be told ({r}), so it stays paused, failed").into();
             }
         };
+        // Past the revision its target took (and may have announced, if it committed): published or
+        // recorded before it runs here again, so a late announcement of the target's is stale here (#533).
+        if let Err(r) = self.advance(&l, 2) {
+            drop(l);
+            vm.set_failed();
+            self.publish();
+            return format!("{e}; and its revision past its target's could be neither published nor recorded here ({r}), so it stays paused, failed").into();
+        }
         let (_, attached) = self.release_to_tap(vm, mig);
         let (s, e) = match vm.resume(attached) {
             Ok(s) => (s, e),
@@ -331,10 +339,6 @@ impl Proc {
         match stayed {
             Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
             Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after an aborted migration: {r}", vm.name),
-        }
-        // Past the revision its target took (and may have announced, if it committed).
-        if let Err(r) = self.advance(&l, 2) {
-            crate::log!("vm {}: recording its revision: {r}", vm.name);
         }
         drop(l);
         self.set_leaving(false);
