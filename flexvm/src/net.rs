@@ -519,6 +519,17 @@ pub fn gateways(table: &str) -> Vec<Ipv4Addr> {
     table.lines().skip(1).filter_map(hop).map(|g| Ipv4Addr::from(g.to_ne_bytes())).collect()
 }
 
+/// The next hops of `table`'s routes to more than one address: the routers, not a peer that
+/// only host routes (flexvm's own `IP/32 via PEER`) go through.
+pub fn routers(table: &str) -> Vec<Ipv4Addr> {
+    let hop = |l: &str| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let g = u32::from_str_radix(f.get(2)?, 16).ok().filter(|&g| g != 0)?;
+        (u32::from_str_radix(f.get(7)?, 16).ok()? != u32::MAX).then(|| Ipv4Addr::from(g.to_ne_bytes()))
+    };
+    table.lines().skip(1).filter_map(hop).collect()
+}
+
 /// A delete names the device, so it removes only that route.
 pub fn route_dev(add: bool, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
     let mut route = rtmsg(RT_SCOPE_LINK);
@@ -778,6 +789,10 @@ mod tests {
                      eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
                      eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         assert_eq!(gateways(table), [Ipv4Addr::new(192, 168, 1, 1)]);
+        // A peer that a VM's host route goes through is no router.
+        let table = format!("{table}eth0\t0700A8C0\t0201A8C0\t0007\t0\t0\t0\tFFFFFFFF\t0\t0\t0\n");
+        assert_eq!(gateways(&table), [Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 2)]);
+        assert_eq!(routers(&table), [Ipv4Addr::new(192, 168, 1, 1)]);
     }
 
     #[test]

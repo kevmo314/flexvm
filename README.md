@@ -182,11 +182,12 @@ addresses remain accepted after the allowlist narrows. The hosts must list each 
 with `--peer HOST:PORT` (each peer's listen address): a listener serves its
 peers' addresses only, and tells any other it is not a peer. A reported route
 next hop (including a migration target's underlay) must be the connection's
-peer address or a configured peer's known address, and cannot be a gateway
-(a peer's address local to this host, as with hosts sharing a network namespace,
-is taken but installs no route). Saved routes are checked again before reinstalling them. The default
-range, `10.200.0.0/16`, is the same on every host, so give each host its own
-once it has peers (`config` warns until then). `--peer` replaces the whole
+peer address or a configured peer's known address, and cannot be a router (the
+next hop of a route here other than to a peer's VM) or not unicast. A peer's
+address local to this host, as with hosts sharing a network namespace, is
+taken but installs no route. Saved routes are checked again before
+reinstalling them. The default range, `10.200.0.0/16`, is the same on every
+host, so give each host its own once it has peers (`config` warns until then). `--peer` replaces the whole
 list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
 `flexvm config` alone prints what is set and what is derived for the rest:
 

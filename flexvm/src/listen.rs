@@ -829,17 +829,18 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     routable(ip, &cfg, &known, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
 }
 
-/// A next hop is the connection's peer or a configured peer, never a gateway or a non-unicast address.
+/// A next hop is the connection's peer or a configured peer, never a router (`net::routers`: not
+/// a peer that routes to its VMs go through already) or a non-unicast address.
 /// Callers include the connection address in `peers`; named peers come from strict listener lookup.
 /// A peer's local address (hosts sharing a network namespace, loopback included) is taken:
 /// `net::route_via` installs nothing for it, and a migration's handoff relies on it.
 pub fn check_via(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
-    via_by(via, peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
+    via_by(via, peers, &crate::net::routers(&std::fs::read_to_string("/proc/net/route")?))
 }
 
-fn via_by(via: Ipv4Addr, peers: &[IpAddr], gateways: &[Ipv4Addr]) -> Result<()> {
-    if !is_peer(peers, IpAddr::V4(via)) || via.is_unspecified() || via.is_broadcast() || via.is_multicast() || gateways.contains(&via) {
-        bail!("{via} is not a peer next hop: not a peer's address, a gateway or not unicast");
+fn via_by(via: Ipv4Addr, peers: &[IpAddr], routers: &[Ipv4Addr]) -> Result<()> {
+    if !is_peer(peers, IpAddr::V4(via)) || via.is_unspecified() || via.is_broadcast() || via.is_multicast() || routers.contains(&via) {
+        bail!("{via} is not a peer next hop: not a peer's address, a router or not unicast");
     }
     Ok(())
 }
@@ -916,7 +917,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn next_hops_are_known_peers_but_never_gateways() {
+    fn next_hops_are_known_peers_but_never_routers() {
         let via: Ipv4Addr = "192.0.2.7".parse().unwrap();
         let peers = [IpAddr::V4(via), "::ffff:192.0.2.8".parse().unwrap(), "127.0.0.1".parse().unwrap()];
         via_by(via, &peers, &[]).unwrap();
