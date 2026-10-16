@@ -174,14 +174,14 @@ impl Pager {
     }
 }
 
+/// Candidates examined per hot page wanted (`select_hot`).
+const SCAN_BUDGET: usize = 4;
+
 /// Keeps up to `cap` of the ascending `candidates`, preferring pages copied last time too (dirty in at least three
 /// intervals; `prev`, ascending, checked with `candidate`), then lower page numbers. Bounded by the cap, not by how many
 /// candidates there are: examines at most `SCAN_BUDGET * cap` candidates, ineligible ones (discarded or unmapped)
 /// included, so it may copy fewer. It runs during the pause, and a large guest can have millions. Returns ascending pages for
 /// copying runs and binary searches. Bitmap words without candidates are still skipped by the iterator.
-/// Candidates examined per hot page wanted (`select_hot`).
-const SCAN_BUDGET: usize = 4;
-
 fn select_hot(candidates: impl Iterator<Item = usize>, prev: &[usize], candidate: impl Fn(usize) -> bool, cap: usize) -> Vec<usize> {
     let mut hot: Vec<usize> = prev.iter().copied().take(cap).filter(|&p| candidate(p)).collect();
     let mut j = 0;

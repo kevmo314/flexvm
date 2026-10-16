@@ -186,8 +186,8 @@ list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
   routed or WireGuard links.
 - `--reserve MIB`, the memory a host keeps free (starts and growth that would
   take it below are refused): a sixteenth of the host's RAM, from 256 MiB to 4 GiB.
-  Allow an additional 128 MiB per VM taking keep-running checkpoints for hot-page
-  buffers in its controller process; these are outside guest memory admission.
+  Hot-page buffers of VMs taking keep-running checkpoints are allocated without
+  admission and can take up to 128 MiB per such VM out of the reserve.
 - `--evict-at MIB`: VMs start moving to peers with room once the host has less
   than this available, the fastest growing first, until it is back above the
   mark by half the mark's height over the reserve. Default: the reserve plus
