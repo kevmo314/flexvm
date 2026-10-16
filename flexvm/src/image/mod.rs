@@ -301,9 +301,22 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
     Ok(std::fs::canonicalize(cached)?)
 }
 
+/// Holds the cache entry `rootfs` (as `prepare` returned it) for a build of a template from it, so
+/// `remove_rootfs` leaves it until the template is published. Fails if it was removed meanwhile.
+pub fn reserve_rootfs(rootfs: &Path) -> Result<Flock> {
+    use std::os::unix::fs::MetadataExt;
+    let st = crate::util::fstat(File::open(rootfs)?.as_raw_fd())?;
+    let held = crate::host::shared_at(&crate::host::host_locks()?, &crate::host::use_lock(&st))?;
+    let now = std::fs::metadata(rootfs).ok().map(|m| (m.dev(), m.ino()));
+    if now != Some((st.st_dev, st.st_ino)) || !entry_complete(rootfs) {
+        bail!("image root filesystem {} was removed (flexvm rmi) as the pull went on", rootfs.display());
+    }
+    Ok(held)
+}
+
 /// Removes the cache entry `rootfs` (a `rootfs/KEY.ext4` of `cache`) under its key's lock, its
 /// marker first, so a build that waits for the lock builds it again. The caller knows no template
-/// uses it. Returns whether it was one of the cache's.
+/// uses it, and none is being built from it. Returns whether it was removed.
 pub fn remove_rootfs(cache: &Path, rootfs: &Path) -> Result<bool> {
     let dir = cache.join("rootfs");
     let (Ok(dir), Some(parent)) = (std::fs::canonicalize(&dir), rootfs.parent()) else { return Ok(false) };
@@ -313,6 +326,15 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path) -> Result<bool> {
     let pinned = crate::host::Directory::open(&dir)?;
     let cached = pinned.path.join(rootfs.file_name().unwrap());
     let _lock = crate::host::lock_at(crate::host::host_locks()?, &key_lock(&pinned, &cached)?, libc::LOCK_EX)?;
+    // Kept while a pull builds a template of it (`reserve_rootfs`).
+    let st = match File::open(&cached) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        f => crate::util::fstat(f?.as_raw_fd())?,
+    };
+    let _use = match crate::host::lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st), libc::LOCK_EX | libc::LOCK_NB) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        r => r?,
+    };
     for ext in ["ok", "ext4", "conf"] {
         match std::fs::remove_file(cached.with_extension(ext)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1375,8 +1397,16 @@ mod tests {
         assert!(!remove_rootfs(&root.join("images"), &root.join("k.ext4")).unwrap());
         assert!(!remove_rootfs(&root.join("images"), &dir.join("k.conf")).unwrap());
         assert!(root.join("k.ext4").exists() && entry_complete(&dir.join("k.ext4")));
+        // A pull building a template of it holds it until it is published.
+        let building = reserve_rootfs(&dir.join("k.ext4")).unwrap();
+        assert!(!remove_rootfs(&root.join("images"), &dir.join("k.ext4")).unwrap());
+        assert!(entry_complete(&dir.join("k.ext4")));
+        drop(building);
         assert!(remove_rootfs(&root.join("images"), &dir.join("k.ext4")).unwrap());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // One removed before the build held it is refused, so the pull builds it again.
+        std::fs::write(dir.join("k.ext4"), "half").unwrap();
+        assert!(reserve_rootfs(&dir.join("k.ext4")).err().unwrap().to_string().contains("was removed"));
     }
 
     #[test]

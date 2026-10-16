@@ -881,7 +881,18 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     net::create_tap(&tap, &host::tap_alias(&host.run, &me))?;
     let res = (|| {
         let init = args.get("init").map(PathBuf::from);
-        let (rootfs, meta) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
+        let prepare = || image::prepare(&state(args)?.join("images"), init.as_deref(), &opts);
+        let (rootfs, meta) = prepare()?;
+        // Held until the template is published: `rmi` leaves the root filesystem to this build.
+        // One removed between the two is built again.
+        let (rootfs, meta, _reserved) = match image::reserve_rootfs(&rootfs) {
+            Ok(r) => (rootfs, meta, r),
+            Err(_) => {
+                let (rootfs, meta) = prepare()?;
+                let r = image::reserve_rootfs(&rootfs)?;
+                (rootfs, meta, r)
+            }
+        };
         if let Some(id) = template::up_to_date(&paths, &name, size, &rootfs, &meta) {
             return output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)));
         }
@@ -1405,7 +1416,7 @@ mod exec_tests {
 
     #[test]
     fn option_values_cannot_start_with_double_dash() {
-        for option in ["--state", "--run", "--ip", "--image", "--cmd"] {
+        for option in ["--state", "--run", "--ip", "--tag", "--cmd"] {
             for value in ["--run", "--unknown", "--"] {
                 let error = Args::parse([option, value, "X"].map(String::from)).err().unwrap();
                 assert_eq!(error.to_string(), format!("{option} needs a value"));

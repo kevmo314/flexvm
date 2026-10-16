@@ -298,6 +298,9 @@ pub struct Template {
     /// The directory as opened, through `_handle`, whatever its path refers to now.
     fixed: PathBuf,
     _handle: File,
+    /// Its use lock, held shared while it is open: `rmi` never removes a generation a VM
+    /// process (starting, standing by or running) has open.
+    _use: crate::host::Flock,
 }
 
 unsafe impl Send for Template {}
@@ -393,6 +396,12 @@ impl Template {
     fn open_dir_with_context(name: &str, dir: PathBuf, pinned: bool) -> Result<Arc<Template>> {
         // All reads, the vmstate Firecracker loads included, go through one directory handle.
         let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
+        let st = crate::util::fstat(handle.as_raw_fd())?;
+        let _use = crate::host::shared_at(&crate::host::host_locks()?, &crate::host::use_lock(&st))?;
+        // Removed (`rmi`) before the lock was ours: what the handle reads is gone.
+        if std::fs::metadata(&dir).ok().map(|m| (m.dev(), m.ino())) != Some((st.st_dev, st.st_ino)) {
+            bail!("template {name:?} was removed (flexvm rmi) as it was opened");
+        }
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
         let meta = Meta::read_from(&fixed, &dir, pinned).map_err(|e| format!("template {name:?}: {e}"))?;
         let file = File::open(fixed.join("mem"))?;
@@ -415,6 +424,7 @@ impl Template {
             verified: Mutex::default(),
             fixed,
             _handle: handle,
+            _use,
         }))
     }
 
@@ -1122,6 +1132,17 @@ pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use
         return Ok(json!({"untagged": name, "kept": id, "reason": "used by a VM here"}));
     }
     let gens = paths.templates.join(GENERATIONS);
+    // Kept while a VM process has it open (one starting has no registry entry yet).
+    let st = crate::util::fstat(File::open(gens.join(id))?.as_raw_fd())?;
+    let _use = match crate::host::lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st), libc::LOCK_EX | libc::LOCK_NB) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            if name.is_none() {
+                bail!("image {id} is open in a VM process here");
+            }
+            return Ok(json!({"untagged": name, "kept": id, "reason": "open in a VM process here"}));
+        }
+        r => r?,
+    };
     let rootfs = Meta::read(&gens.join(id)).map(|m| m.rootfs);
     std::fs::remove_dir_all(gens.join(id))?;
     crate::util::sync_dir(&gens)?;
@@ -1473,6 +1494,24 @@ mod tests {
         publish_as(&f, "v", &gen("dddd4444"));
         assert!(remove(&f.paths, &images_dir, Some("v"), "cccc3333", &none).unwrap_err().to_string().contains("pulled again"));
         assert!(Template::resolve(&f.paths, "v").is_ok());
+    }
+
+    #[test]
+    fn rmi_keeps_a_generation_a_vm_process_has_open() {
+        let f = Fixture::new();
+        let images_dir = f.dir.join("images");
+        publish_as(&f, "t", &Meta { id: "aaaa1111".into(), image: Some(image("sha256:a", "")), ..f.meta.clone() });
+        // A cold run between opening its template and registering its VM: no VM entry names it.
+        let starting = Template::open(&f.paths, "t").unwrap();
+        let none = BTreeSet::new();
+        let r = remove(&f.paths, &images_dir, Some("t"), "aaaa1111", &none).unwrap();
+        assert_eq!((r["kept"].as_str(), r["reason"].as_str()), (Some("aaaa1111"), Some("open in a VM process here")));
+        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &none).unwrap_err().to_string().contains("open in a VM process"));
+        assert!(Template::generation(&f.paths, "aaaa1111").is_some());
+        assert_eq!(starting.pages(0, 0).len(), 0);
+        drop(starting);
+        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &none).unwrap()["deleted"], "aaaa1111");
+        assert!(Template::open_dir("t", f.dir.join(GENERATIONS).join("aaaa1111")).is_err());
     }
 
     #[test]

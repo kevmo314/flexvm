@@ -708,7 +708,15 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   once no other name links to it and no VM here (running, paused or
   suspended) has its content id, and then the image root filesystem no
   generation left uses, its `.ok` marker first and under the cache key's
-  lock, so a pull waiting for that lock builds it again.
+  lock, so a pull waiting for that lock builds it again. Use locks cover what
+  the registry does not show yet: every process that opens a generation (a
+  VM starting, standing by, restoring or arriving) holds its use lock
+  (`host::use_lock`, by the directory's dev and inode, in the host's lock
+  directory) shared for as long as it has it open, and a pull holds its root
+  filesystem's from `prepare` until the template is published. `rmi` takes
+  each exclusively without waiting and keeps what is held; an opener or a
+  pull that locks only after `rmi` removed it finds it gone and fails (the
+  pull builds the root filesystem again).
 - **Component identity.** The content id includes the kernel's hash from build
   time, but migration, resume and restore don't check the kernel file again: the
   running kernel is already in guest memory, so replacing `artifacts/vmlinux`
