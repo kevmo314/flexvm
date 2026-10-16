@@ -276,6 +276,19 @@ impl<T: Transport> Transport for Deadlined<T> {
     }
 }
 
+/// Where redirect `redirects` (0 for the first) from `url` to `loc` goes: refused from an HTTPS `base` to anything
+/// else, and past the fifth.
+fn next_hop(base: &str, url: &str, loc: &str, redirects: usize) -> Result<String> {
+    let next = resolve_location(url, loc)?;
+    if base.starts_with("https://") && !next.starts_with("https://") {
+        bail!("refusing a redirect from HTTPS to {next}");
+    }
+    if redirects >= 5 {
+        bail!("too many redirects from {base}");
+    }
+    Ok(next)
+}
+
 /// `loc` resolved against `base` (an absolute http(s) URL) as RFC 3986 section 5.2 does, without its fragment or any
 /// userinfo; only http(s) URLs with a host are accepted.
 fn resolve_location(base: &str, loc: &str) -> Result<String> {
@@ -464,8 +477,8 @@ impl Registry {
                 if redirects == 0 {
                     req = req.header("Accept", accept);
                 }
-                if let Some(a) = &auth {
-                    req = req.header("Authorization", &**a);
+                if let Some(auth) = auth {
+                    req = req.header("Authorization", auth);
                 }
                 req
             })?;
@@ -487,14 +500,8 @@ impl Registry {
                             Err(_) => bail!("GET {url}: redirect to a location that is not ASCII: {:?}", String::from_utf8_lossy(v.as_bytes())),
                         },
                     };
-                    url = resolve_location(&url, loc)?;
-                    if base.starts_with("https://") && !url.starts_with("https://") {
-                        bail!("refusing a redirect from HTTPS to {url}");
-                    }
+                    url = next_hop(&base, &url, loc, redirects)?;
                     redirects += 1;
-                    if redirects > 5 {
-                        bail!("too many redirects from {base}");
-                    }
                 }
                 ..=299 => return Ok(resp.into_body()),
                 401 if !authenticated && redirects == 0 => {
@@ -975,6 +982,15 @@ pub(super) mod tests {
         respond: impl Fn(&str, &str) -> String + Send + Sync + 'static,
         send: impl Fn(&mut std::net::TcpStream, Vec<u8>) + Send + Sync + 'static,
     ) -> String {
+        http_server_headers(ip, move |base, path, _| respond(base, path), send)
+    }
+
+    /// `http_server_on`, `respond` seeing the request's headers too.
+    fn http_server_headers(
+        ip: &str,
+        respond: impl Fn(&str, &str, &ureq::http::HeaderMap) -> String + Send + Sync + 'static,
+        send: impl Fn(&mut std::net::TcpStream, Vec<u8>) + Send + Sync + 'static,
+    ) -> String {
         use std::io::{BufRead, BufReader};
         let server = std::net::TcpListener::bind((ip, 0)).unwrap();
         let addr = server.local_addr().unwrap().to_string();
@@ -987,13 +1003,45 @@ pub(super) mod tests {
                     let mut reader = BufReader::new(socket.try_clone().unwrap());
                     let mut request = String::new();
                     reader.read_line(&mut request).unwrap();
-                    while reader.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
+                    let mut headers = ureq::http::HeaderMap::new();
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                        if let Some((name, value)) = line.trim_end().split_once(':') {
+                            if let (Ok(name), Ok(value)) = (name.parse::<ureq::http::HeaderName>(), value.trim().parse()) {
+                                headers.append(name, value);
+                            }
+                        }
+                        line.clear();
+                    }
                     let path = request.split(' ').nth(1).unwrap_or("").to_string();
-                    send(&mut socket, respond(&base, &path).into_bytes());
+                    send(&mut socket, respond(&base, &path, &headers).into_bytes());
                 });
             }
         });
         addr
+    }
+
+    type Requests = Arc<Mutex<Vec<(String, ureq::http::HeaderMap)>>>;
+
+    fn capturing_server(respond: impl Fn(&str, &str) -> String + Send + Sync + 'static) -> (String, Requests) {
+        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let addr = http_server_headers(
+            "127.0.0.1",
+            move |base, path, headers| {
+                seen.lock().unwrap().push((path.into(), headers.clone()));
+                respond(base, path)
+            },
+            |socket, response| {
+                use std::io::Write;
+                socket.write_all(&response).unwrap();
+            },
+        );
+        (addr, requests)
+    }
+
+    fn response(status: &str, headers: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
     }
 
     #[test]
@@ -1148,13 +1196,13 @@ pub(super) mod tests {
     #[test]
     fn redirects_go_where_they_point() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let blob = drip_server(usize::MAX, Duration::ZERO, |_, path| {
+        let (blob, blob_requests) = capturing_server(|_, path| {
             let body = if path == "/v2/test/blob" { "moved" } else { "wrong" };
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
         });
         let hops = Arc::new(AtomicUsize::new(0));
         let (blob2, hops2) = (blob.clone(), hops.clone());
-        let addr = drip_server(usize::MAX, Duration::ZERO, move |_, path| {
+        let (addr, requests) = capturing_server(move |_, path| {
             hops2.fetch_add(1, Ordering::SeqCst);
             let loc = if path.ends_with("/blobs/x") { "../elsewhere".to_string() } else { format!("//{blob2}/v2/test/blob") };
             format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -1165,6 +1213,83 @@ pub(super) mod tests {
         reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(5)).unwrap().into_reader().read_to_string(&mut data).unwrap();
         assert_eq!(data, "moved");
         assert_eq!(hops.load(Ordering::SeqCst), 2, "/v2/test/blobs/x, then /v2/test/elsewhere");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].1.get("authorization").unwrap(), "Bearer secret");
+        assert!(!requests[1].1.contains_key("authorization"));
+        let blob_requests = blob_requests.lock().unwrap();
+        assert_eq!(blob_requests.len(), 1);
+        assert!(!blob_requests[0].1.contains_key("authorization"));
+    }
+
+    #[test]
+    fn authentication_failures_are_clear_and_bounded() {
+        // Each case runs through get, including the registry's challenge and token exchange.
+        for (challenge, token, expected, registry_calls, token_calls) in [
+            ("Basic realm=\"test\"", "", "wants basic credentials; none found", 1, 0),
+            ("Digest realm=\"test\"", "", "unsupported auth challenge", 1, 0),
+            ("Bearer service=\"test\"", "", "auth challenge has no realm", 1, 0),
+            ("Bearer realm=\"file:///token\"", "", "token from file:///token", 1, 0),
+            ("Bearer realm=\"{base}/token\"", "{", "EOF while parsing", 1, 1),
+            ("Bearer realm=\"{base}/token\"", "{}", "token response has no token", 1, 1),
+            ("Bearer realm=\"{base}/token\"", "{\"token\":\"secret\"}", "unauthorized (no credentials in docker config)", 2, 1),
+        ] {
+            let (addr, requests) = capturing_server(move |base, path| {
+                if path.starts_with("/token") {
+                    response("200 OK", "", token)
+                } else {
+                    let challenge = challenge.replace("{base}", &format!("http://{base}"));
+                    response("401 Unauthorized", &format!("WWW-Authenticate: {challenge}\r\n"), "")
+                }
+            });
+            let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+            let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(2)).err().unwrap().to_string();
+            assert!(err.contains(expected), "{challenge}: {err}");
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.iter().filter(|(p, _)| p.starts_with("/v2/")).count(), registry_calls, "{challenge}");
+            assert_eq!(seen.iter().filter(|(p, _)| p.starts_with("/token")).count(), token_calls, "{challenge}");
+            if registry_calls == 2 {
+                assert_eq!(seen.last().unwrap().1.get("authorization").unwrap(), "Bearer secret");
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_failures_stop_before_the_forbidden_destination() {
+        let forbidden = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        forbidden.set_nonblocking(true).unwrap();
+        let destination = format!("http://{}/forbidden", forbidden.local_addr().unwrap());
+        for missing in [true, false] {
+            let dest = destination.clone();
+            let (addr, seen) = capturing_server(move |_, path| {
+                let headers = if missing {
+                    String::new()
+                } else if path.ends_with("/5") {
+                    format!("Location: {dest}\r\n")
+                } else {
+                    let n = path.rsplit('/').next().unwrap().parse::<usize>().unwrap();
+                    format!("Location: /v2/test/{}\r\n", n + 1)
+                };
+                response("307 Temporary Redirect", &headers, "")
+            });
+            let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+            let err = reg.get("0", "*/*", Instant::now() + Duration::from_secs(2)).err().unwrap().to_string();
+            assert!(err.contains(if missing { "redirect without a location" } else { "too many redirects" }), "{err}");
+            assert_eq!(seen.lock().unwrap().len(), if missing { 1 } else { 6 });
+            assert_eq!(forbidden.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
+        // From HTTPS, a hop to anything else is refused (`get` bails before requesting it), directly or after
+        // an HTTPS hop; a plain-HTTP registry's redirects may stay plain.
+        let base = "https://reg.example/v2/test/blobs/x";
+        let refused = |url: &str, loc: &str| next_hop(base, url, loc, 1).unwrap_err().to_string();
+        assert!(refused(base, &destination).contains("refusing a redirect from HTTPS"));
+        let hop = next_hop(base, base, "//cdn.example/next", 0).unwrap();
+        assert_eq!(hop, "https://cdn.example/next");
+        assert!(refused(&hop, &destination).contains("refusing a redirect from HTTPS"));
+        assert_eq!(next_hop("http://127.0.0.1:5000/v2/x", "http://127.0.0.1:5000/v2/x", &destination, 0).unwrap(), destination);
+        // The fifth redirect is followed, the sixth is not.
+        assert_eq!(next_hop(base, base, "/v2/test/5", 4).unwrap(), "https://reg.example/v2/test/5");
+        assert!(next_hop(base, base, "/v2/test/6", 5).unwrap_err().to_string().contains("too many redirects"));
     }
 
     /// A 429 (or 503) is retried after its `Retry-After`, or a backoff, unless that would pass the deadline.

@@ -760,18 +760,12 @@ impl Proc {
         let vm = self.vm().clone();
         // One snapshot of the settings as they are now, derived ones included.
         let cfg = self.host.config_now();
-        let (ip, gen, rev, dev, peers) = (vm.ip, self.gen(), self.rev(), cfg.announce_dev(), cfg.peers.clone());
+        let (ip, gen, rev, dev) = (vm.ip, self.gen(), self.rev(), cfg.announce_dev());
         if let Some(dev) = &dev {
             crate::net::proxy_arp(dev);
         }
-        let Some(via) = cfg.underlay() else {
-            if !peers.is_empty() {
-                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or flexvm config --underlay IP); peers not told");
-            }
+        if !self.announcer.route(&cfg, ip, gen, rev, || vm.state().local()) {
             return;
-        };
-        if vm.state().local() {
-            self.announcer.tell(peers, json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen, "rev": rev}));
         }
         let Some(dev) = dev else { return };
         if let Err(e) = thread::Builder::new().spawn(move || {
@@ -2187,6 +2181,21 @@ impl Announcer {
         Ok(a)
     }
 
+    /// The route part of `Proc::announce`, independent of the VM and its ARP device.
+    fn route(&self, cfg: &crate::host::Config, ip: Ipv4Addr, gen: u64, rev: u64, local: impl FnOnce() -> bool) -> bool {
+        let peers = cfg.peers.clone();
+        let Some(via) = cfg.underlay() else {
+            if !peers.is_empty() {
+                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or flexvm config --underlay IP); peers not told");
+            }
+            return false;
+        };
+        if local() {
+            self.tell(peers, json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen, "rev": rev}));
+        }
+        true
+    }
+
     /// `req` for each of `peers` (and none for any other), unless one of its address with a newer generation or
     /// revision is pending.
     fn tell(&self, peers: Vec<String>, req: Value) {
@@ -2411,6 +2420,130 @@ mod tests {
             assert!(Instant::now() < end, "delivered, no longer pending");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Component coverage: a Host, the real memory admission/watch loop, a file-backed cgroup,
+    /// and the production route announcer. No hypervisor, VM, network device or cgroup is created.
+    #[test]
+    fn live_config_reaches_the_running_memory_loop_and_route_announcer() {
+        let root = crate::test_util::TempDir::new("live-config-component");
+        let mut writer = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        first.set_nonblocking(true).unwrap();
+        second.set_nonblocking(true).unwrap();
+        let first_peer = first.local_addr().unwrap().to_string();
+        let second_peer = second.local_addr().unwrap().to_string();
+        writer
+            .configure(|cfg| {
+                cfg.reserve_mib = Some(u64::MAX / 4);
+                cfg.peers = vec![first_peer.clone()];
+                cfg.underlay = Some("192.0.2.10".parse().unwrap());
+                cfg.announce_dev = Some("none".into());
+                Ok(())
+            })
+            .unwrap();
+        let running = writer.clone();
+        let cg = root.join("cgroup");
+        std::fs::create_dir(&cg).unwrap();
+        for (file, value) in [("memory.high", "max"), ("memory.current", "0"), ("memory.events", "high 0")] {
+            std::fs::write(cg.join(file), value).unwrap();
+        }
+        let limit = Arc::new(crate::limit::Limit::new(Some(cg.clone())));
+        limit.start(512, 4096);
+        let original_high = std::fs::read_to_string(cg.join("memory.high")).unwrap();
+        std::fs::write(cg.join("memory.current"), &original_high).unwrap();
+        let peers_host = running.clone();
+        let announcer = Announcer::start(
+            |f| thread::Builder::new().spawn(f).map(drop),
+            |peer, req| peer_call(peer, req.clone()).map(drop),
+            Box::new(move || peers_host.config_now().peers),
+            ANNOUNCE_RETRY,
+        )
+        .unwrap();
+        let (commands, command_rx) = std::sync::mpsc::channel();
+        let (results, result_rx) = std::sync::mpsc::channel();
+        let watched = limit.clone();
+        let controller = thread::spawn(move || {
+            let started = std::cell::Cell::new(false);
+            let revision = std::cell::Cell::new(0);
+            watched.watch(
+                &running,
+                Duration::from_millis(1),
+                || {
+                    if started.replace(true) {
+                        results.send((watched.admitted(), watched.throttled.load(Ordering::SeqCst))).unwrap();
+                    }
+                    if command_rx.recv().is_err() {
+                        return false;
+                    }
+                    revision.set(revision.get() + 1);
+                    announcer.route(&running.config_now(), "10.0.0.9".parse().unwrap(), 7, revision.get(), || true);
+                    true
+                },
+                || true,
+            );
+        });
+        let tick = || {
+            commands.send(()).unwrap();
+            result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        };
+        let receive = |listener: &std::net::TcpListener, via: &str| {
+            let end = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < end, "route message was not delivered");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let req = crate::util::recv_json(&mut BufReader::new(socket.try_clone().unwrap())).unwrap().unwrap();
+            writeln!(socket, "{}", json!({"ok": true, "result": null})).unwrap();
+            assert_eq!(req["op"], "route");
+            assert_eq!(req["ip"], "10.0.0.9");
+            assert_eq!(req["gen"], 7);
+            assert_eq!(req["via"], via);
+        };
+        assert_eq!(tick(), (512, true), "the running loop refuses growth at the reserve");
+        receive(&first, "192.0.2.10");
+        assert_eq!(std::fs::read_to_string(cg.join("memory.high")).unwrap(), original_high);
+
+        // A partially written configuration must retain the last successfully loaded settings.
+        std::fs::write(writer.state.join("host.json"), b"{\"reserve_mib\":").unwrap();
+        assert_eq!(tick(), (512, true));
+        receive(&first, "192.0.2.10");
+        assert_eq!(second.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+
+        // Repair the malformed file before applying the next normal config update.
+        crate::host::store(&writer.state.join("host.json"), &writer.cfg, true).unwrap();
+        writer
+            .configure(|cfg| {
+                cfg.reserve_mib = Some(0);
+                cfg.peers = vec![second_peer.clone()];
+                cfg.underlay = Some("192.0.2.20".parse().unwrap());
+                Ok(())
+            })
+            .unwrap();
+        // Keep the same watcher and its admission backoff: it eventually retries and lifts throttling.
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (admitted, throttled) = tick();
+            receive(&second, "192.0.2.20");
+            if !throttled {
+                assert!(admitted > 512);
+                break;
+            }
+            assert!(Instant::now() < end, "repaired config never admitted growth");
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert!(std::fs::read_to_string(cg.join("memory.high")).unwrap().trim().parse::<u64>().unwrap() > original_high.trim().parse::<u64>().unwrap());
+        assert_eq!(first.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "removed peers receive no new routes");
+        drop(commands);
+        controller.join().unwrap();
     }
 
     /// A peer no longer configured is not told on; one down for long (past 36 tries) is told once it is back.

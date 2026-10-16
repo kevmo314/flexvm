@@ -265,6 +265,22 @@ mod tests {
     }
 
     #[test]
+    fn suspended_vms_keep_both_logs_until_the_snapshot_goes() {
+        let d = dir("suspended-logs");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        std::fs::create_dir_all(host.suspended("sleeping")).unwrap();
+        let logs = [host.vms("sleeping", "log"), host.vms("sleeping", "log.1")];
+        for path in &logs {
+            File::create(path).unwrap().set_modified(SystemTime::now() - ORPHAN_LOG_TTL - Duration::from_secs(60)).unwrap();
+        }
+        vm_files(&host);
+        assert!(logs.iter().all(|p| p.exists()), "a suspended VM has no live holder but keeps its logs");
+        std::fs::remove_dir_all(host.suspended("sleeping")).unwrap();
+        vm_files(&host);
+        assert!(logs.iter().all(|p| !p.exists()), "without its snapshot the old logs are orphaned");
+    }
+
+    #[test]
     fn dead_arrivals_logs_and_old_markers_go() {
         let d = dir("vmfiles");
         let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
