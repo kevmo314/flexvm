@@ -712,6 +712,18 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A host with template `default` (generation `a`) and its pool's directory.
+    fn pool(tag: &str) -> (crate::test_util::TempDir, Host, Paths, PathBuf) {
+        let root = crate::test_util::TempDir::new(tag);
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
+        let paths = Paths::new(&root);
+        let d = dir(&host, "default");
+        std::fs::create_dir_all(&d).unwrap();
+        (root, host, paths, d)
+    }
+
     #[test]
     fn a_dead_standby_exits_124_and_only_leaving_the_pool_exits_0() {
         assert_eq!(leave_status(false, false), None);
@@ -740,7 +752,6 @@ mod tests {
         drop(taking);
         assert_eq!(templates(&host), [template]);
         assert_ne!(d, dir(&host, &"u".repeat(64)));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -773,7 +784,6 @@ mod tests {
                 assert!(error.to_string().contains("deadline passed"), "{error}");
             }
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -813,13 +823,7 @@ mod tests {
 
     #[test]
     fn stopped_standbys_share_one_handshake_budget_and_a_live_one_after_them_wins() {
-        let root = crate::test_util::TempDir::new("standby-budget");
-        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
-        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
-        let paths = Paths::new(&root);
-        let d = dir(&host, "default");
-        std::fs::create_dir_all(&d).unwrap();
+        let (_root, host, paths, d) = pool("standby-budget");
         let stopped = ["0", "00"].map(|n| UnixListener::bind(d.join(format!("{n}.sock"))).unwrap());
         let live = UnixListener::bind(d.join(format!("{}.sock", Ident::me().pid))).unwrap();
         let live = std::thread::spawn(move || {
@@ -838,18 +842,11 @@ mod tests {
         for s in &stopped {
             assert!(send_json(&mut s.accept().unwrap().0, &json!({"claiming": true})).is_err());
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn claim_keeps_an_exit_read_ahead_with_its_reply() {
-        let root = crate::test_util::TempDir::new("standby-buffer");
-        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
-        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
-        let paths = Paths::new(&root);
-        let d = dir(&host, "default");
-        std::fs::create_dir_all(&d).unwrap();
+        let (_root, host, paths, d) = pool("standby-buffer");
         let listener = UnixListener::bind(d.join(format!("{}.sock", Ident::me().pid))).unwrap();
         let peer = std::thread::spawn(move || {
             let (mut c, _) = listener.accept().unwrap();
@@ -880,13 +877,7 @@ mod tests {
 
     #[test]
     fn concurrent_claimers_take_different_standbys() {
-        let root = crate::test_util::TempDir::new("standby-take");
-        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
-        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
-        let paths = Paths::new(&root);
-        let d = dir(&host, "default");
-        std::fs::create_dir_all(&d).unwrap();
+        let (_root, host, paths, d) = pool("standby-take");
         let mut pids = [Ident::me().pid, unsafe { libc::getppid() } as u32];
         pids.sort_by_key(|pid| format!("{pid}.sock"));
         let socks = pids.map(|pid| d.join(format!("{pid}.sock")));
@@ -921,18 +912,11 @@ mod tests {
         }
         assert_eq!(first_claimer.join().unwrap(), json!(1));
         assert_eq!(second_claimer.join().unwrap(), json!(2));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn a_busy_standby_is_tried_if_no_idle_one_remains() {
-        let root = crate::test_util::TempDir::new("standby-busy");
-        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
-        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
-        let paths = Paths::new(&root);
-        let d = dir(&host, "default");
-        std::fs::create_dir_all(&d).unwrap();
+        let (_root, host, paths, d) = pool("standby-busy");
         let sock = d.join(format!("{}.sock", Ident::me().pid));
         let listener = UnixListener::bind(&sock).unwrap();
         let other = try_take(&sock).unwrap().unwrap();
@@ -963,7 +947,6 @@ mod tests {
         File::create(&stale).unwrap();
         assert_eq!(live(&host, "default"), [me]);
         assert!(!stale.exists() && path.exists());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1014,6 +997,5 @@ mod tests {
         assert_eq!(refill_by(&host, "default", true, true).unwrap(), 0);
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
         drop(held);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

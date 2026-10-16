@@ -774,9 +774,8 @@ pub(super) mod tests {
     fn registries_are_local_by_their_peer() {
         use std::sync::atomic::Ordering;
         let deadline = || Instant::now() + Duration::from_secs(10);
-        let ok = |b: &str| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
-        let (token, tokens) = counting_server("127.0.0.1", move |_, _| ok("{\"token\":\"t\"}"));
-        let (blob, blobs) = counting_server("127.0.0.1", move |_, _| ok("private"));
+        let (token, tokens) = counting_server("127.0.0.1", move |_, _| response("200 OK", "", "{\"token\":\"t\"}"));
+        let (blob, blobs) = counting_server("127.0.0.1", move |_, _| response("200 OK", "", "private"));
         let challenge = move |realm: &str| format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"{realm}://{token}/token\"\r\n{CLOSE}");
         let fetch = |reg: &Registry| {
             reg.get("blobs/x", "*/*", deadline()).and_then(|r| {
@@ -841,7 +840,7 @@ pub(super) mod tests {
     #[test]
     fn non_ascii_locations_are_reported() {
         let (addr, _) = counting_server("127.0.0.1", |_, _| format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: /caf\u{e9}\r\n{CLOSE}"));
-        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let reg = registry(&addr);
         let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
         assert!(err.contains("not ASCII") && err.contains("caf"), "{err}");
     }
@@ -1058,22 +1057,25 @@ pub(super) mod tests {
         (addr, requests)
     }
 
+    /// A registry for `test` at `addr`.
+    fn registry(addr: &impl std::fmt::Display) -> Registry {
+        Registry::new(Reference::parse(&format!("{addr}/test")).unwrap())
+    }
+
     fn response(status: &str, headers: &str, body: &str) -> String {
         format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
     }
 
     #[test]
     fn slow_transfers_hit_the_overall_deadline() {
-        let body = |b: &str| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
         // Each byte arrives well within the 120 s read timeout; only the deadline ends them.
         type Respond = fn(&str, &str) -> String;
         let cases: [(&str, usize, Respond); 3] = [
             ("headers", 0, |_, _| format!("HTTP/1.1 200 OK\r\n{}Content-Length: 0\r\n\r\n", "X-Pad: y\r\n".repeat(100))),
-            ("body", 64, |_, _| format!("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{}", "x".repeat(1000))),
+            ("body", 64, |_, _| response("200 OK", "", &"x".repeat(1000))),
             ("token", 64, |base, path| {
                 if path.starts_with("/token") {
-                    let t = format!("{{\"token\": \"{}\"}}", "t".repeat(1000));
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{t}", t.len())
+                    response("200 OK", "", &format!("{{\"token\": \"{}\"}}", "t".repeat(1000)))
                 } else {
                     format!(
                         "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{base}/token\"\r\n\
@@ -1085,7 +1087,7 @@ pub(super) mod tests {
         ];
         for (name, fast, respond) in cases {
             let addr = drip_server(fast, Duration::from_millis(20), respond);
-            let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+            let reg = registry(&addr);
             let start = Instant::now();
             let res = reg.get("blobs/x", "*/*", start + Duration::from_millis(700)).and_then(|r| {
                 let mut data = Vec::new();
@@ -1097,8 +1099,8 @@ pub(super) mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "{name}: took {:?}", start.elapsed());
         }
         // A fast transfer is unaffected.
-        let addr = drip_server(usize::MAX, Duration::ZERO, move |_, _| body("blob"));
-        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let addr = drip_server(usize::MAX, Duration::ZERO, |_, _| response("200 OK", "", "blob"));
+        let reg = registry(&addr);
         let mut data = String::new();
         reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(5)).unwrap().into_reader().read_to_string(&mut data).unwrap();
         assert_eq!(data, "blob");
@@ -1165,7 +1167,7 @@ pub(super) mod tests {
         ];
         for (name, head, fill) in cases {
             let addr = endless_server(head, fill);
-            let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+            let reg = registry(&addr);
             let (start, before) = (Instant::now(), allocated());
             let res = reg.get("manifests/x", "*/*", start + Duration::from_secs(30)).and_then(|r| {
                 let mut data = Vec::new();
@@ -1214,18 +1216,15 @@ pub(super) mod tests {
     #[test]
     fn redirects_go_where_they_point() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let (blob, blob_requests) = capturing_server(|_, path| {
-            let body = if path == "/v2/test/blob" { "moved" } else { "wrong" };
-            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
-        });
+        let (blob, blob_requests) = capturing_server(|_, path| response("200 OK", "", if path == "/v2/test/blob" { "moved" } else { "wrong" }));
         let hops = Arc::new(AtomicUsize::new(0));
         let (blob2, hops2) = (blob.clone(), hops.clone());
         let (addr, requests) = capturing_server(move |_, path| {
             hops2.fetch_add(1, Ordering::SeqCst);
             let loc = if path.ends_with("/blobs/x") { "../elsewhere".to_string() } else { format!("//{blob2}/v2/test/blob") };
-            format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            response("307 Temporary Redirect", &format!("Location: {loc}\r\n"), "")
         });
-        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let reg = registry(&addr);
         *reg.auth.lock().unwrap() = Some("Bearer secret".into());
         let mut data = String::new();
         reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(5)).unwrap().into_reader().read_to_string(&mut data).unwrap();
@@ -1260,7 +1259,7 @@ pub(super) mod tests {
                     response("401 Unauthorized", &format!("WWW-Authenticate: {challenge}\r\n"), "")
                 }
             });
-            let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+            let reg = registry(&addr);
             let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
             assert!(err.contains(expected), "{challenge}: {err}");
             let seen = requests.lock().unwrap();
@@ -1290,7 +1289,7 @@ pub(super) mod tests {
                 };
                 response("307 Temporary Redirect", &headers, "")
             });
-            let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+            let reg = registry(&addr);
             let err = reg.get("0", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
             assert!(err.contains(if missing { "redirect without a location" } else { "too many redirects" }), "{err}");
             assert_eq!(seen.lock().unwrap().len(), if missing { 1 } else { 6 });
@@ -1318,22 +1317,20 @@ pub(super) mod tests {
         let calls2 = calls.clone();
         let addr = drip_server(usize::MAX, Duration::ZERO, move |_, _| {
             if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
-                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+                response("429 Too Many Requests", "Retry-After: 1\r\n", "")
             } else {
-                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nblob".into()
+                response("200 OK", "", "blob")
             }
         });
-        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let reg = registry(&addr);
         let (start, mut data) = (Instant::now(), String::new());
         reg.get("blobs/x", "*/*", start + Duration::from_secs(10)).unwrap().into_reader().read_to_string(&mut data).unwrap();
         assert_eq!((data.as_str(), calls.load(Ordering::SeqCst)), ("blob", 2));
         assert!(start.elapsed() >= Duration::from_secs(1), "waited {:?}", start.elapsed());
 
         // A wait past the deadline fails at once; one always busy stops after MAX_RETRIES.
-        let addr = drip_server(usize::MAX, Duration::ZERO, |_, _| {
-            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 3600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
-        });
-        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let addr = drip_server(usize::MAX, Duration::ZERO, |_, _| response("503 Service Unavailable", "Retry-After: 3600\r\n", ""));
+        let reg = registry(&addr);
         let start = Instant::now();
         let err = reg.get("blobs/x", "*/*", start + Duration::from_secs(60)).err().unwrap().to_string();
         assert!(err.contains("HTTP 503") && err.contains("deadline"), "{err}");
@@ -1342,9 +1339,9 @@ pub(super) mod tests {
         let calls2 = calls.clone();
         let addr = drip_server(usize::MAX, Duration::ZERO, move |_, _| {
             calls2.fetch_add(1, Ordering::SeqCst);
-            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            response("429 Too Many Requests", "Retry-After: 0\r\n", "")
         });
-        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let reg = registry(&addr);
         let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
         assert!(err.contains("HTTP 429"), "{err}");
         assert_eq!(calls.load(Ordering::SeqCst), 1 + MAX_RETRIES as usize);
@@ -1364,10 +1361,10 @@ pub(super) mod tests {
             match calls2.fetch_add(1, Ordering::SeqCst) {
                 0 => "HTTP/1.1 429 Too Many Requests\r\nRetry-After: Wed, 21 Oct 2015 07:28:00 GMT\r\nContent-Length: 0\r\n\r\n".into(),
                 1 => "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 18446744073709551615\r\nContent-Length: 0\r\n\r\n".into(),
-                _ => "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"token\":\"t\"}".into(),
+                _ => response("200 OK", "", "{\"token\":\"t\"}"),
             }
         });
-        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let reg = registry(&addr);
         let start = Instant::now();
         let err = reg.authenticate(&format!("Bearer realm=\"http://{addr}/token\""), start + Duration::from_secs(10), true).unwrap_err().to_string();
         assert!(err.contains("HTTP 503") && err.contains("deadline"), "{err}");
@@ -1388,7 +1385,7 @@ pub(super) mod tests {
         let served2 = served.clone();
         let local = drip_server(usize::MAX, Duration::ZERO, move |_, _| {
             served2.store(true, std::sync::atomic::Ordering::SeqCst);
-            "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"token\":\"t\"}".into()
+            response("200 OK", "", "{\"token\":\"t\"}")
         });
         let port = local.rsplit(':').next().unwrap();
         // A public registry (TEST-NET-3, never contacted here).

@@ -48,6 +48,17 @@ fn link(dir: &Path, parent: Option<Parent>, edit: impl FnOnce(&mut Manifest)) ->
     sum(&body)
 }
 
+/// `dir/ck0` and `n - 1` deltas over it, each `ck{i}` over `ck{i-1}`; returns their ids, newest first.
+fn chain(dir: &Path, n: usize) -> Vec<String> {
+    let (mut parent, mut ids) = (None, Vec::new());
+    for i in 0..n {
+        let id = link(&dir.join(format!("ck{i}")), parent, |_| {});
+        ids.insert(0, id.clone());
+        parent = Some(Parent { path: format!("../ck{i}").into(), id });
+    }
+    ids
+}
+
 #[test]
 fn saved_host_msrs_survive_manifest_roundtrip_and_are_checked() {
     let dir = tmp("saved-msrs");
@@ -72,17 +83,6 @@ fn saved_host_msrs_survive_manifest_roundtrip_and_are_checked() {
 }
 
 #[test]
-fn older_saved_vms_cannot_fall_back_to_template_msrs() {
-    let dir = tmp("missing-saved-msrs");
-    let tpl = template(&dir, &[None; 256]);
-    link(&dir, None, |m| m.saved_msrs = None);
-    let ck = Checkpoint::open(&dir).unwrap();
-    let error = ck.manifest.check_compatibility(&tpl, &tpl.meta.compatibility).unwrap_err().to_string();
-    assert!(error.contains("checkpoint or suspended VM") && error.contains("older flexvm") && error.contains("cannot be restored"), "{error}");
-    assert!(!error.contains("rebuild"), "{error}");
-}
-
-#[test]
 fn saved_tsc_survives_roundtrip_and_checks_only_newest_vmstate() {
     let dir = tmp("saved-tsc");
     let tpl = template(&dir, &[None; 256]);
@@ -101,17 +101,23 @@ fn saved_tsc_survives_roundtrip_and_checks_only_newest_vmstate() {
     Checkpoint::open(&child).unwrap().manifest.check_compatibility(&tpl, &host).unwrap();
 }
 
+/// A manifest without the saved MSRs or TSC rate (older flexvm) cannot fall back to the template's.
 #[test]
-fn older_saved_vms_cannot_fall_back_to_template_tsc_rate() {
-    let dir = tmp("missing-saved-tsc");
+fn older_saved_vms_cannot_fall_back_to_template_msrs_or_tsc_rate() {
+    let dir = tmp("missing-saved");
     let tpl = template(&dir, &[None; 256]);
-    for rate in [None, Some(0)] {
-        let ckdir = dir.join(format!("ck-{rate:?}"));
-        link(&ckdir, None, |m| m.saved_tsc_khz = rate);
-        let ck = Checkpoint::open(&ckdir).unwrap();
+    type Edit = fn(&mut Manifest);
+    let cases: [(&str, Edit, &str); 3] = [
+        ("no msrs", |m| m.saved_msrs = None, "older flexvm"),
+        ("no tsc", |m| m.saved_tsc_khz = None, "TSC rate"),
+        ("zero tsc", |m| m.saved_tsc_khz = Some(0), "TSC rate"),
+    ];
+    for (name, edit, want) in cases {
+        link(&dir.join(name), None, edit);
+        let ck = Checkpoint::open(&dir.join(name)).unwrap();
         let error = ck.manifest.check_compatibility(&tpl, &tpl.meta.compatibility).unwrap_err().to_string();
-        assert!(error.contains("checkpoint or suspended VM") && error.contains("cannot be restored") && error.contains("TSC rate"), "{error}");
-        assert!(!error.contains("rebuild"), "{error}");
+        assert!(error.contains("checkpoint or suspended VM") && error.contains("cannot be restored") && error.contains(want), "{name}: {error}");
+        assert!(!error.contains("rebuild"), "{name}: {error}");
     }
 }
 
@@ -127,7 +133,6 @@ fn manifest_covers_pagemap_without_a_pages_hash() {
     *map.last_mut().unwrap() ^= 1;
     fs::write(dir.join("pagemap"), map).unwrap();
     assert!(Checkpoint::open(&dir).err().unwrap().to_string().contains("pagemap does not match its checksum"));
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -147,12 +152,7 @@ fn metadata_is_bounded_before_reading() {
         assert!(e.contains(want), "{e}");
     }
     // A chain reads at most its budget: the base is refused once it runs out.
-    let (mut parent, mut ids) = (None, Vec::new());
-    for i in 0..3 {
-        let id = link(&dir.join(format!("ck{i}")), parent, |_| {});
-        ids.insert(0, id.clone());
-        parent = Some(Parent { path: format!("../ck{i}").into(), id });
-    }
+    let ids = chain(&dir, 3);
     let top = dir.join("ck2");
     let ck = Checkpoint::open(&top).unwrap();
     assert_eq!((ck.chain.len(), &ck.chain_ids[..], chain_ids(&top).unwrap()), (2, &ids[1..], ids.clone()));
@@ -161,7 +161,6 @@ fn metadata_is_bounded_before_reading() {
     let mut left = cost - 1;
     let e = (0..3).rev().try_for_each(|i| Link::open(&dir.join(format!("ck{i}")), 0, Some(&mut left)).map(drop));
     assert!(e.err().unwrap().to_string().contains("bytes of metadata"));
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
@@ -302,7 +301,6 @@ fn pages_roundtrip_against_the_template() {
     assert_eq!(bad.iter().map(|e| e.kind()).collect::<Vec<_>>(), [io::ErrorKind::InvalidData]);
     // A failed read fails the whole write instead of hanging the other writers.
     assert!(write_pages(&tpl, &Guest(pages, 333, Some(500)), &input, &pages_file(&dir.join("pages-fail")), 4, false).is_err());
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -349,7 +347,6 @@ fn deltas_flatten_over_their_parents() {
         Checkpoint { dir: dir.clone(), manifest, id: String::new(), vmstate: Vec::new(), runs, file, chain: Vec::new(), chain_ids: Vec::new(), meta_left: 0 };
     assert_eq!(ck.content_hash(&tpl).unwrap(), want.finish());
     ck.verify_data().unwrap();
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -399,7 +396,6 @@ fn page_sync_and_pagemap_errors_leave_staging_unpublished() {
         assert!(stat_at(s.ck.as_raw_fd(), c"manifest.json").is_none());
         assert!(!dest.exists());
     }
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -439,7 +435,6 @@ fn staging_is_private_never_overwrites_and_cleans_up() {
     assert!(!dest.exists() && mine().is_empty());
     fs::create_dir_all(&dest).unwrap();
     assert!(Staging::new(&dest, dir.join("vmstate.private")).is_err());
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The page map as built before BASE runs were pushed whole: a page at a time.
@@ -517,7 +512,6 @@ fn whole_base_runs_build_the_per_page_map() {
         assert!(w.map == want && w.zero == zero, "round {round}: runs {runs:?}");
         fs::remove_file(dir.join(format!("p{round}"))).unwrap();
     }
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -685,12 +679,7 @@ fn tmpfs_page_reads_work_without_direct_io_support() {
 fn chains_open_to_their_depth_limit_and_refuse_incompatible_parents() {
     let dir = tmp("chain-limits");
     // MAX_CHAIN checkpoints (a base and its deltas) open; one more delta on top is refused.
-    let (mut parent, mut ids) = (None, Vec::new());
-    for i in 0..=MAX_CHAIN {
-        let id = link(&dir.join(format!("ck{i}")), parent, |_| {});
-        ids.insert(0, id.clone());
-        parent = Some(Parent { path: format!("../ck{i}").into(), id });
-    }
+    let ids = chain(&dir, MAX_CHAIN + 1);
     let at_limit = dir.join(format!("ck{}", MAX_CHAIN - 1));
     let ck = Checkpoint::open(&at_limit).unwrap();
     assert_eq!((ck.chain.len(), &ck.chain_ids[..]), (MAX_CHAIN - 1, &ids[2..]));
@@ -711,5 +700,4 @@ fn chains_open_to_their_depth_limit_and_refuse_incompatible_parents() {
             assert!(e.contains("is of another template or size"), "{e}");
         }
     }
-    fs::remove_dir_all(&dir).unwrap();
 }

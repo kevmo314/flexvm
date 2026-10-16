@@ -200,7 +200,6 @@ mod tests {
         assert!(!left("3-1.take") && left("5-7.take"), "a claimer's marker goes with its standby");
         assert!(left("2-1.lock"));
         assert!(!left(".999999999-1.lock") && left(&mine));
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// A sweep skips the dir while a standby replaces its socket under its `.publish` (one stopped there stalls no
@@ -216,7 +215,6 @@ mod tests {
         flock(&publishing, libc::LOCK_UN).unwrap();
         standby_sockets(&d);
         assert!(!d.join("999999990.sock").exists() && d.join(".publish").exists());
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -228,7 +226,6 @@ mod tests {
         }
         load_sets(&d);
         assert!(d.join(".loadset-ab12").exists() && !d.join(".loadset-cd34").exists() && d.join("default").exists());
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     fn store_holder(host: &Host, name: &str, id: &crate::host::Ident) {
@@ -248,7 +245,6 @@ mod tests {
         // Let go explicitly: another test's child, forked but not yet exec'd, may share it.
         let gc = File::open(host.run.join(".gc.lock")).unwrap();
         assert!(flock(&gc, libc::LOCK_EX | libc::LOCK_NB).is_ok(), "the sweep let go of its lock");
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -307,6 +303,5 @@ mod tests {
         assert!(!dead.exists() && fresh.exists() && live.exists(), "arrivals");
         assert!(!moved.exists() && recent_moved.exists(), "markers");
         assert!(!orphan.exists() && !orphan_prev.exists() && kept_by_moved.exists() && quiet.exists() && failed_log.exists(), "logs");
-        std::fs::remove_dir_all(d).unwrap();
     }
 }

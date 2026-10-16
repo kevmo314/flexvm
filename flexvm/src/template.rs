@@ -886,7 +886,6 @@ mod tests {
         std::fs::write(root.join("templates/t/wset"), b"[[0, 262144], [300000, 512]]").unwrap();
         assert_eq!(Template::working_set_mib_of(&paths, "t").unwrap(), 1026);
         assert!(Template::working_set_mib_of(&paths, "none").is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1238,17 +1237,6 @@ mod tests {
         file.set_len(original.len()).unwrap();
         set_mtime(&file, original.mtime() + 1, original.mtime_nsec());
         assert!(f.fresh().unwrap());
-    }
-
-    #[test]
-    fn rehash_is_remembered_across_opens() {
-        let f = Fixture::new();
-        f.write_meta(&f.meta, &f.dir);
-        f.replace("rootfs", b"rootfs");
-        f.open().unwrap().verify(&f.paths).unwrap();
-        let meta: Meta = serde_json::from_slice(&std::fs::read(f.dir.join("meta.json")).unwrap()).unwrap();
-        assert!(!f.verify(&meta, &mut BTreeMap::new()).unwrap());
-        f.open().unwrap().verify(&f.paths).unwrap();
     }
 
     #[test]

@@ -3035,12 +3035,17 @@ mod tests {
         assert_eq!(l.wanted.load(Ordering::SeqCst), 0);
     }
 
-    fn test_proc(tag: &str) -> (Arc<Proc>, crate::test_util::TempDir) {
+    /// A VM process with no VM, holding `name` if given.
+    fn test_proc(tag: &str, name: Option<&str>) -> (Arc<Proc>, crate::test_util::TempDir) {
         let root = crate::test_util::TempDir::new(&format!("fv-proc-{tag}"));
         std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        (Proc::new(host, Paths::new(&root)).unwrap(), root)
+        let p = Proc::new(host, Paths::new(&root)).unwrap();
+        if let Some(name) = name {
+            p.set_name(p.host.take_name(name, false).unwrap());
+        }
+        (p, root)
     }
 
     /// #509: a revision retry holding the host lock and a process ending (its claim's
@@ -3049,8 +3054,7 @@ mod tests {
     #[test]
     fn a_revision_retry_and_the_end_take_their_locks_in_one_order() {
         use std::sync::mpsc::channel;
-        let (p, _root) = test_proc("record-order");
-        p.set_name(p.host.take_name("ordered", false).unwrap());
+        let (p, _root) = test_proc("record-order", Some("ordered"));
         let claim = p.host.claim_new(&p.host.lock().unwrap(), "ordered", None).unwrap();
         let ip = p.set_addr(claim);
         let ((parked, at), (go, wait)) = (channel(), channel::<()>());
@@ -3095,8 +3099,7 @@ mod tests {
     /// announcement stale, with no process asked, and lets the abort go on.
     #[test]
     fn an_advance_whose_record_write_fails_is_published_still() {
-        let (p, _root) = test_proc("live-abort");
-        p.set_name(p.host.take_name("abort", false).unwrap());
+        let (p, _root) = test_proc("live-abort", Some("abort"));
         let claim = p.host.claim_new(&p.host.lock().unwrap(), "abort", None).unwrap();
         let gen = claim.gen;
         let ip = p.set_addr(claim);
@@ -3123,8 +3126,7 @@ mod tests {
     /// paused, failed); the retry publishes and records it once the writes go through.
     #[test]
     fn an_advance_neither_published_nor_recorded_fails_and_is_tried_again() {
-        let (p, _root) = test_proc("live-both");
-        p.set_name(p.host.take_name("both", false).unwrap());
+        let (p, _root) = test_proc("live-both", Some("both"));
         let claim = p.host.claim_new(&p.host.lock().unwrap(), "both", None).unwrap();
         let ip = p.set_addr(claim);
         let blockers = [block_write(&p.host.state.join("addrs"), &ip.to_string()), block_write(&p.host.run.join("live"), &ip.to_string())];
@@ -3151,8 +3153,7 @@ mod tests {
     /// #533: an arrival whose revision cannot be published is not committed: its source keeps the VM.
     #[test]
     fn an_arrival_whose_revision_cannot_be_published_is_not_committed() {
-        let (p, _root) = test_proc("live-refused");
-        p.set_name(p.host.take_name("refused", false).unwrap());
+        let (p, _root) = test_proc("live-refused", Some("refused"));
         let x: Ipv4Addr = "10.9.5.2".parse().unwrap();
         *p.arrived.lock().unwrap() = Some(p.host.mig_begin(6, "", None, Some(x)).unwrap());
         let blocker = block_write(&p.host.run.join("live"), &x.to_string());
@@ -3171,8 +3172,7 @@ mod tests {
     /// source's is judged by the trailing record in between.
     #[test]
     fn an_arrivals_revision_is_published_under_its_commit_lock() {
-        let (p, _root) = test_proc("live-commit");
-        p.set_name(p.host.take_name("arrival", false).unwrap());
+        let (p, _root) = test_proc("live-commit", Some("arrival"));
         let (x, source) = ("10.9.5.1".parse().unwrap(), Some("10.1.0.1".parse().unwrap()));
         *p.arrived.lock().unwrap() = Some(p.host.mig_begin(5, "", None, Some(x)).unwrap());
         let l = p.host.lock().unwrap();
@@ -3189,8 +3189,7 @@ mod tests {
     #[test]
     fn control_is_bound_synchronously_and_repeated_serving_keeps_the_listener() {
         use std::os::unix::fs::MetadataExt;
-        let (p, _root) = test_proc("control-bind");
-        p.set_name(p.host.take_name("bound", false).unwrap());
+        let (p, _root) = test_proc("control-bind", Some("bound"));
         let sock = p.host.sock("bound").unwrap();
         p.serve_control().unwrap();
         let inode = std::fs::metadata(&sock).unwrap().ino();
@@ -3205,8 +3204,7 @@ mod tests {
 
     #[test]
     fn start_fails_before_publication_when_control_cannot_bind() {
-        let (p, _root) = test_proc("control-bind-fails");
-        p.set_name(p.host.take_name("blocked", false).unwrap());
+        let (p, _root) = test_proc("control-bind-fails", Some("blocked"));
         let sock = p.host.sock("blocked").unwrap();
         std::fs::create_dir(&sock).unwrap();
         // No VM is needed: binding must fail before start_guest can publish it.
@@ -3221,7 +3219,7 @@ mod tests {
     #[test]
     fn control_replies_to_invalid_json_and_accepts_a_large_escaped_command() {
         static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let (p, _root) = test_proc("control-requests");
+        let (p, _root) = test_proc("control-requests", None);
         let large = json!({"op": "unknown", "cmd": "\u{1}".repeat(1 << 20)}).to_string();
         assert!(large.len() > 1 << 20 && large.len() < crate::util::MAX_LINE as usize);
         for (request, error) in [("{invalid".to_string(), "bad request:"), (large, "unknown op")] {
@@ -3243,7 +3241,7 @@ mod tests {
 
     #[test]
     fn a_pause_waiting_for_the_vm_yields_to_a_destroy() {
-        let (p, root) = test_proc("destroy");
+        let (p, _root) = test_proc("destroy", None);
         let held = p.op();
         let q = p.clone();
         let pause = thread::spawn(move || q.op_unless_destroyed().map(drop).map_err(|e| e.to_string()));
@@ -3256,13 +3254,12 @@ mod tests {
         // Refused (`destroy` takes its code back): the next pause goes ahead.
         let _ = p.destroying.compare_exchange(131, 0, Ordering::SeqCst, Ordering::SeqCst);
         assert!(p.op_unless_destroyed().is_ok());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_resume_asked_while_a_sigterm_is_taken_waits_for_its_reservation() {
         let _signals = PROCESS_SIGCONT.lock().unwrap_or_else(|e| e.into_inner());
-        let (p, root) = test_proc("resume-taking");
+        let (p, _root) = test_proc("resume-taking", None);
         assert!(p.ask_resume().is_some());
         // The signal thread has taken a SIGTERM (no longer pending) and not yet reserved.
         let taking = p.taking.lock().unwrap();
@@ -3276,7 +3273,6 @@ mod tests {
         *p.suspending.lock().unwrap() = Suspend::Idle;
         p.early.lock().unwrap().push(libc::SIGTERM);
         assert!(p.ask_resume().is_none(), "queued at startup, still to be replayed");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Held by tests that send this process a SIGCONT (`ask_resume`), which would discard or
@@ -3362,7 +3358,7 @@ mod tests {
     fn a_resume_answers_without_any_signal_taken() {
         let _signals = PROCESS_SIGCONT.lock().unwrap_or_else(|e| e.into_inner());
         // No signal thread (nor a SIGCONT a Ctrl-Z could erase): answered at once, from what is pending.
-        let (p, root) = test_proc("resume-pending");
+        let (p, _root) = test_proc("resume-pending", None);
         thread::spawn(move || {
             let set = crate::util::block_signals(&[libc::SIGTERM, libc::SIGTSTP]);
             unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
@@ -3375,7 +3371,6 @@ mod tests {
         })
         .join()
         .unwrap();
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3412,6 +3407,26 @@ mod tests {
         assert_eq!(stop_status(&[libc::SIGTERM, libc::SIGINT]), Some(128 + libc::SIGTERM));
     }
 
+    /// A standby of template `t`, its SIGUSR1 handled by `sigusr1`: its lock held, naming its live process.
+    fn standby(host: &Host, sigusr1: libc::sighandler_t) -> (std::process::Child, crate::host::Flock) {
+        let mut child = std::process::Command::new("sleep");
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut child, move || {
+                libc::signal(libc::SIGUSR1, sigusr1);
+                Ok(())
+            });
+        }
+        let child = child.arg("30").spawn().unwrap();
+        let d = crate::standby::dir(host, "t");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".template"), "t").unwrap();
+        let id = Ident::of(child.id()).unwrap();
+        let path = d.join(format!("{}.lock", id.key()));
+        let lock = crate::host::Flock::new(std::fs::File::create(&path).unwrap(), libc::LOCK_EX).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
+        (child, lock)
+    }
+
     /// MemAvailable unreadable (None) is no pressure: no standby is stopped
     /// and no eviction is tried; read as under the reserve, both are.
     #[test]
@@ -3420,24 +3435,9 @@ mod tests {
         let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
         host.cfg.reserve_mib = Some(1024);
         host.cfg.peers = vec!["127.0.0.1:1".into()];
-        // A standby of template t: its lock held, naming a live process.
         // Stopped by SIGUSR1's default action, which an ignored or blocked SIGUSR1 inherited from here would defeat.
-        let mut child = std::process::Command::new("sleep");
-        unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut child, || {
-                libc::signal(libc::SIGUSR1, libc::SIG_DFL);
-                Ok(())
-            });
-        }
-        let mut child = child.arg("30").spawn().unwrap();
+        let (mut child, lock) = standby(&host, libc::SIG_DFL);
         let d = crate::standby::dir(&host, "t");
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join(".template"), "t").unwrap();
-        let id = Ident::of(child.id()).unwrap();
-        let path = d.join(format!("{}.lock", id.key()));
-        let lock = std::fs::File::create(&path).unwrap();
-        let lock = crate::host::Flock::new(lock, libc::LOCK_EX).unwrap();
-        std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         assert_eq!(crate::standby::live(&host, "t").len(), 1);
         let (pressure, active) = (crate::standby::pressure(&host), host.run.join("evict.active"));
         let mut stopping = None;
@@ -3468,29 +3468,13 @@ mod tests {
         assert!(!active.exists() && stopping.is_none());
         relieve(&host, Some(0), false, &mut stopping);
         assert!(active.exists(), "with no standby left, eviction starts");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn a_standby_that_has_not_exited_marks_the_pressure_and_holds_eviction_off_a_second_without_waiting() {
         let base = crate::test_util::TempDir::new("relieve-pending");
         let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
-        let mut child = std::process::Command::new("sleep");
-        unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut child, || {
-                libc::signal(libc::SIGUSR1, libc::SIG_IGN);
-                Ok(())
-            });
-        }
-        let mut child = child.arg("30").spawn().unwrap();
-        let id = Ident::of(child.id()).unwrap();
-        let d = crate::standby::dir(&host, "t");
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join(".template"), "t").unwrap();
-        let path = d.join(format!("{}.lock", id.key()));
-        let lock = std::fs::File::create(&path).unwrap();
-        let _lock = crate::host::Flock::new(lock, libc::LOCK_EX).unwrap();
-        std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
+        let (mut child, _lock) = standby(&host, libc::SIG_IGN);
         // Loading, or claimed since enumeration: a delivered signal proves neither stopped,
         // but it will stop, so it is not refilled meanwhile.
         let (mut stopping, active) = (None, host.run.join("evict.active"));

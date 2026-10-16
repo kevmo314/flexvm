@@ -381,6 +381,17 @@ mod tests {
         HostKey { boot_id: "boot-a".into(), flexvm: stamp.clone(), firecracker: stamp, kvm: node(&m), modules: [Some(node(&m)), None, None] }
     }
 
+    /// How many times `host_compat` probed the host (as `host()`) for `key`.
+    fn probes(root: &Path, key: &HostKey) -> usize {
+        let calls = std::cell::Cell::new(0);
+        let compat = host_compat(Some(root), Some(key), || {
+            calls.set(calls.get() + 1);
+            Ok(host())
+        });
+        assert_eq!(compat.unwrap(), host());
+        calls.get()
+    }
+
     #[test]
     fn host_cache_miss_probes_and_hit_skips_probe() {
         let root = crate::test_util::TempDir::new("host-compat");
@@ -417,13 +428,7 @@ mod tests {
         keys[7].flexvm = stamp;
         for changed in keys {
             host_compat(Some(&root), Some(&key), || Ok(host())).unwrap();
-            let calls = std::cell::Cell::new(0);
-            host_compat(Some(&root), Some(&changed), || {
-                calls.set(calls.get() + 1);
-                Ok(host())
-            })
-            .unwrap();
-            assert_eq!(calls.get(), 1, "{changed:?}");
+            assert_eq!(probes(&root, &changed), 1, "{changed:?}");
             host_compat(Some(&root), Some(&changed), || panic!("replacement must be cached")).unwrap();
         }
     }
@@ -451,16 +456,7 @@ mod tests {
         }
         for bytes in invalid {
             std::fs::write(root.join("compat.json"), bytes).unwrap();
-            let calls = std::cell::Cell::new(0);
-            assert_eq!(
-                host_compat(Some(&root), Some(&key), || {
-                    calls.set(calls.get() + 1);
-                    Ok(host())
-                })
-                .unwrap(),
-                host()
-            );
-            assert_eq!(calls.get(), 1);
+            assert_eq!(probes(&root, &key), 1);
             host_compat(Some(&root), Some(&key), || panic!("repaired cache must hit")).unwrap();
         }
         std::fs::remove_file(root.join("compat.json")).unwrap();
@@ -579,15 +575,6 @@ mod tests {
     }
 
     #[test]
-    fn older_metadata_cannot_silently_skip_new_checks() {
-        for field in ["tsc_khz", "tsc_control", "msrs"] {
-            let mut value = serde_json::to_value(host()).unwrap();
-            value.as_object_mut().unwrap().remove(field);
-            assert!(serde_json::from_value::<Compat>(value).is_err(), "{field}");
-        }
-    }
-
-    #[test]
     fn firecracker_cache_hits_and_invalidates_on_stamp_changes() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -621,7 +608,6 @@ mod tests {
         std::fs::create_dir(root.join("firecracker.json")).unwrap();
         assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
         assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 5);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

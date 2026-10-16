@@ -173,7 +173,6 @@ mod tests {
         drop(again);
         drop(b);
         assert_eq!(fs::read_dir(&bases[0]).unwrap().count(), 0);
-        fs::remove_dir_all(t).unwrap();
     }
 
     #[test]
@@ -193,7 +192,6 @@ mod tests {
             assert_eq!(root.dir.parent().unwrap(), t.join("fallback"));
         }
         fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::remove_dir_all(t).unwrap();
     }
 
     #[test]
@@ -212,7 +210,6 @@ mod tests {
         let root = SocketRoot::from_bases(&[shared.clone(), t.join("ok")], &t).unwrap();
         assert_eq!(root.dir.parent().unwrap(), t.join("ok"));
         drop(root);
-        fs::remove_dir_all(t).unwrap();
     }
 
     #[test]
@@ -227,6 +224,5 @@ mod tests {
         let e = SocketRoot::from_bases(&[deep.clone()], &t).err().unwrap().to_string();
         assert!(e.contains("108"), "{e}");
         assert_eq!(fs::read_dir(&deep).unwrap().count(), 0);
-        fs::remove_dir_all(t).unwrap();
     }
 }

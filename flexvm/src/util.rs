@@ -1520,7 +1520,6 @@ mod tests {
         std::os::unix::fs::symlink(&file, &link).unwrap();
         assert!(trusted_file(&link).is_none(), "through a symlink");
         assert!(trusted_file(&dir).is_none(), "not a regular file");
-        std::fs::remove_dir_all(dir).unwrap();
     }
     use std::os::unix::fs::PermissionsExt;
 
@@ -1665,7 +1664,6 @@ mod tests {
         std::fs::create_dir_all(dir.join("dest")).unwrap();
         assert!(write_file(&dir, "dest", b"data", true).is_err());
         assert!(!dir.join(format!(".dest.{}.tmp", std::process::id())).exists());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1748,7 +1746,6 @@ mod tests {
         std::fs::write(root.join("vm-7-9/cgroup.procs"), b"").unwrap();
         assert!(!scope(prefix, 7, 9));
         assert_eq!(std::fs::read(root.join("vm-7-9/cgroup.procs")).unwrap(), b"");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1948,7 +1945,6 @@ mod tests {
         std::fs::rename(&log, d.join("vm.log.1")).unwrap();
         assert!(w.join().unwrap() && start.elapsed() < std::time::Duration::from_millis(900), "{:?}", start.elapsed());
         assert_eq!((read("vm.log.1"), read("vm.log")), ("eight\n".into(), "nine\n".into()));
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1963,7 +1959,6 @@ mod tests {
         let start = Instant::now();
         let e = send_unix(&path, b"{}\n", &[], start + Duration::from_millis(200)).unwrap_err();
         assert!(e.raw_os_error() == Some(libc::EAGAIN) && start.elapsed() < Duration::from_secs(5), "{e}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// What a standby claim's handshake rests on: once the claimer shuts its reads,
@@ -2137,7 +2132,6 @@ mod tests {
         assert!(sync_dir(&root.join("moved/a/b")).is_ok());
         std::fs::write(root.join("f"), "").unwrap();
         assert!(sync_dir(&root.join("f")).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

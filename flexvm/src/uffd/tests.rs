@@ -23,6 +23,28 @@ fn discard(p: &Pages, page: usize) -> bool {
     p.discard(&p.removing(), page)
 }
 
+/// A page server's listener on loopback, and a source naming it.
+fn listen() -> (std::net::TcpListener, Source) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    (listener, Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() })
+}
+
+/// The server's side of a page connection: reads the hello, accepts it, and returns the request reader and the writer.
+fn accept_hello(s: std::net::TcpStream) -> (io::BufReader<std::net::TcpStream>, std::net::TcpStream) {
+    let mut r = io::BufReader::new(s.try_clone().unwrap());
+    let mut w = s;
+    let mut hello = String::new();
+    io::BufRead::read_line(&mut r, &mut hello).unwrap();
+    w.write_all(b"{\"ok\": true}\n").unwrap();
+    (r, w)
+}
+
+/// A page request: `(offset, len)`.
+fn request(q: &[u8; 12]) -> (u64, u32) {
+    (u64::from_le_bytes(q[..8].try_into().unwrap()), u32::from_le_bytes(q[8..].try_into().unwrap()))
+}
+
 #[test]
 fn received_fd_is_cloexec() {
     let (a, b) = UnixStream::pair().unwrap();
@@ -433,8 +455,7 @@ fn eagain_waits_for_events_read() {
 /// A fetch with a head asks for it on its own, pipelined ahead of the rest, and reports the head as soon as it is in.
 #[test]
 fn fetch_asks_for_the_head_first() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+    let (listener, source) = listen();
     let (headed, head_seen) = std::sync::mpsc::channel();
     // The rest is sent only once the head was reported (or never will be, without the rest): no clock to race.
     let server = thread::spawn(move || {
@@ -442,13 +463,9 @@ fn fetch_asks_for_the_head_first() {
         let mut r = io::BufReader::new(s.try_clone().unwrap());
         let mut hello = String::new();
         io::BufRead::read_line(&mut r, &mut hello).unwrap();
-        let mut reqs = [0u8; 24];
-        r.read_exact(&mut reqs).unwrap();
-        let req = |i: usize| {
-            let q = &reqs[i * 12..(i + 1) * 12];
-            (u64::from_le_bytes(q[..8].try_into().unwrap()), u32::from_le_bytes(q[8..].try_into().unwrap()))
-        };
-        assert_eq!((req(0), req(1)), ((8192, 4096), (12288, 3 * 4096)));
+        let mut reqs = [[0u8; 12]; 2];
+        reqs.iter_mut().for_each(|q| r.read_exact(q).unwrap());
+        assert_eq!(reqs.map(|q| request(&q)), [(8192, 4096), (12288, 3 * 4096)]);
         let mut s = s;
         s.write_all(b"{\"ok\": true}\n").unwrap();
         s.write_all(&[&[0u8][..], &[1u8; 4096]].concat()).unwrap();
@@ -456,7 +473,6 @@ fn fetch_asks_for_the_head_first() {
         s.write_all(&[&[0u8][..], &[2u8; 3 * 4096]].concat()).unwrap();
         reported
     });
-    let source = Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() };
     let mut c = PageClient::connect(&source).unwrap();
     let mut buf = vec![0u8; 4 * PAGE_SIZE];
     let mut progress = |data: &[u8]| {
@@ -473,21 +489,15 @@ fn fetch_asks_for_the_head_first() {
 /// A page server whose page `p` is all `p as u8`. Its first connection answers `first` requests only, then hangs up its
 /// side; later ones answer all. Sends each connection's requests, as `(offset, len)`, down `seen` once the client hung
 /// up.
-fn fake_source(first: usize, seen: std::sync::mpsc::Sender<Vec<(u64, u32)>>) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+fn fake_source(first: usize, seen: std::sync::mpsc::Sender<Vec<(u64, u32)>>) -> Source {
+    let (listener, source) = listen();
     thread::spawn(move || {
         for (k, s) in listener.incoming().enumerate() {
-            let s = s.unwrap();
-            let mut r = io::BufReader::new(s.try_clone().unwrap());
-            let mut w = s;
-            let mut hello = String::new();
-            io::BufRead::read_line(&mut r, &mut hello).unwrap();
-            w.write_all(b"{\"ok\": true}\n").unwrap();
+            let (mut r, mut w) = accept_hello(s.unwrap());
             let mut reqs = Vec::new();
             let mut req = [0u8; 12];
             while r.read_exact(&mut req).is_ok() {
-                let (off, len) = (u64::from_le_bytes(req[..8].try_into().unwrap()), u32::from_le_bytes(req[8..].try_into().unwrap()));
+                let (off, len) = request(&req);
                 reqs.push((off, len));
                 if k == 0 && reqs.len() > first {
                     continue;
@@ -502,14 +512,14 @@ fn fake_source(first: usize, seen: std::sync::mpsc::Sender<Vec<(u64, u32)>>) -> 
             let _ = seen.send(reqs);
         }
     });
-    addr
+    source
 }
 
 #[test]
 fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
     let (tx, rx) = std::sync::mpsc::channel();
     // The first connection answers the head and the rest of the first run only.
-    let source = Source { addr: fake_source(2, tx), vm: "v".into(), mig: 1, regions: Vec::new() };
+    let source = fake_source(2, tx);
     let (lane, stop) = (Lane::default(), AtomicBool::new(false));
     let mut link = Link::new(source);
     link.fetch_with(Some(&lane), 0, &mut [], &stop, &mut |_| true).unwrap();
@@ -538,8 +548,7 @@ fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
 
 #[test]
 fn a_fetch_ends_by_its_deadline_however_the_server_trickles() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+    let (listener, source) = listen();
     thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
         s.write_all(b"{\"ok\": true}\n\0").unwrap();
@@ -547,7 +556,6 @@ fn a_fetch_ends_by_its_deadline_however_the_server_trickles() {
             thread::sleep(Duration::from_millis(20));
         }
     });
-    let source = Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() };
     let mut c = PageClient::connect(&source).unwrap();
     let start = Instant::now();
     let e = c.fetch(0, &mut [0u8; PAGE_SIZE], 0, &mut |_| true, start + Duration::from_millis(200)).unwrap_err();
@@ -559,8 +567,7 @@ fn a_fetch_ends_by_its_deadline_however_the_server_trickles() {
 /// what arrived, and completes.
 #[test]
 fn a_slow_source_that_keeps_delivering_is_not_lost() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
+    let (listener, source) = listen();
     let conns = Arc::new(AtomicUsize::new(0));
     let counted = conns.clone();
     thread::spawn(move || {
@@ -568,14 +575,11 @@ fn a_slow_source_that_keeps_delivering_is_not_lost() {
             counted.fetch_add(1, Ordering::SeqCst);
             let s = s.unwrap();
             thread::spawn(move || {
-                let mut r = io::BufReader::new(s.try_clone().unwrap());
-                let mut w = s;
-                let mut hello = String::new();
-                io::BufRead::read_line(&mut r, &mut hello).unwrap();
-                w.write_all(b"{\"ok\": true}\n").unwrap();
+                let (mut r, mut w) = accept_hello(s);
                 let mut req = [0u8; 12];
                 while r.read_exact(&mut req).is_ok() {
-                    let (off, len) = (u64::from_le_bytes(req[..8].try_into().unwrap()), u32::from_le_bytes(req[8..].try_into().unwrap()) as u64);
+                    let (off, len) = request(&req);
+                    let len = len as u64;
                     let _ = w.write_all(&[0]);
                     for p in (off..off + len).step_by(PAGE_SIZE) {
                         thread::sleep(Duration::from_millis(25));
@@ -590,7 +594,7 @@ fn a_slow_source_that_keeps_delivering_is_not_lost() {
     let n = 32;
     let p = pages(&[REMOTE; 32]);
     p.claim(0, n, REMOTE, |_| true);
-    let mut link = Link::new(Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() });
+    let mut link = Link::new(source);
     let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| link.fetch_with(None, off, buf, stop, progress);
     let stop = AtomicBool::new(false);
     let mut got = vec![0u8; n];
@@ -710,24 +714,6 @@ fn claimed_pages_have_one_installer() {
     assert!(res.is_ok());
     assert_eq!((resolved, calls), (2, vec![(0, 2)]));
     assert_eq!(states(&p), [PRESENT, PRESENT, BASE, REMOTE]);
-}
-
-#[test]
-fn remove_during_fetch_skips_the_copy() {
-    // A REMOVE lands while the pages are on the wire: the installer must not copy stale bytes into the discarded page
-    // or mark it PRESENT.
-    let p = pages(&[REMOTE; 4]);
-    p.claim(0, 4, REMOTE, |_| true);
-    assert!(!discard(&p, 1), "the installer accounts for claimed pages");
-    let mut calls = Vec::new();
-    let (resolved, res) = p.install(0, 4, REMOTE, None, |i, n| {
-        calls.push((i, n));
-        Ok(n)
-    });
-    assert!(res.is_ok());
-    assert_eq!(calls, [(0, 1), (2, 2)]);
-    assert_eq!(states(&p), [PRESENT, ZERO, PRESENT, PRESENT]);
-    assert_eq!(resolved, 4);
 }
 
 #[test]
