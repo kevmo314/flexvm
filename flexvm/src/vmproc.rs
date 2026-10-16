@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1010,12 +1010,7 @@ impl Proc {
                         continue;
                     }
                 };
-                let Some(slot) = Slot::take(&CONTROL, MAX_CONTROL) else {
-                    // Not to wait on the client: the reply fits the socket's buffer.
-                    let _ = c.set_nonblocking(true);
-                    let _ = send_json(&mut &c, &json!({"ok": false, "error": "busy"}));
-                    continue;
-                };
+                let Some(slot) = control_slot(&c, &CONTROL) else { continue };
                 let p = p.clone();
                 if let Err(e) = thread::Builder::new().spawn(move || p.control(c, slot)) {
                     crate::log!("control: cannot start a connection's thread: {e}");
@@ -1183,7 +1178,7 @@ impl Proc {
         let _ = c.set_read_timeout(None);
         let reply = match req["op"].as_str().unwrap_or("") {
             // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
-            "exec" | "checkpoint" | "migrate" | "debug" | "resume" if self.vm.get().is_none() => Err(format!("vm {} is starting", self.name()).into()),
+            "exec" | "checkpoint" | "migrate" | "debug" | "resume" if self.vm.get().is_none() => Err(Busy(format!("vm {} is starting", self.name())).into()),
             "exec" => return self.exec(&req, c),
             "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
@@ -2415,6 +2410,16 @@ impl std::fmt::Display for Busy {
 
 impl std::error::Error for Busy {}
 
+/// Refuse excess control clients without waiting: the reply fits the socket's buffer.
+fn control_slot(mut c: &UnixStream, count: &'static AtomicUsize) -> Option<Slot> {
+    let slot = Slot::take(count, MAX_CONTROL);
+    if slot.is_none() {
+        let _ = c.set_nonblocking(true);
+        let _ = send_json(&mut c, &json!({"ok": false, "error": "busy", "busy": true}));
+    }
+    slot
+}
+
 /// A control reply: `busy` set only for a `Busy` error, never for what a peer said.
 fn control_reply(result: &Result<Value>) -> Value {
     let mut reply = crate::util::reply(result);
@@ -3283,6 +3288,9 @@ mod tests {
         send_json(&mut c, &json!({"op": "debug", "what": "status"})).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
         assert_eq!(reply["error"], "vm bound is starting");
+        assert_eq!(reply["busy"], true);
+        let e = call(&p.host, "bound", json!({"op": "migrate", "to": "unused", "if_idle": true}), Some(Instant::now() + Duration::from_secs(5))).unwrap_err();
+        assert!(e.is::<Busy>(), "{e}");
         // A page request (an arrival bound while it prepares, #593): refused on its connection, as not the source.
         use std::os::fd::AsRawFd;
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3294,6 +3302,17 @@ mod tests {
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(&mut client)).unwrap().unwrap();
         assert_eq!(reply["error"], "vm \"bound\" is not the source of migration 7");
+    }
+
+    #[test]
+    fn full_control_slots_reply_busy() {
+        static COUNT: AtomicUsize = AtomicUsize::new(MAX_CONTROL);
+        let (client, server) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert!(control_slot(&server, &COUNT).is_none());
+        let reply = crate::util::recv_json(&mut BufReader::new(client)).unwrap().unwrap();
+        assert_eq!(reply, json!({"ok": false, "error": "busy", "busy": true}));
+        assert_eq!(COUNT.load(Ordering::SeqCst), MAX_CONTROL);
     }
 
     #[test]

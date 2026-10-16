@@ -113,8 +113,8 @@ fn is_public(ip: std::net::IpAddr) -> bool {
                 && !(a == 198 && b & 0xfe == 18)
                 && a < 240
         }
-        // IPv4-mapped, NAT64's well-known prefix, or 6to4: as the IPv4 address it stands for.
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped().or_else(|| nat64_well_known(v6)).or_else(|| six_to_four(v6)) {
+        // IPv4-mapped, SIIT, NAT64's well-known prefix, or 6to4: as the IPv4 address it stands for.
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped().or_else(|| siit(v6)).or_else(|| nat64_well_known(v6)).or_else(|| six_to_four(v6)) {
             Some(v4) => is_public(IpAddr::V4(v4)),
             // NAT64's local-use prefix (RFC 8215) may translate to anything, private addresses included.
             None if is_nat64(v6) => false,
@@ -126,6 +126,11 @@ fn is_public(ip: std::net::IpAddr) -> bool {
             }
         },
     }
+}
+
+/// The IPv4 address embedded in SIIT's IPv4-translatable prefix, ::ffff:0:0/96.
+fn siit(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    (v6.segments()[..6] == [0, 0, 0, 0, 0xffff, 0]).then(|| std::net::Ipv4Addr::from(u128::from(v6) as u32))
 }
 
 /// The IPv4 address embedded in a 6to4 address, 2002::/16.
@@ -1511,6 +1516,28 @@ pub(super) mod tests {
         for ip in ["192.0.1.0", "198.17.255.255", "198.20.0.0", "fe7f::1", "2002:808:808::1", "2003:a00:1::", "2001:1::1", "::1:0:0"] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[test]
+    fn siit_addresses_follow_the_embedded_ipv4() {
+        for (v4, public) in [
+            ("10.0.0.1", false),
+            ("172.16.0.1", false),
+            ("192.168.1.1", false),
+            ("127.0.0.1", false),
+            ("169.254.169.254", false),
+            ("100.64.0.1", false),
+            ("0.0.0.0", false),
+            ("224.0.0.1", false),
+            ("255.255.255.255", false),
+            ("8.8.8.8", true),
+            ("203.0.113.7", true),
+        ] {
+            let ip = format!("::ffff:0:{v4}").parse().unwrap();
+            assert_eq!(is_public(ip), public, "{ip}");
+        }
+        assert!(!is_public("::ffff:0:a00:1".parse().unwrap()));
+        assert!(is_public("::ffff:1:a00:1".parse().unwrap()));
     }
 
     #[test]
