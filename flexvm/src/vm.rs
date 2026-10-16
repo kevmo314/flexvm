@@ -70,6 +70,8 @@ const ADMIT_WAIT: Duration = Duration::from_millis(500);
 pub struct Vm {
     pub name: String,
     pub template: Arc<Template>,
+    /// Effective rate Firecracker loaded (host default when it skipped scaling).
+    pub tsc_khz: u32,
     pub dir: PathBuf,
     pub ip: Ipv4Addr,
     pub tap: String,
@@ -933,6 +935,7 @@ pub struct Prepared {
     fc: Option<Firecracker>,
     pub pager: Arc<Pager>,
     template: Arc<Template>,
+    tsc_khz: u32,
     /// Readies its tap for the address (`net::neighbour`) while loading. The route itself is
     /// never installed by the load: the caller does it under its generation fence (#534).
     /// False when the caller readied the tap itself (a migration target, routed at commit).
@@ -941,8 +944,14 @@ pub struct Prepared {
 
 impl Prepared {
     pub fn new(fc: Firecracker, template: Arc<Template>) -> Result<Self> {
+        let rate = template.meta.compatibility.tsc_khz;
+        Self::with_saved_tsc(fc, template, rate)
+    }
+
+    pub fn with_saved_tsc(fc: Firecracker, template: Arc<Template>, saved_khz: u32) -> Result<Self> {
+        let tsc_khz = crate::compat::restored_tsc_khz(saved_khz, &crate::compat::local(fc.pid())?)?;
         let pager = Pager::start(&fc.sockets.uffd, template.clone(), None)?;
-        let p = Prepared { fc: Some(fc), pager, template, route: true };
+        let p = Prepared { fc: Some(fc), pager, template, tsc_khz, route: true };
         p.pager.set_pid(p.firecracker().pid())?;
         Ok(p)
     }
@@ -972,6 +981,7 @@ impl Prepared {
         Arc::new(Vm {
             name: name.into(),
             template: self.template.clone(),
+            tsc_khz: self.tsc_khz,
             dir: idle.dir.clone(),
             ip,
             tap: idle.tap.clone(),
@@ -1046,7 +1056,7 @@ impl Prepared {
         before_retry: impl FnOnce() -> Result<()>,
         t: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
-        let (tpl, route) = (self.template.clone(), self.route);
+        let (tpl, route, tsc_khz) = (self.template.clone(), self.route, self.tsc_khz);
         let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, true, deadline, t) {
             Ok(r) => return Ok(r),
             Err((e, None)) => return Err(e),
@@ -1054,7 +1064,10 @@ impl Prepared {
         };
         crate::log!("vm {name}: load failed ({e}); once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
         before_retry()?;
-        let mut fresh = Vm::prepare(spawner.take(deadline)?, tpl, t)?;
+        // Retrying the same state on this host preserves its effective rate.
+        let fc = spawner.take(deadline)?;
+        let mut fresh = Prepared::with_saved_tsc(fc, tpl, tsc_khz)?;
+        t.mark("pager_start");
         fresh.route = route;
         if !route {
             // The route waits, but everything else about it goes on the fresh tap.

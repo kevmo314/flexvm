@@ -401,8 +401,10 @@ impl Proc {
         self.app_log.store(m.app_log, Ordering::SeqCst);
         let (vm, restore) = (|| -> Result<_> {
             let seed = Some((ck.runs, Origin::File(ck.file)));
-            let prepared = Vm::prepare(self.spawner.take(None)?, tpl, t)?;
-            m.check_msrs(&crate::compat::local(prepared.firecracker().pid())?.msrs)?;
+            let fc = self.spawner.take(None)?;
+            let rate = m.check_compatibility(&tpl, &crate::compat::local(fc.pid())?)?;
+            let prepared = crate::vm::Prepared::with_saved_tsc(fc, tpl, rate)?;
+            t.mark("pager_start");
             // Test gate: its Firecracker is up, nothing loaded or paged in yet.
             crate::host::hold("restore_prepared_gate");
             prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)

@@ -199,6 +199,7 @@ impl Staging {
             template: vm.template.name.clone(),
             template_id: meta.id.clone(),
             saved_msrs: Some(crate::compat::local(vm.pid().ok_or("firecracker is gone")?)?.msrs),
+            saved_tsc_khz: Some(vm.tsc_khz),
             vcpus: meta.vcpus,
             mem_mib: meta.mem_mib,
             max_mib: meta.max_mib,
