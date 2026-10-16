@@ -8900,14 +8900,19 @@ class RouteWatch:
         self.proc = subprocess.Popen(["ip", "-o", "monitor", "route"], stdout=subprocess.PIPE, text=True)
         self.reader = threading.Thread(target=lambda: self.lines.extend(iter(self.proc.stdout.readline, "")), daemon=True)
         self.reader.start()
+        # `ip monitor` subscribes some time after it starts: a marker seen proves it has.
+        end = time.time() + 10
+        while not self.sync(0.5):
+            if time.time() > end:
+                raise RuntimeError("ip monitor never reported a route change")
 
-    def sync(self):
+    def sync(self, timeout=10):
         self.seq += 1
         metric = 100 + self.seq
         subprocess.run(["ip", "route", "add", f"{self.marker}/32", "via", self.via, "metric", str(metric)], check=True)
         subprocess.run(["ip", "route", "del", f"{self.marker}/32", "via", self.via, "metric", str(metric)], check=True)
         mark = re.compile(rf"^Deleted {re.escape(self.marker)} via .* metric {metric}\b")
-        return wait_for(lambda: any(mark.match(l) for l in list(self.lines)), 10)
+        return wait_for(lambda: any(mark.match(l) for l in list(self.lines)), timeout)
 
     def to_tap(self):
         """The routes of `ip` to a device of its own (a tap), not via a peer, that were installed."""
