@@ -1018,9 +1018,12 @@ impl Host {
     /// `via` None is a withdrawal (of every revision). False if stale (older,
     /// announcing a withdrawn generation, or an older revision of the newest
     /// one). A withdrawal frees a loan of that gen or older.
+    /// The record's revision may trail the one its holder here runs at (published, `live`): the
+    /// newer of the two decides.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
+        let live = via.and_then(|_| self.live_of(ip, &self.addr(l, ip).ok()?)).unwrap_or(0);
         self.update(l, ip, true, |a| {
-            if !a.takes(gen, rev, via) {
+            if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev.max(live))) {
                 return false;
             }
             if via.is_some() || gen > a.seen {
@@ -1045,19 +1048,31 @@ impl Host {
         })
     }
 
-    /// Whether `observe` would take the message, by the record alone.
-    pub fn takes(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
-        Ok(self.addr(l, ip)?.takes(gen, rev, via))
+    fn live_path(&self, ip: Ipv4Addr) -> PathBuf {
+        self.run.join("live").join(ip.to_string())
     }
 
-    /// The VM process here to ask for the revision it runs at (`listen::route`), by its name
-    /// and instance: one holding `ip` with generation `gen`, the newest seen, which an
-    /// announcement of `gen` (`via`) could be older than while the record trails it (#533).
-    /// For any other message the record decides alone.
-    pub fn to_ask(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<Option<(String, Ident)>> {
+    /// Publishes where this process's VM runs within generation `gen` of `ip` (`RUN/live/IP`, on
+    /// tmpfs: replaced, never synced), under the host lock, as its revision changes and before the
+    /// record's durable write, which may come later or fail (#533). `observe` goes by it while this
+    /// process holds the address; once it is dead the record decides alone.
+    pub fn publish_live(&self, _: &Locked, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<()> {
+        let path = self.live_path(ip);
+        std::fs::create_dir_all(path.parent().ok_or("no directory")?)?;
+        store(&path, &Live { id: Ident::me(), gen, rev }, false)
+    }
+
+    /// The revision of the newest generation of `ip` its holder here runs at, as it published it:
+    /// only the record's holder instance's, only while it is alive, and only of the generation it holds.
+    pub fn live(&self, l: &Locked, ip: Ipv4Addr) -> Result<Option<u64>> {
         let a = self.addr(l, ip)?;
-        let asked = via.is_some() && a.seen == gen && a.held == gen && self.held(&a);
-        Ok(asked.then_some(a.holder.zip(a.holder_id)).flatten())
+        Ok(self.live_of(ip, &a))
+    }
+
+    fn live_of(&self, ip: Ipv4Addr, a: &Addr) -> Option<u64> {
+        let id = a.holder_id.as_ref().filter(|id| a.held == a.seen && id.liveness() == Liveness::Alive)?;
+        let live: Live = load(&self.live_path(ip)).ok().flatten()?;
+        (live.id == *id && live.gen == a.held).then_some(live.rev)
     }
 
     /// A paused migration source keeps its route too: its release moves it.
@@ -1659,11 +1674,14 @@ impl Addr {
     pub fn current(&self, gen: u64) -> bool {
         gen > self.seen || (gen == self.seen && !self.withdrawn)
     }
+}
 
-    /// Not stale: not older, announcing a withdrawn generation, or an older revision of the newest one.
-    fn takes(&self, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> bool {
-        !(gen == 0 || gen > RECV_MAX || gen < self.seen || (gen == self.seen && via.is_some() && (self.withdrawn || rev < self.rev)))
-    }
+/// `RUN/live/IP`: the revision of generation `gen` the VM process `id` runs at (`Host::publish_live`).
+#[derive(Debug, Serialize, Deserialize)]
+struct Live {
+    id: Ident,
+    gen: u64,
+    rev: u64,
 }
 
 /// Dropped, it gives the address back; a suspended VM `keep`s it.
@@ -4321,6 +4339,37 @@ mod tests {
         let free = flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_ok();
         spawner.unwrap().join().unwrap();
         assert!(free, "the pass let go of its lock, not only closed it");
+    }
+
+    /// #533: the record can trail the revision its holder here runs at; what the holder published
+    /// decides then, with no process asked. Only the record's holder instance's counts, and only
+    /// while it is alive: a crash leaves the record to decide.
+    #[test]
+    fn announcements_are_judged_by_the_holders_published_revision() {
+        let (_dir, h) = host("live-rev");
+        let (x, gone, a) = (ip("10.9.4.1"), ip("10.9.4.2"), Some(ip("192.0.2.1")));
+        let l = h.lock().unwrap();
+        let _y = h.take_name("y", false).unwrap();
+        h.claim_incoming(&l, "y", x, 7, None).unwrap().keep();
+        let me = Ident::me();
+        std::fs::create_dir_all(h.run.join("live")).unwrap();
+        // Another instance's (its pid reused) is not believed.
+        store(&h.live_path(x), &Live { id: Ident { start: me.start + 1, ..me.clone() }, gen: 7, rev: 5 }, false).unwrap();
+        assert_eq!(h.live(&l, x).unwrap(), None);
+        // Its own: past the record, which trails it (a failed write, an arrival's deferred one).
+        h.publish_live(&l, x, 7, 1).unwrap();
+        assert_eq!((h.live(&l, x).unwrap(), h.addr(&l, x).unwrap().rev), (Some(1), 0));
+        assert!(!h.observe(&l, x, 7, 0, a).unwrap(), "a late announcement of the record's revision is stale");
+        assert_eq!(h.addr(&l, x).unwrap().via, None);
+        assert!(h.observe(&l, x, 7, 1, a).unwrap() && h.addr(&l, x).unwrap().via == a, "not older: taken");
+        assert!(h.observe(&l, x, 7, 0, None).unwrap(), "a withdrawal is not an announcement");
+        // A dead holder's file is stale: the record decides.
+        let dead = dead_owner(&h, 999_999_940, &[]);
+        let crashed = Addr { seen: 7, held: 7, holder: Some("z".into()), holder_id: Some(dead.clone()), ..Default::default() };
+        h.put_addr(gone, &crashed, false).unwrap();
+        store(&h.live_path(gone), &Live { id: dead, gen: 7, rev: 5 }, false).unwrap();
+        assert_eq!(h.live(&l, gone).unwrap(), None);
+        assert!(h.observe(&l, gone, 7, 0, a).unwrap());
     }
 
     #[test]

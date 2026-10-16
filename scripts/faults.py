@@ -2391,9 +2391,9 @@ def delayed_announce_handoff():
     """#492, #533: as delayed_announce, but the source's late announcement reaches
     B while B's handoff is still under way (held at `handoff_gate`). B records
     the arrival's revision only once its handoff is done, so its record still
-    has the source's; B's listener asks the arrival's process, which runs at
-    the next revision, so the late one is stale all the same: it never names
-    A as the way to the address in B's record."""
+    has the source's; the arrival published the next revision at its commit
+    (RUN/live), which B's listener judges by, so the late one is stale all the
+    same: it never names A as the way to the address in B's record."""
     n = "ft-delayed-handoff"
     fault(B, "route_stall", 60000)
     ok(run(A, n))

@@ -260,14 +260,13 @@ recorded here; announcements carry it, and
 one with an older revision of the newest generation is stale, so a source's
 delayed announcement never takes a route back from its target (#256). The
 record can trail the revision its VM runs at (the target's, until recorded; a
-failed write, until retried), so for an announcement the record does not
-already show stale, of the generation a VM process here holds, the listener
-asks that process for its generation and revision on its control socket
-(without the host lock, a bounded wait), believes only the instance the record
-names, and judges under the lock if the record still names it. A holder that
-cannot answer gets the announcement refused for now (announcers try again),
-never taken on the trailing record; recording a newer revision drops a route
-taken for an older one (#533). An address
+failed write, until retried), so a VM process publishes its revision in
+`RUN/live/IP` (tmpfs, replaced atomically, never synced) under the host lock as
+it changes, before the record's write: an arrival at its commit. Under the same
+lock, an announcement of the generation a VM here holds is judged against the
+newer of the record and that file, believed only from the record's holder
+instance while it is alive (after a crash the record decides); recording a
+newer revision drops a route taken for an older one (#533). An address
 is *taken* if its record names a holder instance that is alive (holding the
 name, or dead with its Firecrackers not yet gone) or a holder suspended here
 with that generation, or it is lent. Another instance of the same name (a
