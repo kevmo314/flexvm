@@ -345,7 +345,7 @@ impl Holder {
         if switched.is_ok() {
             let end = Instant::now() + linger;
             while Instant::now() < end {
-                if crate::util::readable(&self.tun, end.saturating_duration_since(Instant::now())).unwrap_or(false) {
+                if crate::util::readable(&self.tun, end.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))).unwrap_or(false) {
                     (0..PASS).take_while(|_| self.read_one(&mut buf)).count();
                 }
                 give(&mut o);
