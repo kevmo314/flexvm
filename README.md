@@ -175,14 +175,16 @@ borrow only an address in it (unset, only this host's `--vm-ips`, so
 migrations between hosts are refused). Both `config` and `listen` warn when
 peers are configured without `--cluster-ips`; `config` shows the effective
 allowlist in `derived.cluster_ips`. Loading `host.json` validates that the
-whole `vm_ips` range fits inside it; a running process keeps its last valid
-configuration if a hand edit is invalid. Withdrawals of previously recorded
+whole `vm_ips` range fits inside it: until a hand edit that breaks this is
+fixed (`flexvm config` still runs, to fix it), other commands refuse to start,
+and a running process keeps its last valid configuration. Withdrawals of previously recorded
 addresses remain accepted after the allowlist narrows. The hosts must list each other
 with `--peer HOST:PORT` (each peer's listen address): a listener serves its
 peers' addresses only, and tells any other it is not a peer. A reported route
 next hop (including a migration target's underlay) must be the connection's
-peer address or a configured peer's known address, and cannot be local or a
-gateway. Saved routes are checked again before reinstalling them. The default
+peer address or a configured peer's known address, and cannot be a gateway
+(a peer's address local to this host, as with hosts sharing a network namespace,
+is taken but installs no route). Saved routes are checked again before reinstalling them. The default
 range, `10.200.0.0/16`, is the same on every host, so give each host its own
 once it has peers (`config` warns until then). `--peer` replaces the whole
 list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
@@ -192,7 +194,10 @@ list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
   address, or for a wildcard one the source address of the kernel's route
   toward the first peer not on this machine (`ip route get`, policy routing
   included). With every peer on this machine (loopback, or one of its
-  addresses) it is loopback; with peers elsewhere, never.
+  addresses) it is loopback; with peers elsewhere, never. Peers take it only
+  as one of the addresses they know this host by (its `--peer` address, or
+  one its name resolves to), so an underlay on another network than that
+  address is refused.
 - `--announce-dev IFACE`, where the host answers ARP for its VMs
   (`proxy_arp`) and announces a VM that arrives: that route's device, none
   for peers on this machine. `--announce-dev none` turns this off, for

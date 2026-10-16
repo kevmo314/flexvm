@@ -1185,15 +1185,21 @@ impl Host {
 
     /// Recheck saved routes against current configuration, without DNS or a wait under the lock.
     fn route_allowed(&self, ip: Ipv4Addr, via: Ipv4Addr) -> bool {
-        let checked = crate::listen::known_peers(self).and_then(|peers| {
-            crate::listen::check_vm_ip(self, ip, &peers)?;
-            crate::listen::check_via(self, via, &peers)
-        });
-        if let Err(e) = checked {
+        self.route_check(ip, via).unwrap_or_else(|e| {
             crate::log!("route {ip} via {via}: not put back: {e}");
-            return false;
+            false
+        })
+    }
+
+    /// Whether the saved route may be put back (a refusal is logged); an error while the peers'
+    /// addresses are not known yet (a name no listener has looked up since a boot), to try again later.
+    fn route_check(&self, ip: Ipv4Addr, via: Ipv4Addr) -> Result<bool> {
+        let peers = crate::listen::known_peers(self)?;
+        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::check_via(via, &peers));
+        if let Err(e) = &checked {
+            crate::log!("route {ip} via {via}: not put back: {e}");
         }
-        true
+        Ok(checked.is_ok())
     }
 
     pub fn current(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {

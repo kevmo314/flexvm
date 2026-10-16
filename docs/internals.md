@@ -813,17 +813,19 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   lookups, briefly waiting for one under way; a restore or resume, root's own,
   against the listener's last-known peer addresses (`RUN/peers.json`) whatever
   their age, with no DNS wait. Reinstall and boot recovery repeat these checks
-  and the next-hop check against current configuration, with no DNS wait.
+  and the next-hop check against current configuration, with no DNS wait; a
+  boot's pass tries again while a peer by name is not known yet.
   A route's `via` and a migration target's reported underlay must be the
   connection's peer address or one of the configured peers' known addresses,
-  never a local, gateway or non-unicast address. Route requests use the
+  never a gateway or non-unicast address; one local to this network namespace
+  (hosts sharing a machine) is taken and installs no route. Route requests use the
   listener's strict peer lookup; migration replies use its last-known peer
   addresses plus the target connection's address.
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
-    Peer-supplied next hops local to this network namespace (including
-    loopback) are refused before route state is saved. The low-level route
-    helper also skips local next hops for internal callers.
+    Routes via an address local to the host's network namespace (including
+    loopback) are skipped, so test hosts sharing a machine keep each other's
+    tap routes; the first skip is logged.
   - **The LAN** (the announce device: the device of the route toward the
     peers, or `flexvm config --announce-dev`): the host answers ARP for its VMs
     (proxy ARP) and sends a gratuitous ARP whenever a VM arrives. Other

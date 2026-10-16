@@ -937,7 +937,7 @@ fn target_via(host: &crate::host::Host, target: &Value, conn: Option<&TcpStream>
     if let Some(conn) = conn {
         peers.push(conn.peer_addr()?.ip());
     }
-    crate::listen::check_via(host, via, &peers)?;
+    crate::listen::check_via(via, &peers)?;
     Ok(via)
 }
 
@@ -1077,7 +1077,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_underlay_must_be_a_known_nonlocal_peer() {
+    fn target_underlay_must_be_a_known_peer() {
         let root = crate::test_util::TempDir::new("target-via");
         let mut host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
         host.configure(|c| {
@@ -1086,7 +1086,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), None).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
-        for target in [json!({}), json!({"underlay": "192.0.2.8"}), json!({"underlay": "127.0.0.1"})] {
+        // A peer sharing this network namespace: the handoff goes by its local underlay.
+        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), None).unwrap(), Ipv4Addr::LOCALHOST);
+        for target in [json!({}), json!({"underlay": "192.0.2.8"}), json!({"underlay": "127.0.0.2"})] {
             assert!(target_via(&host, &target, None).is_err());
         }
         host.configure(|c| {
