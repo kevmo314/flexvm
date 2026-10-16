@@ -422,6 +422,10 @@ impl Proc {
         if hold {
             return Ok(keep_paused(t, None));
         }
+        // Test gate: a resume loaded and paused, not yet marked STARTED (the fence's host lock not yet taken).
+        if owned {
+            crate::host::gate("resume_unmarked_gate");
+        }
         // Test fault `resume_fence_fail`: the generation is found withdrawn at the fence.
         let still = match fault("resume_fence_fail") {
             true => Err("injected fault: the address's generation was withdrawn meanwhile".into()),
@@ -464,6 +468,10 @@ impl Proc {
         }
         drop(still);
         t.mark("resume");
+        // Test gate: a resume marked STARTED and running, not yet published.
+        if owned {
+            crate::host::gate("resume_ran_gate");
+        }
         if fault("restore_after_run") {
             return Err(Restore::Ran(kill("injected fault: restore failed after the vm ran".into())));
         }
