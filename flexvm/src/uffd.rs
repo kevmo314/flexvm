@@ -242,7 +242,7 @@ pub struct Runtime {
     hot_spare: Mutex<Option<hot::Buf>>,
     hot_prev: Mutex<Option<Arc<Held>>>,
     /// The previous interval's snapshot, shared with Frozen for rollback, and sparse words for kept hot pages.
-    hot_dirty: Mutex<Arc<Vec<u64>>>,
+    hot_dirty: Mutex<Arc<pages::DirtyBits>>,
     hot_kept: Mutex<std::collections::BTreeMap<usize, u64>>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,

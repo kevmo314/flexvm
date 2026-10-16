@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::Range;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock, RwLockWriteGuard};
@@ -16,6 +17,40 @@ pub(super) fn set_bits(words: &[u64]) -> impl Iterator<Item = usize> + '_ {
     words.iter().enumerate().flat_map(|(w, &bits)| {
         std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0)).map(move |b| w * 64 + b.trailing_zeros() as usize)
     })
+}
+
+/// A dirty snapshot and the touched word ranges copied into it. Untouched words stay lazily zeroed: scans must use
+/// these ranges rather than read (and fault in) the whole guest bitmap.
+#[derive(Default)]
+pub(super) struct DirtyBits {
+    pub bits: Vec<u64>,
+    chunks: Vec<Range<usize>>,
+    /// Words exposed to snapshot scans, for the freeze regression's bound on bitmap reads.
+    #[cfg(test)]
+    pub visited: AtomicUsize,
+}
+
+impl DirtyBits {
+    /// Touched words intersecting the page range, with their absolute word offsets. Includes boundary words; callers
+    /// enumerating pages must filter their bits to the exact page range.
+    fn words(&self, from: usize, to: usize) -> impl Iterator<Item = (usize, &[u64])> {
+        let (first, end) = (from / 64, to.div_ceil(64));
+        self.chunks.iter().filter(move |_| from < to).skip_while(move |r| r.end <= first).take_while(move |r| r.start < end).map(move |r| {
+            let (a, b) = (r.start.max(first), r.end.min(end));
+            #[cfg(test)]
+            self.visited.fetch_add(b - a, Ordering::Relaxed);
+            (a, &self.bits[a..b])
+        })
+    }
+
+    pub fn count(&self) -> usize {
+        self.words(0, self.bits.len() * 64).flat_map(|(_, words)| words).map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Set pages in the range, ascending even across skipped chunks.
+    pub fn pages(&self, from: usize, to: usize) -> impl Iterator<Item = usize> + '_ {
+        self.words(from, to).flat_map(|(at, words)| set_bits(words).map(move |p| at * 64 + p)).filter(move |&p| p >= from && p < to)
+    }
 }
 
 /// Zeroed atomic storage, lazily backed by the kernel, with each type's alignment.
@@ -186,21 +221,32 @@ impl Pages {
     }
 
     /// The dirty bits, cleared with `take`.
-    pub(super) fn dirty_bits(&self, take: bool) -> Vec<u64> {
+    pub(super) fn dirty_bits(&self, take: bool) -> DirtyBits {
         let mut bits = vec![0; self.dirty.len()];
+        let mut chunks = Vec::new();
         for (at, words) in self.dirty_chunks() {
+            chunks.push(at..at + words.len());
             for (b, w) in bits[at..at + words.len()].iter_mut().zip(words) {
                 *b = if take { w.swap(0, Ordering::SeqCst) } else { w.load(Ordering::SeqCst) };
             }
         }
-        bits
+        // mark_dirty touches its chunk before publishing a dirty bit, and touched bits are never cleared. Thus no
+        // dirty page in this snapshot can lie outside these ranges, including installed, discarded and kept hot pages.
+        DirtyBits {
+            bits,
+            chunks,
+            #[cfg(test)]
+            visited: AtomicUsize::new(0),
+        }
     }
 
     /// Marks dirty again what `dirty_bits` took.
-    pub(super) fn restore_dirty(&self, bits: &[u64]) {
-        for (w, &b) in self.dirty.iter().zip(bits) {
-            if b != 0 {
-                w.fetch_or(b, Ordering::SeqCst);
+    pub(super) fn restore_dirty(&self, bits: &DirtyBits) {
+        for (at, words) in bits.words(0, self.len()) {
+            for (w, &b) in self.dirty[at..at + words.len()].iter().zip(words) {
+                if b != 0 {
+                    w.fetch_or(b, Ordering::SeqCst);
+                }
             }
         }
     }
@@ -422,6 +468,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_scans_clip_regions_and_skip_untouched_words() {
+        for n in [0, 1, CHUNK, 3 * CHUNK + 1] {
+            let pages = Pages::new(n);
+            for p in [0, 63, 64, CHUNK - 1, CHUNK, n.saturating_sub(1)] {
+                if p < n {
+                    pages.mark_dirty(p);
+                }
+            }
+            for take in [false, true] {
+                let mut dirty = pages.dirty_bits(take);
+                let expected: Vec<_> = set_bits(&dirty.bits).collect();
+                // Even nonzero untouched words must never be read by snapshot consumers.
+                for (i, w) in dirty.bits.iter_mut().enumerate() {
+                    if !pages.touched(i * 64) {
+                        *w = u64::MAX;
+                    }
+                }
+                assert_eq!(dirty.count(), expected.len());
+                for (from, to) in [(0, n), (1, n), (63, 65), (CHUNK + 1, 2 * CHUNK), (n, n), (65, 63)] {
+                    assert_eq!(dirty.pages(from, to).collect::<Vec<_>>(), expected.iter().copied().filter(|&p| p >= from && p < to).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual freeze bitmap microbenchmark; run with --release --ignored --nocapture"]
+    fn freeze_bitmap_benchmark() {
+        use std::hint::black_box;
+
+        let pages = Pages::new((47 << 30) / crate::util::PAGE_SIZE);
+        for p in [7, CHUNK + 9, pages.len() - 1] {
+            pages.mark_dirty(p);
+        }
+        let regions = [(0, 128 << 8), (128 << 8, pages.len())];
+        let start = Instant::now();
+        for _ in 0..200 {
+            let dirty = pages.dirty_bits(false);
+            let count: usize = black_box(&dirty.bits).iter().map(|w| w.count_ones() as usize).sum();
+            let protect: Vec<_> = regions.iter().flat_map(|&(from, to)| set_bits(&dirty.bits[from / 64..to.div_ceil(64)]).map(move |p| from + p)).collect();
+            let incremental: Vec<_> = set_bits(&dirty.bits).collect();
+            black_box((count, protect, incremental));
+        }
+        let full = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..200 {
+            let dirty = pages.dirty_bits(false);
+            let count = black_box(&dirty).count();
+            let protect: Vec<_> = regions.iter().flat_map(|&(from, to)| dirty.pages(from, to)).collect();
+            let incremental: Vec<_> = dirty.pages(0, pages.len()).collect();
+            black_box((count, protect, incremental));
+        }
+        println!(
+            "47 GiB, three touched chunks, snapshot + count + region scans + incremental scan: full {:?}, touched {:?} per pause",
+            full / 200,
+            start.elapsed() / 200
+        );
+    }
+
+    #[test]
     fn hot_scan_reads_only_touched_chunks() {
         // The 47 GiB template, with just three chunks touched, including a partial final chunk.
         let pages = Pages::new((47 << 30) / crate::util::PAGE_SIZE + 1);
@@ -433,11 +539,11 @@ mod tests {
         for p in [7, 8, last] {
             pages.mark_dirty(p);
         }
-        assert_eq!(pages.hot_pages(&before).collect::<Vec<_>>(), [7, last]);
+        assert_eq!(pages.hot_pages(&before.bits).collect::<Vec<_>>(), [7, last]);
         assert!(pages.hot_pages(&[]).next().is_none());
         assert_eq!(pages.dirty_count(), 3, "candidate scanning must not consume dirty bits");
         pages.restore_dirty(&before);
-        assert_eq!(set_bits(&pages.dirty_bits(false)).collect::<Vec<_>>(), [7, 8, CHUNK + 9, last], "rollback retains writes after the snapshot");
+        assert_eq!(pages.dirty_bits(false).pages(0, pages.len()).collect::<Vec<_>>(), [7, 8, CHUNK + 9, last], "rollback retains writes after the snapshot");
         // Bound the words read by the hot scan independently of the template's maximum size.
         let scanned: usize = pages.dirty_chunks().map(|(_, words)| words.len()).sum();
         assert_eq!(scanned, 2 * (CHUNK / 64) + 1);
@@ -463,10 +569,10 @@ mod tests {
         let start = Instant::now();
         for _ in 0..100 {
             // The previous pause's whole-guest clones, intersection and kept bitmap allocation.
-            let before = before.lock().unwrap().as_ref().clone();
-            let intersect: Vec<u64> = pages.dirty_bits(false).iter().zip(&before).map(|(a, b)| a & b).collect();
+            let before = before.lock().unwrap().bits.clone();
+            let intersect: Vec<u64> = pages.dirty_bits(false).bits.iter().zip(&before).map(|(a, b)| a & b).collect();
             let hot: Vec<_> = set_bits(&intersect).collect();
-            let dirty = pages.dirty_bits(false);
+            let dirty = pages.dirty_bits(false).bits;
             let next = dirty.clone();
             let mut kept = vec![0u64; dirty.len()];
             hot.iter().for_each(|&p| kept[p / 64] |= 1 << (p % 64));
@@ -476,7 +582,7 @@ mod tests {
         let start = Instant::now();
         for _ in 0..100 {
             let before = before.lock().unwrap();
-            let hot: Vec<_> = pages.hot_pages(&before).collect();
+            let hot: Vec<_> = pages.hot_pages(&before.bits).collect();
             let dirty = Arc::new(pages.dirty_bits(false));
             let mut kept = std::collections::BTreeMap::new();
             hot.iter().for_each(|&p| *kept.entry(p / 64).or_insert(0) |= 1u64 << (p % 64));
@@ -548,7 +654,7 @@ mod tests {
                 result.unwrap();
                 assert_eq!(resolved, if from == REMOTE { pages.len() } else { 0 });
             });
-            assert!(pages.dirty_bits(true).iter().all(|&bits| bits == u64::MAX));
+            assert!(pages.dirty_bits(true).bits.iter().all(|&bits| bits == u64::MAX));
         }
     }
 }

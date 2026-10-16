@@ -1,6 +1,6 @@
 use super::event::{Served, WP};
 use super::hot::Held;
-use super::pages::set_bits;
+use super::pages::DirtyBits;
 use super::{Mapping, Pager, Runs, ALL, ARM_CHUNK, BASE, PREFETCH_RUN, PRESENT};
 use crate::bail;
 use crate::cow::{Cow, PENDING, READING, RESCUING};
@@ -61,7 +61,7 @@ pub struct Frozen {
     /// Pages dirtied since the previous checkpoint's pause.
     pub dirty: usize,
     /// The dirty bits taken, which a checkpoint that fails gives back (`Pager::unfreeze`).
-    taken: Arc<Vec<u64>>,
+    taken: Arc<DirtyBits>,
     pub protected: usize,
     pub protect: Duration,
     /// The hot pages copied during the pause (see `hot`), how many of them stay unprotected, how many were unchanged
@@ -187,7 +187,7 @@ impl Pager {
                 for w in chunk / 64..(chunk + WP_CHUNK).min(to) / 64 {
                     let k = kept.get(&w).copied().unwrap_or(0);
                     n += (dirty.get(w).map_or(0, |d| d.load(Ordering::Relaxed)) & !k).count_ones() as usize;
-                    was += (before.get(w).copied().unwrap_or(0) & !k).count_ones() as usize;
+                    was += (before.bits.get(w).copied().unwrap_or(0) & !k).count_ones() as usize;
                 }
                 let start = WP_SIZES.into_iter().rev().find(|&s| s <= was / 2).unwrap_or(WP_BLOCK);
                 WP_SIZES.into_iter().find(|&s| s > 2 * n).unwrap_or(WP_CHUNK).max(start)
@@ -350,7 +350,7 @@ impl Pager {
     /// Write-protects `ranges`, retrying for a while each one a queued REMOVE fails. For a freeze, which took the dirty
     /// bits `taken`, a failure gives them back: every page must stay protected or dirty. Either way it turns tracking
     /// off, so everything is protected again next time. Returns how many ranges it protected.
-    fn protect(&self, ranges: impl IntoIterator<Item = (usize, usize)>, taken: Option<&[u64]>) -> Result<usize> {
+    fn protect(&self, ranges: impl IntoIterator<Item = (usize, usize)>, taken: Option<&DirtyBits>) -> Result<usize> {
         let mut n = 0;
         for (first, end) in ranges {
             let start = Instant::now();
@@ -365,7 +365,9 @@ impl Pager {
                 },
             };
             if let Err(e) = res {
-                self.pages().restore_dirty(taken.unwrap_or_default());
+                if let Some(taken) = taken {
+                    self.pages().restore_dirty(taken);
+                }
                 self.tracking.store(false, Ordering::SeqCst);
                 bail!("write-protecting guest memory: {e}");
             }
@@ -401,7 +403,7 @@ impl Pager {
         // A VM that stays paused for the write (and is then killed) keeps its dirty pages: if the checkpoint fails and
         // it runs on, they still tell what is unprotected. One that runs on starts a new interval.
         let dirty = Arc::new(pages.dirty_bits(cow));
-        let ndirty = dirty.iter().map(|w| w.count_ones() as usize).sum();
+        let ndirty = dirty.count();
         // Hot pages stay unprotected unless their block did not change since the last checkpoint.
         let prev = hot.as_mut().and_then(|h| h.prev.take());
         let hot_unchanged = hot.as_ref().map_or(0, |h| h.unchanged.len());
@@ -418,11 +420,7 @@ impl Pager {
             // Range by range, not the whole region: a protect makes KVM drop its mappings of everything in the range
             // (see `WP_CHUNK`), so the guest would refault every page it uses there, clean ones too, after the resume.
             // That costs far more than the calls it spares (#281).
-            // Include both boundary words; the filter retains exactly this mapping's pages.
-            let first_word = from / 64;
-            let dirty_here = set_bits(&dirty[first_word..to.div_ceil(64)])
-                .map(|p| p + first_word * 64)
-                .filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && kept.binary_search(&p).is_err());
+            let dirty_here = dirty.pages(from, to).filter(|&p| pages.get(p) == PRESENT && kept.binary_search(&p).is_err());
             protected += self.protect(protect_ranges(dirty_here, &kept), Some(&dirty))?;
         }
         let protect = start.elapsed();
@@ -431,7 +429,7 @@ impl Pager {
             true => {
                 // Pages not dirty keep what the previous checkpoint has, and so do hot pages unchanged since.
                 let mut out: Runs = Vec::new();
-                for p in set_bits(&dirty).take_while(|&p| p < pages.len()).filter(|&p| !unchanged(p)) {
+                for p in dirty.pages(0, pages.len()).filter(|&p| !unchanged(p)) {
                     let r = runs.partition_point(|r| r.0 <= p as u64);
                     let st = match r.checked_sub(1).map(|r| runs[r]) {
                         Some((f, n, s)) if (p as u64) < f + n => s,
@@ -567,4 +565,69 @@ pub(super) fn protect_ranges(pages: impl Iterator<Item = usize>, kept: &[usize])
         ranges.truncate(n);
     }
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::uffd::pages::{Pages, CHUNK};
+    use crate::uffd::{FaultStats, Runtime, ZERO};
+
+    #[test]
+    fn freeze_reads_only_touched_snapshot_chunks() {
+        let dir = crate::test_util::TempDir::new("freeze-sparse");
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "compatibility": {"cpu": "test", "tsc_khz": 2000000, "tsc_control": false,
+                    "msrs": [], "firecracker": "test", "features": {}, "xsave": {}},
+                "vcpus": 1, "mem_mib": 1, "max_mib": 48128, "plugged_mib": 0,
+                "kernel": "/k", "rootfs": "/r", "id": "a", "components": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::File::create(dir.join("mem")).unwrap().set_len(PAGE_SIZE as u64).unwrap();
+        let base = crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap();
+        for incremental in [false, true] {
+            // The default template's 47 GiB plus a partial final chunk. No guest process or UFFD is needed: BASE and
+            // ZERO pages must be counted and saved in deltas, but need no write-protect ioctl.
+            let n = (47 << 30) / PAGE_SIZE + 1;
+            let last = n - 1;
+            let mut pages = Pages::new(n);
+            pages.fill(CHUNK + 9, 1, ZERO);
+            for p in [7, CHUNK + 9, last] {
+                pages.mark_dirty(p);
+            }
+            let pager = Pager {
+                base: base.clone(),
+                runtime: Runtime {
+                    pages: pages.into(),
+                    mappings: [(0, 2 * CHUNK), (2 * CHUNK, last), (last, n)]
+                        .map(|(from, to)| Mapping { offset: (from * PAGE_SIZE) as u64, size: (to - from) * PAGE_SIZE, base_host_virt_addr: 0 })
+                        .to_vec()
+                        .into(),
+                    tracking: true.into(),
+                    ..Runtime::default()
+                },
+                fault_stats: FaultStats::new(),
+                lanes: Default::default(),
+                steer: Mutex::new((0, 0)),
+                collapse_report: Mutex::new(None),
+                collapse_gate: Default::default(),
+            };
+            let runs = vec![(CHUNK as u64 + 9, 1, ZERO)];
+            let frozen = pager.freeze(&runs, incremental, true).unwrap();
+            assert_eq!(frozen.dirty, 3);
+            assert_eq!(frozen.protected, 0);
+            assert_eq!(frozen.runs, if incremental { vec![(7, 1, BASE), (CHUNK as u64 + 9, 1, ZERO), (last as u64, 1, BASE)] } else { runs });
+            // One count, one pass over the mappings, and (for a delta) one incremental scan. Only the two full
+            // touched chunks and the single word in the partial final chunk may be read by each pass.
+            assert_eq!(frozen.taken.visited.load(Ordering::Relaxed), (2 + incremental as usize) * (2 * (CHUNK / 64) + 1));
+            assert_eq!(pager.dirty_count(), 0);
+            pager.pages().mark_dirty(8);
+            pager.unfreeze(&frozen);
+            assert_eq!(pager.pages().dirty_bits(false).pages(0, n).collect::<Vec<_>>(), [7, 8, CHUNK + 9, last]);
+        }
+    }
 }
