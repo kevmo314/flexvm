@@ -1266,6 +1266,55 @@ def prepare_fail():
     cleanup(n)
 
 
+def arrival_flood():
+    """Arrivals waiting for a held host lock (#486): at most 4 from one peer (8 in all), more
+    refused at once (the source's VM runs on), each refused once its preparation time (7 s) is
+    up; prepared ones hold their places until their source hangs up."""
+    n = "ft-flood"
+    m = setup(n)
+    src = source_vm()
+    names = [(f"ft-flood-{i}", spare(B, 10 + i)) for i in range(4)]
+    replies = {}
+    # The listener takes an arrival's place before it makes its log (`.incoming-*.log`).
+    arrivals = lambda: {f for f in os.listdir(os.path.join(B.run, "vms")) if f.startswith(".incoming-")}
+    before = arrivals()
+    with open(os.path.join(B.state, "lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = time.time()
+        def arrive(name, ip):
+            s, r, _ = migrate_in_raw(B, name, ip, src)
+            replies[name] = (r, time.time() - started)
+            s.close()
+        ts = [threading.Thread(target=arrive, args=a) for a in names]
+        for t in ts:
+            t.start()
+        check("arrival flood: the peer's arrivals hold their places", wait_for(lambda: len(arrivals() - before) == len(names), 5), arrivals() - before)
+        t0 = time.time()
+        r = migrate(A, n, B)
+        took = time.time() - t0
+        for t in ts:
+            t.join(30)
+    check("arrival flood: one past the peer's quota refused at once", not r["ok"] and "arriving here already" in r["error"] and took < 5, (r, took))
+    late = {k: v for k, v in replies.items() if v[0].get("ok") or "not admitted" not in v[0].get("error", "") or v[1] > 12}
+    check("arrival flood: waiting arrivals refused within their preparation time", len(replies) == len(names) and not late, replies)
+    check("arrival flood: running on A only", where(n) == {A: "running"}, where(n))
+    check("arrival flood: md5 intact", md5(A, n) == m)
+    # Prepared, then silent: they hold the quota until they hang up.
+    idle = [migrate_in_raw(B, name, ip, src) for name, ip in names]
+    check("arrival flood: idle arrivals prepared", all(r.get("ok") for _, r, _ in idle), [r for _, r, _ in idle])
+    r = migrate(A, n, B)
+    check("arrival flood: refused while idle arrivals hold the quota", not r["ok"] and "arriving here already" in r["error"], r)
+    for s, _, _ in idle:
+        s.close()
+    gone = lambda: not any(os.path.exists(os.path.join(B.run, "vms", f"{name}.lock")) for name, _ in names)
+    check("arrival flood: idle arrivals give up once their source hangs up", wait_for(gone, 10))
+    r = migrate(A, n, B)
+    check("arrival flood: a later migration works", r["ok"] and where(n).get(B) == "running", r)
+    wait_released(B, n)
+    check("arrival flood: md5 intact on B", md5(B, n) == m)
+    cleanup(n)
+
+
 def abort_superseded():
     """A migration that aborts after the source paused does not resume the
     source if a newer generation of its address was recorded meanwhile (the
@@ -7867,7 +7916,7 @@ SCENARIOS = dict(
     resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
-    prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
+    prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood,
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, quarantine_reboot_ls=quarantine_reboot_ls, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,

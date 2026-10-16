@@ -392,7 +392,10 @@ is closed. Peer names are resolved only by one background thread (at start,
 every 30 s, and when a request meets a name not yet resolved); an address
 needs no lookup, and a name no longer configured admits nothing. Request
 lines must arrive whole within 10 s of the connection being accepted (one deadline, however the line trickles in) and are capped at 64 KiB; at most 512
-requests at once. Restarting or not running it loses nothing but the ability
+requests at once. At most 8 incoming migrations are between their start and
+their commit or refusal at once, and 4 from any one peer: slots are per peer
+address. More are refused at once, before the source pauses, and an arrival
+not prepared within 7 s of its accept is refused too. Restarting or not running it loses nothing but the ability
 to receive.
 
 ## Standby pool

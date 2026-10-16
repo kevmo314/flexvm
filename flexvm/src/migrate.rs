@@ -468,7 +468,18 @@ impl Proc {
         let mut w = conn;
         let mig = req["mig"].as_u64().ok_or("missing mig")?;
         let mut prep = Phases::new();
-        let prepared = match self.prepare_in(req, mig, &mut prep) {
+        // Refused once its source cannot wait longer, or has hung up.
+        let by = crate::listen::prepare_by();
+        let going = || -> Result<()> {
+            if Instant::now() >= by {
+                bail!("not prepared within {} s", crate::listen::PREPARE_WAIT.as_secs());
+            }
+            if crate::util::hung_up(&w) {
+                bail!("the source hung up");
+            }
+            Ok(())
+        };
+        let prepared = match self.prepare_in(req, mig, &mut prep, by, &going) {
             Ok(p) => p,
             Err(e) => {
                 send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?;
@@ -673,7 +684,14 @@ impl Proc {
         Ok(())
     }
 
-    fn prepare_in(&self, req: &Value, mig: u64, t: &mut Phases) -> Result<(crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>)> {
+    fn prepare_in(
+        &self,
+        req: &Value,
+        mig: u64,
+        t: &mut Phases,
+        until: Instant,
+        going: &dyn Fn() -> Result<()>,
+    ) -> Result<(crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>)> {
         crate::util::check_kvm()?;
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let regions = serde_json::from_value::<Vec<_>>(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?;
@@ -686,15 +704,21 @@ impl Proc {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
+        going()?;
+        // Admission, the record and the claim under one wait for the lock, which gives up in time.
+        let l = self.host.lock_by(Some(until)).map_err(|e| format!("not admitted within {} s: {e}", crate::listen::PREPARE_WAIT.as_secs()))?;
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo. Never past the guest's size.
         self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req))?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
-        let claim = self.host.claim_arrival(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0), rev, mig)?;
+        let claim = self.host.claim_arrival(&l, &name, ip, req["gen"].as_u64().unwrap_or(0), rev, mig)?;
+        drop(l);
         self.set_addr(claim);
         t.mark("claim_ip");
-        let idle = self.spawner.take(None)?;
+        going()?;
+        let idle = self.spawner.take(Some(until))?;
+        going()?;
         crate::host::stall("incoming_stall");
         crate::host::gate("incoming_gate");
         t.mark("spawn");
@@ -708,12 +732,13 @@ impl Proc {
             self.holder();
             t.mark("holder");
         }
-        if vm.prepare_load()? {
+        if vm.prepare_load(until)? {
             t.mark("prepare_load");
         }
         if fault("prepare_fail") {
             bail!("injected fault: preparing failed");
         }
+        going()?;
         Ok((vm, ip, source, name, load_set))
     }
 
@@ -767,7 +792,7 @@ impl Proc {
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
             _ => before_commit.take().map_or(Ok(Ok(())), |f| f()).and_then(|r| r).and_then(|()| {
                 // The ownership boundary (refused if fenced).
-                let l = self.host.lock()?;
+                let l = self.host.lock_by(Some(deadline))?;
                 if Instant::now() >= deadline {
                     bail!("the migration ran past its deadline");
                 }

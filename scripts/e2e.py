@@ -63,7 +63,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
-          "prepare_disconnect prepare_trickle unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails quarantine_reboot_ls "
+          "prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails quarantine_reboot_ls "
           "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash ckpt_dir_moved "
           "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log forged_peer forged_pages")
 # The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
@@ -939,7 +939,7 @@ COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_resto
         "faults/target_killed": 20, "faults/start_admission": 18, "faults/standby_admission": 17, "faults/forged_pages": 13,
         "faults/cow_wp_race": 13, "faults/pause_lost": 12, "faults/fetch_tail_enomem": 12, "faults/fetch_enomem_stuck": 11,
         "faults/suspend_resume": 9, "faults/ctrl_z_long_op": 8, "faults/resume_failures": 7, "faults/suspend_killed": 6,
-        "faults/source_unpublished": 6, "faults/cow_crash": 6}
+        "faults/source_unpublished": 6, "faults/cow_crash": 6, "faults/arrival_flood": 18}
 BATCH_S = 20
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
