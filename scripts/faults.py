@@ -4373,12 +4373,13 @@ def cow_exact():
         errors, _, out = writer_check(B, "ft-cow2")
         check("cow: the restored copy has exactly the pause-time memory", errors == 0, out)
         cleanup("ft-cow2")
-        # Again, with write tracking on since the first: the writer rewrites more than a pause copies (#235), so its pages
-        # are all protected and copied on write, as before (`ckpt_hot` checks hot pages).
+        # Again, with write tracking on since the first: the writer rewrites more than a pause copies (#235, HOT_MIB), so
+        # the pause copies up to that (#588) and the rest are protected and copied on write (`ckpt_hot` checks hot pages).
         path2 = ckpt_path("ft-cow-again")
         r = ok(checkpoint(A, n, path2))
         print(f"cow again: paused {r['paused_ms']} ms, hot {r['hot']}, copy {r['copy']}")
-        check("cow again: too many hot pages to copy during the pause", r["hot"]["copied_mib"] == 0 and r["copy"]["rescues"] > 0, r)
+        check("cow again: hot pages copied during the pause up to the cap, the rest copied on write",
+              r["hot"]["copied_mib"] <= 64 < r["dirty_mib"] and r["copy"]["rescues"] > 0, r)
         h = ckhash(A, path2)
         check("cow again: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
         ok(restore(B, path2, name="ft-cow3", ip="auto"))
