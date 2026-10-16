@@ -2610,7 +2610,9 @@ mod tests {
                 thread::sleep(Duration::from_millis(1));
             }
         };
-        a.tell(configured.lock().unwrap().clone(), json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
+        // Not told under `configured`'s guard: the announcer reads the peers under `pending`, which tell takes.
+        let peers = configured.lock().unwrap().clone();
+        a.tell(peers, json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
         until(&|| calls("gone") > 0);
         configured.lock().unwrap().retain(|p| p != "gone");
         until(&|| a.pending.lock().unwrap().is_empty());
