@@ -701,3 +701,31 @@ fn chains_open_to_their_depth_limit_and_refuse_incompatible_parents() {
         }
     }
 }
+
+/// Two instances with different run directories that write checkpoints into one
+/// directory share its lock: it is the host's, by the directory's (dev, inode).
+#[test]
+fn instances_with_different_run_directories_share_a_destinations_lock() {
+    let root = tmp("ck-shared-lock");
+    let dest = root.join("dest");
+    fs::create_dir(&dest).unwrap();
+    let (one, two) = (root.join("one"), root.join("two"));
+    let _a = crate::host::Host::open(&one.join("state"), &one.join("run")).unwrap();
+    let _b = crate::host::Host::open(&two.join("state"), &two.join("run")).unwrap();
+    let st = |p: &std::path::Path| {
+        let f = fs::File::open(p).unwrap();
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(std::os::fd::AsRawFd::as_raw_fd(&f), &mut st) }, 0);
+        st
+    };
+    let held = super::staging::parent_lock(&st(&dest), libc::LOCK_EX).unwrap();
+    // As the other instance would take it, through another path to the same directory.
+    std::os::unix::fs::symlink(&dest, root.join("alias")).unwrap();
+    let e = super::staging::parent_lock(&st(&root.join("alias")), libc::LOCK_EX | libc::LOCK_NB).err().unwrap();
+    assert_eq!(e.raw_os_error(), Some(libc::EWOULDBLOCK));
+    for run in [&one, &two] {
+        assert!(!run.join("run/.locks/checkpoints").exists(), "not a run directory's");
+    }
+    drop(held);
+    drop(super::staging::parent_lock(&st(&dest), libc::LOCK_EX | libc::LOCK_NB).unwrap());
+}

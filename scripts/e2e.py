@@ -325,8 +325,8 @@ class Host:
         left = [f"firecracker pid {p}" for p in self.firecrackers()] + [f"tap {t}" for t in self.taps()]
         left += [f"cgroup {c}" for c in self.cgroups()]
         left += [f"process {p}" for p in self.processes()]
-        left += [f"vm {v}" for v in os.listdir(os.path.join(self.run_dir, "vms")) if v.endswith(".lock")] \
-            if os.path.isdir(os.path.join(self.run_dir, "vms")) else []
+        locks = os.path.join(self.run_dir, "vms", ".locks")
+        left += [f"vm {v}" for v in os.listdir(locks) if v.endswith(".lock")] if os.path.isdir(locks) else []
         return left
 
     def save_logs(self):

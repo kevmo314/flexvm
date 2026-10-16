@@ -231,7 +231,7 @@ def wait_for(cond, timeout):
 def name_free(host, name, timeout=10):
     """Waits until `host` holds no `name`: an arrival it refused or aborted gives the name (its lock)
     up only once its process has; returns whether it did."""
-    lock = os.path.join(host.run, "vms", f"{name}.lock")
+    lock = os.path.join(host.run, "vms", ".locks", f"{name}.lock")
     return wait_for(lambda: name not in vms(host) and not os.path.exists(lock), timeout)
 
 
@@ -733,7 +733,7 @@ def target_killed():
     fault(B, "lost_ack", 0)
     # Killed at once, from its lock and work directory alone (no `ls`): the
     # pull must still be under way.
-    holder = json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))
+    holder = json.load(open(os.path.join(B.run, "vms", ".locks", f"{n}.lock")))
     pid = holder["pid"]
     work = os.path.join(B.run, "w", f"{pid}-{holder['start']}")
     fcs = [json.load(open(os.path.join(work, d, "fc")))["pid"] for d in os.listdir(work) if os.path.exists(os.path.join(work, d, "fc"))]
@@ -1353,7 +1353,7 @@ def arrival_flood():
     # The listener takes an arrival's place before it makes its log (`.incoming-*.log`).
     arrivals = lambda: {f for f in os.listdir(os.path.join(B.run, "vms")) if f.startswith(".incoming-")}
     before = arrivals()
-    with open(os.path.join(B.state, "lock"), "a") as lock:
+    with open(os.path.join(B.state, ".locks", "host"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         started = time.time()
         def arrive(name, ip):
@@ -1381,7 +1381,7 @@ def arrival_flood():
     check("arrival flood: refused while idle arrivals hold the quota", not r["ok"] and "arriving here already" in r["error"], r)
     for s, _, _ in idle:
         s.close()
-    gone = lambda: not any(os.path.exists(os.path.join(B.run, "vms", f"{name}.lock")) for name, _ in names)
+    gone = lambda: not any(os.path.exists(os.path.join(B.run, "vms", ".locks", f"{name}.lock")) for name, _ in names)
     check("arrival flood: idle arrivals give up once their source hangs up", wait_for(gone, 10))
     r = migrate(A, n, B)
     check("arrival flood: a later migration works", r["ok"] and where(n).get(B) == "running", r)
@@ -1410,12 +1410,12 @@ def arrival_cap_restart():
     check("arrival cap restart: one past the quota refused", not r.get("ok") and "arriving here already" in r.get("error", ""), r)
     for s, _, _ in idle:
         s.close()
-    gone = lambda: not arrivals(B) & held and not any(os.path.exists(os.path.join(B.run, "vms", f"{n}.lock")) for n, _ in names)
+    gone = lambda: not arrivals(B) & held and not any(os.path.exists(os.path.join(B.run, "vms", ".locks", f"{n}.lock")) for n, _ in names)
     check("arrival cap restart: the arrivals give up once their source hangs up", wait_for(gone, 10), arrivals(B))
     s, r, _ = migrate_in_raw(B, "ft-cap-x", spare(B, 30), src)
     check("arrival cap restart: a later arrival is taken", r.get("ok"), r)
     s.close()
-    lock = os.path.join(B.run, "vms", "ft-cap-x.lock")
+    lock = os.path.join(B.run, "vms", ".locks", "ft-cap-x.lock")
     check("arrival cap restart: and gives up too", wait_for(lambda: not os.path.exists(lock), 10))
 
 def abort_superseded():
@@ -1497,7 +1497,7 @@ def nothing_on(label, other, n, ip, before):
     """`other` has none of `n` left (as of `before`, from `boundary`): no process, arrival, name
     lock, claim, tap or migration record (one left, its arrival killed say, reads aborted and goes
     once asked about)."""
-    lock = os.path.join(other.run, "vms", f"{n}.lock")
+    lock = os.path.join(other.run, "vms", ".locks", f"{n}.lock")
     left = lambda: (n in vms(other), os.path.exists(lock), arrivals(other), taps(other) - before[0], addr(other, ip).get("holder"))
     check(f"{label}: nothing of it left on {other}", wait_for(lambda: left() == (False, False, set(), set(), None), 15), left())
     made = lambda: migs_of(other) - before[1]
@@ -2475,7 +2475,7 @@ def reconcile_announce():
     fault(B, "lost_ack", 0)
     check("reconcile announce: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
     check("reconcile announce: B committed the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
-    os.kill(json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"], signal.SIGKILL)
+    os.kill(json.load(open(os.path.join(B.run, "vms", ".locks", f"{n}.lock")))["pid"], signal.SIGKILL)
     fault(B, "status", 0)
     check("reconcile announce: runs on A again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
     fault(A, "pages_slow", 0)
@@ -2569,7 +2569,7 @@ def reconcile_kill():
     got = unknown_then_kill(n, signal.SIGINT, True, use_cli=True)
     if got:
         ip, gen, _, mig = got
-        os.kill(json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"], signal.SIGKILL)
+        os.kill(json.load(open(os.path.join(B.run, "vms", ".locks", f"{n}.lock")))["pid"], signal.SIGKILL)
         cli(A, "debug", "gc")
         check(f"{what}: unsettled while the target cannot say", len(owed(A)) == 1 and addr(A, ip).get("lent") == gen, (owed(A), addr(A, ip)))
         code, out, err = cli(A, "reclaim", ip)
@@ -2609,7 +2609,7 @@ def reconcile_kill():
     r = [None]
     th = threading.Thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
     th.start()
-    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
     wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
     os.kill(pid, signal.SIGINT)
     th.join()
@@ -2637,9 +2637,9 @@ def reconcile_kill():
     check(f"{what}: the VM runs on at B, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
     # A forgets the outcome before it tells B `done`, so B's own retirement (its source gone)
     # could take the released record first, and `done` would find nothing (#380). Held off
-    # (its `.retire.lock`, which a pass skips while taken), only `done` can take it.
+    # (its `.locks/retire`, which a pass skips while taken), only `done` can take it.
     import fcntl
-    retire = open(os.path.join(B.run, ".retire.lock"), "a")
+    retire = open(os.path.join(B.run, ".locks", "retire"), "a")
     fcntl.flock(retire, fcntl.LOCK_EX)
     try:
         b_log = B.listen_log
@@ -2869,7 +2869,7 @@ def arrival_abort_route():
     n, ip = "ft-abort-route", A.ips.split("-")[1].rsplit(".", 1)[0] + ".201"
     scenario_vms.add(n)
     s, mig, gw, gen = arrival_with_peer_route(n, ip)
-    seen, lock = set(), os.path.join(B.run, "vms", f"{n}.lock")
+    seen, lock = set(), os.path.join(B.run, "vms", ".locks", f"{n}.lock")
     # Until it gives up (its preload never comes), watch the route.
     end = time.time() + 5
     while time.time() < end:
@@ -2891,7 +2891,7 @@ def arrival_killed_route():
     n, ip = "ft-killed-route", A.ips.split("-")[1].rsplit(".", 1)[0] + ".202"
     scenario_vms.add(n)
     s, mig, gw, gen = arrival_with_peer_route(n, ip)
-    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
     pid = json.load(open(lock))["pid"]
     # Its load failed; it waits for the preloaded pages.
     time.sleep(2)
@@ -4191,7 +4191,7 @@ def standby():
     comes up, `standby 0` stops them all; without one, run loads cold."""
     t = args.template
     ok(cli_json(A, "standby", "--template", t, "2"))
-    live = lambda: len([f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
+    live = lambda: len([f for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
     check("standby: two ready", live() == 2, live())
     r = claimed = ok(run(A, "ft-sb1"))
     check("standby: run claims one", r["standby"] is True, r)
@@ -4228,7 +4228,7 @@ def standby_vm_ips():
     ok(run(A, old))
     old_ip = vms(A)[old]["ip"]
     ok(cli_json(A, "standby", "--template", t, "1"))
-    ready = lambda: {f[:-5] for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])}
+    ready = lambda: {f[:-5] for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])}
     pool = ready()
     check("standby vm ips: a standby ready before the change", len(pool) == 1, pool)
     new, dns = spare(A, 1), "192.0.2.53"
@@ -5643,7 +5643,7 @@ def mem_high_evict():
     check("mem high evict: moved to B", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-2000:]))
     st = wait_released(B, n, timeout=60)
     check("mem high evict: pulled and released", st["released"] is True and st["failed"] is None, st)
-    holds = lambda: [f for f in os.listdir(os.path.join(B.run, "holds")) if not f.startswith(".")] if os.path.isdir(os.path.join(B.run, "holds")) else []
+    holds = lambda: [f for f in os.listdir(os.path.join(B.run, ".locks", "holds")) if not f.startswith(".")] if os.path.isdir(os.path.join(B.run, ".locks", "holds")) else []
     check("mem high evict: the arrival's held grant goes once its memory is in", wait_for(lambda: not holds(), 10), holds())
     check("mem high evict: the fill finishes there", wait_for(lambda: hog_done(B, n), 240), cgroup(B, n))
     check("mem high evict: md5 intact", md5(B, n) == m)
@@ -6213,7 +6213,7 @@ def arrival_grew():
         raise Skip(f"its guest has {v['guest_mib']} MiB, too little to grow by {grow} MiB")
     # B's room, whatever this machine has: ample for its preflight and for the move given room.
     with marks(1024, 1024, host=B), mem_available_as(B, 1024 + ARRIVAL_ROOM):
-        hold_dir = os.path.join(B.run, "holds")
+        hold_dir = os.path.join(B.run, ".locks", "holds")
         holds = lambda: [f for f in os.listdir(hold_dir) if not f.startswith(".")] if os.path.isdir(hold_dir) else []
         migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
         check("arrival grew: b holds nothing before", not holds(), holds())
@@ -6258,7 +6258,7 @@ def arrival_grew_admitted():
 
 def grew_admitted():
     grow = 1024
-    hold_dir = os.path.join(B.run, "holds")
+    hold_dir = os.path.join(B.run, ".locks", "holds")
     # Live ones: a dead owner's file stays, its lock free, until an admission next looks.
     holds = lambda: {int(f.split("-")[0]): int(f.split("-")[1]) for f in (os.listdir(hold_dir) if os.path.isdir(hold_dir) else [])
                      if not f.startswith(".") and not released(f)}
@@ -6298,7 +6298,7 @@ def grew_admitted():
     m = setup(n, mib=1)
     t, res, first, more = grown(n, "grew killed")
     check("grew killed: b's hold grew by what the guest grew by", more, (first, holds()))
-    lock = json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))
+    lock = json.load(open(os.path.join(B.run, "vms", ".locks", f"{n}.lock")))
     os.kill(lock["pid"], signal.SIGKILL)
     t.join()
     fault(B, "admitted_stall", 0)
@@ -6338,7 +6338,7 @@ def meminfo_unreadable():
     mtime = lambda p: os.stat(p).st_mtime if os.path.exists(p) else None
     try:
         ok(cli_json(A, "standby", "--template", t, "1"))
-        locks = lambda: [f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])]
+        locks = lambda: [f for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])]
         check("meminfo: a standby ready", wait_for(lambda: len(locks()) == 1, 60), locks())
         ready, pressed = locks(), mtime(pressure)
         fault(A, "no_meminfo", 600000)
@@ -6363,7 +6363,7 @@ def standby_admission():
     ok(run(A, "ft-sbadm-dup"))
     try:
         ok(cli_json(A, "standby", "--template", t, "1"))
-        live = lambda: len([f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
+        live = lambda: len([f for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
         check("standby admission: one ready", wait_for(lambda: live() == 1, 60), live())
         with tight_reserve(256 + 48):
             r = run(A, "ft-sbadm-dup")
@@ -6407,7 +6407,7 @@ def kill_refused_checkpoint():
     t = threading.Thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
     t.start()
     # The target stalls preparing; the source holds its operation lock, not yet a source.
-    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
     wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
     os.kill(pid, signal.SIGINT)
     t.join()
@@ -6592,6 +6592,14 @@ def forged_peer():
     recorded, a huge vmstate, too many preloaded pages, an endless request
     line, a huge page request; page-server refusals reach the client."""
     tid = source_vm()
+    # #549: a valid generation must never route a peer's underlay into a guest.
+    peer_ip = A.addr.rsplit(":", 1)[0]
+    n = "ft-forged-peer-ip"
+    scenario_vms.add(n)
+    s, r, _ = migrate_in_raw(B, n, peer_ip, tid)
+    s.close()
+    check("forged peer ip: arrival refused", not r.get("ok") and "not a vm's address" in r.get("error", ""), r)
+    check("forged peer ip: no guest or tap prepared", n not in vms(B), vms(B).get(n))
     n, ip = "ft-forged-gen", spare(B, 2)
     scenario_vms.add(n)
     s, r, _ = migrate_in_raw(B, n, ip, tid, gen=0)
@@ -6927,7 +6935,7 @@ def incoming_killed():
     t = threading.Thread(target=lambda: (lambda x: (s.__setitem__(0, x[0]), r.__setitem__(0, x[1]), mig.__setitem__(0, x[2])))(migrate_in_raw(B, n, ip, source_vm())))
     t.start()
     pid = None
-    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
     wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
     holder = json.load(open(lock))
     pid, work = holder["pid"], os.path.join(B.run, "w", f"{holder['pid']}-{holder['start']}")
@@ -7044,7 +7052,7 @@ def claim_killed():
     # The claim parks once the VM runs, before the standby answers (`claim_stall`, a gate).
     clear_gate(A, "claim_stall")
     fault(A, "claim_stall", 60000)
-    lockdir = standby_dir(A.run, args.template)
+    lockdir = os.path.join(standby_dir(A.run, args.template), ".locks")
     pids = [json.load(open(os.path.join(lockdir, f)))["pid"] for f in os.listdir(lockdir) if f.endswith(".lock")]
     res = {}
     t = threading.Thread(target=lambda: res.update(r=cli_json(A, "run", n, "--template", args.template, "-d")))
@@ -7471,7 +7479,7 @@ def pull_died():
     stall.start()
     ok(migrate(B, n, A))
     stall.join()
-    pid = json.load(open(os.path.join(A.run, "vms", f"{n}.lock")))["pid"]
+    pid = json.load(open(os.path.join(A.run, "vms", ".locks", f"{n}.lock")))["pid"]
     os.kill(pid, signal.SIGKILL)
     fault(B, "pages", 0)
     check("home died: the source runs its copy again", wait_for(lambda: vms(B).get(n, {}).get("state") == "running", 60), where(n))
@@ -7859,7 +7867,7 @@ def cmd_flag():
     scenario_vms.update({n, r})
     ok(cli_json(A, "standby", "--template", t, "1"))
     try:
-        live = lambda: len([f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
+        live = lambda: len([f for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
         check("cmd flag: a standby ready", wait_for(lambda: live() == 1, 60), live())
         # Hold the old publish-before-bind window open deterministically.
         clear_gate(A, "claim_stall")
@@ -7905,7 +7913,7 @@ def pause_cmd_start():
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--",
                           "echo started; exit 9"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV, text=True)
     # Once it holds its name its signals are taken (blocked from its first instruction).
-    lock = os.path.join(A.run, "vms", f"{n}.lock")
+    lock = os.path.join(A.run, "vms", ".locks", f"{n}.lock")
     check("pause cmd: starting", wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 30))
     os.kill(p.pid, signal.SIGTSTP)
     fault(A, "start_stall", 0)
@@ -8354,7 +8362,7 @@ def in_cgroup(cg):
 
 
 def standby_pids(host, t):
-    d = standby_dir(host.run, t)
+    d = os.path.join(standby_dir(host.run, t), ".locks")
     pids = []
     for f in os.listdir(d) if os.path.isdir(d) else []:
         if f.endswith(".lock"):
@@ -8541,7 +8549,7 @@ def arrival_log():
     res = {}
     t = threading.Thread(target=lambda: res.update(r=migrate_in_raw(B, n, ip, src)))
     t.start()
-    lock = os.path.join(vd, f"{n}.lock")
+    lock = os.path.join(vd, ".locks", f"{n}.lock")
     wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
     pid = json.load(open(lock))["pid"]
     mine = arrivals() - before

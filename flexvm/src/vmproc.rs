@@ -1814,8 +1814,10 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         Start::Incoming { req } => {
             let log = std::env::var_os("FLEXVM_INCOMING_LOG").map(PathBuf::from);
             std::env::remove_var("FLEXVM_INCOMING_LOG");
-            // Its own lock as well as its stdout's, until the log is published or removed.
-            let _held = log.as_ref().and_then(|l| std::fs::File::open(l).ok()).filter(|f| crate::host::flock(f, libc::LOCK_SH).is_ok());
+            // The arrival's lock (`listen::incoming`), held until the log is published or removed;
+            // close-on-exec, so no Firecracker holds it on.
+            let held =
+                log.as_ref().map(|_| unsafe { std::fs::File::from_raw_fd(5) }).filter(|_| unsafe { libc::fcntl(5, libc::F_SETFD, libc::FD_CLOEXEC) } == 0);
             let res = p.migrate_in(&req, unsafe { std::net::TcpStream::from_raw_fd(3) });
             if let Some(log) = log {
                 match crate::listen::finish_incoming_log(&p.host, &p.name(), &log, res.is_ok()) {
@@ -1827,6 +1829,10 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
                     Ok(()) => {}
                     Err(e) => crate::log!("arrival log {}: {e}", log.display()),
                 }
+            }
+            // Let go of explicitly, not by close: see `host::Flock`.
+            if let Some(held) = held {
+                let _ = crate::host::flock(&held, libc::LOCK_UN);
             }
             res.map(|()| Value::Null)
         }
@@ -2184,7 +2190,7 @@ fn rank(mut vms: Vec<Entry>, rss: impl Fn(&Entry) -> u64) -> Vec<Entry> {
 }
 
 /// Per VM and peer (a peer may refuse a big VM but take a small one), in
-/// RUN/evict.backoff under evict.lock, so changing deciders share it and a
+/// RUN/evict.backoff under STATE/.locks/evict, so changing deciders share it and a
 /// reboot clears it. Deadlines use boot-clock seconds and the boot id also
 /// expires old wall-clock records. An entry a minute past its cooldown is forgotten.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -2222,7 +2228,7 @@ fn eviction_time() -> u64 {
 static EVICTING: AtomicBool = AtomicBool::new(false);
 
 /// Under pressure standby VMs go first, then VMs move to peers. Every VM
-/// process calls this each tick; the `STATE/evict.lock` holder decides, at
+/// process calls this each tick; the `STATE/.locks/evict` holder decides, at
 /// most every 5 s, and runs the eviction on a thread of its own that keeps
 /// the lock until it is done, so the controller ticks on meanwhile.
 ///
@@ -2249,7 +2255,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     if (avail >= at && !evicting && !starved_here) || EVICTING.load(Ordering::SeqCst) {
         return;
     }
-    let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("evict.lock")) else { return };
+    let Ok(lock) = crate::host::private_file(&crate::host::locks(&host.state).join("evict")) else { return };
     let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     let pressure = avail < until && (evicting || avail < at);
     if pressure && !evicting {
@@ -2297,14 +2303,14 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
 }
 
 /// Standby VMs a controller signalled, settled on its later ticks, never
-/// waited for. `STATE/standby.stop.lock` is held only until its next tick starts.
+/// waited for. `STATE/.locks/standby.stop` is held only until its next tick starts.
 struct Stopping {
     lock: Option<crate::host::Flock>,
     fds: Vec<crate::host::PidFd>,
     by: Instant,
 }
 
-/// Under the reserve: SIGUSR1s the standby VMs, under `STATE/standby.stop.lock`
+/// Under the reserve: SIGUSR1s the standby VMs, under `STATE/.locks/standby.stop`
 /// (not eviction's lock, which a migration may hold for a while), and marks
 /// the pressure so they are not refilled. True until any exits (an idle one
 /// takes ~200 ms) or a second passes, while another process is stopping
@@ -3035,6 +3041,29 @@ mod tests {
         assert_eq!(l.wanted.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn migrate_in_refuses_peer_ip_before_preparing_anything() {
+        let (p, _root) = test_proc("incoming-peer", None);
+        let ip = "10.98.0.1";
+        p.host
+            .clone()
+            .configure(|cfg| {
+                cfg.peers = vec![format!("{ip}:7000")];
+                Ok(())
+            })
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut source = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let conn = listener.accept().unwrap().0;
+        let e = p.migrate_in(&json!({"ip": ip, "mig": 7, "gen": 99, "name": "forged"}), conn).unwrap_err();
+        assert!(e.to_string().contains("not a vm's address"), "{e}");
+        let reply = crate::util::recv_json(&mut std::io::BufReader::new(&mut source)).unwrap().unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(!p.host.vms("forged", "lock").unwrap().exists());
+        assert!(!p.host.state.join("addrs").join(ip).exists());
+        assert!(std::fs::read_dir(p.host.state.join("migs")).unwrap().next().is_none());
+    }
+
     /// A VM process with no VM, holding `name` if given.
     fn test_proc(tag: &str, name: Option<&str>) -> (Arc<Proc>, crate::test_util::TempDir) {
         let root = crate::test_util::TempDir::new(&format!("fv-proc-{tag}"));
@@ -3421,8 +3450,8 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(".template"), "t").unwrap();
         let id = Ident::of(child.id()).unwrap();
-        let path = d.join(format!("{}.lock", id.key()));
-        let lock = crate::host::Flock::new(std::fs::File::create(&path).unwrap(), libc::LOCK_EX).unwrap();
+        let path = crate::host::locks(&d).join(format!("{}.lock", id.key()));
+        let lock = crate::host::Flock::new(crate::host::private_file(&path).unwrap(), libc::LOCK_EX).unwrap();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         (child, lock)
     }
@@ -3448,7 +3477,7 @@ mod tests {
         }
         // Mid-claim (`PID-START.claim` locked): not counted as stopped, so eviction starts.
         let id = Ident::of(child.id()).unwrap();
-        let claim = std::fs::File::create(d.join(format!("{}.claim", id.key()))).unwrap();
+        let claim = crate::host::private_file(&crate::host::locks(&d).join(format!("{}.claim", id.key()))).unwrap();
         let claim = crate::host::Flock::new(claim, libc::LOCK_EX).unwrap();
         relieve(&host, Some(0), false, &mut stopping);
         assert!(!pressure.exists() && active.exists());

@@ -291,8 +291,9 @@ impl Proc {
         let ck = Checkpoint::open(&dir)?;
         let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
         t.mark("verify_checkpoint");
-        let tpl = self.admit_checkpoint(&ck, &mut t)?;
         let ip = ck.manifest.ip;
+        crate::listen::check_vm_ip(&self.host, ip, None, Instant::now() + crate::listen::PREPARE_WAIT)?;
+        let tpl = self.admit_checkpoint(&ck, &mut t)?;
         let claim = {
             let l = self.host.lock()?;
             if !self.host.current(&l, ip, gen)? {
@@ -344,13 +345,16 @@ impl Proc {
         let ck = Checkpoint::open(dir)?;
         t.mark("verify_checkpoint");
         let name = name.unwrap_or(&ck.manifest.name).to_string();
-        self.set_name(self.host.take_name(&name, false)?);
-        let tpl = self.admit_checkpoint(&ck, &mut t)?;
         let want = match ip {
             Some("auto") => None,
             Some(ip) => Some(ip.parse().map_err(|_| format!("bad address {ip:?}"))?),
             None => Some(ck.manifest.ip),
         };
+        if let Some(ip) = want {
+            crate::listen::check_vm_ip(&self.host, ip, None, Instant::now() + crate::listen::PREPARE_WAIT)?;
+        }
+        self.set_name(self.host.take_name(&name, false)?);
+        let tpl = self.admit_checkpoint(&ck, &mut t)?;
         // Decided and claimed under one lock, by one reading of the range: a change
         // between them cannot send a local address to `claim_new` as foreign.
         let l = self.host.lock()?;
