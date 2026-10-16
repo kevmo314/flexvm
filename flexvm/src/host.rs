@@ -583,11 +583,11 @@ impl Host {
     }
 
     pub fn vms(&self, name: &str, ext: &str) -> PathBuf {
-        self.run.join("vms").join(format!("{name}.{ext}"))
+        self.run.join("vms").join(format!("{}.{ext}", confined(name)))
     }
 
     pub fn suspended(&self, name: &str) -> PathBuf {
-        self.state.join("suspended").join(name)
+        self.state.join("suspended").join(confined(name))
     }
 
     /// Whether a suspended VM of this name may still be resumed (or is
@@ -2353,6 +2353,19 @@ fn tap_prefix(state: &Path) -> String {
     std::iter::once('f').chain((0..5).map(digit)).collect()
 }
 
+/// Stands in for a name `check_name` refuses in the paths made from VM
+/// names, so none (a peer's "../x", say) reaches outside its directory. No
+/// VM can hold it: names never start with '.'.
+const BAD_NAME: &str = ".bad-name";
+
+fn confined(name: &str) -> &str {
+    if check_name(name).is_ok() {
+        name
+    } else {
+        BAD_NAME
+    }
+}
+
 pub fn check_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 || name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
         bail!("bad vm name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.'");
@@ -2490,6 +2503,20 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_paths_stay_in_their_directories() {
+        let (_base, h) = host("confined");
+        for name in ["../x", "../../var/run/docker", "a/b", "/etc/passwd", "", ".", "..", ".lock", "x\0y"] {
+            for p in [h.sock(name), h.vms(name, "lock")] {
+                assert_eq!(p.parent(), Some(h.run.join("vms").as_path()), "{name:?}");
+                assert!(p.file_name().unwrap().to_str().unwrap().starts_with(BAD_NAME), "{name:?}");
+            }
+            assert_eq!(h.suspended(name), h.state.join("suspended").join(BAD_NAME), "{name:?}");
+        }
+        assert_eq!(h.sock("web.1"), h.run.join("vms/web.1.sock"));
+        assert_eq!(h.suspended("web.1"), h.state.join("suspended/web.1"));
+    }
 
     fn host(tag: &str) -> (crate::test_util::TempDir, Host) {
         let base = crate::test_util::TempDir::new(&format!("host-{tag}"));

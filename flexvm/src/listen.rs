@@ -512,8 +512,12 @@ pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accep
 fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let fwd = json!({"op": "pages", "mig": req["mig"]});
-    if let Err(e) = crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()], std::time::Instant::now() + std::time::Duration::from_secs(5)) {
-        refuse(conn, &format!("vm {name} is not the source of migration {}: {e}", req["mig"]), Some(Duration::from_secs(1)));
+    let sent =
+        crate::host::check_name(name).and_then(|()| crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()], Instant::now() + Duration::from_secs(5)));
+    if let Err(e) = sent {
+        // The reason stays here: it tells what exists on this host.
+        crate::log!("migration {}: page request for {name:?} refused: {e}", req["mig"]);
+        refuse(conn, &format!("vm {name:?} is not the source of migration {}", req["mig"]), Some(Duration::from_secs(1)));
     }
     Ok(())
 }
@@ -599,6 +603,29 @@ mod tests {
         }
         std::mem::forget(activated().expect("fd 3 taken"));
         assert_eq!(unsafe { libc::fcntl(3, libc::F_GETFD) } & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    }
+
+    #[test]
+    fn pages_stays_in_run_vms_and_tells_nothing() {
+        let root = crate::test_util::TempDir::new("pages-name");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        // A socket the traversal name would reach, and a suspended VM.
+        let outside = std::os::unix::net::UnixListener::bind(root.join("outside.sock")).unwrap();
+        outside.set_nonblocking(true).unwrap();
+        std::fs::create_dir_all(host.suspended("asleep")).unwrap();
+        std::fs::write(host.suspended("asleep").join("manifest.json"), "").unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ask = |name: &str| {
+            let mut c = TcpStream::connect(tcp.local_addr().unwrap()).unwrap();
+            pages(&host, &json!({"op": "pages", "name": name, "mig": 7}), tcp.accept().unwrap().0).unwrap();
+            let mut reply = String::new();
+            c.read_to_string(&mut reply).unwrap();
+            serde_json::from_str::<Value>(&reply).unwrap()["error"].as_str().unwrap().to_string()
+        };
+        for name in ["../../outside", "asleep", "nothing"] {
+            assert_eq!(ask(name), format!("vm {name:?} is not the source of migration 7"));
+        }
+        assert_eq!(outside.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 
     #[test]
