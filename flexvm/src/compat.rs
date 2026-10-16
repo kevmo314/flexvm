@@ -101,22 +101,78 @@ impl Compat {
     }
 }
 
-/// Cached while the Firecracker binary is unchanged.
+/// Identity of the host probe, including module reloads within a boot. Directory
+/// inodes/ctimes change on reload even if a static /dev/kvm node survives it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HostKey {
+    boot_id: String,
+    firecracker: Stamp,
+    kvm: Stamp,
+    modules: [Option<Stamp>; 3],
+}
+
+impl HostKey {
+    fn local(firecracker: Stamp) -> Result<Self> {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        if boot_id.trim().is_empty() {
+            bail!("empty boot id");
+        }
+        let mut modules = [None, None, None];
+        for (slot, name) in modules.iter_mut().zip(["kvm", "kvm_intel", "kvm_amd"]) {
+            match std::fs::metadata(format!("/sys/module/{name}")) {
+                Ok(m) => *slot = Some(Stamp::of(&m)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Self { boot_id, firecracker, kvm: Stamp::of(&std::fs::metadata("/dev/kvm")?), modules })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct HostCache {
+    version: u32,
+    key: HostKey,
+    compat: Compat,
+}
+
+/// Cache failures only cost another probe. Version the probe as well as its inputs
+/// so a future change to the CPUID/MSR selection can invalidate older results.
+fn host_compat(run: Option<&Path>, key: Option<&HostKey>, probe: impl FnOnce() -> Result<Compat>) -> Result<Compat> {
+    let read = run.and_then(|d| std::fs::read(d.join("compat.json")).ok()).and_then(|b| serde_json::from_slice::<HostCache>(&b).ok());
+    if let Some(cached) = read.filter(|c| c.version == 1 && Some(&c.key) == key) {
+        return Ok(cached.compat);
+    }
+    let compat = probe()?;
+    if let (Some(run), Some(key)) = (run, key) {
+        let cached = HostCache { version: 1, key: key.clone(), compat: compat.clone() };
+        let _ = crate::util::write_file(run, "compat.json", &serde_json::to_vec(&cached)?, false);
+    }
+    Ok(compat)
+}
+
+/// Shared across VM processes and cached in-process while the host key is unchanged.
 pub fn local(pid: u32) -> Result<Compat> {
-    static CACHE: Mutex<Option<(Stamp, Compat)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<(HostKey, Compat)>> = Mutex::new(None);
     let firecracker = PathBuf::from(format!("/proc/{pid}/exe"));
     let stamp = Stamp::of(&std::fs::metadata(&firecracker)?);
+    // If an identity cannot be read, probe rather than trust an unverifiable cache.
+    let key = HostKey::local(stamp).ok();
     let mut cache = CACHE.lock().unwrap();
-    if let Some((_, c)) = cache.as_ref().filter(|(s, _)| *s == stamp) {
+    if let Some((_, c)) = cache.as_ref().filter(|(k, _)| Some(k) == key.as_ref()) {
         return Ok(c.clone());
     }
-    let (stamp, binary) = firecracker_id(&firecracker, crate::host::run_dir())?;
-    let kvm = File::open("/dev/kvm").map_err(|e| format!("/dev/kvm: {e}"))?;
-    let mut compat = Compat::of_cpuid(&supported_cpuid(&kvm)?, binary)?;
-    compat.tsc_khz = tsc_khz(&kvm)?;
-    compat.tsc_control = ioctl(&kvm, 0xae03, 60, "KVM_CHECK_EXTENSION(TSC_CONTROL)")? > 0;
-    compat.msrs = saved_msrs(&kvm)?;
-    *cache = Some((stamp, compat.clone()));
+    let run = crate::host::run_dir();
+    let compat = host_compat(run, key.as_ref(), || {
+        let (_, binary) = firecracker_id(&firecracker, run)?;
+        let kvm = File::open("/dev/kvm").map_err(|e| format!("/dev/kvm: {e}"))?;
+        let mut compat = Compat::of_cpuid(&supported_cpuid(&kvm)?, binary)?;
+        compat.tsc_khz = tsc_khz(&kvm)?;
+        compat.tsc_control = ioctl(&kvm, 0xae03, 60, "KVM_CHECK_EXTENSION(TSC_CONTROL)")? > 0;
+        compat.msrs = saved_msrs(&kvm)?;
+        Ok(compat)
+    })?;
+    *cache = key.map(|key| (key, compat.clone()));
     Ok(compat)
 }
 
@@ -331,6 +387,103 @@ mod tests {
         h.tsc_khz = 2_000_000;
         h.msrs = [0x10, 0x122, 0xda0].into();
         h
+    }
+
+    fn host_key(root: &Path) -> HostKey {
+        let stamp = Stamp::of(&std::fs::metadata(root).unwrap());
+        HostKey { boot_id: "boot-a".into(), firecracker: stamp.clone(), kvm: stamp.clone(), modules: [Some(stamp), None, None] }
+    }
+
+    #[test]
+    fn host_cache_miss_probes_and_hit_skips_probe() {
+        let root = crate::test_util::TempDir::new("host-compat");
+        let key = host_key(&root);
+        let expected = host();
+        assert_eq!(host_compat(Some(&root), Some(&key), || Ok(expected.clone())).unwrap(), expected);
+        assert!(root.join("compat.json").is_file());
+        assert_eq!(host_compat(Some(&root), Some(&key), || panic!("cache hit must not probe KVM")).unwrap(), expected);
+        // A missing run directory or unverifiable host identity must still work.
+        assert_eq!(host_compat(None, Some(&key), || Ok(expected.clone())).unwrap(), expected);
+        let mut changed = expected.clone();
+        changed.tsc_khz += 1;
+        assert_eq!(host_compat(Some(&root), None, || Ok(changed.clone())).unwrap(), changed);
+        assert_eq!(host_compat(Some(&root), Some(&key), || panic!("missing identity must not overwrite cache")).unwrap(), expected);
+    }
+
+    #[test]
+    fn host_cache_invalidates_each_host_identity() {
+        let root = crate::test_util::TempDir::new("host-compat-key");
+        let key = host_key(&root);
+        // A different inode provides a distinct stamp without relying on clock resolution.
+        let replacement = root.join("replacement");
+        std::fs::write(&replacement, b"replacement").unwrap();
+        let stamp = Stamp::of(&std::fs::metadata(replacement).unwrap());
+        let mut keys = vec![key.clone(); 7];
+        keys[0].boot_id = "boot-b".into();
+        keys[1].firecracker = stamp.clone();
+        keys[2].kvm = stamp.clone();
+        keys[3].modules[0] = Some(stamp.clone());
+        keys[4].modules[1] = Some(stamp.clone());
+        keys[5].modules[2] = Some(stamp);
+        keys[6].modules[0] = None;
+        for changed in keys {
+            host_compat(Some(&root), Some(&key), || Ok(host())).unwrap();
+            let calls = std::cell::Cell::new(0);
+            host_compat(Some(&root), Some(&changed), || {
+                calls.set(calls.get() + 1);
+                Ok(host())
+            })
+            .unwrap();
+            assert_eq!(calls.get(), 1, "{changed:?}");
+            host_compat(Some(&root), Some(&changed), || panic!("replacement must be cached")).unwrap();
+        }
+    }
+
+    #[test]
+    fn host_cache_reprobes_corrupt_incomplete_and_unreadable_entries() {
+        let root = crate::test_util::TempDir::new("host-compat-invalid");
+        let key = host_key(&root);
+        let cached = HostCache { version: 1, key: key.clone(), compat: host() };
+        let valid = serde_json::to_value(&cached).unwrap();
+        let mut invalid = vec![b"broken".to_vec(), b"{}".to_vec()];
+        for field in ["tsc_khz", "tsc_control", "msrs", "features", "xsave", "cpu", "firecracker"] {
+            let mut value = valid.clone();
+            value["compat"].as_object_mut().unwrap().remove(field);
+            invalid.push(serde_json::to_vec(&value).unwrap());
+        }
+        for (field, value) in [
+            ("tsc_khz", serde_json::json!(0)),
+            ("cpu", serde_json::json!("")),
+            ("firecracker", serde_json::json!("")),
+            ("msrs", serde_json::json!([])),
+            ("features", serde_json::json!({})),
+        ] {
+            let mut entry = valid.clone();
+            entry["compat"][field] = value;
+            invalid.push(serde_json::to_vec(&entry).unwrap());
+        }
+        let mut old = valid.clone();
+        old["version"] = serde_json::json!(0);
+        invalid.push(serde_json::to_vec(&old).unwrap());
+        for bytes in invalid {
+            std::fs::write(root.join("compat.json"), bytes).unwrap();
+            let calls = std::cell::Cell::new(0);
+            assert_eq!(
+                host_compat(Some(&root), Some(&key), || {
+                    calls.set(calls.get() + 1);
+                    Ok(host())
+                })
+                .unwrap(),
+                host()
+            );
+            assert_eq!(calls.get(), 1);
+            host_compat(Some(&root), Some(&key), || panic!("repaired cache must hit")).unwrap();
+        }
+        std::fs::remove_file(root.join("compat.json")).unwrap();
+        assert!(host_compat(Some(&root), Some(&key), || bail!("probe failed")).is_err());
+        assert!(!root.join("compat.json").exists());
+        std::fs::create_dir(root.join("compat.json")).unwrap();
+        assert_eq!(host_compat(Some(&root), Some(&key), || Ok(host())).unwrap(), host());
     }
 
     #[test]
