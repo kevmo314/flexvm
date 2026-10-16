@@ -252,7 +252,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "handoff_gate", "ckpt_wp_race", "ckpt_rescue_fail",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail",
           "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail", "hold_route_fail", "hold_plug_fail",
           "exec_lose_echo", "exec_retry")
@@ -2388,33 +2388,34 @@ def delayed_announce():
 
 
 def delayed_announce_handoff():
-    """#492: as delayed_announce, but the source's late announcement reaches
-    B while B's handoff is still under way (`handoff_stall`, 3 s). B recorded
-    the arrival's revision at the commit, before the source had its answer,
-    so the late one is stale already: it never names A as the way to the
-    address in B's record."""
+    """#492, #533: as delayed_announce, but the source's late announcement reaches
+    B while B's handoff is still under way (held at `handoff_gate`). B records
+    the arrival's revision only once its handoff is done, so its record still
+    has the source's; the arrival published the next revision at its commit
+    (RUN/live), which B's listener judges by, so the late one is stale all the
+    same: it never names A as the way to the address in B's record."""
     n = "ft-delayed-handoff"
     fault(B, "route_stall", 60000)
     ok(run(A, n))
     v = vms(A)[n]
     ip, gen = v["ip"], v["gen"]
     check("delayed handoff: B holds up A's announcement", wait_for(lambda: conns(B) == 1, 10), conns(B))
-    clear_gate(B, "handoff_stall")
-    fault(B, "handoff_stall", 30000)
+    clear_gate(B, "handoff_gate")
+    fault(B, "handoff_gate", 60000)
     r = migrate(A, n, B)
-    answered = time.time()
     check("delayed handoff: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
-    check("delayed handoff: B's handoff is stalled", wait_for(lambda: reached(B, "handoff_stall"), 2), reached(B, "handoff_stall"))
-    check("delayed handoff: B recorded the arrival's revision at the commit", addr(B, ip).get("rev") == 1, addr(B, ip))
+    check("delayed handoff: B's handoff is held", wait_for(lambda: reached(B, "handoff_gate"), 5), reached(B, "handoff_gate"))
+    check("delayed handoff: B's record trails the arrival's revision", addr(B, ip).get("rev") == 0, addr(B, ip))
+    # The held announcement's, and the migration's (its handoff still open).
+    held = conns(B)
     fault(B, "route_stall", 0)
-    check("delayed handoff: B handled A's announcement", wait_for(lambda: conns(B) == 0, 2), conns(B))
-    check("delayed handoff: within the handoff stall", time.time() - answered < 3, time.time() - answered)
+    check("delayed handoff: B handled A's announcement", wait_for(lambda: conns(B) == held - 1, 10), (held, conns(B)))
     a = addr(B, ip)
-    check("delayed handoff: A's late one is stale", a.get("seen") == gen and a.get("rev") == 1 and a.get("via") is None, a)
-    fault(B, "handoff_stall", 0)
+    check("delayed handoff: A's late one is stale", a.get("seen") == gen and a.get("rev") == 0 and a.get("via") is None, a)
+    fault(B, "handoff_gate", 0)
     wait_released(B, n)
-    a = addr(B, ip)
-    check("delayed handoff: and stays so after the handoff", a.get("rev") == 1 and a.get("via") is None, a)
+    check("delayed handoff: the arrival's revision recorded after the handoff",
+          wait_for(lambda: addr(B, ip).get("rev") == 1, 10) and addr(B, ip).get("via") is None, addr(B, ip))
     check("delayed handoff: running on B", where(n) == {B: "running"}, where(n))
     kill(B, n)
 

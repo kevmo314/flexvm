@@ -951,13 +951,20 @@ impl Host {
 
     /// Lets go of `holder`'s claim; with `id`, only that instance's.
     /// Durable: a claim let go after an outcome was settled must stay gone across a crash.
+    /// Its published revision (`publish_live`) goes with it.
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
+        let mut released = None;
         self.update(l, ip, true, |a| {
             let by = |h: &Ident| id.is_none_or(|id| id == h);
             if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
-                (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, None);
+                released = a.holder_id.take();
+                (a.holder, a.arriving, a.leaving) = (None, None, None);
             }
-        })
+        })?;
+        if let Some(id) = id.or(released.as_ref()) {
+            self.unpublish(l, ip, id);
+        }
+        Ok(())
     }
 
     /// True if this made the loan (only then may its maker undo it). The
@@ -1018,9 +1025,12 @@ impl Host {
     /// `via` None is a withdrawal (of every revision). False if stale (older,
     /// announcing a withdrawn generation, or an older revision of the newest
     /// one). A withdrawal frees a loan of that gen or older.
+    /// The record's revision may trail the one its holder here runs at (published, `live`): the
+    /// newer of the two decides.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
+        let live = via.and_then(|_| self.live_of(ip, &self.addr(l, ip).ok()?)).unwrap_or(0);
         self.update(l, ip, true, |a| {
-            if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev)) {
+            if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev.max(live))) {
                 return false;
             }
             if via.is_some() || gen > a.seen {
@@ -1034,13 +1044,81 @@ impl Host {
         })
     }
 
-    /// Records revision `rev` of `gen`, if newer: where this host's VM runs again.
+    /// Records revision `rev` of `gen`, if newer: where this host's VM runs again. A peer's
+    /// route for an older revision goes with it: taken while the record trailed (#533), it
+    /// would name a place the VM left as the way to it.
     pub fn advance(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<()> {
         self.update(l, ip, true, |a| {
-            if gen == a.seen {
-                a.rev = a.rev.max(rev);
+            if gen == a.seen && rev > a.rev {
+                (a.rev, a.via) = (rev, None);
             }
         })
+    }
+
+    fn live_path(&self, ip: Ipv4Addr) -> PathBuf {
+        self.run.join("live").join(ip.to_string())
+    }
+
+    /// Publishes where this process's VM runs within generation `gen` of `ip` (`RUN/live/IP`, on
+    /// tmpfs: replaced, never synced), under the host lock, as its revision changes and before the
+    /// record's durable write, which may come later or fail (#533). `observe` goes by it while this
+    /// process holds the address; once it is dead the record decides alone.
+    pub fn publish_live(&self, _: &Locked, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<()> {
+        let path = self.live_path(ip);
+        std::fs::create_dir_all(path.parent().ok_or("no directory")?)?;
+        store(&path, &Live { id: Ident::me(), gen, rev }, false)
+    }
+
+    /// Removes `ip`'s published revision if `id` published it (and no other instance since).
+    pub fn unpublish(&self, _: &Locked, ip: Ipv4Addr, id: &Ident) {
+        let path = self.live_path(ip);
+        if load::<Live>(&path).ok().flatten().is_some_and(|live| live.id == *id) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// `RUN/live` entries no live process will remove: published by a dead process the record no
+    /// longer names (one it names goes with its claim, `withdraw_dead`), unreadable ones, and a
+    /// dead writer's temporary files (`.IP.PID.tmp`, from `util::write_file`).
+    fn sweep_live(&self) -> Result<()> {
+        let dir = self.run.join("live");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => bail!("cannot read {}: {e}", dir.display()),
+        };
+        let l = self.lock()?;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stale = match name.strip_prefix('.') {
+                Some(tmp) => {
+                    let pid = tmp.strip_suffix(".tmp").and_then(|t| t.rsplit_once('.')).and_then(|(_, pid)| pid.parse::<u32>().ok());
+                    pid.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists())
+                }
+                None => match (name.parse::<Ipv4Addr>(), load::<Live>(&e.path())) {
+                    (Ok(ip), Ok(Some(live))) => live.id.liveness() == Liveness::Gone && self.addr(&l, ip)?.holder_id.as_ref() != Some(&live.id),
+                    (Ok(_), Ok(None)) => false,
+                    _ => true,
+                },
+            };
+            if stale {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        Ok(())
+    }
+
+    /// The revision of the newest generation of `ip` its holder here runs at, as it published it:
+    /// only the record's holder instance's, only while it is alive, and only of the generation it holds.
+    pub fn live(&self, l: &Locked, ip: Ipv4Addr) -> Result<Option<u64>> {
+        let a = self.addr(l, ip)?;
+        Ok(self.live_of(ip, &a))
+    }
+
+    fn live_of(&self, ip: Ipv4Addr, a: &Addr) -> Option<u64> {
+        let id = a.holder_id.as_ref().filter(|id| a.held == a.seen && id.liveness() == Liveness::Alive)?;
+        let live: Live = load(&self.live_path(ip)).ok().flatten()?;
+        (live.id == *id && live.gen == a.held).then_some(live.rev)
     }
 
     /// A paused migration source keeps its route too: its release moves it.
@@ -1644,6 +1722,14 @@ impl Addr {
     }
 }
 
+/// `RUN/live/IP`: the revision of generation `gen` the VM process `id` runs at (`Host::publish_live`).
+#[derive(Debug, Serialize, Deserialize)]
+struct Live {
+    id: Ident,
+    gen: u64,
+    rev: u64,
+}
+
 /// Dropped, it gives the address back; a suspended VM `keep`s it.
 pub struct AddrClaim {
     host: Host,
@@ -1659,8 +1745,12 @@ pub struct AddrClaim {
 }
 
 impl AddrClaim {
+    /// Kept past this process (suspended): its published revision goes with the process.
     pub fn keep(mut self) {
         self.kept = true;
+        if let Ok(l) = self.host.lock() {
+            self.host.unpublish(&l, self.ip, &self.id);
+        }
     }
 
     pub fn release(mut self, l: &Locked) -> Result<()> {
@@ -2080,7 +2170,12 @@ impl Host {
             }
         }
         collect_owned(&self.run);
-        self.withdraw_dead()
+        let withdrawn = self.withdraw_dead();
+        // After the sweep of dead holders, whose claims took their published revisions with them.
+        if let Err(e) = self.sweep_live() {
+            crate::log!("garbage collection: {e}");
+        }
+        withdrawn
     }
 
     /// Addresses whose holder died without withdrawing them (SIGKILLed, or a
@@ -3881,7 +3976,11 @@ mod tests {
         assert_eq!(h.claim_incoming(&l, "y", x, 7, Some(9)).unwrap().rev, 9);
         assert!(h.observe(&l, x, 7, 4, b).unwrap(), "an arrival's revision counts only once it commits");
         h.advance(&l, x, 7, 6).unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().via, None, "a route for an older revision goes with it");
         assert!(!h.observe(&l, x, 7, 5, b).unwrap());
+        assert!(h.observe(&l, x, 7, 6, b).unwrap());
+        h.advance(&l, x, 7, 6).unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().via, b, "one for the same revision stays");
         assert!(h.observe(&l, x, 8, 0, a).unwrap(), "a newer generation starts over");
         assert!(h.observe(&l, x, 8, 0, None).unwrap() && !h.observe(&l, x, 8, 9, b).unwrap(), "a withdrawal takes every revision");
     }
@@ -4297,6 +4396,83 @@ mod tests {
         assert!(free, "the pass let go of its lock, not only closed it");
     }
 
+    /// #533: the record can trail the revision its holder here runs at; what the holder published
+    /// decides then, with no process asked. Only the record's holder instance's counts, and only
+    /// while it is alive: a crash leaves the record to decide.
+    #[test]
+    fn announcements_are_judged_by_the_holders_published_revision() {
+        let (_dir, h) = host("live-rev");
+        let (x, gone, a) = (ip("10.9.4.1"), ip("10.9.4.2"), Some(ip("192.0.2.1")));
+        let l = h.lock().unwrap();
+        let _y = h.take_name("y", false).unwrap();
+        h.claim_incoming(&l, "y", x, 7, None).unwrap().keep();
+        let me = Ident::me();
+        std::fs::create_dir_all(h.run.join("live")).unwrap();
+        // Another instance's (its pid reused) is not believed.
+        store(&h.live_path(x), &Live { id: Ident { start: me.start + 1, ..me.clone() }, gen: 7, rev: 5 }, false).unwrap();
+        assert_eq!(h.live(&l, x).unwrap(), None);
+        // Its own: past the record, which trails it (a failed write, an arrival's deferred one).
+        h.publish_live(&l, x, 7, 1).unwrap();
+        assert_eq!((h.live(&l, x).unwrap(), h.addr(&l, x).unwrap().rev), (Some(1), 0));
+        assert!(!h.observe(&l, x, 7, 0, a).unwrap(), "a late announcement of the record's revision is stale");
+        assert_eq!(h.addr(&l, x).unwrap().via, None);
+        assert!(h.observe(&l, x, 7, 1, a).unwrap() && h.addr(&l, x).unwrap().via == a, "not older: taken");
+        assert!(h.observe(&l, x, 7, 0, None).unwrap(), "a withdrawal is not an announcement");
+        // A dead holder's file is stale: the record decides.
+        let dead = dead_owner(&h, 999_999_940, &[]);
+        let crashed = Addr { seen: 7, held: 7, holder: Some("z".into()), holder_id: Some(dead.clone()), ..Default::default() };
+        h.put_addr(gone, &crashed, false).unwrap();
+        store(&h.live_path(gone), &Live { id: dead, gen: 7, rev: 5 }, false).unwrap();
+        assert_eq!(h.live(&l, gone).unwrap(), None);
+        assert!(h.observe(&l, gone, 7, 0, a).unwrap());
+    }
+
+    /// #533: a published revision goes with its claim (released, withdrawn or kept past the
+    /// process), only if that instance published it; gc sweeps what dead processes left.
+    #[test]
+    fn published_revisions_go_with_their_claims_and_dead_writers() {
+        let (_dir, h) = host("live-gc");
+        let (x, y, z) = (ip("10.9.6.1"), ip("10.9.6.2"), ip("10.9.6.3"));
+        let me = Ident::me();
+        let l = h.lock().unwrap();
+        let _n = h.take_name("n", false).unwrap();
+        let exists = |ip: Ipv4Addr| h.live_path(ip).exists();
+        let claim = h.claim_incoming(&l, "n", x, 7, None).unwrap();
+        h.publish_live(&l, x, 7, 1).unwrap();
+        claim.release(&l).unwrap();
+        assert!(!exists(x), "released, its revision goes");
+        let claim = h.claim_incoming(&l, "n", x, 7, None).unwrap();
+        h.publish_live(&l, x, 7, 2).unwrap();
+        claim.keep();
+        assert!(!exists(x), "kept past the process (suspended), it goes");
+        h.release(&l, x, "n", None).unwrap();
+        // Another instance's (published since) stays when this one lets go.
+        let claim = h.claim_incoming(&l, "n", y, 7, None).unwrap();
+        store(&h.live_path(y), &Live { id: Ident { start: me.start + 1, ..me.clone() }, gen: 7, rev: 3 }, false).unwrap();
+        drop(claim);
+        assert!(exists(y), "another instance's stays");
+        std::fs::remove_file(h.live_path(y)).unwrap();
+        // What dead processes left: a writer the record no longer names, unreadable files and
+        // dead writers' temporary files go; a named dead writer's waits for its claim's sweep.
+        let (gone, named) = (dead_owner(&h, 999_999_930, &[]), dead_owner(&h, 999_999_931, &[]));
+        store(&h.live_path(x), &Live { id: gone, gen: 7, rev: 4 }, false).unwrap();
+        let held = Addr { seen: 7, held: 7, holder: Some("m".into()), holder_id: Some(named.clone()), ..Default::default() };
+        h.put_addr(y, &held, false).unwrap();
+        store(&h.live_path(y), &Live { id: named, gen: 7, rev: 4 }, false).unwrap();
+        let _claim = h.claim_incoming(&l, "n", z, 7, None).unwrap();
+        h.publish_live(&l, z, 7, 1).unwrap();
+        let live = h.run.join("live");
+        std::fs::write(live.join("10.9.6.4"), b"{").unwrap();
+        std::fs::write(live.join(".10.9.6.5.999999930.tmp"), b"").unwrap();
+        let mine = format!(".10.9.6.5.{}.tmp", std::process::id());
+        std::fs::write(live.join(&mine), b"").unwrap();
+        drop(l);
+        h.sweep_live().unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&live).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, [mine, y.to_string(), z.to_string()]);
+    }
+
     #[test]
     fn committed_arrival_does_not_need_its_routing_revision_for_recovery() {
         let (_dir, h) = host("arrival-revision");
@@ -4308,10 +4484,10 @@ mod tests {
         assert_eq!(before.rev, 0, "the incoming revision must not outrank the source before commit");
         record.commit(&l).unwrap();
         drop(l);
-        assert_eq!(h.mig_status(1).unwrap(), "committed", "a live target owns it even without its revision recorded (advance is best effort)");
+        assert_eq!(h.mig_status(1).unwrap(), "committed", "a live target owns it even before the deferred revision write");
         assert_eq!(h.addr(&h.lock().unwrap(), x).unwrap(), before);
 
-        // Model a crash before the revision is recorded: the durable claim and commit
+        // Model a crash before the deferred write: the durable claim and commit
         // remain, with a dead owner. Recovery must clear that arrival before it
         // tells the source it may resume; no routing revision is needed.
         let dead = dead_owner(&h, 999_999_950, &[]);

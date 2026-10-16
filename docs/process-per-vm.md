@@ -253,11 +253,23 @@ withdrawals carry it; each host keeps the newest (generation, withdrawn) seen
 per address and ignores older messages and announcements of withdrawn
 generations; a withdrawal frees a loan of its generation or older. Within a
 generation, each place the VM runs has a revision: a migration's target takes
-the source's next one (recorded at its commit), a source that runs again after
+the source's next one (its own from its commit, recorded once its packets are
+handed over), a source that runs again after
 an abort the one after that (and announces it), a restore one past the newest
 recorded here; announcements carry it, and
 one with an older revision of the newest generation is stale, so a source's
-delayed announcement never takes a route back from its target (#256). An address
+delayed announcement never takes a route back from its target (#256). The
+record can trail the revision its VM runs at (the target's, until recorded; a
+failed write, until retried), so a VM process publishes its revision in
+`RUN/live/IP` (tmpfs, replaced atomically, never synced) under the host lock as
+it changes, before the record's write: an arrival right before its commit (not
+committed if it cannot), a source that runs again after an abort before it does
+(left paused, failed if neither the file nor the record takes it). The file
+goes with the claim, and gc sweeps those dead processes left. Under the same
+lock, an announcement of the generation a VM here holds is judged against the
+newer of the record and that file, believed only from the record's holder
+instance while it is alive (after a crash the record decides); recording a
+newer revision drops a route taken for an older one (#533). An address
 is *taken* if its record names a holder instance that is alive (holding the
 name, or dead with its Firecrackers not yet gone) or a holder suspended here
 with that generation, or it is lent. Another instance of the same name (a
