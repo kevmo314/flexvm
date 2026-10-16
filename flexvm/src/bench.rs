@@ -315,7 +315,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
 fn host_context(template: &str) -> Value {
     let read = |path| std::fs::read_to_string(path).ok().map(|s: String| s.trim().to_string());
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let model = cpuinfo.lines().find_map(|l| Some(l.split_once(':')?).filter(|(k, _)| k.trim() == "model name"));
+    let model = cpuinfo.lines().filter_map(|l| l.split_once(':')).find(|(k, _)| k.trim() == "model name");
     json!({
         "hostname": read("/proc/sys/kernel/hostname"),
         "kernel": read("/proc/sys/kernel/osrelease"),

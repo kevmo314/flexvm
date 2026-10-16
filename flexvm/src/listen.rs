@@ -467,10 +467,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) ->
             .map(|id: crate::host::Ident| json!({"gone": id.liveness() == crate::host::Liveness::Gone && !host.owes(&id)})),
         op => Err(format!("unknown op {op:?}").into()),
     };
-    let reply = match reply {
-        Ok(v) => json!({"ok": true, "result": v}),
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
-    };
+    let reply = crate::util::reply(&reply);
     send_json(&mut conn, &reply)?;
     Ok(())
 }

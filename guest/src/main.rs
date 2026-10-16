@@ -341,10 +341,7 @@ fn discard(pipes: Vec<File>) {
         return;
     }
     let n = pipes.len();
-    let refused = match DISCARDER.get_or_init(|| Discarder::start(MAX_DISCARDED).ok()) {
-        Some(d) => d.add(pipes),
-        None => n,
-    };
+    let refused = DISCARDER.get_or_init(|| Discarder::start(MAX_DISCARDED).ok()).as_ref().map_or(n, |d| d.add(pipes));
     if refused > 0 {
         eprintln!("flexvm-init: closed {refused} output pipe(s) still held by a finished exec's background processes: {MAX_DISCARDED} are kept at most");
     }
@@ -506,10 +503,7 @@ fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
         v if app::VERBS.contains(&v) => return app::handle(v, arg, out, statuses),
         _ => return msg(out, format!("unknown request {verb:?}")),
     };
-    match reply {
-        Ok(m) => msg(out, m),
-        Err(e) => fail(out, e),
-    }
+    reply.map_or_else(|e| fail(out, e), |m| msg(out, m))
 }
 
 fn parse_time(s: &str) -> Option<libc::timespec> {

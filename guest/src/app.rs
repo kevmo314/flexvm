@@ -82,10 +82,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
         }
         _ => return msg(out, format!("unknown request {verb:?}")),
     };
-    match reply {
-        Ok(m) => msg(out, m),
-        Err(e) => fail(out, e),
-    }
+    reply.map_or_else(|e| fail(out, e), |m| msg(out, m))
 }
 
 struct Conf {

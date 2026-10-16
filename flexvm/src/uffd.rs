@@ -150,49 +150,51 @@ enum PagerFailure {
 
 /// The working-set prefetch and load-set learning (`learn_load_set`): while learning, faults go into the load set, and
 /// a prefetch that comes due before the snapshot is loaded is held back until it is.
-#[derive(Clone, Copy)]
-enum PrefetchState {
-    Idle,
-    /// Learning, the snapshot not loaded yet.
-    Learning,
-    /// Learning, with a prefetch due once the snapshot is loaded.
-    Held,
-    /// The snapshot is loaded: a prefetch starts as soon as it is due.
-    Loaded,
-    /// Learning again after a load.
-    LoadedLearning,
+#[derive(Default)]
+struct PrefetchState {
+    learning: bool,
+    loaded: bool,
+    due: bool,
 }
 
 impl PrefetchState {
-    fn learning(self) -> bool {
-        matches!(self, Self::Learning | Self::Held | Self::LoadedLearning)
+    fn learning(&self) -> bool {
+        self.learning
     }
 
     fn learn(&mut self) {
-        *self = match *self {
-            Self::Idle => Self::Learning,
-            Self::Loaded => Self::LoadedLearning,
-            s => s,
-        };
+        self.learning = true;
     }
 
     fn request(&mut self, loaded: bool, due: bool) -> bool {
-        match (loaded, due, *self) {
-            (true, due, state) => {
-                *self = Self::Loaded;
-                due || matches!(state, Self::Held)
-            }
-            (false, true, Self::Learning | Self::Held) => {
-                *self = Self::Held;
-                false
-            }
-            (_, due, _) => due,
-        }
+        self.loaded |= loaded;
+        self.learning &= !loaded;
+        self.due |= due;
+        let start = self.due && (self.loaded || !self.learning);
+        self.due &= !start;
+        start
     }
 }
 
 pub struct Pager {
     base: Arc<Template>,
+    runtime: Runtime,
+    pub fault_stats: FaultStats,
+    /// Runs of REMOTE pages faults claimed, per fault fetcher (`fetch_faults`).
+    lanes: [Lane; FAULT_FETCHERS],
+    /// Pages `[next, end)` past the latest REMOTE fault, which the pullers take before going on with their share
+    /// (`steered`).
+    steer: Mutex<(usize, usize)>,
+    /// What the pass collapsing paged-in memory into huge pages did, once done (see `collapse`).
+    collapse_report: Mutex<Option<collapse::CollapseReport>>,
+    /// Held across each collapse call, so `hold_collapse` can wait one out; signalled when the hold is lifted or the
+    /// pager stops.
+    collapse_gate: (Mutex<collapse::Gate>, Condvar),
+}
+
+// Kept contiguous so runtime resources retain their field drop order.
+#[derive(Default)]
+pub struct Runtime {
     mappings: OnceLock<Vec<Mapping>>,
     pages: OnceLock<Pages>,
     uffd: OnceLock<OwnedFd>,
@@ -264,17 +266,13 @@ pub struct Pager {
     /// for `seed`.
     awaiting_seed: AtomicBool,
     prefetch: Mutex<PrefetchState>,
-    pub fault_stats: FaultStats,
-    /// Runs of REMOTE pages faults claimed, per fault fetcher (`fetch_faults`).
-    lanes: [Lane; FAULT_FETCHERS],
-    /// Pages `[next, end)` past the latest REMOTE fault, which the pullers take before going on with their share
-    /// (`steered`).
-    steer: Mutex<(usize, usize)>,
-    /// What the pass collapsing paged-in memory into huge pages did, once done (see `collapse`).
-    collapse_report: Mutex<Option<collapse::CollapseReport>>,
-    /// Held across each collapse call, so `hold_collapse` can wait one out; signalled when the hold is lifted or the
-    /// pager stops.
-    collapse_gate: (Mutex<collapse::Gate>, Condvar),
+}
+
+impl std::ops::Deref for Pager {
+    type Target = Runtime;
+    fn deref(&self) -> &Runtime {
+        &self.runtime
+    }
 }
 
 impl Pager {
@@ -289,46 +287,7 @@ impl Pager {
         listener.set_nonblocking(true)?;
         let pager = Arc::new(Pager {
             base,
-            mappings: OnceLock::new(),
-            pages: OnceLock::new(),
-            uffd: OnceLock::new(),
-            pid: AtomicU32::new(0),
-            pidfd: OnceLock::new(),
-            remote: Mutex::new(None),
-            file: Mutex::new(None),
-            from_file: AtomicBool::new(false),
-            discards: AtomicU64::new(0),
-            remote_left: AtomicUsize::new(0),
-            pull_started: OnceLock::new(),
-            pull_finished: OnceLock::new(),
-            done: (Mutex::new(()), Condvar::new()),
-            quiesce: AtomicBool::new(false),
-            prefetch_cut: AtomicBool::new(false),
-            template_next: AtomicUsize::new(usize::MAX),
-            prefetching: AtomicU8::new(0),
-            failed: OnceLock::new(),
-            stop: AtomicBool::new(false),
-            thread: Mutex::new(None),
-            tracking: AtomicBool::new(false),
-            registered_wp: AtomicBool::new(false),
-            cow: Mutex::new(None),
-            wp: Mutex::new(()),
-            pagemap: OnceLock::new(),
-            hot_spare: Mutex::new(None),
-            hot_prev: Mutex::new(None),
-            hot_dirty: Mutex::new(Vec::new()),
-            hot_kept: Mutex::new(Vec::new()),
-            fail_protect: AtomicBool::new(false),
-            wp_race: AtomicBool::new(false),
-            rescue_fail: AtomicBool::new(false),
-            rescue_tries: AtomicU32::new(0),
-            tail_fail: AtomicU32::new(0),
-            stuck_from: Mutex::new(None),
-            pull_fail: AtomicU32::new(0),
-            initial: Mutex::new(initial),
-            seeded: Condvar::new(),
-            awaiting_seed: AtomicBool::new(false),
-            prefetch: Mutex::new(PrefetchState::Idle),
+            runtime: Runtime { template_next: AtomicUsize::new(usize::MAX), initial: Mutex::new(initial), ..Runtime::default() },
             fault_stats: FaultStats::new(),
             lanes: Default::default(),
             steer: Mutex::new((0, 0)),

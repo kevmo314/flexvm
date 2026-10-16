@@ -905,7 +905,7 @@ fn zeroed_atomic_arrays_are_aligned_and_writable() {
 fn prefetch_ordering_preserves_learning_and_load_completion() {
     // All six-event sequences, including repeated notifications and learning after load.
     for mut sequence in 0..3usize.pow(6) {
-        let mut state = PrefetchState::Idle;
+        let mut state = PrefetchState::default();
         let (mut loaded, mut due, mut learning) = (false, false, false);
         for _ in 0..6 {
             let event = sequence % 3;

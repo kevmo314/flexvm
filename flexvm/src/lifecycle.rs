@@ -138,13 +138,9 @@ impl Proc {
         }
         let res = crate::fault_result!(fault("readdress_fail") => Err("injected fault: setting the address failed".into());
             vm.guest_net(vm.ip, self.host.config_now().dns.as_deref()));
-        match res {
-            Ok(()) => {
-                vm.pending_net.store(false, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(e) => bail!("vm {} runs, but setting its address {} failed: {e}; flexvm resume {} tries again", vm.name, vm.ip, vm.name),
-        }
+        res.map_err(|e| format!("vm {} runs, but setting its address {} failed: {e}; flexvm resume {} tries again", vm.name, vm.ip, vm.name))?;
+        vm.pending_net.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// With `stop` the VM stays paused for the caller to destroy.
