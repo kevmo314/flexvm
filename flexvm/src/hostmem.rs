@@ -1,4 +1,4 @@
-//! Host memory state the VM processes share (#648), in `RUN/.locks/memory-BOOT`, mapped by each.
+//! Host memory state the VM processes share (#648), in `RUN/.locks/memory-v2-BOOT`, mapped by each.
 //!
 //! - The room rescue memory, hot pages' memory and writer buffers grow within (`cow::Room`): one for the host, so VMs
 //!   copying at once share it rather than each spending all of it.
@@ -38,37 +38,55 @@ pub struct Shared {
 
 #[repr(C)]
 struct Member {
-    /// Its process, `pid | start << 32` (start truncated), 0 for a free slot.
-    owner: AtomicU64,
+    /// One word, so claiming the slot, reserving, and reclaiming it from a process gone are each one compare-and-swap
+    /// (#674): a reclaim succeeds only on the word it saw, never on a new owner's. Its process's tag (`tag_of`; 0 for
+    /// a free slot) above `PEND_BITS`, and below them the MiB that process took from the room (`cow::Room::take`)
+    /// and has yet to populate: MemAvailable still shows that memory, so a refresh and admission count it as used
+    /// until then (#672).
+    word: AtomicU64,
     /// The last release request it answered.
     ack: AtomicU32,
     _pad: u32,
 }
 
-fn owner_of(pid: u32, start: u64) -> u64 {
-    pid as u64 | (start << 32)
+const PEND_BITS: u32 = 24;
+const PEND: u64 = (1 << PEND_BITS) - 1;
+const PID_BITS: u32 = 22;
+
+/// A process's tag: its pid (at most 2^22, Linux's limit) and the low bits of its start time, so another that got
+/// its pid is not taken for it.
+fn tag_of(pid: u32, start: u64) -> u64 {
+    (pid as u64 & ((1 << PID_BITS) - 1)) | (start & ((1 << (64 - PEND_BITS - PID_BITS)) - 1)) << PID_BITS
+}
+
+fn tag(w: u64) -> u64 {
+    w >> PEND_BITS
+}
+
+fn pend(w: u64) -> u64 {
+    w & PEND
 }
 
 fn me() -> u64 {
     let id = crate::host::Ident::me();
-    owner_of(id.pid, id.start)
+    tag_of(id.pid, id.start)
 }
 
-/// Whether the process `owner` names still runs (not another that got its pid), and whether it is stopped (it cannot
+/// Whether the process tagged `t` still runs (not another that got its pid), and whether it is stopped (it cannot
 /// answer then). None if it is gone.
-fn running(owner: u64) -> Option<bool> {
-    let pid = owner as u32;
-    if pid == 0 {
+fn running(t: u64) -> Option<bool> {
+    let pid = (t & ((1 << PID_BITS) - 1)) as u32;
+    if t == 0 {
         return None;
     }
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
     let (state, start) = (*fields.first()?, fields.get(19)?.parse::<u64>().ok()?);
-    (state != "Z" && owner_of(pid, start) == owner).then_some(!matches!(state, "T" | "t"))
+    (state != "Z" && tag_of(pid, start) == t).then_some(!matches!(state, "T" | "t"))
 }
 
-fn alive(owner: u64) -> bool {
-    running(owner).is_some()
+fn alive(t: u64) -> bool {
+    running(t).is_some()
 }
 
 fn futex(word: &AtomicU32, op: libc::c_int, val: u32, timeout: Option<Duration>) {
@@ -83,7 +101,7 @@ static MAPPED: Mutex<Vec<(PathBuf, &'static Shared)>> = Mutex::new(Vec::new());
 
 /// The host's, under its RUN directory `run`.
 pub fn at(run: &Path) -> std::io::Result<&'static Shared> {
-    let path = crate::host::locks(run).join(format!("memory-{}", crate::host::boot_id()));
+    let path = crate::host::locks(run).join(format!("memory-v2-{}", crate::host::boot_id()));
     let mut mapped = MAPPED.lock().unwrap();
     if let Some(&(_, s)) = mapped.iter().find(|(p, _)| *p == path) {
         return Ok(s);
@@ -131,29 +149,75 @@ fn map(path: &Path) -> std::io::Result<&'static Shared> {
 }
 
 impl Shared {
-    /// This process's member slot: its own, or one free or left by a process that is gone.
-    fn join(&self) -> Option<&Member> {
+    /// This process's member slot: its own, or one free or left by a process that is gone (claimed with nothing
+    /// reserved). None if every one is another's that runs.
+    pub fn slot(&self) -> Option<usize> {
         let me = me();
-        if let Some(m) = self.members.iter().find(|m| m.owner.load(Ordering::SeqCst) == me) {
-            return Some(m);
+        if let Some(i) = self.members.iter().position(|m| tag(m.word.load(Ordering::SeqCst)) == me) {
+            return Some(i);
         }
-        self.members.iter().find(|m| {
-            let o = m.owner.load(Ordering::SeqCst);
-            (o == 0 || !alive(o)) && m.owner.compare_exchange(o, me, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        self.members.iter().position(|m| {
+            let w = m.word.load(Ordering::SeqCst);
+            (w == 0 || !alive(tag(w))) && m.word.compare_exchange(w, me << PEND_BITS, Ordering::SeqCst, Ordering::SeqCst).is_ok()
         })
+    }
+
+    /// Counts `mib` more (or, not `more`, fewer) taken by this process, in its slot `slot`, and not yet populated.
+    /// False if the slot is not its own (any more): nothing is counted.
+    pub fn reserve(&self, slot: usize, mib: u64, more: bool) -> bool {
+        let me = me();
+        let mib = mib.min(PEND);
+        let r = self.members[slot].word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
+            (tag(w) == me).then(|| me << PEND_BITS | if more { (pend(w) + mib).min(PEND) } else { pend(w).saturating_sub(mib) })
+        });
+        r.is_ok()
+    }
+
+    /// Frees `m` if it still holds `w`, the word of a process gone (with what it had reserved): a new owner's is left.
+    fn reclaim(m: &Member, w: u64) {
+        let _ = m.word.compare_exchange(w, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// MiB taken from the room and not yet populated by processes still running; the slots of those gone are
+    /// reclaimed, their reservations with them.
+    pub fn outstanding(&self) -> u64 {
+        let mut sum = 0;
+        for m in &self.members {
+            let w = m.word.load(Ordering::SeqCst);
+            if pend(w) == 0 {
+                continue;
+            }
+            match alive(tag(w)) {
+                true => sum += pend(w),
+                false => Shared::reclaim(m, w),
+            }
+        }
+        sum
+    }
+
+    /// Every slot another running process's (init's).
+    #[cfg(test)]
+    pub fn occupy_all(&self) {
+        let init = tag_of(1, crate::host::starttime(1).unwrap());
+        self.members.iter().for_each(|m| m.word.store(init << PEND_BITS, Ordering::SeqCst));
+    }
+
+    #[cfg(test)]
+    pub fn free(&self, slot: usize) {
+        self.members[slot].word.store(0, Ordering::SeqCst);
     }
 
     /// Whether this process answers release requests (`serve`).
     #[cfg(test)]
     pub fn joined(&self) -> bool {
         let me = me();
-        self.members.iter().any(|m| m.owner.load(Ordering::SeqCst) == me)
+        self.members.iter().any(|m| tag(m.word.load(Ordering::SeqCst)) == me)
     }
 
     /// Answers release requests for the life of this process, calling `release` for each (one at a time). Returns at
     /// once if there is no slot left for it.
     pub fn serve(&self, release: impl Fn()) {
-        let Some(m) = self.join() else {
+        let Some(m) = self.slot().map(|i| &self.members[i]) else {
             crate::log!("hostmem: no slot left: memory kept for checkpoints is not released on request");
             return;
         };
@@ -180,13 +244,13 @@ impl Shared {
         let answered = |m: &Member| (m.ack.load(Ordering::SeqCst).wrapping_sub(g) as i32) >= 0;
         let mut all = true;
         for m in &self.members {
-            let o = m.owner.load(Ordering::SeqCst);
-            if o == 0 || answered(m) {
+            let w = m.word.load(Ordering::SeqCst);
+            if w == 0 || answered(m) {
                 continue;
             }
-            match running(o) {
+            match running(tag(w)) {
                 None => {
-                    let _ = m.owner.compare_exchange(o, 0, Ordering::SeqCst, Ordering::SeqCst);
+                    Shared::reclaim(m, w);
                     continue;
                 }
                 Some(false) => {
@@ -195,7 +259,7 @@ impl Shared {
                 }
                 Some(true) => {}
             }
-            while !answered(m) && m.owner.load(Ordering::SeqCst) == o {
+            while !answered(m) && tag(m.word.load(Ordering::SeqCst)) == tag(w) {
                 if Instant::now() >= deadline {
                     all = false;
                     break;
@@ -220,6 +284,11 @@ impl Shared {
     pub fn forget_release(&self) {
         self.released.store(0, Ordering::SeqCst);
     }
+}
+
+/// `Shared::outstanding` for the host under `run`; 0 if it cannot be mapped (nothing could reserve there then).
+pub fn outstanding(run: &Path) -> u64 {
+    at(run).map_or(0, |s| s.outstanding())
 }
 
 /// Asks the VM processes of the host under `run` to release the memory they keep for their next checkpoint
@@ -268,38 +337,101 @@ mod tests {
         assert!(s.release_kept(Instant::now() + Duration::from_secs(5)));
         assert_eq!(released.load(Ordering::SeqCst), 2);
         // Another mapping of the file (as another process has) sees the same state.
-        let other = map(&crate::host::locks(&dir).join(format!("memory-{}", crate::host::boot_id()))).unwrap();
+        let other = map(&crate::host::locks(&dir).join(format!("memory-v2-{}", crate::host::boot_id()))).unwrap();
         assert!(!std::ptr::eq(s, other));
         assert_eq!(other.release.load(Ordering::SeqCst), s.release.load(Ordering::SeqCst));
         // A member that does not answer in time: the request gives up at its deadline.
-        other.members[MEMBERS - 1].owner.store(me(), Ordering::SeqCst);
+        other.members[MEMBERS - 1].word.store(me() << PEND_BITS, Ordering::SeqCst);
         let t = Instant::now();
         assert!(!s.release_kept(Instant::now() + Duration::from_millis(50)), "the silent one did not answer");
         assert!(t.elapsed() < Duration::from_secs(2));
         // Gone (no such process): not waited for, and its slot freed.
-        other.members[MEMBERS - 1].owner.store(owner_of(u32::MAX - 1, 1), Ordering::SeqCst);
+        other.members[MEMBERS - 1].word.store(gone(1) << PEND_BITS, Ordering::SeqCst);
         assert!(s.release_kept(Instant::now() + Duration::from_secs(5)));
-        assert_eq!(other.members[MEMBERS - 1].owner.load(Ordering::SeqCst), 0, "pruned");
+        assert_eq!(other.members[MEMBERS - 1].word.load(Ordering::SeqCst), 0, "pruned");
         // Stopped: it cannot answer, so it is not waited for (but it keeps its slot).
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
         unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
         let t = Instant::now();
         let stopped = loop {
-            if let Some(false) = crate::host::starttime(pid).and_then(|st| running(owner_of(pid, st))) {
-                break owner_of(pid, crate::host::starttime(pid).unwrap());
+            if let Some(false) = crate::host::starttime(pid).and_then(|st| running(tag_of(pid, st))) {
+                break tag_of(pid, crate::host::starttime(pid).unwrap());
             }
             assert!(t.elapsed() < Duration::from_secs(5), "stopped");
             std::thread::sleep(Duration::from_millis(1));
         };
-        other.members[MEMBERS - 1].owner.store(stopped, Ordering::SeqCst);
+        other.members[MEMBERS - 1].word.store(stopped << PEND_BITS, Ordering::SeqCst);
         let t = Instant::now();
         assert!(!s.release_kept(Instant::now() + Duration::from_secs(5)), "not every one answered");
         assert!(t.elapsed() < Duration::from_secs(2), "not waited for");
-        assert_eq!(other.members[MEMBERS - 1].owner.load(Ordering::SeqCst), stopped);
-        other.members[MEMBERS - 1].owner.store(0, Ordering::SeqCst);
+        assert_eq!(tag(other.members[MEMBERS - 1].word.load(Ordering::SeqCst)), stopped);
+        other.members[MEMBERS - 1].word.store(0, Ordering::SeqCst);
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// A tag no running process has: a pid past any here.
+    fn gone(n: u64) -> u64 {
+        tag_of((1 << PID_BITS) - 2, n)
+    }
+
+    /// What a process took from the room and has yet to populate counts while it runs; once it is gone its slot is
+    /// reclaimed with its reservations (#672), and a slot claimed starts with none.
+    #[test]
+    fn reservations_of_processes_gone_are_reclaimed() {
+        let dir = crate::test_util::TempDir::new("hostmem-reserved");
+        let s = at(&dir).unwrap();
+        let mine = s.slot().unwrap();
+        assert!(s.reserve(mine, 30, true));
+        let dead = MEMBERS - 2;
+        s.members[dead].word.store(gone(1) << PEND_BITS | 50, Ordering::SeqCst);
+        assert_eq!(s.outstanding(), 30, "only the running one's");
+        assert_eq!(s.members[dead].word.load(Ordering::SeqCst), 0, "reclaimed");
+        assert!(s.reserve(mine, 10, false));
+        assert_eq!(s.outstanding(), 20);
+        assert!(s.reserve(mine, 100, false));
+        assert_eq!(s.outstanding(), 0, "never below none");
+        // Not its own slot: nothing counted.
+        assert!(!s.reserve(dead, 5, true));
+        assert_eq!(s.members[dead].word.load(Ordering::SeqCst), 0);
+        // A slot claimed from a process gone starts with nothing reserved.
+        s.members[mine].word.store(0, Ordering::SeqCst);
+        s.members[dead].word.store(gone(2) << PEND_BITS | 70, Ordering::SeqCst);
+        let init = tag_of(1, crate::host::starttime(1).unwrap());
+        (0..MEMBERS).filter(|&i| i != dead).for_each(|i| s.members[i].word.store(init << PEND_BITS, Ordering::SeqCst));
+        assert_eq!(s.slot(), Some(dead));
+        assert_eq!(s.members[dead].word.load(Ordering::SeqCst), me() << PEND_BITS);
+    }
+
+    /// A reclaim of a slot whose process it saw gone never takes a new owner's claim or reservation (#674): it frees
+    /// the slot only if it still holds the word it saw.
+    #[test]
+    fn a_reclaim_leaves_a_new_owner_alone() {
+        let dir = crate::test_util::TempDir::new("hostmem-reclaim");
+        let s = at(&dir).unwrap();
+        let m = &s.members[3];
+        let seen = gone(1) << PEND_BITS | 50;
+        m.word.store(seen, Ordering::SeqCst);
+        // Claimed and reserved by a new owner after the reclaim saw it.
+        assert!(m.word.compare_exchange(seen, me() << PEND_BITS, Ordering::SeqCst, Ordering::SeqCst).is_ok());
+        assert!(s.reserve(3, 30, true));
+        Shared::reclaim(m, seen);
+        assert_eq!(m.word.load(Ordering::SeqCst), me() << PEND_BITS | 30, "the new owner's, as it was");
+        assert_eq!(s.outstanding(), 30);
+        m.word.store(0, Ordering::SeqCst);
+    }
+
+    /// With every slot another running process's, none is had (and a room then attaches to none, `cow::Room`); one
+    /// freed later is.
+    #[test]
+    fn with_every_slot_taken_none_is_had() {
+        let dir = crate::test_util::TempDir::new("hostmem-full");
+        let s = at(&dir).unwrap();
+        s.occupy_all();
+        assert_eq!(s.slot(), None);
+        s.free(7);
+        assert_eq!(s.slot(), Some(7));
     }
 
     /// Callers queued on the host lock do not each ask (and wait) again: once a second at most.

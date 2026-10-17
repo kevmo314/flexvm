@@ -1499,7 +1499,9 @@ impl Host {
             format!("{e}: memory held for migrations and restores still arriving cannot be counted")
         })?;
         let pending = pending(&grants, &held, now);
-        let need = floor.saturating_add(pending).saturating_add(mib);
+        // Checkpoint memory taken and not yet populated (MemAvailable still shows it) is spoken for too (#672).
+        let reserved = crate::hostmem::outstanding(&self.run);
+        let need = floor.saturating_add(pending).saturating_add(reserved).saturating_add(mib);
         let mut avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         // Memory VM processes keep for their next checkpoint is not admitted: it goes back rather than refuse (#648).
         if avail < need {
@@ -6780,6 +6782,21 @@ mod tests {
         kept.store(80, SeqCst);
         assert!(h.grow_hold_inner(&hold, 20, Floor::Reserve, None, avail).unwrap().is_ok());
         assert_eq!(kept.load(SeqCst), 0);
+    }
+
+    /// Checkpoint memory taken from the room and not yet populated is spoken for though MemAvailable still shows it
+    /// (#672): admission counts it.
+    #[test]
+    fn admission_counts_checkpoint_memory_still_to_populate() {
+        let (_h_dir, mut h) = host("admit-reserved");
+        h.cfg.reserve_mib = Some(0);
+        pin_clock(boottime_ms());
+        let shared = crate::hostmem::at(&h.run).unwrap();
+        let slot = shared.slot().unwrap();
+        shared.reserve(slot, 300, true);
+        assert!(h.grant_inner(AVAIL - 200, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_err());
+        shared.reserve(slot, 300, false);
+        assert!(h.grant_inner(AVAIL - 200, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
     }
 
     /// A grant comes out of the room checkpoint memory grows within at once (#648): until a refresh counts it as

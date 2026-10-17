@@ -291,7 +291,13 @@ impl Pager {
         listener.set_nonblocking(true)?;
         let pager = Arc::new(Pager {
             base,
-            runtime: Runtime { template_next: AtomicUsize::new(usize::MAX), initial: Mutex::new(initial), ..Runtime::default() },
+            // Closed until its VM process attaches it to the host's and refreshes it (`cow::Room::closed`).
+            runtime: Runtime {
+                template_next: AtomicUsize::new(usize::MAX),
+                initial: Mutex::new(initial),
+                mem_room: crate::cow::Room::closed(),
+                ..Runtime::default()
+            },
             fault_stats: FaultStats::new(),
             lanes: Default::default(),
             steer: Mutex::new((0, 0)),

@@ -1035,6 +1035,8 @@ impl Proc {
         if *serving {
             return Ok(());
         }
+        // Before any request can checkpoint: the room it copies within is the host's, refreshed, or none (#674).
+        self.ready_room(false);
         let p = self.arc().ok_or("vm process gone")?;
         let sock = self.host.sock(&self.name())?;
         let _ = std::fs::remove_file(&sock);
@@ -1395,6 +1397,7 @@ impl Proc {
 
     fn controller(self: Arc<Self>) {
         let (mut published, mut growth, mut stopping) = (false, Growth::default(), None::<Stopping>);
+        let mut told_unattached = false;
         loop {
             thread::sleep(Duration::from_secs(1));
             // Standby VMs signalled last tick had that sleep: other processes may stop them now, however long this tick blocks.
@@ -1427,17 +1430,16 @@ impl Proc {
                 self.publish();
             }
             let mut avail = host_available_mib();
-            let (reserve, at, _) = self.host.config_now().evict_marks();
+            let (_, at, _) = self.host.config_now().evict_marks();
             // Memory VM processes keep for their next checkpoint never moves a VM away: it goes back first (#648).
             if avail.is_some_and(|a| a < at) {
                 crate::hostmem::release_kept(&self.host.run, None);
                 avail = host_available_mib();
             }
-            if let Ok(s) = crate::hostmem::at(&self.host.run) {
-                vm.pager.mem_room().attach(s);
+            let short = avail.is_some_and(|a| a < at) || vm.starving();
+            if !self.ready_room(short) && !std::mem::replace(&mut told_unattached, true) {
+                crate::log!("vm {}: no slot in the host's memory file: no memory for checkpoint copies until there is", vm.name);
             }
-            let room = room_sample(reserve, host_available_mib, || self.host.promised());
-            vm.pager.host_memory(room, avail.is_some_and(|a| a < at) || vm.starving());
             relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
             if let Some(dev) = self.host.config_now().announce_dev() {
@@ -1457,6 +1459,20 @@ impl Proc {
             true => resize(vm, &self.host, hint, true),
             false => Ok(Resized::Busy),
         }
+    }
+
+    /// Attaches the VM's checkpoint memory room to the host's (`cow::Room::attach`) and refreshes it (`ready_room`),
+    /// and while the host is `short` releases what is kept for the next checkpoint (`Pager::host_memory`). Whether it
+    /// is attached.
+    /// None yet (bound before a resume or restore has its VM): its room stays closed (`cow::Room::closed`) until
+    /// the controller's first tick.
+    fn ready_room(&self, short: bool) -> bool {
+        let Some(vm) = self.vm.get() else { return false };
+        let reserve = self.host.config_now().reserve();
+        let attached = crate::hostmem::at(&self.host.run).is_ok_and(|s| vm.pager.mem_room().attach(s));
+        let sample = room_sample(reserve, host_available_mib, || self.host.promised());
+        vm.pager.host_memory(attached_sample(attached, sample), short);
+        attached
     }
 
     /// Answers other processes' requests that this one release the memory it keeps for the next checkpoint
@@ -1981,6 +1997,12 @@ fn arrival_more(granted: u64, (need, cap): (u64, u64)) -> u64 {
 /// epoch: a sample read before would be published after a newer refresh by a controller held up meanwhile.
 fn room_sample(reserve: u64, available: impl FnOnce() -> Option<u64>, promised: impl FnOnce() -> Option<u64>) -> impl FnOnce() -> Option<u64> {
     move || Some(available()?.saturating_sub(reserve).saturating_sub(promised().unwrap_or(u64::MAX)))
+}
+
+/// What a room refreshes to: `sample` once attached to the host's, else none (retried at the next refresh): memory
+/// taken from a room of its own could not be counted host-wide (#674).
+fn attached_sample(attached: bool, sample: impl FnOnce() -> Option<u64>) -> impl FnOnce() -> Option<u64> {
+    move || if attached { sample() } else { Some(0) }
 }
 
 /// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`;
@@ -2785,6 +2807,30 @@ fn call_checked(host: &Host, name: &str, req: Value, at: Option<Instant>, check:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkpoint asked for as the VM process starts (before its controller's first tick) takes no memory that is
+    /// not counted host-wide (#674): its room is closed until it attaches, which happens before the control socket
+    /// serves; with no slot to be had it stays at none, and attached it is the host's, refreshed.
+    #[test]
+    fn a_checkpoint_right_after_start_takes_only_counted_memory() {
+        let dir = crate::test_util::TempDir::new("room-start");
+        let host = crate::hostmem::at(&dir).unwrap();
+        let room = crate::cow::Room::closed();
+        assert!(room.take(1).is_none(), "closed as it starts");
+        // No slot: not attached, and refreshed to none.
+        host.occupy_all();
+        assert!(!room.attach(host));
+        room.refresh(attached_sample(false, || Some(5000)));
+        assert!(room.take(1).is_none(), "none without a slot");
+        // A slot: the host's, refreshed from the sample; what it takes is counted there.
+        host.free(0);
+        assert!(room.attach(host));
+        host.stamp.store(0, Ordering::SeqCst);
+        room.refresh(attached_sample(true, || Some(100)));
+        let r = room.take(40).unwrap();
+        assert_eq!((room.get(), host.outstanding()), (60, 40));
+        drop(r);
+    }
 
     /// The controller's room sample is read only once its refresh has claimed its epoch (#648): read before, a
     /// controller held up while another refreshed would publish a stale, higher sample. Here the other refreshes

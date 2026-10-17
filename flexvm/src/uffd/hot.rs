@@ -132,10 +132,11 @@ impl Pager {
         }
         *spare = None;
         // Not into the host's reserve (see `host_memory`): the pause protects these pages instead.
-        if self.mem_room.take(((want * PAGE_SIZE) >> 20) as u64 + 1).is_none() {
+        // Reserved until `Buf::new` has populated it.
+        let Some(_reserved) = self.mem_room.take(((want * PAGE_SIZE) >> 20) as u64 + 1) else {
             crate::log!("uffd: no room for hot pages ({want} pages): the host is near its reserve");
             return;
-        }
+        };
         match Buf::new(want) {
             Ok(b) => *spare = Some(b),
             Err(e) => crate::log!("uffd: no memory for hot pages ({want} pages): {e}"),

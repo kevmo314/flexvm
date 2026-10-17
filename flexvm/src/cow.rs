@@ -627,7 +627,34 @@ pub struct Room(Arc<RoomCell>);
 #[derive(Default)]
 struct RoomCell {
     local: AtomicU64,
-    host: OnceLock<&'static crate::hostmem::Shared>,
+    /// The host's, with this process's slot there, where what it took and has yet to populate is counted
+    /// (`Reserved`): set together, so no take ever sees the host's room without the slot (#674).
+    host: OnceLock<(&'static crate::hostmem::Shared, usize)>,
+}
+
+/// Room taken (`Room::take`) whose memory is not populated yet: counted as outstanding in the host's room (a refresh
+/// and admission take it off what MemAvailable shows) until `populated`, or dropped (the memory never came). Without
+/// it a reservation not populated by the second refresh would be forgotten while still to come (#672).
+pub struct Reserved {
+    mib: u64,
+    at: Epoch,
+    /// Where it is counted, if anywhere: what its drop takes off again.
+    slot: Option<(&'static crate::hostmem::Shared, usize)>,
+}
+
+impl Reserved {
+    /// Its memory is populated (MemAvailable shows it taken): when it was taken, to give it back (`Room::give`).
+    pub fn populated(self) -> Epoch {
+        self.at
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        if let Some((h, slot)) = self.slot {
+            h.reserve(slot, self.mib, false);
+        }
+    }
 }
 
 /// When `Room` was taken from, to give back within (`Room::give`).
@@ -665,12 +692,28 @@ fn room_of(mib: u64) -> u64 {
 impl Room {
     /// From now on the host's room (`hostmem`), shared with every VM process. Once; what was taken before is not
     /// counted there (the next refresh shows it).
-    pub fn attach(&self, host: &'static crate::hostmem::Shared) {
-        let _ = self.0.host.set(host);
+    /// False if there is no slot there for this process (every one another's that runs): not attached then, and
+    /// it may be tried again. Its controller keeps the room it has without (its own) at none meanwhile: memory it took
+    /// could not be counted as reserved.
+    pub fn attach(&self, host: &'static crate::hostmem::Shared) -> bool {
+        if self.0.host.get().is_some() {
+            return true;
+        }
+        let Some(slot) = host.slot() else { return false };
+        let _ = self.0.host.set((host, slot));
+        true
     }
 
     fn word(&self) -> &AtomicU64 {
-        self.0.host.get().map_or(&self.0.local, |h| &h.room)
+        self.0.host.get().map_or(&self.0.local, |(h, _)| &h.room)
+    }
+
+    /// One with no room until refreshed: a VM process's, so nothing is taken before it is attached to the host's and
+    /// refreshed (#674), not even by a checkpoint asked for as it starts.
+    pub fn closed() -> Room {
+        let r = Room::default();
+        r.0.local.store(pack(0, 0, room_of(0)), Ordering::SeqCst);
+        r
     }
 
     /// Sets it to `mib` (u64::MAX: no bound), forgetting what was taken.
@@ -680,9 +723,10 @@ impl Room {
     }
 
     /// From what is available now (`mib`, read only for a refresh; None: unknown, no bound), less what was taken since
-    /// the last refresh. The host's at most every `REFRESH_GAP_MS`: whichever process comes first refreshes it.
+    /// the last refresh and what is reserved and not yet populated (`Reserved`). The host's at most every
+    /// `REFRESH_GAP_MS`: whichever process comes first refreshes it.
     pub fn refresh(&self, mib: impl FnOnce() -> Option<u64>) {
-        if let Some(h) = self.0.host.get() {
+        if let Some((h, _)) = self.0.host.get() {
             let (now, last) = (crate::host::boottime_ms(), h.stamp.load(Ordering::SeqCst));
             if now.wrapping_sub(last) < REFRESH_GAP_MS || h.stamp.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_err() {
                 return;
@@ -692,9 +736,11 @@ impl Room {
         // make memory taken since spendable again): what was taken since is in `recent`.
         let word = self.word();
         let at = epoch(word.load(Ordering::SeqCst));
+        // Before the sample: one populated in between is counted twice (until the next refresh), never not at all.
+        let reserved = self.0.host.get().map_or(0, |(h, _)| h.outstanding());
         let mib = mib();
         let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
-            (epoch(w) == at).then(|| pack(at.wrapping_add(1), 0, mib.map_or(0, |m| room_of(m.saturating_sub(recent(w))))))
+            (epoch(w) == at).then(|| pack(at.wrapping_add(1), 0, mib.map_or(0, |m| room_of(m.saturating_sub(recent(w)).saturating_sub(reserved)))))
         });
     }
 
@@ -705,20 +751,28 @@ impl Room {
         }
     }
 
-    /// Takes `mib` of it, if there is that much: when, to give it back (`give`).
-    pub fn take(&self, mib: u64) -> Option<Epoch> {
+    /// Takes `mib` of it, if there is that much: reserved until its memory is populated (`Reserved`).
+    pub fn take(&self, mib: u64) -> Option<Reserved> {
         let mut at = 0;
-        self.word()
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
-                at = epoch(w);
-                match room_field(w) {
-                    0 => Some(w),
-                    r if r - 1 < mib => None,
-                    r => Some(pack(at, recent(w) + mib, r - mib)),
-                }
-            })
-            .ok()
-            .map(|_| at)
+        // One read of the attachment: the word taken from and the slot counted in are the same host's.
+        let host = self.0.host.get().copied();
+        // Reserved first: a refresh between the two counts it twice, never not at all. A slot no longer its own
+        // (taken for a process gone): nothing can be counted, so nothing is taken.
+        if host.is_some_and(|(h, slot)| !h.reserve(slot, mib, true)) {
+            return None;
+        }
+        let word = host.map_or(&self.0.local, |(h, _)| &h.room);
+        let taken = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
+            at = epoch(w);
+            match room_field(w) {
+                0 => Some(w),
+                r if r - 1 < mib => None,
+                r => Some(pack(at, recent(w) + mib, r - mib)),
+            }
+        });
+        // Dropped if refused: the reservation goes again.
+        let r = Reserved { mib, at, slot: host };
+        taken.is_ok().then_some(r)
     }
 
     /// Takes `mib` from the host's room whether or not there is that much (to none left): memory admission granted a
@@ -763,9 +817,14 @@ impl Slots {
     fn take(&self, n: usize, unbounded: bool) -> std::io::Result<Option<Vec<Slot>>> {
         let mut inner = self.inner.lock().unwrap();
         let short = short_mib(n, inner.free.len());
-        if short > 0 && !unbounded && self.room.take(short).is_none() {
-            return Ok(None);
-        }
+        // Held until the chunks are mapped, each populated as it is (`map_chunk`).
+        let _reserved = match short > 0 && !unbounded {
+            true => match self.room.take(short) {
+                Some(r) => Some(r),
+                None => return Ok(None),
+            },
+            false => None,
+        };
         while inner.free.len() < n {
             let c = map_chunk()?;
             inner.chunks.push(c);
@@ -877,6 +936,66 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    /// Room taken and not yet populated stays taken however many refreshes come first (#672): MemAvailable still
+    /// shows its memory, and other checkpoints must not spend it.
+    #[test]
+    fn a_reservation_counts_until_its_memory_is_populated() {
+        let dir = crate::test_util::TempDir::new("room-reserved");
+        let host = crate::hostmem::at(&dir).unwrap();
+        let room = Room::default();
+        room.attach(host);
+        let refresh = |mib| {
+            host.stamp.store(crate::host::boottime_ms().wrapping_sub(REFRESH_GAP_MS), Ordering::SeqCst);
+            room.refresh(|| Some(mib));
+            room.get()
+        };
+        assert_eq!(refresh(1000), 1000);
+        let r = room.take(100).unwrap();
+        assert_eq!(host.outstanding(), 100);
+        assert_eq!(refresh(1000), 800, "taken since, and reserved: counted twice until the next");
+        assert_eq!(refresh(1000), 900, "still reserved");
+        assert_eq!(refresh(1000), 900, "however many refreshes");
+        let at = r.populated();
+        assert_eq!(host.outstanding(), 0);
+        // Populated: MemAvailable shows it taken now.
+        assert_eq!(refresh(900), 900);
+        room.give(100, at);
+        assert_eq!(room.get(), 900, "refreshed since: not counted twice");
+        // Refused, or dropped unpopulated (its memory never came): nothing stays reserved.
+        assert!(room.take(10_000).is_none());
+        drop(room.take(10));
+        assert_eq!(host.outstanding(), 0);
+    }
+
+    /// A reservation is taken off again only where it was counted (#674): one taken before the room attached (its
+    /// own then) leaves the host's alone, and with no slot to be had the room does not attach (its controller keeps
+    /// it at none, `vmproc`), and attaches once one is free.
+    #[test]
+    fn a_reservation_comes_off_only_where_it_was_counted() {
+        let dir = crate::test_util::TempDir::new("room-where");
+        let host = crate::hostmem::at(&dir).unwrap();
+        let room = Room::default();
+        let before = room.take(10).unwrap();
+        assert!(room.attach(host));
+        let after = room.take(20).unwrap();
+        assert_eq!(host.outstanding(), 20);
+        drop(before);
+        assert_eq!(host.outstanding(), 20, "the host's reservations are left alone");
+        drop(after);
+        assert_eq!(host.outstanding(), 0);
+        // No slot to be had: not attached (its own room still), and attached once one is free.
+        let full_dir = crate::test_util::TempDir::new("room-full");
+        let full = crate::hostmem::at(&full_dir).unwrap();
+        full.occupy_all();
+        let other = Room::default();
+        assert!(!other.attach(full));
+        other.set(5);
+        assert_eq!((other.get(), full.outstanding()), (5, 0), "its own");
+        full.free(3);
+        assert!(other.attach(full));
+        assert_eq!(other.get(), u64::MAX, "the host's, unknown yet");
+    }
+
     /// VM processes copying at once share the host's room (#648): one's take is the others' too, so together they
     /// never take more than there is.
     #[test]
@@ -898,7 +1017,7 @@ mod tests {
         b.refresh(|| panic!("not due: MemAvailable is not read"));
         assert!(a.take(60).is_some());
         assert!(b.take(60).is_none(), "taken by the other already");
-        let at = b.take(40).unwrap();
+        let at = b.take(40).unwrap().populated();
         assert_eq!(a.get(), 0);
         b.give(40, at);
         assert_eq!(a.get(), 40, "given back within its epoch");
@@ -911,7 +1030,7 @@ mod tests {
         b.refresh(|| Some(100));
         assert_eq!(a.get(), 100);
         // Given back once refreshed: MemAvailable shows it freed, so it is not counted twice.
-        let at = a.take(10).unwrap();
+        let at = a.take(10).unwrap().populated();
         due();
         a.refresh(|| Some(50));
         a.give(10, at);
