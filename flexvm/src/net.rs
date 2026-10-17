@@ -627,14 +627,45 @@ pub fn conf(family: &str, dev: &str, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Proxy ARP on an announce device, once per device this process adopts (a
-/// derived one follows the routes); a failure is logged once.
-pub fn proxy_arp(dev: &str) {
-    static ON: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
-    if ON.lock().unwrap().insert(dev.into()) {
-        if let Err(e) = conf("ipv4", dev, "proxy_arp", "1") {
+/// Proxy ARP on an announce device, once per interface identity; failed writes are
+/// retried, with warnings suppressed independently of successful setup.
+pub fn proxy_arp(dev: &str) -> Result<()> {
+    static STATE: std::sync::Mutex<ProxyArp> =
+        std::sync::Mutex::new(ProxyArp { on: std::collections::BTreeMap::new(), warned: std::collections::BTreeSet::new() });
+    let mut state = STATE.lock().unwrap();
+    let result = state.enable(dev, || ifindex(dev), || conf("ipv4", dev, "proxy_arp", "1"));
+    if let Err(e) = &result {
+        if state.warned.insert(dev.into()) {
             crate::log!("WARNING: proxy ARP on {dev}: {e}");
         }
+    }
+    result
+}
+
+struct ProxyArp {
+    on: std::collections::BTreeMap<String, u32>,
+    warned: std::collections::BTreeSet<String>,
+}
+
+impl ProxyArp {
+    fn enable(&mut self, dev: &str, identity: impl Fn() -> Result<u32>, write: impl FnOnce() -> Result<()>) -> Result<()> {
+        let index = match identity() {
+            Ok(index) => index,
+            Err(e) => {
+                self.on.remove(dev);
+                return Err(e);
+            }
+        };
+        if self.on.get(dev) == Some(&index) {
+            return Ok(());
+        }
+        self.on.remove(dev);
+        write()?;
+        if identity()? != index {
+            bail!("interface {dev} changed during proxy ARP setup");
+        }
+        self.on.insert(dev.into(), index);
+        Ok(())
     }
 }
 
@@ -737,6 +768,40 @@ impl IpRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_arp_retries_failures_and_recreated_interfaces() {
+        let mut state = ProxyArp { on: Default::default(), warned: Default::default() };
+        let writes = std::cell::Cell::new(0);
+        let write = || {
+            writes.set(writes.get() + 1);
+            Ok(())
+        };
+        assert!(state.enable("eth0", || Err("missing".into()), write).is_err());
+        assert_eq!(writes.get(), 0);
+        for _ in 0..2 {
+            assert!(state
+                .enable(
+                    "eth0",
+                    || Ok(1),
+                    || {
+                        writes.set(writes.get() + 1);
+                        Err("write failed".into())
+                    }
+                )
+                .is_err());
+        }
+        state.warned.insert("eth0".into());
+        state.enable("eth0", || Ok(1), write).unwrap();
+        state.enable("eth0", || Ok(1), write).unwrap();
+        assert_eq!(writes.get(), 3, "success alone skips a write, even after warnings");
+        assert!(state.enable("eth0", || Ok(2), || Err("write failed".into())).is_err());
+        state.enable("eth0", || Ok(2), write).unwrap();
+        assert_eq!(writes.get(), 4, "the same name with a new index needs setup");
+        assert!(state.enable("eth0", || Err("missing".into()), write).is_err());
+        state.enable("eth0", || Ok(2), write).unwrap();
+        assert_eq!(writes.get(), 5, "a missing interface invalidates cached success");
+    }
 
     #[test]
     fn allocation_starts_at_the_hint_and_wraps() {

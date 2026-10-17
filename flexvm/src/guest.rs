@@ -288,13 +288,75 @@ pub fn app_status(uds: &Path) -> Result<String> {
     message(uds, "APPSTATUS", TIMEOUT)
 }
 
-pub fn probe(uds: &Path, port: u16) -> Result<bool> {
-    Ok(message(uds, &format!("PROBE {port}"), TIMEOUT)? == "ok")
+/// Readiness I/O checks cancellation between short waits, preserving partial frames
+/// and the request's overall deadline instead of restarting a command on each poll.
+struct Readiness<'a> {
+    stream: By<UnixStream>,
+    stop: &'a dyn Fn() -> Result<()>,
 }
 
-pub fn check(uds: &Path, cmd: &str, timeout: Duration) -> Result<bool> {
+impl Readiness<'_> {
+    fn io<T>(&mut self, mut op: impl FnMut(&mut UnixStream, Duration) -> std::io::Result<T>) -> std::io::Result<T> {
+        loop {
+            (self.stop)().map_err(std::io::Error::other)?;
+            let left = self.stream.left()?.min(Duration::from_millis(50));
+            match op(&mut self.stream.s, left) {
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Read for Readiness<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.io(|s, left| {
+            s.set_read_timeout(Some(left))?;
+            s.read(buf)
+        })
+    }
+}
+
+impl Write for Readiness<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.io(|s, left| {
+            s.set_write_timeout(Some(left))?;
+            s.write(buf)
+        })
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.s.flush()
+    }
+}
+
+fn readiness(uds: &Path, line: &str, timeout: Duration, stop: &dyn Fn() -> Result<()>) -> Result<String> {
+    let at = Instant::now().checked_add(timeout).ok_or("guest timeout is too large")?;
+    if ABANDONED.lock().unwrap().iter().any(|p| p == uds) {
+        bail!("its firecracker exited");
+    }
+    let s = loop {
+        stop()?;
+        let left = By { s: (), at }.left()?.min(Duration::from_millis(50));
+        match crate::util::connect_unix(uds, left) {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            result => break result?,
+        }
+    };
+    let mut r = handshake(Readiness { stream: By { s, at }, stop }, line)?;
+    match read_frame(&mut r)? {
+        Some((FRAME_MSG, m)) => Ok(String::from_utf8_lossy(&m).into_owned()),
+        Some((_, m)) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
+        None => Err(lost(format!("guest closed the connection before answering {line:?}"))),
+    }
+}
+
+pub fn probe(uds: &Path, port: u16, stop: &dyn Fn() -> Result<()>) -> Result<bool> {
+    Ok(readiness(uds, &format!("PROBE {port}"), TIMEOUT, stop)? == "ok")
+}
+
+pub fn check(uds: &Path, cmd: &str, timeout: Duration, stop: &dyn Fn() -> Result<()>) -> Result<bool> {
     let hex: String = cmd.bytes().map(|b| format!("{b:02x}")).collect();
-    match message(uds, &format!("CHECK {} {hex}", timeout.as_millis()), timeout.checked_add(TIMEOUT).ok_or("guest timeout is too large")?)? {
+    match readiness(uds, &format!("CHECK {} {hex}", timeout.as_millis()), timeout.checked_add(TIMEOUT).ok_or("guest timeout is too large")?, stop)? {
         m if m == "ok" => Ok(true),
         m if m.starts_with("exit ") || m == "timeout" => Ok(false),
         m => bail!("readiness command: {m}"),
@@ -342,7 +404,7 @@ mod tests {
     #[test]
     fn overflowing_timeouts_fail_before_contacting_the_guest() {
         let path = Path::new("/nonexistent-flexvm-timeout-test");
-        for error in [clock(path, Duration::MAX).unwrap_err(), check(path, "true", Duration::MAX).unwrap_err()] {
+        for error in [clock(path, Duration::MAX).unwrap_err(), check(path, "true", Duration::MAX, &|| Ok(())).unwrap_err()] {
             assert_eq!(error.to_string(), "guest timeout is too large");
         }
     }

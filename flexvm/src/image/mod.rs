@@ -202,15 +202,22 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
 }
 
 pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
+    warm_up_until(vsock, meta, interrupted)
+}
+
+fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()>) -> Result<()> {
+    stop()?;
     let start = Instant::now();
     guest::start_app(vsock)?;
     loop {
+        stop()?;
         let left = meta.ready_timeout.saturating_sub(start.elapsed());
         let ready = match &meta.ready {
-            Some(Ready::Port(p)) => guest::probe(vsock, *p)?,
-            Some(Ready::Cmd(c)) => guest::check(vsock, c, left.max(Duration::from_millis(100)))?,
+            Some(Ready::Port(p)) => guest::probe(vsock, *p, &stop)?,
+            Some(Ready::Cmd(c)) => guest::check(vsock, c, left.max(Duration::from_millis(100)), &stop)?,
             None => true,
         };
+        stop()?;
         if ready {
             crate::log!("image: app ready after {} ms", ms(start.elapsed()));
             return Ok(());
@@ -775,6 +782,71 @@ mod tests {
 
     fn read(p: impl AsRef<Path>) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn warm_readiness_is_cancelled_during_handshake_and_partial_replies() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for ready in [Ready::Port(8080), Ready::Cmd("sleep 120".into())] {
+            for partial in [b"".as_slice(), b"OK 1\n\x04", b"OK 1\n\x04\x02\x00\x00\x00o"] {
+                let dir = tmpdir("warm-cancel");
+                let path = dir.join("vsock");
+                let listener = UnixListener::bind(&path).unwrap();
+                let stopped = AtomicBool::new(false);
+                let meta = ImageMeta {
+                    source: String::new(),
+                    digest: String::new(),
+                    config_digest: String::new(),
+                    app_conf: String::new(),
+                    argv: vec![],
+                    warm: true,
+                    ready: Some(ready.clone()),
+                    ready_timeout: Duration::from_secs(120),
+                };
+                std::thread::scope(|scope| {
+                    let server = scope.spawn(|| {
+                        for app in [true, false] {
+                            let (stream, _) = listener.accept().unwrap();
+                            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                            let mut r = BufReader::new(stream);
+                            let mut line = String::new();
+                            r.read_line(&mut line).unwrap();
+                            assert_eq!(line, format!("CONNECT {}\n", guest::PORT));
+                            line.clear();
+                            r.read_line(&mut line).unwrap();
+                            if app {
+                                assert_eq!(line, "APP\n");
+                                r.get_mut().write_all(b"OK 1\n").unwrap();
+                                guest::write_frame(r.get_mut(), guest::FRAME_MSG, b"ok 1").unwrap();
+                            } else {
+                                assert!(line.starts_with("PROBE 8080") || line.starts_with("CHECK "));
+                                r.get_mut().write_all(partial).unwrap();
+                                std::thread::sleep(Duration::from_millis(100));
+                                stopped.store(true, Ordering::Relaxed);
+                                assert_eq!(r.read(&mut [0]).unwrap(), 0, "cancellation closes the request");
+                            }
+                        }
+                    });
+                    let start = Instant::now();
+                    let stop = || if stopped.load(Ordering::Relaxed) { Err("interrupted".into()) } else { Ok(()) };
+                    assert_eq!(warm_up_until(&path, &meta, stop).unwrap_err().to_string(), "interrupted");
+                    assert!(start.elapsed() < Duration::from_secs(2));
+                    server.join().unwrap();
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn warm_up_checks_interruption_before_starting() {
+        let meta: ImageMeta = serde_json::from_value(json!({
+            "source": "", "digest": "", "config_digest": "", "app_conf": "", "argv": [], "warm": true
+        }))
+        .unwrap();
+        assert_eq!(warm_up_until(Path::new("/missing-vsock"), &meta, || Err("interrupted".into())).unwrap_err().to_string(), "interrupted");
     }
 
     #[test]
