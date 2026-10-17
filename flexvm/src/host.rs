@@ -1340,6 +1340,11 @@ impl Host {
     /// An error if the directory (made by the first hold) or an entry of it
     /// cannot be read: holds would be missed.
     fn holds(&self, _l: &Locked) -> Result<Vec<(u64, u64)>> {
+        self.live_holds(true)
+    }
+
+    /// `holds`, removing those with no owner left only if `reap` (under the host lock).
+    fn live_holds(&self, reap: bool) -> Result<Vec<(u64, u64)>> {
         let dir = locks(&self.run).join("holds");
         let mut live = Vec::new();
         let entries = match std::fs::read_dir(&dir) {
@@ -1355,7 +1360,8 @@ impl Host {
                 continue;
             }
             match File::open(e.path()).map(|f| flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok()) {
-                Ok(true) => drop(std::fs::remove_file(e.path())),
+                Ok(true) if reap => drop(std::fs::remove_file(e.path())),
+                Ok(true) => {}
                 // Being unlinked by its owner.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 // Held; or unreadable, which counts as held.
@@ -1427,10 +1433,10 @@ impl Host {
         floor: Floor,
         hold: bool,
         deadline: Option<std::time::Instant>,
-        available: impl FnOnce() -> Option<u64>,
+        available: impl Fn() -> Option<u64>,
     ) -> Result<std::result::Result<(u64, Option<Hold>), Error>> {
         let l = self.lock_by(deadline)?;
-        let mut grants = match self.room(&l, mib, floor, available)? {
+        let mut grants = match self.room(&l, mib, floor, deadline, available)? {
             Ok(grants) => grants,
             Err(why) => return Ok(Err(why)),
         };
@@ -1456,13 +1462,23 @@ impl Host {
             drop(hold);
             return Err(e);
         }
+        self.debit_room(mib);
         Ok(Ok((id, hold)))
     }
 
     /// Whether `mib` more fits above `floor` (see `grant_inner`): Ok(Ok(the
     /// grants of the window, to add to)), or Ok(Err(why)) if refused. Test
     /// fault `no_admit`: refuses everything.
-    fn room(&self, l: &Locked, mib: u64, floor: Floor, available: impl FnOnce() -> Option<u64>) -> Result<std::result::Result<Grants, Error>> {
+    /// Before it refuses, VM processes are asked to release the memory they keep for their next checkpoint
+    /// (`hostmem`), waiting for them up to `deadline`, and MemAvailable is read again.
+    fn room(
+        &self,
+        l: &Locked,
+        mib: u64,
+        floor: Floor,
+        deadline: Option<std::time::Instant>,
+        available: impl Fn() -> Option<u64>,
+    ) -> Result<std::result::Result<Grants, Error>> {
         if fault("no_admit") {
             return Ok(Err(format!("not enough memory here for {mib} MiB (injected fault)").into()));
         }
@@ -1476,21 +1492,34 @@ impl Host {
         };
         let now = boottime_ms();
         let mut grants: Grants = load(&self.grants())?.unwrap_or_default();
-        // Ignore future stamps so they cannot extend the cooldown indefinitely.
-        grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
+        in_window(&mut grants, now);
         // Fails closed: unread holds would leave out memory still to arrive.
         let held = self.holds(l).map_err(|e| {
             crate::log!("admission: {e}; granting nothing until it can be read");
             format!("{e}: memory held for migrations and restores still arriving cannot be counted")
         })?;
-        let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
-        // Saturating: a peer's sizes are not trusted to fit.
-        let pending = grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).chain(held.iter().map(|h| h.1)).fold(0, u64::saturating_add);
-        let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
-        if avail < floor.saturating_add(pending).saturating_add(mib) {
+        let pending = pending(&grants, &held, now);
+        let need = floor.saturating_add(pending).saturating_add(mib);
+        let mut avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
+        // Memory VM processes keep for their next checkpoint is not admitted: it goes back rather than refuse (#648).
+        if avail < need {
+            crate::hostmem::release_kept(&self.run, deadline);
+            avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
+        }
+        if avail < need {
             return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
         }
         Ok(Ok(grants))
+    }
+
+    /// Memory granted that MemAvailable may not show taken yet (`room`'s pending: the window's grants and the holds),
+    /// read without the host lock: for memory that is not admitted but keeps out of what is (`cow::Room`). None if it
+    /// cannot be read.
+    pub fn promised(&self) -> Option<u64> {
+        let now = boottime_ms();
+        let grants: Grants = load(&self.grants()).ok()?.unwrap_or_default();
+        let held = self.live_holds(false).ok()?;
+        Some(pending(&grants, &held, now))
     }
 
     /// Counts `hold` as `mib` more, admitted above `floor` like a grant
@@ -1513,16 +1542,26 @@ impl Host {
         mib: u64,
         floor: Floor,
         deadline: Option<std::time::Instant>,
-        available: impl FnOnce() -> Option<u64>,
+        available: impl Fn() -> Option<u64>,
     ) -> Result<std::result::Result<(), Error>> {
         let l = self.lock_by(deadline)?;
         let mut g = hold.lock().unwrap();
         let h = g.as_mut().ok_or("no held grant to grow")?;
-        if let Err(why) = self.room(&l, mib, floor, available)? {
+        if let Err(why) = self.room(&l, mib, floor, deadline, available)? {
             return Ok(Err(why));
         }
         h.resize(h.mib.saturating_add(mib))?;
+        self.debit_room(mib);
         Ok(Ok(()))
+    }
+
+    /// A grant of `mib` comes out of the room checkpoint memory grows within too (`cow::Room`), at once: until the
+    /// next refresh counts it (`promised`), the two would spend the same memory above the reserve.
+    fn debit_room(&self, mib: u64) {
+        match crate::hostmem::at(&self.run) {
+            Ok(s) => crate::cow::Room::debit_host(s, mib),
+            Err(e) => crate::log!("admission: the checkpoint memory room is not debited: {e}"),
+        }
     }
 
     // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
@@ -1858,6 +1897,20 @@ impl Host {
 
 /// Recent grants, as (boot-clock ms, MiB, id).
 type Grants = Vec<(u64, u64, u64)>;
+
+/// Keeps the grants of the last `GRANT_WINDOW`, ignoring future stamps so they cannot extend the cooldown indefinitely.
+fn in_window(grants: &mut Grants, now: u64) {
+    grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
+}
+
+/// What `grants` (of the window, from `now`) and the holds `held` count as used, each once. Saturating: a peer's sizes
+/// are not trusted to fit.
+fn pending(grants: &Grants, held: &[(u64, u64)], now: u64) -> u64 {
+    let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
+    let window = GRANT_WINDOW.as_millis() as u64;
+    let live = grants.iter().filter(|&&(t, ..)| t <= now && now - t <= window);
+    live.filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).chain(held.iter().map(|h| h.1)).fold(0, u64::saturating_add)
+}
 
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
 
@@ -6689,6 +6742,68 @@ mod tests {
         assert!(h.grant_inner(1, Floor::Reserve, true, None, || Some(AVAIL)).is_err(), "nor a held grant");
         std::fs::remove_file(&dir).unwrap();
         assert!(grant().unwrap().is_some() && grants().len() == 2);
+    }
+
+    /// Memory VM processes keep for their next checkpoint never refuses a grant (#648): asked for it before a refusal,
+    /// they let it go, and MemAvailable is read again.
+    #[test]
+    fn kept_checkpoint_memory_goes_back_before_a_grant_is_refused() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let (_h_dir, mut h) = host("kept-release");
+        h.cfg.reserve_mib = Some(0);
+        pin_clock(boottime_ms());
+        let kept: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(300)));
+        let shared = crate::hostmem::at(&h.run).unwrap();
+        std::thread::spawn(move || shared.serve(|| kept.store(0, SeqCst)));
+        let t = std::time::Instant::now();
+        while !shared.joined() {
+            assert!(t.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let avail = || Some(AVAIL - kept.load(SeqCst));
+        // Fits once the kept memory is back.
+        assert!(h.grant_inner(AVAIL - 100, Floor::Reserve, false, None, avail).unwrap().is_ok());
+        assert_eq!(kept.load(SeqCst), 0, "released on request");
+        // Nothing kept to give: still refused.
+        shared.forget_release();
+        kept.store(50, SeqCst);
+        assert!(h.grant_inner(200, Floor::Reserve, false, None, avail).unwrap().is_err());
+        // Asked again within a second: not asked, but MemAvailable is read again all the same.
+        kept.store(80, SeqCst);
+        let reads = std::sync::atomic::AtomicU64::new(0);
+        let later = || Some(AVAIL - [80, 0][(reads.fetch_add(1, SeqCst) as usize).min(1)]);
+        assert!(h.grant_inner(10, Floor::Reserve, false, None, later).unwrap().is_ok(), "read again");
+        assert_eq!(kept.load(SeqCst), 80, "not asked");
+        // A held grant grows the same way.
+        shared.forget_release();
+        let hold = Mutex::new(Some(h.grant_inner(10, Floor::Reserve, true, None, || Some(AVAIL)).unwrap().unwrap().1.unwrap()));
+        kept.store(80, SeqCst);
+        assert!(h.grow_hold_inner(&hold, 20, Floor::Reserve, None, avail).unwrap().is_ok());
+        assert_eq!(kept.load(SeqCst), 0);
+    }
+
+    /// A grant comes out of the room checkpoint memory grows within at once (#648): until a refresh counts it as
+    /// promised, the two would spend the same memory above the reserve.
+    #[test]
+    fn grants_come_out_of_the_checkpoint_memory_room() {
+        let (_h_dir, mut h) = host("grant-debits-room");
+        h.cfg.reserve_mib = Some(0);
+        pin_clock(boottime_ms());
+        let room = crate::cow::Room::default();
+        room.attach(crate::hostmem::at(&h.run).unwrap());
+        room.set(1000);
+        assert!(h.grant_inner(300, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
+        assert_eq!(room.get(), 700);
+        let hold = Mutex::new(Some(h.grant_inner(100, Floor::Reserve, true, None, || Some(AVAIL)).unwrap().unwrap().1.unwrap()));
+        assert!(h.grow_hold_inner(&hold, 50, Floor::Reserve, None, || Some(AVAIL)).unwrap().is_ok());
+        assert_eq!(room.get(), 550, "held, and grown");
+        // More than is left: none left (not refused for it: admission has its own bound).
+        assert!(h.grant_inner(600, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
+        assert_eq!(room.get(), 0);
+        // Refused: nothing taken.
+        room.set(1000);
+        assert!(h.grant_inner(AVAIL, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_err());
+        assert_eq!(room.get(), 1000);
     }
 
     #[test]

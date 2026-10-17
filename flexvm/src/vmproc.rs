@@ -1068,6 +1068,7 @@ impl Proc {
             thread::spawn(move || f(p));
         };
         spawn(Proc::controller);
+        spawn(Proc::release_on_request);
         spawn(Proc::serve_memory);
         spawn(Proc::watch_memory);
         if self.vm().template.meta.image.as_ref().is_some_and(|i| i.has_app()) {
@@ -1425,9 +1426,18 @@ impl Proc {
                 published = vm.starving();
                 self.publish();
             }
-            let avail = host_available_mib();
+            let mut avail = host_available_mib();
             let (reserve, at, _) = self.host.config_now().evict_marks();
-            vm.pager.host_memory(avail.map(|a| a.saturating_sub(reserve)), avail.is_some_and(|a| a < at) || vm.starving());
+            // Memory VM processes keep for their next checkpoint never moves a VM away: it goes back first (#648).
+            if avail.is_some_and(|a| a < at) {
+                crate::hostmem::release_kept(&self.host.run, None);
+                avail = host_available_mib();
+            }
+            if let Ok(s) = crate::hostmem::at(&self.host.run) {
+                vm.pager.mem_room().attach(s);
+            }
+            let room = room_sample(reserve, host_available_mib, || self.host.promised());
+            vm.pager.host_memory(room, avail.is_some_and(|a| a < at) || vm.starving());
             relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
             if let Some(dev) = self.host.config_now().announce_dev() {
@@ -1446,6 +1456,16 @@ impl Proc {
         match *vm.cow_copy.lock().unwrap() {
             true => resize(vm, &self.host, hint, true),
             false => Ok(Resized::Busy),
+        }
+    }
+
+    /// Answers other processes' requests that this one release the memory it keeps for the next checkpoint
+    /// (`hostmem`): admission asks before it refuses, eviction and the standby pool before they react to the host
+    /// running short.
+    fn release_on_request(self: Arc<Self>) {
+        match crate::hostmem::at(&self.host.run) {
+            Ok(s) => s.serve(|| self.vm().pager.release_kept()),
+            Err(e) => crate::log!("vm {}: memory kept for checkpoints is not released on request: {e}", self.vm().name),
         }
     }
 
@@ -1954,6 +1974,13 @@ pub fn cgroup_root() -> Option<PathBuf> {
 /// can hold (its memory mark stops there), less what it has.
 fn arrival_more(granted: u64, (need, cap): (u64, u64)) -> u64 {
     crate::limit::allowance(need).min(cap.max(need)).saturating_sub(granted)
+}
+
+/// The room checkpoint memory grows within (`cow::Room::refresh`): MemAvailable above `reserve`, less what admission
+/// promised guests (none if that cannot be read). Read only when called, which a refresh does once it has claimed its
+/// epoch: a sample read before would be published after a newer refresh by a controller held up meanwhile.
+fn room_sample(reserve: u64, available: impl FnOnce() -> Option<u64>, promised: impl FnOnce() -> Option<u64>) -> impl FnOnce() -> Option<u64> {
+    move || Some(available()?.saturating_sub(reserve).saturating_sub(promised().unwrap_or(u64::MAX)))
 }
 
 /// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`;
@@ -2758,6 +2785,43 @@ fn call_checked(host: &Host, name: &str, req: Value, at: Option<Instant>, check:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The controller's room sample is read only once its refresh has claimed its epoch (#648): read before, a
+    /// controller held up while another refreshed would publish a stale, higher sample. Here the other refreshes
+    /// between the claim and the read: the sample is MemAvailable as read after, and the claimed refresh is dropped.
+    #[test]
+    fn the_room_is_sampled_after_its_refresh_claims_it() {
+        use std::sync::atomic::AtomicU64;
+        let dir = crate::test_util::TempDir::new("room-sample");
+        let host = crate::hostmem::at(&dir).unwrap();
+        let (a, b) = (crate::cow::Room::default(), crate::cow::Room::default());
+        a.attach(host);
+        b.attach(host);
+        let avail = AtomicU64::new(5000);
+        let reads = AtomicU64::new(0);
+        let read = || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            Some(avail.load(Ordering::SeqCst))
+        };
+        let sample = room_sample(1000, read, || Some(500));
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "not read until the refresh calls it");
+        host.stamp.store(0, Ordering::SeqCst);
+        a.refresh(sample);
+        assert_eq!((reads.load(Ordering::SeqCst), a.get()), (1, 3500));
+        // Claimed, and held up before its read while another refreshes with less available: dropped, not published.
+        host.stamp.store(0, Ordering::SeqCst);
+        a.refresh(|| {
+            host.stamp.store(0, Ordering::SeqCst);
+            avail.store(2000, Ordering::SeqCst);
+            b.refresh(room_sample(1000, read, || Some(500)));
+            room_sample(1000, || Some(9000), || Some(500))()
+        });
+        assert_eq!(b.get(), 500, "the newer sample stands");
+        // Unreadable promises: no room, not all of it.
+        host.stamp.store(0, Ordering::SeqCst);
+        a.refresh(room_sample(1000, read, || None));
+        assert_eq!(a.get(), 0);
+    }
 
     #[test]
     fn cgroup_controllers_are_whole_words() {

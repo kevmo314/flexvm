@@ -486,8 +486,13 @@ pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
 /// refilled: a host with no running VM has no controller to stop it (#600). A running
 /// VM's controller stops them first (`vmproc::relieve`), holding eviction off meanwhile.
 fn under_reserve(host: &Host, template: &str) -> bool {
-    let Some(avail) = crate::vmproc::host_available_mib() else { return false };
+    let Some(mut avail) = crate::vmproc::host_available_mib() else { return false };
     let reserve = host.config_now().reserve();
+    // Memory VM processes keep for their next checkpoint goes back first (#648).
+    if avail < reserve {
+        crate::hostmem::release_kept(&host.run, None);
+        avail = crate::vmproc::host_available_mib().unwrap_or(avail);
+    }
     if avail >= reserve {
         return false;
     }

@@ -111,8 +111,10 @@ pub struct Cow {
     stopped: AtomicBool,
     /// Whether a writer has started reading pages (`CowPages::read`).
     writing: AtomicBool,
-    /// Times a writer waited for a rescue to settle (`wait_rescued`), for test fault `ckpt_rescue_fail`.
+    /// Times a writer waited for a rescue to settle (`wait_rescued`), for test fault `ckpt_rescue_fail`: counted only
+    /// while it is armed (`count_rescue_waits`).
     rescue_waits: AtomicU64,
+    count_waits: bool,
     error: Mutex<Option<String>>,
     started: Instant,
     /// The pages to save, as `[first, end)` runs.
@@ -146,6 +148,7 @@ impl Cow {
             stopped: AtomicBool::new(false),
             writing: AtomicBool::new(false),
             rescue_waits: AtomicU64::new(0),
+            count_waits: false,
             error: Mutex::new(None),
             started: Instant::now(),
             runs,
@@ -163,6 +166,12 @@ impl Cow {
         }
         self.slots.room = room;
         self.home = Some(home);
+        self
+    }
+
+    /// Counts the times writers wait for a rescue to settle (`rescue_waits`), for test fault `ckpt_rescue_fail`.
+    pub fn count_rescue_waits(mut self, on: bool) -> Cow {
+        self.count_waits = on;
         self
     }
 
@@ -229,7 +238,9 @@ impl Cow {
     /// Parks a writer while `page` is RESCUING, until the rescue keeps its copy, gives it back, or the copy stops. No
     /// wakeup is lost: each of those changes the state (or stops) before it notifies under `progress`'s lock.
     fn wait_rescued(&self, page: usize) {
-        self.rescue_waits.fetch_add(1, Ordering::SeqCst);
+        if self.count_waits {
+            self.rescue_waits.fetch_add(1, Ordering::SeqCst);
+        }
         let g = self.progress.0.lock().unwrap();
         drop(self.progress.1.wait_while(g, |_| self.active() && self.state(page) == RESCUING).unwrap());
     }
@@ -581,78 +592,189 @@ impl Slot {
 /// the copy (`Cow` dropped), so a writer never reads memory a stop took away.
 #[derive(Default)]
 pub struct Slots {
-    chunks: Mutex<Vec<usize>>,
-    free: Mutex<Vec<Slot>>,
+    /// The chunks mapped, and the slots of them free.
+    inner: Mutex<SlotsInner>,
+    /// How many chunks, read without the lock.
+    mapped: AtomicUsize,
     room: Room,
     /// Slots taken and not given back, and the most at once.
     used: AtomicUsize,
     peak: AtomicUsize,
 }
 
+#[derive(Default)]
+struct SlotsInner {
+    chunks: Vec<usize>,
+    free: Vec<Slot>,
+}
+
 const SLOT_CHUNK: usize = 2 << 20;
 const MADV_POPULATE_WRITE: libc::c_int = 23;
 
-/// What host memory rescue memory may still take, in MiB above the host's reserve: as the VM process's memory
-/// controller last read it (`Pager::host_memory`, every second), less what was mapped since. Unknown (as it starts):
-/// no bound. Rescue memory is not admitted like a guest's (its copy would wait), so it keeps out of the reserve instead.
-#[derive(Clone)]
-pub struct Room(Arc<AtomicU64>);
+/// What host memory rescue memory, hot pages' memory and writer buffers may still take, in MiB: what is available above
+/// the host's reserve and the memory admission has granted and guests have yet to touch, as last read (`refresh`,
+/// about every second), less what was taken since. One for the host, shared by its VM processes once `attach`ed
+/// (`hostmem`), so VMs copying at once share it. Unknown (as it starts): no bound. That memory is not admitted like a
+/// guest's (its copy would wait), so it keeps out of the reserve instead.
+///
+/// One word: the room (0 for no bound, else 1 more than it), what was taken since the last refresh, and the refresh's
+/// epoch. A refresh reads MemAvailable, which shows memory taken before it once it is populated: it takes off again
+/// what was taken since the refresh before (taken and not populated yet, or counted twice until the next), and no
+/// more. Memory given back counts only within the epoch it was taken in: from the next refresh on MemAvailable shows it.
+#[derive(Clone, Default)]
+pub struct Room(Arc<RoomCell>);
 
-impl Default for Room {
-    fn default() -> Room {
-        Room(Arc::new(AtomicU64::new(u64::MAX)))
+#[derive(Default)]
+struct RoomCell {
+    local: AtomicU64,
+    host: OnceLock<&'static crate::hostmem::Shared>,
+}
+
+/// When `Room` was taken from, to give back within (`Room::give`).
+pub type Epoch = u16;
+
+const FIELD: u64 = (1 << 24) - 1;
+/// How often a host's room is refreshed, by whichever VM process comes first.
+const REFRESH_GAP_MS: u64 = 900;
+
+fn room_field(w: u64) -> u64 {
+    w & FIELD
+}
+
+fn recent(w: u64) -> u64 {
+    (w >> 24) & FIELD
+}
+
+fn epoch(w: u64) -> Epoch {
+    (w >> 48) as Epoch
+}
+
+fn pack(epoch: Epoch, recent: u64, room: u64) -> u64 {
+    (epoch as u64) << 48 | recent.min(FIELD) << 24 | room
+}
+
+/// The room field for `mib` (u64::MAX: no bound).
+fn room_of(mib: u64) -> u64 {
+    if mib == u64::MAX {
+        0
+    } else {
+        mib.min(FIELD - 1) + 1
     }
 }
 
 impl Room {
+    /// From now on the host's room (`hostmem`), shared with every VM process. Once; what was taken before is not
+    /// counted there (the next refresh shows it).
+    pub fn attach(&self, host: &'static crate::hostmem::Shared) {
+        let _ = self.0.host.set(host);
+    }
+
+    fn word(&self) -> &AtomicU64 {
+        self.0.host.get().map_or(&self.0.local, |h| &h.room)
+    }
+
+    /// Sets it to `mib` (u64::MAX: no bound), forgetting what was taken.
+    #[cfg(test)]
     pub fn set(&self, mib: u64) {
-        self.0.store(mib, Ordering::SeqCst)
+        let _ = self.word().fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| Some(pack(epoch(w).wrapping_add(1), 0, room_of(mib))));
+    }
+
+    /// From what is available now (`mib`, read only for a refresh; None: unknown, no bound), less what was taken since
+    /// the last refresh. The host's at most every `REFRESH_GAP_MS`: whichever process comes first refreshes it.
+    pub fn refresh(&self, mib: impl FnOnce() -> Option<u64>) {
+        if let Some(h) = self.0.host.get() {
+            let (now, last) = (crate::host::boottime_ms(), h.stamp.load(Ordering::SeqCst));
+            if now.wrapping_sub(last) < REFRESH_GAP_MS || h.stamp.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                return;
+            }
+        }
+        // Only if no refresh came between the claim and the sample (one from a refresher held up meanwhile would
+        // make memory taken since spendable again): what was taken since is in `recent`.
+        let word = self.word();
+        let at = epoch(word.load(Ordering::SeqCst));
+        let mib = mib();
+        let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
+            (epoch(w) == at).then(|| pack(at.wrapping_add(1), 0, mib.map_or(0, |m| room_of(m.saturating_sub(recent(w))))))
+        });
     }
 
     pub fn get(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        match room_field(self.word().load(Ordering::SeqCst)) {
+            0 => u64::MAX,
+            r => r - 1,
+        }
     }
 
-    /// Takes `mib` of it, if there is that much.
-    pub fn take(&self, mib: u64) -> bool {
-        self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| r.checked_sub(mib)).is_ok()
+    /// Takes `mib` of it, if there is that much: when, to give it back (`give`).
+    pub fn take(&self, mib: u64) -> Option<Epoch> {
+        let mut at = 0;
+        self.word()
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
+                at = epoch(w);
+                match room_field(w) {
+                    0 => Some(w),
+                    r if r - 1 < mib => None,
+                    r => Some(pack(at, recent(w) + mib, r - mib)),
+                }
+            })
+            .ok()
+            .map(|_| at)
     }
 
-    /// Gives back `mib` taken from it (its memory is unmapped again, or never was).
-    pub fn give(&self, mib: u64) {
-        let _ = self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| Some(r.saturating_add(mib)));
+    /// Takes `mib` from the host's room whether or not there is that much (to none left): memory admission granted a
+    /// guest, which the next refresh counts (`Host::promised`), and until then this.
+    pub fn debit_host(host: &crate::hostmem::Shared, mib: u64) {
+        let _ = host.room.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| match room_field(w) {
+            0 => None,
+            r => Some(pack(epoch(w), recent(w) + mib.min(FIELD), r.saturating_sub(mib).max(1))),
+        });
+    }
+
+    /// Gives back `mib` taken from it `at` (its memory is unmapped again, or never was): unless it was refreshed since,
+    /// which counted it already.
+    pub fn give(&self, mib: u64, at: Epoch) {
+        let _ = self.word().fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
+            let r = room_field(w);
+            (epoch(w) == at && r != 0).then(|| pack(at, recent(w).saturating_sub(mib), (r + mib.min(FIELD)).min(FIELD)))
+        });
     }
 }
 
 const CHUNK_MIB: u64 = (SLOT_CHUNK >> 20) as u64;
 
+/// The MiB of chunks to map for `n` slots with `free` of them free.
+fn short_mib(n: usize, free: usize) -> u64 {
+    n.saturating_sub(free).div_ceil(SLOT_CHUNK / PAGE_SIZE) as u64 * CHUNK_MIB
+}
+
 impl Slots {
     /// Whether `take` would give `n` slots now: free ones, or room to map more (or `unbounded`).
     fn can_take(&self, n: usize, unbounded: bool) -> bool {
-        let short = n.saturating_sub(self.free.lock().unwrap().len());
-        short == 0 || unbounded || self.room.get() >= short.div_ceil(SLOT_CHUNK / PAGE_SIZE) as u64 * CHUNK_MIB
+        let short = short_mib(n, self.inner.lock().unwrap().free.len());
+        short == 0 || unbounded || self.room.get() >= short
     }
 
     pub fn mapped_bytes(&self) -> usize {
-        self.chunks.lock().unwrap().len() * SLOT_CHUNK
+        self.mapped.load(Ordering::Relaxed) * SLOT_CHUNK
     }
 
     /// `n` slots, ascending where they come from a new chunk. None if there are not that many free and the host has no
     /// `room` to map more (but for `unbounded`): nothing is taken then.
     fn take(&self, n: usize, unbounded: bool) -> std::io::Result<Option<Vec<Slot>>> {
-        let mut free = self.free.lock().unwrap();
-        let short = n.saturating_sub(free.len()).div_ceil(SLOT_CHUNK / PAGE_SIZE) as u64 * CHUNK_MIB;
-        if short > 0 && !unbounded && !self.room.take(short) {
+        let mut inner = self.inner.lock().unwrap();
+        let short = short_mib(n, inner.free.len());
+        if short > 0 && !unbounded && self.room.take(short).is_none() {
             return Ok(None);
         }
-        while free.len() < n {
+        while inner.free.len() < n {
             let c = map_chunk()?;
-            self.chunks.lock().unwrap().push(c);
+            inner.chunks.push(c);
+            self.mapped.fetch_add(1, Ordering::Relaxed);
             // Descending: they are taken from the end.
-            free.extend((0..SLOT_CHUNK / PAGE_SIZE).rev().map(|i| Slot(c + i * PAGE_SIZE)));
+            inner.free.extend((0..SLOT_CHUNK / PAGE_SIZE).rev().map(|i| Slot(c + i * PAGE_SIZE)));
         }
-        let at = free.len() - n;
-        let mut out = free.split_off(at);
+        let at = inner.free.len() - n;
+        let mut out = inner.free.split_off(at);
         out.reverse();
         let used = self.used.fetch_add(n, Ordering::Relaxed) + n;
         self.peak.fetch_max(used, Ordering::Relaxed);
@@ -662,7 +784,7 @@ impl Slots {
     fn give(&self, slots: Vec<Slot>) {
         if !slots.is_empty() {
             self.used.fetch_sub(slots.len(), Ordering::Relaxed);
-            self.free.lock().unwrap().extend(slots);
+            self.inner.lock().unwrap().free.extend(slots);
         }
     }
 
@@ -670,28 +792,29 @@ impl Slots {
     /// budget of rescued copies (a held-back discard rescues past it, `Pager::save_rest`), none while the host has no
     /// room (under its reserve), every slot free, and forgets that most.
     fn trim(&mut self) {
-        let chunks = self.chunks.get_mut().unwrap();
+        let inner = self.inner.get_mut().unwrap();
         let cap = if self.room.get() == 0 { 0 } else { (BUDGET_MIB << 20) / SLOT_CHUNK };
-        let keep = self.peak.get_mut().div_ceil(SLOT_CHUNK / PAGE_SIZE).min(chunks.len()).min(cap);
-        for &c in &chunks[keep..] {
+        let keep = self.peak.get_mut().div_ceil(SLOT_CHUNK / PAGE_SIZE).min(inner.chunks.len()).min(cap);
+        for &c in &inner.chunks[keep..] {
             unsafe { libc::munmap(c as *mut _, SLOT_CHUNK) };
         }
-        chunks.truncate(keep);
-        let free = self.free.get_mut().unwrap();
-        free.clear();
-        free.extend(chunks.iter().rev().flat_map(|&c| (0..SLOT_CHUNK / PAGE_SIZE).rev().map(move |i| Slot(c + i * PAGE_SIZE))));
+        inner.chunks.truncate(keep);
+        *self.mapped.get_mut() = keep;
+        inner.free.clear();
+        let chunks = &inner.chunks;
+        inner.free.extend(chunks.iter().rev().flat_map(|&c| (0..SLOT_CHUNK / PAGE_SIZE).rev().map(move |i| Slot(c + i * PAGE_SIZE))));
         (*self.used.get_mut(), *self.peak.get_mut()) = (0, 0);
     }
 
     #[cfg(test)]
     fn mapped(&self) -> usize {
-        self.chunks.lock().unwrap().len() * SLOT_CHUNK / PAGE_SIZE
+        self.mapped_bytes() / PAGE_SIZE
     }
 }
 
 impl Drop for Slots {
     fn drop(&mut self) {
-        for &c in self.chunks.get_mut().unwrap().iter() {
+        for &c in self.inner.get_mut().unwrap().chunks.iter() {
             unsafe { libc::munmap(c as *mut _, SLOT_CHUNK) };
         }
     }
@@ -723,6 +846,16 @@ fn map_chunk() -> std::io::Result<usize> {
 
 #[cfg(test)]
 impl Cow {
+    /// As once a writer has started reading pages.
+    pub fn start_writing(&self) {
+        self.writing.store(true, Ordering::SeqCst);
+    }
+
+    /// The pages faults asked the writers for, first first.
+    pub fn wanted_pages(&self) -> Vec<usize> {
+        self.wanted.lock().unwrap().iter().copied().collect()
+    }
+
     /// Rescued copies held now.
     pub fn rescued_mib(&self) -> f64 {
         self.rescued_bytes.load(Ordering::SeqCst) as f64 / (1 << 20) as f64
@@ -743,6 +876,61 @@ impl Cow {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    /// VM processes copying at once share the host's room (#648): one's take is the others' too, so together they
+    /// never take more than there is.
+    #[test]
+    fn the_host_room_is_shared_by_its_vm_processes() {
+        let dir = crate::test_util::TempDir::new("room");
+        let host = crate::hostmem::at(&dir).unwrap();
+        let (a, b) = (Room::default(), Room::default());
+        a.attach(host);
+        b.attach(host);
+        // Unknown until refreshed: no bound, and nothing debited.
+        assert_eq!(a.get(), u64::MAX);
+        assert!(a.take(1 << 30).is_some());
+        assert_eq!(b.get(), u64::MAX);
+        let due = || host.stamp.store(crate::host::boottime_ms().wrapping_sub(REFRESH_GAP_MS), Ordering::SeqCst);
+        due();
+        a.refresh(|| Some(100));
+        assert_eq!(b.get(), 100);
+        // Refreshed by whichever process comes first, at most every REFRESH_GAP_MS for the host.
+        b.refresh(|| panic!("not due: MemAvailable is not read"));
+        assert!(a.take(60).is_some());
+        assert!(b.take(60).is_none(), "taken by the other already");
+        let at = b.take(40).unwrap();
+        assert_eq!(a.get(), 0);
+        b.give(40, at);
+        assert_eq!(a.get(), 40, "given back within its epoch");
+        // A refresh takes off what was taken since the one before (it may not show in MemAvailable yet)...
+        due();
+        b.refresh(|| Some(100));
+        assert_eq!(a.get(), 40);
+        // ...and no more after the next, by which it does.
+        due();
+        b.refresh(|| Some(100));
+        assert_eq!(a.get(), 100);
+        // Given back once refreshed: MemAvailable shows it freed, so it is not counted twice.
+        let at = a.take(10).unwrap();
+        due();
+        a.refresh(|| Some(50));
+        a.give(10, at);
+        assert_eq!(b.get(), 40);
+        // A refresher held up between its claim and its sample while another refreshed: its sample is not published
+        // (memory taken since would be spendable again).
+        due();
+        a.refresh(|| {
+            due();
+            b.refresh(|| Some(30));
+            Some(500)
+        });
+        assert_eq!(a.get(), 30, "the newer refresh stands");
+        // A process not attached keeps its own.
+        let own = Room::default();
+        own.set(5);
+        assert_eq!((own.get(), a.get()), (5, 30));
+        assert!(own.take(5).is_some() && own.take(1).is_none());
+    }
 
     /// A non-blocking eventfd, for a waker.
     fn eventfd() -> OwnedFd {
