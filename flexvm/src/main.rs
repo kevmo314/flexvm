@@ -588,7 +588,7 @@ fn run(args: &Args, image: &str) -> Result<()> {
     }
     // Pulled the first time, as docker does (a detached run's VM process finds it there).
     if std::fs::symlink_metadata(paths.templates.join(&template)).is_err() {
-        pull_missing(args, image)?;
+        pull_missing(args, &template)?;
     }
     let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
     // A made-up name is only checked free here: one another run took meanwhile is made up
@@ -1019,11 +1019,16 @@ fn template_vcpus(args: &Args) -> Result<u32> {
     Ok(cpus)
 }
 
+fn pull_missing_args(args: &Args, name: &str) -> Vec<String> {
+    child_args(args, &["pull", &template::image_of(name)])
+}
+
 /// `run IMAGE` of an image not pulled here: `flexvm pull IMAGE` first, its output on stderr.
-fn pull_missing(args: &Args, image: &str) -> Result<()> {
+fn pull_missing(args: &Args, name: &str) -> Result<()> {
+    let image = template::image_of(name);
     crate::log!("flexvm: unable to find image {image} here; pulling it");
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.args(child_args(args, &["pull", image]));
+    cmd.args(pull_missing_args(args, name));
     let status = cmd.stdout(std::io::stderr()).status()?;
     if !status.success() {
         bail!("pulling {image} failed ({status})");
@@ -1434,6 +1439,21 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn auto_pull_uses_the_resolved_templates_reference() {
+        let args = Args::parse(["--state", "/s", "run", "ghcr.io+org+app"].map(String::from)).unwrap();
+        for input in ["ghcr.io+org+app", "ghcr.io/org/app", "ghcr.io+org+app:v1", "nginx"] {
+            let name = template::name_of(input).unwrap();
+            let words = pull_missing_args(&args, &name);
+            assert_eq!(&words[..3], ["--state", "/s", "pull"]);
+            let reference = image::Reference::parse(&words[3]).unwrap();
+            assert_eq!(reference.template_name(), name);
+            if input == "ghcr.io+org+app" {
+                assert_eq!(words[3], "ghcr.io/org/app:latest");
+            }
+        }
     }
 
     #[test]

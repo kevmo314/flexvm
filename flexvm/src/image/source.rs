@@ -308,7 +308,11 @@ fn download_layers<T: Sync>(descs: &[(String, u64, T)], download: impl Fn(&str, 
             .map(|_| {
                 scope.spawn(|| -> Result<()> {
                     loop {
-                        let next = pending.lock().unwrap().next();
+                        let next = {
+                            let mut pending = pending.lock().unwrap();
+                            crate::template::interrupted()?;
+                            pending.next()
+                        };
                         let Some((d, (size, src))) = next else { return Ok(()) };
                         if let Err(e) = download(d, size, src) {
                             // Start nothing more; downloads in flight finish.

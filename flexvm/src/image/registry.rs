@@ -214,19 +214,54 @@ fn io_error(e: std::io::Error, timeout: NextTimeout) -> ureq::Error {
     }
 }
 
+/// Poll blocking socket I/O without shortening its idle/transfer timeout.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+fn network_wait<T>(timeout: NextTimeout, mut io: impl FnMut(Duration) -> std::io::Result<T>) -> std::result::Result<T, ureq::Error> {
+    let until = Instant::now() + timeout.not_zero().map_or(IDLE, |t| *t);
+    loop {
+        crate::template::interrupted().map_err(|e| std::io::Error::other(e.to_string()))?;
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(ureq::Error::Timeout(timeout.reason));
+        }
+        match io(left.min(CANCEL_POLL)) {
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => continue,
+            result => return result.map_err(|e| io_error(e, timeout)),
+        }
+    }
+}
+
 impl Transport for PeerTcp {
     fn buffers(&mut self) -> &mut dyn Buffers {
         &mut self.buffers
     }
 
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> std::result::Result<(), ureq::Error> {
-        self.stream.set_write_timeout(timeout.not_zero().map(|t| *t))?;
-        self.stream.write_all(&self.buffers.output()[..amount]).map_err(|e| io_error(e, timeout))
+        let until = Instant::now() + timeout.not_zero().map_or(IDLE, |t| *t);
+        let mut output = &self.buffers.output()[..amount];
+        while !output.is_empty() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(ureq::Error::Timeout(timeout.reason));
+            }
+            let n = network_wait(NextTimeout { after: left.into(), reason: timeout.reason }, |wait| {
+                self.stream.set_write_timeout(Some(wait))?;
+                self.stream.write(output)
+            })?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            output = &output[n..];
+        }
+        Ok(())
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
-        self.stream.set_read_timeout(timeout.not_zero().map(|t| *t))?;
-        let n = self.stream.read(self.buffers.input_append_buf()).map_err(|e| io_error(e, timeout))?;
+        let n = network_wait(timeout, |wait| {
+            self.stream.set_read_timeout(Some(wait))?;
+            self.stream.read(self.buffers.input_append_buf())
+        })?;
         self.buffers.input_appended(n);
         Ok(n > 0)
     }
@@ -262,6 +297,7 @@ struct Deadlined<T> {
 
 impl<T> Deadlined<T> {
     fn timeout(&self, next: NextTimeout) -> std::result::Result<NextTimeout, ureq::Error> {
+        crate::template::interrupted().map_err(|e| std::io::Error::other(e.to_string()))?;
         let left = self.deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(ureq::Error::Timeout(Timeout::Global))?;
         let idle = NextTimeout { after: next.after.min(IDLE.into()), reason: next.reason };
         Ok(if idle.after > left.into() { NextTimeout { after: left.into(), reason: Timeout::Global } } else { idle })
@@ -376,6 +412,18 @@ fn retry_wait(retry_after: Option<&str>, n: u32) -> Duration {
     retry_after.and_then(|v| v.trim().parse().ok()).map_or(backoff(n), |s| Duration::from_secs(s).min(MAX_RETRY_AFTER))
 }
 
+fn retry_sleep(wait: Duration) -> Result<()> {
+    let until = Instant::now() + wait;
+    loop {
+        crate::template::interrupted()?;
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(left.min(CANCEL_POLL));
+    }
+}
+
 /// `req` sent, and sent again after a 429 or 503 (a rate limit, or a registry briefly unavailable) up to `MAX_RETRIES`
 /// times: after `retry_wait`, and only while that wait ends before `deadline`. The last answer is returned whatever its
 /// status.
@@ -399,7 +447,7 @@ fn call(
             bail!("{what}: HTTP {code}, and a retry in {} s would pass the transfer deadline", wait.as_secs());
         }
         crate::log!("image: {what}: HTTP {code}; retrying in {} s", wait.as_secs_f32().ceil());
-        std::thread::sleep(wait);
+        retry_sleep(wait)?;
     }
     unreachable!()
 }
@@ -470,6 +518,7 @@ impl Registry {
 
     /// The time left before `deadline`, for the next request: ureq's own limit for it, under `Deadlined`'s.
     fn left(deadline: Instant, what: &str) -> Result<Duration> {
+        crate::template::interrupted()?;
         match deadline.checked_duration_since(Instant::now()) {
             Some(left) if !left.is_zero() => Ok(left),
             _ => bail!("{what}: transfer deadline passed"),
@@ -813,6 +862,48 @@ pub(super) mod tests {
     }
 
     const CLOSE: &str = "Content-Length: 0\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    fn dripped_reader_is_cancelled_and_removes_partial_blob() {
+        // Isolate the process-wide signal flag from other tests.
+        const CHILD: &str = "FLEXVM_TEST_DRIP_CANCEL";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "image::registry::tests::dripped_reader_is_cancelled_and_removes_partial_blob", "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        struct Drip(usize);
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                network_wait(NextTimeout { after: IDLE.into(), reason: Timeout::Global }, |_| {
+                    std::thread::sleep(Duration::from_millis(10));
+                    buf[0] = b'x';
+                    self.0 += 1;
+                    if self.0 == 3 {
+                        crate::template::interrupt(libc::SIGINT);
+                    }
+                    Ok(1)
+                })
+                .map_err(std::io::Error::other)
+            }
+        }
+        let dir = super::super::unpack::tests::tmpdir("drip-cancel");
+        let digest = sha256_hex(b"unused");
+        let path = blob_path(&dir, &digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let start = Instant::now();
+        let error = cached_blob(&digest, 8 << 30, &dir, || Ok(Drip(0))).unwrap_err();
+        assert!(error.to_string().contains("interrupted"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 0);
+        assert!(retry_sleep(MAX_RETRY_AFTER).unwrap_err().to_string().contains("interrupted"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A registry is local by the address its answer came from: one reached on a private address by name may use a
     /// private token service and redirect into private networks; one reached on a public address may not, nor can a
