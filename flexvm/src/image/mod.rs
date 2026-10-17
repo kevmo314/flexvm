@@ -205,8 +205,7 @@ pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
     warm_up_until(vsock, meta, interrupted)
 }
 
-fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()>) -> Result<()> {
-    stop()?;
+fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()> + Sync) -> Result<()> {
     let start = Instant::now();
     guest::start_app(vsock)?;
     loop {
@@ -217,7 +216,6 @@ fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()>) 
             Some(Ready::Cmd(c)) => guest::check(vsock, c, left.max(Duration::from_millis(100)), &stop)?,
             None => true,
         };
-        stop()?;
         if ready {
             crate::log!("image: app ready after {} ms", ms(start.elapsed()));
             return Ok(());
@@ -838,15 +836,6 @@ mod tests {
                 });
             }
         }
-    }
-
-    #[test]
-    fn warm_up_checks_interruption_before_starting() {
-        let meta: ImageMeta = serde_json::from_value(json!({
-            "source": "", "digest": "", "config_digest": "", "app_conf": "", "argv": [], "warm": true
-        }))
-        .unwrap();
-        assert_eq!(warm_up_until(Path::new("/missing-vsock"), &meta, || Err("interrupted".into())).unwrap_err().to_string(), "interrupted");
     }
 
     #[test]

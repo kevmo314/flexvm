@@ -76,6 +76,11 @@ pub fn abandon(uds: &Path) {
 /// All I/O by `deadline`; nothing is sent once it has passed. Test faults: `guest_drop`,
 /// `guest_lose_reply`.
 fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<(u8, Vec<u8>)> {
+    ask_watched(uds, line, deadline, |_| Ok(()))
+}
+
+/// `ask`, with `watch` shown the connection before anything is sent.
+fn ask_watched(uds: &Path, line: &str, deadline: Instant, watch: impl FnOnce(&UnixStream) -> Result<()>) -> Result<(u8, Vec<u8>)> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(std::io::Error::new(ErrorKind::TimedOut, format!("no time left for {line:?}")).into());
@@ -87,6 +92,7 @@ fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<(u8, Vec<u8>)> {
     if fault("guest_drop") {
         return Err(lost("injected fault: guest connection refused"));
     }
+    watch(&s)?;
     let reply = read_frame(&mut handshake(By { s, at: deadline }, line)?)?;
     let reply = reply.ok_or_else(|| lost(format!("guest closed the connection before answering {line:?}")))?;
     if fault("guest_lose_reply") {
@@ -288,73 +294,40 @@ pub fn app_status(uds: &Path) -> Result<String> {
     message(uds, "APPSTATUS", TIMEOUT)
 }
 
-/// Readiness I/O checks cancellation between short waits, preserving partial frames
-/// and the request's overall deadline instead of restarting a command on each poll.
-struct Readiness<'a> {
-    stream: By<UnixStream>,
-    stop: &'a dyn Fn() -> Result<()>,
-}
-
-impl Readiness<'_> {
-    fn io<T>(&mut self, mut op: impl FnMut(&mut UnixStream, Duration) -> std::io::Result<T>) -> std::io::Result<T> {
-        loop {
-            (self.stop)().map_err(std::io::Error::other)?;
-            let left = self.stream.left()?.min(Duration::from_millis(50));
-            match op(&mut self.stream.s, left) {
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
-                result => return result,
-            }
-        }
+/// A readiness request whose connection is shut down once `stop` fails, so an interrupted
+/// pull is not held for the request's whole timeout.
+fn readiness(uds: &Path, line: &str, timeout: Duration, stop: &(dyn Fn() -> Result<()> + Sync)) -> Result<String> {
+    let deadline = Instant::now().checked_add(timeout).ok_or("guest timeout is too large")?;
+    let done = &std::sync::atomic::AtomicBool::new(false);
+    let reply = std::thread::scope(|scope| {
+        let reply = ask_watched(uds, line, deadline, |s| {
+            let s = s.try_clone()?;
+            scope.spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if stop().is_err() {
+                        let _ = s.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+            Ok(())
+        });
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        reply
+    });
+    stop()?;
+    match reply? {
+        (FRAME_MSG, m) => Ok(String::from_utf8_lossy(&m).into_owned()),
+        (_, m) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
     }
 }
 
-impl Read for Readiness<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.io(|s, left| {
-            s.set_read_timeout(Some(left))?;
-            s.read(buf)
-        })
-    }
-}
-
-impl Write for Readiness<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.io(|s, left| {
-            s.set_write_timeout(Some(left))?;
-            s.write(buf)
-        })
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.s.flush()
-    }
-}
-
-fn readiness(uds: &Path, line: &str, timeout: Duration, stop: &dyn Fn() -> Result<()>) -> Result<String> {
-    let at = Instant::now().checked_add(timeout).ok_or("guest timeout is too large")?;
-    if ABANDONED.lock().unwrap().iter().any(|p| p == uds) {
-        bail!("its firecracker exited");
-    }
-    let s = loop {
-        stop()?;
-        let left = By { s: (), at }.left()?.min(Duration::from_millis(50));
-        match crate::util::connect_unix(uds, left) {
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-            result => break result?,
-        }
-    };
-    let mut r = handshake(Readiness { stream: By { s, at }, stop }, line)?;
-    match read_frame(&mut r)? {
-        Some((FRAME_MSG, m)) => Ok(String::from_utf8_lossy(&m).into_owned()),
-        Some((_, m)) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
-        None => Err(lost(format!("guest closed the connection before answering {line:?}"))),
-    }
-}
-
-pub fn probe(uds: &Path, port: u16, stop: &dyn Fn() -> Result<()>) -> Result<bool> {
+pub fn probe(uds: &Path, port: u16, stop: &(dyn Fn() -> Result<()> + Sync)) -> Result<bool> {
     Ok(readiness(uds, &format!("PROBE {port}"), TIMEOUT, stop)? == "ok")
 }
 
-pub fn check(uds: &Path, cmd: &str, timeout: Duration, stop: &dyn Fn() -> Result<()>) -> Result<bool> {
+pub fn check(uds: &Path, cmd: &str, timeout: Duration, stop: &(dyn Fn() -> Result<()> + Sync)) -> Result<bool> {
     let hex: String = cmd.bytes().map(|b| format!("{b:02x}")).collect();
     match readiness(uds, &format!("CHECK {} {hex}", timeout.as_millis()), timeout.checked_add(TIMEOUT).ok_or("guest timeout is too large")?, stop)? {
         m if m == "ok" => Ok(true),
