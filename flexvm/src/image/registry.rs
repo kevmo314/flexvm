@@ -985,6 +985,27 @@ pub(super) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Reserve a TCP port without listening, so connections are refused until the socket is dropped.
+    fn refusing_socket(ip: &str) -> std::net::TcpListener {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as _,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(ip.parse::<std::net::Ipv4Addr>().unwrap().octets()) },
+            sin_zero: [0; 8],
+        };
+        assert_eq!(
+            unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_in).cast(), std::mem::size_of_val(&addr) as _) },
+            0,
+            "bind: {}",
+            std::io::Error::last_os_error()
+        );
+        std::net::TcpListener::from(fd)
+    }
+
     #[test]
     fn cancellable_connect_connects_and_reports_refusal() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -996,8 +1017,8 @@ pub(super) mod tests {
         let mut got = [0; 2];
         stream.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"ok");
-        drop(listener);
-        let err = connect_cancellable(&addr, Some(Duration::from_secs(5))).unwrap_err();
+        let reserved = refusing_socket("127.0.0.1");
+        let err = connect_cancellable(&reserved.local_addr().unwrap(), Some(Duration::from_secs(5))).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
         if let Ok(v6) = std::net::TcpListener::bind("[::1]:0") {
             connect_cancellable(&v6.local_addr().unwrap(), None).unwrap();
@@ -1051,23 +1072,7 @@ pub(super) mod tests {
         assert!(err.contains("not on a public address"), "{err}");
         // Public, unreachable first: reserve a TCP port without listening, so it refuses
         // connections and cannot be reused by another test before the fallback is exercised.
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let addr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as _,
-            sin_port: 0,
-            sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(PUBLIC.parse::<std::net::Ipv4Addr>().unwrap().octets()) },
-            sin_zero: [0; 8],
-        };
-        assert_eq!(
-            unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_in).cast(), std::mem::size_of_val(&addr) as _) },
-            0,
-            "bind: {}",
-            std::io::Error::last_os_error()
-        );
-        let reserved = std::net::TcpListener::from(fd);
+        let reserved = refusing_socket(PUBLIC);
         let refused = reserved.local_addr().unwrap();
         assert_eq!(fetch(&named_registry("mixed-down.test", &[refused, registry("127.0.0.1", "http")])).unwrap(), "private");
         assert_eq!((tokens.load(Ordering::SeqCst), blobs.load(Ordering::SeqCst)), (2, 2));
