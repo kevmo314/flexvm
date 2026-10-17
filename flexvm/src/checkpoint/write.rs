@@ -159,6 +159,9 @@ pub(crate) struct Buf {
     len: usize,
 }
 
+// Its mapping is its own alone (unmapped on drop): a writer thread may be handed it.
+unsafe impl Send for Buf {}
+
 #[cfg(test)]
 thread_local! {
     /// Tests: the next `Buf::map` on this thread fails.
@@ -182,21 +185,34 @@ fn populate(ptr: *mut u8, len: usize) {
 }
 
 impl Buf {
+    #[cfg(test)]
     fn new(room: &Room) -> io::Result<Buf> {
-        let len = UNIT * PAGE_SIZE;
-        let huge = len.next_multiple_of(HUGE);
-        // Populated within the take, so the room sees it taken in MemAvailable, not with its first write (#672).
-        let mapped = room.take((huge >> 20) as u64, || {
+        Ok(Buf::many(room, 1)?.pop().unwrap())
+    }
+
+    /// Buffers for `n` writers: huge ones for as many as the room shows space for, in one take (a checkpoint's
+    /// writers take the host lock once, not each: a fault may be trying for it, #677), the rest ordinary.
+    fn many(room: &Room, n: usize) -> io::Result<Vec<Buf>> {
+        let (len, huge) = (UNIT * PAGE_SIZE, (UNIT * PAGE_SIZE).next_multiple_of(HUGE));
+        let mib = (huge >> 20) as u64;
+        let fit = n.min(usize::try_from(room.get() / mib).unwrap_or(usize::MAX));
+        // Populated within the take, so the room sees it taken, not with its first write (#672).
+        let one = || -> io::Result<Buf> {
             let ptr = Buf::map(huge, len, HUGE)?;
+            let b = Buf { ptr, map: huge, len };
             // Only a hint: without it the buffer is ordinary pages.
             unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
             populate(ptr, huge);
-            Ok(ptr)
-        });
-        match mapped {
-            Some(ptr) => ptr.map(|ptr| Buf { ptr, map: huge, len }),
-            None => Buf::plain(UNIT),
+            Ok(b)
+        };
+        let mut out = match fit {
+            0 => Vec::new(),
+            k => room.take(k as u64 * mib, || (0..k).map(|_| one()).collect::<io::Result<Vec<Buf>>>()).transpose()?.unwrap_or_default(),
+        };
+        while out.len() < n {
+            out.push(Buf::plain(UNIT)?);
         }
+        Ok(out)
     }
 
     /// Ordinary page-aligned storage, taking no room.
@@ -277,8 +293,10 @@ pub(super) fn write_pages(
         }
         (0..).map(|_| next.fetch_add(1, Ordering::Relaxed)).take_while(|&k| k < units.len()).find(|&k| !taken[k].swap(true, Ordering::SeqCst))
     };
+    let threads = threads.min(units.len()).max(1);
+    let bufs = Mutex::new(Buf::many(room, threads)?);
     let work = || -> Result<()> {
-        let mut buf = Buf::new(room)?;
+        let mut buf = bufs.lock().unwrap().pop().map_or_else(|| Buf::plain(UNIT), Ok)?;
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         let mut scratch = Vec::with_capacity(UNIT);
         loop {
@@ -312,7 +330,6 @@ pub(super) fn write_pages(
         }
     };
     let work = || work().inspect_err(|_| failed.store(true, Ordering::Relaxed));
-    let threads = threads.min(units.len()).max(1);
     std::thread::scope(|s| {
         // Helpers as many as can be had (a failed spawn must not panic, which aborts with
         // the VM paused): this thread works too, so the copy goes on with fewer.
@@ -396,6 +413,17 @@ mod buf_tests {
         }
         // No bound: huge.
         assert_eq!(Buf::new(&Room::default()).unwrap().map, HUGE);
+    }
+
+    /// A checkpoint's writers take their huge buffers in one take, as many as the room shows space for (#677).
+    #[test]
+    fn writer_buffers_are_taken_together() {
+        let room = Room::default();
+        room.set(5);
+        let bufs = Buf::many(&room, 4).unwrap();
+        assert_eq!(bufs.iter().map(|b| b.map == HUGE).collect::<Vec<_>>(), [true, true, false, false]);
+        assert_eq!(room.get(), 1);
+        assert_eq!(Buf::many(&room, 3).unwrap().iter().filter(|b| b.map == HUGE).count(), 0, "no room left");
     }
 
     #[test]

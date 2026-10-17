@@ -1567,15 +1567,15 @@ impl Host {
     /// Memory not admitted like a guest's (checkpoint rescue memory, hot pages', writer buffers: `cow::Room`), which
     /// keeps out of the reserve instead: `populate` maps and populates `mib` if MemAvailable has that much above the
     /// reserve, what admission granted guests that have yet to touch it, and what was taken lately
-    /// (`recent_debits`). Checked and debited under the host lock, only if it is free at once (a fault may be waiting
-    /// on the take), and populated after it goes. With what was left before it (MiB; None if the lock was busy): its
+    /// (`recent_debits`). Checked and debited under the host lock, only if it is free within `TAKE_TRIES` (a fault
+    /// may be waiting on the take), and populated after it goes. With what was left before it (MiB; None if the lock was busy): its
     /// result, or None if there was not enough, or MemAvailable or the grants could not be read (0 left then).
     pub fn take_room<R>(&self, mib: u64, populate: impl FnOnce() -> R) -> (Option<u64>, Option<R>) {
         self.take_room_inner(mib, crate::vmproc::host_available_mib, populate)
     }
 
     fn take_room_inner<R>(&self, mib: u64, available: impl Fn() -> Option<u64>, populate: impl FnOnce() -> R) -> (Option<u64>, Option<R>) {
-        let Some(l) = self.try_lock() else { return (None, None) };
+        let Some(l) = self.try_lock_for(TAKE_TRIES) else { return (None, None) };
         let (left, debits) = match self.pending(&l) {
             Ok((_, pending, debits)) => (available().map_or(0, |a| a.saturating_sub(self.config_now().reserve()).saturating_sub(pending)), debits),
             Err(_) => (0, None),
@@ -1590,6 +1590,21 @@ impl Host {
         }
         drop(l);
         (Some(left), Some(populate()))
+    }
+
+    /// The host lock if it is free now, or within `tries` (it is tried again every 50 us, never waited on): None if
+    /// another thread or process has it all that while.
+    fn try_lock_for(&self, tries: std::time::Duration) -> Option<Locked> {
+        let by = std::time::Instant::now() + tries;
+        loop {
+            if let Some(l) = self.try_lock() {
+                return Some(l);
+            }
+            if std::time::Instant::now() >= by {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
     }
 
     /// The host lock if it is free now: None if another thread or process has it.
@@ -1983,6 +1998,10 @@ type Grants = Vec<(u64, u64, u64)>;
 
 /// Checkpoint memory taken lately, as (boot-clock ms, MiB): `Host::recent_debits`.
 type Debits = Vec<(u64, u64)>;
+
+/// How long a take tries for the host lock: past another take's (tens of us, its memory populated after), never as
+/// long as a holder that waits (admission asking for kept memory back): a fault may be waiting on the take.
+const TAKE_TRIES: Duration = Duration::from_millis(1);
 
 /// How long a debit counts in full: its memory may still be being populated.
 const DEBIT_FULL_MS: u64 = 2000;
@@ -7060,7 +7079,7 @@ pub(crate) mod tests {
         held_rx.recv().unwrap();
         let start = std::time::Instant::now();
         assert_eq!(h.take_room_inner(1, || Some(AVAIL), || panic!("nothing populated")), (None, None));
-        assert!(start.elapsed() < Duration::from_millis(50), "{:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_millis(50), "tried briefly, never waited: {:?}", start.elapsed());
         tx.send(()).unwrap();
         t.join().unwrap();
     }

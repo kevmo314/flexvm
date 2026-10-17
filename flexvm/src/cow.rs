@@ -616,7 +616,8 @@ const MADV_POPULATE_WRITE: libc::c_int = 23;
 /// take is the host's (`Host::take_room`), checked against MemAvailable less the reserve, the grants guests have yet
 /// to touch and what was taken lately, and debited, under the host lock. VM processes taking at once, and admission,
 /// each see what the others took then, and nothing taken is left to reclaim if its process dies (#677). A take never
-/// waits for the lock: a fault may be waiting on it, so a busy lock is no room for `BUSY_MS` and the fault leaves
+/// waits on the lock (it tries for a moment, `Host::take_room`): a fault may be waiting on it, so a lock busy past
+/// that is no room for `BUSY_MS` and the fault leaves
 /// its pages to the writers. Unattached, a bound of its own (tests; and none for a VM process's until it is attached,
 /// `closed`).
 #[derive(Clone)]
