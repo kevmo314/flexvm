@@ -556,9 +556,8 @@ def pause_resume():
     print(f"  counter +{c1 - c0} over {t1 - t0:.1f} s with {paused_s} s paused")
     check("pause: guest stopped while paused", c1 - c0 < (t1 - t0 - paused_s) / 0.05 + paused_s / 0.05 / 2,
           (c0, c1, round(t1 - t0, 2)))
-    time.sleep(0.5)
-    c2 = count(A, vm)
-    check("resume: guest process continues", c2 > c1, (c1, c2))
+    # The guest runs again some time after the resume: polled until its counter moves, within a functional timeout.
+    check("resume: guest process continues", wait_for(lambda: count(A, vm) > c1, 30), (c1, count(A, vm)))
     check("resume: same process (pid, start time)", marker_id(A, vm) == proc)
     err = wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 5)
     check("resume: guest clock right after 3 s paused", err, clock_error(A, vm))

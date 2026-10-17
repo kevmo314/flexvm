@@ -219,9 +219,12 @@ impl Pager {
                             break 'regions;
                         }
                     }
-                    // Test fault `collapse_slow`: a pass that lasts, for a checkpoint or migration to cut short.
-                    if crate::host::fault("collapse_slow") {
-                        self.collapse_pause(Duration::from_millis(300));
+                    // Test gate `collapse_hold`: the pass parks after a call (telling the test it got here) until a
+                    // checkpoint or migration cuts it short, or the test disarms it.
+                    if crate::host::tripped("collapse_hold") {
+                        while self.collapse_halt().is_none() && crate::host::fault("collapse_hold") {
+                            self.collapse_pause(Duration::from_millis(20));
+                        }
                     }
                 }
             }
