@@ -113,7 +113,18 @@ pub fn sweep_due(host: &Host) {
 /// Local cleanup and network retirement have separate nonblocking locks, so
 /// slow sources cannot keep other processes from cleaning up local files.
 pub fn sweep(host: &Host) {
-    local_cleanup(host);
+    sweep_by(host, false);
+}
+
+/// `flexvm debug gc`: a sweep that waits for one under way to finish (another process's periodic one)
+/// and then runs its own local cleanup, so what was collectable when it was asked is collected when it
+/// returns. A nonblocking one would return having done nothing.
+pub fn sweep_now(host: &Host) {
+    sweep_by(host, true);
+}
+
+fn sweep_by(host: &Host, wait: bool) {
+    local_cleanup_by(host, wait);
     // Its own nonblocking lock: a peer that is down holds up no local cleanup.
     host.deliver_withdrawals();
     host.retire_migrations();
@@ -122,8 +133,12 @@ pub fn sweep(host: &Host) {
 
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
+    local_cleanup_by(host, false);
+}
+
+fn local_cleanup_by(host: &Host, wait: bool) {
     let Ok(lock) = crate::host::private_file(&crate::host::locks(&host.run).join("gc")) else { return };
-    let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
+    let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) else { return };
     if let Err(e) = host.collect_garbage() {
         crate::log!("garbage collection: {e}");
     }
@@ -365,6 +380,32 @@ mod tests {
         // Let go explicitly: another test's child, forked but not yet exec'd, may share it.
         let gc = File::open(crate::host::locks(&host.run).join("gc")).unwrap();
         assert!(flock(&gc, libc::LOCK_EX | libc::LOCK_NB).is_ok(), "the sweep let go of its lock");
+    }
+
+    #[test]
+    fn an_asked_for_sweep_waits_for_one_under_way() {
+        let d = dir("sweep-now");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let marker = host.vms("gone", "moved").unwrap();
+        File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
+        // Another process's sweep under way: a periodic one skips, `debug gc`'s waits for it.
+        let busy = crate::host::private_file(&crate::host::locks(&host.run).join("gc")).unwrap();
+        flock(&busy, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        sweep(&host);
+        assert!(marker.exists(), "a nonblocking sweep ran under another's lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                sweep_now(&host);
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "it did not wait for the sweep under way");
+        flock(&busy, libc::LOCK_UN).unwrap();
+        rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        waiting.join().unwrap();
+        assert!(!marker.exists(), "it swept once the other was done");
     }
 
     #[test]

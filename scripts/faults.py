@@ -4474,13 +4474,12 @@ def resume_mark_fails():
     disarm()
     check("marker kept: quarantined", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
     ip = vms(A)[n]["ip"]
-    # A reboot that showed STARTED on disk: that resume never ran its VM, so its earlier boot's
-    # quarantine no longer keeps a sweep from withdrawing the generation (#556). The quarantine is
-    # an earlier boot's before STARTED appears, as after a real reboot: a periodic sweep in between
-    # would take the checkpoint for this boot's consumed one and leave its generation alone.
-    rewrite(os.path.join(d, "QUARANTINE"), lambda q: "another-boot " + q.split(" ", 1)[1])
     open(os.path.join(d, "STARTED"), "w").close()
     check("marker kept: no longer listed (consumed)", n not in vms(A), vms(A).get(n))
+    # A reboot that showed STARTED on disk: that resume never ran its VM, so its earlier boot's
+    # quarantine no longer keeps a sweep from withdrawing the generation (#556). `debug gc` waits
+    # for a sweep under way (another process's periodic one), then runs its own.
+    rewrite(os.path.join(d, "QUARANTINE"), lambda q: "another-boot " + q.split(" ", 1)[1])
     ok(cli_json(A, "debug", "gc"))
     check("marker kept, after a reboot: its generation withdrawn", addr(A, ip).get("withdrawn") is True and addr(A, ip).get("holder") is None, addr(A, ip))
     r = resume_suspended(A, n)

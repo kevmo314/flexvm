@@ -445,7 +445,7 @@ fn real_main(args: &Args) -> Result<()> {
         Some("debug") => match name {
             "gc" => {
                 let host = open_host(args)?;
-                gc::sweep(&host);
+                gc::sweep_now(&host);
                 Ok(())
             }
             "fault" => host::arm(&open_host(args)?, arg2.ok_or("debug fault NAME MS")?, pos.get(3).and_then(|m| m.parse().ok()).unwrap_or(1000)),
