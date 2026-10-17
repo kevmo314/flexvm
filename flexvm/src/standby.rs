@@ -1027,18 +1027,44 @@ mod tests {
         assert!(!host.state.join("standby/default").exists());
     }
 
+    fn removal_child() -> crate::test_util::ChildGuard {
+        use std::process::{Command, Stdio};
+
+        // USR1 interrupts read in some shells: resume waiting inside the handler.
+        let script = "wait_for_eof() { while read line; do :; done; exit 0; }; trap 'echo stopped; wait_for_eof' USR1; echo ready; wait_for_eof";
+        crate::test_util::ChildGuard(Command::new("sh").args(["-c", script]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap())
+    }
+
+    #[test]
+    fn removal_helper_exits_when_stdin_closes() {
+        use std::io::BufRead;
+
+        for stopped in [false, true] {
+            let mut child = removal_child();
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            assert_eq!(line, "ready\n");
+            if stopped {
+                assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGUSR1) }, 0);
+                line.clear();
+                output.read_line(&mut line).unwrap();
+                assert_eq!(line, "stopped\n");
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(child.try_wait().unwrap().is_none(), "USR1 must leave the helper waiting for EOF");
+            }
+            drop(child.stdin.take());
+            let status = crate::util::retry(Duration::from_secs(5), Duration::from_millis(10), || Ok(child.try_wait()?.ok_or("running")?)).unwrap();
+            assert!(status.success());
+        }
+    }
+
     #[test]
     fn removal_waits_for_process_exit_after_its_pool_lock_disappears() {
         use std::io::BufRead;
-        use std::process::{Command, Stdio};
 
         let (_root, host, paths, d) = pool("standby-rmi-exit");
-        let mut child = Command::new("sh")
-            .args(["-c", "trap 'echo stopped' USR1; echo ready; while :; do read line && exit; done"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = removal_child();
         let mut ready = String::new();
         let mut output = BufReader::new(child.stdout.take().unwrap());
         output.read_line(&mut ready).unwrap();
@@ -1089,7 +1115,7 @@ mod tests {
 
     #[test]
     fn a_claimed_standby_is_not_waited_for() {
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("30").spawn().unwrap());
         let id = Ident::of(child.id()).unwrap();
         let fd = || vec![(id.clone(), PidFd::open(&id).unwrap().unwrap())];
         let start = Instant::now();
@@ -1112,7 +1138,9 @@ mod tests {
         std::os::unix::fs::symlink(&paths.templates, host.state.join("templates")).unwrap();
         crate::util::write_file(&host.state.join("standby"), "default", b"3", true).unwrap();
         // Ignores the stop; exits once its stdin closes.
-        let mut child = Command::new("sh").args(["-c", "trap '' USR1; echo ready; read line"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut child = crate::test_util::ChildGuard(
+            Command::new("sh").args(["-c", "trap '' USR1; echo ready; read line"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap(),
+        );
         let mut ready = String::new();
         std::io::BufRead::read_line(&mut BufReader::new(child.stdout.take().unwrap()), &mut ready).unwrap();
         assert_eq!(ready, "ready\n");
@@ -1189,7 +1217,7 @@ mod tests {
             let stop = Flock::new(stop_lock(&host).unwrap(), libc::LOCK_SH).unwrap();
             let (r, mut w) = UnixStream::pair().unwrap();
             std::io::Write::write_all(&mut w, reply.as_bytes()).unwrap();
-            let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
             let pid = child.id();
             let relief_host = host.clone();
             let relief = std::thread::spawn(move || {
@@ -1234,7 +1262,7 @@ mod tests {
         send_json(&mut w, &json!({"locked": true})).unwrap();
         // A partial readiness reply must not extend its deadline either.
         std::io::Write::write_all(&mut w, b"{\"ok\":").unwrap();
-        let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
         let mut r = BufReader::new(r);
         wait_locked(&mut r, &mut child, Instant::now() + Duration::from_secs(1)).unwrap();
         assert!(child.try_wait().unwrap().is_none());
@@ -1291,7 +1319,7 @@ mod tests {
         let (r, mut w) = UnixStream::pair().unwrap();
         std::io::Write::write_all(&mut w, b"{\"locked\":true}\n{\"ok\":true}\n").unwrap();
         let mut r = BufReader::new(r);
-        let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
         let locked = wait_locked(&mut r, &mut child, Instant::now() + Duration::from_secs(1));
         child.kill().unwrap();
         child.wait().unwrap();
@@ -1379,7 +1407,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = crate::test_util::TempDir::new("standby-planted");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let (d, mut victim) = (dir(&host, "default"), std::process::Command::new("sleep").arg("100").spawn().unwrap());
+        let (d, mut victim) = (dir(&host, "default"), crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("100").spawn().unwrap()));
         let locks = crate::host::locks(&d);
         crate::host::private_dir(&locks).unwrap();
         let id = Ident::of(victim.id()).unwrap();

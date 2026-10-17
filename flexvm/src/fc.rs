@@ -560,7 +560,8 @@ mod tests {
             )
             .arg("sh")
             .arg("x".repeat(4096));
-        let (mut child, logging) = spawn_logged(cmd, &dir).unwrap();
+        let (child, logging) = spawn_logged(cmd, &dir).unwrap();
+        let mut child = crate::test_util::ChildGuard(child);
         assert!(child.wait().unwrap().success());
         logging.join().unwrap();
         let mut total = 0;
@@ -885,7 +886,7 @@ mod tests {
     #[test]
     fn exit_status_leaves_the_child_unreaped() {
         for (script, want) in [("exit 3", "exit status: 3"), ("kill -9 $$", "signal: 9")] {
-            let mut child = Command::new("sh").args(["-c", script]).spawn().unwrap();
+            let mut child = crate::test_util::ChildGuard(Command::new("sh").args(["-c", script]).spawn().unwrap());
             let st = retry(Duration::from_secs(5), Duration::from_millis(10), || Ok(exited(&child)?.ok_or("running")?)).unwrap();
             assert!(st.to_string().contains(want), "{st}");
             assert!(exited(&child).unwrap().is_some(), "still there to ask again");

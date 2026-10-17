@@ -203,7 +203,7 @@ mod tests {
         assert!(wait(&run, n, now()));
         assert_eq!(released.load(Ordering::SeqCst), 2);
         // A member that runs and does not answer: given up on at the deadline, and it stays a member.
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("30").spawn().unwrap());
         let pid = child.id();
         let silent = Ident::of(pid).unwrap();
         member(&run, &silent, 0);
