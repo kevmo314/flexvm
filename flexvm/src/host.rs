@@ -7028,10 +7028,12 @@ pub(crate) mod tests {
         assert!(take_at(&h, 5000, read, || ()).1.is_some());
         assert_eq!(take_at(&h, 1, read, || panic!("nothing populated")), (0, None), "none left: one at a time");
         assert!(h.grant_inner(1, Floor::Reserve, false, None, read).unwrap().is_err(), "admission counts the debits too");
-        // Older than DEBIT_FULL_MS: together at most what the per-CPU counters can hide; past the window, nothing.
+        // Older than DEBIT_FULL_MS: together at most what the per-CPU counters can hide, while within the window
+        // (twice vm.stat_interval: none past DEBIT_FULL_MS where that is 1 s); past the window, nothing.
         pin_clock(t0 + DEBIT_FULL_MS);
         let window = GRANT_WINDOW.as_millis() as u64;
-        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 3000 - vmstat_drift_mib().min(6000));
+        let older = if debit_window_ms() > DEBIT_FULL_MS { vmstat_drift_mib().min(6000) } else { 0 };
+        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 3000 - older);
         pin_clock(t0 + debit_window_ms().max(window) + DEBIT_FULL_MS);
         assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000, "expired by age, grants too");
         // Unreadable: nothing taken, and none left (never no bound); unreadable debits count the drift bound.
