@@ -277,12 +277,12 @@ trials, before process-per-VM): 2 vCPU 37 ms before, 26 ms with steps 1–3 on s
 load 4 ms, resume 1.4 ms); 24 vCPU 50 and 25 ms (its load is still 11 ms and
 its resume 4 ms: vCPU threads, state parsing).
 
-### Lifecycle: pause, checkpoint, restore, suspend
+### Lifecycle: pause, checkpoint, restore, stop
 
 ```
-starting -> running <-> paused                     (pause / resume)
+starting -> running <-> paused                     (pause / unpause)
 running | paused -> checkpointing -> running | paused | gone   (checkpoint [--stop])
-running | paused -> checkpointing -> suspended -> running      (suspend / resume)
+running | paused -> checkpointing -> suspended -> running      (stop / start)
 running | paused -> source (migrating) -> gone, or back if the target aborted
 any -> failed (memory lost) -> gone                (rm)
 ```
@@ -291,7 +291,7 @@ Every lifecycle operation (and each controller resize) first reserves the
 VM's name, so operations on one VM never interleave; the controller skips a
 VM that is busy, paused or suspended.
 
-- **pause / resume** stop and restart the vCPUs; memory and devices stay.
+- **pause / unpause** stop and restart the vCPUs; memory and devices stay.
   Both take under a millisecond (2 vCPU) to 1.5 ms (24 vCPU).
 - **checkpoint NAME DIR** first waits for any VM still pulling memory (from a
   migration source or its checkpoint), and for virtio-mem to settle (see
@@ -312,8 +312,8 @@ VM that is busy, paused or suspended.
   address a peer is using; `--ip auto` picks a new one, which also makes a
   restore a fork of a running VM. `--paused` holds the restored VM paused
   until `unpause`; its memory is still paged in meanwhile.
-- **suspend** (SIGTERM) checkpoints into `STATE/suspended/NAME` (`/var/lib/flexvm` by
-  default; it must be on disk, not tmpfs). Then suspend kills Firecracker, so the VM costs no memory. Memory is
+- **stop** (SIGTERM) checkpoints into `STATE/suspended/NAME` (`/var/lib/flexvm` by
+  default; it must be on disk, not tmpfs). Then stop kills Firecracker, so the VM costs no memory. Memory is
   released only once the checkpoint is durable. The pager is stopped before
   Firecracker dies, so no discard event can mark a saved page as zero.
   A suspended VM's checkpoint stays in `suspended/`.

@@ -200,6 +200,7 @@ impl Config {
     }
 
     /// What a hand edit must get right: refused on open, and never taken live (`config_now`).
+    /// Content only: checks of current interfaces belong in `warnings`.
     pub fn validate(&self) -> Result<()> {
         if !self.cluster()?.contains_range(&self.range()?) {
             bail!("vm_ips {} is not inside cluster_ips {}", self.vm_ips, self.effective_cluster_ips());
@@ -209,9 +210,8 @@ impl Config {
         }
         // A peer's underlays count only while it is a peer (`underlays_of`): a dropped peer's are ignored.
         for (peer, ips) in &self.peer_underlays {
-            if let Some(ip) = ips.iter().find(|i| i.is_unspecified() || i.is_broadcast() || i.is_multicast() || crate::net::is_local_addr(**i).unwrap_or(true))
-            {
-                bail!("peer_underlays {peer}: {ip} is local or not unicast");
+            if let Some(ip) = ips.iter().find(|i| i.is_unspecified() || i.is_broadcast() || i.is_multicast() || i.is_loopback()) {
+                bail!("peer_underlays {peer}: {ip} is loopback or not unicast");
             }
         }
         if let Some(d) = self.dns.as_deref().filter(|d| d.parse::<Ipv4Addr>().is_err()) {
@@ -225,6 +225,10 @@ impl Config {
 
     /// What `flexvm info` and the listener warn of: valid, but likely a mistake.
     pub fn warnings(&self) -> Vec<String> {
+        self.warnings_by(crate::net::is_local_addr)
+    }
+
+    fn warnings_by(&self, local: impl Fn(Ipv4Addr) -> Result<bool>) -> Vec<String> {
         let mut w: Vec<String> = self.cluster_warning().into_iter().collect();
         if !self.peers.is_empty() && self.vm_ips == Config::default().vm_ips {
             w.push(format!("flexvm: warning: vm_ips is the default {}; each peer needs a range of its own", self.vm_ips));
@@ -239,6 +243,16 @@ impl Config {
         }
         if let Some(p) = self.peer_underlays.keys().find(|p| !self.peers.contains(p)) {
             w.push(format!("flexvm: warning: peer_underlays names {p}, which is not a peer: ignored"));
+        }
+        // Interfaces can change after a config was saved: warn without blocking commands or reloads.
+        for (peer, ips) in &self.peer_underlays {
+            for &ip in ips {
+                match local(ip) {
+                    Ok(true) => w.push(format!("flexvm: warning: peer_underlays {peer}: {ip} is local")),
+                    Err(e) => w.push(format!("flexvm: warning: peer_underlays {peer}: cannot check whether {ip} is local: {e}")),
+                    Ok(false) => {}
+                }
+            }
         }
         w
     }
@@ -3710,6 +3724,50 @@ mod tests {
         assert!(w.contains("gone:1") && w.contains("under the 300 MiB reserve"), "{w}");
         std::fs::write(&path, format!(r#"{{"reserve_mib": {}}}"#, total + 1)).unwrap();
         assert!(Host::open(&h.state, &h.run).unwrap().cfg.warnings().join("").contains("every start is refused"));
+    }
+
+    #[test]
+    fn peer_underlay_live_checks_only_warn() {
+        let ip = "192.0.2.7".parse().unwrap();
+        let mut cfg = Config::default();
+        cfg.peer_underlays.insert("peer:7070".into(), vec![ip]);
+        cfg.peers.push("peer:7070".into());
+        let check = |local: std::result::Result<bool, &str>| {
+            cfg.validate().unwrap();
+            cfg.warnings_by(|a| {
+                assert_eq!(a, ip);
+                local.map_err(Into::into)
+            })
+            .join("\n")
+        };
+        assert!(!check(Ok(false)).contains("peer_underlays"));
+        assert!(check(Ok(true)).contains("peer_underlays peer:7070: 192.0.2.7 is local"));
+        assert!(check(Err("getifaddrs failed")).contains("cannot check whether 192.0.2.7 is local: getifaddrs failed"));
+    }
+
+    #[test]
+    fn peer_underlay_content_is_checked_on_open_reload_and_write() {
+        let (_dir, mut h) = host("underlay-validation");
+        let path = h.state.join("host.json");
+        let mut cfg = Config { peers: vec!["peer:7070".into()], ..Config::default() };
+        cfg.peer_underlays.insert("peer:7070".into(), vec!["192.0.2.7".parse().unwrap()]);
+        store(&path, &cfg, true).unwrap();
+        Host::open(&h.state, &h.run).unwrap();
+        assert_eq!(h.config_now().peer_underlays, cfg.peer_underlays);
+        h.configure(|c| {
+            c.peers = cfg.peers.clone();
+            c.peer_underlays = cfg.peer_underlays.clone();
+            Ok(())
+        })
+        .unwrap();
+        for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "127.0.0.1"] {
+            let mut bad = cfg.clone();
+            bad.peer_underlays.insert("peer:7070".into(), vec![ip.parse().unwrap()]);
+            store(&path, &bad, true).unwrap();
+            assert!(Host::open(&h.state, &h.run).is_err(), "{ip}");
+            assert_eq!(h.config_now().peer_underlays, cfg.peer_underlays);
+            assert!(h.configure(|_| Ok(())).is_err(), "{ip}");
+        }
     }
 
     #[test]

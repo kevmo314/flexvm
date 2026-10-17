@@ -464,7 +464,7 @@ impl Vm {
             bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
         }
         if self.pending_net.load(Ordering::SeqCst) {
-            bail!("vm {} has not taken its new address yet; resume it first", self.name);
+            bail!("vm {} has not taken its new address yet; run flexvm unpause {} first", self.name, self.name);
         }
         Ok(())
     }
