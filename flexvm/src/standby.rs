@@ -4,7 +4,8 @@
 //! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, generation}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows. An
-//! `attached` claim (a foreground `run`'s) ends the VM if the claimer hangs up first.
+//! `attached` claim (a foreground `run`'s, with its `cgroup`, which the VM joins) ends the
+//! VM if the claimer hangs up first.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -501,7 +502,15 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 // A foreground claimer follows the VM, as a cold foreground run's process is it:
                 // one gone later (SIGKILLed) leaves the VM to no one, so it goes too. A detached
                 // claimer hangs up once answered.
-                let watch = (req["attached"] == json!(true)).then(|| c.try_clone());
+                let attached = req["attached"] == json!(true);
+                // In the claimer's cgroup, as a cold foreground run's VM process is (its Firecracker
+                // has its own either way). This process moves itself: its own pid is never a reused one.
+                if let (true, Some(cg)) = (attached, req["cgroup"].as_str()) {
+                    if let Err(e) = crate::util::join_cgroup(cg) {
+                        crate::log!("vm {}: not moved to its claimer's cgroup {cg:?}: {e}", req["name"].as_str().unwrap_or(""));
+                    }
+                }
+                let watch = attached.then(|| c.try_clone());
                 *p.claimer.lock().unwrap() = Some(c);
                 match watch {
                     Some(Ok(w)) => {
@@ -512,6 +521,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                             if p.claimer.lock().unwrap().is_none() {
                                 return;
                             }
+                            // Set first: a migration that refuses the destroy ends the VM if it aborts (`abort`).
+                            p.claimer_gone.store(true, std::sync::atomic::Ordering::SeqCst);
                             crate::log!("vm {n}: its claimer (a foreground run) is gone: destroying it");
                             crate::log!("vm {n}: {}", p.destroy(crate::vmproc::FAILED));
                         });

@@ -761,15 +761,29 @@ pub fn wait_hung_up(fd: &impl AsRawFd) {
     }
 }
 
-/// Moves process `pid` into this process's cgroup (cgroup2's `0::` entry). Without cgroup2, Ok
-/// (nothing is moved).
-pub fn join_my_cgroup(pid: u32) -> io::Result<()> {
+/// This process's cgroup2 path (`/proc/self/cgroup`'s `0::` entry), if cgroup2 is mounted at /sys/fs/cgroup.
+pub fn my_cgroup() -> Option<String> {
     if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        return Ok(());
+        return None;
     }
-    let mine = std::fs::read_to_string("/proc/self/cgroup")?;
-    let path = mine.lines().find_map(|l| l.strip_prefix("0::")).ok_or_else(|| io::Error::other("no cgroup2 entry in /proc/self/cgroup"))?;
-    std::fs::write(format!("/sys/fs/cgroup{}/cgroup.procs", path.trim_end_matches('/')), pid.to_string())
+    let mine = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    mine.lines().find_map(|l| l.strip_prefix("0::")).map(String::from)
+}
+
+/// `cgroup.procs` of cgroup2 path `cg` (as `my_cgroup` gives it): None unless absolute, of plain components.
+fn cgroup_procs(cg: &str) -> Option<std::path::PathBuf> {
+    let rel = cg.strip_prefix('/')?.trim_end_matches('/');
+    let plain = |c: &str| !c.is_empty() && c != "." && c != ".." && !c.contains(['\0', '\n']);
+    if !rel.is_empty() && !rel.split('/').all(plain) {
+        return None;
+    }
+    Some(std::path::Path::new("/sys/fs/cgroup").join(rel).join("cgroup.procs"))
+}
+
+/// Moves this process (all its threads) into cgroup2 path `cg`.
+pub fn join_cgroup(cg: &str) -> io::Result<()> {
+    let procs = cgroup_procs(cg).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a cgroup path"))?;
+    std::fs::write(procs, std::process::id().to_string())
 }
 
 /// After a failed `accept`: one worth retrying at once (interrupted, the
@@ -1458,6 +1472,16 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claimer_cgroup_is_an_absolute_path_of_plain_components() {
+        let procs = |cg| cgroup_procs(cg).map(|p| p.display().to_string());
+        assert_eq!(procs("/").as_deref(), Some("/sys/fs/cgroup/cgroup.procs"));
+        assert_eq!(procs("/system.slice/ci.service").as_deref(), Some("/sys/fs/cgroup/system.slice/ci.service/cgroup.procs"));
+        for bad in ["", "system.slice", "/a/../b", "/..", "/a//b", "/./a", "/a\nb"] {
+            assert_eq!(procs(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn a_hang_up_ends_the_wait_and_input_does_not() {

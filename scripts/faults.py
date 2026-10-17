@@ -7422,6 +7422,20 @@ def standby_claim_signal():
         cli(A, "pull", t, "--standby", "0")
 
 
+def fresh_standby(host, t, n):
+    """`t`'s pool emptied, then set to `n` standby VMs, all ready: a stop only signals them, so
+    a count set right after one counts those still leaving and starts none to replace them."""
+    clear_standby(host, t)
+    ok(set_standby(host, t, n))
+    return wait_for(lambda: len(standby_socks(host, t)) == n and len([p for p in standby_pids(host, t) if alive(p)]) == n, 60)
+
+
+def clear_standby(host, t):
+    """`t`'s pool stopped, and its standby VMs gone."""
+    cli(host, "pull", t, "--standby", "0")
+    wait_for(lambda: not [p for p in standby_pids(host, t) if alive(p)], 60)
+
+
 def standby_claim_orphan():
     """A foreground `run` that claimed a standby VM, SIGKILLed once the VM runs (a CI job's
     timeout): the VM goes, as a cold foreground run's would (its process is that run), and
@@ -7429,9 +7443,8 @@ def standby_claim_orphan():
     cgroup, as a cold run's is. A detached claim (`-d`) runs on after its `run` exits."""
     t, n, d, e = args.template, "ft-sb-orphan", "ft-sb-orphan-d", "ft-sb-orphan-e"
     scenario_vms.update([n, d, e])
-    ok(set_standby(A, t, 1))
     try:
-        check("standby claim orphan: a standby ready", wait_for(lambda: len(standby_socks(A, t)) == 1, 60), standby_pids(A, t))
+        check("standby claim orphan: a standby ready", fresh_standby(A, t, 1), standby_pids(A, t))
         # Output to a file: an orphaned VM would hold a pipe open, and reading it would never end.
         out = tempfile.TemporaryFile("w+")
         p = spawn_cli(A, "run", "--name", n, t, "sleep 600", stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
@@ -7463,7 +7476,46 @@ def standby_claim_orphan():
         check("standby claim orphan: a foreground claim's command ends, its status told", code == 0 and out == "hi" and '"standby":true' in err.replace(" ", ""), (code, out, err))
         check("standby claim orphan: a told claimer's hang-up destroys nothing", "is gone" not in err, err)
     finally:
-        cli(A, "pull", t, "--standby", "0")
+        clear_standby(A, t)
+
+
+def standby_claim_orphan_migrating():
+    """A foreground claim's VM is a migration's source when its run is SIGKILLed: the destroy is
+    refused (the target may be pulling its memory), but the hang-up is kept. The target then dies
+    before it has all the memory, so the VM runs here again, and it goes then instead of running
+    on with no one to stop it."""
+    t, n = args.template, "ft-sb-orphan-mig"
+    scenario_vms.add(n)
+    try:
+        check("standby claim orphan migrating: a standby ready", fresh_standby(A, t, 1), standby_pids(A, t))
+        out = tempfile.TemporaryFile("w+")
+        # No command: a VM that runs one cannot migrate.
+        p = spawn_cli(A, "run", "--name", n, t, stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
+
+        def said():
+            out.seek(0)
+            return out.read()
+        check("standby claim orphan migrating: the foreground run claims the standby", wait_for(lambda: '"standby":true' in said().replace(" ", ""), 60), said()[-800:])
+        check("standby claim orphan migrating: the claimed vm runs", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+        pid = vm_pid(A, n)
+        code, o = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=100 iflag=fullblock 2>/dev/null && sync")
+        assert code == 0, o
+        # Every page reply a second late: the target is still pulling when it is killed.
+        with armed_fault(A, "pages_slow", 120000):
+            r = migrate(A, n, B)
+            check("standby claim orphan migrating: the migration commits, its source keeping the memory", r["ok"] and alive(pid), (r, where(n)))
+            p.kill()
+            p.wait()
+            check("standby claim orphan migrating: the claimer's hang-up is seen, and the destroy refused",
+                  wait_for(lambda: "is gone: destroying it" in said() and "source of a migration in progress" in said(), 15), said()[-1500:])
+            holder = json.load(open(os.path.join(B.run, "vms", ".locks", f"{n}.lock")))
+            os.kill(holder["pid"], signal.SIGKILL)
+            check("standby claim orphan migrating: back here, the vm is destroyed", wait_for(lambda: not alive(pid) and not where(n), 60),
+                  (where(n), said()[-1500:]))
+        check("standby claim orphan migrating: said why", "its claimer (a foreground run) is gone, so it is destroyed" in said(), said()[-1500:])
+    finally:
+        fault(A, "pages_slow", 0)
+        clear_standby(A, t)
 
 
 def standby_dir(run, t):
@@ -9473,7 +9525,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
-    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
+    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_claim_orphan_migrating=standby_claim_orphan_migrating, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),

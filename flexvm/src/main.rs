@@ -620,7 +620,10 @@ fn run_as(
     // A claimed standby VM writes where this process would, to opens made here (`own`).
     let log = args.has("detach").then(|| log_file(host, &name)).transpose()?;
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "attached": log.is_none()});
+    // And joins this process's cgroup, where a cold run's VM process (this one) would be.
+    let cgroup = log.is_none().then(util::my_cgroup).flatten();
+    let req =
+        json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "attached": log.is_none(), "cgroup": cgroup});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
@@ -715,11 +718,6 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
     let set = util::block_signals(&FOLLOW_SIGNALS);
     // A fast command's process may be gone already: its exit frame is buffered.
     if let Ok(Some(vm)) = host::PidFd::open(&id) {
-        // In this process's cgroup, as a cold run's VM process (this one) would be: the
-        // caller's unit limits it and stops it (its Firecracker has a cgroup of its own either way).
-        if let Err(e) = util::join_my_cgroup(id.pid) {
-            crate::log!("flexvm: the claimed vm stays out of this process's cgroup: {e}");
-        }
         std::thread::spawn(move || loop {
             match util::wait_signal(&set) {
                 libc::SIGHUP => {}

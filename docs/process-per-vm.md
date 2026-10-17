@@ -34,7 +34,7 @@ so stopping its starter's cgroup (a systemd unit's restart with
 does not reach it. Its Firecrackers move on to `flexvm/idle-PID-START-N`. Without
 cgroup2 it stays where it was started, and says so in its log. A foreground
 VM process stays in its caller's cgroup, and a foreground `run` that claims a
-standby VM moves that VM's process into the caller's cgroup (`util::join_my_cgroup`).
+standby VM has that VM's process move itself into the caller's cgroup (`util::join_cgroup`).
 
 **Resource caps** (`Resources`, `vm.rs`). `run --cpus N` sets `cpu.max` on
 the VM's Firecracker cgroup (a quota of N times its 100 ms period; the vCPU
@@ -521,9 +521,13 @@ comes back after a reboot, a template rebuild or a standby's death. A foreground
 one forwards its signals to it and exits with the status the VM process sends
 back on the claim connection. Its claim is `attached`: the VM process watches that
 connection, and if the `run` hangs up before it is told the status (SIGKILLed, say)
-the VM is destroyed, as a cold foreground run's VM (that process) would be. The `run`
-also moves the VM process into its own cgroup, where a cold run's VM process is. A
-detached claim (`run -d`) hangs up once answered, and its VM runs on. Under memory pressure standby VMs are stopped
+the VM is destroyed, as a cold foreground run's VM (that process) would be. A VM
+that is a migration's source refuses the destroy, but the hang-up is kept: if the
+migration aborts and the VM runs here again, it is destroyed then. Once a migration
+commits, the claimer is told (0) as a cold run's process would end, and the VM at
+its target is no longer attached to anything. The claim also carries the claimer's
+cgroup (`cgroup`), and the VM process moves itself there, where a cold run's VM
+process is. A detached claim (`run -d`) hangs up once answered, and its VM runs on. Under memory pressure standby VMs are stopped
 (SIGUSR1) first. The count is explicit, and refills stop under the eviction mark; one refill
 of a template runs at a time (`.locks/refill`), and waits until the standby
 VMs it starts are ready (a minute at most each), so concurrent claims never overfill. A claim sent
