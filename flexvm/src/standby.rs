@@ -157,7 +157,6 @@ pub(crate) fn removing<T>(host: &Host, paths: &Paths, template: &str, remove: im
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::from(e)),
     };
-    let ino = || std::fs::symlink_metadata(&count).ok().map(|m| m.ino());
     let restore = |saved: &Option<Vec<u8>>, gone: bool| -> Result<()> {
         match saved.as_ref().filter(|_| !gone) {
             Some(bytes) => crate::util::write_file(&counts, template, bytes, true)?,
@@ -184,7 +183,15 @@ pub(crate) fn removing<T>(host: &Host, paths: &Paths, template: &str, remove: im
             let _ = restore(&saved, false);
             return Err(e.into());
         }
-        (saved, ino(), waiting)
+        // Held open until compared: its inode cannot be freed and reused by a later file.
+        let ours = match File::open(&count) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = restore(&saved, false);
+                return Err(e.into());
+            }
+        };
+        (saved, ours, waiting)
     };
     // A claimed one may still be listed (its files go after its registry entry is published).
     let mut captured: Vec<Ident> = Vec::new();
@@ -211,7 +218,8 @@ pub(crate) fn removing<T>(host: &Host, paths: &Paths, template: &str, remove: im
         }
     };
     // Not ours any more: a `set` wrote it since (left as it is if it cannot be read).
-    let saved = if ino() != ours { read()? } else { saved };
+    let saved = if replaced(&ours, &count) { read()? } else { saved };
+    drop(ours);
     let result = stopped.and_then(|()| {
         // None starts while the refill lock is held; this is only the snapshot's recheck.
         if live(host, template).iter().any(|id| !captured.contains(id)) {
@@ -225,6 +233,14 @@ pub(crate) fn removing<T>(host: &Host, paths: &Paths, template: &str, remove: im
         (Ok(_), Err(e)) => Err(e),
         (Err(e), Ok(())) => Err(e),
         (Err(e), Err(r)) => Err(format!("{e} (and restoring its standby count failed: {r})").into()),
+    }
+}
+
+/// Whether `path` is no longer the file `f` has open (by device and inode; `f` keeps its inode in use).
+fn replaced(f: &File, path: &std::path::Path) -> bool {
+    match (f.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) != (b.dev(), b.ino()),
+        _ => true,
     }
 }
 
@@ -1010,6 +1026,22 @@ mod tests {
         worker.join().unwrap().unwrap();
         assert!(early.is_err(), "removal returned while the process still held its template");
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn a_count_replaced_is_told_from_the_one_held_open() {
+        let root = crate::test_util::TempDir::new("standby-count-replaced");
+        crate::util::write_file(&root, "c", b"0", false).unwrap();
+        let path = root.join("c");
+        let ours = File::open(&path).unwrap();
+        assert!(!replaced(&ours, &path));
+        // Two replacements: the first frees nothing while `ours` is open, so the second cannot reuse its inode.
+        for n in [b"1", b"2"] {
+            crate::util::write_file(&root, "c", n, false).unwrap();
+            assert!(replaced(&ours, &path));
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(replaced(&ours, &path));
     }
 
     #[test]
