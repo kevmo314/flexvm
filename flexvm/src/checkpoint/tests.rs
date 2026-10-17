@@ -271,15 +271,14 @@ fn pages_roundtrip_against_the_template() {
     let want_zero = (0..900).filter(|&i| i % 2 == 0 && (i % 5 == 1 || discarded(i))).count() as u64;
     let mut last = None;
     // Room for every writer's huge-page buffer, for one of them (2 MiB) only, and for none:
-    // the others write through ordinary buffers, the same pages.
-    for (threads, room_mib, left) in [(8, u64::MAX, None), (3, 3, Some(1)), (1, 0, Some(0))] {
+    // the others write through ordinary buffers, the same pages. Once the writers are done,
+    // all of it is back.
+    for (threads, room_mib) in [(8, u64::MAX), (3, 3), (1, 0)] {
         let path = dir.join(format!("pages-{threads}"));
         let room = Room::default();
         room.set(room_mib);
         let w = write_pages(&tpl, &guest, &input, &pages_file(&path), threads, false, &room).unwrap();
-        if let Some(left) = left {
-            assert_eq!(room.get(), left, "{threads} writers");
-        }
+        assert_eq!(room.get(), room_mib, "{threads} writers");
         assert_eq!((w.data, w.zero, fs::metadata(&path).unwrap().len()), (want_data, want_zero, w.data * PAGE_SIZE as u64));
         let (map, sums) = parse_pagemap(&w.map, n as u64, false, 0).unwrap();
         // Runs past the guest's end, a truncated map, and a DATA run pointing anywhere but its place.

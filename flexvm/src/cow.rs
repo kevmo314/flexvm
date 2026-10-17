@@ -617,6 +617,11 @@ impl Room {
     pub fn take(&self, mib: u64) -> bool {
         self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| r.checked_sub(mib)).is_ok()
     }
+
+    /// Gives back `mib` taken from it (its memory is unmapped again, or never was).
+    pub fn give(&self, mib: u64) {
+        let _ = self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| Some(r.saturating_add(mib)));
+    }
 }
 
 const CHUNK_MIB: u64 = (SLOT_CHUNK >> 20) as u64;

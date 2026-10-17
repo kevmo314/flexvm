@@ -169,9 +169,33 @@ struct Buf {
     ptr: *mut u8,
     map: usize,
     len: usize,
-    /// Whether it took room for a huge page (tests look).
+    /// The room a huge one took, given back when it goes (held for its drop; tests look).
     #[cfg_attr(not(test), allow(dead_code))]
-    huge: bool,
+    charge: Option<Charge>,
+}
+
+/// `mib` taken from a room, given back on drop: a buffer unmapped, or never mapped.
+struct Charge {
+    room: Room,
+    mib: u64,
+}
+
+impl Charge {
+    fn take(room: &Room, mib: u64) -> Option<Charge> {
+        room.take(mib).then(|| Charge { room: room.clone(), mib })
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.room.give(self.mib);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the next `Buf::map` on this thread fails.
+    static FAIL_MAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 const HUGE: usize = 2 << 20;
@@ -180,18 +204,23 @@ impl Buf {
     fn new(pages: usize, room: &Room) -> io::Result<Buf> {
         let len = pages * PAGE_SIZE;
         let huge = len.next_multiple_of(HUGE);
-        if !room.take((huge >> 20) as u64) {
-            return Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len, huge: false });
-        }
+        let Some(charge) = Charge::take(room, (huge >> 20) as u64) else {
+            return Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len, charge: None });
+        };
+        // A failed map drops the charge: the room is back.
         let ptr = Buf::map(huge, len, HUGE)?;
         // Only a hint: without it the buffer is ordinary pages.
         unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
-        Ok(Buf { ptr, map: huge, len, huge: true })
+        Ok(Buf { ptr, map: huge, len, charge: Some(charge) })
     }
 
     /// `map` bytes of anonymous memory, at a multiple of `align` (0: anywhere).
     fn map(map: usize, len: usize, align: usize) -> io::Result<*mut u8> {
         let full = map + align;
+        #[cfg(test)]
+        if FAIL_MAP.with(|f| f.replace(false)) {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "injected: cannot allocate checkpoint buffer"));
+        }
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), full, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
         if raw == libc::MAP_FAILED {
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, format!("cannot allocate checkpoint buffer of {len} bytes")));
@@ -218,6 +247,7 @@ impl Buf {
 
 impl Drop for Buf {
     fn drop(&mut self) {
+        // Unmapped first, then `charge` gives its room back.
         unsafe { libc::munmap(self.ptr.cast(), self.map) };
     }
 }
@@ -363,7 +393,7 @@ mod buf_tests {
         for (have, huge, left) in [(0, false, 0), (1, false, 1), (5, true, 3)] {
             room.set(have);
             let mut b = Buf::new(UNIT, &room).unwrap();
-            assert_eq!((b.huge, room.get()), (huge, left), "room {have} MiB");
+            assert_eq!((b.charge.is_some(), room.get()), (huge, left), "room {have} MiB");
             // A huge one is all of an aligned 2 MiB; an ordinary one only what it holds,
             // which no huge page fits in.
             assert_eq!(b.map, if huge { HUGE } else { UNIT * PAGE_SIZE });
@@ -375,10 +405,27 @@ mod buf_tests {
             if !huge {
                 assert_eq!(anon_huge_kib(b.ptr as usize), 0, "an ordinary buffer took a huge page");
             }
+            drop(b);
+            assert_eq!(room.get(), have, "room {have} MiB: given back once unmapped");
         }
-        // Unknown room (as a pager starts): no bound.
+        // Unknown room (as a pager starts): no bound, and still unknown after.
         let unbounded = Room::default();
-        assert!(Buf::new(UNIT, &unbounded).unwrap().huge);
+        let b = Buf::new(UNIT, &unbounded).unwrap();
+        assert!(b.charge.is_some());
+        drop(b);
+        assert_eq!(unbounded.get(), u64::MAX);
+    }
+
+    #[test]
+    fn a_failed_buffer_map_gives_its_room_back() {
+        let room = Room::default();
+        room.set(5);
+        FAIL_MAP.with(|f| f.set(true));
+        assert!(Buf::new(UNIT, &room).is_err());
+        assert_eq!(room.get(), 5);
+        // And the next one maps (huge) as usual.
+        let b = Buf::new(UNIT, &room).unwrap();
+        assert_eq!((b.charge.is_some(), room.get()), (true, 3));
     }
 
     /// AnonHugePages of the mapping starting at `addr`, from /proc/self/smaps.
