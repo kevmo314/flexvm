@@ -3,7 +3,7 @@ use super::hot::Held;
 use super::pages::DirtyBits;
 use super::{Mapping, Pager, Runs, ALL, ARM_CHUNK, BASE, PREFETCH_RUN, PRESENT};
 use crate::bail;
-use crate::cow::{Cow, PENDING, READING, RESCUING};
+use crate::cow::{Cow, Slot, PENDING, READING, RESCUING};
 use crate::util::{Result, PAGE_SIZE};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,9 +37,6 @@ const WP_BLOCK: usize = 16;
 /// range and flush the vCPUs' TLBs, about 30-40 µs a call here, against well under 0.1 µs a page.
 const WP_CHUNK: usize = 512;
 const WP_SIZES: [usize; 4] = [WP_BLOCK, 4 * WP_BLOCK, 16 * WP_BLOCK, WP_CHUNK];
-/// Pages of its block a fault saves itself during a copy, at most: every other fault waits meanwhile. The rest of the
-/// block stays protected until a writer (or a later fault) saves it.
-const WP_SAVE: usize = 4 * WP_BLOCK;
 /// Pagemap bits: the page is present, swapped out, write-protected by userfaultfd.
 const PM_PRESENT: u64 = 1 << 63;
 const PM_SWAP: u64 = 1 << 62;
@@ -75,8 +72,11 @@ pub struct Frozen {
 }
 
 impl Pager {
-    /// A write to a write-protected page. During a checkpoint copy, saves the pages around it (`WP_SAVE`) that the
-    /// copy has not saved yet; then unprotects the pages of its block (`wp_block`) around it that need not stay
+    /// A write to a write-protected page. During a checkpoint copy, saves the pages of its block (`wp_block`) that the
+    /// copy has not saved yet, all of them: a fault costs the guest about 50 µs besides its rescue here (KVM's exit and
+    /// refault, waking this thread and the vCPU), and the block is sized by how much of its chunk the guest writes,
+    /// against about 1 µs a page to copy. Rescuing 64 pages a fault at most lost a heavy writer twice as much (#630).
+    /// Then unprotects the pages of its block (`wp_block`) around it that need not stay
     /// protected for the copy, and marks them dirty. Unless it must wait for a writer to save the page first
     /// (`Served::Writer`).
     pub(super) fn wp_fault(&self, page: usize, m: &Mapping, first: bool) -> io::Result<Served> {
@@ -112,8 +112,7 @@ impl Pager {
                 }
             }
             let start = Instant::now();
-            let save = first + (page - first) / WP_SAVE * WP_SAVE;
-            let rescued = if over { 0 } else { self.rescue(cow, save, (save + WP_SAVE).min(end))? };
+            let rescued = if over { 0 } else { self.rescue(cow, first, end)? };
             if rescued > 0 {
                 let ns = start.elapsed().as_nanos() as u64;
                 let s = &cow.stats;
@@ -194,60 +193,31 @@ impl Pager {
             }
             false => WP_BLOCK,
         };
-        let first = from + at - at % size;
-        (first, (first + size).min(to))
+        block_at(page, (from, to), size)
     }
 
     /// Saves the pages of `first..end` (within one region) that the copy has yet to save out of the guest into `cow`.
     /// Returns how many. Never reads a page that may be missing, which would fault back to the event thread: only pages
     /// the pagemap shows populated are read (a missing one was missing, so zero, at the pause).
     fn rescue(&self, cow: &Cow, first: usize, end: usize) -> io::Result<usize> {
-        let claimed: Vec<usize> = (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect();
-        if claimed.is_empty() {
-            return Ok(0);
-        }
-        let mut pages: Vec<Box<[u8]>> = claimed.iter().map(|_| vec![0u8; PAGE_SIZE].into_boxed_slice()).collect();
-        let read = self.rescue_fail(cow, &claimed).and_then(|()| self.pagemap(first, end - first)).and_then(|map| {
-            // Runs of claimed populated pages, each read with one call into the pages' own buffers.
-            let mut i = 0;
-            while i < claimed.len() {
-                if map[claimed[i] - first] & (PM_PRESENT | PM_SWAP) == 0 {
-                    i += 1;
-                    continue;
-                }
-                let mut j = i + 1;
-                while j < claimed.len() && j - i < 1024 && claimed[j] == claimed[j - 1] + 1 && map[claimed[j] - first] & (PM_PRESENT | PM_SWAP) != 0 {
-                    j += 1;
-                }
-                self.read_pages(claimed[i], &mut pages[i..j])?;
-                i = j;
-            }
-            Ok(())
-        });
-        if let Err(e) = read {
-            cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
-            cow.unclaim_many(&claimed);
-            return Err(e);
-        }
-        cow.rescue_many(first, end, claimed.iter().copied().zip(pages));
-        Ok(claimed.len())
+        let map = |claimed: &[usize]| self.rescue_fail(cow, claimed).and_then(|()| self.pagemap(first, end - first));
+        rescue_block(cow, first, end, map, |p, local| self.read_at((p * PAGE_SIZE) as u64, local))
     }
 
     /// Test fault `ckpt_rescue_fail`, once the writers run: every other rescue fails after its claim, with a writer
-    /// asked to take its first page meanwhile, so that the writer finds the page RESCUING and then given back.
+    /// asked to take its first page meanwhile, so that the writer finds the page RESCUING and then given back. Until a
+    /// writer has (in this copy), the failure waits for one to (up to 200 ms: `ckpt_slow` writers sleep 50 ms before
+    /// each unit, which a fixed 5 ms caught only by chance, never on a slow host); then 5 ms.
     fn rescue_fail(&self, cow: &Cow, claimed: &[usize]) -> io::Result<()> {
         if !self.rescue_fail.load(Ordering::Relaxed) || !cow.writing() || self.rescue_tries.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
             return Ok(());
         }
         cow.want(claimed[0]);
-        thread::sleep(Duration::from_millis(5));
+        let (start, wait) = (Instant::now(), if cow.rescue_waits() == 0 { 200 } else { 5 });
+        while start.elapsed() < Duration::from_millis(wait) && !(wait > 5 && cow.rescue_waits() > 0) {
+            thread::sleep(Duration::from_micros(200));
+        }
         Err(io::Error::other("injected fault: rescue failed"))
-    }
-
-    /// Reads consecutive guest pages from `page` out of Firecracker, a page into each buffer of `pages`.
-    fn read_pages(&self, page: usize, pages: &mut [Box<[u8]>]) -> io::Result<()> {
-        let local: Vec<libc::iovec> = pages.iter_mut().map(|b| libc::iovec { iov_base: b.as_mut_ptr().cast(), iov_len: PAGE_SIZE }).collect();
-        self.read_at((page * PAGE_SIZE) as u64, &local)
     }
 
     /// The pagemap entries of `n` pages from `page` in Firecracker (`PM_*` bits).
@@ -454,7 +424,7 @@ impl Pager {
             *self.hot_dirty.lock().unwrap() = dirty.clone();
         }
         let cow = cow.then(|| {
-            let c = Cow::new(pages.len(), &out);
+            let c = Cow::new(pages.len(), &out).keep_slots(self.slot_spare.clone(), self.mem_room.clone());
             hot.iter().for_each(|h| c.hold(h.held.clone()));
             Arc::new(c)
         });
@@ -528,6 +498,87 @@ impl Pager {
     }
 }
 
+/// The aligned block of `size` pages of the region `span` holding `page`, cut short at the region's end. Aligned within
+/// the region: a region starts at any whole MiB of guest memory.
+fn block_at(page: usize, (from, to): (usize, usize), size: usize) -> (usize, usize) {
+    let at = page - from;
+    let first = from + at - at % size;
+    (first, (first + size).min(to))
+}
+
+/// `Pager::rescue` of `first..end`, with `map` giving their pagemap entries (once it has claimed the pages it gets),
+/// and `read` (see `fill_slots`).
+fn rescue_block(
+    cow: &Cow,
+    first: usize,
+    end: usize,
+    map: impl FnOnce(&[usize]) -> io::Result<Vec<u64>>,
+    read: impl FnMut(usize, &[libc::iovec]) -> io::Result<()>,
+) -> io::Result<usize> {
+    // Only pages no one saved or is saving: a writer may hold some (READING), or have saved them, or they are hot.
+    let claimed: Vec<usize> = (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect();
+    if claimed.is_empty() {
+        return Ok(0);
+    }
+    let slots = match cow.take_slots(claimed.len()) {
+        Ok(Some(s)) => s,
+        // No memory for them now (`Room`): they stay protected for the writers, and the fault waits for them as over
+        // budget (`Cow::over_budget` says so too now).
+        Ok(None) => {
+            cow.unclaim_many(&claimed);
+            return Ok(0);
+        }
+        Err(e) => {
+            cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
+            cow.unclaim_many(&claimed);
+            return Err(e);
+        }
+    };
+    let filled = map(&claimed).and_then(|map| fill_slots(&claimed, &slots, |p| map[p - first] & (PM_PRESENT | PM_SWAP) != 0, read));
+    if let Err(e) = filled {
+        cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
+        cow.give_slots(slots);
+        cow.unclaim_many(&claimed);
+        return Err(e);
+    }
+    cow.rescue_many(first, end, claimed.iter().copied().zip(slots));
+    Ok(claimed.len())
+}
+
+/// Fills `slots[i]` with the pause-time contents of page `claimed[i]` (ascending): runs of consecutive `present` pages
+/// with one `read` each (a page, and where its run goes: slots next to each other in one piece), the others with zeroes
+/// (missing at the pause, and the slot may hold an old copy). One thread: reads on more at once took longer here.
+fn fill_slots(
+    claimed: &[usize],
+    slots: &[Slot],
+    present: impl Fn(usize) -> bool,
+    mut read: impl FnMut(usize, &[libc::iovec]) -> io::Result<()>,
+) -> io::Result<()> {
+    assert_eq!(claimed.len(), slots.len());
+    let mut i = 0;
+    while i < claimed.len() {
+        if !present(claimed[i]) {
+            unsafe { std::ptr::write_bytes(slots[i].as_mut_ptr(), 0, PAGE_SIZE) };
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < claimed.len() && j - i < 1024 && claimed[j] == claimed[j - 1] + 1 && present(claimed[j]) {
+            j += 1;
+        }
+        let mut local: Vec<libc::iovec> = Vec::new();
+        for s in &slots[i..j] {
+            match local.last_mut() {
+                Some(v) if v.iov_base as usize + v.iov_len == s.as_mut_ptr() as usize => v.iov_len += PAGE_SIZE,
+                _ => local.push(libc::iovec { iov_base: s.as_mut_ptr().cast(), iov_len: PAGE_SIZE }),
+            }
+        }
+        read(claimed[i], &local)?;
+        i = j;
+    }
+    Ok(())
+}
+
 /// The ranges that protect `pages` (ascending): merged across gaps of up to `PROTECT_GAP` pages, wider ones while there
 /// are more than `PROTECT_MAX`, never across a page of `kept` (ascending).
 pub(super) fn protect_ranges(pages: impl Iterator<Item = usize>, kept: &[usize]) -> Vec<(usize, usize)> {
@@ -572,6 +623,283 @@ mod tests {
     use super::*;
     use crate::uffd::pages::{Pages, CHUNK};
     use crate::uffd::{FaultStats, Runtime, ZERO};
+
+    /// Guest memory for rescues: page `p` filled with `p + 1` (mod 256), unless absent.
+    fn guest_read(mem: &[u8]) -> impl Fn(usize, &[libc::iovec]) -> io::Result<()> + Sync + '_ {
+        move |p, local| {
+            let mut at = p * PAGE_SIZE;
+            for v in local {
+                unsafe { std::ptr::copy_nonoverlapping(mem[at..].as_ptr(), v.iov_base.cast::<u8>(), v.iov_len) };
+                at += v.iov_len;
+            }
+            Ok(())
+        }
+    }
+
+    /// Page `p` filled with `p + 1` (mod 256).
+    fn guest_mem(n: usize) -> Vec<u8> {
+        (0..n * PAGE_SIZE).map(|i| ((i / PAGE_SIZE) as u8).wrapping_add(1)).collect()
+    }
+
+    #[test]
+    fn slots_fill_by_runs_and_zero_absent_pages() {
+        let cow = Cow::new(16, &vec![(0, 16, crate::uffd::REMOTE)]);
+        let mem = guest_mem(16);
+        // Slots used before hold old copies: an absent page's must not show through.
+        let old = cow.take_slots(5).unwrap().unwrap();
+        old.iter().for_each(|s| unsafe { std::ptr::write_bytes(s.as_mut_ptr(), 0xee, PAGE_SIZE) });
+        cow.give_slots(old);
+        let slots = cow.take_slots(5).unwrap().unwrap();
+        let claimed = [3, 4, 5, 9, 10];
+        let reads = Mutex::new(Vec::new());
+        let read = guest_read(&mem);
+        fill_slots(
+            &claimed,
+            &slots,
+            |p| p != 4,
+            |p, local| {
+                reads.lock().unwrap().push((p, local.iter().map(|v| v.iov_len / PAGE_SIZE).collect::<Vec<_>>()));
+                read(p, local)
+            },
+        )
+        .unwrap();
+        let reads = reads.into_inner().unwrap();
+        // A call per run of present pages; slots next to each other go as one piece.
+        assert_eq!(reads.len(), 3);
+        assert_eq!(reads[0].0, 3);
+        assert_eq!(reads[1].0, 5);
+        assert_eq!((reads[2].0, reads[2].1.iter().sum::<usize>()), (9, 2));
+        for (&p, s) in claimed.iter().zip(&slots) {
+            let want = if p == 4 { 0 } else { (p as u8).wrapping_add(1) };
+            assert!(unsafe { std::slice::from_raw_parts(s.as_mut_ptr(), PAGE_SIZE) }.iter().all(|&b| b == want), "page {p}");
+        }
+        cow.give_slots(slots);
+    }
+
+    #[test]
+    fn a_rescue_saves_each_unsaved_page_of_its_block_once() {
+        use crate::cow::{CowPages, CLEAN, HELD, RESCUED};
+        let n = 64;
+        let mut mem = guest_mem(n);
+        let cow = Cow::new(n, &vec![(0, 40, crate::uffd::REMOTE), (40, 4, crate::uffd::ZERO)]);
+        // Partly saved already: page 1 by a writer, page 2 is hot (copied during the pause), and a writer is reading
+        // page 3 right now.
+        assert!(cow.claim(1, PENDING, READING));
+        assert!(cow.claim(1, READING, CLEAN));
+        cow.hold(Arc::new(Held::of(&[(2, 3)])));
+        assert!(cow.claim(3, PENDING, READING));
+        let left = cow.left();
+        // Page 6 was missing at the pause: zero.
+        let map = |_: &[usize]| Ok((0..16).map(|i| if i == 6 { 0 } else { PM_PRESENT }).collect());
+        assert_eq!(rescue_block(&cow, 0, 16, map, guest_read(&mem)).unwrap(), 13);
+        assert_eq!(cow.left(), left - 13);
+        assert!([0, 4, 5, 6, 15].iter().all(|&p| cow.state(p) == RESCUED));
+        assert_eq!((cow.state(1), cow.state(2), cow.state(3)), (CLEAN, HELD, READING));
+        // Another fault on the block saves nothing again; the block's end is the next one's start.
+        assert_eq!(rescue_block(&cow, 0, 16, |_| panic!("nothing to read"), |_, _| panic!()).unwrap(), 0);
+        assert_eq!(rescue_block(&cow, 16, 18, |_| Ok(vec![PM_PRESENT; 2]), guest_read(&mem)).unwrap(), 2);
+        // A failed read gives its pages and slots back.
+        let fail = |_: usize, _: &[libc::iovec]| Err(io::Error::other("gone"));
+        assert!(rescue_block(&cow, 18, 24, |_| Ok(vec![PM_PRESENT; 6]), fail).is_err());
+        assert!((18..24).all(|p| cow.state(p) == PENDING));
+        assert_eq!(cow.left(), left - 15);
+        // The guest writes on; the writer gets the pause-time contents.
+        mem.iter_mut().for_each(|b| *b = 0xaa);
+        assert!(cow.claim(3, READING, CLEAN));
+        struct Mem(Vec<u8>);
+        impl crate::checkpoint::GuestPages for Mem {
+            fn region_end(&self, _: usize) -> Option<usize> {
+                Some(64)
+            }
+            fn read(&self, page: usize, buf: &mut [u8]) -> crate::util::Result<()> {
+                buf.copy_from_slice(&self.0[page * PAGE_SIZE..page * PAGE_SIZE + buf.len()]);
+                Ok(())
+            }
+        }
+        let guest = Mem(guest_mem(n));
+        let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+        // Not pages 1 and 3: the writer saved them before (the claims above stand for it).
+        for (a, b) in [(0, 1), (2, 3), (4, 24)] {
+            let mut buf = vec![0u8; (b - a) * PAGE_SIZE];
+            crate::checkpoint::GuestPages::read(&pages, a, &mut buf).unwrap();
+            for (p, page) in (a..b).zip(buf.chunks(PAGE_SIZE)) {
+                let want = match p {
+                    2 => 3,
+                    6 => 0,
+                    _ => (p as u8).wrapping_add(1),
+                };
+                assert!(page.iter().all(|&b| b == want), "page {p}");
+            }
+        }
+        assert!((0..24).all(|p| cow.state(p) == CLEAN));
+    }
+
+    #[test]
+    fn rescues_racing_the_writer_save_every_page_once() {
+        use crate::cow::{CowPages, CLEAN};
+        struct Mem(Vec<u8>);
+        impl crate::checkpoint::GuestPages for Mem {
+            fn region_end(&self, _: usize) -> Option<usize> {
+                None
+            }
+            fn read(&self, page: usize, buf: &mut [u8]) -> crate::util::Result<()> {
+                buf.copy_from_slice(&self.0[page * PAGE_SIZE..page * PAGE_SIZE + buf.len()]);
+                Ok(())
+            }
+        }
+        let n = 4096;
+        let guest = Mem(guest_mem(n));
+        for round in 0..4 {
+            let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]);
+            let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+            let out = Mutex::new(vec![0u8; n * PAGE_SIZE]);
+            let rescued = AtomicUsize::new(0);
+            thread::scope(|s| {
+                s.spawn(|| {
+                    // Blocks of all sizes, all over, from the end down: they meet the writer's units at every offset.
+                    let mut x = 0x9e37_79b9_u64 + round;
+                    for i in 0..400 {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let size = [4, 16, 64, 512][i % 4];
+                        let page = n - 1 - (x as usize % n) / 2 - i * 4 % (n / 2);
+                        let first = page - page % size;
+                        let map = |_: &[usize]| Ok(vec![PM_PRESENT; size]);
+                        rescued.fetch_add(rescue_block(&cow, first, (first + size).min(n), map, guest_read(&guest.0)).unwrap(), Ordering::Relaxed);
+                    }
+                });
+                for unit in (0..n).step_by(32) {
+                    let mut buf = vec![0u8; 32 * PAGE_SIZE];
+                    crate::checkpoint::GuestPages::read(&pages, unit, &mut buf).unwrap();
+                    out.lock().unwrap()[unit * PAGE_SIZE..(unit + 32) * PAGE_SIZE].copy_from_slice(&buf);
+                }
+            });
+            assert_eq!(cow.left(), 0);
+            assert!((0..n).all(|p| cow.state(p) == CLEAN));
+            assert!(out.into_inner().unwrap() == guest.0, "every page as at the pause");
+            assert!(rescued.into_inner() > 0, "some pages rescued");
+            assert_eq!(cow.rescued_mib(), 0.0);
+        }
+    }
+
+    #[test]
+    fn no_room_for_rescue_memory_leaves_pages_to_the_writers() {
+        use crate::cow::{CowPages, Room, CLEAN};
+        let n = 2048;
+        let mem = guest_mem(n);
+        let room = Room::default();
+        let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), room.clone());
+        // Writing: rescue memory grows only within the room, 2 MiB a chunk.
+        struct Mem<'a>(&'a [u8]);
+        impl crate::checkpoint::GuestPages for Mem<'_> {
+            fn region_end(&self, _: usize) -> Option<usize> {
+                None
+            }
+            fn read(&self, page: usize, buf: &mut [u8]) -> crate::util::Result<()> {
+                buf.copy_from_slice(&self.0[page * PAGE_SIZE..page * PAGE_SIZE + buf.len()]);
+                Ok(())
+            }
+        }
+        let guest = Mem(&mem);
+        let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+        crate::checkpoint::GuestPages::read(&pages, 0, &mut vec![0u8; PAGE_SIZE]).unwrap();
+        room.set(3);
+        assert!(!cow.over_budget());
+        let present = |c: &[usize]| Ok(vec![PM_PRESENT; c.len().max(512)]);
+        assert_eq!(rescue_block(&cow, 512, 1024, present, guest_read(&mem)).unwrap(), 512);
+        assert_eq!(room.get(), 1, "a chunk taken out of the room");
+        // No room for another chunk: the pages stay unsaved (and protected) for the writers; nothing fails.
+        assert!(cow.over_budget(), "faults wait for the writers");
+        let left = cow.left();
+        assert_eq!(rescue_block(&cow, 1024, 1536, present, |_, _| panic!("nothing read")).unwrap(), 0);
+        assert_eq!(cow.left(), left);
+        assert!((1024..1536).all(|p| cow.state(p) == PENDING));
+        // Once the writer takes the copies, their slots serve the next rescue without more room.
+        let mut buf = vec![0u8; 512 * PAGE_SIZE];
+        crate::checkpoint::GuestPages::read(&pages, 512, &mut buf).unwrap();
+        assert!(buf == mem[512 * PAGE_SIZE..1024 * PAGE_SIZE]);
+        assert!(!cow.over_budget());
+        assert_eq!(rescue_block(&cow, 1024, 1536, present, guest_read(&mem)).unwrap(), 512);
+        assert_eq!(room.get(), 1);
+        crate::checkpoint::GuestPages::read(&pages, 1024, &mut buf).unwrap();
+        assert!(buf == mem[1024 * PAGE_SIZE..1536 * PAGE_SIZE]);
+        assert!((0..1).chain(512..1536).all(|p| cow.state(p) == CLEAN));
+        assert!((1..512).all(|p| cow.state(p) == PENDING));
+        // Before the writers start, the faults of the resume rescue past the room, up to `PRE_WRITER_MIB`.
+        let early = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), Room::default());
+        let none = Room::default();
+        none.set(0);
+        let early = early.keep_slots(Arc::new(Mutex::new(None)), none);
+        assert!(!early.over_budget());
+        assert_eq!(rescue_block(&early, 0, 512, present, guest_read(&mem)).unwrap(), 512);
+    }
+
+    #[test]
+    fn memory_kept_for_the_next_checkpoint_goes_back_when_the_host_is_short() {
+        let dir = crate::test_util::TempDir::new("host-memory");
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "compatibility": {"cpu": "test", "tsc_khz": 2000000, "tsc_control": false,
+                    "msrs": [], "firecracker": "test", "features": {}, "xsave": {}},
+                "vcpus": 1, "mem_mib": 1, "max_mib": 64, "plugged_mib": 0,
+                "kernel": "/k", "rootfs": "/r", "id": "a", "components": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::File::create(dir.join("mem")).unwrap().set_len(PAGE_SIZE as u64).unwrap();
+        let n = 4096;
+        let pager = Pager {
+            base: crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap(),
+            runtime: Runtime {
+                pages: Pages::new(n).into(),
+                mappings: vec![Mapping { offset: 0, size: n * PAGE_SIZE, base_host_virt_addr: 0 }].into(),
+                tracking: true.into(),
+                ..Runtime::default()
+            },
+            fault_stats: FaultStats::new(),
+            lanes: Default::default(),
+            steer: Mutex::new((0, 0)),
+            collapse_report: Mutex::new(None),
+            collapse_gate: Default::default(),
+        };
+        // A copy that rescued pages leaves their memory for the next one; so does a checkpoint its hot pages'.
+        let keep = || {
+            let cow = Cow::new(n, &vec![]).keep_slots(pager.slot_spare.clone(), pager.mem_room.clone());
+            let s = cow.take_slots(3).unwrap().unwrap();
+            cow.give_slots(s);
+        };
+        keep();
+        pager.prepare_hot();
+        let kept = || (pager.slot_spare.lock().unwrap().as_ref().map_or(0, |s| s.mapped_bytes()), pager.hot_spare.lock().unwrap().is_some());
+        assert_eq!(kept(), (2 << 20, true));
+        pager.host_memory(Some(1000), false);
+        assert_eq!(kept(), (2 << 20, true), "kept while there is room");
+        pager.host_memory(Some(0), true);
+        assert_eq!(kept(), (0, false), "released when short");
+        // Under the reserve: no hot pages' memory, and a copy keeps none of its rescue memory.
+        pager.prepare_hot();
+        keep();
+        assert_eq!(kept(), (0, false));
+        // Unknown: no bound.
+        pager.host_memory(None, false);
+        pager.prepare_hot();
+        assert!(kept().1);
+    }
+
+    #[test]
+    fn blocks_stay_in_their_region() {
+        // Aligned within the region, which starts at 1 MiB (256 pages) here, not 2 MiB.
+        assert_eq!(block_at(700, (256, 1280), 512), (256, 768));
+        assert_eq!(block_at(800, (256, 1280), 512), (768, 1280));
+        assert_eq!(block_at(800, (256, 1280), 16), (800, 816));
+        // Cut short by the region's end; the next region's first block starts at its own start.
+        assert_eq!(block_at(1030, (768, 1040), 512), (768, 1040));
+        assert_eq!(block_at(1039, (1024, 1040), 16), (1024, 1040));
+        assert_eq!(block_at(1040, (1040, 2064), 512), (1040, 1552));
+    }
 
     #[test]
     fn freeze_reads_only_touched_snapshot_chunks() {
