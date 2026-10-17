@@ -132,14 +132,10 @@ impl Pager {
         }
         *spare = None;
         // Not into the host's reserve (see `host_memory`): the pause protects these pages instead.
-        // Reserved until `Buf::new` has populated it.
-        let Some(_reserved) = self.mem_room.take(((want * PAGE_SIZE) >> 20) as u64 + 1) else {
-            crate::log!("uffd: no room for hot pages ({want} pages): the host is near its reserve");
-            return;
-        };
-        match Buf::new(want) {
-            Ok(b) => *spare = Some(b),
-            Err(e) => crate::log!("uffd: no memory for hot pages ({want} pages): {e}"),
+        match self.mem_room.take(((want * PAGE_SIZE) >> 20) as u64 + 1, || Buf::new(want)) {
+            Some(Ok(b)) => *spare = Some(b),
+            Some(Err(e)) => crate::log!("uffd: no memory for hot pages ({want} pages): {e}"),
+            None => crate::log!("uffd: no room for hot pages ({want} pages): the host is near its reserve"),
         }
     }
 
@@ -167,7 +163,7 @@ impl Pager {
 
     /// The VM process's memory controller, every second: `room` gives what host memory is left above its reserve and
     /// the grants guests have yet to touch (MiB; None if unknown), which rescue memory and hot pages' memory grow
-    /// within, as they are not admitted like a guest's (`cow::Room`, the host's once attached); and while the host is
+    /// within, as they are not admitted like a guest's (`cow::Room`, which checks again as it takes); and while the host is
     /// `short` (under its eviction mark, or this VM starved) the memory kept for the next checkpoint (both of those)
     /// goes back. A copy running on keeps what it has until it ends.
     pub fn host_memory(&self, room: impl FnOnce() -> Option<u64>, short: bool) {
