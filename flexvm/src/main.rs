@@ -385,8 +385,8 @@ fn real_main(args: &Args) -> Result<()> {
         Some("start") if args.has("attach") => {
             // A detached start's VM process (`start -a`, answering on FLEXVM_NOTIFY_FD) must answer
             // its parent through vmproc, even if another start won meanwhile.
-            if std::env::var_os("FLEXVM_NOTIFY_FD").is_none() && resume(&open_host(args)?, name)? {
-                return Ok(());
+            if std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
+                stopped_to_attach(&open_host(args)?, name)?;
             }
             vmproc::main(open_host(args)?, paths(args)?, Start::Resume { name: name.into() }, notify_fd())
         }
@@ -575,110 +575,6 @@ fn memory_mib(v: &str) -> Result<u64> {
     Ok(mib as u64)
 }
 
-/// Made up as docker does: an adjective and a scientist, one no VM here has.
-fn generated_name(host: &Host) -> Result<String> {
-    const ADJECTIVES: &[&str] = &[
-        "admiring",
-        "agitated",
-        "amazing",
-        "bold",
-        "brave",
-        "busy",
-        "calm",
-        "clever",
-        "cool",
-        "dazzling",
-        "eager",
-        "ecstatic",
-        "elegant",
-        "epic",
-        "festive",
-        "focused",
-        "friendly",
-        "gallant",
-        "happy",
-        "hopeful",
-        "jolly",
-        "keen",
-        "kind",
-        "laughing",
-        "lucid",
-        "magical",
-        "modest",
-        "nifty",
-        "nostalgic",
-        "optimistic",
-        "peaceful",
-        "pensive",
-        "quirky",
-        "relaxed",
-        "serene",
-        "sharp",
-        "stoic",
-        "tender",
-        "trusting",
-        "vibrant",
-        "wizardly",
-        "youthful",
-        "zealous",
-    ];
-    const NAMES: &[&str] = &[
-        "agnesi",
-        "albattani",
-        "babbage",
-        "bardeen",
-        "bell",
-        "boole",
-        "curie",
-        "darwin",
-        "dijkstra",
-        "einstein",
-        "euler",
-        "faraday",
-        "fermat",
-        "fermi",
-        "feynman",
-        "galileo",
-        "gauss",
-        "goldberg",
-        "hamilton",
-        "hawking",
-        "hopper",
-        "hypatia",
-        "johnson",
-        "kepler",
-        "knuth",
-        "lamarr",
-        "lovelace",
-        "maxwell",
-        "mccarthy",
-        "meitner",
-        "newton",
-        "noether",
-        "pascal",
-        "ritchie",
-        "shannon",
-        "tesla",
-        "thompson",
-        "torvalds",
-        "turing",
-        "wiles",
-        "wozniak",
-        "yalow",
-    ];
-    for _ in 0..100 {
-        let r = u64::from_str_radix(&util::random_hex(8)?, 16).unwrap_or(0);
-        let name = format!("{}_{}", ADJECTIVES[(r % ADJECTIVES.len() as u64) as usize], NAMES[((r >> 32) % NAMES.len() as u64) as usize]);
-        let taken = host.alive(&name)
-            || host.suspended(&name)?.exists()
-            || ["failed", "lost", "moved"].iter().any(|ext| host.vms(&name, ext).is_ok_and(|p| p.exists()));
-        if !taken {
-            return Ok(name);
-        }
-    }
-    bail!("could not make up a free name: give one with --name")
-}
-
 /// `run IMAGE`: claims a standby VM if there is one, else becomes the VM.
 fn run(args: &Args, image: &str) -> Result<()> {
     let (host, paths) = (open_host(args)?, paths(args)?);
@@ -686,19 +582,44 @@ fn run(args: &Args, image: &str) -> Result<()> {
     let resources = resources(args)?;
     let ip = args.get("ip").filter(|&s| s != "auto");
     let ip: Option<std::net::Ipv4Addr> = ip.map(|s| s.parse().map_err(|_| format!("bad --ip {s:?}"))).transpose()?;
-    let name = match args.get("name") {
-        Some(name) => name.to_string(),
-        None => generated_name(&host)?,
-    };
-    host::check_name(&name)?;
+    if let Some(name) = args.get("name") {
+        host::check_name(name)?;
+    }
     // Pulled the first time, as docker does (a detached run's VM process finds it there).
     if std::fs::symlink_metadata(paths.templates.join(&template)).is_err() {
         pull_missing(args, image)?;
     }
     let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
+    // A made-up name is only checked free here: one another run took meanwhile is made up
+    // again (a cold foreground run's VM process does that itself, `Proc::run`).
+    for _ in 0..20 {
+        let name = match args.get("name") {
+            Some(name) => name.to_string(),
+            None => host::generated_name(&host)?,
+        };
+        match run_as(args, &host, &paths, &template, name, ip, cmd.clone(), resources) {
+            Err(e) if args.get("name").is_none() && host::name_taken(&e) => continue,
+            r => return r,
+        }
+    }
+    bail!("every name made up was taken meanwhile: give one with --name")
+}
+
+/// `run` of VM `name`: a standby's claim, or this process becomes the VM.
+#[allow(clippy::too_many_arguments)]
+fn run_as(
+    args: &Args,
+    host: &Host,
+    paths: &Paths,
+    template: &str,
+    name: String,
+    ip: Option<std::net::Ipv4Addr>,
+    cmd: Option<String>,
+    resources: vm::Resources,
+) -> Result<()> {
     let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources});
     // A claimed standby VM writes where this process would, to opens made here (`own`).
-    let log = args.has("detach").then(|| log_file(&host, &name)).transpose()?;
+    let log = args.has("detach").then(|| log_file(host, &name)).transpose()?;
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
@@ -706,7 +627,7 @@ fn run(args: &Args, image: &str) -> Result<()> {
     // A foreground claim's signals wait from before it is sent: the VM it makes gets them
     // (`follow`), as a cold start would, never orphaned by this process dying mid-claim.
     let set = (!tried && log.is_none()).then(|| util::block_signals(&FOLLOW_SIGNALS));
-    let taken = if tried { None } else { standby::take(&host, &paths, &template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? };
+    let taken = if tried { None } else { standby::take(host, paths, template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? };
     if let (None, Some(set)) = (&taken, &set) {
         // No claim: this process becomes the VM, and one pending kills it as before.
         unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
@@ -721,9 +642,12 @@ fn run(args: &Args, image: &str) -> Result<()> {
         (None, Some(log)) => {
             // The child takes the name made up here.
             let child = [&["--name".to_string(), name.clone()][..], &args.child_args].concat();
-            spawn_detached(&host, &name, &child, &log)
+            spawn_detached(host, &name, &child, &log)
         }
-        (None, None) => vmproc::main(host, paths, Start::Run { name, template, ip, cmd, resources }, notify_fd()),
+        (None, None) => {
+            let generated = args.get("name").is_none();
+            vmproc::main(host.clone(), paths.clone(), Start::Run { name, template: template.into(), ip, cmd, resources, generated }, notify_fd())
+        }
     }
 }
 
@@ -836,6 +760,25 @@ fn resume(host: &Host, name: &str) -> Result<bool> {
 /// How long `resume` waits for the VM process's answer: longer than it waits for the resume.
 const RESUME_ANSWER: Duration = Duration::from_secs(75);
 
+/// `start -a` attaches to a VM it starts, so only a stopped one: a stop under way is waited out,
+/// a paused or running VM refused (its command's output and status are its own process's).
+fn stopped_to_attach(host: &Host, name: &str) -> Result<()> {
+    host::check_name(name)?;
+    let deadline = Instant::now() + STOP_WAIT;
+    while host.alive(name) {
+        match host.entry(name).map(|e| e.state) {
+            Ok(s) if s == "paused" => bail!("vm {name} is paused, not stopped: flexvm unpause {name} resumes it (start -a attaches only to a vm it starts)"),
+            // Stopping, or starting (not published yet): what it ends as decides.
+            Ok(s) if s == "suspending" && Instant::now() < deadline => {}
+            Err(_) if Instant::now() < deadline => {}
+            Ok(s) => bail!("vm {name} is {s}, not stopped: start -a attaches only to a vm it starts"),
+            Err(e) => return Err(e),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 /// Why a VM with no process cannot be paused or unpaused.
 fn not_running(host: &Host, name: &str) -> util::Error {
     match host.suspended(name).map(|d| d.exists()) {
@@ -901,11 +844,14 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     if !alive && !stopped && records()? {
         bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
     }
+    let done = || output(format_args!("{name}\n"));
+    if !running {
+        return remove_stopped(host, name, records()?).and_then(|()| done());
+    }
     // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
     if host.entry(name).is_ok_and(|e| e.state == "source") {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
     }
-    let done = || output(format_args!("{name}\n"));
     if let Ok(vm) = host.signal(name, libc::SIGINT) {
         if !vm.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
@@ -939,6 +885,28 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
         Err(_) => Err(format!("no vm named {name:?}").into()),
     }
+}
+
+/// `rm` without -f: under the name, so a `start` meanwhile either wins first (and this is
+/// refused: the VM runs) or waits until it is gone; no process is ever signalled. `had`:
+/// a stopped VM's records were there before (taking the name clears failed and lost ones).
+fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
+    if !had {
+        return match std::fs::read_to_string(host.vms(name, "moved")?) {
+            Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
+            Err(_) => Err(format!("no vm named {name:?}").into()),
+        };
+    }
+    let _lock = match host.take_name(name, true) {
+        Ok(lock) => lock,
+        Err(_) if host.alive(name) => bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"),
+        Err(e) => return Err(e),
+    };
+    // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
+    if host.suspended(name)?.exists() {
+        lifecycle::revoke(host, name)??;
+    }
+    Ok(())
 }
 
 /// Withdraws the generation an address was lent out with, everywhere, and forgets what
@@ -1585,7 +1553,43 @@ mod exec_tests {
         // Growth stops at the cap, in whole steps.
         assert_eq!(r(None, Some(384 + 5000)).hotplug_cap(&meta), 4992);
         assert_eq!(r(None, None).hotplug_cap(&meta), 8192);
+        // A stopped VM's, from its manifest's sizes (`ps -a`).
+        assert_eq!((r(None, Some(384 + 5000)).ceiling(384, 384 + 8192), r(None, None).ceiling(384, 384 + 8192)), (384 + 4992, 384 + 8192));
         assert_eq!((r(Some(1.5), None).cpu_max(), r(None, None).cpu_max()), ("150000 100000".to_string(), "max 100000".to_string()));
+    }
+
+    #[test]
+    fn a_held_name_is_taken_and_plain_rm_or_start_a_leave_its_vm_alone() {
+        let root = crate::test_util::TempDir::new("held-name");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let lock = host.take_name("web", false).unwrap();
+        // Made up again when taken (`run`, `Proc::run`); an explicit name's error stays.
+        assert!(host::name_taken(&host.take_name("web", false).err().unwrap()));
+        assert!(!host::name_taken(&host::check_name(".x").unwrap_err()));
+        // A VM started meanwhile holds its name: a plain rm takes it to remove, so is refused,
+        // signalling nothing; the record it saw stays.
+        std::fs::write(host.vms("web", "failed").unwrap(), "died").unwrap();
+        let e = remove_stopped(&host, "web", true).unwrap_err().to_string();
+        assert!(e.contains("is running") && e.contains("rm -f web"), "{e}");
+        assert!(host.vms("web", "failed").unwrap().exists());
+        // start -a: a paused VM is unpaused, not attached to.
+        let entry = host::Entry { name: "web".into(), ident: host::Ident::me(), state: "paused".into(), ..host::Entry::default() };
+        std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
+        lock.publish(&entry).unwrap();
+        let e = stopped_to_attach(&host, "web").unwrap_err().to_string();
+        assert!(e.contains("flexvm unpause web"), "{e}");
+        drop(lock);
+        stopped_to_attach(&host, "web").unwrap();
+    }
+
+    #[test]
+    fn cpus_need_the_cpu_controller() {
+        let root = crate::test_util::TempDir::new("cpu-controller");
+        assert!(vmproc::cpu_controller(None).unwrap_err().to_string().contains("cgroup"));
+        std::fs::write(root.join("cgroup.subtree_control"), "memory cpuset\n").unwrap();
+        assert!(vmproc::cpu_controller(Some(&root)).unwrap_err().to_string().contains("cpu controller"));
+        std::fs::write(root.join("cgroup.subtree_control"), "cpuset cpu memory\n").unwrap();
+        vmproc::cpu_controller(Some(&root)).unwrap();
     }
 
     #[test]
@@ -1593,7 +1597,7 @@ mod exec_tests {
         let root = crate::test_util::TempDir::new("names");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         for _ in 0..20 {
-            let n = generated_name(&host).unwrap();
+            let n = host::generated_name(&host).unwrap();
             host::check_name(&n).unwrap();
             assert!(n.contains('_'), "{n}");
         }

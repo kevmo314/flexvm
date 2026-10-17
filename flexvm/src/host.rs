@@ -749,7 +749,7 @@ impl Host {
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
         let (lock, suspended) = (self.vms(name, "lock")?, self.suspended(name)?);
         if !resuming && self.is_suspended(name) {
-            bail!("vm {name:?} exists (suspended); resume or kill it");
+            bail!("vm {name:?} exists (stopped); flexvm start or rm it");
         }
         // A sweep holds a dead holder's lock for a moment (`collect_owned`):
         // not taken, so tried again briefly.
@@ -770,7 +770,7 @@ impl Host {
             crate::lifecycle::remove_debris(self, name)?;
         }
         if !resuming && suspended.exists() {
-            bail!("vm {name:?} exists (suspended); resume or kill it");
+            bail!("vm {name:?} exists (stopped); flexvm start or rm it");
         }
         for ext in ["json", "sock", "moved", "failed", "lost"] {
             let _ = std::fs::remove_file(self.vms(name, ext)?);
@@ -3030,6 +3030,117 @@ fn tap_prefix(state: &Path) -> String {
     let h = state.as_os_str().as_bytes().iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
     let digit = |i: u32| char::from_digit((h / 36u64.pow(i) % 36) as u32, 36).unwrap();
     std::iter::once('f').chain((0..5).map(digit)).collect()
+}
+
+/// Made up as docker does: an adjective and a scientist, one no VM here has.
+pub fn generated_name(host: &Host) -> Result<String> {
+    const ADJECTIVES: &[&str] = &[
+        "admiring",
+        "agitated",
+        "amazing",
+        "bold",
+        "brave",
+        "busy",
+        "calm",
+        "clever",
+        "cool",
+        "dazzling",
+        "eager",
+        "ecstatic",
+        "elegant",
+        "epic",
+        "festive",
+        "focused",
+        "friendly",
+        "gallant",
+        "happy",
+        "hopeful",
+        "jolly",
+        "keen",
+        "kind",
+        "laughing",
+        "lucid",
+        "magical",
+        "modest",
+        "nifty",
+        "nostalgic",
+        "optimistic",
+        "peaceful",
+        "pensive",
+        "quirky",
+        "relaxed",
+        "serene",
+        "sharp",
+        "stoic",
+        "tender",
+        "trusting",
+        "vibrant",
+        "wizardly",
+        "youthful",
+        "zealous",
+    ];
+    const NAMES: &[&str] = &[
+        "agnesi",
+        "albattani",
+        "babbage",
+        "bardeen",
+        "bell",
+        "boole",
+        "curie",
+        "darwin",
+        "dijkstra",
+        "einstein",
+        "euler",
+        "faraday",
+        "fermat",
+        "fermi",
+        "feynman",
+        "galileo",
+        "gauss",
+        "goldberg",
+        "hamilton",
+        "hawking",
+        "hopper",
+        "hypatia",
+        "johnson",
+        "kepler",
+        "knuth",
+        "lamarr",
+        "lovelace",
+        "maxwell",
+        "mccarthy",
+        "meitner",
+        "newton",
+        "noether",
+        "pascal",
+        "ritchie",
+        "shannon",
+        "tesla",
+        "thompson",
+        "torvalds",
+        "turing",
+        "wiles",
+        "wozniak",
+        "yalow",
+    ];
+    for _ in 0..100 {
+        let r = u64::from_str_radix(&crate::util::random_hex(8)?, 16).unwrap_or(0);
+        let name = format!("{}_{}", ADJECTIVES[(r % ADJECTIVES.len() as u64) as usize], NAMES[((r >> 32) % NAMES.len() as u64) as usize]);
+        let taken = host.alive(&name)
+            || host.suspended(&name)?.exists()
+            || ["failed", "lost", "moved"].iter().any(|ext| host.vms(&name, ext).is_ok_and(|p| p.exists()));
+        if !taken {
+            return Ok(name);
+        }
+    }
+    bail!("could not make up a free name: give one with --name")
+}
+
+/// Whether `take_name` refused a name because a VM (running or stopped) holds it: a made-up
+/// name is then made up again (`generated_name`), an explicit one is the caller's error.
+pub fn name_taken(e: &crate::util::Error) -> bool {
+    let e = e.to_string();
+    e.contains("is taken") || e.contains("exists (stopped)")
 }
 
 pub fn check_name(name: &str) -> Result<()> {

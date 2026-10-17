@@ -534,9 +534,14 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     };
     let mut t = Phases::new();
     // Checked against this standby's own generation; a refusal leaves it for another claim.
-    let resources = serde_json::from_value(req["resources"].clone()).map_err(|e| (format!("bad resources: {e}").into(), false))?;
+    let resources: crate::vm::Resources = serde_json::from_value(req["resources"].clone()).map_err(|e| (format!("bad resources: {e}").into(), false))?;
     let tpl = p.standby.lock().unwrap().as_ref().map(|s| s.template()).ok_or_else(|| ("standby vm gone".into(), true))?;
     p.set_resources(resources, &tpl.meta).map_err(|e| (e, false))?;
+    // Taken uncapped, ahead of the claim: capped now, before it runs.
+    if resources.cpus.is_some() {
+        let s = p.standby.lock().unwrap();
+        s.as_ref().ok_or_else(|| ("standby vm gone".into(), true))?.firecracker().set_cpu_max(&resources.cpu_max()).map_err(|e| (e, false))?;
+    }
     let lock = host.take_name(name, false).map_err(|e| (e, false))?;
     // Its memory is already out of MemAvailable: only the step is charged. Sized
     // as it was loaded (`serve`), and admitted before the address is claimed.

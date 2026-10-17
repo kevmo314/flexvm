@@ -50,7 +50,9 @@ pub struct Firecracker {
     pub tap: String,
     api: Api,
     /// The cgroup move: joined before a load or reap.
-    joining: RefCell<Option<std::thread::JoinHandle<()>>>,
+    joining: RefCell<Option<std::thread::JoinHandle<std::io::Result<()>>>>,
+    /// Under a `--cpus` cap (`Spawner::cap_cpus`): one it cannot be held to is an error.
+    capped: bool,
     /// Drained after exit, before reading diagnostics or removing the directory.
     logging: RefCell<Option<std::thread::JoinHandle<()>>>,
 }
@@ -87,6 +89,7 @@ impl Firecracker {
             tap: String::new(),
             api: Api::default(),
             joining: RefCell::new(None),
+            capped: false,
             logging: RefCell::new(Some(logging)),
         };
         let id = crate::host::Ident::of(fc.pid()).ok_or_else(|| fc.post_mortem())?;
@@ -121,7 +124,7 @@ impl Firecracker {
     /// `vmstate` with devices other than it has, and takes no host resource (tap, socket, file)
     /// from `vmstate` (#548).
     pub fn load_snapshot(&self, vmstate: &Path, template: &Path, tap: &str, clock_realtime: Option<bool>, timeout: Duration) -> Result<Value> {
-        self.join_cgroup();
+        self.join_cgroup()?;
         let mut body = serde_json::json!({
             "snapshot_path": vmstate,
             "device_reference_path": template,
@@ -166,10 +169,23 @@ impl Firecracker {
         format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
 
-    pub fn join_cgroup(&self) {
-        if let Some(j) = self.joining.borrow_mut().take() {
-            let _ = j.join();
+    /// An error only under a `--cpus` cap: outside its cgroup, the VM would run uncapped.
+    pub fn join_cgroup(&self) -> Result<()> {
+        let joined = match self.joining.borrow_mut().take() {
+            Some(j) => j.join().unwrap_or_else(|_| Err(std::io::Error::other("cgroup thread panicked"))),
+            None => Ok(()),
+        };
+        match joined {
+            Err(e) if self.capped => bail!("--cpus not applied: firecracker {} has no cgroup of its own: {e}", self.pid()),
+            _ => Ok(()),
         }
+    }
+
+    /// `cpu.max` on its cgroup (`vm::Resources::cpu_max`), for a claimed standby's.
+    pub fn set_cpu_max(&self, max: &str) -> Result<()> {
+        let cg = self.cgroup.as_ref().ok_or("--cpus needs per-VM cgroups, which this host does not have")?;
+        std::fs::write(cg.join("cpu.max"), max).map_err(|e| format!("--cpus not applied: {}: {e}", cg.join("cpu.max").display()))?;
+        Ok(())
     }
 
     fn join_log(&self) {
@@ -366,7 +382,7 @@ fn log_tail(r: &mut (impl Read + Seek)) -> std::io::Result<String> {
 impl Drop for Firecracker {
     fn drop(&mut self) {
         // Reaped only once its pager has stopped.
-        self.join_cgroup();
+        let _ = self.join_cgroup();
         self.api.connection.get_mut().take();
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -412,6 +428,8 @@ pub struct Spawner {
     next: AtomicU64,
     /// Taps handed out but not made yet: a concurrent `take` sees none of them in sysfs.
     making: Mutex<HashSet<String>>,
+    /// `cpu.max` for each Firecracker taken from now on (`--cpus`), written before it is handed out.
+    cpu_max: Mutex<Option<String>>,
 }
 
 /// Reuse vanished taps; the lifetime counter is only for directories and cgroups.
@@ -443,7 +461,13 @@ impl Spawner {
             tap_owner: tap_owner.into(),
             next: AtomicU64::new(0),
             making: Mutex::default(),
+            cpu_max: Mutex::default(),
         }
+    }
+
+    /// Every Firecracker `take` hands out from now on is held to `max` (`cpu.max`), or not taken.
+    pub fn cap_cpus(&self, max: Option<String>) {
+        *self.cpu_max.lock().unwrap() = max;
     }
 
     pub fn take(&self, deadline: Option<std::time::Instant>) -> Result<Firecracker> {
@@ -479,13 +503,26 @@ impl Spawner {
                 crate::log!("firecracker {}: no metrics: {e}", fc.pid());
             }
         }
+        // A capped one's cgroup is made, and capped, before Firecracker joins it (or none is taken):
+        // the cap holds from the VM's first instruction.
+        let cap = self.cpu_max.lock().unwrap().clone();
+        if let Some(max) = &cap {
+            fc.capped = true;
+            fc.cgroup = cgroup.clone();
+            fc.tap = tap.clone();
+            let cg = cgroup.as_ref().ok_or("--cpus needs per-VM cgroups (cgroup2 at /sys/fs/cgroup), which this host does not have")?;
+            std::fs::create_dir(cg)
+                .and_then(|()| std::fs::write(cg.join("cpu.max"), max))
+                .map_err(|e| format!("--cpus not applied: {}: {e}", cg.join("cpu.max").display()))?;
+        }
         if let Some(cg) = cgroup.clone() {
             let pid = fc.pid();
+            let made = cap.is_some();
             *fc.joining.get_mut() = Some(std::thread::spawn(move || {
                 // Never swapped: at its mark the VM is throttled (sleeps a migration's or
                 // checkpoint's lift waits out), not paged out to swap, whose reads would hold
                 // up its pauses. Without swap accounting the file is missing: nothing to do.
-                let joined = std::fs::create_dir(&cg).and_then(|()| {
+                let joined = if made { Ok(()) } else { std::fs::create_dir(&cg) }.and_then(|()| {
                     if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0") {
                         if e.kind() != std::io::ErrorKind::NotFound {
                             crate::log!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
@@ -493,9 +530,10 @@ impl Spawner {
                     }
                     std::fs::write(cg.join("cgroup.procs"), pid.to_string())
                 });
-                if let Err(e) = joined {
+                if let Err(e) = &joined {
                     crate::log!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
                 }
+                joined
             }));
         }
         fc.cgroup = cgroup;

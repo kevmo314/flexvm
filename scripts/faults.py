@@ -4249,7 +4249,7 @@ def suspend_resume():
     code, out = sh(A, n, "echo hi")
     check("suspend: exec refused", code != 0, out)
     r = run(A, n)
-    check("suspend: its name stays taken", not r["ok"] and "suspended" in r["error"], r)
+    check("suspend: its name stays taken", not r["ok"] and "stopped" in r["error"], r)
     # Nothing about a suspended VM lives in a process: the listeners restart.
     restart_listeners("suspend")
     check("suspend: still suspended", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
@@ -8218,11 +8218,14 @@ def resume_suspending():
         end = time.time() + 10
         while state() != "suspending" and time.time() < end:
             time.sleep(0.005)
-        code, out, err = cli(A, "start", "-a", n)
+        code, out, err = cli(A, "start", n)
     fault(A, "suspend_slow", 0)
-    check("resume suspending: a failed suspend's vm runs on, resume exits 0",
+    check("resume suspending: a failed suspend's vm runs on, start exits 0",
           code == 0 and alive(pid) and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 10), (code, err, vms(A).get(n)))
     check("resume suspending: the suspend did fail", "injected fault: writing the checkpoint failed" in log(A, n), log(A, n)[-500:])
+    # start -a attaches only to a vm it starts: a running one is refused, and runs on.
+    code, out, err = cli(A, "start", "-a", n)
+    check("resume suspending: start -a of the running vm is refused", code == 125 and "not stopped" in err and alive(pid), (code, err))
     ok(kill(A, n))
     # Resume right behind the SIGTERM, before anything is published: still waited out, the VM resumed.
     ok(run(A, n))

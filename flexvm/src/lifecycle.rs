@@ -1074,7 +1074,8 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };
     Some(json!({
         "name": name, "ip": m.ip.to_string(), "template": m.template, "template_id": m.template_id,
-        "state": state, "vcpus": m.vcpus, "guest_mib": m.mem_mib.saturating_add(m.hotplug_mib), "max_mib": m.max_mib,
+        "state": state, "vcpus": m.vcpus, "cpus": m.resources.cpus, "resources": m.resources,
+        "guest_mib": m.mem_mib.saturating_add(m.hotplug_mib), "max_mib": m.resources.ceiling(m.mem_mib, m.max_mib),
         "checkpoint_mib": (m.data_pages.saturating_mul(PAGE_SIZE as u64)) >> 20,
     }))
 }

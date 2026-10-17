@@ -839,7 +839,8 @@ impl Proc {
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         // Its caps move with it (the same template: they fit).
-        *self.resources.lock().unwrap() = serde_json::from_value(req["resources"].clone()).unwrap_or_default();
+        // Refused before the source pauses: a capped VM never runs uncapped here.
+        self.keep_resources(serde_json::from_value(req["resources"].clone()).unwrap_or_default())?;
         t.mark("template");
         going()?;
         // Admission, the record and the claim under one wait for the lock, which gives up in time.

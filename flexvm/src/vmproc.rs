@@ -83,6 +83,8 @@ pub enum Start {
         ip: Option<Ipv4Addr>,
         cmd: Option<String>,
         resources: crate::vm::Resources,
+        /// Made up (`host::generated_name`): made up again if taken meanwhile.
+        generated: bool,
     },
     Resume {
         name: String,
@@ -295,16 +297,24 @@ impl Proc {
     pub fn adopt(&self, vm: Arc<Vm>) {
         let _early = self.early.lock().unwrap();
         self.charged.store(0, Ordering::SeqCst);
-        let r = *self.resources.lock().unwrap();
-        *vm.resources.lock().unwrap() = r;
-        // A standby's or a reused Firecracker's cgroup may hold another cap.
-        vm.limit.set_cpu_max(&r.cpu_max(), r.cpus.is_some());
+        // Its cap is already on its cgroup (`keep_resources`; a claimed standby's by `claim`).
+        *vm.resources.lock().unwrap() = *self.resources.lock().unwrap();
         let _ = self.vm.set(vm);
     }
 
     /// What the VM will be capped at, checked against its template first.
     pub fn set_resources(&self, r: crate::vm::Resources, meta: &crate::template::Meta) -> Result<()> {
         r.check(meta)?;
+        self.keep_resources(r)
+    }
+
+    /// What the VM will be capped at: every Firecracker taken from now on is held to its
+    /// `--cpus`, or refused.
+    pub fn keep_resources(&self, r: crate::vm::Resources) -> Result<()> {
+        if r.cpus.is_some() {
+            cpu_controller(cgroup_root().as_deref())?;
+        }
+        self.spawner.cap_cpus(r.cpus.map(|_| r.cpu_max()));
         *self.resources.lock().unwrap() = r;
         Ok(())
     }
@@ -940,9 +950,17 @@ impl Proc {
         }
     }
 
-    fn run(&self, name: &str, template: &str, want: Option<Ipv4Addr>) -> Result<Value> {
+    fn run(&self, name: &str, template: &str, want: Option<Ipv4Addr>, generated: bool) -> Result<Value> {
         let mut t = Phases::new();
-        self.set_name(self.host.take_name(name, false)?);
+        let mut name = name.to_string();
+        let lock = loop {
+            match self.host.take_name(&name, false) {
+                Err(e) if generated && crate::host::name_taken(&e) => name = crate::host::generated_name(&self.host)?,
+                r => break r?,
+            }
+        };
+        self.set_name(lock);
+        let name = name.as_str();
         let tpl = Template::open(&self.paths, template)?;
         let resources = *self.resources.lock().unwrap();
         self.set_resources(resources, &tpl.meta)?;
@@ -1824,10 +1842,10 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let kvm = if matches!(start, Start::Incoming { .. }) { Ok(()) } else { crate::util::check_kvm() };
     let res = match start {
         _ if kvm.is_err() => kvm.map(|()| Value::Null),
-        Start::Run { name, template, ip, cmd, resources } => {
+        Start::Run { name, template, ip, cmd, resources, generated } => {
             *p.cmd.lock().unwrap() = cmd;
             *p.resources.lock().unwrap() = resources;
-            p.run(&name, &template, ip)
+            p.run(&name, &template, ip, generated)
         }
         Start::Resume { name } => p.resume_suspended(&name),
         Start::Restore { dir, name, ip, paused, resources } => p.restore(&dir, name.as_deref(), ip.as_deref(), paused, resources),
@@ -1880,6 +1898,17 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
 
 fn has_controller(controllers: &str, name: &str) -> bool {
     controllers.split_whitespace().any(|controller| controller == name)
+}
+
+/// A `--cpus` cap needs the cpu controller in the VMs' cgroups (`cgroup_root`): without it the
+/// start (or arrival) is refused, never run uncapped.
+pub fn cpu_controller(root: Option<&std::path::Path>) -> Result<()> {
+    let root = root.ok_or("--cpus needs per-VM cgroups (cgroup2 at /sys/fs/cgroup), which this host does not have")?;
+    let ctl = std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap_or_default();
+    if !has_controller(&ctl, "cpu") {
+        bail!("--cpus needs the cgroup cpu controller in {}, which this host does not enable", root.display());
+    }
+    Ok(())
 }
 
 pub fn cgroup_root() -> Option<PathBuf> {

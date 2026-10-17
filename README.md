@@ -75,12 +75,15 @@ flexvm run -d --ip 10.200.0.9 --cpus 2 --memory 8g nginx:1.27
 ```
 
 `run` pulls an image it does not find here first, as `docker run` does.
-Without `--name` it makes one up (`epic_yalow`, as Docker does); the
+Without `--name` it makes one up (`epic_yalow`, as Docker does; one
+another run takes meanwhile is made up again); the
 JSON `-d` prints, and `flexvm ps`, give it. The options go before the image:
 every word after it is the command.
 
 `--cpus N` caps the VM's CPU time at N CPUs (`1.5`: one and a half; a
-`cpu.max` quota on its Firecracker's cgroup); it still has its image's vCPUs.
+`cpu.max` quota on its Firecracker's cgroup, set before the VM runs); it
+still has its image's vCPUs. A host without the cgroup cpu controller refuses
+a start (or an arrival) with `--cpus` rather than run it uncapped.
 `--memory SIZE` (`512m`, `2g`; a plain number is bytes, as in Docker) caps
 how far the VM grows: from its image's boot memory plus what its snapshot
 plugged (a VM never shrinks below that) up to the image's ceiling. A value
@@ -149,7 +152,9 @@ A stopped VM keeps its name and address. `start` restores it in a new
 process, in the background whether it first ran in the foreground or with
 `-d`; `start -a` brings it back in the foreground. A `run IMAGE CMD` VM stops with its
 command, which keeps running once started again: `start -a` prints the rest
-of its output and exits with its status. `start` of a paused VM unpauses it.
+of its output and exits with its status. `start` of a paused VM unpauses it;
+`start -a` attaches only to a VM it starts, so it refuses a running or paused
+one (`unpause` that), after waiting out a stop under way.
 
 A closed terminal (SIGHUP) leaves a foreground VM running; its output then
 goes to `/run/flexvm/vms/NAME.log`.

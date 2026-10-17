@@ -1004,10 +1004,21 @@ impl Resources {
     /// steps, never below what the snapshot plugged.
     pub fn hotplug_cap(&self, meta: &crate::template::Meta) -> u64 {
         let total = meta.max_mib - meta.mem_mib;
+        self.hotplug_within(meta.mem_mib, total).max(meta.plugged_mib.min(total))
+    }
+
+    /// Of a hotplug region of `total` after `mem_mib` of boot memory: up to `memory_mib`, in whole steps.
+    fn hotplug_within(&self, mem_mib: u64, total: u64) -> u64 {
         match self.memory_mib {
-            Some(m) => (m.saturating_sub(meta.mem_mib) / crate::template::STEP_MIB * crate::template::STEP_MIB).clamp(meta.plugged_mib.min(total), total),
+            Some(m) => (m.saturating_sub(mem_mib) / crate::template::STEP_MIB * crate::template::STEP_MIB).min(total),
             None => total,
         }
+    }
+
+    /// The memory ceiling of a VM with `mem_mib` of boot memory and a template ceiling of `max_mib`
+    /// (a stopped VM's, from its manifest).
+    pub fn ceiling(&self, mem_mib: u64, max_mib: u64) -> u64 {
+        mem_mib + self.hotplug_within(mem_mib, max_mib.saturating_sub(mem_mib))
     }
 
     /// `cpu.max`: `QUOTA PERIOD`, or `max PERIOD`.
@@ -1208,8 +1219,7 @@ impl Prepared {
             // All of routing the address here but the route, alongside the load: the route waits for the fence.
             let neighbour = self.neighbour.then(|| std::thread::spawn(move || crate::net::neighbour(ip, &tap)));
             // Before `left` is read: the deadline covers it too.
-            fc.join_cgroup();
-            let loaded = fc.load_snapshot(&path, &self.template.vmstate(), &fc.tap, Some(clock_realtime), left(API_TIMEOUT));
+            let loaded = fc.join_cgroup().and_then(|()| fc.load_snapshot(&path, &self.template.vmstate(), &fc.tap, Some(clock_realtime), left(API_TIMEOUT)));
             if matches!(vmstate, Snapshot::Bytes(_)) {
                 let _ = std::fs::remove_file(&path);
             }
