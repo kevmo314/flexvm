@@ -25,7 +25,11 @@ use crate::util::{ms, recv_json, send_json, By, Error, Phases, Result};
 use crate::vm::{Snapshot, State, Vm};
 use crate::vmproc::{peer_call, Busy, End, Op, Proc, BUSY};
 
-/// From the target's prepare answer to its commit answer.
+/// From the target's prepare answer to its commit answer: the target receives, loads and commits
+/// within it, or refuses. The source's one deadline for its post-pause sends and the commit reply is as
+/// long, but starts at the pause, after that answer reached it: it ends after the target's, so an
+/// honest target's answer is never cut short, and waiting past it (for more bytes, a slower link) would
+/// only hold the VM paused for a target that has already given up. A bigger budget is the target's to give.
 const INCOMING_WAIT: Duration = Duration::from_secs(30);
 const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_HEADER: u64 = 256 << 20;
@@ -117,7 +121,7 @@ impl Proc {
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
-        let (mut conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
+        let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
         let prepare = prep.elapsed();
         // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
         let mut wanted = crate::standby::load_set(&self.host, &vm.template);
@@ -188,47 +192,47 @@ impl Proc {
             data.resize(data.len() + crate::util::PAGE_SIZE, 0);
         }
         let remote_pages: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
-        let sent = (|| -> Result<Value> {
-            send_json(
-                &mut conn,
-                &Header {
-                    runs: Cow::Borrowed(&runs),
-                    vmstate_len: state.len() as u64,
-                    preload: Cow::Borrowed(&pages),
-                    paused: vm.was_paused(),
-                    app_log: match self.hold_app_log() {
-                        // Test fault `bad_app_log`: an offset past all of the guest's output.
-                        _ if fault("bad_app_log") => u64::MAX,
-                        at => at,
-                    },
+        let sent = send_paused(
+            &conn,
+            &Header {
+                runs: Cow::Borrowed(&runs),
+                vmstate_len: state.len() as u64,
+                preload: Cow::Borrowed(&pages),
+                paused: vm.was_paused(),
+                app_log: match self.hold_app_log() {
+                    // Test fault `bad_app_log`: an offset past all of the guest's output.
+                    _ if fault("bad_app_log") => u64::MAX,
+                    at => at,
                 },
-            )?;
-            conn.write_all(&state)?;
-            if fault("slow_preload") {
-                thread::sleep(Duration::from_millis(300));
-            }
-            conn.write_all(&data)?;
-            t.mark("send_state");
-            Ok(recv_json(&mut BufReader::new(By { s: &conn, at: Instant::now() + Duration::from_secs(30) }))?.ok_or("target hung up")?)
-        })();
-        let (target, answered) = match sent {
-            Ok(reply) if reply["ok"] == json!(true) => (reply["result"].clone(), true),
+            },
+            &state,
+            &data,
+            // Ends after the target's own (`INCOMING_WAIT`), which started at its prepare answer.
+            Instant::now() + INCOMING_WAIT,
+            &mut t,
+        );
+        let (target, conn) = match sent {
+            Ok(reply) if reply["ok"] == json!(true) => (reply["result"].clone(), Some(conn)),
             // A target refuses only before resuming the VM, or after killing it.
             Ok(reply) => return Err(self.abort(&op, &vm, mig, format!("target refused: {}", reply["error"]).into())),
-            Err(e) => match outcome(to, mig, Duration::from_secs(2)) {
-                Some(Outcome::Committed(target)) => (target, false),
-                Some(Outcome::Aborted) => return Err(self.abort(&op, &vm, mig, e)),
-                None => {
-                    self.reconcile_later(mig, to.to_string());
-                    bail!("migrating {} to {to}: {e}; {to} has not said whether it resumed the vm, so it stays paused here until it does", vm.name);
+            Err(e) => {
+                // Close before asking its outcome, so the target's arrival can abort.
+                drop(conn);
+                match outcome(to, mig, Duration::from_secs(2)) {
+                    Some(Outcome::Committed(target)) => (target, None),
+                    Some(Outcome::Aborted) => return Err(self.abort(&op, &vm, mig, e)),
+                    None => {
+                        self.reconcile_later(mig, to.to_string());
+                        bail!("migrating {} to {to}: {e}; {to} has not said whether it resumed the vm, so it stays paused here until it does", vm.name);
+                    }
                 }
-            },
+            }
         };
         t.mark("target");
         let downtime = t.total();
         // A target that takes this held stream (no sequence numbers) and `SWITCH` says so; to any
         // other, nothing held is sent (it is counted as dropped).
-        let (held, rerouted) = self.reroute(mig, to, &target, answered.then_some(&conn), prepared["hold_switch2"] == true);
+        let (held, rerouted) = self.reroute(mig, to, &target, conn.as_ref(), prepared["hold_switch2"] == true);
         if let Err(e) = &rerouted {
             crate::log!("vm {}: migration {mig} to {to}: rerouting failed: {e}", self.name());
         }
@@ -991,6 +995,19 @@ impl Proc {
     }
 }
 
+/// Header, state, preload and commit reply share one cap: partial writes cannot extend the pause.
+fn send_paused(conn: &TcpStream, header: &Header<'_>, state: &[u8], data: &[u8], at: Instant, t: &mut Phases) -> Result<Value> {
+    let mut conn = By { s: conn, at };
+    send_json(&mut conn, header)?;
+    conn.write_all(state)?;
+    if fault("slow_preload") {
+        thread::sleep(Duration::from_millis(300));
+    }
+    conn.write_all(data)?;
+    t.mark("send_state");
+    Ok(recv_json(&mut BufReader::new(conn))?.ok_or("target hung up")?)
+}
+
 /// Check the target before forwarding held packets or changing any route.
 fn target_via(host: &crate::host::Host, target: &Value, to: &str, peer: Option<IpAddr>) -> Result<Ipv4Addr> {
     let via = target["underlay"].as_str().ok_or("target sent no underlay")?.parse()?;
@@ -1258,6 +1275,61 @@ mod tests {
         assert_eq!(retry.resolve(&host).unwrap(), Ipv4Addr::LOCALHOST);
         assert!(route.via.is_none());
         assert!(target_via(&host, &route.target, &route.to, None).is_err());
+    }
+
+    #[test]
+    fn paused_send_deadline_bounds_a_slow_target() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let reader = thread::spawn(move || {
+            let mut buf = [0; 4096];
+            let mut drained = 0;
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            while !stopped.load(Ordering::SeqCst) {
+                let n = peer.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                drained += n;
+                thread::sleep(Duration::from_millis(10));
+            }
+            drained
+        });
+        let header = Header { runs: Cow::Borrowed(&[]), vmstate_len: 1, preload: Cow::Borrowed(&[]), paused: false, app_log: 0 };
+        let data = vec![7; 16 << 20];
+        let start = Instant::now();
+        let budget = Duration::from_millis(200);
+        let result = send_paused(&conn, &header, &[0], &data, start + budget, &mut Phases::new());
+        let elapsed = start.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        drop(conn);
+        let drained = reader.join().unwrap();
+        assert_eq!(result.unwrap_err().downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+        assert!(elapsed >= budget && elapsed < budget + Duration::from_secs(1), "{elapsed:?}");
+        assert!(drained > 4096 && drained < data.len(), "peer must make partial progress: {drained}");
+    }
+
+    #[test]
+    fn paused_send_deadline_bounds_the_commit_reply() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        // Takes everything at once, then never answers.
+        let reader = thread::spawn(move || std::io::copy(&mut peer, &mut std::io::sink()).unwrap());
+        let header = Header { runs: Cow::Borrowed(&[]), vmstate_len: 1, preload: Cow::Borrowed(&[]), paused: false, app_log: 0 };
+        let data = vec![7; 1 << 20];
+        let start = Instant::now();
+        let budget = Duration::from_millis(300);
+        let result = send_paused(&conn, &header, &[0], &data, start + budget, &mut Phases::new());
+        let elapsed = start.elapsed();
+        drop(conn);
+        let drained = reader.join().unwrap();
+        assert_eq!(result.unwrap_err().downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+        assert!(elapsed >= budget && elapsed < budget + Duration::from_secs(1), "{elapsed:?}");
+        assert!(drained > data.len() as u64, "all was sent before the wait for the reply: {drained}");
     }
 
     /// A refused arrival reads what its source still sends, so the source, still writing, gets the reason, not a reset.
