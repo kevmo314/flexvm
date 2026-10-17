@@ -3572,20 +3572,27 @@ def pause_resume():
     check("pause: a stray SIGSTOP/SIGCONT leaves a running vm running", vms(A)[n]["state"] == "running"
           and sh(A, n, "echo hi") == (0, "hi"), vms(A)[n]["state"])
     pause(A, n)
-    # Slow the pull before it starts (a paused arrival pulls at once; a stall armed after the migration
-    # can come too late): every page reply a second late, so it is still going when the resume comes.
-    with armed_fault(A, "pages_slow", 5000):
-        t = time.time()
-        ok(migrate(A, n, B))
-        migrated = time.time() - t
-        check("paused migrate: stays paused on the target", vms(B)[n]["state"] == "paused", vms(B)[n]["state"])
-        pending = vms(B)[n].get("background_pull_ms") is None
-        # A resume on the target must wait for all its memory.
-        waited = resume(B, n)
-    # Its pull still going as the resume began, and ended when it returned (events, not durations).
-    pulled = vms(B)[n].get("background_pull_ms")
+    # The target's pull held (`pull_gate`) until released: a resume there must wait for all its memory, in that order.
+    clear_gate(B, "pull_gate")
+    with armed_fault(B, "pull_gate", 600000):
+        try:
+            ok(migrate(A, n, B))
+            check("paused migrate: stays paused on the target", vms(B)[n]["state"] == "paused", vms(B)[n]["state"])
+            check("paused migrate: its pull is held", wait_for(lambda: reached(B, "pull_gate"), 10) and vms(B)[n].get("background_pull_ms") is None,
+                  (reached(B, "pull_gate"), vms(B)[n]))
+            done = {}
+            resuming = start_thread(target=lambda: done.update(r=cli(B, "unpause", n), pulled=vms(B)[n].get("background_pull_ms")))
+            # Not a wait for something to happen: the resume must not return, nor the VM run, while its pull is held.
+            blocked = not wait_for(lambda: done or vms(B)[n]["state"] != "paused", 3)
+            check("paused migrate: the resume waits while the pull is held", blocked, (done, vms(B)[n]["state"]))
+            release(B, "pull_gate")
+            resuming.join(60)
+        finally:
+            # Pullers parked at a gate wait out its marker, not its arming.
+            release(B, "pull_gate")
+    # The pull had ended when the resume returned: sampled straight after it, before any other command.
     st = wait_released(B, n)
-    check("paused migrate: resume waited for the whole pull", pending and pulled is not None, (migrated, waited, pulled, st))
+    check("paused migrate: resume waited for the whole pull", done.get("r", (1,))[0] == 0 and done.get("pulled") is not None, (done, st))
     check("paused migrate: source released, only on B", where(n) == {B: "running"} and st["released"] is True, (where(n), st))
     check("paused migrate: runs on B after resume, md5 intact", md5(B, n) == m)
 
