@@ -3749,7 +3749,9 @@ mod tests {
         let old = h.state.join("lock");
         std::fs::write(&old, b"").unwrap();
         let _old = Flock::new(File::open(&old).unwrap(), libc::LOCK_EX).unwrap();
-        drop(h.lock_by(Some(std::time::Instant::now() + Duration::from_secs(5))).unwrap());
+        // Probe this host's file directly: lock_by also waits on THREADS, which
+        // unrelated tests' host locks may hold past its deadline (#633).
+        drop(lock_path(&h.lock_file(), libc::LOCK_EX | libc::LOCK_NB).unwrap());
         drop(name);
     }
 
