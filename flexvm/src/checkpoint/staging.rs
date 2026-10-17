@@ -178,7 +178,7 @@ impl Staging {
                 self.add_file("vmstate", &vmstate)?;
                 Ok(vmstate)
             })?;
-            let copied = write_pages(&vm.template, src, runs, &pages, writer_threads(), parent.is_some()).and_then(|out| {
+            let copied = write_pages(&vm.template, src, runs, &pages, writer_threads(), parent.is_some(), vm.pager.mem_room()).and_then(|out| {
                 t.mark("write_pages");
                 self.sync_pages_and_pagemap(&pages.file, &out.map)?;
                 Ok(out)

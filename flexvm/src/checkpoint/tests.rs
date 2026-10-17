@@ -6,6 +6,7 @@ use super::{
     *,
 };
 use crate::{
+    cow::Room,
     template::{Paths, Template},
     uffd::{Runs, BASE as P_BASE, REMOTE, ZERO as P_ZERO},
     util::{stat_at, Result, PAGE_SIZE},
@@ -269,9 +270,15 @@ fn pages_roundtrip_against_the_template() {
     let want_data = (0..900).filter(|&i| i % 5 >= 2 && !discarded(i)).count() as u64;
     let want_zero = (0..900).filter(|&i| i % 2 == 0 && (i % 5 == 1 || discarded(i))).count() as u64;
     let mut last = None;
-    for threads in [8, 3, 1] {
+    // Room for every writer's huge-page buffer, for one of them (2 MiB) only, and for none:
+    // the others write through ordinary buffers, the same pages. Once the writers are done,
+    // all of it is back.
+    for (threads, room_mib) in [(8, u64::MAX), (3, 3), (1, 0)] {
         let path = dir.join(format!("pages-{threads}"));
-        let w = write_pages(&tpl, &guest, &input, &pages_file(&path), threads, false).unwrap();
+        let room = Room::default();
+        room.set(room_mib);
+        let w = write_pages(&tpl, &guest, &input, &pages_file(&path), threads, false, &room).unwrap();
+        assert_eq!(room.get(), room_mib, "{threads} writers");
         assert_eq!((w.data, w.zero, fs::metadata(&path).unwrap().len()), (want_data, want_zero, w.data * PAGE_SIZE as u64));
         let (map, sums) = parse_pagemap(&w.map, n as u64, false, 0).unwrap();
         // Runs past the guest's end, a truncated map, and a DATA run pointing anywhere but its place.
@@ -300,7 +307,7 @@ fn pages_roundtrip_against_the_template() {
     let bad: Vec<_> = (0..n).filter_map(|i| (got[i].0 == REMOTE).then(|| file.read(i, &mut one, false).err()).flatten()).collect();
     assert_eq!(bad.iter().map(|e| e.kind()).collect::<Vec<_>>(), [io::ErrorKind::InvalidData]);
     // A failed read fails the whole write instead of hanging the other writers.
-    assert!(write_pages(&tpl, &Guest(pages, 333, Some(500)), &input, &pages_file(&dir.join("pages-fail")), 4, false).is_err());
+    assert!(write_pages(&tpl, &Guest(pages, 333, Some(500)), &input, &pages_file(&dir.join("pages-fail")), 4, false, &Room::default()).is_err());
 }
 
 #[test]
@@ -311,7 +318,9 @@ fn deltas_flatten_over_their_parents() {
     let tpl = template(&dir, &tpl_pages);
     let tpl_page = |i: usize| tpl_pages[i].map_or(vec![0; PAGE_SIZE], |b| vec![b; PAGE_SIZE]);
     let v1: Vec<Vec<u8>> = (0..n).map(|i| if i < 200 { page(i) } else { tpl_page(i) }).collect();
-    let w1 = write_pages(&tpl, &Guest(v1.clone(), 128, None), &runs_of((0..200).map(|i| (i, REMOTE))), &pages_file(&dir.join("p1")), 3, false).unwrap();
+    let w1 =
+        write_pages(&tpl, &Guest(v1.clone(), 128, None), &runs_of((0..200).map(|i| (i, REMOTE))), &pages_file(&dir.join("p1")), 3, false, &Room::default())
+            .unwrap();
     // Generation 2: new data, back to the template's, zero, discarded, and populated since (BASE before).
     let (mut v2, mut dirty) = (v1, Vec::new());
     type Change<'a> = (&'a [usize], u8, &'a dyn Fn(usize) -> Vec<u8>);
@@ -329,7 +338,7 @@ fn deltas_flatten_over_their_parents() {
         }
     }
     dirty.sort();
-    let w2 = write_pages(&tpl, &Guest(v2.clone(), 128, None), &runs_of(dirty), &pages_file(&dir.join("p2")), 2, true).unwrap();
+    let w2 = write_pages(&tpl, &Guest(v2.clone(), 128, None), &runs_of(dirty), &pages_file(&dir.join("p2")), 2, true, &Room::default()).unwrap();
     assert_eq!(w2.data, 6, "only the changed data pages are stored");
     let (m1, s1) = parse_pagemap(&w1.map, n as u64, false, 1).unwrap();
     let (m2, s2) = parse_pagemap(&w2.map, n as u64, true, 0).unwrap();
@@ -503,7 +512,7 @@ fn whole_base_runs_build_the_per_page_map() {
             p += count + if gap { rand(10) } else { 0 };
         }
         let explicit = round % 2 == 1;
-        let w = write_pages(&tpl, &guest, &runs, &pages_file(&dir.join(format!("p{round}"))), 1, explicit).unwrap();
+        let w = write_pages(&tpl, &guest, &runs, &pages_file(&dir.join(format!("p{round}"))), 1, explicit, &Room::default()).unwrap();
         let (map, zero, sums) = per_page_map(&tpl, &guest, &runs, explicit);
         let mut want = MAGIC.to_vec();
         let words = [map.len() as u64, w.data].into_iter().chain(map.into_iter().flatten());
@@ -746,4 +755,20 @@ fn template_users_count_every_suspended_vm() {
     assert!(host.alive("b"));
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222"].map(String::from).into();
     assert_eq!(host.template_users(), want);
+}
+
+#[test]
+fn reserve_allocates_in_units_up_to_what_is_asked() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tmp("reserve");
+    let path = dir.join("pages");
+    let file = pages_file(&path);
+    let allocated = |f: &PagesFile| f.file.metadata().unwrap().blocks() * 512;
+    // Not a whole number of units, then more on top: what was there stays, the rest is added.
+    file.reserve(600);
+    assert!(allocated(&file) >= 600 * PAGE_SIZE as u64, "{}", allocated(&file));
+    file.reserve(100);
+    file.reserve(1000);
+    assert!(allocated(&file) >= 1000 * PAGE_SIZE as u64, "{}", allocated(&file));
+    assert_eq!(file.file.metadata().unwrap().len(), 1000 * PAGE_SIZE as u64);
 }

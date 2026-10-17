@@ -96,10 +96,14 @@ mod hw {
 
     #[target_feature(enable = "sse4.2")]
     pub(super) unsafe fn page(p: &[u8], t: &[[u32; 256]; 4]) -> (u32, bool) {
-        let word = |i: usize| u64::from_le_bytes(p[i..i + 8].try_into().unwrap());
+        let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
+        let (streams, rest) = p.split_at(3 * STREAM);
+        let (s0, s12) = streams.split_at(STREAM);
+        let (s1, s2) = s12.split_at(STREAM);
         let (mut a, mut b, mut c, mut or) = (!0u32 as u64, 0u64, 0u64, 0u64);
-        for i in (0..STREAM).step_by(8) {
-            let (x, y, z) = (word(i), word(STREAM + i), word(2 * STREAM + i));
+        // Fixed-size chunks: no bounds checks in the loop.
+        for ((x, y), z) in s0.chunks_exact(8).zip(s1.chunks_exact(8)).zip(s2.chunks_exact(8)) {
+            let (x, y, z) = (word(x), word(y), word(z));
             a = _mm_crc32_u64(a, x);
             b = _mm_crc32_u64(b, y);
             c = _mm_crc32_u64(c, z);
@@ -107,8 +111,8 @@ mod hw {
         }
         // raw(r, X) = shift(r, |X|) ^ raw(0, X): stitch the streams together.
         let mut r = (shift(t, shift(t, a as u32) ^ b as u32) ^ c as u32) as u64;
-        for i in (3 * STREAM..p.len()).step_by(8) {
-            let x = word(i);
+        for x in rest.chunks_exact(8) {
+            let x = word(x);
             r = _mm_crc32_u64(r, x);
             or |= x;
         }
