@@ -736,12 +736,18 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     and checked against the directory's path, so one renamed away before the
     lock was ours fails the open. Its registry entry comes later.
   - A standby VM: its process, as a running VM. The standby count names only
-    the template name; under the exclusive templates lock, `rmi` waits for
-    any refill in progress, saves the count, sets it to 0, and stops the live
-    standby VMs. It waits on their pidfds for process exit (their pool lock
-    files disappear before they release the generation's use lock). It deletes
-    the count only after the name's link is gone, or restores it if the name
-    survives, including on timeout or a failed removal.
+    the template name. `rmi` takes the pool's refill lock (waiting for any
+    refill in progress) and holds it to the end, so no standby starts; then,
+    briefly under the exclusive templates lock, saves the count, captures the
+    live standby VMs' pidfds and sets the count to 0. With the templates lock
+    released (pulls go on), it stops them and waits on their pidfds for process
+    exit (their pool lock files disappear before they release the generation's
+    use lock), or until one is claimed (a registry entry: a VM now, which
+    ignores the stop and keeps its generation as any VM does). Under the
+    exclusive templates lock again, it takes a count `set` wrote meanwhile as
+    the one to keep, rechecks that no standby VM is live, and removes. It
+    deletes the count only after the name's link is gone, or restores it if the
+    name survives, including on timeout or a failed removal.
   - An incoming migration: the target's process, from opening the source's
     content id (`open_id`) until it is a running VM.
   - A checkpoint restore: the restoring process, from `open_id`. A checkpoint
@@ -773,10 +779,11 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   1. The templates lock (`templates-DEV-INO`): exclusive for `rmi` and
      sweeps, shared while a build makes its staging directory and publishes,
      and while `standby::set` checks the name and writes its count. `set` drops
-     it before refilling; `rmi` takes the pool's refill lock under it, so no
-     refill can start a standby between its snapshot and removal. A refill
-     never takes the templates lock, so waiting for it does not reverse this
-     order.
+     it before refilling. `rmi` takes the pool's refill lock before it and
+     holds that throughout, so no refill starts a standby between its snapshot
+     and removal; a refill never takes the templates lock, and nothing takes a
+     refill lock under it, so `rmi` never waits for a refill (or for standby
+     VMs to exit) holding it.
   2. A generation's use lock: shared by its users (waiting), exclusive for
      `rmi` (never waiting: held, the generation stays).
   3. An image key's lock: exclusive for a pull (waiting, until interrupted),
