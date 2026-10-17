@@ -741,7 +741,7 @@ fn instances_with_different_run_directories_share_a_destinations_lock() {
 
 /// #631: what `rmi` reads under a generation's exclusive use lock. A suspended VM has no process,
 /// so its record is all that keeps its generation; one being resumed (its name held by a live
-/// process that may not have opened its template yet) counts too, while `ls` lists it as the process.
+/// process that may not have opened its template yet) counts too, while `ps` lists it as the process.
 #[test]
 fn template_users_count_every_suspended_vm() {
     let root = tmp("template-users");

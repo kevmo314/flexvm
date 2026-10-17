@@ -671,7 +671,7 @@ impl Proc {
             .as_ref()
     }
 
-    /// Best effort: the registry is for `ls`; nothing decides ownership by it.
+    /// Best effort: the registry is for `ps`; nothing decides ownership by it.
     pub fn publish(&self) {
         // Read and written in turn: a publish racing a state change never overwrites the newer entry.
         let _publishing = self.publishing.lock().unwrap();
@@ -688,7 +688,7 @@ impl Proc {
             template_id: vm.template.meta.id.clone(),
             vcpus: vm.template.meta.vcpus,
             max_mib: vm.max_mib(),
-            cpus: vm.cpus(),
+            cpus: vm.resources().cpus,
             state: match vm.state() {
                 State::Source(mig) if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) => "reconciling",
                 // SIGCONT does nothing then: `flexvm unpause` waits for the suspend instead.

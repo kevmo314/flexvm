@@ -781,7 +781,7 @@ impl Proc {
             hold.end().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
             // Up to the vCPUs running: the balloon re-arm after it is the guest's time (#190).
             pause = Some(hold.resumed.unwrap_or_else(Instant::now).duration_since(paused));
-            // Out of the pause: `ls` shows it running while the copy goes on (#152).
+            // Out of the pause: `ps` shows it running while the copy goes on (#152).
             self.publish();
             t.mark("resume");
             growth = Some(CopyGrowth::start(vm));
@@ -1026,7 +1026,7 @@ pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
 
 /// Marked DISCARDED durably before the address is freed and withdrawn.
 /// The outer error: not revoked (still resumable). The inner one: revoked,
-/// but freeing its address failed (a later `kill` or the address's next
+/// but freeing its address failed (a later `rm` or the address's next
 /// claim finishes that).
 pub fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
     let dir = host.suspended(name)?;

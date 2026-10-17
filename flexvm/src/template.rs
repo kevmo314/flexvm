@@ -315,9 +315,6 @@ const MAX_LOAD_SET: usize = 512;
 /// Template builds' guest commands, on a possibly loaded host.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// What `bench` (without `--template`) uses.
-pub const DEFAULT_IMAGE: &str = "ubuntu:24.04";
-
 /// Room for the build's lock and staging names around it in one file name (255 bytes).
 pub const MAX_NAME: usize = 200;
 
@@ -752,7 +749,7 @@ impl Staging {
         crate::util::create_dir_durably(&paths.templates, 0o777)?;
         let parent = crate::host::Directory::open(&paths.templates)?;
         let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
-        sweep(paths, &paths.images)?;
+        sweep(paths)?;
         let _l = templates_lock(paths, libc::LOCK_SH)?;
         let file = format!(".{name}.new-{}", crate::util::random_hex(8)?);
         let lock_name = template_lock_name(paths, "template-new", &format!("-{file}"))?;
@@ -777,12 +774,12 @@ impl Drop for Staging {
 
 /// Removes staging directories whose builds are gone (their lock free, or no lock) and
 /// leftover publish links: builds killed before they could clean up.
-fn sweep(paths: &Paths, images: &Path) -> Result<()> {
+fn sweep(paths: &Paths) -> Result<()> {
     let _l = templates_lock(paths, libc::LOCK_EX)?;
-    sweep_locked(paths, images)
+    sweep_locked(paths)
 }
 
-fn sweep_locked(paths: &Paths, images: &Path) -> Result<()> {
+fn sweep_locked(paths: &Paths) -> Result<()> {
     let locks = crate::host::host_locks()?;
     let prefix = template_lock_name(paths, "template-new", "-")?;
     let live = |name: &str| {
@@ -812,7 +809,7 @@ fn sweep_locked(paths: &Paths, images: &Path) -> Result<()> {
         let tombstone = name.strip_prefix('.').and_then(|n| n.split_once(".rm-")).is_some_and(|(id, nonce)| valid_id(id) && crate::util::is_nonce(nonce));
         // Like a build's leftovers: one it cannot finish must not stop every build after it.
         if entry.file_type()?.is_dir() && tombstone {
-            if let Err(e) = finish_remove(paths, &entry.path(), images) {
+            if let Err(e) = finish_remove(paths, &entry.path()) {
                 crate::log!("template: removing {}, left by an rmi that did not finish: {e}", entry.path().display());
             }
         }
@@ -1128,17 +1125,17 @@ pub fn generation_by_prefix(paths: &Paths, id: &str) -> Result<String> {
 /// VMs here use from their records (`Host::template_users`); it is read under the generation's
 /// exclusive use lock, after every process that had the generation open let it go: a VM that
 /// suspended (or started resuming) since an earlier read is seen then.
-pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Value> {
+pub fn remove(paths: &Paths, name: Option<&str>, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Value> {
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
     // No build publishes meanwhile (they take it shared).
     let _l = templates_lock(paths, libc::LOCK_EX)?;
-    remove_locked(paths, images, name, id, in_use)
+    remove_locked(paths, name, id, in_use)
 }
 
 /// `remove`, with the templates directory pinned and its lock held exclusively by the caller.
-pub(crate) fn remove_locked(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Value> {
-    sweep_locked(paths, images)?;
+pub(crate) fn remove_locked(paths: &Paths, name: Option<&str>, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Value> {
+    sweep_locked(paths)?;
     // Test gate: what the caller saw of the VMs here may be out of date by the time this goes on.
     crate::host::hold("rmi_hold");
     if let Some(name) = name {
@@ -1150,35 +1147,29 @@ pub(crate) fn remove_locked(paths: &Paths, images: &Path, name: Option<&str>, id
         std::fs::remove_file(&link)?;
         crate::util::sync_dir(&paths.templates)?;
     }
+    let kept = |reason: String, refusal: String| -> Result<Value> {
+        if name.is_none() {
+            bail!("{refusal}");
+        }
+        Ok(json!({"untagged": name, "kept": id, "reason": reason}))
+    };
     let names = names(&paths.templates)?;
     if let Some((other, _)) = names.iter().find(|(_, i)| i == id) {
-        if name.is_none() {
-            bail!("image {id} is {}; remove that: flexvm rmi {0}", image_of(other));
-        }
-        return Ok(json!({"untagged": name, "kept": id, "reason": format!("{} is the same image", image_of(other))}));
+        return kept(format!("{} is the same image", image_of(other)), format!("image {id} is {0}; remove that: flexvm rmi {0}", image_of(other)));
     }
     let gens = paths.templates.join(GENERATIONS);
     // Kept while a VM process has it open (one starting has no registry entry yet).
     let st = crate::util::fstat(File::open(gens.join(id))?.as_raw_fd())?;
-    let _use = match crate::host::lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st), libc::LOCK_EX | libc::LOCK_NB) {
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            if name.is_none() {
-                bail!("image {id} is open in a VM process here");
-            }
-            return Ok(json!({"untagged": name, "kept": id, "reason": "open in a VM process here"}));
-        }
-        r => r?,
+    let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else {
+        return kept("open in a VM process here".into(), format!("image {id} is open in a VM process here"));
     };
     if in_use().contains(id) {
-        if name.is_none() {
-            bail!("image {id} is used by a VM here");
-        }
-        return Ok(json!({"untagged": name, "kept": id, "reason": "used by a VM here"}));
+        return kept("used by a VM here".into(), format!("image {id} is used by a VM here"));
     }
     let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
     std::fs::rename(gens.join(id), &tombstone)?;
     crate::util::sync_dir(&gens)?;
-    let removed_rootfs = finish_remove(paths, &tombstone, images)?;
+    let removed_rootfs = finish_remove(paths, &tombstone)?;
     Ok(json!({"untagged": name, "deleted": id, "rootfs": removed_rootfs}))
 }
 
@@ -1186,7 +1177,7 @@ pub(crate) fn remove_locked(paths: &Paths, images: &Path, name: Option<&str>, id
 /// its rootfs is decided: its `meta.json` is kept (the rest removed) while a pull uses the rootfs
 /// (`Removal::InUse`), and the next sweep asks again, so a pull that fails leaves no rootfs nothing
 /// will remove. Interrupted, a sweep retries it the same way.
-fn finish_remove(paths: &Paths, tombstone: &Path, images: &Path) -> Result<Option<PathBuf>> {
+fn finish_remove(paths: &Paths, tombstone: &Path) -> Result<Option<PathBuf>> {
     let gens = paths.templates.join(GENERATIONS);
     let mut removed = None;
     if let Ok(meta) = Meta::read(tombstone) {
@@ -1195,7 +1186,7 @@ fn finish_remove(paths: &Paths, tombstone: &Path, images: &Path) -> Result<Optio
         for g in generations(&paths.templates)? {
             used |= Meta::read(&gens.join(g)).map_or(true, |m| m.rootfs == rootfs);
         }
-        match if used { crate::image::Removal::Absent } else { crate::image::remove_rootfs(images, &rootfs)? } {
+        match if used { crate::image::Removal::Absent } else { crate::image::remove_rootfs(&paths.images, &rootfs)? } {
             crate::image::Removal::Removed => removed = Some(rootfs),
             crate::image::Removal::Absent => {}
             crate::image::Removal::InUse => {
@@ -1471,7 +1462,7 @@ mod tests {
         assert!(name_of("[::1]:5000/x").is_err());
         assert_eq!(image_of("nginx"), "nginx:latest");
         assert_eq!(image_of("ghcr.io+o+a:v1"), "ghcr.io/o/a:v1");
-        assert_eq!(name_of(DEFAULT_IMAGE).unwrap(), DEFAULT_IMAGE);
+        assert_eq!(name_of("ubuntu:24.04").unwrap(), "ubuntu:24.04");
     }
 
     /// Publishes a generation `id` of `name` with the fixture's files and `meta`.
@@ -1520,7 +1511,6 @@ mod tests {
     #[test]
     fn rmi_removes_names_and_unused_generations_only() {
         let f = Fixture::new();
-        let images_dir = f.dir.join("images");
         let gen = |id: &str| Meta { id: id.into(), image: Some(image("sha256:a", "")), ..f.meta.clone() };
         // t was pulled twice (aaaa1111 is an earlier pull's), u once.
         publish_as(&f, "t", &gen("aaaa1111"));
@@ -1535,21 +1525,21 @@ mod tests {
         assert_eq!(generation_by_prefix(&f.paths, "aaaa").unwrap(), "aaaa1111");
         assert!(generation_by_prefix(&f.paths, "aaa").is_err());
         assert!(generation_by_prefix(&f.paths, "dddd").is_err());
-        assert!(remove(&f.paths, &images_dir, None, "cccc3333", &|| none.clone()).unwrap_err().to_string().contains("flexvm rmi u:latest"));
+        assert!(remove(&f.paths, None, "cccc3333", &|| none.clone()).unwrap_err().to_string().contains("flexvm rmi u:latest"));
         let vm = BTreeSet::from(["aaaa1111".to_string()]);
-        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &|| vm.clone()).is_err());
+        assert!(remove(&f.paths, None, "aaaa1111", &|| vm.clone()).is_err());
         // A name goes; its generation too, unless a VM here uses it.
-        let r = remove(&f.paths, &images_dir, Some("t"), "bbbb2222", &|| none.clone()).unwrap();
+        let r = remove(&f.paths, Some("t"), "bbbb2222", &|| none.clone()).unwrap();
         assert_eq!(r["deleted"], "bbbb2222");
         assert!(Template::resolve(&f.paths, "t").is_err() && Template::generation(&f.paths, "bbbb2222").is_none());
         assert!(Template::generation(&f.paths, "aaaa1111").is_some(), "an earlier pull's stays for its VMs");
         let used = BTreeSet::from(["cccc3333".to_string()]);
-        assert_eq!(remove(&f.paths, &images_dir, Some("u"), "cccc3333", &|| used.clone()).unwrap()["kept"], "cccc3333");
+        assert_eq!(remove(&f.paths, Some("u"), "cccc3333", &|| used.clone()).unwrap()["kept"], "cccc3333");
         assert!(Template::resolve(&f.paths, "u").is_err() && Template::generation(&f.paths, "cccc3333").is_some());
-        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &|| none.clone()).unwrap()["deleted"], "aaaa1111");
+        assert_eq!(remove(&f.paths, None, "aaaa1111", &|| none.clone()).unwrap()["deleted"], "aaaa1111");
         // A name pulled again since it was looked up is left alone.
         publish_as(&f, "v", &gen("dddd4444"));
-        assert!(remove(&f.paths, &images_dir, Some("v"), "cccc3333", &|| none.clone()).unwrap_err().to_string().contains("pulled again"));
+        assert!(remove(&f.paths, Some("v"), "cccc3333", &|| none.clone()).unwrap_err().to_string().contains("pulled again"));
         assert!(Template::resolve(&f.paths, "v").is_ok());
     }
 
@@ -1569,7 +1559,7 @@ mod tests {
         std::fs::remove_file(f.paths.templates.join("t")).unwrap();
         std::fs::rename(gens.join(&meta.id), &tombstone).unwrap();
         // Interrupted immediately after rename: sweep still has metadata for the rootfs.
-        sweep(&f.paths, &f.paths.images).unwrap();
+        sweep(&f.paths).unwrap();
         assert!(!tombstone.exists());
         for ext in ["ext4", "ok", "conf"] {
             assert!(!rootfs.with_extension(ext).exists());
@@ -1579,7 +1569,7 @@ mod tests {
         std::fs::write(tombstone.join("mem"), b"remaining").unwrap();
         std::fs::write(&rootfs, b"image").unwrap();
         publish_as(&f, "u", &Meta { id: "bbbb2222".into(), ..meta.clone() });
-        assert_eq!(remove(&f.paths, &cache, Some("u"), "bbbb2222", &BTreeSet::new).unwrap()["rootfs"], json!(rootfs));
+        assert_eq!(remove(&f.paths, Some("u"), "bbbb2222", &BTreeSet::new).unwrap()["rootfs"], json!(rootfs));
         assert!(!rootfs.exists());
         assert!(!tombstone.exists(), "rmi finishes earlier tombstones too");
     }
@@ -1595,7 +1585,7 @@ mod tests {
         std::fs::create_dir(&tombstone).unwrap();
         f.write_meta(&Meta { rootfs: rootfs.clone(), ..f.meta.clone() }, &tombstone);
         let used = BTreeSet::from(["aaaa1111".into()]);
-        assert_eq!(remove(&f.paths, &f.paths.images, Some("t"), "aaaa1111", &|| used.clone()).unwrap()["kept"], "aaaa1111");
+        assert_eq!(remove(&f.paths, Some("t"), "aaaa1111", &|| used.clone()).unwrap()["kept"], "aaaa1111");
         assert!(!tombstone.exists());
         assert!(!rootfs.exists());
     }
@@ -1609,7 +1599,7 @@ mod tests {
         let tombstone = f.paths.templates.join(GENERATIONS).join(".aaaa1111.rm-0000000000000001");
         std::fs::create_dir_all(&tombstone).unwrap();
         f.write_meta(&Meta { rootfs: rootfs.clone(), ..f.meta.clone() }, &tombstone);
-        sweep(&f.paths, &f.paths.images).unwrap();
+        sweep(&f.paths).unwrap();
         assert!(!tombstone.exists());
         assert!(rootfs.exists());
     }
@@ -1625,7 +1615,7 @@ mod tests {
         std::fs::write(stuck.join("file"), b"x").unwrap();
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
         let removable = std::fs::remove_file(stuck.join("file")).is_ok(); // as root
-        let res = sweep(&f.paths, &f.paths.images);
+        let res = sweep(&f.paths);
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
         res.unwrap();
         assert!(removable || stuck.exists());
@@ -1644,29 +1634,28 @@ mod tests {
         let tombstone = f.paths.templates.join(GENERATIONS).join(".bbbb2222.rm-0000000000000001");
         std::fs::create_dir(&tombstone).unwrap();
         f.write_meta(&meta, &tombstone);
-        sweep(&f.paths, &f.paths.images).unwrap();
+        sweep(&f.paths).unwrap();
         assert!(!tombstone.exists());
         assert!(rootfs.exists());
         assert!(Template::resolve(&f.paths, "t").is_ok());
-        assert_eq!(remove(&f.paths, &cache, Some("t"), "aaaa1111", &BTreeSet::new).unwrap()["rootfs"], json!(rootfs));
+        assert_eq!(remove(&f.paths, Some("t"), "aaaa1111", &BTreeSet::new).unwrap()["rootfs"], json!(rootfs));
         assert!(!rootfs.exists());
     }
 
     #[test]
     fn rmi_keeps_a_generation_a_vm_process_has_open() {
         let f = Fixture::new();
-        let images_dir = f.dir.join("images");
         publish_as(&f, "t", &Meta { id: "aaaa1111".into(), image: Some(image("sha256:a", "")), ..f.meta.clone() });
         // A cold run between opening its template and registering its VM: no VM entry names it.
         let starting = Template::open(&f.paths, "t").unwrap();
         let none = BTreeSet::new();
-        let r = remove(&f.paths, &images_dir, Some("t"), "aaaa1111", &|| none.clone()).unwrap();
+        let r = remove(&f.paths, Some("t"), "aaaa1111", &|| none.clone()).unwrap();
         assert_eq!((r["kept"].as_str(), r["reason"].as_str()), (Some("aaaa1111"), Some("open in a VM process here")));
-        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &|| none.clone()).unwrap_err().to_string().contains("open in a VM process"));
+        assert!(remove(&f.paths, None, "aaaa1111", &|| none.clone()).unwrap_err().to_string().contains("open in a VM process"));
         assert!(Template::generation(&f.paths, "aaaa1111").is_some());
         assert_eq!(starting.pages(0, 0).len(), 0);
         drop(starting);
-        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &|| none.clone()).unwrap()["deleted"], "aaaa1111");
+        assert_eq!(remove(&f.paths, None, "aaaa1111", &|| none.clone()).unwrap()["deleted"], "aaaa1111");
         assert!(Template::open_dir("t", f.dir.join(GENERATIONS).join("aaaa1111")).is_err());
     }
 
@@ -1679,7 +1668,6 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{mpsc, Arc};
         let f = Fixture::new();
-        let images_dir = f.dir.join("images");
         let (mut open_seen, mut record_seen) = (0, 0);
         for round in 0..200u32 {
             let id = format!("{:08x}", 0xa000_0000u32 + round);
@@ -1712,7 +1700,7 @@ mod tests {
                 }
             };
             go.send(()).unwrap();
-            let r = remove(&f.paths, &images_dir, Some("t"), &id, &in_use).unwrap();
+            let r = remove(&f.paths, Some("t"), &id, &in_use).unwrap();
             vm.join().unwrap();
             match r["reason"].as_str() {
                 Some("open in a VM process here") => open_seen += 1,
@@ -1737,18 +1725,18 @@ mod tests {
         publish_as(&f, "t", &Meta { id: "aaaa1111".into(), rootfs: rootfs.clone(), ..f.meta.clone() });
         let st = crate::util::fstat(File::open(&rootfs).unwrap().as_raw_fd()).unwrap();
         let pulling = crate::host::shared_at(&crate::host::host_locks().unwrap(), &crate::host::use_lock(&st)).unwrap();
-        let r = remove(&f.paths, &f.paths.images, Some("t"), "aaaa1111", &BTreeSet::new).unwrap();
+        let r = remove(&f.paths, Some("t"), "aaaa1111", &BTreeSet::new).unwrap();
         assert_eq!((r["deleted"].as_str(), &r["rootfs"]), (Some("aaaa1111"), &Value::Null));
         let gens = f.paths.templates.join(GENERATIONS);
         let left: Vec<PathBuf> = std::fs::read_dir(&gens).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(left.len(), 1, "the tombstone stays");
         let files: Vec<_> = std::fs::read_dir(&left[0]).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(files, ["meta.json"]);
-        sweep(&f.paths, &f.paths.images).unwrap();
+        sweep(&f.paths).unwrap();
         assert!(left[0].exists() && rootfs.exists(), "still held");
         // The pull failed: the next sweep removes the rootfs, then the tombstone.
         drop(pulling);
-        sweep(&f.paths, &f.paths.images).unwrap();
+        sweep(&f.paths).unwrap();
         assert!(!left[0].exists() && !rootfs.exists() && !rootfs.with_extension("ok").exists());
     }
 
@@ -2054,7 +2042,7 @@ mod tests {
         // A concurrent fork can inherit the open file description until exec.
         crate::host::flock(&running, libc::LOCK_UN).unwrap();
         drop(running);
-        sweep(&f.paths, &f.paths.images).unwrap();
+        sweep(&f.paths).unwrap();
         assert!(!exists(".t.new-0000000000000002") && second.dir.exists());
         // Templates and generations are never touched.
         assert!(exists("kernel") && exists("mem"));

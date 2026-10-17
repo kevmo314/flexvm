@@ -229,7 +229,10 @@ impl Config {
     }
 
     fn warnings_by(&self, local: impl Fn(Ipv4Addr) -> Result<bool>) -> Vec<String> {
-        let mut w: Vec<String> = self.cluster_warning().into_iter().collect();
+        let mut w = Vec::new();
+        if !self.peers.is_empty() && self.cluster_ips.is_none() {
+            w.push(format!("flexvm: warning: cluster_ips is unset; peer VM addresses outside vm_ips {} are refused", self.vm_ips));
+        }
         if !self.peers.is_empty() && self.vm_ips == Config::default().vm_ips {
             w.push(format!("flexvm: warning: vm_ips is the default {}; each peer needs a range of its own", self.vm_ips));
         }
@@ -272,11 +275,6 @@ impl Config {
 
     pub fn effective_cluster_ips(&self) -> &str {
         self.cluster_ips.as_deref().unwrap_or(&self.vm_ips)
-    }
-
-    pub fn cluster_warning(&self) -> Option<String> {
-        (!self.peers.is_empty() && self.cluster_ips.is_none())
-            .then(|| format!("flexvm: warning: cluster_ips is unset; peer VM addresses outside vm_ips {} are refused", self.vm_ips))
     }
 
     /// Never a wildcard address. Unset: the listen address, else the source
@@ -405,7 +403,7 @@ impl Config {
 }
 
 /// HOST:PORT, an IPv6 address in brackets; a name is resolved only when used.
-pub fn is_endpoint(s: &str) -> bool {
+fn is_endpoint(s: &str) -> bool {
     let Some((h, port)) = s.rsplit_once(':') else { return false };
     let host = match h.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
         Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
@@ -547,13 +545,6 @@ impl Host {
     /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
     /// A `host.json` that does not validate is refused: fix the file.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
-        let host = Self::open_unvalidated(state, run)?;
-        host.cfg.validate().map_err(|e| format!("{}: {e} (see README: Configuration)", host.state.join("host.json").display()))?;
-        Ok(host)
-    }
-
-    /// `open`, taking `host.json` whatever it says (it may still fail to parse).
-    fn open_unvalidated(state: &Path, run: &Path) -> Result<Host> {
         let dirs = [("addrs", 0o755), ("standby", 0o755), ("migs", 0o755), ("owed", 0o700), ("withdrawals", 0o700), ("suspended", 0o700)];
         let named = |d: &Path, e: std::io::Error| {
             let hint = if e.kind() == std::io::ErrorKind::PermissionDenied { " (run flexvm as root to create it)" } else { "" };
@@ -612,7 +603,10 @@ impl Host {
         let cfg_stamp = stamp(&state.join("host.json"));
         let mut cfg: Config = load(&state.join("host.json"))?.unwrap_or_default();
         cfg.run = Some(run.clone());
-        Ok(Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)) })
+        let host = Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)) };
+        drop(_held);
+        host.cfg.validate().map_err(|e| format!("{}: {e} (see README: Configuration)", host.state.join("host.json").display()))?;
+        Ok(host)
     }
 
     pub fn configure(&mut self, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
@@ -3011,7 +3005,7 @@ fn collect_owned(run: &Path) {
         }
     }
     // Names whose holder was killed: taken (so no one else holds them) and let go,
-    // as `NameLock` would have. `failed` and `moved` records stay for `ls`.
+    // as `NameLock` would have. `failed` and `moved` records stay for `ps -a`.
     let vms = run.join("vms");
     for e in std::fs::read_dir(locks(&vms)).into_iter().flatten().flatten() {
         let path = e.path();
@@ -3220,7 +3214,7 @@ pub fn host_dir(path: &Path, mode: u32) -> std::io::Result<()> {
     trusted_dir(path)
 }
 
-/// Direct host records (including markers), readable as before by non-root `ls`, never truncating a symlink's target.
+/// Direct host records (including markers), readable as before by non-root `ps -a`, never truncating a symlink's target.
 pub fn write_record(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     File::options().write(true).create(true).truncate(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(path)?.write_all(data)
@@ -3330,6 +3324,14 @@ impl Drop for HeldLock {
 /// before we lock (`HeldLock`), so retried until the one locked is the name's.
 pub fn lock_at(dir: OwnedFd, name: &str, how: i32) -> std::io::Result<HeldLock> {
     lock_at_with(dir, name, |file| flock(file, how))
+}
+
+/// An exclusive `lock_at` without waiting: `None` while another holder has it.
+pub fn try_lock_at(dir: OwnedFd, name: &str) -> std::io::Result<Option<HeldLock>> {
+    match lock_at(dir, name, libc::LOCK_EX | libc::LOCK_NB) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        r => r.map(Some),
+    }
 }
 
 /// Like `lock_at`, with an interruptible or bounded acquisition.
@@ -3665,15 +3667,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peer_endpoints_are_validated() {
+        for good in ["10.0.0.2:7070", "host-b:7070", "[2001:db8::2]:7070"] {
+            assert!(is_endpoint(good), "{good}");
+        }
+        for bad in ["10.0.0.2", "notahost", "10.0.0.2:0", "2001:db8::2", "[foo]:1", ":7070", "a:b"] {
+            assert!(!is_endpoint(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn cluster_defaults_are_visible_and_warn_with_peers() {
         let mut cfg = Config::default();
         assert_eq!(cfg.effective_cluster_ips(), cfg.vm_ips);
-        assert!(cfg.cluster_warning().is_none());
+        assert!(!cfg.warnings().iter().any(|w| w.contains("cluster_ips is unset")));
         cfg.peers.push("192.0.2.7:7070".into());
-        assert!(cfg.cluster_warning().unwrap().contains(&cfg.vm_ips));
+        assert!(cfg.warnings().iter().any(|w| w.contains("cluster_ips is unset") && w.contains(&cfg.vm_ips)));
         cfg.cluster_ips = Some("10.200.0.0/15".into());
         assert_eq!(cfg.effective_cluster_ips(), "10.200.0.0/15");
-        assert!(cfg.cluster_warning().is_none());
+        assert!(!cfg.warnings().iter().any(|w| w.contains("cluster_ips is unset")));
     }
 
     #[test]

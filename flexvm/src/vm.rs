@@ -191,10 +191,6 @@ impl Vm {
         *self.resources.lock().unwrap()
     }
 
-    pub fn cpus(&self) -> Option<f64> {
-        self.resources().cpus
-    }
-
     /// Its memory ceiling: boot memory and `hotplug_total`.
     pub fn max_mib(&self) -> u64 {
         self.template.meta.mem_mib + self.hotplug_total()

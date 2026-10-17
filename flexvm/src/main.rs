@@ -885,10 +885,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
             format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()).into()
         );
     }
-    match std::fs::read_to_string(host.vms(name, "moved")?) {
-        Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
-        Err(_) => Err(format!("no vm named {name:?}").into()),
-    }
+    remove_stopped(host, name, false)
 }
 
 /// `rm` without -f: under the name, so a `start` meanwhile either wins first (and this is
@@ -1119,19 +1116,19 @@ fn images(host: &Host, paths: &Paths, as_json: bool) -> Result<()> {
 /// `rmi IMAGE|ID`: refused while a VM here (running, paused or suspended) uses it. Its standby
 /// VMs go first (its count set to 0).
 fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
-    let vms = vms(host);
     let in_use = || host.template_users();
     let linked = template::name_of(what).ok().filter(|n| std::fs::symlink_metadata(paths.templates.join(n)).is_ok());
     let Some(name) = linked else {
         let id = template::generation_by_prefix(paths, what).map_err(|e| format!("{e} (see flexvm images)"))?;
-        return print(template::remove(paths, &host.state.join("images"), None, &id, &in_use)?);
+        return print(template::remove(paths, None, &id, &in_use)?);
     };
+    let vms = vms(host);
     let users: Vec<&str> = vms.iter().filter(|v| v["template"].as_str() == Some(name.as_str())).filter_map(|v| v["name"].as_str()).collect();
     if !users.is_empty() {
         bail!("image {} is used by {}: remove them first (flexvm rm -f)", template::image_of(&name), users.join(", "));
     }
     let id = std::fs::read_link(paths.templates.join(&name))?.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    print(standby::removing(host, paths, &name, |paths| template::remove_locked(paths, &host.state.join("images"), Some(&name), &id, &in_use))?)
+    print(standby::removing(host, paths, &name, |paths| template::remove_locked(paths, Some(&name), &id, &in_use))?)
 }
 
 fn image_options(args: &Args, src: &str) -> Result<image::Options> {
@@ -1738,16 +1735,6 @@ mod exec_tests {
             &["run", "--checkpoint", "/d", "--ip", "auto", "--paused", "--name", "w"],
         ] {
             assert_eq!(err(ok), None, "{ok:?}");
-        }
-    }
-
-    #[test]
-    fn peer_endpoints_are_validated() {
-        for good in ["10.0.0.2:7070", "host-b:7070", "[2001:db8::2]:7070"] {
-            assert!(host::is_endpoint(good), "{good}");
-        }
-        for bad in ["10.0.0.2", "notahost", "10.0.0.2:0", "2001:db8::2", "[foo]:1", ":7070", "a:b"] {
-            assert!(!host::is_endpoint(bad), "{bad}");
         }
     }
 
