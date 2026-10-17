@@ -57,7 +57,7 @@ not wait on the host:
   marked starved. Before it refuses, every VM process is asked to release
   the memory it keeps for its next checkpoint: the request is a number in
   `RUN/.locks/release-BOOT`, raised under the host lock, which each VM
-  process looks for every 50 ms, answering in its own file in
+  process looks for every 100 ms, answering in its own file in
   `RUN/.locks/released-BOOT/`. The request waits up to 200 ms for each that
   runs (not for one that is stopped; the files of those proven gone are
   removed), and MemAvailable is read again whoever answered: that memory is
@@ -571,19 +571,28 @@ through, so the checkpoint is exactly the memory at the pause.
   checked against MemAvailable less the reserve and the grants guests have
   yet to touch, and mapped and populated, under the host lock, so VMs
   copying at once, and admission, see what the others took and never take
-  more than there is together (#648). Nothing is recorded for a take, so
-  nothing is left to count or reclaim when a process dies; a take whose
-  lock stays busy for 50 ms, or whose MemAvailable or grants cannot be read,
-  takes nothing (#677). Each VM process's controller samples what is left
-  about every second, which faults look at to tell whether a block of
-  copies may still be had; a take checks again. Rescue chunks cost one
-  take per 2 MiB, and are kept from one copy for the next, so most copies
-  take none. A VM process takes nothing before its controller has
-  attached its room to the host (its room is closed until then). An older
-  flexvm's VM processes (`RUN/.locks/memory-BOOT` or `memory-v2-BOOT`) are
-  not asked to release theirs until they exit: their own controllers
-  release it when the host is short.
-  Writer buffers are populated within their take (written page by page
+  more than there is together (#648). The take is debited under the lock
+  (`RUN/room-debits-BOOT`, as boot-clock time and MiB) and populated after
+  it goes. Linux folds each CPU's counter deltas into MemAvailable only
+  every `vm.stat_interval` (or past a threshold), so memory populated just
+  now may not show for a while: a debit counts in full for 2 s (it may
+  still be populating) and, up to twice the interval, together with the
+  other older ones for at most what those deltas can hide (the zones'
+  thresholds in /proc/zoneinfo, about 15 MiB on 24 CPUs). Admission counts
+  them too. Debits expire by age, so a process that dies leaves nothing to
+  reclaim (#677). A take never waits for the lock (a fault may be waiting
+  on it): busy, it takes nothing and the fault leaves its pages to the
+  writers. A take whose MemAvailable or grants cannot be read takes
+  nothing; unreadable debits count as that most the deltas can hide. Each VM process's controller samples what is left about every
+  second, which faults look at to tell whether a block of copies may still
+  be had; a take checks again. Rescue chunks are kept from one copy for
+  the next, so most copies take none. A VM process takes nothing before
+  its controller has attached its room to the host (its room is closed
+  until then). VM processes started by a flexvm before #677 keep its
+  mapped `RUN/.locks/memory-v2-BOOT` room, which neither sees these takes
+  nor answers these requests: after an upgrade, restart or migrate them;
+  until then the reserve may be overcommitted.
+  Writer buffers are populated as they are made (written page by page
   where the kernel cannot). Without room for a block of copies, faults ask the writers for
   their pages and wait for them as over budget, and the pause protects
   pages it would have copied hot; no checkpoint fails for it. Under the

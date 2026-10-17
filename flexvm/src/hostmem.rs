@@ -9,9 +9,9 @@
 //! removes the files of those proven gone. The room that memory grows within is not here: each take is checked and
 //! populated under the host lock (`Host::take_room`), so nothing taken is left for anyone to count.
 //!
-//! VM processes of a flexvm before #677 answer only requests in their mapped `memory-BOOT` or `memory-v2-BOOT` file,
-//! which nothing writes now: until they exit, their kept memory goes back only when their own controller finds the
-//! host short.
+//! VM processes started by a flexvm before #677 keep its mapped `memory-v2-BOOT` room, which neither sees these
+//! takes nor answers these requests: after an upgrade, restart or migrate them; until then the reserve may be
+//! overcommitted.
 
 use crate::host::{load, locks, store, Host, Ident, Liveness};
 use std::path::{Path, PathBuf};
@@ -24,8 +24,9 @@ pub const RELEASE_WAIT: Duration = Duration::from_millis(200);
 /// the host lock would each wait again.
 const RELEASE_GAP_MS: u64 = 1000;
 
-/// How often a VM process looks for a request: well within `RELEASE_WAIT`.
-const POLL: Duration = Duration::from_millis(50);
+/// How often a VM process looks for a request: within `RELEASE_WAIT`, with time left to release. A look costs about
+/// 6 us (and a wakeup): well under 1 ms of CPU a second per VM process.
+const POLL: Duration = Duration::from_millis(100);
 
 /// The last request: its number and when it was made (boottime ms).
 fn request(run: &Path) -> PathBuf {

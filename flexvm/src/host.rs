@@ -1514,7 +1514,7 @@ impl Host {
             Floor::EvictMark if self.evicting(l) => return Ok(Err("this host is moving vms away itself".into())),
             Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
         };
-        let (grants, pending) = self.pending(l)?;
+        let (grants, pending, _) = self.pending(l)?;
         let need = floor.saturating_add(pending).saturating_add(mib);
         let mut avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         // Memory VM processes keep for their next checkpoint is not admitted: it goes back rather than refuse (#648).
@@ -1528,9 +1528,10 @@ impl Host {
         Ok(Ok(grants))
     }
 
-    /// The window's grants, and with the holds what they count as used that MemAvailable may not show taken yet.
+    /// The window's grants, and with the holds and checkpoint memory taken lately (`recent_debits`) what they count
+    /// as used that MemAvailable may not show taken yet, with those debits (None if unreadable).
     /// Fails closed: unread holds would leave out memory still to arrive.
-    fn pending(&self, l: &Locked) -> Result<(Grants, u64)> {
+    fn pending(&self, l: &Locked) -> Result<(Grants, u64, Option<Debits>)> {
         let now = boottime_ms();
         let mut grants: Grants = load(&self.grants())?.unwrap_or_default();
         in_window(&mut grants, now);
@@ -1538,33 +1539,70 @@ impl Host {
             crate::log!("admission: {e}; granting nothing until it can be read");
             format!("{e}: memory held for migrations and restores still arriving cannot be counted")
         })?;
-        let pending = pending(&grants, &held, now);
-        Ok((grants, pending))
+        let (debits, taken) = self.recent_debits(l, now);
+        let pending = pending(&grants, &held, now).saturating_add(taken);
+        Ok((grants, pending, debits))
+    }
+
+    /// Checkpoint memory taken lately (`take_room`), as (boottime ms, MiB), under the host lock: `RUN/room-debits-BOOT`.
+    fn debits(&self) -> PathBuf {
+        self.run.join(format!("room-debits-{}", boot_id()))
+    }
+
+    /// The debits MemAvailable may not show yet, and what they count as taken (#677). Linux folds each CPU's counter
+    /// deltas in only every `vm.stat_interval` (or once one passes its threshold), so memory populated just now may
+    /// not show for a while: a debit younger than `DEBIT_FULL_MS` counts in full (its memory may still be being
+    /// populated), and older ones up to twice the interval count together for no more than those deltas can hide
+    /// (`vmstat_drift_mib`). They expire by age: a process gone leaves nothing to clean. Unreadable: None, counting
+    /// that bound.
+    fn recent_debits(&self, _l: &Locked, now: u64) -> (Option<Debits>, u64) {
+        let Ok(debits) = load::<Debits>(&self.debits()) else { return (None, vmstat_drift_mib()) };
+        let mut debits = debits.unwrap_or_default();
+        debits.retain(|&(t, _)| t <= now && now - t < debit_window_ms());
+        let sum = |young: bool| debits.iter().filter(|d| (now - d.0 < DEBIT_FULL_MS) == young).fold(0u64, |a, d| a.saturating_add(d.1));
+        let taken = sum(true).saturating_add(sum(false).min(vmstat_drift_mib()));
+        (Some(debits), taken)
     }
 
     /// Memory not admitted like a guest's (checkpoint rescue memory, hot pages', writer buffers: `cow::Room`), which
-    /// keeps out of the reserve instead: `populate` maps and populates `mib` under the host lock if MemAvailable has
-    /// that much above the reserve and what admission granted guests that have yet to touch it, so whoever looks
-    /// next (admission, or another VM process's take) sees it taken. Nothing is counted on its behalf, so nothing is
-    /// left to undo if its process dies. With what was left before it (MiB): its result, or None if there was not
-    /// enough, MemAvailable or the grants could not be read, or the lock stayed busy until `deadline` (0 left then).
-    pub fn take_room<R>(&self, mib: u64, deadline: std::time::Instant, populate: impl FnOnce() -> R) -> (u64, Option<R>) {
-        self.take_room_inner(mib, deadline, crate::vmproc::host_available_mib, populate)
+    /// keeps out of the reserve instead: `populate` maps and populates `mib` if MemAvailable has that much above the
+    /// reserve, what admission granted guests that have yet to touch it, and what was taken lately
+    /// (`recent_debits`). Checked and debited under the host lock, only if it is free at once (a fault may be waiting
+    /// on the take), and populated after it goes. With what was left before it (MiB; None if the lock was busy): its
+    /// result, or None if there was not enough, or MemAvailable or the grants could not be read (0 left then).
+    pub fn take_room<R>(&self, mib: u64, populate: impl FnOnce() -> R) -> (Option<u64>, Option<R>) {
+        self.take_room_inner(mib, crate::vmproc::host_available_mib, populate)
     }
 
-    fn take_room_inner<R>(
-        &self,
-        mib: u64,
-        deadline: std::time::Instant,
-        available: impl Fn() -> Option<u64>,
-        populate: impl FnOnce() -> R,
-    ) -> (u64, Option<R>) {
-        let Ok(l) = self.lock_by(Some(deadline)) else { return (0, None) };
-        let left = match self.pending(&l) {
-            Ok((_, pending)) => available().map_or(0, |a| a.saturating_sub(self.config_now().reserve()).saturating_sub(pending)),
-            Err(_) => 0,
+    fn take_room_inner<R>(&self, mib: u64, available: impl Fn() -> Option<u64>, populate: impl FnOnce() -> R) -> (Option<u64>, Option<R>) {
+        let Some(l) = self.try_lock() else { return (None, None) };
+        let (left, debits) = match self.pending(&l) {
+            Ok((_, pending, debits)) => (available().map_or(0, |a| a.saturating_sub(self.config_now().reserve()).saturating_sub(pending)), debits),
+            Err(_) => (0, None),
         };
-        (left, (left >= mib).then(populate))
+        if left < mib {
+            return (Some(left), None);
+        }
+        let mut debits = debits.unwrap_or_default();
+        debits.push((boottime_ms(), mib));
+        if store(&self.debits(), &debits, false).is_err() {
+            return (Some(0), None);
+        }
+        drop(l);
+        (Some(left), Some(populate()))
+    }
+
+    /// The host lock if it is free now: None if another thread or process has it.
+    fn try_lock(&self) -> Option<Locked> {
+        if DEPTH.with(|d| d.get()) > 0 {
+            DEPTH.with(|d| d.set(d.get() + 1));
+            return Some(Locked(None));
+        }
+        let threads = THREADS.take(Some(std::time::Instant::now()))?;
+        let f = private_file(&self.lock_file()).ok()?;
+        flock(&f, libc::LOCK_EX | libc::LOCK_NB).ok()?;
+        DEPTH.with(|d| d.set(1));
+        Some(Locked(Some((f, threads))))
     }
 
     /// Memory granted that MemAvailable may not show taken yet (`room`'s pending: the window's grants and the holds),
@@ -1942,6 +1980,35 @@ impl Host {
 
 /// Recent grants, as (boot-clock ms, MiB, id).
 type Grants = Vec<(u64, u64, u64)>;
+
+/// Checkpoint memory taken lately, as (boot-clock ms, MiB): `Host::recent_debits`.
+type Debits = Vec<(u64, u64)>;
+
+/// How long a debit counts in full: its memory may still be being populated.
+const DEBIT_FULL_MS: u64 = 2000;
+
+/// How long a debit counts at all: twice `vm.stat_interval`, at least `DEBIT_FULL_MS`.
+fn debit_window_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        let secs = std::fs::read_to_string("/proc/sys/vm/stat_interval").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(1);
+        secs.saturating_mul(2000).max(DEBIT_FULL_MS)
+    })
+}
+
+/// The most memory (MiB) the per-CPU counter deltas Linux has yet to fold in can hide from MemAvailable: the sum of
+/// every zone's and CPU's threshold (/proc/zoneinfo); without it, the kernel's largest threshold (125 pages) for each
+/// CPU and two zones.
+fn vmstat_drift_mib() -> u64 {
+    static MIB: OnceLock<u64> = OnceLock::new();
+    *MIB.get_or_init(|| {
+        let zoneinfo = std::fs::read_to_string("/proc/zoneinfo").unwrap_or_default();
+        let pages = zoneinfo.lines().filter_map(|l| l.trim().strip_prefix("vm stats threshold:")?.trim().parse::<u64>().ok()).sum::<u64>();
+        let cpus = std::thread::available_parallelism().map_or(64, |n| n.get() as u64);
+        let pages = if pages > 0 { pages } else { cpus * 125 * 2 };
+        (pages * crate::util::PAGE_SIZE as u64).div_ceil(1 << 20)
+    })
+}
 
 /// Keeps the grants of the last `GRANT_WINDOW`, ignoring future stamps so they cannot extend the cooldown indefinitely.
 fn in_window(grants: &mut Grants, now: u64) {
@@ -6930,32 +6997,70 @@ pub(crate) mod tests {
         assert_eq!(kept.load(SeqCst), 0);
     }
 
-    /// Checkpoint memory is taken under the host lock against what admission counts (#677): MemAvailable above the
-    /// reserve, less the grants guests have yet to touch; populated before the lock goes, so the next to look sees it
-    /// in MemAvailable and nothing stays counted for it. Unreadable MemAvailable or grants take nothing.
+    /// `take_room_inner`, again while another test has the host lock (takes never wait for it).
+    fn take_at<R>(h: &Host, mib: u64, available: impl Fn() -> Option<u64>, populate: impl FnOnce() -> R) -> (u64, Option<R>) {
+        let mut populate = Some(populate);
+        loop {
+            if let (Some(left), r) = h.take_room_inner(mib, &available, || populate.take().unwrap()()) {
+                return (left, r);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Checkpoint memory is taken against what admission counts (#677): MemAvailable above the reserve, less the
+    /// grants guests have yet to touch and what was taken lately, which MemAvailable may not show for a while
+    /// (Linux folds per-CPU counters in late): two takes with room for one never both succeed, however MemAvailable
+    /// moves. Unreadable MemAvailable or grants take nothing.
     #[test]
     fn checkpoint_memory_is_taken_against_what_admission_counts() {
-        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
         let (_h_dir, mut h) = host("take-room");
         h.cfg.reserve_mib = Some(1000);
-        pin_clock(boottime_ms());
-        let avail = AtomicU64::new(AVAIL);
-        let read = || Some(avail.load(SeqCst));
-        let by = || std::time::Instant::now() + Duration::from_secs(5);
-        // Populated (MemAvailable shows it) inside the take.
-        let take = |mib: u64| h.take_room_inner(mib, by(), read, || avail.fetch_sub(mib, SeqCst));
-        assert_eq!(take(500), (AVAIL - 1000, Some(AVAIL)));
+        let t0 = boottime_ms();
+        pin_clock(t0);
+        // MemAvailable as Linux may show it right after: unchanged.
+        let read = || Some(AVAIL);
+        assert_eq!(take_at(&h, 500, read, || 7), (AVAIL - 1000, Some(7)));
+        assert_eq!(take_at(&h, 500, read, || ()).0, AVAIL - 1500, "the first is debited though MemAvailable did not move");
         assert!(h.grant_inner(3000, Floor::Reserve, false, None, read).unwrap().is_ok());
-        // Left: AVAIL - 500 - 1000 - 3000 granted.
-        assert_eq!(take(5501).0, 5500);
-        assert_eq!(take(5501).1, None, "more than is left");
-        assert_eq!(avail.load(SeqCst), AVAIL - 500, "nothing taken");
-        assert!(take(5500).1.is_some());
-        assert!(h.grant_inner(1, Floor::Reserve, false, None, read).unwrap().is_err(), "admission sees it taken");
-        // Unreadable: nothing taken, and none left (never no bound).
-        assert_eq!(h.take_room_inner(1, by(), || None, || ()), (0, None));
+        // Left: AVAIL - 1000 reserve - 1000 taken - 3000 granted.
+        assert_eq!(take_at(&h, 5001, read, || panic!("nothing populated")), (5000, None), "more than is left");
+        assert!(take_at(&h, 5000, read, || ()).1.is_some());
+        assert_eq!(take_at(&h, 1, read, || panic!("nothing populated")), (0, None), "none left: one at a time");
+        assert!(h.grant_inner(1, Floor::Reserve, false, None, read).unwrap().is_err(), "admission counts the debits too");
+        // Older than DEBIT_FULL_MS: together at most what the per-CPU counters can hide; past the window, nothing.
+        pin_clock(t0 + DEBIT_FULL_MS);
+        let window = GRANT_WINDOW.as_millis() as u64;
+        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 3000 - vmstat_drift_mib().min(6000));
+        pin_clock(t0 + debit_window_ms().max(window) + DEBIT_FULL_MS);
+        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000, "expired by age, grants too");
+        // Unreadable: nothing taken, and none left (never no bound); unreadable debits count the drift bound.
+        assert_eq!(take_at(&h, 1, || None, || panic!("nothing populated")), (0, None));
+        std::fs::write(h.debits(), "{").unwrap();
+        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - vmstat_drift_mib());
         std::fs::write(h.grants(), "{").unwrap();
-        assert_eq!(h.take_room_inner(1, by(), || Some(AVAIL), || ()), (0, None));
+        assert_eq!(take_at(&h, 1, read, || panic!("nothing populated")), (0, None));
+    }
+
+    /// A take never waits for the host lock (a fault may be waiting on it): busy, it is refused at once.
+    #[test]
+    fn a_take_never_waits_for_the_host_lock() {
+        let (_h_dir, mut h) = host("take-busy");
+        h.cfg.reserve_mib = Some(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = h.clone();
+        let t = std::thread::spawn(move || {
+            let _l = holder.lock().unwrap();
+            held_tx.send(()).unwrap();
+            rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(h.take_room_inner(1, || Some(AVAIL), || panic!("nothing populated")), (None, None));
+        assert!(start.elapsed() < Duration::from_millis(50), "{:?}", start.elapsed());
+        tx.send(()).unwrap();
+        t.join().unwrap();
     }
 
     #[test]
