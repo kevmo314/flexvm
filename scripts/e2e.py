@@ -71,7 +71,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
           "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash ckpt_dir_moved "
           "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log warm_ready forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked restore_route_fence "
-          "resume_outcome exec_recovery_instance")
+          "resume_outcome exec_recovery_instance pause_resume collapse_abort")
 # The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
 # never gets its pages, gated deterministically).
@@ -80,10 +80,10 @@ LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_
 RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd_err fetch_tail_enomem fetch_enomem_stuck cow_wp_race"
 # GiB-scale guests (pages_dead, source_killed_basic, which runs source_killed, pull_died, kill_source,
 # kill_refused_checkpoint, quiet_source, checkpoint_crash, suspend_disk_freed), long device and
-# eviction sequences (cow_reports_held, evict_*), THP collapse (collapse_*), a stalled shrink and
-# paused migration: scheduled, one at a time (--jobs 1).
+# eviction sequences (cow_reports_held, evict_*), THP collapse cut short by a failed checkpoint
+# (collapse_ckpt_fail) and a stalled shrink: scheduled, one at a time (--jobs 1).
 HEAVY_FAULTS = ("pages_dead source_killed_basic pull_died kill_source kill_refused_checkpoint quiet_source checkpoint_crash suspend_disk_freed "
-                "cow_reports_held collapse_abort collapse_ckpt_fail shrink_stall evict_no_pingpong evict_grower pause_resume")
+                "cow_reports_held collapse_ckpt_fail shrink_stall evict_no_pingpong evict_grower")
 SHARDS = {"pr": FAULTS + " " + RECOVERY_FAULTS, "main": FAULTS, "recovery": RECOVERY_FAULTS, "heavy": HEAVY_FAULTS}
 p.add_argument("--shard", choices=SHARDS, default="main",
                help="pr, main: the cases and those scenarios; recovery, heavy: only the faults case, with those scenarios")
@@ -985,12 +985,12 @@ def worker():
 COST = {"faults/exec_background": 110, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
-        "faults/arrival_grew": 25, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
+        "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
         "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
         "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
         "faults/resume_suspending": 16, "image_template": 15, "faults/arrival_flood": 14, "faults/page_conns": 14,
-        "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13,
+        "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
         "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,
         "faults/standby_admission": 11, "faults/wildcard_listen": 11, "faults/arrival_abort_route": 10,

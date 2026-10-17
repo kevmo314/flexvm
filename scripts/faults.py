@@ -594,6 +594,19 @@ def restart_listeners(label, hosts=None):
     check(f"{label}: new listeners took over (pid, start time)", all(after[a] and after[a] != before[a] for a in after), (before, after))
 
 
+def threads_of(pid):
+    """What each thread of `pid` is doing (state, wait channel, kernel stack): why a process outlives its kill."""
+    out = []
+    for t in sorted(f"/proc/{pid}/task/{tid}" for tid in os.listdir(f"/proc/{pid}/task")) if os.path.isdir(f"/proc/{pid}/task") else []:
+        read = lambda f: (lambda: open(f"{t}/{f}").read().strip())
+        try:
+            out.append((os.path.basename(t), read("comm")(), read("stat")().rsplit(")", 1)[1].split()[0], read("wchan")(),
+                        " < ".join(l.split(" ", 1)[-1] for l in read("stack")().splitlines()[:6])))
+        except OSError as e:
+            out.append((os.path.basename(t), str(e)))
+    return out
+
+
 def fc_pid(host, name):
     return vms(host)[name]["firecracker"]
 
@@ -642,7 +655,9 @@ def resume_suspended(host, name):
 # --- migration --------------------------------------------------------------
 
 
-def basic():
+def basic(swept=False):
+    """A migration there and back. `swept`: a record left by a killed source (`source_killed_basic`) goes
+    at a sweep, not at a `done`; each try runs one on A (which settles what it owes) and then on B."""
     n = "ft-basic"
     m = setup(n)
     r = ok(migrate(A, n, B))
@@ -658,7 +673,9 @@ def basic():
     # A target forgets a migration only once its source said it is done
     # with it (it never asks again); until then it says released.
     migs = lambda h: os.listdir(os.path.join(h.state, "migs"))
-    check("basic: records go once their sources are done", wait_for(lambda: not migs(A) and not migs(B), 10), (migs(A), migs(B)))
+    swept_ok = lambda: not swept or all(cli(h, "debug", "gc")[0] == 0 for h in (A, B))
+    check("basic: records go once their sources are done", wait_for(lambda: swept_ok() and not migs(A) and not migs(B), 10),
+          (migs(A), migs(B)))
     s3 = peer(B, {"op": "migration", "mig": 12345})
     check("basic: an unknown id is fenced as aborted", s3["result"]["outcome"] == "aborted", s3)
 
@@ -3555,15 +3572,27 @@ def pause_resume():
     check("pause: a stray SIGSTOP/SIGCONT leaves a running vm running", vms(A)[n]["state"] == "running"
           and sh(A, n, "echo hi") == (0, "hi"), vms(A)[n]["state"])
     pause(A, n)
-    ok(migrate(A, n, B))
-    # Stall the pull: a resume on the target must wait for all its memory.
-    fault(A, "pages", 2000)
-    check("paused migrate: stays paused on the target", vms(B)[n]["state"] == "paused", vms(B)[n]["state"])
-    waited = resume(B, n)
-    # Its pull already ended when the resume returned (compared as events, not as two durations).
-    pulled = vms(B)[n].get("background_pull_ms")
+    # The target's pull held (`pull_gate`) until released: a resume there must wait for all its memory, in that order.
+    clear_gate(B, "pull_gate")
+    with armed_fault(B, "pull_gate", 600000):
+        try:
+            ok(migrate(A, n, B))
+            check("paused migrate: stays paused on the target", vms(B)[n]["state"] == "paused", vms(B)[n]["state"])
+            check("paused migrate: its pull is held", wait_for(lambda: reached(B, "pull_gate"), 10) and vms(B)[n].get("background_pull_ms") is None,
+                  (reached(B, "pull_gate"), vms(B)[n]))
+            done = {}
+            resuming = start_thread(target=lambda: done.update(r=cli(B, "unpause", n), pulled=vms(B)[n].get("background_pull_ms")))
+            # Not a wait for something to happen: the resume must not return, nor the VM run, while its pull is held.
+            blocked = not wait_for(lambda: done or vms(B)[n]["state"] != "paused", 3)
+            check("paused migrate: the resume waits while the pull is held", blocked, (done, vms(B)[n]["state"]))
+            release(B, "pull_gate")
+            resuming.join(60)
+        finally:
+            # Pullers parked at a gate wait out its marker, not its arming.
+            release(B, "pull_gate")
+    # The pull had ended when the resume returned: sampled straight after it, before any other command.
     st = wait_released(B, n)
-    check("paused migrate: resume waited for the whole pull", waited > 1.0 and pulled is not None, (waited, pulled, st))
+    check("paused migrate: resume waited for the whole pull", done.get("r", (1,))[0] == 0 and done.get("pulled") is not None, (done, st))
     check("paused migrate: source released, only on B", where(n) == {B: "running"} and st["released"] is True, (where(n), st))
     check("paused migrate: runs on B after resume, md5 intact", md5(B, n) == m)
 
@@ -4724,15 +4753,21 @@ def collapse_abort():
         raise Skip("transparent huge pages are disabled here")
     n = "ft-collapse-abort"
     m = setup(n, mib=600)
-    ok(migrate(A, n, B))
-    st = wait_released(B, n)
-    check("collapse abort: migrated and pulled", st["released"] and st["state"] == "running", st)
-    # Hundreds of chunks: the pass runs for seconds, so it is still going when the migration back pauses the VM.
-    mid = collapse_report(B, n)
-    with armed_fault(A, "resume_kill", 60000):
-        r = migrate(B, n, A)
+    # Slowed (300 ms after each call, about 20 calls), the pass is still going when the migration back pauses the VM:
+    # unslowed it can be over in 100 ms.
+    with armed_fault(B, "collapse_slow", 60000):
+        clear_log(B, n)
+        ok(migrate(A, n, B))
+        st = wait_released(B, n)
+        check("collapse abort: migrated and pulled", st["released"] and st["state"] == "running", st)
+        mid = collapse_report(B, n)
+        with armed_fault(A, "resume_kill", 60000):
+            r = migrate(B, n, A)
     check("collapse abort: migration committed, then the target died", r["ok"], r)
     check("collapse abort: the source runs its copy again", wait_for(lambda: where(n) == {B: "running"}, 60), where(n))
+    passes = lambda: [l for l in log(B, n).splitlines() if "huge pages in" in l]
+    check("collapse abort: the migration stopped the pass mid-way", wait_for(lambda: passes(), 10) and passes()[0].endswith("stopped: checkpoint or migration"),
+          passes())
     wait_for(lambda: collapse_report(B, n) is not None, 120)
     c = collapse_report(B, n)
     huge, _ = huge_mib(B, n)
@@ -4955,7 +4990,8 @@ def cow_crash():
     for f in partial:
         r = restore(B, f, ip="auto")
         check("cow crash: the partial directory does not restore", not r["ok"], r)
-    check("cow crash: the VM died with its process", wait_for(lambda: not alive(fc), 15) and n not in vms(A), vms(A).get(n))
+    died = wait_for(lambda: not alive(fc), 15)
+    check("cow crash: the VM died with its process", died and n not in vms(A), vms(A).get(n) if died else threads_of(fc))
     ok(run(A, n))
     start_writer(A, n, mib=16)
     ok(checkpoint(A, n, path))
@@ -8741,7 +8777,7 @@ def source_killed_basic():
     comes) forgets the record once the source's listener says no such source
     is left: `basic` after `source_killed`, on the same state, finds none."""
     source_killed()
-    basic()
+    basic(swept=True)
 
 
 # --- what a unit's cgroup and garbage collection leave alone, and what they take ---

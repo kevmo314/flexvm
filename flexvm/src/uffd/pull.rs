@@ -65,6 +65,8 @@ impl Pager {
     /// run, the pages past the latest REMOTE fault (`steered`). `fetch` holds the file (if any) too: let go as the
     /// thread ends, as soon as nothing is left to pull.
     fn pull(&self, t: usize, file: Option<Arc<PageFile>>, fetch: &mut Fetch) {
+        // Test gate `pull_gate`: the background pull starts only once the test lets it (faults fetch meanwhile).
+        crate::host::hold("pull_gate");
         // A checkpoint's pages come off local disk: the ones in the template's working set first, as the guest needs
         // them soonest.
         let first = self.chunks(self.working_set(t, PULL_THREADS).filter(|_| file.is_some()), PULL_RUN);
