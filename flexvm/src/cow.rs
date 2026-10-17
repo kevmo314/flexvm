@@ -708,6 +708,14 @@ impl Room {
         self.0.host.get().map_or(&self.0.local, |(h, _)| &h.room)
     }
 
+    /// One with no room until refreshed: a VM process's, so nothing is taken before it is attached to the host's and
+    /// refreshed (#674), not even by a checkpoint asked for as it starts.
+    pub fn closed() -> Room {
+        let r = Room::default();
+        r.0.local.store(pack(0, 0, room_of(0)), Ordering::SeqCst);
+        r
+    }
+
     /// Sets it to `mib` (u64::MAX: no bound), forgetting what was taken.
     #[cfg(test)]
     pub fn set(&self, mib: u64) {
