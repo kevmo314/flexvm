@@ -2393,6 +2393,17 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
     true
 }
 
+fn prune_peer_backoffs(backoff: &mut std::collections::HashMap<String, PeerBackoff>, now: u64) {
+    // Candidates are only this tick's subset: a live VM keeps its peer cooldown even when omitted.
+    backoff.retain(|key, b| {
+        b.recent(now)
+            && key.split_once(' ').and_then(|(id, _)| id.split_once('-')).is_some_and(|(pid, start)| match (pid.parse(), start.parse()) {
+                (Ok(pid), Ok(start)) => Ident { pid, start, boot: b.boot.clone() }.alive(),
+                _ => false,
+            })
+    });
+}
+
 /// Moves the first of `vms` that a peer takes, and waits (until `deadline`)
 /// for its copy here to go, so the next decision sees its memory freed.
 /// A VM busy with anything (a checkpoint's copy, a migration, an arrival
@@ -2402,9 +2413,8 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
     let Ok(saved) = crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&backoff_path) else { return };
     let mut backoff = saved.unwrap_or_default();
     let now = eviction_time();
-    let instances: std::collections::HashSet<_> = vms.iter().map(|vm| vm.ident.key()).collect();
     let before = backoff.len();
-    backoff.retain(|key, b| b.recent(now) && key.split_once(' ').is_some_and(|(id, _)| instances.contains(id)));
+    prune_peer_backoffs(&mut backoff, now);
     if backoff.len() != before && crate::host::store(&backoff_path, &backoff, false).is_err() {
         return;
     }
@@ -3839,6 +3849,33 @@ mod tests {
         let saved = crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&path).unwrap().unwrap();
         assert_eq!(saved.len(), 1);
         assert!(!saved[&current].ready(eviction_time()), "the current instance keeps its cooldown");
+    }
+
+    #[test]
+    fn eviction_keeps_peer_backoff_for_a_live_non_candidate() {
+        let key = format!("{} refusing-peer", Ident::me().key());
+        let now = eviction_time();
+        let mut b = PeerBackoff::default();
+        b.refuse(now);
+        let until = b.until;
+        let mut backoff = std::collections::HashMap::from([(key.clone(), b)]);
+        let previous = Ident { start: Ident::me().start + 1, ..Ident::me() };
+        for stale in [format!("{} refusing-peer", previous.key()), "old-name refusing-peer".into()] {
+            let mut b = PeerBackoff::default();
+            b.refuse(now);
+            backoff.insert(stale, b);
+        }
+        // Each live VM is omitted by rank, or by relieve's no-pressure filter.
+        for (state, cmd) in [("paused", false), ("running", true), ("running", false)] {
+            let vm = Entry { ident: Ident::me(), state: state.into(), cmd, ..Entry::default() };
+            let mut candidates = rank(vec![vm], |_| 0);
+            candidates.retain(|vm| vm.starved);
+            assert!(candidates.is_empty());
+            prune_peer_backoffs(&mut backoff, now);
+            assert_eq!(backoff.len(), 1, "stale identities are pruned");
+            assert_eq!(backoff[&key].until, until, "{state}, cmd={cmd}: cooldown retained");
+            assert!(!backoff[&key].ready(now));
+        }
     }
 
     /// #599: a peer answering every eviction with this host's busy text is a refusal

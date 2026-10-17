@@ -1,6 +1,6 @@
 use super::event::{FETCH, FIRST, QUEUED};
 use super::{os, Pager, Pages, Source, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
-use crate::checkpoint::{aligned, as_bytes};
+use crate::checkpoint::Buf;
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
 use std::net::TcpStream;
@@ -134,11 +134,11 @@ impl Pager {
     /// Fetches and installs the runs faults claimed (`lane`), so that the event thread never waits for the network or
     /// disk. The faulting thread is woken by the copy, the event thread by the pages settling.
     pub(super) fn fetch_faults(&self, lane: &Lane, fetch: &mut Fetch) {
-        let mut storage = match aligned(REMOTE_FAULT_RUN) {
+        let mut storage = match Buf::plain(REMOTE_FAULT_RUN) {
             Ok(buf) => buf,
             Err(e) => return self.fail(format!("allocating fault fetch buffer: {e}")),
         };
-        let buf = as_bytes(&mut storage);
+        let buf = storage.bytes();
         let pages = self.pages();
         // Connects ahead of the first fault (nothing to read).
         if let Err(e) = fetch(0, &mut [], &self.stop, &mut |_| true) {
@@ -311,9 +311,8 @@ impl Lane {
         q.sent = q.sent.saturating_sub(1);
     }
 
-    /// Takes `conn` for requests, and writes those not out yet. Before reading the reply to `req`, the front job's:
-    /// fails if its request was out asking for something else (the connection must go). Every write ends by `at`, the
-    /// deadline of the fetcher's attempt.
+    /// Takes `conn` for requests, and writes those not out yet. Updates the front job's request to `req` after a
+    /// partial fetch detached the connection. Every write ends by `at`, the deadline of the fetcher's attempt.
     fn flush(&self, conn: &TcpStream, req: Option<(u64, usize)>, at: Instant) -> io::Result<()> {
         let mut q = self.q.lock().unwrap();
         if q.conn.is_none() {
@@ -322,9 +321,7 @@ impl Lane {
         }
         if let Some((front, req)) = q.jobs.front_mut().zip(req).filter(|(f, req)| f.req != *req) {
             front.req = req;
-            if q.sent > 0 {
-                return Err(io::Error::other("refetching part of a run"));
-            }
+            debug_assert_eq!(q.sent, 0, "refetching part of a run");
         }
         // Written without holding `q`, so that queueing (the event thread) never waits for a write; it writes nothing
         // meanwhile (`writing`), which keeps requests in order.
