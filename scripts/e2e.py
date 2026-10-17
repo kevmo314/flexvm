@@ -363,6 +363,11 @@ class Host:
         left = [f"firecracker pid {p}" for p in self.firecrackers()] + [f"tap {t}" for t in self.taps()]
         left += [f"cgroup {c}" for c in self.cgroups()]
         left += [f"process {p}" for p in self.processes()]
+        # The lane's next batch hands out the same addresses: a host route into them would be its surprise.
+        net = ipaddress.IPv4Network(f"{self.net}.0/24")
+        routes = subprocess.run(["ip", "-4", "route", "show"], capture_output=True, text=True).stdout.splitlines()
+        left += [f"route {r}" for r in routes if r.split() and r.split()[0].count(".") == 3 and "/" not in r.split()[0]
+                 and ipaddress.IPv4Address(r.split()[0]) in net]
         locks = os.path.join(self.run_dir, "vms", ".locks")
         left += [f"vm {v}" for v in os.listdir(locks) if v.endswith(".lock")] if os.path.isdir(locks) else []
         return left
@@ -1049,7 +1054,7 @@ def main():
     needed = set().union(*(w[1] for w in work))
     scheduled = list(work)
     lock, out_lock = threading.Condition(), threading.Lock()
-    built, broken, procs, summary = set(), set(), [], []
+    built, broken, procs, summary, swept = set(), set(), [], [], []
     started = time.time()
 
     def say(line):
@@ -1147,6 +1152,9 @@ def main():
             if m:
                 st = {"ok": "PASS", "FAILED": "FAIL", "SKIPPED": "SKIP"}[m.group(2)]
                 got.append((f"faults/{m.group(1)}", st, float(m.group(3)), label))
+                if "(left something for a sweep)" in line:
+                    with lock:
+                        swept.append(f"faults/{m.group(1)} (batch {label})")
         code = p.wait()
         try:
             # The faults case fails for a skip under --no-skips, which its scenario's own line says already.
@@ -1225,6 +1233,9 @@ def main():
     skipped = [r for r in summary if r[1] == "SKIP"]
     failed = [r for r in summary if r[1] == "FAIL" or (r[1] == "SKIP" and args.no_skips)]
     print("\n" + "\n".join(f"{s} {c} ({d:.1f} s, batch {b})" for c, s, d, b in summary))
+    if swept:
+        # Passed, but left a dead VM process's tap, route or name that only a sweep took away (faults.py's barrier).
+        print(f"left something for a sweep ({len(swept)}): {', '.join(sorted(swept))}")
     print(f"{len([r for r in summary if r[1] == 'PASS'])} passed, {len(skipped)} skipped{' (failures: --no-skips)' if skipped and args.no_skips else ''}, {len([r for r in summary if r[1] == 'FAIL'])} failed "
           f"in {time.time() - started:.0f} s ({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
     if args.selftest:

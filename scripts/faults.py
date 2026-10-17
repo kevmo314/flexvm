@@ -24,7 +24,7 @@ a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
 """
 from contextlib import ExitStack, contextmanager, suppress
 
-import argparse, base64, fcntl, ipaddress, json, shlex, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, base64, fcntl, glob, ipaddress, json, shlex, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -2076,7 +2076,8 @@ def same_host_bulk_tcp():
     # A sink: the guest takes all it is sent and answers nothing.
     code, out = sh(A, n, "setsid socat -u TCP-LISTEN:7001,reuseaddr OPEN:/dev/null >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
-    time.sleep(0.3)
+    listening = lambda: ":7001 " in sh(A, n, "ss -Hltn")[1]
+    assert wait_for(listening, 10), sh(A, n, "ss -Hltn")
     conn = socket.create_connection((ip, 7001), timeout=10)
     stop, sent = threading.Event(), [0]
 
@@ -2090,15 +2091,15 @@ def same_host_bulk_tcp():
                 return
 
     t = start_thread(target=pump, daemon=True)
-    time.sleep(0.5)
+    # A download under way (more than the socket buffers hold) before each move, and going on after it.
+    flowing = lambda since: wait_for(lambda: sent[0] - since > 4 << 20 or len(sent) > 1, 10) and sent[0] - since
+    assert flowing(0), ("no download under way before the first move", sent)
     held, moved = [], []
     for src, dst in ((A, B), (B, A)):
         r = migrate(src, n, dst)
         held.append((r.get("result") or {}).get("held") or r.get("error"))
         wait_released(dst, n, src)
-        before = sent[0]
-        time.sleep(1)
-        moved.append(sent[0] - before)
+        moved.append(flowing(sent[0]))
     stop.set()
     t.join(15)
     conn.close()
@@ -2502,7 +2503,9 @@ def delayed_announce_handoff():
         # The held announcement's, and the migration's (its handoff still open).
         held = conns(B)
         fault(B, "route_stall", 0)
-        check("delayed handoff: B handled A's announcement", wait_for(lambda: conns(B) == held - 1, 10), (held, conns(B)))
+        # Fewer, not exactly one fewer: a request of the migration's own that queued behind the held one
+        # (B serialises them) may be answered with it.
+        check("delayed handoff: B handled A's announcement", wait_for(lambda: conns(B) < held, 10), (held, conns(B)))
         a = addr(B, ip)
         check("delayed handoff: A's late one is stale", a.get("seen") == gen and a.get("rev") == 0 and a.get("via") is None, a)
     wait_released(B, n)
@@ -3959,7 +3962,7 @@ def resume_readdress_fail():
             before = sigcont_failed()
             code, out, err = cli(B, "unpause", n)
             check(f"readdress fails ({what}): another resume tries again, and says it failed",
-                  code != 0 and "setting its address" in err and sigcont_failed() > before, (code, err, log(B, n)[-2000:]))
+                  code != 0 and "setting its address" in err and wait_for(lambda: sigcont_failed() > before, 10), (code, err, log(B, n)[-2000:]))
             check(f"readdress fails ({what}): the background retries too", wait_for(lambda: "trying again" in log(B, n), 30), log(B, n)[-2000:])
         check(f"readdress fails ({what}): set once it can be, unasked", wait_for(lambda: has(r["ip"]), 30), sh(B, n, "ip -4 -o addr show eth0"))
         check(f"readdress fails ({what}): logged as taken", "took its address" in log(B, n), log(B, n)[-2000:])
@@ -4417,6 +4420,15 @@ def suspend_disk_freed():
     check("disk freed: still running, md5 intact", vms(A)[n]["state"] == "running" and md5(A, n) == m)
 
 
+def rewrite(path, change):
+    """Replaces file `path` by `change(its contents)` atomically: a reader never sees it empty or half written."""
+    new = change(open(path).read())
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(new)
+    os.replace(tmp, path)
+
+
 def resume_mark_fails():
     """A resume whose STARTED marker cannot be made durable takes it back
     durably and leaves the VM suspended; if taking it back fails too, the VM
@@ -4447,8 +4459,7 @@ def resume_mark_fails():
     check("unmark fails: no resume while quarantined", not r["ok"] and "quarantined" in r["error"], r)
     check("unmark fails: checkpoint kept", exists("manifest.json"))
     # A reboot (another boot id): the disk has no marker, so it is suspended again, and ls agrees.
-    q = open(os.path.join(d, "QUARANTINE")).read()
-    open(os.path.join(d, "QUARANTINE"), "w").write("another-boot " + q.split(" ", 1)[1])
+    rewrite(os.path.join(d, "QUARANTINE"), lambda q: "another-boot " + q.split(" ", 1)[1])
     v = vms(A).get(n, {})
     check("unmark fails: after a reboot, listed suspended", v.get("state") == "suspended" and exists("QUARANTINE"), v)
     ok(resume_suspended(A, n))
@@ -4466,9 +4477,9 @@ def resume_mark_fails():
     open(os.path.join(d, "STARTED"), "w").close()
     check("marker kept: no longer listed (consumed)", n not in vms(A), vms(A).get(n))
     # A reboot that showed STARTED on disk: that resume never ran its VM, so its earlier boot's
-    # quarantine no longer keeps a sweep from withdrawing the generation (#556).
-    q = open(os.path.join(d, "QUARANTINE")).read()
-    open(os.path.join(d, "QUARANTINE"), "w").write("another-boot " + q.split(" ", 1)[1])
+    # quarantine no longer keeps a sweep from withdrawing the generation (#556). `debug gc` waits
+    # for a sweep under way (another process's periodic one), then runs its own.
+    rewrite(os.path.join(d, "QUARANTINE"), lambda q: "another-boot " + q.split(" ", 1)[1])
     ok(cli_json(A, "debug", "gc"))
     check("marker kept, after a reboot: its generation withdrawn", addr(A, ip).get("withdrawn") is True and addr(A, ip).get("holder") is None, addr(A, ip))
     r = resume_suspended(A, n)
@@ -7116,7 +7127,9 @@ def spoof_filter():
     new = r["ip"]
     code, out, err = cli(A, "unpause", n2)
     check("spoof: restored at a new address and resumed", code == 0 and new != mine, (r, err))
-    check("spoof: readdressed", wait_for(lambda: f"inet {new}/" in sh(A, n2, "ip -4 -o addr show eth0")[1], 30), sh(A, n2, "ip -4 -o addr show eth0"))
+    # Done once the old address is gone too (the agent adds the new one, then deletes the old), not when the new one shows.
+    eth0 = lambda: sh(A, n2, "ip -4 -o addr show eth0")[1]
+    check("spoof: readdressed", wait_for(lambda: (lambda out: f"inet {new}/" in out and f"inet {mine}/" not in out)(eth0()), 30), eth0())
     got = send(A, n2, [new, mine, theirs])
     check("spoof: after a readdress the new address gets through", got.get(new) == {new}, got)
     check("spoof: after a readdress the old address is dropped", mine not in got and theirs not in got, got)
@@ -7844,7 +7857,9 @@ def standby_starting(host):
             stat = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
         except OSError:
             continue
-        if host.state.encode() in argv and b"--standby" in argv and stat[0] != "Z":
+        # A standby's argv: ... run --standby TEMPLATE (a `pull T --standby N` CLI has the flag too).
+        standby = any(a == b"run" and b == b"--standby" for a, b in zip(argv, argv[1:]))
+        if host.state.encode() in argv and standby and stat[0] != "Z":
             out.append((int(pid), int(stat[19])))
     return out
 
@@ -9639,6 +9654,214 @@ def reboot():
         subprocess.run(["rm", "-rf", other])
 
 
+# --- isolation between scenarios ------------------------------------------------------------------
+# Scenarios share A and B. Whatever one leaves (a VM or standby process still exiting, a VM it did not
+# register, a standby count, host.json keys, a route, a tap, a request its listener has yet to answer,
+# an armed fault or gate) would otherwise be the next one's surprise (#650, #665). After each scenario's
+# own cleanup, `isolate` undoes what can be undone and waits, on the conditions themselves, until
+# nothing of it is left; past ISOLATE_S it fails the scenario with a dump of what was, and clears that
+# by force so the next one still starts clean.
+ISOLATE_S = 30
+SWEPT = {}  # scenario -> what it left that only a sweep removed
+BASELINE = {}  # host -> its host.json before the first scenario
+PREFIXES = {}  # host -> its taps' prefix (derived from its state directory, so fixed)
+
+
+def write_host_config(host, conf):
+    """Replaces `host`'s host.json with `conf`, atomically (as `configure` does)."""
+    fd, tmp = tempfile.mkstemp(dir=host.state, prefix=".host.json.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(conf, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, os.path.join(host.state, "host.json"))
+
+
+def isolation_baseline():
+    for h in (A, B):
+        BASELINE[h] = host_config(h)
+        PREFIXES[h] = ok(cli_json(h, "info"))["derived"]["prefix"]
+
+
+def listed(host):
+    """`ps -a`'s names and states (no `debug status` per VM, as `vms` asks)."""
+    code, out, err = cli(host, "ps", "-a", "--json")
+    assert code == 0, err
+    return {v["name"]: v.get("state") for v in json.loads(out)}
+
+
+def own_pids():
+    """This script, its ancestors and the hosts' listeners: never counted as left behind."""
+    pids, p = set(), os.getpid()
+    while p > 1:
+        pids.add(p)
+        try:
+            p = int(open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    pids |= {l.pid for l in listeners.values() if l.poll() is None}
+    pids |= {i[0] for h in (A, B) for i in [listener_id(h)] if i}
+    return pids
+
+
+def host_processes(skip):
+    """(pid, start time, argv) of the processes under test on A or B: of this flexvm binary or the hosts'
+    Firecracker (by executable), working for A's or B's run directory (its --run; a Firecracker's, its cwd)."""
+    exes = {os.path.realpath(BIN)} | {os.path.realpath(os.path.join(h.state, "artifacts", "firecracker")) for h in (A, B)}
+    runs = {os.path.realpath(h.run) for h in (A, B)}
+    under = lambda p: any(p == r or p.startswith(r + "/") for r in runs)
+    out = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        if int(pid) in skip:
+            continue
+        # Held through the checks, the pidfd pins the process; its start time, read before and after them,
+        # says the /proc entries read between belong to it (a pid reused meanwhile changes it).
+        try:
+            fd = os.pidfd_open(int(pid))
+        except OSError:
+            continue
+        try:
+            start = starttime_of(pid)
+            exe = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
+            if start is None or os.path.realpath(exe) not in exes:
+                continue
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+            run = argv[argv.index(b"--run") + 1].decode(errors="replace") if b"--run" in argv[:-1] else None
+            mine = (run and os.path.realpath(run) in runs) or under(cwd)
+            if mine and alive(pid) and starttime_of(pid) == start:
+                out.append((int(pid), start, b" ".join(argv).decode(errors="replace")[:240]))
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+    return out
+
+
+def kill_process(pid, start):
+    """SIGKILLs process `pid` if it is still the one that started at `start` (by pidfd: never a later one with its pid)."""
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        return  # gone
+    try:
+        if starttime_of(pid) == start:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def host_routes():
+    """The kernel's host routes into A's and B's address ranges (their /24s), or via the third peer."""
+    nets = {ipaddress.IPv4Network(f"{ip}/24", strict=False) for h in (A, B) for ip in h.ips.split("-")}
+    out = []
+    for line in subprocess.run(["ip", "-4", "route", "show"], capture_output=True, text=True).stdout.splitlines():
+        dest = line.split()[0] if line.split() else ""
+        try:
+            ip = ipaddress.IPv4Address(dest)
+        except ValueError:
+            continue  # a network route (no /32), the default
+        if any(ip in n for n in nets) or (THIRD and f"via {THIRD['addr']}" in line):
+            out.append(line)
+    return out
+
+
+def left_behind(skip):
+    """What the last scenario left on A and B, by kind; empty once nothing is."""
+    left = {}
+    procs = host_processes(skip)
+    if procs:
+        left["processes"] = procs
+    for h in (A, B):
+        if (vm := listed(h)):
+            left[f"vms on {h}"] = vm
+        if (t := sorted(d for d in os.listdir("/sys/class/net") if d.startswith(PREFIXES[h]))):
+            left[f"taps of {h}"] = t
+        if (c := conns(h)):
+            left[f"requests {h}'s listener has yet to answer"] = c
+        armed = [f for f in ("faults.json", "mem_available_mib") if os.path.exists(os.path.join(h.run, f))]
+        gates = os.path.join(h.run, "gates")
+        armed += [f"gates/{g}" for g in (os.listdir(gates) if os.path.isdir(gates) else [])]
+        if armed:
+            left[f"armed on {h}"] = armed
+    if (r := host_routes()):
+        left["routes"] = r
+    return left
+
+
+def isolate(scenario):
+    """The barrier between scenarios (see above); returns whether nothing was left past ISOLATE_S."""
+    notes = []
+    for h in (A, B):
+        # Standby counts: refills would start more under the next scenario.
+        d = os.path.join(h.state, "standby")
+        for t in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            path = os.path.join(d, t)
+            if t.startswith(".") or not os.path.isfile(path):
+                continue
+            with suppress(OSError, ValueError):
+                if int(open(path).read().strip() or 0):
+                    notes.append(f"standby count of {t} on {h}")
+                    set_standby(h, t, 0)
+        # A listener saves host.json itself (its `listen`, unset keys as null): that is not a scenario's change.
+        settings = lambda c: {k: v for k, v in c.items() if v is not None and k != "listen"}
+        if settings(host_config(h)) != settings(BASELINE[h]):
+            now = host_config(h)
+            notes.append(f"host.json of {h}: {settings(now)}")
+            write_host_config(h, {**BASELINE[h], **({"listen": now["listen"]} if now.get("listen") else {})})
+        if not args.no_listeners and (h.addr not in listeners or listeners[h.addr].poll() is not None):
+            notes.append(f"{h}'s listener was not running")
+            start_listener(h)
+    end, left, removed, swept = time.time() + ISOLATE_S, {}, set(), None
+    while True:
+        disarm()
+        for h in (A, B):
+            for n in listed(h):
+                if n not in scenario_vms and (h, n) not in removed:
+                    notes.append(f"vm {n} on {h}, which it did not register")
+                removed.add((h, n))
+                kill(h, n)
+        skip = own_pids()
+        if not (left := left_behind(skip)) or time.time() > end:
+            break
+        # A SIGKILLed VM process's tap, route and name are a sweep's to collect, which some process on the host
+        # runs every 30 s or so: once no process is left, the one that would come, now. What only it removes is
+        # recorded first, and reported (`SWEPT`): the scenario left it, gc only hides it.
+        if swept is None and "processes" not in left:
+            swept = left
+            for h in (A, B):
+                cli(h, "debug", "gc")
+            continue
+        time.sleep(0.1)
+    # What processes that are gone left as markers (relief's, eviction's) is theirs, not the next scenario's.
+    for h in (A, B):
+        for f in (os.path.join(h.run, "standby", ".pressure"), os.path.join(h.run, "evict.active")):
+            with suppress(OSError):
+                os.unlink(f)
+        for f in glob.glob(os.path.join(h.run, "standby", "*", ".failed")):
+            with suppress(OSError):
+                os.unlink(f)
+    if notes:
+        print(f"isolation after {scenario}: undid {'; '.join(notes)}", flush=True)
+    if swept and not left:
+        SWEPT[scenario] = swept
+        print(f"isolation after {scenario}: left for a sweep to collect: {swept}", flush=True)
+    if not left:
+        return True
+    check(f"{scenario}: leaves nothing behind within {ISOLATE_S} s", False, left)
+    # By force, so the next scenario is not failed for this one's leftovers.
+    for pid, start, argv in left.get("processes", []):
+        print(f"  pid {pid} ({argv}): {threads_of(pid)[:4]}", flush=True)
+        kill_process(pid, start)
+    for line in left.get("routes", []):
+        subprocess.run(["ip", "route", "del", line.split()[0] + "/32"], capture_output=True)
+    for h in (A, B):
+        cli(h, "debug", "gc")
+    return False
+
+
 SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
@@ -9701,6 +9924,7 @@ for h in (A, B):
     for n in vms(h):
         if n.startswith("ft-"):
             kill(h, n)
+isolation_baseline()
 skipped = []
 try:
     for s in names:
@@ -9721,15 +9945,22 @@ try:
                     kill(h, n)
             for path in scenario_checkpoints:
                 rm_ckpt(path)
+            try:
+                isolate(s)
+            except Exception as e:
+                traceback.print_exc()
+                check(f"{s}: isolation barrier raised {type(e).__name__}", False, e)
             if failures == before and why is not None:
                 skipped.append(s)
                 print(f"scenario {s}: SKIPPED ({why}) in {time.time() - started:.1f} s", flush=True)
             else:
-                print(f"scenario {s}: {'ok' if failures == before else 'FAILED'} in {time.time() - started:.1f} s", flush=True)
+                note = " (left something for a sweep)" if s in SWEPT else ""
+                print(f"scenario {s}: {'ok' if failures == before else 'FAILED'}{note} in {time.time() - started:.1f} s", flush=True)
 finally:
     stop_listeners()
     remove_third_peer()
     for d in OWN_DIRS:
         subprocess.run(["rm", "-rf", d])
-print("failures:", failures, "skipped:", len(skipped), *(["(" + " ".join(skipped) + ")"] if skipped else []))
+print("failures:", failures, "skipped:", len(skipped), *(["(" + " ".join(skipped) + ")"] if skipped else []),
+      "left for a sweep:", len(SWEPT), *(["(" + " ".join(SWEPT) + ")"] if SWEPT else []))
 sys.exit(1 if failures or (skipped and args.no_skips) else 0)

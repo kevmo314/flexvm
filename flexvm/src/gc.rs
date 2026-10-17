@@ -114,6 +114,28 @@ pub fn sweep_due(host: &Host) {
 /// slow sources cannot keep other processes from cleaning up local files.
 pub fn sweep(host: &Host) {
     local_cleanup(host);
+    network(host);
+}
+
+/// How long `flexvm debug gc` waits for a sweep under way: one stopped or stuck (on the host lock, say)
+/// fails it, never hangs it.
+const SWEEP_WAIT: Duration = Duration::from_secs(30);
+
+/// `flexvm debug gc`: a sweep that waits for one under way to finish (another process's periodic one),
+/// `SWEEP_WAIT` at most, and then runs its own local cleanup, so what was collectable when it was asked is
+/// collected when it returns. A nonblocking one would return having done nothing.
+pub fn sweep_now(host: &Host) -> Result<()> {
+    sweep_within(host, SWEEP_WAIT)
+}
+
+fn sweep_within(host: &Host, wait: Duration) -> Result<()> {
+    let lock = gc_lock(host, Some(wait))?;
+    cleanup_locked(host, lock);
+    network(host);
+    Ok(())
+}
+
+fn network(host: &Host) {
     // Its own nonblocking lock: a peer that is down holds up no local cleanup.
     host.deliver_withdrawals();
     host.retire_migrations();
@@ -122,8 +144,33 @@ pub fn sweep(host: &Host) {
 
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
-    let Ok(lock) = crate::host::private_file(&crate::host::locks(&host.run).join("gc")) else { return };
-    let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
+    if let Ok(Some(lock)) = gc_lock(host, None) {
+        cleanup_locked(host, Some(lock));
+    }
+}
+
+/// The local sweep lock: None at once if another holds it (`wait` None), else polled for until `wait` is up,
+/// then an error.
+fn gc_lock(host: &Host, wait: Option<Duration>) -> Result<Option<Flock>> {
+    let path = crate::host::locks(&host.run).join("gc");
+    let until = wait.map(|w| std::time::Instant::now() + w);
+    loop {
+        match Flock::new(crate::host::private_file(&path)?, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(e) if e.raw_os_error() != Some(libc::EWOULDBLOCK) => return Err(e.into()),
+            Err(_) => match until {
+                None => return Ok(None),
+                Some(t) if std::time::Instant::now() >= t => {
+                    bail!("another sweep has held {} for {} s; not swept", path.display(), wait.unwrap_or_default().as_secs())
+                }
+                Some(_) => std::thread::sleep(Duration::from_millis(20)),
+            },
+        }
+    }
+}
+
+fn cleanup_locked(host: &Host, lock: Option<Flock>) {
+    let Some(_lock) = lock else { return };
     if let Err(e) = host.collect_garbage() {
         crate::log!("garbage collection: {e}");
     }
@@ -365,6 +412,39 @@ mod tests {
         // Let go explicitly: another test's child, forked but not yet exec'd, may share it.
         let gc = File::open(crate::host::locks(&host.run).join("gc")).unwrap();
         assert!(flock(&gc, libc::LOCK_EX | libc::LOCK_NB).is_ok(), "the sweep let go of its lock");
+    }
+
+    #[test]
+    fn an_asked_for_sweep_waits_for_one_under_way() {
+        let d = dir("sweep-now");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let marker = host.vms("gone", "moved").unwrap();
+        File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
+        // Another process's sweep under way: a periodic one skips, `debug gc`'s waits for it.
+        let busy = crate::host::private_file(&crate::host::locks(&host.run).join("gc")).unwrap();
+        flock(&busy, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        sweep(&host);
+        assert!(marker.exists(), "a nonblocking sweep ran under another's lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                sweep_now(&host).unwrap();
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "it did not wait for the sweep under way");
+        flock(&busy, libc::LOCK_UN).unwrap();
+        rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        waiting.join().unwrap();
+        assert!(!marker.exists(), "it swept once the other was done");
+        // One that never finishes (stopped, or stuck on the host lock) fails it in time, never hangs it.
+        File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
+        flock(&busy, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let e = sweep_within(&host, Duration::from_millis(200)).unwrap_err().to_string();
+        assert!(e.contains("another sweep has held") && e.contains("not swept"), "{e}");
+        assert!(marker.exists());
+        flock(&busy, libc::LOCK_UN).unwrap();
     }
 
     #[test]
