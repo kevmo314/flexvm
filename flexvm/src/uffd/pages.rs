@@ -381,12 +381,8 @@ impl Pages {
     }
 
     /// Settles claimed `page`, claimed from state `from`. Returns whether a REMOTE page got resolved, for the pager's
-    /// count of pages to pull.
+    /// count of pages to pull. Populated pages must already have their dirty bits published.
     fn settle(&self, page: usize, populated: bool, from: u8) -> bool {
-        if populated {
-            // Installed writable: publish dirty before PRESENT, which lets quiesce_export finish and freeze take it.
-            self.mark_dirty(page);
-        }
         let old = self.states[page]
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
                 Some(match (s, populated) {
@@ -438,10 +434,20 @@ impl Pages {
                 Ok(done) => {
                     let done = done.clamp(1, m);
                     self.woke(i, done);
+                    // Installed writable: publish dirty once per word before any PRESENT, which lets
+                    // quiesce_export finish and freeze take these pages.
+                    let mut p = i;
+                    while p < i + done {
+                        let count = (i + done - p).min(64 - p % 64);
+                        self.touch(p);
+                        self.dirty[p / 64].fetch_or((u64::MAX >> (64 - count)) << (p % 64), Ordering::SeqCst);
+                        p += count;
+                    }
                     resolved += (i..i + done).filter(|&p| self.settle(p, true, from)).count();
                     i += done;
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    self.mark_dirty(i);
                     resolved += self.settle(i, true, from) as usize;
                     i += 1;
                 }
@@ -592,6 +598,60 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual install bookkeeping microbenchmark; run before and after changes with --release --ignored --nocapture"]
+    fn install_dirty_benchmark() {
+        use std::hint::black_box;
+
+        const N: usize = (1 << 30) / crate::util::PAGE_SIZE;
+        const REPEATS: u32 = 100;
+        let mut pages = Pages::new(N);
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..REPEATS {
+            pages.fill(0, N, REMOTE);
+            for word in &mut pages.dirty {
+                *word.get_mut() = 0;
+            }
+            assert_eq!(pages.claim(0, N, REMOTE, |_| true), N);
+            let start = Instant::now();
+            // No ioctl or data copy: measure the install state/dirty bookkeeping for 1 GiB in 32-page runs.
+            let (resolved, result) = pages.install(0, N, REMOTE, None, |_, count| Ok(black_box(count)));
+            elapsed += start.elapsed();
+            result.unwrap();
+            assert_eq!(resolved, N);
+            assert_eq!(pages.dirty_count(), N);
+            black_box(&pages);
+        }
+        println!(
+            "1 GiB installed in 32-page runs: {:?}, {:.2} GiB/s (mean of {REPEATS}, bookkeeping only)",
+            elapsed / REPEATS,
+            f64::from(REPEATS) / elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn install_marks_exact_dirty_bits_across_words() {
+        for first in [0, 1, 32, 48, 63, 64, CHUNK - 16] {
+            for n in [1, 16, 32, 65] {
+                for limit in [1, 17, 32] {
+                    let pages = Pages::new(first + n + 65);
+                    assert_eq!(pages.claim(first, n, BASE, |_| true), n);
+                    let (resolved, result) = pages.install(first, n, BASE, None, |_, count| Ok(count.min(limit)));
+                    result.unwrap();
+                    assert_eq!(resolved, 0);
+                    let mut expected = vec![0u64; pages.dirty.len()];
+                    for p in first..first + n {
+                        expected[p / 64] |= 1 << (p % 64);
+                    }
+                    assert_eq!(pages.dirty_bits(false).bits, expected, "first={first}, n={n}, limit={limit}");
+                    for p in 0..pages.len() {
+                        assert_eq!(pages.get(p), if (first..first + n).contains(&p) { PRESENT } else { BASE });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn install_uses_full_capped_runs() {
         let mut pages = Pages::new(513);
         pages.fill(0, 513, REMOTE);
@@ -650,7 +710,7 @@ mod tests {
                     }
                 });
                 let (resolved, result) =
-                    pages.install(0, pages.len(), from, None, |p, _| if p % 2 == 0 { Ok(1) } else { Err(io::Error::from_raw_os_error(libc::EEXIST)) });
+                    pages.install(0, pages.len(), from, None, |p, count| if p % 64 < 32 { Ok(count) } else { Err(io::Error::from_raw_os_error(libc::EEXIST)) });
                 result.unwrap();
                 assert_eq!(resolved, if from == REMOTE { pages.len() } else { 0 });
             });
