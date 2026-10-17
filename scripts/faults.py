@@ -9714,19 +9714,27 @@ def host_processes(skip):
     for pid in filter(str.isdigit, os.listdir("/proc")):
         if int(pid) in skip:
             continue
+        # Held through the checks, the pidfd pins the process; its start time, read before and after them,
+        # says the /proc entries read between belong to it (a pid reused meanwhile changes it).
         try:
+            fd = os.pidfd_open(int(pid))
+        except OSError:
+            continue
+        try:
+            start = starttime_of(pid)
             exe = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
-            if os.path.realpath(exe) not in exes:
+            if start is None or os.path.realpath(exe) not in exes:
                 continue
             argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
             cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+            run = argv[argv.index(b"--run") + 1].decode(errors="replace") if b"--run" in argv[:-1] else None
+            mine = (run and os.path.realpath(run) in runs) or under(cwd)
+            if mine and alive(pid) and starttime_of(pid) == start:
+                out.append((int(pid), start, b" ".join(argv).decode(errors="replace")[:240]))
         except OSError:
             continue
-        run = argv[argv.index(b"--run") + 1].decode(errors="replace") if b"--run" in argv[:-1] else None
-        if (run and os.path.realpath(run) in runs) or under(cwd):
-            start = starttime_of(pid)
-            if start is not None and alive(pid):
-                out.append((int(pid), start, b" ".join(argv).decode(errors="replace")[:240]))
+        finally:
+            os.close(fd)
     return out
 
 

@@ -445,8 +445,7 @@ fn real_main(args: &Args) -> Result<()> {
         Some("debug") => match name {
             "gc" => {
                 let host = open_host(args)?;
-                gc::sweep_now(&host);
-                Ok(())
+                gc::sweep_now(&host)
             }
             "fault" => host::arm(&open_host(args)?, arg2.ok_or("debug fault NAME MS")?, pos.get(3).and_then(|m| m.parse().ok()).unwrap_or(1000)),
             "ckhash" => print(lifecycle::ckhash(&paths(args)?, std::path::Path::new(arg2.ok_or("debug ckhash DIR")?))?),

@@ -113,18 +113,29 @@ pub fn sweep_due(host: &Host) {
 /// Local cleanup and network retirement have separate nonblocking locks, so
 /// slow sources cannot keep other processes from cleaning up local files.
 pub fn sweep(host: &Host) {
-    sweep_by(host, false);
+    local_cleanup(host);
+    network(host);
 }
 
-/// `flexvm debug gc`: a sweep that waits for one under way to finish (another process's periodic one)
-/// and then runs its own local cleanup, so what was collectable when it was asked is collected when it
-/// returns. A nonblocking one would return having done nothing.
-pub fn sweep_now(host: &Host) {
-    sweep_by(host, true);
+/// How long `flexvm debug gc` waits for a sweep under way: one stopped or stuck (on the host lock, say)
+/// fails it, never hangs it.
+const SWEEP_WAIT: Duration = Duration::from_secs(30);
+
+/// `flexvm debug gc`: a sweep that waits for one under way to finish (another process's periodic one),
+/// `SWEEP_WAIT` at most, and then runs its own local cleanup, so what was collectable when it was asked is
+/// collected when it returns. A nonblocking one would return having done nothing.
+pub fn sweep_now(host: &Host) -> Result<()> {
+    sweep_within(host, SWEEP_WAIT)
 }
 
-fn sweep_by(host: &Host, wait: bool) {
-    local_cleanup_by(host, wait);
+fn sweep_within(host: &Host, wait: Duration) -> Result<()> {
+    let lock = gc_lock(host, Some(wait))?;
+    cleanup_locked(host, lock);
+    network(host);
+    Ok(())
+}
+
+fn network(host: &Host) {
     // Its own nonblocking lock: a peer that is down holds up no local cleanup.
     host.deliver_withdrawals();
     host.retire_migrations();
@@ -133,12 +144,33 @@ fn sweep_by(host: &Host, wait: bool) {
 
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
-    local_cleanup_by(host, false);
+    if let Ok(Some(lock)) = gc_lock(host, None) {
+        cleanup_locked(host, Some(lock));
+    }
 }
 
-fn local_cleanup_by(host: &Host, wait: bool) {
-    let Ok(lock) = crate::host::private_file(&crate::host::locks(&host.run).join("gc")) else { return };
-    let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) else { return };
+/// The local sweep lock: None at once if another holds it (`wait` None), else polled for until `wait` is up,
+/// then an error.
+fn gc_lock(host: &Host, wait: Option<Duration>) -> Result<Option<Flock>> {
+    let path = crate::host::locks(&host.run).join("gc");
+    let until = wait.map(|w| std::time::Instant::now() + w);
+    loop {
+        match Flock::new(crate::host::private_file(&path)?, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(e) if e.raw_os_error() != Some(libc::EWOULDBLOCK) => return Err(e.into()),
+            Err(_) => match until {
+                None => return Ok(None),
+                Some(t) if std::time::Instant::now() >= t => {
+                    bail!("another sweep has held {} for {} s; not swept", path.display(), wait.unwrap_or_default().as_secs())
+                }
+                Some(_) => std::thread::sleep(Duration::from_millis(20)),
+            },
+        }
+    }
+}
+
+fn cleanup_locked(host: &Host, lock: Option<Flock>) {
+    let Some(_lock) = lock else { return };
     if let Err(e) = host.collect_garbage() {
         crate::log!("garbage collection: {e}");
     }
@@ -397,7 +429,7 @@ mod tests {
         let waiting = {
             let host = host.clone();
             std::thread::spawn(move || {
-                sweep_now(&host);
+                sweep_now(&host).unwrap();
                 tx.send(()).unwrap();
             })
         };
@@ -406,6 +438,13 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(30)).unwrap();
         waiting.join().unwrap();
         assert!(!marker.exists(), "it swept once the other was done");
+        // One that never finishes (stopped, or stuck on the host lock) fails it in time, never hangs it.
+        File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
+        flock(&busy, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let e = sweep_within(&host, Duration::from_millis(200)).unwrap_err().to_string();
+        assert!(e.contains("another sweep has held") && e.contains("not swept"), "{e}");
+        assert!(marker.exists());
+        flock(&busy, libc::LOCK_UN).unwrap();
     }
 
     #[test]
