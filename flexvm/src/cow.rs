@@ -24,7 +24,9 @@
 //!
 //! Rescued copies are kept in memory up to a budget; past it (once the writers
 //! have started), a fault on a PENDING page asks the writers to take that
-//! page's unit next and waits for them instead.
+//! page's unit next and waits for them instead. Their memory (`Slots`) is
+//! kept for the next copy, as much as this one used at once, up to the
+//! budget: faulting in fresh memory costs a rescue more than the copy.
 //!
 //! Discards: the kernel zaps a page right after the pager reads the REMOVE
 //! event, so the pager never reads one while pages are PENDING. It probes
@@ -33,7 +35,7 @@
 //! REMOVE slips in between the probe and the read, the checkpoint is
 //! invalidated instead of saving wrong contents.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -86,7 +88,11 @@ pub struct Stats {
 pub struct Cow {
     states: Vec<AtomicU8>,
     left: AtomicUsize,
-    rescued: Mutex<HashMap<usize, Box<[u8]>>>,
+    /// Where each RESCUED page's copy is (a slot of `slots`), 0 for none.
+    rescued: Index,
+    slots: Slots,
+    /// Where `slots` go when the copy is dropped, for the next one.
+    home: Option<Arc<Mutex<Option<Slots>>>>,
     rescued_bytes: AtomicUsize,
     /// Pages copied during the pause (HELD).
     held: OnceLock<Arc<Held>>,
@@ -122,7 +128,9 @@ impl Cow {
         Cow {
             states,
             left: AtomicUsize::new(runs.iter().map(|(a, b)| b - a).sum()),
-            rescued: Mutex::new(HashMap::new()),
+            rescued: Index::new(total),
+            slots: Slots::default(),
+            home: None,
             rescued_bytes: AtomicUsize::new(0),
             held: OnceLock::new(),
             budget: BUDGET_MIB << 20,
@@ -140,6 +148,17 @@ impl Cow {
             runs,
             stats: Stats::default(),
         }
+    }
+
+    /// Rescues write into the memory `home` holds from the last copy, if any, and hand it back there, trimmed to what
+    /// this copy used at most, once it is dropped: memory faulted in fresh costs a rescue several times what copying
+    /// into it does here (#630), and a guest that wrote much during one copy tends to again.
+    pub fn keep_slots(mut self, home: Arc<Mutex<Option<Slots>>>) -> Cow {
+        if let Some(s) = home.lock().unwrap().take() {
+            self.slots = s;
+        }
+        self.home = Some(home);
+        self
     }
 
     /// The pages to save, as `[first, end)` runs.
@@ -267,18 +286,25 @@ impl Cow {
         self.rescued_bytes.load(Ordering::SeqCst) >= budget
     }
 
-    /// Keeps the pause-time copies of pages claimed RESCUING in `first..end`.
-    pub fn rescue_many(&self, first: usize, end: usize, pages: impl IntoIterator<Item = (usize, Box<[u8]>)>) {
-        let mut rescued = self.rescued.lock().unwrap();
-        let (mut n, mut bytes) = (0, 0);
-        for (page, copy) in pages {
-            bytes += copy.len();
-            rescued.insert(page, copy);
+    /// Memory for `n` pages' copies: slots for `rescue_many`, or back with `give_slots`.
+    pub fn take_slots(&self, n: usize) -> std::io::Result<Vec<Slot>> {
+        self.slots.take(n)
+    }
+
+    pub fn give_slots(&self, slots: Vec<Slot>) {
+        self.slots.give(slots)
+    }
+
+    /// Keeps the pause-time copies of pages claimed RESCUING in `first..end`, each in its slot (`take_slots`).
+    pub fn rescue_many(&self, first: usize, end: usize, pages: impl IntoIterator<Item = (usize, Slot)>) {
+        let mut n = 0;
+        for (page, slot) in pages {
+            // Before the state: a writer that sees RESCUED finds the copy.
+            self.rescued[page].store(slot.0 as u64, Ordering::SeqCst);
             self.set(page, RESCUED);
             n += 1;
         }
-        self.rescued_bytes.fetch_add(bytes, Ordering::SeqCst);
-        drop(rescued);
+        self.rescued_bytes.fetch_add(n * PAGE_SIZE, Ordering::SeqCst);
         self.saved(first, end, n);
     }
 
@@ -330,7 +356,7 @@ impl Cow {
     /// held are dropped, and faults waiting for a writer are retried.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
-        self.rescued.lock().unwrap().clear();
+        // Their memory goes with the copy (`Slots`): a writer may be reading one still.
         self.notify();
         self.settled(0, usize::MAX);
     }
@@ -414,6 +440,8 @@ impl GuestPages for CowPages<'_> {
         }
         (0..n).filter(|&k| mine[k]).for_each(|k| cow.set(page + k, CLEAN));
         cow.saved(page, page + n, mine.iter().filter(|&&m| m).count());
+        // Slots of rescued copies taken here, reused once copied (on every return).
+        let mut done = Done(&cow.slots, Vec::new());
         // The rest were copied during the pause, or a fault saved them first (or is saving them right now).
         'copies: for k in (0..n).filter(|&k| !mine[k]) {
             let p = page + k;
@@ -445,12 +473,16 @@ impl GuestPages for CowPages<'_> {
             }
             // A copy that stops (abort, kill) drops the rescued copies under
             // the writers: that is the stop, not a lost page.
-            let Some(bytes) = cow.rescued.lock().unwrap().remove(&p) else {
-                cow.check_active()?;
-                crate::bail!("page {p}: rescued copy missing");
+            let slot = match cow.rescued[p].swap(0, Ordering::SeqCst) {
+                0 => {
+                    cow.check_active()?;
+                    crate::bail!("page {p}: rescued copy missing");
+                }
+                a => Slot(a as usize),
             };
-            cow.rescued_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
-            buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE].copy_from_slice(&bytes);
+            cow.rescued_bytes.fetch_sub(PAGE_SIZE, Ordering::SeqCst);
+            buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE].copy_from_slice(slot.bytes());
+            done.1.push(slot);
             cow.set(p, CLEAN);
         }
         Ok(())
@@ -458,6 +490,182 @@ impl GuestPages for CowPages<'_> {
 
     fn wanted(&self) -> Option<usize> {
         self.cow.wanted.lock().unwrap().pop_front()
+    }
+}
+
+impl Drop for Cow {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take() {
+            let mut slots = std::mem::take(&mut self.slots);
+            slots.trim();
+            *home.lock().unwrap() = Some(slots);
+        }
+    }
+}
+
+/// A word a page, mapped on its own: zero until written, backed only where written, and set up in no time whatever
+/// the guest's size. A heap allocation this large can be zeroed by hand (malloc's mmap threshold grows past the size
+/// of what was freed last), which took up to 4 ms of a checkpoint's pause at 4 GiB.
+struct Index(&'static [AtomicU64]);
+
+impl Index {
+    fn new(n: usize) -> Index {
+        let len = (n * 8).max(1);
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
+        };
+        assert!(p != libc::MAP_FAILED, "mapping a copy index: {}", std::io::Error::last_os_error());
+        Index(unsafe { std::slice::from_raw_parts(p.cast::<AtomicU64>(), n) })
+    }
+}
+
+impl std::ops::Deref for Index {
+    type Target = [AtomicU64];
+    fn deref(&self) -> &[AtomicU64] {
+        self.0
+    }
+}
+
+impl Drop for Index {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.0.as_ptr() as *mut _, (self.0.len() * 8).max(1)) };
+    }
+}
+
+/// Slots a writer copied out, given back when it is done.
+struct Done<'a>(&'a Slots, Vec<Slot>);
+
+impl Drop for Done<'_> {
+    fn drop(&mut self) {
+        self.0.give(std::mem::take(&mut self.1));
+    }
+}
+
+/// Memory for one page's rescued copy, in `Slots`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Slot(usize);
+
+impl Slot {
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.0 as *mut u8
+    }
+
+    /// Its contents. Only while it holds a copy: no one writes it then.
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.0 as *const u8, PAGE_SIZE) }
+    }
+}
+
+/// Rescued copies' memory, a page a slot, in chunks of `SLOT_CHUNK` faulted in whole when mapped (huge pages where the
+/// kernel gives them): a rescue writes into memory that is there already, where a page fault on fresh memory costs
+/// several µs here, more than copying the page (#630). Slots the writers are done with are reused. Unmapped only with
+/// the copy (`Cow` dropped), so a writer never reads memory a stop took away.
+#[derive(Default)]
+pub struct Slots {
+    chunks: Mutex<Vec<usize>>,
+    free: Mutex<Vec<Slot>>,
+    /// Slots taken and not given back, and the most at once.
+    used: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+const SLOT_CHUNK: usize = 2 << 20;
+const MADV_POPULATE_WRITE: libc::c_int = 23;
+
+impl Slots {
+    /// `n` slots, ascending where they come from a new chunk.
+    fn take(&self, n: usize) -> std::io::Result<Vec<Slot>> {
+        let mut free = self.free.lock().unwrap();
+        while free.len() < n {
+            let c = map_chunk()?;
+            self.chunks.lock().unwrap().push(c);
+            // Descending: they are taken from the end.
+            free.extend((0..SLOT_CHUNK / PAGE_SIZE).rev().map(|i| Slot(c + i * PAGE_SIZE)));
+        }
+        let at = free.len() - n;
+        let mut out = free.split_off(at);
+        out.reverse();
+        let used = self.used.fetch_add(n, Ordering::Relaxed) + n;
+        self.peak.fetch_max(used, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    fn give(&self, slots: Vec<Slot>) {
+        if !slots.is_empty() {
+            self.used.fetch_sub(slots.len(), Ordering::Relaxed);
+            self.free.lock().unwrap().extend(slots);
+        }
+    }
+
+    /// Once nothing uses any slot (the copy is gone): keeps as many chunks as were in use at most at once, up to the
+    /// budget of rescued copies (a held-back discard rescues past it, `Pager::save_rest`), every slot free, and forgets
+    /// that most.
+    fn trim(&mut self) {
+        let chunks = self.chunks.get_mut().unwrap();
+        let keep = self.peak.get_mut().div_ceil(SLOT_CHUNK / PAGE_SIZE).min(chunks.len()).min((BUDGET_MIB << 20) / SLOT_CHUNK);
+        for &c in &chunks[keep..] {
+            unsafe { libc::munmap(c as *mut _, SLOT_CHUNK) };
+        }
+        chunks.truncate(keep);
+        let free = self.free.get_mut().unwrap();
+        free.clear();
+        free.extend(chunks.iter().rev().flat_map(|&c| (0..SLOT_CHUNK / PAGE_SIZE).rev().map(move |i| Slot(c + i * PAGE_SIZE))));
+        (*self.used.get_mut(), *self.peak.get_mut()) = (0, 0);
+    }
+
+    #[cfg(test)]
+    fn mapped(&self) -> usize {
+        self.chunks.lock().unwrap().len() * SLOT_CHUNK / PAGE_SIZE
+    }
+}
+
+impl Drop for Slots {
+    fn drop(&mut self) {
+        for &c in self.chunks.get_mut().unwrap().iter() {
+            unsafe { libc::munmap(c as *mut _, SLOT_CHUNK) };
+        }
+    }
+}
+
+/// `SLOT_CHUNK` of anonymous memory, aligned to it (so it can be a huge page) and populated.
+fn map_chunk() -> std::io::Result<usize> {
+    let len = 2 * SLOT_CHUNK;
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+    if p == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    let (start, end) = (p as usize, p as usize + len);
+    let c = start.next_multiple_of(SLOT_CHUNK);
+    unsafe {
+        if c > start {
+            libc::munmap(start as *mut _, c - start);
+        }
+        if end > c + SLOT_CHUNK {
+            libc::munmap((c + SLOT_CHUNK) as *mut _, end - c - SLOT_CHUNK);
+        }
+        libc::madvise(c as *mut _, SLOT_CHUNK, libc::MADV_HUGEPAGE);
+        if libc::madvise(c as *mut _, SLOT_CHUNK, MADV_POPULATE_WRITE) != 0 {
+            (0..SLOT_CHUNK).step_by(PAGE_SIZE).for_each(|o| ((c + o) as *mut u8).write_volatile(0));
+        }
+    }
+    Ok(c)
+}
+
+#[cfg(test)]
+impl Cow {
+    /// Rescued copies held now.
+    pub fn rescued_mib(&self) -> f64 {
+        self.rescued_bytes.load(Ordering::SeqCst) as f64 / (1 << 20) as f64
+    }
+
+    /// `rescue_many` from copies in hand.
+    pub fn rescue_copies(&self, first: usize, end: usize, pages: impl IntoIterator<Item = (usize, Box<[u8]>)>) {
+        let pages: Vec<(usize, Box<[u8]>)> = pages.into_iter().collect();
+        let slots = self.take_slots(pages.len()).unwrap();
+        for ((_, copy), slot) in pages.iter().zip(&slots) {
+            unsafe { std::ptr::copy_nonoverlapping(copy.as_ptr(), slot.as_mut_ptr(), PAGE_SIZE) };
+        }
+        self.rescue_many(first, end, pages.iter().map(|p| p.0).zip(slots));
     }
 }
 
@@ -531,7 +739,7 @@ mod tests {
         assert_eq!(cow.left(), 40);
         // A fault on page 3 saves it before the guest overwrites it.
         assert!(cow.claim(3, PENDING, RESCUING));
-        cow.rescue_many(3, 4, [(3, vec![3u8; PAGE_SIZE].into())]);
+        cow.rescue_copies(3, 4, [(3, vec![3u8; PAGE_SIZE].into())]);
         live.pages.lock().unwrap()[3 * PAGE_SIZE..4 * PAGE_SIZE].fill(0xee);
         // Page 5 is being saved by a fault while the writer gets there.
         assert!(cow.claim(5, PENDING, RESCUING));
@@ -541,7 +749,7 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(Duration::from_millis(50));
-                cow.rescue_many(5, 6, [(5, vec![5u8; PAGE_SIZE].into())]);
+                cow.rescue_copies(5, 6, [(5, vec![5u8; PAGE_SIZE].into())]);
             });
             pages.read(0, &mut buf).unwrap();
         });
@@ -549,7 +757,7 @@ mod tests {
             assert!(p.iter().all(|&b| b == i as u8), "page {i} has its pause-time contents");
         }
         assert_eq!(cow.left(), 32);
-        assert!(cow.rescued.lock().unwrap().is_empty(), "rescued copies are dropped once written");
+        assert_eq!(cow.rescued_bytes.load(Ordering::SeqCst), 0, "rescued copies are dropped once written");
         assert_eq!(cow.state(3), CLEAN);
         // Faults wait on pages; writers take those units first.
         cow.want(30);
@@ -633,7 +841,7 @@ mod tests {
                 });
                 assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "{end}: the writer waits for the rescue");
                 match end {
-                    "rescued" => cow.rescue_many(0, 1, [(0, vec![1u8; PAGE_SIZE].into())]),
+                    "rescued" => cow.rescue_copies(0, 1, [(0, vec![1u8; PAGE_SIZE].into())]),
                     "unclaimed" => cow.unclaim(0),
                     _ => cow.stop(),
                 }
@@ -659,7 +867,7 @@ mod tests {
         }
         cow.wait_for(1, RESCUING);
         cow.wait_for(4, RESCUING);
-        cow.rescue_many(1, 5, claimed.map(|p| (p, vec![p as u8; PAGE_SIZE].into())));
+        cow.rescue_copies(1, 5, claimed.map(|p| (p, vec![p as u8; PAGE_SIZE].into())));
         assert_eq!(wakes(&fd), Some(1), "one wake for the whole batch");
         assert!(cow.waits.lock().unwrap().is_empty());
         assert_eq!(cow.left(), 3);
@@ -681,7 +889,7 @@ mod tests {
         assert_eq!(cow.left(), 0);
         assert_eq!(*cow.progress.0.lock().unwrap(), 6);
         assert_eq!(cow.rescued_bytes.load(Ordering::SeqCst), 0);
-        assert!(cow.rescued.lock().unwrap().is_empty());
+        assert_eq!(cow.rescued_bytes.load(Ordering::SeqCst), 0);
     }
 
     /// Guest memory whose reads stop half way until the test lets them go.
@@ -703,6 +911,47 @@ mod tests {
         }
     }
 
+    /// Rescue memory is reused, and kept for the next copy as much of it as one used at most at once.
+    #[test]
+    fn rescue_memory_is_reused_and_kept_by_peak_use() {
+        let home = Arc::new(Mutex::new(None));
+        let per = SLOT_CHUNK / PAGE_SIZE;
+        {
+            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone());
+            let a = cow.take_slots(per + 1).unwrap();
+            assert_eq!(cow.slots.mapped(), 2 * per);
+            assert!(a.windows(2).take(per - 1).all(|w| w[1].0 == w[0].0 + PAGE_SIZE), "ascending within a chunk");
+            cow.give_slots(a);
+            let b = cow.take_slots(2 * per).unwrap();
+            assert_eq!(cow.slots.mapped(), 2 * per, "freed slots reused");
+            cow.give_slots(b);
+            // Taken and never given back (a copy that failed): still free for the next copy.
+            let _lost = cow.take_slots(3).unwrap();
+        }
+        assert_eq!(home.lock().unwrap().as_ref().unwrap().mapped(), 2 * per);
+        {
+            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone());
+            assert!(home.lock().unwrap().is_none(), "one copy at a time uses it");
+            let a = cow.take_slots(2 * per).unwrap();
+            assert_eq!(cow.slots.mapped(), 2 * per, "all of it free again");
+            cow.give_slots(a);
+            let a = cow.take_slots(1).unwrap();
+            cow.give_slots(a);
+        }
+        // This copy used both chunks at once: kept.
+        assert_eq!(home.lock().unwrap().as_ref().unwrap().mapped(), 2 * per);
+        {
+            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone());
+            let a = cow.take_slots(10).unwrap();
+            cow.give_slots(a);
+        }
+        assert_eq!(home.lock().unwrap().as_ref().unwrap().mapped(), per, "trimmed to the last copy's peak");
+        {
+            let _idle = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone());
+        }
+        assert_eq!(home.lock().unwrap().as_ref().unwrap().mapped(), 0, "an idle copy keeps none");
+    }
+
     /// A writer that finds the rescued copy of a page gone: because the copy
     /// was stopped under it (it says why, `aborted`), or, while the copy is
     /// still active, an integrity error.
@@ -712,7 +961,7 @@ mod tests {
             let cow = Cow::new(64, &vec![(0, 2, REMOTE)]);
             // Page 1 was rescued by a fault; the writer reads page 0 itself.
             assert!(cow.claim(1, PENDING, RESCUING));
-            cow.rescue_many(1, 2, [(1, vec![1u8; PAGE_SIZE].into())]);
+            cow.rescue_copies(1, 2, [(1, vec![1u8; PAGE_SIZE].into())]);
             let gate = Gate { entered: std::sync::Barrier::new(2), go: std::sync::Barrier::new(2) };
             let pages = CowPages { guest: &gate, cow: &cow, slow: || Duration::ZERO };
             let mut buf = vec![0u8; 2 * PAGE_SIZE];
@@ -724,7 +973,7 @@ mod tests {
                 if abort {
                     cow.invalidate("the copy was aborted");
                 } else {
-                    cow.rescued.lock().unwrap().remove(&1);
+                    cow.rescued[1].swap(0, Ordering::SeqCst);
                 }
                 gate.go.wait();
                 w.join().unwrap().unwrap_err().to_string()

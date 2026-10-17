@@ -533,10 +533,23 @@ through, so the checkpoint is exactly the memory at the pause.
   and 1.5–1.9 s at 4 GiB).
 - **The copy.** The parallel writer reads each unsaved page out of
   Firecracker and writes it as before. A write fault on an unsaved page
-  copies its block into memory (a "rescue": 120–250 µs here, a heavily
-  loaded host) before unprotecting it; writers take the rescued copy. Past
-  256 MiB of rescued copies a fault waits for the writers to reach its page
-  instead. Writers never unprotect anything, so tracking continues.
+  copies the unsaved pages of its whole block (16 to 512 pages, as above)
+  into memory (a "rescue", about 1 µs a page here) before unprotecting it;
+  writers take the rescued copy. Past 256 MiB of rescued copies a fault
+  waits for the writers to reach its page instead. Writers never unprotect
+  anything, so tracking continues. Each fault costs the guest about 50 µs
+  besides its rescue (KVM's exit and refault, waking the pager and the
+  vCPU), so a fault saves its whole block rather than 64 pages of it
+  (#630): with a guest rewriting 2 × 128 MiB, 1–8 GiB, about 228 faults a
+  checkpoint instead of 650–840, and total stall 87–102 ms instead of
+  130–142 for incremental checkpoints (97–111 instead of 168–355 for
+  full ones), the pause unchanged. Rescues copy
+  into 2 MiB chunks of memory (huge pages) kept from one copy for the
+  next, as much as the last one held at once, up to the 256 MiB budget, per
+  VM taking keep-running checkpoints, outside admission like the hot
+  pages': fresh memory faulted in here cost more than the copy itself
+  (1.3–2.5 µs a page, 60 ms of a 150 ms fault budget). Reading on more
+  threads at once was slower.
 - **Hot pages** (#235). Every `UFFDIO_WRITEPROTECT`, protect or unprotect,
   makes KVM zap its mappings of the whole range (6.18 ignores the notifier's
   event type) and flush every vCPU's TLB: after the resume the guest

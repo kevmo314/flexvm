@@ -240,6 +240,8 @@ pub struct Runtime {
     /// Memory for the next checkpoint's hot pages, and the hot pages of the last one, while it is the delta base (see
     /// `hot`).
     hot_spare: Mutex<Option<hot::Buf>>,
+    /// Memory for rescued copies, kept from one checkpoint copy for the next (`Cow::keep_slots`).
+    slot_spare: Arc<Mutex<Option<crate::cow::Slots>>>,
     hot_prev: Mutex<Option<Arc<Held>>>,
     /// The previous interval's snapshot, shared with Frozen for rollback, and sparse words for kept hot pages.
     hot_dirty: Mutex<Arc<pages::DirtyBits>>,
