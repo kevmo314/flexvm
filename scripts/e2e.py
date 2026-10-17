@@ -363,6 +363,11 @@ class Host:
         left = [f"firecracker pid {p}" for p in self.firecrackers()] + [f"tap {t}" for t in self.taps()]
         left += [f"cgroup {c}" for c in self.cgroups()]
         left += [f"process {p}" for p in self.processes()]
+        # The lane's next batch hands out the same addresses: a host route into them would be its surprise.
+        net = ipaddress.IPv4Network(f"{self.net}.0/24")
+        routes = subprocess.run(["ip", "-4", "route", "show"], capture_output=True, text=True).stdout.splitlines()
+        left += [f"route {r}" for r in routes if r.split() and r.split()[0].count(".") == 3 and "/" not in r.split()[0]
+                 and ipaddress.IPv4Address(r.split()[0]) in net]
         locks = os.path.join(self.run_dir, "vms", ".locks")
         left += [f"vm {v}" for v in os.listdir(locks) if v.endswith(".lock")] if os.path.isdir(locks) else []
         return left
