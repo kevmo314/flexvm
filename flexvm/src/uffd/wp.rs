@@ -205,13 +205,18 @@ impl Pager {
     }
 
     /// Test fault `ckpt_rescue_fail`, once the writers run: every other rescue fails after its claim, with a writer
-    /// asked to take its first page meanwhile, so that the writer finds the page RESCUING and then given back.
+    /// asked to take its first page meanwhile, so that the writer finds the page RESCUING and then given back. Until a
+    /// writer has (in this copy), the failure waits for one to (up to 200 ms: `ckpt_slow` writers sleep 50 ms before
+    /// each unit, which a fixed 5 ms caught only by chance, never on a slow host); then 5 ms.
     fn rescue_fail(&self, cow: &Cow, claimed: &[usize]) -> io::Result<()> {
         if !self.rescue_fail.load(Ordering::Relaxed) || !cow.writing() || self.rescue_tries.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
             return Ok(());
         }
         cow.want(claimed[0]);
-        thread::sleep(Duration::from_millis(5));
+        let (start, wait) = (Instant::now(), if cow.rescue_waits() == 0 { 200 } else { 5 });
+        while start.elapsed() < Duration::from_millis(wait) && !(wait > 5 && cow.rescue_waits() > 0) {
+            thread::sleep(Duration::from_micros(200));
+        }
         Err(io::Error::other("injected fault: rescue failed"))
     }
 
@@ -619,7 +624,7 @@ mod tests {
     use crate::uffd::pages::{Pages, CHUNK};
     use crate::uffd::{FaultStats, Runtime, ZERO};
 
-    /// Guest memory for rescues: page `p` filled with `p as u8 + 1`, unless absent.
+    /// Guest memory for rescues: page `p` filled with `p + 1` (mod 256), unless absent.
     fn guest_read(mem: &[u8]) -> impl Fn(usize, &[libc::iovec]) -> io::Result<()> + Sync + '_ {
         move |p, local| {
             let mut at = p * PAGE_SIZE;
@@ -631,8 +636,9 @@ mod tests {
         }
     }
 
+    /// Page `p` filled with `p + 1` (mod 256).
     fn guest_mem(n: usize) -> Vec<u8> {
-        (0..n * PAGE_SIZE).map(|i| (i / PAGE_SIZE) as u8 + 1).collect()
+        (0..n * PAGE_SIZE).map(|i| ((i / PAGE_SIZE) as u8).wrapping_add(1)).collect()
     }
 
     #[test]
@@ -664,7 +670,7 @@ mod tests {
         assert_eq!(reads[1].0, 5);
         assert_eq!((reads[2].0, reads[2].1.iter().sum::<usize>()), (9, 2));
         for (&p, s) in claimed.iter().zip(&slots) {
-            let want = if p == 4 { 0 } else { p as u8 + 1 };
+            let want = if p == 4 { 0 } else { (p as u8).wrapping_add(1) };
             assert!(unsafe { std::slice::from_raw_parts(s.as_mut_ptr(), PAGE_SIZE) }.iter().all(|&b| b == want), "page {p}");
         }
         cow.give_slots(slots);
@@ -720,7 +726,7 @@ mod tests {
                 let want = match p {
                     2 => 3,
                     6 => 0,
-                    _ => p as u8 + 1,
+                    _ => (p as u8).wrapping_add(1),
                 };
                 assert!(page.iter().all(|&b| b == want), "page {p}");
             }

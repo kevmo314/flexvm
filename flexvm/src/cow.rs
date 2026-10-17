@@ -111,6 +111,8 @@ pub struct Cow {
     stopped: AtomicBool,
     /// Whether a writer has started reading pages (`CowPages::read`).
     writing: AtomicBool,
+    /// Times a writer waited for a rescue to settle (`wait_rescued`), for test fault `ckpt_rescue_fail`.
+    rescue_waits: AtomicU64,
     error: Mutex<Option<String>>,
     started: Instant,
     /// The pages to save, as `[first, end)` runs.
@@ -143,6 +145,7 @@ impl Cow {
             fault_waits: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             writing: AtomicBool::new(false),
+            rescue_waits: AtomicU64::new(0),
             error: Mutex::new(None),
             started: Instant::now(),
             runs,
@@ -178,6 +181,10 @@ impl Cow {
 
     fn set(&self, page: usize, state: u8) {
         self.states[page].store(state, Ordering::SeqCst)
+    }
+
+    pub fn rescue_waits(&self) -> u64 {
+        self.rescue_waits.load(Ordering::SeqCst)
     }
 
     /// Whether the writers have started, so may claim pages under a fault.
@@ -222,6 +229,7 @@ impl Cow {
     /// Parks a writer while `page` is RESCUING, until the rescue keeps its copy, gives it back, or the copy stops. No
     /// wakeup is lost: each of those changes the state (or stops) before it notifies under `progress`'s lock.
     fn wait_rescued(&self, page: usize) {
+        self.rescue_waits.fetch_add(1, Ordering::SeqCst);
         let g = self.progress.0.lock().unwrap();
         drop(self.progress.1.wait_while(g, |_| self.active() && self.state(page) == RESCUING).unwrap());
     }
