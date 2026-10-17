@@ -718,7 +718,7 @@ pub fn interrupted() -> Result<()> {
 
 /// Held shared while a build makes its staging directory and while it publishes, exclusive
 /// while one sweeps: a staging directory without a lock, or a link, seen under it is dead.
-fn templates_lock(paths: &Paths, how: i32) -> Result<crate::host::Flock> {
+pub(crate) fn templates_lock(paths: &Paths, how: i32) -> Result<crate::host::Flock> {
     Ok(crate::host::Flock::new(template_lock(paths, "templates", "")?, how)?)
 }
 
@@ -1133,6 +1133,11 @@ pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
     // No build publishes meanwhile (they take it shared).
     let _l = templates_lock(paths, libc::LOCK_EX)?;
+    remove_locked(paths, images, name, id, in_use)
+}
+
+/// `remove`, with the templates directory pinned and its lock held exclusively by the caller.
+pub(crate) fn remove_locked(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Value> {
     sweep_locked(paths, images)?;
     // Test gate: what the caller saw of the VMs here may be out of date by the time this goes on.
     crate::host::hold("rmi_hold");
