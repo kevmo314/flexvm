@@ -33,7 +33,8 @@ so stopping its starter's cgroup (a systemd unit's restart with
 `KillMode=control-group`, a oneshot unit's end, logind's `KillUserProcesses`)
 does not reach it. Its Firecrackers move on to `flexvm/idle-PID-START-N`. Without
 cgroup2 it stays where it was started, and says so in its log. A foreground
-VM process stays in its caller's cgroup.
+VM process stays in its caller's cgroup, and a foreground `run` that claims a
+standby VM moves that VM's process into the caller's cgroup (`util::join_my_cgroup`).
 
 **Resource caps** (`Resources`, `vm.rs`). `run --cpus N` sets `cpu.max` on
 the VM's Firecracker cgroup (a quota of N times its 100 ms period; the vCPU
@@ -510,7 +511,7 @@ standby VMs until there are N: each is `flexvm run --standby`, a VM process
 that restores the template, lets the guest reseed and settle, pauses, and
 listens on `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters of the template's name;
 the claim request carries the generation key). `flexvm run` claims one (`claim
-{name, ip, cmd, generation}` with its stdout/stderr passed over SCM_RIGHTS): the standby
+{name, ip, cmd, generation, attached}` with its stdout/stderr passed over SCM_RIGHTS): the standby
 takes the name and address, routes, resumes, sends `START`, and becomes that
 VM. A claimed standby starts its replacement, and every 5 s the listener and
 each running VM process refill any pool below its target (skipped while
@@ -518,7 +519,11 @@ another refill holds the lock, for a minute after memory pressure stopped
 standby VMs, and for a minute after a template's refill failed), so a pool
 comes back after a reboot, a template rebuild or a standby's death. A foreground `run` that claimed
 one forwards its signals to it and exits with the status the VM process sends
-back on the claim connection. Under memory pressure standby VMs are stopped
+back on the claim connection. Its claim is `attached`: the VM process watches that
+connection, and if the `run` hangs up before it is told the status (SIGKILLed, say)
+the VM is destroyed, as a cold foreground run's VM (that process) would be. The `run`
+also moves the VM process into its own cgroup, where a cold run's VM process is. A
+detached claim (`run -d`) hangs up once answered, and its VM runs on. Under memory pressure standby VMs are stopped
 (SIGUSR1) first. The count is explicit, and refills stop under the eviction mark; one refill
 of a template runs at a time (`.locks/refill`), and waits until the standby
 VMs it starts are ready (a minute at most each), so concurrent claims never overfill. A claim sent

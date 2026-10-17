@@ -3,7 +3,8 @@
 //! `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters) and holds
 //! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, generation}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
-//! started the VM and is never retried elsewhere. `{"exit": code}` follows.
+//! started the VM and is never retried elsewhere. `{"exit": code}` follows. An
+//! `attached` claim (a foreground `run`'s) ends the VM if the claimer hangs up first.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -497,7 +498,27 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 if let [out, err, ..] = &fds[..] {
                     crate::util::output::retarget([out.as_raw_fd(), err.as_raw_fd()]);
                 }
+                // A foreground claimer follows the VM, as a cold foreground run's process is it:
+                // one gone later (SIGKILLed) leaves the VM to no one, so it goes too. A detached
+                // claimer hangs up once answered.
+                let watch = (req["attached"] == json!(true)).then(|| c.try_clone());
                 *p.claimer.lock().unwrap() = Some(c);
+                match watch {
+                    Some(Ok(w)) => {
+                        let (p, n) = (p.clone(), req["name"].as_str().unwrap_or("").to_string());
+                        std::thread::spawn(move || {
+                            crate::util::wait_hung_up(&w);
+                            // Taken by `finish`: the VM is ending, and the claimer hung up once told.
+                            if p.claimer.lock().unwrap().is_none() {
+                                return;
+                            }
+                            crate::log!("vm {n}: its claimer (a foreground run) is gone: destroying it");
+                            crate::log!("vm {n}: {}", p.destroy(crate::vmproc::FAILED));
+                        });
+                    }
+                    Some(Err(e)) => crate::log!("vm {}: its claimer is not watched: {e}", req["name"].as_str().unwrap_or("")),
+                    None => {}
+                }
                 for f in p.files.lock().unwrap().drain(..) {
                     let _ = std::fs::remove_file(f);
                 }

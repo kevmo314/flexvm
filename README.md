@@ -377,7 +377,10 @@ needed. Likewise logind's `KillUserProcesses`, or the end of a
 running. A foreground `flexvm run IMAGE` (or `start -a`) stays in its
 caller's cgroup, so a service whose `ExecStart` is one is supervised like any
 process: stopping it sends SIGTERM, which suspends the VM to disk (give it
-`TimeoutStopSec` for that), and `KillSignal=SIGINT` destroys it instead.
+`TimeoutStopSec` for that), and `KillSignal=SIGINT` destroys it instead. A
+foreground run that claims a standby VM moves that VM's process into its
+cgroup, so this holds for it too, and killing the run (SIGKILL) destroys the
+VM, as it would a cold run's.
 
 ## Fast starts
 

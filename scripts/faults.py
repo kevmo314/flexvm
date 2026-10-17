@@ -7422,6 +7422,50 @@ def standby_claim_signal():
         cli(A, "pull", t, "--standby", "0")
 
 
+def standby_claim_orphan():
+    """A foreground `run` that claimed a standby VM, SIGKILLed once the VM runs (a CI job's
+    timeout): the VM goes, as a cold foreground run's would (its process is that run), and
+    its name and address are free again. A foreground claim's VM process is in its caller's
+    cgroup, as a cold run's is. A detached claim (`-d`) runs on after its `run` exits."""
+    t, n, d, e = args.template, "ft-sb-orphan", "ft-sb-orphan-d", "ft-sb-orphan-e"
+    scenario_vms.update([n, d, e])
+    ok(set_standby(A, t, 1))
+    try:
+        check("standby claim orphan: a standby ready", wait_for(lambda: len(standby_socks(A, t)) == 1, 60), standby_pids(A, t))
+        # Output to a file: an orphaned VM would hold a pipe open, and reading it would never end.
+        out = tempfile.TemporaryFile("w+")
+        p = spawn_cli(A, "run", "--name", n, t, "sleep 600", stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
+
+        def said():
+            out.seek(0)
+            return out.read()
+        check("standby claim orphan: the foreground run claims the standby", wait_for(lambda: '"standby":true' in said().replace(" ", ""), 60), said()[-800:])
+        check("standby claim orphan: the claimed vm runs", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+        v = vms(A)[n]
+        pid, ip = v["pid"], v["ip"]
+        check("standby claim orphan: the claimed vm is in its caller's cgroup", open(f"/proc/{pid}/cgroup").read() == open("/proc/self/cgroup").read(),
+              open(f"/proc/{pid}/cgroup").read())
+        p.kill()
+        p.wait()
+        check("standby claim orphan: the claimed vm is destroyed", wait_for(lambda: n not in vms(A) and not alive(pid), 30), (vms(A).get(n), log(A, n)[-1500:]))
+        # Its name and address are free: a run of that name at that address starts (cold, or the refill's claim).
+        r = cli_json(A, "run", "--name", n, "--ip", ip, "-d", t)
+        check("standby claim orphan: its name and address are free again", r["ok"] and r["result"]["ip"] == ip, r)
+        kill(A, n)
+        check("standby claim orphan: a standby ready again", wait_for(lambda: len(standby_socks(A, t)) == 1, 60), standby_pids(A, t))
+        r = ok(cli_json(A, "run", "--name", d, "-d", t, "sleep 600"))
+        check("standby claim orphan: the detached run claims the standby", r["standby"] is True, r)
+        time.sleep(2)
+        check("standby claim orphan: a detached claim runs on after its run exits", vms(A).get(d, {}).get("state") == "running" and alive(r["pid"]), vms(A).get(d))
+        # A foreground claim whose command ends: its run is told the status, and hangs up then, unremarked.
+        check("standby claim orphan: a standby ready for a command", wait_for(lambda: len(standby_socks(A, t)) == 1, 60), standby_pids(A, t))
+        code, out, err = cli(A, "run", "--name", e, t, "echo hi")
+        check("standby claim orphan: a foreground claim's command ends, its status told", code == 0 and out == "hi" and '"standby":true' in err.replace(" ", ""), (code, out, err))
+        check("standby claim orphan: a told claimer's hang-up destroys nothing", "is gone" not in err, err)
+    finally:
+        cli(A, "pull", t, "--standby", "0")
+
+
 def standby_dir(run, t):
     """RUN/standby/HASH: HASH is 16 hex characters; `standby::dir` hashes the template's name (`template::Hash`)."""
     m, h = (1 << 64) - 1, 0xcbf29ce484222325
@@ -9429,7 +9473,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
-    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
+    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
