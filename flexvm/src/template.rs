@@ -1123,14 +1123,19 @@ pub fn generation_by_prefix(paths: &Paths, id: &str) -> Result<String> {
 }
 
 /// `rmi`: removes the name `name` (if given), then the generation `id` (the one the name linked to)
-/// unless a name still links to it or a VM here uses it (`in_use`, content ids), and the image
-/// root filesystems that no generation left uses. The caller checked that no VM uses the name.
-pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use: &BTreeSet<String>) -> Result<Value> {
+/// unless a name still links to it or a VM here uses it, and the image root filesystems that no
+/// generation left uses. The caller checked that no VM uses the name. `in_use` reads the content ids
+/// VMs here use from their records (`Host::template_users`); it is read under the generation's
+/// exclusive use lock, after every process that had the generation open let it go: a VM that
+/// suspended (or started resuming) since an earlier read is seen then.
+pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Value> {
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
     // No build publishes meanwhile (they take it shared).
     let _l = templates_lock(paths, libc::LOCK_EX)?;
     sweep_locked(paths, images)?;
+    // Test gate: what the caller saw of the VMs here may be out of date by the time this goes on.
+    crate::host::hold("rmi_hold");
     if let Some(name) = name {
         check_name(name)?;
         let link = paths.templates.join(name);
@@ -1147,12 +1152,6 @@ pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use
         }
         return Ok(json!({"untagged": name, "kept": id, "reason": format!("{} is the same image", image_of(other))}));
     }
-    if in_use.contains(id) {
-        if name.is_none() {
-            bail!("image {id} is used by a VM here");
-        }
-        return Ok(json!({"untagged": name, "kept": id, "reason": "used by a VM here"}));
-    }
     let gens = paths.templates.join(GENERATIONS);
     // Kept while a VM process has it open (one starting has no registry entry yet).
     let st = crate::util::fstat(File::open(gens.join(id))?.as_raw_fd())?;
@@ -1165,6 +1164,12 @@ pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use
         }
         r => r?,
     };
+    if in_use().contains(id) {
+        if name.is_none() {
+            bail!("image {id} is used by a VM here");
+        }
+        return Ok(json!({"untagged": name, "kept": id, "reason": "used by a VM here"}));
+    }
     let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
     std::fs::rename(gens.join(id), &tombstone)?;
     crate::util::sync_dir(&gens)?;
@@ -1172,23 +1177,38 @@ pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use
     Ok(json!({"untagged": name, "deleted": id, "rootfs": removed_rootfs}))
 }
 
-/// Under the templates lock. Tombstones are no longer rootfs users. Their metadata stays
-/// intact until rootfs cleanup finishes, so a sweep can retry after an interrupted removal.
+/// Under the templates lock. A tombstone's generation is gone, but it stays a rootfs user until
+/// its rootfs is decided: its `meta.json` is kept (the rest removed) while a pull uses the rootfs
+/// (`Removal::InUse`), and the next sweep asks again, so a pull that fails leaves no rootfs nothing
+/// will remove. Interrupted, a sweep retries it the same way.
 fn finish_remove(paths: &Paths, tombstone: &Path, images: &Path) -> Result<Option<PathBuf>> {
+    let gens = paths.templates.join(GENERATIONS);
     let mut removed = None;
     if let Ok(meta) = Meta::read(tombstone) {
         let rootfs = meta.rootfs;
-        let gens = paths.templates.join(GENERATIONS);
         let mut used = false;
         for g in generations(&paths.templates)? {
             used |= Meta::read(&gens.join(g)).map_or(true, |m| m.rootfs == rootfs);
         }
-        if !used && crate::image::remove_rootfs(images, &rootfs)? {
-            removed = Some(rootfs);
+        match if used { crate::image::Removal::Absent } else { crate::image::remove_rootfs(images, &rootfs)? } {
+            crate::image::Removal::Removed => removed = Some(rootfs),
+            crate::image::Removal::Absent => {}
+            crate::image::Removal::InUse => {
+                for entry in std::fs::read_dir(tombstone)? {
+                    let entry = entry?;
+                    match entry.file_name() {
+                        n if n == "meta.json" => {}
+                        _ if entry.file_type()?.is_dir() => std::fs::remove_dir_all(entry.path())?,
+                        _ => std::fs::remove_file(entry.path())?,
+                    }
+                }
+                crate::util::sync_dir(tombstone)?;
+                return Ok(None);
+            }
         }
     }
     std::fs::remove_dir_all(tombstone)?;
-    crate::util::sync_dir(&paths.templates.join(GENERATIONS))?;
+    crate::util::sync_dir(&gens)?;
     Ok(removed)
 }
 
@@ -1510,21 +1530,21 @@ mod tests {
         assert_eq!(generation_by_prefix(&f.paths, "aaaa").unwrap(), "aaaa1111");
         assert!(generation_by_prefix(&f.paths, "aaa").is_err());
         assert!(generation_by_prefix(&f.paths, "dddd").is_err());
-        assert!(remove(&f.paths, &images_dir, None, "cccc3333", &none).unwrap_err().to_string().contains("flexvm rmi u:latest"));
+        assert!(remove(&f.paths, &images_dir, None, "cccc3333", &|| none.clone()).unwrap_err().to_string().contains("flexvm rmi u:latest"));
         let vm = BTreeSet::from(["aaaa1111".to_string()]);
-        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &vm).is_err());
+        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &|| vm.clone()).is_err());
         // A name goes; its generation too, unless a VM here uses it.
-        let r = remove(&f.paths, &images_dir, Some("t"), "bbbb2222", &none).unwrap();
+        let r = remove(&f.paths, &images_dir, Some("t"), "bbbb2222", &|| none.clone()).unwrap();
         assert_eq!(r["deleted"], "bbbb2222");
         assert!(Template::resolve(&f.paths, "t").is_err() && Template::generation(&f.paths, "bbbb2222").is_none());
         assert!(Template::generation(&f.paths, "aaaa1111").is_some(), "an earlier pull's stays for its VMs");
         let used = BTreeSet::from(["cccc3333".to_string()]);
-        assert_eq!(remove(&f.paths, &images_dir, Some("u"), "cccc3333", &used).unwrap()["kept"], "cccc3333");
+        assert_eq!(remove(&f.paths, &images_dir, Some("u"), "cccc3333", &|| used.clone()).unwrap()["kept"], "cccc3333");
         assert!(Template::resolve(&f.paths, "u").is_err() && Template::generation(&f.paths, "cccc3333").is_some());
-        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &none).unwrap()["deleted"], "aaaa1111");
+        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &|| none.clone()).unwrap()["deleted"], "aaaa1111");
         // A name pulled again since it was looked up is left alone.
         publish_as(&f, "v", &gen("dddd4444"));
-        assert!(remove(&f.paths, &images_dir, Some("v"), "cccc3333", &none).unwrap_err().to_string().contains("pulled again"));
+        assert!(remove(&f.paths, &images_dir, Some("v"), "cccc3333", &|| none.clone()).unwrap_err().to_string().contains("pulled again"));
         assert!(Template::resolve(&f.paths, "v").is_ok());
     }
 
@@ -1554,7 +1574,7 @@ mod tests {
         std::fs::write(tombstone.join("mem"), b"remaining").unwrap();
         std::fs::write(&rootfs, b"image").unwrap();
         publish_as(&f, "u", &Meta { id: "bbbb2222".into(), ..meta.clone() });
-        assert_eq!(remove(&f.paths, &cache, Some("u"), "bbbb2222", &BTreeSet::new()).unwrap()["rootfs"], json!(rootfs));
+        assert_eq!(remove(&f.paths, &cache, Some("u"), "bbbb2222", &BTreeSet::new).unwrap()["rootfs"], json!(rootfs));
         assert!(!rootfs.exists());
         assert!(!tombstone.exists(), "rmi finishes earlier tombstones too");
     }
@@ -1570,7 +1590,7 @@ mod tests {
         std::fs::create_dir(&tombstone).unwrap();
         f.write_meta(&Meta { rootfs: rootfs.clone(), ..f.meta.clone() }, &tombstone);
         let used = BTreeSet::from(["aaaa1111".into()]);
-        assert_eq!(remove(&f.paths, &f.paths.images, Some("t"), "aaaa1111", &used).unwrap()["kept"], "aaaa1111");
+        assert_eq!(remove(&f.paths, &f.paths.images, Some("t"), "aaaa1111", &|| used.clone()).unwrap()["kept"], "aaaa1111");
         assert!(!tombstone.exists());
         assert!(!rootfs.exists());
     }
@@ -1623,7 +1643,7 @@ mod tests {
         assert!(!tombstone.exists());
         assert!(rootfs.exists());
         assert!(Template::resolve(&f.paths, "t").is_ok());
-        assert_eq!(remove(&f.paths, &cache, Some("t"), "aaaa1111", &BTreeSet::new()).unwrap()["rootfs"], json!(rootfs));
+        assert_eq!(remove(&f.paths, &cache, Some("t"), "aaaa1111", &BTreeSet::new).unwrap()["rootfs"], json!(rootfs));
         assert!(!rootfs.exists());
     }
 
@@ -1635,14 +1655,96 @@ mod tests {
         // A cold run between opening its template and registering its VM: no VM entry names it.
         let starting = Template::open(&f.paths, "t").unwrap();
         let none = BTreeSet::new();
-        let r = remove(&f.paths, &images_dir, Some("t"), "aaaa1111", &none).unwrap();
+        let r = remove(&f.paths, &images_dir, Some("t"), "aaaa1111", &|| none.clone()).unwrap();
         assert_eq!((r["kept"].as_str(), r["reason"].as_str()), (Some("aaaa1111"), Some("open in a VM process here")));
-        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &none).unwrap_err().to_string().contains("open in a VM process"));
+        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &|| none.clone()).unwrap_err().to_string().contains("open in a VM process"));
         assert!(Template::generation(&f.paths, "aaaa1111").is_some());
         assert_eq!(starting.pages(0, 0).len(), 0);
         drop(starting);
-        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &none).unwrap()["deleted"], "aaaa1111");
+        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &|| none.clone()).unwrap()["deleted"], "aaaa1111");
         assert!(Template::open_dir("t", f.dir.join(GENERATIONS).join("aaaa1111")).is_err());
+    }
+
+    /// #631: a VM that suspends while `rmi` runs lets its use lock go only after its checkpoint (the
+    /// record that names the generation) is published, so `rmi` must read the records after it holds
+    /// the use lock exclusively, not before: every round, the VM is a user at each moment, and the
+    /// generation stays.
+    #[test]
+    fn rmi_keeps_the_generation_of_a_vm_that_suspends_meanwhile() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        let f = Fixture::new();
+        let images_dir = f.dir.join("images");
+        let (mut open_seen, mut record_seen) = (0, 0);
+        for round in 0..200u32 {
+            let id = format!("{:08x}", 0xa000_0000u32 + round);
+            publish_as(&f, "t", &Meta { id: id.clone(), image: Some(image("sha256:a", "")), ..f.meta.clone() });
+            let suspended = Arc::new(AtomicBool::new(false));
+            let tpl = Template::open(&f.paths, "t").unwrap();
+            let (go, started) = mpsc::channel();
+            let vm = {
+                let suspended = suspended.clone();
+                std::thread::spawn(move || {
+                    started.recv().unwrap();
+                    for _ in 0..round % 50 {
+                        std::thread::yield_now();
+                    }
+                    // The suspend: its checkpoint published, then the process ends.
+                    suspended.store(true, Ordering::SeqCst);
+                    drop(tpl);
+                })
+            };
+            let gen = Template::generation(&f.paths, &id).unwrap();
+            let in_use = || {
+                // Read under the exclusive use lock: no process may take it shared now.
+                let st = crate::util::fstat(File::open(&gen).unwrap().as_raw_fd()).unwrap();
+                let lock = crate::host::open_lock(&crate::host::host_locks().unwrap(), crate::host::use_lock(&st).as_ref()).unwrap();
+                assert!(crate::host::flock(&lock, libc::LOCK_SH | libc::LOCK_NB).is_err(), "read before the use lock was held");
+                if suspended.load(Ordering::SeqCst) {
+                    BTreeSet::from([id.clone()])
+                } else {
+                    BTreeSet::new()
+                }
+            };
+            go.send(()).unwrap();
+            let r = remove(&f.paths, &images_dir, Some("t"), &id, &in_use).unwrap();
+            vm.join().unwrap();
+            match r["reason"].as_str() {
+                Some("open in a VM process here") => open_seen += 1,
+                Some("used by a VM here") => record_seen += 1,
+                _ => panic!("round {round}: the generation of a VM suspending meanwhile went: {r}"),
+            }
+            assert!(Template::generation(&f.paths, &id).is_some());
+        }
+        assert!(record_seen > 0, "no round saw the VM suspended first ({open_seen} saw it open)");
+    }
+
+    /// A tombstone stays a rootfs user while a pull holds the rootfs: kept (its `meta.json` only) and
+    /// asked again by each sweep, so a pull that fails leaves no rootfs behind that nothing removes.
+    #[test]
+    fn a_tombstone_waits_for_a_pull_holding_its_rootfs() {
+        let f = Fixture::new();
+        let rootfs = f.paths.images.join("rootfs/a.ext4");
+        std::fs::create_dir_all(rootfs.parent().unwrap()).unwrap();
+        for ext in ["ext4", "ok", "conf"] {
+            std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+        }
+        publish_as(&f, "t", &Meta { id: "aaaa1111".into(), rootfs: rootfs.clone(), ..f.meta.clone() });
+        let st = crate::util::fstat(File::open(&rootfs).unwrap().as_raw_fd()).unwrap();
+        let pulling = crate::host::shared_at(&crate::host::host_locks().unwrap(), &crate::host::use_lock(&st)).unwrap();
+        let r = remove(&f.paths, &f.paths.images, Some("t"), "aaaa1111", &BTreeSet::new).unwrap();
+        assert_eq!((r["deleted"].as_str(), &r["rootfs"]), (Some("aaaa1111"), &Value::Null));
+        let gens = f.paths.templates.join(GENERATIONS);
+        let left: Vec<PathBuf> = std::fs::read_dir(&gens).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(left.len(), 1, "the tombstone stays");
+        let files: Vec<_> = std::fs::read_dir(&left[0]).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(files, ["meta.json"]);
+        sweep(&f.paths, &f.paths.images).unwrap();
+        assert!(left[0].exists() && rootfs.exists(), "still held");
+        // The pull failed: the next sweep removes the rootfs, then the tombstone.
+        drop(pulling);
+        sweep(&f.paths, &f.paths.images).unwrap();
+        assert!(!left[0].exists() && !rootfs.exists() && !rootfs.with_extension("ok").exists());
     }
 
     #[test]
