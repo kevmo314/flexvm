@@ -7445,6 +7445,45 @@ def standby_socks(host, t):
     return [f for f in os.listdir(d) if f.endswith(".sock")] if os.path.isdir(d) else []
 
 
+def standby_claim_caps():
+    """A claim's --cpus and --memory are its own: one refused at its name (taken) leaves the
+    standby it reached as it was, and the next claim of it, uncapped, sets its cgroup's cpu.max
+    to max itself; a capped claim gets its quota and its memory ceiling."""
+    t = args.template
+    ctl = "/sys/fs/cgroup/flexvm/cgroup.subtree_control"
+    if not os.path.exists(ctl) or "cpu" not in open(ctl).read().split():
+        raise Skip("no cgroup cpu controller")
+
+    def cpu_max(name):
+        cg = open(f"/proc/{fc_pid(A, name)}/cgroup").read().strip().split("::", 1)[1]
+        return open(f"/sys/fs/cgroup{cg}/cpu.max").read().strip()
+
+    held, free, capped = "ft-sbc-held", "ft-sbc-free", "ft-sbc-capped"
+    scenario_vms.update([free, capped])
+    ok(run(A, held))
+    ok(set_standby(A, t, 1))
+    live = lambda: {int(f[:-5].split("-")[0]) for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])}
+    check("standby claim caps: one ready", wait_for(lambda: len(live()) == 1, 60), live())
+    ready = live()
+    r = cli_json(A, "run", "--name", held, "-d", "--cpus", "0.5", "--memory", "1408m", t)
+    check("standby claim caps: a capped claim of a taken name is refused", not r["ok"] and "is taken" in r["error"], r)
+    check("standby claim caps: the standby it reached stays", live() == ready, (live(), ready))
+    r = ok(run(A, free))
+    check("standby claim caps: the next claim takes that standby", r["standby"] is True and r["pid"] in ready, (r, ready))
+    check("standby claim caps: uncapped, its cpu.max is max (not the refused claim's)", cpu_max(free) == "max 100000", cpu_max(free))
+    check("standby claim caps: and no cap listed", vms(A)[free].get("cpus") is None, vms(A)[free])
+    # Claimable once it listens (`PID.sock`), not as soon as its lock is held.
+    claimable = lambda: [p for p in live() if os.path.exists(os.path.join(standby_dir(A.run, t), f"{p}.sock"))]
+    check("standby claim caps: refilled", wait_for(lambda: len(claimable()) == 1, 60), (live(), claimable()))
+    r = ok(cli_json(A, "run", "--name", capped, "-d", "--cpus", "0.5", "--memory", "1408m", t))
+    v = vms(A)[capped]
+    check("standby claim caps: a capped claim gets its quota and ceiling",
+          r["standby"] is True and cpu_max(capped) == "50000 100000" and v.get("cpus") == 0.5 and v.get("max_mib") == 1408, (r.get("standby"), cpu_max(capped), v))
+    ok(set_standby(A, t, 0))
+    for n in (held, free, capped):
+        cleanup(n)
+
+
 def standby_concurrent_claims():
     """Concurrent runs claim different standby VMs at once: none queues on
     another's claim (each parks at the `claim_stall` gate, and both get there
@@ -9390,7 +9429,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
-    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=evict_latency,
+    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),

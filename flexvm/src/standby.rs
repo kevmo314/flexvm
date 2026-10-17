@@ -513,6 +513,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             }
             Err((e, retry)) => {
                 *p.cmd.lock().unwrap() = None;
+                // Nor its caps (`--memory` included): the next claim sets its own.
+                let _ = p.keep_resources(crate::vm::Resources::default());
                 let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": retry}));
                 if p.standby.lock().unwrap().is_none() {
                     p.finish(op, End::NotStarted, crate::vmproc::FAILED, None);
@@ -537,10 +539,15 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     let resources: crate::vm::Resources = serde_json::from_value(req["resources"].clone()).map_err(|e| (format!("bad resources: {e}").into(), false))?;
     let tpl = p.standby.lock().unwrap().as_ref().map(|s| s.template()).ok_or_else(|| ("standby vm gone".into(), true))?;
     p.set_resources(resources, &tpl.meta).map_err(|e| (e, false))?;
-    // Taken uncapped, ahead of the claim: capped now, before it runs.
-    if resources.cpus.is_some() {
+    // Taken ahead of any claim: every claim sets its cgroup's cap, `max` for none, so one an
+    // earlier claim that failed set (after this point) never carries over to this VM.
+    {
         let s = p.standby.lock().unwrap();
-        s.as_ref().ok_or_else(|| ("standby vm gone".into(), true))?.firecracker().set_cpu_max(&resources.cpu_max()).map_err(|e| (e, false))?;
+        let fc = s.as_ref().ok_or_else(|| ("standby vm gone".into(), true))?.firecracker();
+        match fc.set_cpu_max(&resources.cpu_max()) {
+            Err(e) if resources.cpus.is_some() => return Err((e, false)),
+            _ => {}
+        }
     }
     let lock = host.take_name(name, false).map_err(|e| (e, false))?;
     // Its memory is already out of MemAvailable: only the step is charged. Sized
