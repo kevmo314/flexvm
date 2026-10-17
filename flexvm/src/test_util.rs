@@ -1,10 +1,46 @@
 //! Temporary fixtures shared by the host and guest unit tests.
 use std::fs;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
+
+/// Kills and reaps a helper process even when its test unwinds.
+pub struct ChildGuard(pub std::process::Child);
+
+impl Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn helper_process_is_killed_and_reaped_on_unwind() {
+    let child = ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+    let pid = child.id();
+    let result = std::panic::catch_unwind(move || {
+        let _child = child;
+        panic!("exercise child cleanup");
+    });
+    assert!(result.is_err());
+    assert_eq!(unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+}
 
 #[derive(Debug)]
 pub struct TempDir(PathBuf);
@@ -137,7 +173,7 @@ fn temporary_directories_are_unique_and_removed_on_unwind() {
 #[test]
 fn sweep_removes_dead_fixtures_and_preserves_live_and_unrelated_directories() {
     let root = TempDir::new("sweep");
-    let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+    let mut child = ChildGuard(std::process::Command::new("/bin/true").spawn().unwrap());
     let dead = child.id();
     child.wait().unwrap();
     let gone = [

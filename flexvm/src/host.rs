@@ -4646,11 +4646,11 @@ pub(crate) mod tests {
         dead
     }
 
-    struct Sleeper(std::process::Child, Ident);
+    struct Sleeper(crate::test_util::ChildGuard, Ident);
 
     impl Sleeper {
         fn new() -> Sleeper {
-            let c = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            let c = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
             let id = Ident::of(c.id()).unwrap();
             Sleeper(c, id)
         }

@@ -1884,7 +1884,7 @@ mod exec_tests {
                 Ok(())
             });
         }
-        let mut child = child.arg("60").spawn().unwrap();
+        let mut child = crate::test_util::ChildGuard(child.arg("60").spawn().unwrap());
         let mut entry = host::Entry { name: "moving".into(), ident: host::Ident::of(child.id()).unwrap(), state: "source".into(), ..host::Entry::default() };
         // Hold the name on the child's behalf, with its identity in both records.
         std::fs::write(host.vms("moving", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();

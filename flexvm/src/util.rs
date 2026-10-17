@@ -1675,22 +1675,32 @@ mod tests {
 
     #[test]
     fn the_reaper_polls_only_real_fds() {
+        struct Children(Vec<Reaping>);
+        impl Drop for Children {
+            fn drop(&mut self) {
+                for entry in self.0.drain(..) {
+                    drop(crate::test_util::ChildGuard(entry.child));
+                }
+            }
+        }
         let entry = |pidfd: bool, hold: bool| {
             let fd = || OwnedFd::from(UnixStream::pair().unwrap().0);
+            let pidfd = pidfd.then(fd);
+            let hold = hold.then(|| (fd(), Box::new(()) as Box<dyn Send>));
             let child = std::process::Command::new("true").spawn().unwrap();
-            Reaping { child, pidfd: pidfd.then(fd), hold: hold.then(|| (fd(), Box::new(()) as Box<dyn Send>)) }
+            Reaping { child, pidfd, hold }
         };
         // Those without fds add nothing to the poll (no -1 placeholders), then one with both.
-        let mut r: Vec<Reaping> = (0..3).map(|_| entry(false, false)).collect();
-        r.push(entry(true, true));
-        let (fds, whose, timer) = reap_fds(-5, &r);
+        let mut r = Children(Vec::new());
+        for _ in 0..3 {
+            r.0.push(entry(false, false));
+        }
+        r.0.push(entry(true, true));
+        let (fds, whose, timer) = reap_fds(-5, &r.0);
         assert_eq!(fds.len(), 3);
         assert!(fds[1..].iter().all(|f| f.fd >= 0));
         assert_eq!(whose, [(3, false), (3, true)]);
         assert!(timer, "one without a pidfd is tried on a timer");
-        for mut e in r {
-            e.child.wait().unwrap();
-        }
     }
 
     #[test]
@@ -1707,24 +1717,38 @@ mod tests {
         static HELD: AtomicUsize = AtomicUsize::new(0);
         let gone = |pid: u32| !Path::new(&format!("/proc/{pid}")).exists();
         let (done, mut told) = UnixStream::pair().unwrap();
+        let slot = Slot::take(&HELD, 1).unwrap();
         let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
-        reap_later(child, Some((done.into(), Box::new(Slot::take(&HELD, 1).unwrap()))));
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(Slot::take(&HELD, 1).is_none(), "held while the child has not said");
-        // Signal explicitly: a concurrent fork may still hold another copy of `told`.
-        told.write_all(b"done").unwrap();
-        assert!(within(Duration::from_secs(5), || HELD.load(Ordering::SeqCst) == 0), "let go once told");
-        let running = !gone(pid);
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        reap_later(child, Some((done.into(), Box::new(slot))));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(Slot::take(&HELD, 1).is_none(), "held while the child has not said");
+            // Signal explicitly: a concurrent fork may still hold another copy of `told`.
+            told.write_all(b"done").unwrap();
+            assert!(within(Duration::from_secs(5), || HELD.load(Ordering::SeqCst) == 0), "let go once told");
+            assert!(!gone(pid), "the child runs on");
+        }));
+        // Keep the production reaper as the sole waiter, including after a panic.
+        // Holding its mutex prevents the pid from being reused before the kill.
+        {
+            let mut reaping = REAPING.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(child) = reaping.iter_mut().find(|e| e.child.id() == pid) {
+                let _ = child.child.kill();
+            }
+        }
         drop(told);
-        assert!(running, "the child runs on");
-        assert!(within(Duration::from_secs(5), || gone(pid)), "reaped once it exited");
+        let reaped = within(Duration::from_secs(5), || gone(pid));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(reaped, "reaped once it exited");
         // One that ends without saying lets go too, whoever else holds its fd.
         let (done, told) = UnixStream::pair().unwrap();
+        let slot = Slot::take(&HELD, 1).unwrap();
         let child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
-        reap_later(child, Some((done.into(), Box::new(Slot::take(&HELD, 1).unwrap()))));
+        reap_later(child, Some((done.into(), Box::new(slot))));
         assert!(within(Duration::from_secs(5), || HELD.load(Ordering::SeqCst) == 0 && gone(pid)));
         drop(told);
     }

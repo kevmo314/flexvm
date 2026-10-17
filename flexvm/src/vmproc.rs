@@ -3678,7 +3678,7 @@ mod tests {
     }
 
     /// A standby of template `t`, its SIGUSR1 handled by `sigusr1`: its lock held, naming its live process.
-    fn standby(host: &Host, sigusr1: libc::sighandler_t) -> (std::process::Child, crate::host::Flock) {
+    fn standby(host: &Host, sigusr1: libc::sighandler_t) -> (crate::test_util::ChildGuard, crate::host::Flock) {
         let mut child = std::process::Command::new("sleep");
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut child, move || {
@@ -3686,7 +3686,7 @@ mod tests {
                 Ok(())
             });
         }
-        let child = child.arg("30").spawn().unwrap();
+        let child = crate::test_util::ChildGuard(child.arg("30").spawn().unwrap());
         let d = crate::standby::dir(host, "t");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(".template"), "t").unwrap();
@@ -3844,7 +3844,7 @@ mod tests {
     fn eviction_skips_a_replaced_candidate() {
         let root = crate::test_util::TempDir::new("fv-evict-replaced");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let mut original = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut original = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("30").spawn().unwrap());
         let vm = Entry { name: "ev".into(), ident: Ident::of(original.id()).unwrap(), state: "running".into(), ..Entry::default() };
         original.kill().unwrap();
         original.wait().unwrap();
