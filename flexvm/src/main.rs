@@ -845,6 +845,8 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     if alive && !running {
         bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}");
     }
+    // Its tap and route go now, not at a sweep; best effort, as taking the name reaps again where it must.
+    let _ = host.reap_dead_holder(name);
     let records = || -> Result<bool> { Ok(host.suspended(name)?.exists() || host.vms(name, "failed")?.exists() || host.vms(name, "lost")?.exists()) };
     if !alive && !stopped && records()? {
         bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
