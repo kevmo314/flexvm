@@ -197,7 +197,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
             Admission::Peer => {
                 let Some(slot) = ACTIVE.take(from) else { continue };
                 let (host, peers) = (host.clone(), peers.clone());
-                std::thread::spawn(move || serve(&host, &peers, conn, slot, deadline));
+                spawn_request(std::thread::Builder::new(), move || serve(&host, &peers, conn, slot, deadline));
                 continue;
             }
             Admission::Refused => None,
@@ -209,7 +209,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
             continue;
         };
         let (host, peers) = (host.clone(), peers.clone());
-        std::thread::spawn(move || {
+        spawn_request(std::thread::Builder::new(), move || {
             let admitted = peers.admit_by(&host, from, Instant::now() + ADMIT_WAIT);
             drop(waiting);
             match admitted.then(|| ACTIVE.take(from)).flatten() {
@@ -222,10 +222,17 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     Ok(())
 }
 
+fn spawn_request(builder: std::thread::Builder, work: impl FnOnce() + Send + 'static) {
+    // A failed spawn drops the closure, closing its connection and releasing its slot.
+    if let Err(e) = builder.spawn(work) {
+        log_refusal(format_args!("cannot start request worker: {e}"));
+    }
+}
+
 fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Wait, deadline: Instant) {
     let _ = conn.set_nodelay(true);
     if let Err(e) = handle(host, peers, conn, deadline, &LOCKING) {
-        crate::log!("peer request: {e}");
+        log_refusal(e);
     }
 }
 
@@ -498,16 +505,18 @@ impl Peers {
 fn not_a_peer(conn: TcpStream, from: IpAddr) {
     let local = conn.local_addr().map(|a| a.to_string()).unwrap_or_default();
     let e = format!("{from} is not a peer of {local} (add it to peers in that host's host.json)");
-    // A flood of non-peers is counted, not logged line by line.
+    log_refusal(&e);
+    refuse(conn, &e, None);
+}
+
+/// All request refusals share a budget, including those from configured peers.
+fn log_refusal(e: impl std::fmt::Display) {
     static WINDOW: Mutex<RefusalLog> = Mutex::new(RefusalLog { second: 0, logged: 0, unlogged: 0 });
     let second = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let logged = WINDOW.lock().unwrap_or_else(|p| p.into_inner()).take(second);
-    match logged {
-        Some(0) => crate::log!("peer request: {e}"),
-        Some(n) => crate::log!("peer request: {e} ({n} refusals before it not logged)"),
-        None => {}
+    let line = WINDOW.lock().unwrap_or_else(|p| p.into_inner()).line(second, e);
+    if let Some(line) = line {
+        crate::log!("{line}");
     }
-    refuse(conn, &e, None);
 }
 
 /// Refusals logged at most in any one second.
@@ -521,6 +530,13 @@ struct RefusalLog {
 }
 
 impl RefusalLog {
+    fn line(&mut self, second: u64, e: impl std::fmt::Display) -> Option<String> {
+        self.take(second).map(|n| match n {
+            0 => format!("peer request: {e}"),
+            n => format!("peer request: {e} ({n} refusals before it not logged)"),
+        })
+    }
+
     /// Whether a refusal in `second` is logged, with how many were not since the last that was.
     fn take(&mut self, second: u64) -> Option<u64> {
         if self.second != second {
@@ -757,7 +773,7 @@ fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     // Connected only to a valid name's socket in RUN/vms (`connect` checks it).
     if let Err(e) = crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()], Instant::now() + Duration::from_secs(5), None) {
         // The reason stays here: it tells what exists on this host.
-        crate::log!("migration {}: page request for {name:?} refused: {e}", req["mig"]);
+        log_refusal(format_args!("migration {}: page request for {name:?} refused: {e}", req["mig"]));
         crate::vmproc::refuse_not_source(conn, name, &req["mig"]);
     }
     Ok(())
@@ -1442,6 +1458,50 @@ mod tests {
         assert!(first.iter().flatten().all(|&n| n == 0));
         assert_eq!(w.take(6), Some(1000 - REFUSALS_LOGGED as u64));
         assert_eq!(w.take(6), Some(0));
+    }
+
+    #[test]
+    fn configured_peer_errors_share_the_refusal_budget_and_report_suppressed_counts() {
+        let mut w = RefusalLog { second: 0, logged: 0, unlogged: 0 };
+        let errors = ["invalid JSON", "migration 7: page request refused", "not a peer", "cannot start request worker"];
+        for i in 0..100 {
+            let e = errors[i % errors.len()];
+            let line = w.line(5, e);
+            if i < REFUSALS_LOGGED as usize {
+                assert_eq!(line, Some(format!("peer request: {e}")));
+            } else {
+                assert_eq!(line, None);
+            }
+        }
+        assert_eq!(w.line(6, errors[1]), Some(format!("peer request: {} (90 refusals before it not logged)", errors[1])));
+        assert_eq!(w.line(6, errors[0]), Some(format!("peer request: {}", errors[0])));
+    }
+
+    #[test]
+    fn a_failed_request_spawn_closes_the_connection_and_releases_its_slot() {
+        for waiting in [Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM), Waiting::new(MAX_WAITING, MAX_WAITING_FROM), Waiting::new(MAX_MOVED, MAX_MOVED_FROM)] {
+            let from = "127.0.0.1".parse().unwrap();
+            let slot = waiting.take(from).unwrap();
+            let (mut client, conn) = std::os::unix::net::UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (done, ran) = std::sync::mpsc::channel();
+            // An impossible stack allocation fails without exhausting tasks for other tests.
+            spawn_request(std::thread::Builder::new().stack_size(usize::MAX / 2), move || {
+                drop((conn, slot));
+                let _ = done.send(());
+            });
+            assert_eq!(ran.recv_timeout(Duration::from_secs(5)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected), "the request must not run");
+            assert!(waiting.held.lock().unwrap().is_empty(), "the failed spawn must release admission capacity");
+            assert_eq!(client.read(&mut [0]).unwrap(), 0, "the unanswered connection is closed");
+            let slot = waiting.take(from).unwrap();
+            let (done, ran) = std::sync::mpsc::channel();
+            spawn_request(std::thread::Builder::new(), move || {
+                drop(slot);
+                done.send(()).unwrap();
+            });
+            ran.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(waiting.held.lock().unwrap().is_empty());
+        }
     }
 
     fn pair() -> (TcpStream, TcpStream) {
