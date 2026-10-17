@@ -145,9 +145,7 @@ fn network(host: &Host) {
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
     if let Ok(Some(lock)) = gc_lock(host, None) {
-        if let Err(e) = cleanup_locked(host, Some(lock)) {
-            crate::log!("garbage collection: {e}");
-        }
+        cleanup_locked(host, Some(lock)).unwrap_or_else(|e| crate::log!("garbage collection: {e}"));
     }
 }
 

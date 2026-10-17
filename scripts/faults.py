@@ -9832,7 +9832,8 @@ def isolate(scenario):
         if swept is None and "processes" not in left:
             swept = left
             for h in (A, B):
-                cli(h, "debug", "gc")
+                if (gc := cli(h, "debug", "gc"))[0]:
+                    print(f"isolation after {scenario}: debug gc on {h} failed: {gc[2] or gc[1]}", flush=True)
             continue
         time.sleep(0.1)
     # What processes that are gone left as markers (relief's, eviction's) is theirs, not the next scenario's.

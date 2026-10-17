@@ -27,13 +27,6 @@ fn publish_permissions(fd: RawFd, mode: libc::mode_t, owner: &libc::stat) -> io:
     check(unsafe { libc::fchmod(fd, mode) })
 }
 
-pub(super) fn read_vmstate(reader: impl Read) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.take(MAX_VMSTATE + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= MAX_VMSTATE, "its vmstate is over {MAX_VMSTATE} bytes");
-    Ok(bytes)
-}
-
 /// The lock on a checkpoint destination's directory (`st`, its stat) while staging is made
 /// there and stale staging cleared: one per directory on the host, whichever instance.
 pub(super) fn parent_lock(st: &libc::stat, how: i32) -> io::Result<crate::host::HeldLock> {
@@ -108,14 +101,13 @@ impl Staging {
                 parent_path.display()
             );
             check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
-            Ok(open_dir_at(outer.as_raw_fd(), c"ck")?)
+            let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
+            publish_permissions(ck.as_raw_fd(), 0o700, &fstat(pfd.as_raw_fd())?)?;
+            Ok(ck)
         })()
         .inspect_err(|_| remove_staging(pfd.as_raw_fd(), &outer_name, outer.as_raw_fd(), None))?;
         let _ = std::fs::remove_file(&vmstate);
-        let staging =
-            Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: chain_meta_budget(), app_log: 0 };
-        publish_permissions(staging.ck.as_raw_fd(), 0o700, &fstat(staging.parent.as_raw_fd())?)?;
-        Ok(staging)
+        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: chain_meta_budget(), app_log: 0 })
     }
 
     pub fn dest(&self) -> &Path {
@@ -180,7 +172,9 @@ impl Staging {
         // The scope joins every writer before the manifest, including on failure.
         let (out, vmstate) = std::thread::scope(|s| -> Result<_> {
             let state = std::thread::Builder::new().spawn_scoped(s, || -> Result<_> {
-                let vmstate = read_vmstate(File::open(&self.vmstate)?)?;
+                let mut vmstate = Vec::new();
+                File::open(&self.vmstate)?.take(MAX_VMSTATE + 1).read_to_end(&mut vmstate)?;
+                ensure!(vmstate.len() as u64 <= MAX_VMSTATE, "its vmstate is over {MAX_VMSTATE} bytes");
                 self.add_file("vmstate", &vmstate)?;
                 Ok(vmstate)
             })?;
