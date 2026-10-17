@@ -73,11 +73,10 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
         return Ok(true);
     }
     let forwarding = crate::net::ip_forward();
-    if let Some(dev) = host.config_now().announce_dev() {
-        crate::net::proxy_arp(&dev);
-    }
+    let proxy_arp = host.config_now().announce_dev().map_or(Ok(()), |dev| crate::net::proxy_arp(&dev));
     recover(host);
     forwarding?;
+    proxy_arp?;
     if !local {
         bail!("local boot recovery incomplete; see earlier errors");
     }

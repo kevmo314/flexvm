@@ -957,12 +957,17 @@ impl Host {
     /// suspended here with this generation. Another instance of the same name
     /// (a restart after a SIGKILL) does not hold it.
     fn held(&self, a: &Addr) -> bool {
+        self.held_swept(a, false)
+    }
+
+    /// `held`, its dead taps already removed by a sweep when `swept`.
+    fn held_swept(&self, a: &Addr, swept: bool) -> bool {
         let (Some(h), Some(id)) = (a.holder.as_deref(), &a.holder_id) else { return false };
         let instance = match id.liveness() {
             // What cannot be read about its name keeps it held.
             Liveness::Alive => self.held_by(h, id).unwrap_or(true),
             // Until its Firecrackers are reaped.
-            Liveness::Gone => reap(&self.run, id).is_err(),
+            Liveness::Gone => reap_swept(&self.run, id, swept).is_err(),
             Liveness::Unknown => true,
         };
         instance || self.suspended_with(h, a.held)
@@ -1823,7 +1828,7 @@ impl Host {
         self.unlend(&l, ip, gen)?;
         // A dead source's `leaving` claim goes too: withdrawn, nothing is owed for it (#570).
         if let (Some(_), Some(name), Some(by)) = (&a.leaving, &a.holder, &a.holder_id) {
-            if self.dead_and_reaped(&a) {
+            if self.dead_and_reaped(&a, false) {
                 self.release(&l, ip, name, Some(by))?;
             }
         }
@@ -2373,6 +2378,11 @@ impl PidFd {
 /// Removes a dead process's taps and kills and waits for its Firecrackers: they die with it, but not at once.
 /// Anything it cannot read is an error, never nothing to reap.
 pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
+    reap_swept(run, owner, false)
+}
+
+/// `reap`, leaving the taps to a sweep that already removed them when `swept`.
+fn reap_swept(run: &Path, owner: &Ident, swept: bool) -> Result<()> {
     match owner.liveness() {
         Liveness::Gone => {}
         Liveness::Alive => bail!("process {} is alive", owner.pid),
@@ -2380,7 +2390,9 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     }
     trusted_root(run)?;
     trusted_dir(&run.join("w"))?;
-    collect_dead_taps(run, Some(owner));
+    if !swept {
+        collect_dead_taps(run, Some(owner));
+    }
     let dir = owner.work_dir(run);
     match trusted_dir(&dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2766,7 +2778,7 @@ impl Host {
             // the VM is its target's to say, as for a source killed while reconciling.
             if let (Some(left), Some(by)) = (a.leaving.as_ref(), a.holder_id.as_ref()) {
                 // Its generation withdrawn or superseded: nothing is owed, the claim just goes (#570).
-                if !a.current(gen) && self.dead_and_reaped(&a) {
+                if !a.current(gen) && self.dead_and_reaped(&a, true) {
                     match self.release(&l, ip, name, Some(by)) {
                         Ok(()) => crate::log!(
                             "vm {name} died as the source of migration {} to {}: {ip} generation {gen} is withdrawn or superseded, so nothing is owed",
@@ -2777,7 +2789,7 @@ impl Host {
                             crate::log!("vm {name} died as the source of migration {}: letting go of its claim: {e}; retried on the next sweep", left.mig)
                         }
                     }
-                } else if a.current(gen) && self.dead_and_reaped(&a) {
+                } else if a.current(gen) && self.dead_and_reaped(&a, true) {
                     let owe = || {
                         self.owe(left.mig, &Owed { to: left.to.clone(), ip, gen, by: by.clone() })?;
                         self.release(&l, ip, name, Some(by))
@@ -2854,8 +2866,8 @@ impl Host {
     }
 
     /// Proven dead, with its Firecrackers reaped.
-    fn dead_and_reaped(&self, a: &Addr) -> bool {
-        a.holder_id.as_ref().is_some_and(|id| id.liveness() == Liveness::Gone) && !self.held(a)
+    fn dead_and_reaped(&self, a: &Addr, swept: bool) -> bool {
+        a.holder_id.as_ref().is_some_and(|id| id.liveness() == Liveness::Gone) && !self.held_swept(a, swept)
     }
 
     /// Records in `STATE/DIR` by id (`ID`; anything else there, a write's
@@ -2899,7 +2911,7 @@ impl Host {
             && !pulling.contains(id)
             && a.current(a.held)
             && (settled || a.lent.is_none_or(|lent| lent < a.held))
-            && self.dead_and_reaped(a)
+            && self.dead_and_reaped(a, true)
             && self.suspended(name).is_ok_and(|d| !quarantined_now(&d))
     }
 
@@ -3081,7 +3093,7 @@ fn collect_owned(run: &Path) {
     }
     for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {
         let owner = load::<Ident>(&e.path().join("owner")).ok().flatten();
-        if owner.is_some_and(|o| reap(run, &o).is_ok()) {
+        if owner.is_some_and(|o| reap_swept(run, &o, true).is_ok()) {
             crate::socket::remove(&e.path());
             let _ = std::fs::remove_dir_all(e.path());
         }
@@ -3097,7 +3109,7 @@ fn collect_owned(run: &Path) {
         // Reaped first, without the lock: a start may take the name meanwhile (`take_name`
         // waits only briefly for a sweep), and then the holder read again under it differs.
         let reaped = match lock_holder(&path) {
-            Ok(Some(o)) if o.liveness() == Liveness::Gone && reap(run, &o).is_ok() => Some(Some(o)),
+            Ok(Some(o)) if o.liveness() == Liveness::Gone && reap_swept(run, &o, true).is_ok() => Some(Some(o)),
             Ok(None) => Some(None),
             // Alive, unknown, or unreadable: kept, never taken for an empty lock.
             _ => None,

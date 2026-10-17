@@ -160,7 +160,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::net::ip_forward()?;
     let dev = host.cfg.announce_dev();
     if let Some(dev) = &dev {
-        crate::net::proxy_arp(dev);
+        let _ = crate::net::proxy_arp(dev);
     }
     let underlay = host.cfg.underlay().map_or("none".into(), |u| u.to_string());
     crate::log!("flexvm listening on {} (underlay {underlay}, announce device {})", listener.local_addr()?, dev.as_deref().unwrap_or("none"));

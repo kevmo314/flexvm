@@ -76,6 +76,11 @@ pub fn abandon(uds: &Path) {
 /// All I/O by `deadline`; nothing is sent once it has passed. Test faults: `guest_drop`,
 /// `guest_lose_reply`.
 fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<(u8, Vec<u8>)> {
+    ask_watched(uds, line, deadline, |_| Ok(()))
+}
+
+/// `ask`, with `watch` shown the connection before anything is sent.
+fn ask_watched(uds: &Path, line: &str, deadline: Instant, watch: impl FnOnce(&UnixStream) -> Result<()>) -> Result<(u8, Vec<u8>)> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(std::io::Error::new(ErrorKind::TimedOut, format!("no time left for {line:?}")).into());
@@ -87,6 +92,7 @@ fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<(u8, Vec<u8>)> {
     if fault("guest_drop") {
         return Err(lost("injected fault: guest connection refused"));
     }
+    watch(&s)?;
     let reply = read_frame(&mut handshake(By { s, at: deadline }, line)?)?;
     let reply = reply.ok_or_else(|| lost(format!("guest closed the connection before answering {line:?}")))?;
     if fault("guest_lose_reply") {
@@ -288,13 +294,42 @@ pub fn app_status(uds: &Path) -> Result<String> {
     message(uds, "APPSTATUS", TIMEOUT)
 }
 
-pub fn probe(uds: &Path, port: u16) -> Result<bool> {
-    Ok(message(uds, &format!("PROBE {port}"), TIMEOUT)? == "ok")
+/// A readiness request whose connection is shut down once `stop` fails, so an interrupted
+/// pull is not held for the request's whole timeout.
+fn readiness(uds: &Path, line: &str, timeout: Duration, stop: &(dyn Fn() -> Result<()> + Sync)) -> Result<String> {
+    let deadline = Instant::now().checked_add(timeout).ok_or("guest timeout is too large")?;
+    let done = &std::sync::atomic::AtomicBool::new(false);
+    let reply = std::thread::scope(|scope| {
+        let reply = ask_watched(uds, line, deadline, |s| {
+            let s = s.try_clone()?;
+            scope.spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if stop().is_err() {
+                        let _ = s.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+            Ok(())
+        });
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        reply
+    });
+    stop()?;
+    match reply? {
+        (FRAME_MSG, m) => Ok(String::from_utf8_lossy(&m).into_owned()),
+        (_, m) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
+    }
 }
 
-pub fn check(uds: &Path, cmd: &str, timeout: Duration) -> Result<bool> {
+pub fn probe(uds: &Path, port: u16, stop: &(dyn Fn() -> Result<()> + Sync)) -> Result<bool> {
+    Ok(readiness(uds, &format!("PROBE {port}"), TIMEOUT, stop)? == "ok")
+}
+
+pub fn check(uds: &Path, cmd: &str, timeout: Duration, stop: &(dyn Fn() -> Result<()> + Sync)) -> Result<bool> {
     let hex: String = cmd.bytes().map(|b| format!("{b:02x}")).collect();
-    match message(uds, &format!("CHECK {} {hex}", timeout.as_millis()), timeout.checked_add(TIMEOUT).ok_or("guest timeout is too large")?)? {
+    match readiness(uds, &format!("CHECK {} {hex}", timeout.as_millis()), timeout.checked_add(TIMEOUT).ok_or("guest timeout is too large")?, stop)? {
         m if m == "ok" => Ok(true),
         m if m.starts_with("exit ") || m == "timeout" => Ok(false),
         m => bail!("readiness command: {m}"),
@@ -342,7 +377,7 @@ mod tests {
     #[test]
     fn overflowing_timeouts_fail_before_contacting_the_guest() {
         let path = Path::new("/nonexistent-flexvm-timeout-test");
-        for error in [clock(path, Duration::MAX).unwrap_err(), check(path, "true", Duration::MAX).unwrap_err()] {
+        for error in [clock(path, Duration::MAX).unwrap_err(), check(path, "true", Duration::MAX, &|| Ok(())).unwrap_err()] {
             assert_eq!(error.to_string(), "guest timeout is too large");
         }
     }

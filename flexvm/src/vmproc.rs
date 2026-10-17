@@ -926,7 +926,7 @@ impl Proc {
         let cfg = self.host.config_now();
         let (ip, gen, rev, dev) = (vm.ip, self.gen(), self.rev(), cfg.announce_dev());
         if let Some(dev) = &dev {
-            crate::net::proxy_arp(dev);
+            let _ = crate::net::proxy_arp(dev);
         }
         if !self.announcer.route(&cfg, ip, gen, rev, || vm.state().local()) {
             return;
@@ -1443,7 +1443,7 @@ impl Proc {
             relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
             if let Some(dev) = self.host.config_now().announce_dev() {
-                crate::net::proxy_arp(&dev);
+                let _ = crate::net::proxy_arp(&dev);
             }
         }
     }
@@ -1855,7 +1855,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     crate::util::output::guard()?;
     let _ = crate::net::ip_forward();
     if let Some(dev) = &host.cfg.announce_dev() {
-        crate::net::proxy_arp(dev);
+        let _ = crate::net::proxy_arp(dev);
     }
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();

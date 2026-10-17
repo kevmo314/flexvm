@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -663,19 +664,24 @@ fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
 /// So freed plug memory is reported in the template, not in every VM after restore (~64 MiB
 /// RSS each). Done: 4 s quiet after `expect_mib` reported. Returns (MiB, done).
 fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Result<(u64, bool)> {
-    let (start, mut quiet, mut total, mut seen) = (Instant::now(), 0, 0u64, 0usize);
+    let (start, mut quiet, mut total) = (Instant::now(), 0, 0u64);
+    let mut reader = BufReader::new(File::open(metrics)?);
+    let mut line = String::new();
     // Reporting starts 2 s after memory is freed and works through it in rounds.
     while !(quiet >= 4 && total >> 20 >= expect_mib) && start.elapsed() < Duration::from_secs(120) {
         interrupted()?;
         std::thread::sleep(Duration::from_secs(1));
         fc.put("/actions", json!({"action_type": "FlushMetrics"}))?;
-        let text = std::fs::read_to_string(metrics)?;
         let mut freed = 0;
-        for line in text[seen..].lines() {
-            let m: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+        while reader.read_line(&mut line)? != 0 {
+            // A flush may still be appending a record: retain its partial line.
+            if !line.ends_with('\n') {
+                break;
+            }
+            let m: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
             freed += m["balloon"]["free_page_report_freed"].as_u64().unwrap_or(0);
+            line.clear();
         }
-        seen = text.len();
         total += freed;
         quiet = if freed == 0 { quiet + 1 } else { 0 };
     }
