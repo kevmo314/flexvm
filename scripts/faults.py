@@ -2093,7 +2093,7 @@ def same_host_bulk_tcp():
     t = start_thread(target=pump, daemon=True)
     # A download under way (more than the socket buffers hold) before each move, and going on after it.
     flowing = lambda since: wait_for(lambda: sent[0] - since > 4 << 20 or len(sent) > 1, 10) and sent[0] - since
-    flowing(0)
+    assert flowing(0), ("no download under way before the first move", sent)
     held, moved = [], []
     for src, dst in ((A, B), (B, A)):
         r = migrate(src, n, dst)
@@ -9663,6 +9663,7 @@ def reboot():
 # nothing of it is left; past ISOLATE_S it fails the scenario with a dump of what was, and clears that
 # by force so the next one still starts clean.
 ISOLATE_S = 30
+SWEPT = {}  # scenario -> what it left that only a sweep removed
 BASELINE = {}  # host -> its host.json before the first scenario
 PREFIXES = {}  # host -> its taps' prefix (derived from its state directory, so fixed)
 
@@ -9705,21 +9706,44 @@ def own_pids():
 
 
 def host_processes(skip):
-    """Processes working on A's or B's directories (VM, standby and CLI processes, their Firecrackers)."""
+    """(pid, start time, argv) of the processes under test on A or B: of this flexvm binary or the hosts'
+    Firecracker (by executable), working for A's or B's run directory (its --run; a Firecracker's, its cwd)."""
+    exes = {os.path.realpath(BIN)} | {os.path.realpath(os.path.join(h.state, "artifacts", "firecracker")) for h in (A, B)}
+    runs = {os.path.realpath(h.run) for h in (A, B)}
+    under = lambda p: any(p == r or p.startswith(r + "/") for r in runs)
     out = []
     for pid in filter(str.isdigit, os.listdir("/proc")):
         if int(pid) in skip:
             continue
         try:
+            exe = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
+            if os.path.realpath(exe) not in exes:
+                continue
             argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-            comm = open(f"/proc/{pid}/comm").read().strip()
-            cwd = os.readlink(f"/proc/{pid}/cwd") if comm == "firecracker" else ""
+            cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
         except OSError:
             continue
-        mine = any(h.state.encode() in argv or (cwd + "/").startswith(h.run.rstrip("/") + "/") for h in (A, B))
-        if mine and alive(pid):
-            out.append((int(pid), b" ".join(argv).decode(errors="replace")[:240]))
+        run = argv[argv.index(b"--run") + 1].decode(errors="replace") if b"--run" in argv[:-1] else None
+        if (run and os.path.realpath(run) in runs) or under(cwd):
+            start = starttime_of(pid)
+            if start is not None and alive(pid):
+                out.append((int(pid), start, b" ".join(argv).decode(errors="replace")[:240]))
     return out
+
+
+def kill_process(pid, start):
+    """SIGKILLs process `pid` if it is still the one that started at `start` (by pidfd: never a later one with its pid)."""
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        return  # gone
+    try:
+        if starttime_of(pid) == start:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def host_routes():
@@ -9783,7 +9807,7 @@ def isolate(scenario):
         if not args.no_listeners and (h.addr not in listeners or listeners[h.addr].poll() is not None):
             notes.append(f"{h}'s listener was not running")
             start_listener(h)
-    end, left, removed, swept = time.time() + ISOLATE_S, {}, set(), False
+    end, left, removed, swept = time.time() + ISOLATE_S, {}, set(), None
     while True:
         disarm()
         for h in (A, B):
@@ -9796,9 +9820,10 @@ def isolate(scenario):
         if not (left := left_behind(skip)) or time.time() > end:
             break
         # A SIGKILLed VM process's tap, route and name are a sweep's to collect, which some process on the host
-        # runs every 30 s or so: once no process is left, the one that would come, now.
-        if not swept and "processes" not in left:
-            swept = True
+        # runs every 30 s or so: once no process is left, the one that would come, now. What only it removes is
+        # recorded first, and reported (`SWEPT`): the scenario left it, gc only hides it.
+        if swept is None and "processes" not in left:
+            swept = left
             for h in (A, B):
                 cli(h, "debug", "gc")
             continue
@@ -9813,14 +9838,16 @@ def isolate(scenario):
                 os.unlink(f)
     if notes:
         print(f"isolation after {scenario}: undid {'; '.join(notes)}", flush=True)
+    if swept and not left:
+        SWEPT[scenario] = swept
+        print(f"isolation after {scenario}: left for a sweep to collect: {swept}", flush=True)
     if not left:
         return True
     check(f"{scenario}: leaves nothing behind within {ISOLATE_S} s", False, left)
     # By force, so the next scenario is not failed for this one's leftovers.
-    for pid, argv in left.get("processes", []):
+    for pid, start, argv in left.get("processes", []):
         print(f"  pid {pid} ({argv}): {threads_of(pid)[:4]}", flush=True)
-        with suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
+        kill_process(pid, start)
     for line in left.get("routes", []):
         subprocess.run(["ip", "route", "del", line.split()[0] + "/32"], capture_output=True)
     for h in (A, B):
@@ -9920,11 +9947,13 @@ try:
                 skipped.append(s)
                 print(f"scenario {s}: SKIPPED ({why}) in {time.time() - started:.1f} s", flush=True)
             else:
-                print(f"scenario {s}: {'ok' if failures == before else 'FAILED'} in {time.time() - started:.1f} s", flush=True)
+                note = " (left something for a sweep)" if s in SWEPT else ""
+                print(f"scenario {s}: {'ok' if failures == before else 'FAILED'}{note} in {time.time() - started:.1f} s", flush=True)
 finally:
     stop_listeners()
     remove_third_peer()
     for d in OWN_DIRS:
         subprocess.run(["rm", "-rf", d])
-print("failures:", failures, "skipped:", len(skipped), *(["(" + " ".join(skipped) + ")"] if skipped else []))
+print("failures:", failures, "skipped:", len(skipped), *(["(" + " ".join(skipped) + ")"] if skipped else []),
+      "left for a sweep:", len(SWEPT), *(["(" + " ".join(SWEPT) + ")"] if SWEPT else []))
 sys.exit(1 if failures or (skipped and args.no_skips) else 0)
