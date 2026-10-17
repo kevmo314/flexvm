@@ -833,37 +833,50 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
     };
     // A withdrawal's: the latest revision of the generation its sender knows (none: 0).
     let withdrawn_rev = req["rev"].as_u64().unwrap_or(0);
-    if let Some(via) = via.filter(|_| fault("route_stall")) {
-        // Test hook: an announcement held up (as by a slow network) while armed.
+    // Test hook: an announcement held up (as by a slow network) while armed; its answer is logged
+    // once given, which is how a test knows the listener got to it.
+    let held = via.filter(|_| fault("route_stall"));
+    if let Some(via) = held {
         crate::log!("route {ip} via {via}: held up (injected fault)");
         while fault("route_stall") {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    let l = host_lock(host)?;
-    if via.is_none() {
-        let a = host.addr(&l, ip)?;
-        // A recorded generation remains withdrawable after the allowlist narrows, including retries.
-        if a.seen == 0 {
-            check_vm_ip(host, ip, peers)?;
+    let answer = (|| {
+        let l = host_lock(host)?;
+        if via.is_none() {
+            let a = host.addr(&l, ip)?;
+            // A recorded generation remains withdrawable after the allowlist narrows, including retries.
+            if a.seen == 0 {
+                check_vm_ip(host, ip, peers)?;
+            }
+            // Not by another peer, unless it had the VM later: a newer generation, or a newer revision
+            // (the VM migrated on to it and ended there before its announcement got here).
+            if let Some(owner) = a.via.filter(|&o| gen == a.seen && !a.withdrawn && withdrawn_rev <= a.rev && !is_peer(sender, IpAddr::V4(o))) {
+                bail!("{ip} generation {gen} is routed via {owner} at revision {}, not via the asking peer: only that peer, or one with a newer revision, withdraws it", a.rev);
+            }
         }
-        // Not by another peer, unless it had the VM later: a newer generation, or a newer revision
-        // (the VM migrated on to it and ended there before its announcement got here).
-        if let Some(owner) = a.via.filter(|&o| gen == a.seen && !a.withdrawn && withdrawn_rev <= a.rev && !is_peer(sender, IpAddr::V4(o))) {
-            bail!("{ip} generation {gen} is routed via {owner} at revision {}, not via the asking peer: only that peer, or one with a newer revision, withdraws it", a.rev);
+        if !host.observe(&l, ip, gen, rev, via)? {
+            return Ok(json!({"ip": ip.to_string(), "stale": true}));
         }
-    }
-    if !host.observe(&l, ip, gen, rev, via)? {
-        return Ok(json!({"ip": ip.to_string(), "stale": true}));
-    }
-    let local = host.keeps_route(&l, ip, gen)?;
-    if !local {
-        match via {
-            Some(via) => crate::net::route_via(ip, via)?,
-            None => crate::net::unroute(ip),
+        let local = host.keeps_route(&l, ip, gen)?;
+        if !local {
+            match via {
+                Some(via) => crate::net::route_via(ip, via)?,
+                None => crate::net::unroute(ip),
+            }
         }
+        Ok(json!({"ip": ip.to_string(), "local": local}))
+    })();
+    if let Some(via) = held {
+        let how = match &answer {
+            Ok(r) if r["stale"] == json!(true) => "stale".to_string(),
+            Ok(_) => "taken".to_string(),
+            Err(e) => format!("refused: {e}"),
+        };
+        crate::log!("route {ip} via {via} generation {gen} revision {rev}: held announcement answered: {how}");
     }
-    Ok(json!({"ip": ip.to_string(), "local": local}))
+    answer
 }
 
 /// Validates an address from a migration or a checkpoint before it is prepared or claimed,

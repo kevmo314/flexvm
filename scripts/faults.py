@@ -2463,17 +2463,19 @@ def delayed_announce():
     an older revision of the same generation: stale, it routes nothing back
     to the source. The destination's announcement is taken by the source's host."""
     n = "ft-delayed-announce"
+    since = log_end(B)
     with armed_fault(B, "route_stall", 60000):
         ok(run(A, n))
         v = vms(A)[n]
         ip, gen = v["ip"], v["gen"]
-        check("delayed announce: B holds up A's announcement", wait_for(lambda: conns(B) == 1, 10), conns(B))
+        check("delayed announce: B holds up A's announcement", wait_for(lambda: held_routes(B, ip, since)["held"] == 1, 10), held_routes(B, ip, since))
         r = migrate(A, n, B)
         check("delayed announce: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
         wait_released(B, n)
         check("delayed announce: B took the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
         check("delayed announce: A heard of it", wait_for(lambda: addr(A, ip).get("rev") == 1, 10), addr(A, ip))
-    check("delayed announce: B handled it", wait_for(lambda: conns(B) == 0, 10), conns(B))
+    check("delayed announce: B handled it, as stale", wait_for(lambda: held_routes(B, ip, since)["answered"], 10)
+          and held_routes(B, ip, since)["answered"] == [(gen, 0, "stale")], held_routes(B, ip, since))
     a = addr(B, ip)
     check("delayed announce: A's late one is stale, the route stays off A",
           a.get("seen") == gen and a.get("rev") == 1 and a.get("via") is None, a)
@@ -2489,23 +2491,23 @@ def delayed_announce_handoff():
     (RUN/live), which B's listener judges by, so the late one is stale all the
     same: it never names A as the way to the address in B's record."""
     n = "ft-delayed-handoff"
+    since = log_end(B)
     fault(B, "route_stall", 60000)
     ok(run(A, n))
     v = vms(A)[n]
     ip, gen = v["ip"], v["gen"]
-    check("delayed handoff: B holds up A's announcement", wait_for(lambda: conns(B) == 1, 10), conns(B))
+    check("delayed handoff: B holds up A's announcement", wait_for(lambda: held_routes(B, ip, since)["held"] == 1, 10), held_routes(B, ip, since))
     clear_gate(B, "handoff_gate")
     with armed_fault(B, "handoff_gate", 60000):
         r = migrate(A, n, B)
         check("delayed handoff: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
         check("delayed handoff: B's handoff is held", wait_for(lambda: reached(B, "handoff_gate"), 5), reached(B, "handoff_gate"))
         check("delayed handoff: B's record trails the arrival's revision", addr(B, ip).get("rev") == 0, addr(B, ip))
-        # The held announcement's, and the migration's (its handoff still open).
-        held = conns(B)
         fault(B, "route_stall", 0)
-        # Fewer, not exactly one fewer: a request of the migration's own that queued behind the held one
-        # (B serialises them) may be answered with it.
-        check("delayed handoff: B handled A's announcement", wait_for(lambda: conns(B) < held, 10), (held, conns(B)))
+        # B's own account of its answer, not its count of connections pending: the source's polls of
+        # the migration's outcome come and go meanwhile (#683).
+        check("delayed handoff: B handled A's announcement, as stale", wait_for(lambda: held_routes(B, ip, since)["answered"], 10)
+              and held_routes(B, ip, since)["answered"] == [(gen, 0, "stale")], held_routes(B, ip, since))
         a = addr(B, ip)
         check("delayed handoff: A's late one is stale", a.get("seen") == gen and a.get("rev") == 0 and a.get("via") is None, a)
     wait_released(B, n)
@@ -2544,9 +2546,11 @@ def announce_arp_timer():
         cap.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
         cap.settimeout(0.2)
         configure(A, announce_dev=dev)
+        since = log_end(B)
         fault(B, "route_stall", 60000)
         ok(run(A, n))
-        ip = socket.inet_aton(vms(A)[n]["ip"])
+        addr_a = vms(A)[n]["ip"]
+        ip = socket.inet_aton(addr_a)
         end = time.time() + 10
         while len(arps) < 2 and time.time() < end:
             try:
@@ -2559,7 +2563,7 @@ def announce_arp_timer():
                 arps.append(sec + nsec / 1e9)
         # PACKET_STATISTICS: (frames, drops) since the socket opened.
         drops = struct.unpack("II", cap.getsockopt(263, 6, 8))[1]
-        check("announce arp timer: B holds up A's announcement", conns(B) >= 1, conns(B))
+        check("announce arp timer: B holds up A's announcement", wait_for(lambda: held_routes(B, addr_a, since)["held"] >= 1, 10), held_routes(B, addr_a, since))
     finally:
         # Each step whatever the one before did (B gone, a CLI failing): the host as found.
         try:
@@ -2575,7 +2579,8 @@ def announce_arp_timer():
     if len(arps) == 2:
         gap = arps[1] - arps[0]
         check("announce arp timer: the second within 1 s of the first", 0.15 < gap < 1, f"{gap:.2f} s")
-    check("announce arp timer: B handled it", wait_for(lambda: conns(B) == 0, 10), conns(B))
+    check("announce arp timer: B handled it", wait_for(lambda: len(held_routes(B, addr_a, since)["answered"]) == held_routes(B, addr_a, since)["held"] >= 1, 10),
+          held_routes(B, addr_a, since))
     kill(A, n)
 
 
@@ -2584,14 +2589,16 @@ def prepare_fail_announce():
     never outranks its running source: the source's announcement, held up in
     B's listener until after, is still taken."""
     n = "ft-prep-announce"
+    since = log_end(B)
     with armed_fault(B, "route_stall", 60000):
         ok(run(A, n))
         ip = vms(A)[n]["ip"]
-        check("prepare fail announce: B holds up A's announcement", wait_for(lambda: conns(B) == 1, 10), conns(B))
+        check("prepare fail announce: B holds up A's announcement", wait_for(lambda: held_routes(B, ip, since)["held"] == 1, 10), held_routes(B, ip, since))
         with armed_fault(B, "prepare_fail", 10000):
             r = migrate(A, n, B)
         check("prepare fail announce: migrate refused", not r["ok"] and "injected fault" in r["error"], r)
-    check("prepare fail announce: B handled it", wait_for(lambda: conns(B) == 0, 10), conns(B))
+    check("prepare fail announce: B handled it, taken", wait_for(lambda: held_routes(B, ip, since)["answered"], 10)
+          and [how for _, _, how in held_routes(B, ip, since)["answered"]] == ["taken"], held_routes(B, ip, since))
     a = addr(B, ip)
     check("prepare fail announce: taken, routed to A", a.get("via") == "127.0.0.1" and a.get("rev") == 0 and not a.get("holder"), a)
     check("prepare fail announce: running on A", where(n) == {A: "running"}, where(n))
@@ -2930,6 +2937,30 @@ def page_refusals():
     fault(A, "pages_slow", 0)
     st = wait_released(B, n)
     check("page refusals: migration completed, md5 intact", st["released"] is True and where(n) == {B: "running"} and md5(B, n) == m, (st, where(n)))
+
+
+def log_end(host):
+    """Where `host`'s listener log ends now: `held_routes` reads what is logged after it."""
+    try:
+        return os.path.getsize(host.listen_log)
+    except OSError:
+        return 0
+
+
+def held_routes(host, ip, since):
+    """`host`'s listener's account, logged after offset `since`, of the announcements of `ip` it held
+    up (`route_stall`): {"held": how many it held, "answered": [(generation, revision, how)]}, `how`
+    "stale", "taken" or "refused: ..." for each it answered once let go."""
+    try:
+        with open(host.listen_log, "rb") as f:
+            f.seek(since)
+            text = f.read().decode(errors="replace")
+    except OSError:
+        text = ""
+    ip = re.escape(ip)
+    return {"held": len(re.findall(rf"^route {ip} via \S+: held up \(injected fault\)$", text, re.M)),
+            "answered": [(int(g), int(r), how) for g, r, how in
+                         re.findall(rf"^route {ip} via \S+ generation (\d+) revision (\d+): held announcement answered: (.*)$", text, re.M)]}
 
 
 def conns(host):
