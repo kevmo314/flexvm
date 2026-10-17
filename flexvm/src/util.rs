@@ -387,6 +387,14 @@ pub fn resolve(addr: &str, at: Instant) -> io::Result<Addrs> {
     resolve_with(addr, at, &DNS, false, |addr| lookup(&addr))
 }
 
+/// `resolve`, giving up on the wait as soon as `stop` fails (checked every `STOP_POLL`).
+pub fn resolve_until(addr: &str, at: Instant, stop: &dyn Fn() -> io::Result<()>) -> io::Result<Addrs> {
+    resolve_stoppable(addr, at, &DNS, false, Some(stop), |addr| lookup(&addr))
+}
+
+/// How often a stoppable wait checks its stop.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
 /// Resolves a stale address without reusing a finished answer; still joins a lookup under way.
 pub fn resolve_fresh(addr: &str, at: Instant) -> io::Result<Addrs> {
     resolve_with(addr, at, &DNS, true, |addr| lookup(&addr))
@@ -427,6 +435,17 @@ fn resolve_with(
     at: Instant,
     dns: &'static Resolver,
     fresh: bool,
+    lookup: impl FnOnce(String) -> io::Result<Addrs> + Send + 'static,
+) -> io::Result<Addrs> {
+    resolve_stoppable(addr, at, dns, fresh, None, lookup)
+}
+
+fn resolve_stoppable(
+    addr: &str,
+    at: Instant,
+    dns: &'static Resolver,
+    fresh: bool,
+    stop: Option<&dyn Fn() -> io::Result<()>>,
     lookup: impl FnOnce(String) -> io::Result<Addrs> + Send + 'static,
 ) -> io::Result<Addrs> {
     let fail = |kind, why: &str| io::Error::new(kind, format!("DNS lookup of {addr}: {why}"));
@@ -479,7 +498,10 @@ fn resolve_with(
             Some(_) => fail(io::ErrorKind::TimedOut, "not answered by the deadline"),
             None => fail(io::ErrorKind::TimedOut, &format!("all {DNS_WORKERS} DNS workers stayed busy until the deadline")),
         })?;
-        l = dns.changed.wait_timeout(l, left).unwrap().0;
+        if let Some(stop) = stop {
+            stop()?;
+        }
+        l = dns.changed.wait_timeout(l, if stop.is_some() { left.min(STOP_POLL) } else { left }).unwrap().0;
     }
 }
 
@@ -1757,6 +1779,21 @@ mod tests {
         let got = resolve_with("hung.example:80", Instant::now() + Duration::from_secs(5), &DNS, false, |_| panic!("answered recently"));
         assert_eq!(got.unwrap(), vec![addr]);
         assert_eq!(workers(&DNS), 0);
+    }
+
+    #[test]
+    fn a_stopped_wait_for_a_hung_name_ends_promptly() {
+        static DNS: Resolver = Resolver::new();
+        let (release, lookup) = held();
+        let (start, checks) = (Instant::now(), std::sync::atomic::AtomicU32::new(0));
+        let stop = || match checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+            0..3 => Ok(()),
+            _ => Err(io::Error::other("stopped")),
+        };
+        let err = resolve_stoppable("hung.example:80", start + Duration::from_secs(3600), &DNS, false, Some(&stop), lookup).unwrap_err();
+        assert_eq!(err.to_string(), "stopped");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        release.send(Vec::new()).unwrap();
     }
 
     #[test]
