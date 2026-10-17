@@ -2,7 +2,7 @@ use super::{
     chain::{flatten, overlay, read_at, read_with_fallback, Link},
     format::{parse_pagemap, sum, Run, DATA, MAGIC, MAX_VMSTATE, TEMPLATE, ZERO},
     staging::STAGING_PREFIX,
-    write::{aligned, as_bytes, classify, direct, write_pages, PagesFile},
+    write::{classify, direct, write_pages, Buf, PagesFile},
     *,
 };
 use crate::{
@@ -375,10 +375,10 @@ fn overlays_buffers_and_parent_paths() {
     assert_eq!(parent_path(Path::new("/d/ck2"), Path::new("/d/ck1")), Path::new("../ck1"));
     assert_eq!(parent_path(Path::new("/e/ck2"), Path::new("/d/ck1")), Path::new("/d/ck1"));
     // Writer buffers are aligned and zeroed; one larger than Linux can map fails, even with overcommit.
-    let mut buf = aligned(2).unwrap();
-    assert_eq!(buf.as_ptr() as usize % PAGE_SIZE, 0);
-    assert!(as_bytes(&mut buf).len() == 2 * PAGE_SIZE && as_bytes(&mut buf).iter().all(|&b| b == 0));
-    assert_eq!(aligned(isize::MAX as usize / PAGE_SIZE).err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+    let mut buf = Buf::plain(2).unwrap();
+    assert_eq!(buf.bytes().as_ptr() as usize % PAGE_SIZE, 0);
+    assert!(buf.bytes().len() == 2 * PAGE_SIZE && buf.bytes().iter().all(|&b| b == 0));
+    assert_eq!(Buf::plain(isize::MAX as usize / PAGE_SIZE).err().unwrap().kind(), io::ErrorKind::OutOfMemory);
 }
 
 #[test]
@@ -550,8 +550,8 @@ fn ancestor_vmstate_is_unused_but_metadata_and_pages_remain_checked() {
     let ck = Checkpoint::open(&head).unwrap();
     assert_eq!(ck.vmstate, b"s");
     assert_eq!(ck.meta_left, budget);
-    let mut storage = aligned(1).unwrap();
-    let restored = as_bytes(&mut storage);
+    let mut storage = Buf::plain(1).unwrap();
+    let restored = storage.bytes();
     ck.file.read(0, restored, false).unwrap();
     assert_eq!(restored, page.as_slice());
     fs::write(base.join("pages"), vec![8; PAGE_SIZE]).unwrap();
@@ -622,8 +622,8 @@ fn direct_page_reads_are_aligned_across_file_boundaries() {
         sums.push(data.chunks(PAGE_SIZE).map(|p| crate::crc32c::page(p).0).collect());
     }
     let (_, file) = flatten(&[vec![(0, 2, DATA, 0, 1), (2, 2, DATA, 1, 1)]], files, sums);
-    let mut storage = aligned(4).unwrap();
-    let bytes = as_bytes(&mut storage);
+    let mut storage = Buf::plain(4).unwrap();
+    let bytes = storage.bytes();
     assert_eq!(bytes.as_ptr() as usize % PAGE_SIZE, 0);
     assert_eq!(bytes[2 * PAGE_SIZE..].as_ptr() as usize % PAGE_SIZE, 0);
     file.read(0, bytes, false).unwrap();
@@ -677,8 +677,8 @@ fn tmpfs_page_reads_work_without_direct_io_support() {
         r => r.unwrap(),
     }
     let (_, file) = flatten(&[vec![(0, 1, DATA, 0, 0)]], vec![file], vec![vec![crate::crc32c::page(&data).0]]);
-    let mut storage = aligned(1).unwrap();
-    let bytes = as_bytes(&mut storage);
+    let mut storage = Buf::plain(1).unwrap();
+    let bytes = storage.bytes();
     file.read(0, bytes, true).unwrap();
     assert_eq!(bytes, data);
     file.drop_cache();

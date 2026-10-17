@@ -427,7 +427,7 @@ rather than letting it run on wrong memory. The checksums catch corruption,
 not deliberate tampering.
 
 The writer copies each page once and reads it once more to checksum it and
-check it for zeroes (plus a template compare where the template has data). Up to 12
+check it for zeroes (plus a template compare where the template has data). Up to 6
 threads take 1 MiB units of PRESENT pages in turn. A thread copies its unit
 out of Firecracker with `process_vm_readv`, compares each page with the
 template (only where the template has data) and computes its CRC32C and
@@ -436,9 +436,14 @@ It then reserves the unit's place at the end of `pages` and writes its DATA
 pages there with `pwritev` and `O_DIRECT`, straight from its buffer, so the
 page cache is never involved. Units land in the order they finish, which the
 page map records, so no thread waits for another. `pages` is created in the
-staging directory and preallocated (`fallocate`) for every PRESENT page
-before the VM pauses, which is what lets ext4 run the direct writes in
-parallel; it is trimmed to what was written.
+staging directory and preallocated (`fallocate`) in chunks of at most 1 MiB
+before the VM pauses, which lets ext4 run the direct writes in parallel.
+A full checkpoint reserves every PRESENT page; an incremental checkpoint
+reserves the smaller of the PRESENT and dirty page counts. The file is
+trimmed to what was written. Each writer uses a 1 MiB buffer backed by a
+2 MiB aligned transparent huge page where the host allows it. The whole
+2 MiB mapping is charged to the host's memory room and returned on drop;
+without enough room, the writer uses an ordinary 1 MiB page-aligned buffer.
 
 An incremental checkpoint (format 3) adds `parent` to the manifest: the
 parent's path (`../NAME` when they share a directory, else absolute) and id

@@ -147,25 +147,13 @@ fn pwritev_all(file: &File, mut iov: &mut [libc::iovec], mut off: u64) -> io::Re
     Ok(())
 }
 
-/// One page, aligned for O_DIRECT.
-#[derive(Clone)]
-#[repr(C, align(4096))]
-pub(crate) struct Page([u8; PAGE_SIZE]);
-
-pub(crate) fn aligned(n: usize) -> io::Result<Vec<Page>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(n).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"))?;
-    v.resize(n, Page([0; PAGE_SIZE]));
-    Ok(v)
-}
-
-/// A writer's buffer: `pages` pages at the start of a 2 MiB-aligned mapping, backed by a
+/// A writer's buffer: `UNIT` pages at the start of a 2 MiB-aligned mapping, backed by a
 /// transparent huge page where the host allows (`madvise` mode included). Each direct write
 /// then pins one folio rather than every page and goes out in fewer, larger segments: on a
 /// 4 GiB guest here the copy took about 12% less CPU and 30% less time. The huge page is
 /// all of the rounded-up mapping, which counts against the host's memory room as rescued
-/// copies do (`cow::Room`); without that much room the buffer is ordinary pages, just `pages`.
-struct Buf {
+/// copies do (`cow::Room`); without that much room the buffer is ordinary pages, just `UNIT`.
+pub(crate) struct Buf {
     ptr: *mut u8,
     map: usize,
     len: usize,
@@ -201,17 +189,23 @@ thread_local! {
 const HUGE: usize = 2 << 20;
 
 impl Buf {
-    fn new(pages: usize, room: &Room) -> io::Result<Buf> {
-        let len = pages * PAGE_SIZE;
+    fn new(room: &Room) -> io::Result<Buf> {
+        let len = UNIT * PAGE_SIZE;
         let huge = len.next_multiple_of(HUGE);
         let Some(charge) = Charge::take(room, (huge >> 20) as u64) else {
-            return Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len, charge: None });
+            return Buf::plain(UNIT);
         };
         // A failed map drops the charge: the room is back.
         let ptr = Buf::map(huge, len, HUGE)?;
         // Only a hint: without it the buffer is ordinary pages.
         unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
         Ok(Buf { ptr, map: huge, len, charge: Some(charge) })
+    }
+
+    /// Ordinary page-aligned storage, without a huge-page room charge.
+    pub(crate) fn plain(pages: usize) -> io::Result<Buf> {
+        let len = pages * PAGE_SIZE;
+        Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len, charge: None })
     }
 
     /// `map` bytes of anonymous memory, at a multiple of `align` (0: anywhere).
@@ -239,7 +233,7 @@ impl Buf {
         Ok(start as *mut u8)
     }
 
-    fn bytes(&mut self) -> &mut [u8] {
+    pub(crate) fn bytes(&mut self) -> &mut [u8] {
         // Mapped, initialized (zero) and ours alone.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
@@ -250,11 +244,6 @@ impl Drop for Buf {
         // Unmapped first, then `charge` gives its room back.
         unsafe { libc::munmap(self.ptr.cast(), self.map) };
     }
-}
-
-pub(crate) fn as_bytes(pages: &mut [Page]) -> &mut [u8] {
-    // `Page` is PAGE_SIZE initialized bytes with no padding.
-    unsafe { std::slice::from_raw_parts_mut(pages.as_mut_ptr().cast(), std::mem::size_of_val(pages)) }
 }
 
 /// Writes the REMOTE pages of `runs` into `out` and builds the page map; with `explicit`
@@ -293,7 +282,7 @@ pub(super) fn write_pages(
         (0..).map(|_| next.fetch_add(1, Ordering::Relaxed)).take_while(|&k| k < units.len()).find(|&k| !taken[k].swap(true, Ordering::SeqCst))
     };
     let work = || -> Result<()> {
-        let mut buf = Buf::new(UNIT, room)?;
+        let mut buf = Buf::new(room)?;
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         let mut scratch = Vec::with_capacity(UNIT);
         loop {
@@ -392,7 +381,7 @@ mod buf_tests {
         let room = Room::default();
         for (have, huge, left) in [(0, false, 0), (1, false, 1), (5, true, 3)] {
             room.set(have);
-            let mut b = Buf::new(UNIT, &room).unwrap();
+            let mut b = Buf::new(&room).unwrap();
             assert_eq!((b.charge.is_some(), room.get()), (huge, left), "room {have} MiB");
             // A huge one is all of an aligned 2 MiB; an ordinary one only what it holds,
             // which no huge page fits in.
@@ -410,7 +399,7 @@ mod buf_tests {
         }
         // Unknown room (as a pager starts): no bound, and still unknown after.
         let unbounded = Room::default();
-        let b = Buf::new(UNIT, &unbounded).unwrap();
+        let b = Buf::new(&unbounded).unwrap();
         assert!(b.charge.is_some());
         drop(b);
         assert_eq!(unbounded.get(), u64::MAX);
@@ -421,18 +410,23 @@ mod buf_tests {
         let room = Room::default();
         room.set(5);
         FAIL_MAP.with(|f| f.set(true));
-        assert!(Buf::new(UNIT, &room).is_err());
+        assert!(Buf::new(&room).is_err());
         assert_eq!(room.get(), 5);
         // And the next one maps (huge) as usual.
-        let b = Buf::new(UNIT, &room).unwrap();
+        let b = Buf::new(&room).unwrap();
         assert_eq!((b.charge.is_some(), room.get()), (true, 3));
     }
 
     /// AnonHugePages of the mapping starting at `addr`, from /proc/self/smaps.
     fn anon_huge_kib(addr: usize) -> u64 {
         let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-        let start = format!("{addr:x}-");
-        let mut lines = smaps.lines().skip_while(|l| !l.starts_with(&start)).skip(1);
+        // The mapping holding `addr`: another test's plain buffer mapped next to it may have merged with it.
+        let range = |l: &str| -> Option<(usize, usize)> {
+            let (s, e) = l.split(' ').next()?.split_once('-')?;
+            Some((usize::from_str_radix(s, 16).ok()?, usize::from_str_radix(e, 16).ok()?))
+        };
+        let holds = |l: &str| range(l).is_some_and(|(s, e)| (s..e).contains(&addr));
+        let mut lines = smaps.lines().skip_while(|l| !holds(l)).skip(1);
         let line = lines.find(|l| l.starts_with("AnonHugePages:")).expect("mapping in smaps");
         line.split_whitespace().nth(1).unwrap().parse().unwrap()
     }

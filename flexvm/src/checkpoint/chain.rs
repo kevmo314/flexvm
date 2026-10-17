@@ -3,7 +3,7 @@ use super::{
     bail,
     format::{parse_pagemap, sum, Canon, Manifest, Run, DATA, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE, TEMPLATE},
     fstat, open_at, open_dir_at,
-    write::{aligned, as_bytes, direct},
+    write::{direct, Buf},
 };
 use crate::{
     crc32c,
@@ -178,8 +178,8 @@ impl Checkpoint {
     }
 
     fn each_page(&self, drop_cache: bool, mut f: impl FnMut(usize, &[u8])) -> Result<()> {
-        let mut storage = aligned(256)?;
-        let buf = as_bytes(&mut storage);
+        let mut storage = Buf::plain(256)?;
+        let buf = storage.bytes();
         for &(first, count, state) in &self.runs {
             for p in (first as usize..(first + count) as usize).step_by(256) {
                 let n = ((first + count) as usize - p).min(256);

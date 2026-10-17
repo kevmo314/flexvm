@@ -1,7 +1,7 @@
 use super::event::PULL;
 use super::fetch::{Failed, Fetch, FetchFailure, Link};
 use super::{os, Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, REMOTE};
-use crate::checkpoint::{aligned, as_bytes, PageFile};
+use crate::checkpoint::{Buf, PageFile};
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -71,11 +71,11 @@ impl Pager {
         // them soonest.
         let first = self.chunks(self.working_set(t, PULL_THREADS).filter(|_| file.is_some()), PULL_RUN);
         let all = self.chunks(ALL, PULL_RUN).skip(t).step_by(PULL_THREADS);
-        let mut storage = match aligned(PULL_RUN) {
+        let mut storage = match Buf::plain(PULL_RUN) {
             Ok(buf) => buf,
             Err(e) => return self.fail(format!("allocating background pull buffer: {e}")),
         };
-        let buf = as_bytes(&mut storage);
+        let buf = storage.bytes();
         for (i, end) in first.chain(all) {
             if !self.pulling() {
                 break;
