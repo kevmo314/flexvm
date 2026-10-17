@@ -3576,18 +3576,23 @@ pub fn faults_on() -> bool {
 
 /// Test faults (`RUN/faults.json`); only with FLEXVM_FAULTS=1.
 pub fn fault(name: &str) -> bool {
+    armed_until(name).is_some()
+}
+
+/// When fault `name`'s arming ends, if it is armed now: each arming has its own.
+fn armed_until(name: &str) -> Option<u64> {
     static CACHE: Mutex<Option<(SystemTime, HashMap<String, u64>)>> = Mutex::new(None);
     if !faults_on() {
-        return false;
+        return None;
     }
-    let Some(path) = RUN_DIR.get().map(|r| r.join("faults.json")) else { return false };
+    let path = RUN_DIR.get()?.join("faults.json");
     let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     let mut c = CACHE.lock().unwrap();
     if c.as_ref().map(|c| Some(c.0)) != Some(mtime) {
         *c = mtime.map(|m| (m, load(&path).ok().flatten().unwrap_or_default()));
     }
     let now = wall_ms();
-    c.as_ref().is_some_and(|(_, armed)| armed.get(name).is_some_and(|&until| now < until))
+    c.as_ref()?.1.get(name).copied().filter(|&until| now < until)
 }
 
 /// Test hook: MemAvailable (MiB) as a test wrote it to `RUN/mem_available_mib`, in place of the host's.
@@ -3625,14 +3630,41 @@ pub fn tripped(name: &str) -> bool {
 /// Test hook: parks here, if `name` is armed when reached, until the test removes this process's
 /// reached-marker (RUN/gates/NAME.PID; `rm -rf RUN/gates` releases every one), or for at most 10 minutes.
 /// Neither the arming's expiry nor the host lock releases it: it parks under the lock too.
+///
+/// The threads of a process that park at `name` share the marker, which holds how many are parked (so a test can
+/// wait for all of them), and one latch: once the marker is removed, the gate stays open for that arming, so a
+/// thread that gets here late never parks on a marker it made after the release.
 pub fn hold(name: &str) {
-    if !tripped(name) {
-        return;
+    /// One arming's latch, shared by a process's threads at one gate.
+    struct Latch {
+        until: u64,
+        parked: usize,
+        open: bool,
     }
+    static GATES: Mutex<Option<HashMap<String, Latch>>> = Mutex::new(None);
+    let Some(until) = armed_until(name) else { return };
     let Some(marker) = RUN_DIR.get().map(|r| r.join("gates").join(format!("{name}.{}", std::process::id()))) else { return };
+    {
+        let mut gates = GATES.lock().unwrap();
+        let l = gates.get_or_insert_with(HashMap::new).entry(name.into()).or_insert(Latch { until, parked: 0, open: false });
+        if l.until != until {
+            *l = Latch { until, parked: 0, open: false };
+        }
+        // Released: by the latch, or the marker gone with others parked (before they noticed).
+        if l.open || (l.parked > 0 && !marker.exists()) {
+            l.open = true;
+            return;
+        }
+        l.parked += 1;
+        reached_count(name, l.parked);
+    }
     let end = std::time::Instant::now() + Duration::from_secs(600);
     while marker.exists() && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut gates = GATES.lock().unwrap();
+    if let Some(l) = gates.as_mut().and_then(|g| g.get_mut(name)).filter(|l| l.until == until) {
+        l.open = true;
     }
 }
 
@@ -3641,6 +3673,14 @@ fn reached(name: &str) {
     if let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) {
         let _ = host_dir(&dir, 0o700);
         let _ = write_record(&dir.join(format!("{name}.{}", std::process::id())), b"");
+    }
+}
+
+/// `reached`, saying how many of this process's threads are parked there (`hold`).
+fn reached_count(name: &str, n: usize) {
+    if let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) {
+        let _ = host_dir(&dir, 0o700);
+        let _ = write_record(&dir.join(format!("{name}.{}", std::process::id())), n.to_string().as_bytes());
     }
 }
 
