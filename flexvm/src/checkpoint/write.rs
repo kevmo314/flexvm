@@ -169,12 +169,6 @@ struct Charge {
     at: Epoch,
 }
 
-impl Charge {
-    fn take(room: &Room, mib: u64) -> Option<Charge> {
-        room.take(mib).map(|at| Charge { room: room.clone(), mib, at })
-    }
-}
-
 impl Drop for Charge {
     fn drop(&mut self) {
         self.room.give(self.mib, self.at);
@@ -188,18 +182,30 @@ thread_local! {
 }
 
 const HUGE: usize = 2 << 20;
+const MADV_POPULATE_WRITE: libc::c_int = 23;
 
 impl Buf {
     fn new(room: &Room) -> io::Result<Buf> {
         let len = UNIT * PAGE_SIZE;
         let huge = len.next_multiple_of(HUGE);
-        let Some(charge) = Charge::take(room, (huge >> 20) as u64) else {
+        let mib = (huge >> 20) as u64;
+        let Some(reserved) = room.take(mib) else {
             return Buf::plain(UNIT);
         };
-        // A failed map drops the charge: the room is back.
-        let ptr = Buf::map(huge, len, HUGE)?;
+        let ptr = match Buf::map(huge, len, HUGE) {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                // Never mapped: the room is back.
+                room.give(mib, reserved.populated());
+                return Err(e);
+            }
+        };
         // Only a hint: without it the buffer is ordinary pages.
         unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
+        // Populated now, so its reservation in the room ends here, not with its first write (#672). Only a hint too:
+        // where the kernel cannot, the first write faults it in.
+        unsafe { libc::madvise(ptr.cast(), huge, MADV_POPULATE_WRITE) };
+        let charge = Charge { room: room.clone(), mib, at: reserved.populated() };
         Ok(Buf { ptr, map: huge, len, charge: Some(charge) })
     }
 

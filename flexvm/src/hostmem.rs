@@ -42,7 +42,9 @@ struct Member {
     owner: AtomicU64,
     /// The last release request it answered.
     ack: AtomicU32,
-    _pad: u32,
+    /// MiB it took from the room (`cow::Room::take`) and has yet to populate: MemAvailable still shows that memory,
+    /// so a refresh and admission count it as used until then (#672). Freed with its slot once it is gone.
+    pending: AtomicU32,
 }
 
 fn owner_of(pid: u32, start: u64) -> u64 {
@@ -139,8 +141,46 @@ impl Shared {
         }
         self.members.iter().find(|m| {
             let o = m.owner.load(Ordering::SeqCst);
-            (o == 0 || !alive(o)) && m.owner.compare_exchange(o, me, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            let taken = (o == 0 || !alive(o)) && m.owner.compare_exchange(o, me, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+            if taken {
+                // A process gone left nothing to populate.
+                m.pending.store(0, Ordering::SeqCst);
+            }
+            taken
         })
+    }
+
+    /// This process's slot (`join`), for its reservations (`reserve`).
+    pub fn slot(&self) -> Option<usize> {
+        let m = self.join()?;
+        self.members.iter().position(|x| std::ptr::eq(x, m))
+    }
+
+    /// Counts `mib` more (or, not `more`, fewer) taken by slot `slot`'s process and not yet populated.
+    pub fn reserve(&self, slot: usize, mib: u64, more: bool) {
+        let mib = mib.min(u32::MAX as u64) as u32;
+        let _ = self.members[slot]
+            .pending
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| Some(if more { p.saturating_add(mib) } else { p.saturating_sub(mib) }));
+    }
+
+    /// MiB taken from the room and not yet populated by processes still running; the reservations of those gone are
+    /// reclaimed, their slots freed.
+    pub fn outstanding(&self) -> u64 {
+        let mut sum = 0;
+        for m in &self.members {
+            let p = m.pending.load(Ordering::SeqCst);
+            if p == 0 {
+                continue;
+            }
+            let o = m.owner.load(Ordering::SeqCst);
+            if o != 0 && alive(o) {
+                sum += p as u64;
+            } else if m.owner.compare_exchange(o, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                m.pending.store(0, Ordering::SeqCst);
+            }
+        }
+        sum
     }
 
     /// Whether this process answers release requests (`serve`).
@@ -186,7 +226,9 @@ impl Shared {
             }
             match running(o) {
                 None => {
-                    let _ = m.owner.compare_exchange(o, 0, Ordering::SeqCst, Ordering::SeqCst);
+                    if m.owner.compare_exchange(o, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                        m.pending.store(0, Ordering::SeqCst);
+                    }
                     continue;
                 }
                 Some(false) => {
@@ -220,6 +262,11 @@ impl Shared {
     pub fn forget_release(&self) {
         self.released.store(0, Ordering::SeqCst);
     }
+}
+
+/// `Shared::outstanding` for the host under `run`; 0 if it cannot be mapped (nothing could reserve there then).
+pub fn outstanding(run: &Path) -> u64 {
+    at(run).map_or(0, |s| s.outstanding())
 }
 
 /// Asks the VM processes of the host under `run` to release the memory they keep for their next checkpoint
@@ -300,6 +347,36 @@ mod tests {
         other.members[MEMBERS - 1].owner.store(0, Ordering::SeqCst);
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// What a process took from the room and has yet to populate counts while it runs; once it is gone its
+    /// reservations are reclaimed and its slot freed (#672).
+    #[test]
+    fn reservations_of_processes_gone_are_reclaimed() {
+        let dir = crate::test_util::TempDir::new("hostmem-reserved");
+        let s = at(&dir).unwrap();
+        let mine = s.slot().unwrap();
+        s.reserve(mine, 30, true);
+        let dead = MEMBERS - 2;
+        s.members[dead].owner.store(owner_of(u32::MAX - 1, 1), Ordering::SeqCst);
+        s.members[dead].pending.store(50, Ordering::SeqCst);
+        assert_eq!(s.outstanding(), 30, "only the running one's");
+        assert_eq!((s.members[dead].owner.load(Ordering::SeqCst), s.members[dead].pending.load(Ordering::SeqCst)), (0, 0), "reclaimed");
+        s.reserve(mine, 10, false);
+        assert_eq!(s.outstanding(), 20);
+        s.reserve(mine, 100, false);
+        assert_eq!(s.outstanding(), 0, "never below none");
+        // A slot taken over from a process gone starts with nothing reserved.
+        s.members[dead].owner.store(owner_of(u32::MAX - 1, 1), Ordering::SeqCst);
+        s.members[dead].pending.store(70, Ordering::SeqCst);
+        s.members[mine].owner.store(0, Ordering::SeqCst);
+        let first = s.members.iter().position(|m| m.owner.load(Ordering::SeqCst) == 0).unwrap();
+        (0..dead)
+            .filter(|&i| i != first)
+            .for_each(|i| _ = s.members[i].owner.compare_exchange(0, owner_of(u32::MAX - 1, 2), Ordering::SeqCst, Ordering::SeqCst));
+        s.members[first].owner.store(owner_of(u32::MAX - 1, 3), Ordering::SeqCst);
+        assert_eq!(s.slot(), Some(first), "the first gone one's");
+        assert_eq!(s.members[first].pending.load(Ordering::SeqCst), 0);
     }
 
     /// Callers queued on the host lock do not each ask (and wait) again: once a second at most.

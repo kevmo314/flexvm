@@ -572,7 +572,11 @@ through, so the checkpoint is exactly the memory at the pause.
   the grants guests have yet to touch, taking off again what was taken since
   the refresh before (it may not show in MemAvailable yet); it is debited as
   they grow, and by admission's grants. A refresh whose sample was taken
-  before another refresh landed is dropped. The file is refused unless it is
+  before another refresh landed is dropped. Memory taken and not yet
+  populated (MemAvailable still shows it) stays reserved in the file, under
+  its process, until it is: every refresh and admission count it as used
+  however long that takes, and a process gone has its reservations
+  reclaimed (#672). Writer buffers are populated as they are made. The file is refused unless it is
   this user's (or root's), writable by no one else, with no other link. Without room for a block of copies, faults ask the writers for
   their pages and wait for them as over budget, and the pause protects
   pages it would have copied hot; no checkpoint fails for it. Under the
