@@ -25,7 +25,11 @@ use crate::util::{ms, recv_json, send_json, By, Error, Phases, Result};
 use crate::vm::{Snapshot, State, Vm};
 use crate::vmproc::{peer_call, Busy, End, Op, Proc, BUSY};
 
-/// From the target's prepare answer to its commit answer.
+/// From the target's prepare answer to its commit answer: the target receives, loads and commits
+/// within it, or refuses. The source's one deadline for its post-pause sends and the commit reply is as
+/// long, but starts at the pause, after that answer reached it: it ends after the target's, so an
+/// honest target's answer is never cut short, and waiting past it (for more bytes, a slower link) would
+/// only hold the VM paused for a target that has already given up. A bigger budget is the target's to give.
 const INCOMING_WAIT: Duration = Duration::from_secs(30);
 const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_HEADER: u64 = 256 << 20;
@@ -203,6 +207,7 @@ impl Proc {
             },
             &state,
             &data,
+            // Ends after the target's own (`INCOMING_WAIT`), which started at its prepare answer.
             Instant::now() + INCOMING_WAIT,
             &mut t,
         );
@@ -1299,6 +1304,26 @@ mod tests {
         assert_eq!(result.unwrap_err().downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
         assert!(elapsed >= budget && elapsed < budget + Duration::from_secs(1), "{elapsed:?}");
         assert!(drained > 4096 && drained < data.len(), "peer must make partial progress: {drained}");
+    }
+
+    #[test]
+    fn paused_send_deadline_bounds_the_commit_reply() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        // Takes everything at once, then never answers.
+        let reader = thread::spawn(move || std::io::copy(&mut peer, &mut std::io::sink()).unwrap());
+        let header = Header { runs: Cow::Borrowed(&[]), vmstate_len: 1, preload: Cow::Borrowed(&[]), paused: false, app_log: 0 };
+        let data = vec![7; 1 << 20];
+        let start = Instant::now();
+        let budget = Duration::from_millis(300);
+        let result = send_paused(&conn, &header, &[0], &data, start + budget, &mut Phases::new());
+        let elapsed = start.elapsed();
+        drop(conn);
+        let drained = reader.join().unwrap();
+        assert_eq!(result.unwrap_err().downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+        assert!(elapsed >= budget && elapsed < budget + Duration::from_secs(1), "{elapsed:?}");
+        assert!(drained > data.len() as u64, "all was sent before the wait for the reply: {drained}");
     }
 
     /// A refused arrival reads what its source still sends, so the source, still writing, gets the reason, not a reset.
