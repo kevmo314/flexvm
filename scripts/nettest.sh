@@ -116,17 +116,21 @@ start_listener() {
     mkdir -p "$dir/state" "$dir/run"
     ln -sfn "$state/artifacts" "$dir/state/artifacts"
     ln -sfn "$state/templates" "$dir/state/templates"
-    cli "$ns" "$dir" config --peer "$peer" --vm-ips "$ips" --cluster-ips "$NET.128-$NET.250" > /dev/null
+    # STATE/host.json, written whole and atomically (a fresh state directory has none to merge with).
+    printf '{"peers": ["%s"], "vm_ips": "%s", "cluster_ips": "%s"}\n' "$peer" "$ips" "$NET.128-$NET.250" > "$dir/state/host.json.tmp"
+    chmod 644 "$dir/state/host.json.tmp"
+    mv -f "$dir/state/host.json.tmp" "$dir/state/host.json"
     cli "$ns" "$dir" listen "$listen" > "$work/listen-$ns.log" 2>&1 &
     listener_pids+=($!)
 }
 start_listener "${P}A" "$dir_A" "$host_A" "$host_B" "$NET.128-$NET.191"
 start_listener "${P}B" "$dir_B" "$host_B" "$host_A" "$NET.192-$NET.250"
-wait_for test -f "$dir_A/state/host.json"
-wait_for test -f "$dir_B/state/host.json"
+# Each listener saves its address in host.json once it listens.
+wait_for grep -q '"listen"' "$dir_A/state/host.json"
+wait_for grep -q '"listen"' "$dir_B/state/host.json"
 sleep 0.5
 
-addr=$(cli "${P}A" "$dir_A" run "$name" --template "${TEMPLATE:-small}" -d | python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"])')
+addr=$(cli "${P}A" "$dir_A" run --name "$name" -d "${TEMPLATE:-small}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"])')
 say "vm $name at $addr"
 
 cat > "$work/server.py" <<'PY'
@@ -253,10 +257,10 @@ progress_after() {
 }
 absent() {
     local listing
-    listing=$(cli "$1" "$2" ls) || return 1
+    listing=$(cli "$1" "$2" ps -a) || return 1
     awk -v n="$name" 'NR>1 && $1==n {f=1} END {exit f}' <<< "$listing"
 }
-running() { cli "$1" "$2" ls | awk -v n="$name" 'NR>1 && $1==n && $4=="running" {f=1} END {exit !f}'; }
+running() { cli "$1" "$2" ps | awk -v n="$name" 'NR>1 && $1==n && $4=="running" {f=1} END {exit !f}'; }
 migrate() {
     local res
     res=$(cli "$1" "$2" migrate "$name" "$3") || die "migrate to $3 failed"

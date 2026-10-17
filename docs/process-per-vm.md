@@ -1,6 +1,6 @@
 # One process per VM
 
-flexvm has no central daemon. `flexvm run NAME` starts a process
+flexvm has no central daemon. `flexvm run IMAGE` starts a process
 that *is* the VM: it owns the Firecracker child, the uffd pager, the tap and
 route, packet holds, guest sessions, checkpoints and its side of every
 migration. The process exits when the VM is gone. Everything host-wide lives in
@@ -9,8 +9,8 @@ small flock-guarded files.
 ## Process model
 
 ```
-flexvm run web            # foreground: the process is the VM
-flexvm run web -d         # same, detached; prints {"name","ip","pid",...} once ready
+flexvm run --name web IMAGE      # foreground: the process is the VM
+flexvm run -d --name web IMAGE   # same, detached; prints {"name","ip","pid",...} once ready
 ```
 
 A VM process:
@@ -35,7 +35,16 @@ does not reach it. Its Firecrackers move on to `flexvm/idle-PID-START-N`. Withou
 cgroup2 it stays where it was started, and says so in its log. A foreground
 VM process stays in its caller's cgroup.
 
-Exit status: with `-- CMD`, CMD's; else 0 when it migrated away or was
+**Resource caps** (`Resources`, `vm.rs`). `run --cpus N` sets `cpu.max` on
+the VM's Firecracker cgroup (a quota of N times its 100 ms period; the vCPU
+count stays the image's). `--memory SIZE` caps the hotplug region the growth
+controller may plug (whole steps, from the boot memory plus what the
+snapshot plugged up to the image's ceiling). Both are kept in the
+checkpoint manifest (`resources`), the migration request and the standby
+claim, so they survive stop/start, checkpoints and migration;
+`run --checkpoint DIR` with either replaces the manifest's.
+
+Exit status: with a command (`run IMAGE CMD...`), CMD's; else 0 when it migrated away or was
 stopped by `checkpoint --stop`; 128 + the signal when one ended it (130:
 SIGINT destroyed it, 143: SIGTERM suspended it); 125 when flexvm failed (it
 could not start the VM, or gave it up); 124 when it died under the process
@@ -46,8 +55,8 @@ waits on Firecracker give up, the pager stops, a checkpoint is cancelled;
 a suspend that published meanwhile is revoked and ends as a death, not a kill),
 then cleaned up as a
 kill, with why (Firecracker's exit status and the end of its log, the
-guest's console) in `RUN/vms/NAME.failed`, which `ls` shows as `failed`
-until `flexvm kill NAME`.
+guest's console) in `RUN/vms/NAME.failed`, which `ps -a` shows as `failed`
+until `flexvm rm NAME`.
 
 Ownership is held in guards that give back exactly what they took: the name
 lock (`NameLock`), the address claim (`AddrClaim`: dropped, it releases the
@@ -58,7 +67,7 @@ operation lock: it kills the VM and waits for its Firecracker, settles the
 address by how the VM left (`End::Gone` withdraws it, `Suspended` keeps it,
 `Moved` releases it, `NotStarted` releases it or, for a generation made for
 this VM, withdraws it), deletes a consumed checkpoint, gives up the name, and
-tells a waiting client and a standby claimer before it exits. With `-- CMD`, the VM runs
+tells a waiting client and a standby claimer before it exits. With CMD, the VM runs
 CMD in the guest, streams its output, and the process exits with CMD's status
 (the VM is destroyed afterwards). The main command waits for a paused or
 checkpointing VM at every stage (Ctrl-Z during startup included; early
@@ -68,7 +77,7 @@ giving up, never ending the VM; the command ending the VM and a suspend
 starting exclude each other through `suspending`), and once the VM is paused
 the suspend holds its session, recording in the checkpoint (`CMD`) the
 command, its guest session, how much of its output was written out and its
-exit status if it had one; `flexvm resume` reattaches it from there (or
+exit status if it had one; `flexvm start -a` reattaches it from there (or
 takes that status) and exits with its status.
 Its control socket serves `exec`, `checkpoint` and `migrate`, plus `claim` (a
 standby), `pages` (passed on by the listener) and `debug` (tests).
@@ -77,12 +86,12 @@ standby), `pages` (passed on by the listener) and `debug` (tests).
 
 | signal | effect |
 |---|---|
-| SIGTERM | suspend: checkpoint to `STATE/suspended/NAME`, free everything, exit 143. `flexvm resume NAME` restores it in a new process. An unclaimed standby VM has nothing to suspend: it is destroyed, exit 143 |
-| SIGTSTP | pause the vCPUs (the process keeps running and serving pages; Ctrl-Z works) |
+| SIGTERM | suspend: checkpoint to `STATE/suspended/NAME`, free everything, exit 143 (`flexvm stop NAME` sends it and waits). `flexvm start NAME` restores it in a new process. An unclaimed standby VM has nothing to suspend: it is destroyed, exit 143 |
+| SIGTSTP | pause the vCPUs (the process keeps running and serving pages; Ctrl-Z and `flexvm pause` work) |
 | SIGCONT | resume the vCPUs of a VM paused by SIGTSTP (ignored otherwise: the kernel sends it after any SIGSTOP, systemd after SIGTERM) |
-| SIGINT | destroy the VM, withdraw its address, exit 130 (Ctrl-C works) |
+| SIGINT | destroy the VM, withdraw its address, exit 130 (Ctrl-C and `flexvm kill` work) |
 | SIGQUIT | as SIGINT (Ctrl-\ destroys the VM rather than dumping core) |
-| SIGUSR1 | stop a standby VM (`flexvm standby`, memory pressure), exit 0; a claimed VM ignores it, so a stop that lands after a claim started never destroys the VM the claim made |
+| SIGUSR1 | stop a standby VM (`flexvm pull IMAGE --standby N` lowering the count, memory pressure), exit 0; a claimed VM ignores it, so a stop that lands after a claim started never destroys the VM the claim made |
 | SIGSTOP | cannot be caught: freezes the pager, so the guest stalls. Unsupported |
 
 They (and SIGHUP, ignored: a closed terminal leaves the VM running) are
@@ -94,7 +103,7 @@ what must not be refused (SIGINT, SIGTERM, a dead VM, the end of a
 migration) waits for it, after cancelling a checkpoint in progress.
 SIGTERM's suspend runs off the signal thread, so a SIGINT after it is still
 taken. It is reserved before its thread starts: SIGTERMs while one runs are
-taken into it, and none starts once a `run -- CMD` command ends the VM
+taken into it, and none starts once a `run IMAGE CMD` command ends the VM
 (`suspend_overlap`). SIGINT wins: a suspend that published its checkpoint meanwhile
 revokes it (discarded, address withdrawn) and the process exits destroyed,
 and `flexvm kill` discards one that finished first (`suspend_killed`).
@@ -144,7 +153,7 @@ STATE (default /var/lib/flexvm, on disk)
                          base rootfs (scripts/fetch.sh, for scripts/test-image.py)
   templates/             pulled images' templates: NAME -> .gen/ID (see internals.md; NAME: README.md#images)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
-  host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
+  host.json              host config, edited by hand (listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
   run.json               canonical run path, bound on first open under `.locks/open`'s flock; fsynced
   .locks/                root's locks (0700): open (held while a root `Host::open` binds or repairs the root),
                          host (the host lock, held for short critical sections only), evict (one eviction
@@ -167,8 +176,8 @@ STATE (default /var/lib/flexvm, on disk)
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{json,sock,log}        registry entry, control socket, log of -d/standby VMs (0600)
   vms/.locks/NAME.lock            liveness lock; NAME.log, a log's writers' lock; .incoming-*.log, an arrival's lock
-  vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)
-  vms/NAME.lost                   a VM lost with the host, recorded before its address is withdrawn (until `flexvm kill`)
+  vms/NAME.{failed,moved}         why a VM died (until `flexvm rm`); where it migrated to (an hour)
+  vms/NAME.lost                   a VM lost with the host, recorded before its address is withdrawn (until `flexvm rm`)
   .boot                  the boot id once this boot's recovery completed (`gc::after_boot`)
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
@@ -185,8 +194,7 @@ RUN (default /run/flexvm, tmpfs)
   grants-BOOTID          recent grants not yet held, counted against the reserve
   evict.active           present while the host is under its eviction mark
   evict.backoff          refused VM and peer pairs and when to try them again
-  standby/H/             template T's standby files, H the 16-hex hash of T's name (independent of T's length;
-                         `flexvm standby` shows each one's `dir`)
+  standby/H/             template T's standby files, H the 16-hex hash of T's name (independent of T's length)
   standby/H/.template    T, the template's name
   standby/H/PID.sock     a standby VM of template T (.locks/PID-START.lock while it lives)
   standby/H/.locks/      PID-START.claim (locked by a standby VM while a claim of it is under way),
@@ -203,6 +211,17 @@ RUN (default /run/flexvm, tmpfs)
                          Firecracker a directory with `fc` (its pid and start time)
 ```
 
+**host.json** is edited by hand; only `flexvm listen` writes a key (`listen`).
+Write it atomically (a temp file in `STATE`, renamed over it). It must be a
+regular file, not a symlink, owned by root or the user and writable by no
+one else; an unknown key is refused. Every load validates it
+(`Config::validate`: `vm_ips` inside `cluster_ips`, peers `HOST:PORT`,
+`peer_underlays` unicast and not local, `dns` IPv4, `announce_dev` not
+empty). An invalid one makes every command refuse (`STATE/host.json: ...
+(see README: Configuration)`); running processes re-read it when its mtime
+or inode changes and keep the last valid one meanwhile. `flexvm info` shows
+what is set, what is derived for the rest, and warnings.
+
 Every lock flexvm flocks is a 0600 file in a directory only root may enter
 (0700, root's), opened relative to that directory's descriptor once it was
 checked, never through a link: Linux grants an exclusive flock through a
@@ -216,7 +235,7 @@ staging cleared), an image directory's (`image-DEV-INO-KEY.lock`,
 `publish-DEV-INO`) and the templates directory's (`templates-DEV-INO`,
 `verify-DEV-INO-ID`, `template-new-DEV-INO-STAGING`). Readable files and
 directories (logs, checkpoint directories, the state root) are never flocked; a
-log's writers' lock stays when the log goes. A non-root `flexvm ls` opens the
+log's writers' lock stays when the log goes. A non-root `flexvm ps` opens the
 state root without its lock and shows entries whose process is alive, without
 the lock's check. Files of the older layout (`STATE/lock` and the like) are
 never used; running older and newer flexvm binaries on one host at once is
@@ -226,7 +245,7 @@ unsupported.
 belongs to a dead process and is ignored; an entry is believed only for the
 process the lock names (pid and start time). Unlinking a lock file is done
 holding it, and a taker re-checks after locking that the path still names
-the inode it locked. Signals to a VM (`kill`, `resume`, a foreground `run`
+the inode it locked. Signals to a VM (`kill`, `stop`, `pause`, a foreground `run`
 forwarding them, eviction of standby VMs) go through a pidfd opened for the
 process the registry or lock names, checked after opening.
 
@@ -282,8 +301,8 @@ reentrant within a thread, so a guard dropped under it (an address claim)
 never deadlocks.
 
 Peer VM addresses must be inside the locally configured `cluster_ips`, set
-with `flexvm config --cluster-ips CIDR|FIRST-LAST` to contain every host's
-`vm_ips`. Unset or reset with `--cluster-ips ''`, it allows only this host's
+in host.json (`cluster_ips`: CIDR or FIRST-LAST) to contain every host's
+`vm_ips`. Unset, it allows only this host's
 `vm_ips`. Local, peer, underlay and gateway addresses are still refused.
 
 **Addresses and generations** keep the semantics of the generations work
@@ -331,18 +350,17 @@ outlives a power loss with a record that reads as withdrawn.
 **After a reboot.** Until a recovery pass completes in this boot (`RUN/.boot`
 with the boot id), every opener of the host as root runs `Host::after_boot` under
 the host lock. It records each VM that died with the host as lost
-(`RUN/vms/NAME.lost`, listed `lost` until `flexvm kill NAME`; its log was on RUN
+(`RUN/vms/NAME.lost`, listed `lost` by `ps -a` until `flexvm rm NAME`; its log was on RUN
 and is gone) before withdrawing what it held (as any sweep does: notices for the
 peers, an outcome owed by a source that was migrating); any sweep does the same
 until the pass completes. It puts back the routes to peers' VMs from
 `STATE/addrs` (`via`, not withdrawn, not held here): kernel routes do not
 outlive the boot, and peers never announce again what they delivered (#553).
-A command, the listener as it starts, and `flexvm recover` then set forwarding,
+A root command (`ps`, say) and the listener as it starts then set forwarding,
 sweep (the peers told, owed outcomes settled) and refill the standby VMs
 (`gc::recover`), and only then, if every step succeeded, write `RUN/.boot`; a
 VM process or a template build does only the local part and leaves the marker
-to a full pass. `flexvm recover` requires root and exits non-zero if the local
-boot recovery, forwarding setup or writing `RUN/.boot` fails. A `QUARANTINE`
+to a full pass. A `QUARANTINE`
 of an earlier boot no longer keeps a dead claim from being withdrawn, and the
 name's next holder withdraws its generation as it
 removes that debris (that resume never ran its VM).
@@ -380,7 +398,7 @@ copies and 64 MiB for the next copy, allocated before the pause and kept for
 reuse) are not admitted. Once allocated they are out of MemAvailable, so later
 admissions count them, but allocating them can take the host below the
 reserve: up to 128 MiB per VM taking keep-running checkpoints. Size
-`--reserve` with that in mind.
+`reserve_mib` with that in mind.
 
 **Memory marks** (`limit.rs`): each VM's Firecracker cgroup has a
 `memory.high` at the memory admitted for it plus Firecracker's overhead
@@ -429,7 +447,7 @@ answer, held packets). What changed is who is at each end:
 4. Pages: the target's pager connects to the *source's* listener (the
    address the source sent: its listen address, or for a wildcard one its
    underlay address with the listen port, derived from the kernel's route toward
-   the peers without `--underlay`) with `pages {name, mig}`; the listener passes the socket (SCM_RIGHTS) to the
+   the peers without `underlay` set) with `pages {name, mig}`; the listener passes the socket (SCM_RIGHTS) to the
    source VM process, which serves it if it is the source of that migration.
 5. Release: the source polls `migration {mig}` on the target's listener.
    The listener answers from `STATE/migs/ID`: `pending`, `committed`,
@@ -453,7 +471,7 @@ answer, held packets). What changed is who is at each end:
 migrations (and page requests for VMs migrating away). It is stateless and
 socket-activatable (`LISTEN_FDS`, taking its address from the socket when
 no ADDR is given, or binds ADDR or `host.json`'s `listen`); it saves only its
-address, once the socket is bound and valid. Settings are `flexvm config`'s;
+address, once the socket is bound and valid. Settings are `host.json`'s (above);
 those unset are derived where used, never saved (`Config::underlay`,
 `announce_dev`, `reserve`: the kernel's route toward the first peer elsewhere,
 cached for 30 s, and the host's RAM). Proxy ARP on the announce device is enabled
@@ -485,7 +503,9 @@ to receive.
 
 ## Standby pool
 
-`flexvm standby [--template T] N` records N in `STATE/standby/T` and starts
+`flexvm pull T --standby N` records N in `STATE/standby/T` (alone, on an
+image already pulled, it only sets the count; `rmi` sets it to 0 and waits
+for its standby VMs to go) and starts
 standby VMs until there are N: each is `flexvm run --standby`, a VM process
 that restores the template, lets the guest reseed and settle, pauses, and
 listens on `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters of the template's name;
@@ -526,7 +546,7 @@ it moves to another power of two; an arrival's pull does not count).
 Pressure relief needs one decider per host: every second each VM process
 whose host is under pressure, or whose VM is starved, tries
 `STATE/.locks/evict` (non-blocking). Pressure starts when MemAvailable falls
-under the high-water mark (`evict_mib`, `config --evict-at`; default the
+under the high-water mark (`evict_mib`; default the
 reserve plus the reserve or 512 MiB, whichever is more; the reserve's default
 is a sixteenth of the host's RAM, from 256 MiB to 4 GiB) and lasts until it is
 back above the mark by half the mark's height over the reserve (at least
@@ -550,7 +570,7 @@ or for a second (a loading or just claimed standby must not hold it longer). The
 holder, at most once per 5 s, reads the registry and ranks running VMs: the
 starved first, then the fastest growing (by power of two, under 8 MiB/s is
 none), then the biggest RSS (without pressure, only starved VMs are
-candidates; a `run -- CMD` VM never is: its process ends with CMD's, so
+candidates; a `run IMAGE CMD` VM never is: its process ends with CMD's, so
 its registry entry says so (`cmd`, set before it is first published, for a
 run, a standby claim or a resume), `migrate` with `evict` refuses it as busy
 and a plain `migrate` refuses it outright). It runs the eviction on a thread of its own that keeps the lock,
@@ -574,7 +594,7 @@ to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
 log is removed; an accepted one becomes `NAME.log`.
 Announcements and `lend` requests go to all peers at once, by the peers
 configured now (`Host::config_now`); the listener re-reads them too, so
-`flexvm config --peer` reaches running processes.
+an edit of host.json's `peers` reaches running processes.
 
 ## Exec across hosts
 
@@ -626,28 +646,28 @@ where it is kept and what tests it.
    to be up. SIGTERM on a migration source is a no-op (it ends once the
    target has its memory); on a target still pulling, the suspend waits for
    the pull (`save` drains, giving up if the VM is being killed). SIGCONT
-   resumes only a VM paused by SIGTSTP (or held by `restore --paused`), and
+   resumes only a VM paused by SIGTSTP (or held by `run --checkpoint DIR --paused`), and
    is ignored once a suspend or kill began: the kernel sends it after any
    SIGSTOP, systemd right after SIGTERM. A destroy refused because the VM is
-   migrating away (SIGINT, or `run -- CMD` ending), its target having
+   migrating away (SIGINT, or `run IMAGE CMD` ending), its target having
 committed, never ends the process,
    and takes back the checkpoint cancel it raised (fault
    `kill_refused_checkpoint`).
-6. **Suspend markers and quarantine.** `STARTED` means consumed: `resume`
-   deletes such a checkpoint and `ls` does not show it; deleting it holds
+6. **Suspend markers and quarantine.** `STARTED` means consumed: `start`
+   deletes such a checkpoint and `ps -a` does not show it; deleting it holds
    the operation lock, and a suspend deletes it first. A suspended directory
    without a manifest (a revoke or a removal cut short), or marked `STARTED`
    (a resume killed outright) or `DISCARDED`, is debris: it holds neither
-   name nor address, `ls` does not show it, and whoever takes the name next
-   (`run`, `resume`, `restore`, `kill`, an arrival; a suspend for its own
+   name nor address, `ps -a` does not show it, and whoever takes the name next
+   (`run`, `start`, `run --checkpoint`, `kill`, `rm`, an arrival; a suspend for its own
    VM) removes it durably and lets go of its address (without withdrawing
    its generation: a consumed checkpoint's VM may run on elsewhere). A
    revoked checkpoint is removed whole. Unit test
    `host::suspend_debris_is_removed_by_the_names_next_holder`; faults
    `suspend_debris`, `revoked_publication`. Quarantine is a file
-   (`QUARANTINE`, with the boot id), held only in that boot by both `resume`
-   and `ls` (fault `resume_mark_fails`). Suspended VMs keep name and address with
-   no pid, and `ls` lists them.
+   (`QUARANTINE`, with the boot id), held only in that boot by both `start`
+   and `ps` (fault `resume_mark_fails`). Suspended VMs keep name and address with
+   no pid, and `ps -a` lists them.
 7. **Address state** is read fresh and changed per change under the host
    lock, durable where it orders anything. The listener's skip-local check
    reads the holder under that lock.

@@ -181,13 +181,62 @@ def control(host, name, req, timeout=60):
 
 
 def run(host, name, ip=None, template=None):
+    """`run -d` of VM `name` of image `template` (default: --template); options go before the image."""
     scenario_vms.add(name)
-    a = ["run", name, "--template", template or args.template, "-d"] + (["--ip", ip] if ip else [])
-    return cli_json(host, *a)
+    return cli_json(host, "run", "--name", name, "-d", *(["--ip", ip] if ip else []), template or args.template)
 
 
 def kill(host, name):
-    return cli_json(host, "kill", name)
+    """`rm -f`: destroys `name` whatever its state, running or stopped (what `flexvm kill` did before
+    it took only running VMs); prints the name."""
+    return cli_json(host, "rm", "-f", name)
+
+
+def host_config(host):
+    """`host`'s STATE/host.json ({} if there is none)."""
+    try:
+        with open(os.path.join(host.state, "host.json")) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+HOST_KEYS = {"listen", "peers", "peer_underlays", "vm_ips", "cluster_ips", "underlay", "announce_dev", "dns", "reserve_mib", "evict_mib"}
+
+
+def configure(host, **keys):
+    """Sets `keys` in `host`'s STATE/host.json, read, modified and replaced atomically (a temp file in
+    its directory, then a rename) so running processes see the whole new file; a None, "" or empty
+    list or object value removes the key (it is then derived or unset). Returns the new contents.
+    Nothing is validated here: an invalid file makes the next command refuse."""
+    assert set(keys) <= HOST_KEYS, set(keys) - HOST_KEYS
+    conf = host_config(host)
+    for k, v in keys.items():
+        if v is None or v == "" or v == [] or v == {}:
+            conf.pop(k, None)
+        else:
+            conf[k] = v
+    os.makedirs(host.state, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=host.state, prefix=".host.json.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(conf, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(host.state, "host.json"))
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return conf
+
+
+def set_standby(host, template, n, timeout=120):
+    """`pull TEMPLATE --standby N` of a template already pulled here: only sets its standby count
+    (answers {"template", "standby", "started"})."""
+    return cli_json(host, "pull", template, "--standby", str(n), timeout=timeout)
 
 
 def migrate(src, name, dst, timeout=120):
@@ -200,7 +249,7 @@ def checkpoint(host, name, path, stop=False, incremental=False, timeout=300):
 
 def restore(host, path, name=None, ip=None, paused=False):
     scenario_vms.add(name or os.path.basename(path))
-    a = ["restore", path, "-d"] + (["--name", name] if name else []) + (["--ip", ip] if ip else []) + (["--paused"] if paused else [])
+    a = ["run", "--checkpoint", path, "-d"] + (["--name", name] if name else []) + (["--ip", ip] if ip else []) + (["--paused"] if paused else [])
     return cli_json(host, *a)
 
 
@@ -210,8 +259,8 @@ def sh(host, name, cmd):
 
 
 def vms(host):
-    """ls, with each live VM's own account of itself (`debug VM status`)."""
-    code, out, err = cli(host, "ls", "--json")
+    """`ps -a` (stopped VMs too), with each live VM's own account of itself (`debug VM status`)."""
+    code, out, err = cli(host, "ps", "-a", "--json")
     assert code == 0, err
     out = {v["name"]: v for v in json.loads(out)}
     for n, v in out.items():
@@ -442,16 +491,16 @@ def listing_third_peer(*hosts):
     """The third peer listed by `hosts` (and by a listener restarted meanwhile), their own peer lists
     as they were afterwards. Not across a restart of a loopback listener: one refuses a peer elsewhere."""
     peer = f"{third_peer()}:7070"
-    before = {h: ok(cli_json(h, "config"))["set"].get("peers", []) for h in hosts}
+    before = {h: host_config(h).get("peers", []) for h in hosts}
     EXTRA_PEERS.append(peer)
     try:
         for h in hosts:
-            ok(cli_json(h, "config", *[a for p in before[h] + [peer] for a in ("--peer", p)]))
+            configure(h, peers=before[h] + [peer])
         yield
     finally:
         EXTRA_PEERS.remove(peer)
         for h in hosts:
-            ok(cli_json(h, "config", *([a for p in before[h] for a in ("--peer", p)] or ["--peer", ""])))
+            configure(h, peers=before[h])
 
 
 def with_third_peer(scenario):
@@ -462,10 +511,10 @@ def with_third_peer(scenario):
     run.__name__ = scenario.__name__
     return run
 
-def start_listener(h, listen=None, extra=(), peer=None, wait=True):
-    """`h`'s listener, on `listen` (default: its address) with `extra` flags,
-    peered with `peer` (default: the other host's address); `wait`: until it
-    takes connections."""
+def start_listener(h, listen=None, extra=None, peer=None, wait=True):
+    """`h`'s listener, on `listen` (default: its address) with `extra` host.json keys
+    (`peers` ones added to its own), peered with `peer` (default: the other host's
+    address); `wait`: until it takes connections."""
     other = B if h is A else A
     for d in (h.state, h.run):
         os.makedirs(d, exist_ok=True)
@@ -473,8 +522,9 @@ def start_listener(h, listen=None, extra=(), peer=None, wait=True):
     # Include the spare addresses in each subnet used by forged-arrival scenarios too.
     nets = [ipaddress.IPv4Network(f"{ip}/24", strict=False) for host in (h, other) for ip in host.ips.split("-")]
     first, last = min(n.network_address for n in nets) + 1, max(n.broadcast_address for n in nets) - 1
-    ok(cli_json(h, "config", "--peer", peer or other.addr, *[a for p in EXTRA_PEERS for a in ("--peer", p)], "--vm-ips", h.ips,
-                "--cluster-ips", f"{first}-{last}", "--reserve", "512", *extra))
+    extra = dict(extra or {})
+    configure(h, peers=[peer or other.addr, *EXTRA_PEERS, *extra.pop("peers", [])], vm_ips=h.ips,
+              cluster_ips=f"{first}-{last}", reserve_mib=512, **extra)
     listeners[h.addr] = spawn_cli(h, "listen", listen or h.addr, stdout=lg, stderr=lg)
     if not wait:
         return
@@ -564,9 +614,9 @@ def pause(host, name):
 
 
 def resume(host, name):
-    """SIGCONT (`flexvm resume` of a paused VM); returns how long until it runs (s)."""
+    """SIGCONT (`flexvm unpause` of a paused VM); returns how long until it runs (s)."""
     t = time.time()
-    code, out, err = cli(host, "resume", name)
+    code, out, err = cli(host, "unpause", name)
     assert code == 0, err
     wait_for(lambda: vms(host)[name]["state"] == "running", 60)
     return time.time() - t
@@ -585,7 +635,8 @@ def suspend(host, name):
 
 
 def resume_suspended(host, name):
-    return cli_json(host, "resume", name, "-d")
+    """`start NAME`: resumes a suspended VM in the background; answers its JSON."""
+    return cli_json(host, "start", name)
 
 
 # --- migration --------------------------------------------------------------
@@ -734,12 +785,12 @@ def resume_kill():
     check("resume kill: md5 intact on A", md5(A, n) == m)
     cleanup(n)
     n = "ft-resume-kill-hot"
-    ok(cli_json(A, "standby", "--template", args.template, "1"))
+    ok(set_standby(A, args.template, 1))
     with armed_fault(A, "resume_kill", 60000):
         r = run(A, n)
     check("resume kill: a run claiming a standby vm fails", not r["ok"] and "may have run" in r.get("error", ""), r)
     check("resume kill: no vm left", n not in vms(A), vms(A).get(n))
-    ok(cli_json(A, "standby", "--template", args.template, "0"))
+    ok(set_standby(A, args.template, 0))
     r = run(A, n)
     check("resume kill: the name runs again", r["ok"], r)
 
@@ -846,7 +897,7 @@ def target_killed():
         with armed_fault(B, "lost_ack", 30000):
             fault(B, "status", 30000)
             r = migrate(A, n, B)
-        # Killed at once, from its lock and work directory alone (no `ls`): the
+        # Killed at once, from its lock and work directory alone (no `ps`): the
         # pull must still be under way.
         holder = json.load(open(os.path.join(B.run, "vms", ".locks", f"{n}.lock")))
         pid = holder["pid"]
@@ -1545,7 +1596,7 @@ def abort_superseded():
 
 def taps(host):
     """`host`'s taps (by its prefix), as the kernel has them."""
-    prefix = ok(cli_json(host, "config"))["derived"]["prefix"]
+    prefix = ok(cli_json(host, "info"))["derived"]["prefix"]
     return {d for d in os.listdir("/sys/class/net") if d.startswith(prefix)}
 
 
@@ -1661,7 +1712,7 @@ def capture_fail():
 def abort_gen_fail():
     """#460: an abort (the target refused a bad preload page) that cannot read its address's
     record (`abort_gen_fail`) cannot tell whether the address went to another VM: the source
-    never runs on it again, its vCPUs stay paused, it says it failed and `flexvm resume` does not
+    never runs on it again, its vCPUs stay paused, it says it failed and `flexvm unpause` does not
     run it; its loan stays (the address never free meanwhile) and the target has nothing. A kill
     ends it, freeing the address for a new VM."""
     n = "ft-abort-gen"
@@ -1680,8 +1731,8 @@ def abort_gen_fail():
     a = addr(A, ip)
     check("abort gen fail: the address stays its, lent", a.get("holder") == n and a.get("held") == gen and a.get("lent") == gen, a)
     nothing_on("abort gen fail", B, n, ip, before)
-    code, out, err = cli(A, "resume", n)
-    check("abort gen fail: flexvm resume does not run it",
+    code, out, err = cli(A, "unpause", n)
+    check("abort gen fail: flexvm unpause does not run it",
           where(n) == {A: "failed"} and fc_api(api_sock(A, n), "GET", "/")["state"] == "Paused", (code, out, err, where(n)))
     ok(kill(A, n))
     check("abort gen fail: a kill frees the address", wait_for(lambda: not addr(A, ip).get("holder") and not addr(A, ip).get("lent"), 10), addr(A, ip))
@@ -1772,7 +1823,7 @@ def commit_fail_routed():
         return out
 
     def ls(h):
-        return {v["name"]: v for v in nsjson(h, "ls", "--json")}
+        return {v["name"]: v for v in nsjson(h, "ps", "-a", "--json")}
 
     n = "ft-commit-routed"
     try:
@@ -1792,8 +1843,7 @@ def commit_fail_routed():
             os.makedirs(x.run)
             for d in ("artifacts", "templates"):
                 os.symlink(os.path.realpath(os.path.join(A.state, d)), os.path.join(x.state, d))
-            nsjson(h, "config", "--peer", hosts[other].addr, "--vm-ips", x.ips,
-                   "--cluster-ips", f"{net}.128-{net}.250", "--reserve", "512")
+            configure(x, peers=[hosts[other].addr], vm_ips=x.ips, cluster_ips=f"{net}.128-{net}.250", reserve_mib=512)
             lg = open(os.path.join(root, f"listen-{h}.log"), "a")
             # Its arrivals' Firecrackers get cgroups too: the hierarchy `ip netns exec`'s sysfs lacks.
             procs.append(subprocess.Popen(["ip", "netns", "exec", ns[h], "sh", "-c", 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"', "sh",
@@ -1801,7 +1851,7 @@ def commit_fail_routed():
         up = lambda h: subprocess.run(["ip", "netns", "exec", ns[h], "bash", "-c", f"exec 3<>/dev/tcp/{hosts[h].addr.replace(':', '/')}"],
                                       capture_output=True).returncode == 0
         assert wait_for(lambda: up("a") and up("b"), 10), "listeners did not come up"
-        r = nsjson("a", "run", n, "--template", args.template, "-d")
+        r = nsjson("a", "run", "--name", n, "-d", args.template)
         ip = r["ip"]
         code, out, err = nscli("a", "exec", n, "dd if=/dev/urandom of=/tmp/f bs=1M count=20 iflag=fullblock 2>/dev/null && md5sum /tmp/f")
         assert code == 0, err or out
@@ -1835,7 +1885,8 @@ def commit_fail_routed():
         seen.add((ls("b")[n]["pid"], ls("b")[n]["start"]))
         code, out, err = nscli("b", "exec", n, "md5sum /tmp/f")
         check("commit fail routed: md5 intact on the target", code == 0 and out.split()[0] == m, out or err)
-        nsjson("b", "kill", n)
+        code, out, err = nscli("b", "kill", n)
+        assert code == 0, err or out
     finally:
         for p in procs:
             p.terminate()
@@ -2454,7 +2505,7 @@ def announce_arp_timer():
     and the gap is between the kernel's timestamps, not between the reads (the
     first ARP goes out before `run` returns, its read later)."""
     n, dev = "ft-arp-timer", f"garp{A.addr.rsplit(':', 1)[1]}"
-    was = ok(cli_json(A, "config"))["set"].get("announce_dev") or ""
+    was = ok(cli_json(A, "info"))["set"].get("announce_dev") or ""
     arps, drops, cap = [], None, socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
     subprocess.run(["ip", "link", "del", dev], capture_output=True)
     subprocess.run(["ip", "link", "add", dev, "up", "type", "dummy"], check=True)
@@ -2464,8 +2515,7 @@ def announce_arp_timer():
         # Stamped by the kernel as each frame went out: read late, a frame's time is still its own.
         cap.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
         cap.settimeout(0.2)
-        code, out, err = cli(A, "config", "--announce-dev", dev)
-        assert code == 0, err
+        configure(A, announce_dev=dev)
         fault(B, "route_stall", 60000)
         ok(run(A, n))
         ip = socket.inet_aton(vms(A)[n]["ip"])
@@ -2488,7 +2538,7 @@ def announce_arp_timer():
             fault(B, "route_stall", 0)
         finally:
             try:
-                cli(A, "config", "--announce-dev", was)
+                configure(A, announce_dev=was)
             finally:
                 cap.close()
                 subprocess.run(["ip", "link", "del", dev], capture_output=True)
@@ -3115,8 +3165,8 @@ def slow_preload():
     n = "ft-slow-preload"
     # Pages to preload: what loads of the template touch, which standby VMs learn.
     for h in (A, B):
-        ok(cli_json(h, "standby", "--template", args.template, "1"))
-        ok(cli_json(h, "standby", "--template", args.template, "0"))
+        ok(set_standby(h, args.template, 1))
+        ok(set_standby(h, args.template, 0))
     m = setup(n)
     ip = vms(A)[n]["ip"]
     stop = threading.Event()
@@ -3834,7 +3884,7 @@ def resume_slow_guest():
 def resume_readdress_fail():
     """A restore at a new address whose readdress fails runs on with the
     address pending (no checkpoint meanwhile), held (--paused) or not: each
-    `flexvm resume` retries it, and so does the process in the background
+    `flexvm unpause` retries it, and so does the process in the background
     until it is set."""
     n = "ft-readdr"
     m = setup(n, mib=20)
@@ -3853,7 +3903,7 @@ def resume_readdress_fail():
         with armed_fault(B, "readdress_fail", 120000):
             if paused:
                 r = ok(restore(B, path, paused=True, ip="auto"))
-                code, out, err = cli(B, "resume", n)
+                code, out, err = cli(B, "unpause", n)
                 check(f"readdress fails ({what}): resume reports it", code != 0 and "setting its address" in err, (code, err))
                 check(f"readdress fails ({what}): logged", wait_for(lambda: sigcont_failed() == 1, 30), log(B, n)[-2000:])
             else:
@@ -3866,7 +3916,7 @@ def resume_readdress_fail():
             rm_ckpt(path + "-x")
             # A SIGCONT is let through while the address is pending: it tries again.
             before = sigcont_failed()
-            code, out, err = cli(B, "resume", n)
+            code, out, err = cli(B, "unpause", n)
             check(f"readdress fails ({what}): another resume tries again, and says it failed",
                   code != 0 and "setting its address" in err and sigcont_failed() > before, (code, err, log(B, n)[-2000:]))
             check(f"readdress fails ({what}): the background retries too", wait_for(lambda: "trying again" in log(B, n), 30), log(B, n)[-2000:])
@@ -3883,7 +3933,7 @@ def resume_readdress_fail():
 def resume_unpause_fail():
     """A suspended VM whose vCPUs fail to resume may have run some of them:
     its checkpoint is not resumed again, but the VM, paused again, is kept
-    and `flexvm resume` runs it."""
+    and `flexvm unpause` runs it."""
     n = "ft-unpause-fail"
     m = setup(n)
     proc = marker(A, n)
@@ -3897,7 +3947,7 @@ def resume_unpause_fail():
     check("unpause fails: its checkpoint is consumed (STARTED, or deleted once paged in)",
           not os.path.exists(d) or os.path.exists(os.path.join(d, "STARTED")), os.listdir(d) if os.path.exists(d) else None)
     resume(A, n)
-    check("unpause fails: flexvm resume runs it", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+    check("unpause fails: flexvm unpause runs it", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
     check("unpause fails: md5 intact, same processes", md5(A, n) == m and marker_id(A, n) == proc, (proc, marker_id(A, n)))
 
 
@@ -3937,18 +3987,18 @@ def resume_unsettled():
 
 
 def resume_outcome():
-    """#517: `flexvm resume` answers once the VM's process has tried: a resume
+    """#517: `flexvm unpause` answers once the VM's process has tried: a resume
     that fails part way (`resume_partial`) exits non-zero with its error, the
     VM still paused; one that succeeds exits 0 with the VM already running."""
     n = "ft-resume-outcome"
     m = setup(n, mib=20)
     check("resume outcome: paused", pause(A, n))
     with armed_fault(A, "resume_partial", 60000):
-        code, out, err = cli(A, "resume", n)
+        code, out, err = cli(A, "unpause", n)
     check("resume outcome: the fault was reached", "injected fault: firecracker PATCH /vm: 400 the resume failed part way" in log(A, n), log(A, n)[-1000:])
     check("resume outcome: a failed resume exits non-zero, saying why", code != 0 and "resume failed part way" in err, (code, out, err))
     check("resume outcome: still paused", vms(A).get(n, {}).get("state") == "paused", vms(A).get(n))
-    code, out, err = cli(A, "resume", n)
+    code, out, err = cli(A, "unpause", n)
     check("resume outcome: then it resumes, running when it exits 0", code == 0 and vms(A).get(n, {}).get("state") == "running", (code, err, vms(A).get(n)))
     check("resume outcome: md5 intact", md5(A, n) == m)
 
@@ -3971,7 +4021,7 @@ def kill_prepare():
         with armed_fault(A, "destroy_wait", 60000), armed_fault(host, gate, 8000):
             moved, mt = background(lambda: migrate(A, n, B))
             check(f"{what}: the migration got to the gate", wait_for(lambda: reached(host, gate), 8), reached(host, gate))
-            killed, kt = background(lambda: kill(A, n))
+            killed, kt = background(lambda: cli_json(A, "kill", n))
             check(f"{what}: the kill waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 8), reached(A, "destroy_wait"))
             fault(host, gate, 0)
             mt.join()
@@ -3988,7 +4038,7 @@ def kill_prepare():
 
 
 def resume_migrating():
-    """#569: `flexvm resume` of a VM whose migration's outcome is unknown (ack lost, status
+    """#569: `flexvm unpause` of a VM whose migration's outcome is unknown (ack lost, status
     unavailable: it stays paused here, reconciling) fails, saying it is migrating away, rather
     than reporting a resume that never ran: whether it was paused or running when it left."""
     for paused in (True, False):
@@ -4002,7 +4052,7 @@ def resume_migrating():
             fault(B, "status", 30000)
             r = migrate(A, n, B)
         check(f"{what}: outcome unknown, the source reconciling", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
-        code, out, err = cli(A, "resume", n)
+        code, out, err = cli(A, "unpause", n)
         check(f"{what}: resume fails, saying so", code != 0 and "migrating away" in err, (code, out, err))
         check(f"{what}: the vm process said so", "migrating away" in log(A, n), log(A, n)[-500:])
         fault(B, "status", 0)
@@ -4159,7 +4209,7 @@ def app_abort():
 def abort_link_fail():
     """Raising a VM's tap fails as it resumes after an aborted migration or a
     checkpoint: it is left paused (as Firecracker has it), never failed, and
-    `flexvm resume` runs it."""
+    `flexvm unpause` runs it."""
     n = "ft-link-fail"
     m = setup(n, mib=20)
     with armed_fault(A, ('bad_preload', 'resume_link_fail'), 60000):
@@ -4168,14 +4218,14 @@ def abort_link_fail():
     check("link fails after an abort: paused on A only, not failed", where(n) == {A: "paused"}, where(n))
     check("link fails after an abort: Firecracker paused", fc_api(api_sock(A, n), "GET", "/")["state"] == "Paused")
     resume(A, n)
-    check("link fails after an abort: flexvm resume runs it", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    check("link fails after an abort: flexvm unpause runs it", where(n) == {A: "running"} and md5(A, n) == m, where(n))
     path = ckpt_path("ft-link-fail")
     with armed_fault(A, "resume_link_fail", 60000):
         r = checkpoint(A, n, path)
     check("link fails after a checkpoint: it fails, saying so", not r["ok"] and "after its checkpoint failed" in r.get("error", ""), r)
     check("link fails after a checkpoint: paused, not failed", vms(A)[n]["state"] == "paused", vms(A)[n])
     resume(A, n)
-    check("link fails after a checkpoint: flexvm resume runs it", vms(A)[n]["state"] == "running" and md5(A, n) == m, vms(A)[n])
+    check("link fails after a checkpoint: flexvm unpause runs it", vms(A)[n]["state"] == "running" and md5(A, n) == m, vms(A)[n])
     r = migrate(A, n, B)
     check("link fails: a later migration works", r["ok"] and where(n).get(B) == "running", r)
     wait_released(B, n)
@@ -4186,7 +4236,7 @@ def abort_link_fail():
 
 def suspend_resume():
     """SIGTERM suspends: the VM's memory is freed and its process exits;
-    `flexvm resume` pages it back in lazily, in a new process."""
+    `flexvm start` pages it back in lazily, in a new process."""
     n = "ft-suspend"
     m = setup(n)
     proc_before = marker(A, n)
@@ -4199,7 +4249,7 @@ def suspend_resume():
     code, out = sh(A, n, "echo hi")
     check("suspend: exec refused", code != 0, out)
     r = run(A, n)
-    check("suspend: its name stays taken", not r["ok"] and "suspended" in r["error"], r)
+    check("suspend: its name stays taken", not r["ok"] and "stopped" in r["error"], r)
     # Nothing about a suspended VM lives in a process: the listeners restart.
     restart_listeners("suspend")
     check("suspend: still suspended", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
@@ -4391,7 +4441,7 @@ def resume_mark_fails():
     resume_suspended(A, n)
     disarm()
     check("quarantined kill: quarantined", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
-    ok(kill(A, n))
+    ok(cli_json(A, "rm", n))
     check("quarantined kill: gone", n not in vms(A), vms(A).get(n))
     check("quarantined kill: checkpoint deleted", not exists("manifest.json"))
     r = resume_suspended(A, n)
@@ -4400,16 +4450,16 @@ def resume_mark_fails():
 
 def standby():
     """Standby VMs: `run` claims one (a resume and START), its replacement
-    comes up, `standby 0` stops them all; without one, run loads cold."""
+    comes up, `pull --standby 0` stops them all; without one, run loads cold."""
     t = args.template
-    ok(cli_json(A, "standby", "--template", t, "2"))
+    ok(set_standby(A, t, 2))
     live = lambda: len([f for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
     check("standby: two ready", live() == 2, live())
     r = claimed = ok(run(A, "ft-sb1"))
     check("standby: run claims one", r["standby"] is True, r)
     check("standby: claimed vm works", sh(A, "ft-sb1", "echo hi") == (0, "hi"))
     check("standby: refilled to two", wait_for(lambda: live() == 2, 60), live())
-    ok(cli_json(A, "standby", "--template", t, "0"))
+    ok(set_standby(A, t, 0))
     check("standby: 0 stops them", wait_for(lambda: live() == 0, 30), live())
     r = ok(run(A, "ft-sb2"))
     check("standby: without one, a cold run", r["standby"] is False, r)
@@ -4432,20 +4482,20 @@ def standby():
 
 
 def standby_vm_ips():
-    """A `--vm-ips` and `--dns` change reaches a standby VM started before it (#521): its claim
+    """A `vm_ips` and `dns` change (host.json) reaches a standby VM started before it (#521): its claim
     takes its address from the new range and gives the guest the new DNS server; a VM already
     running keeps its address."""
     t, n, old = args.template, "ft-sbips", "ft-sbips-old"
-    was = ok(cli_json(A, "config"))["set"]
+    was = host_config(A)
     ok(run(A, old))
     old_ip = vms(A)[old]["ip"]
-    ok(cli_json(A, "standby", "--template", t, "1"))
+    ok(set_standby(A, t, 1))
     ready = lambda: {f[:-5] for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])}
     pool = ready()
     check("standby vm ips: a standby ready before the change", len(pool) == 1, pool)
     new, dns = spare(A, 1), "192.0.2.53"
     try:
-        ok(cli_json(A, "config", "--vm-ips", f"{new}-{new}", "--dns", dns))
+        configure(A, vm_ips=f"{new}-{new}", dns=dns)
         check("standby vm ips: the same standby waits after the change", ready() == pool, (pool, ready()))
         r = ok(run(A, n))
         pid = int(next(iter(pool)).split("-")[0])
@@ -4456,8 +4506,8 @@ def standby_vm_ips():
         check("standby vm ips: the guest has the new DNS server", code == 0 and f"nameserver {dns}" in conf, conf)
         check("standby vm ips: the running vm keeps its address", vms(A)[old]["ip"] == old_ip and old_ip != new, vms(A)[old])
     finally:
-        ok(cli_json(A, "standby", "--template", t, "0"))
-        ok(cli_json(A, "config", "--vm-ips", was["vm_ips"], "--dns", was.get("dns") or ""))
+        ok(set_standby(A, t, 0))
+        configure(A, vm_ips=was.get("vm_ips"), dns=was.get("dns"))
     check("standby vm ips: standbys stopped", wait_for(lambda: not ready(), 30), ready())
     cleanup(n)
 
@@ -5921,8 +5971,8 @@ def mem_refused_fill():
         check("refused fill: the host's cgroup saw no OOM", cgroup(A, n)[2].get("oom_kill") == "0", cgroup(A, n)[2])
         said = log(A, n).count("starved: the host's reserve refused")
         check("refused fill: its starving is logged once, not at each retry", said == 1, log(A, n)[-1500:])
-        rows = [l.split() for l in cli(A, "ls")[1].splitlines()]
-        check("refused fill: plain ls shows it starved", rows[0][-1] == "STARVED" and any(r[0] == n and r[-1] == "yes" for r in rows[1:]), rows)
+        rows = [l.split() for l in cli(A, "ps")[1].splitlines()]
+        check("refused fill: plain ps shows it starved", rows[0][-1] == "STARVED" and any(r[0] == n and r[-1] == "yes" for r in rows[1:]), rows)
         # Relief: moved to B, where it grows.
     check("refused fill: moved to B", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-1500:]))
     st = wait_released(B, n, timeout=60)
@@ -6160,11 +6210,11 @@ def evict_grower():
 
 
 def evict_skips_cmd():
-    """A host under pressure leaves a `run -- CMD` VM where it is (CMD's end
+    """A host under pressure leaves a `run IMAGE CMD` VM where it is (CMD's end
     there ends it, with CMD's status), even starved, and moves another."""
     n, other = "ft-ev-cmd", "ft-ev-plain"
     scenario_vms.update({n})
-    p = spawn_cli(A, "run", n, "--template", args.template, "--", "sleep 600", stderr=open(os.path.join(A.run, f"{n}.stderr"), "w"), start_new_session=True)
+    p = spawn_cli(A, "run", "--name", n, args.template, "sleep 600", stderr=open(os.path.join(A.run, f"{n}.stderr"), "w"), start_new_session=True)
     check("evict cmd: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     m = setup(other, mib=1)
     with pressure(512, 1000, A):
@@ -6209,12 +6259,12 @@ def evict_peer_busy():
     n = "ft-ev-peer-busy"
     m = setup(n, mib=1)
     with busy_peer() as stub:
-        ok(cli_json(A, "config", "--peer", stub.addr, "--peer", B.addr))
+        configure(A, peers=[stub.addr, B.addr])
         try:
             with pressure(512, 1000, A):
                 moved = wait_for(lambda: where(n) == {B: "running"}, 60)
         finally:
-            ok(cli_json(A, "config", "--peer", B.addr))
+            configure(A, peers=[B.addr])
     with open(os.path.join(A.run, "evict.backoff")) as f:
         backoff = json.load(f)
     check("evict peer busy: the stub was asked", "migrate_in" in stub.asked, stub.asked)
@@ -6235,7 +6285,7 @@ def standby_relief_no_vm():
     marker = os.path.join(A.run, "standby", ".pressure")
     with suppress(FileNotFoundError):
         os.remove(marker)
-    ok(cli_json(A, "standby", "--template", t, "1"))
+    ok(set_standby(A, t, 1))
     try:
         check("standby relief no vm: one ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
         pid = standby_pids(A, t)[0]
@@ -6247,7 +6297,7 @@ def standby_relief_no_vm():
     finally:
         with suppress(FileNotFoundError):
             os.remove(marker)
-        cli(A, "standby", "--template", t, "0")
+        cli(A, "pull", t, "--standby", "0")
         wait_for(lambda: not standby_pids(A, t), 30)
 
 
@@ -6258,19 +6308,19 @@ def standby_refill_mark():
     marker = os.path.join(A.run, "standby", ".pressure")
     with suppress(FileNotFoundError):
         os.remove(marker)
-    derived = ok(cli_json(A, "config"))["derived"]
+    derived = ok(cli_json(A, "info"))["derived"]
     reserve, at = derived["reserve_mib"], derived["evict_at_mib"]
     try:
         with mem_available_as(A, at - 64) as avail:
             check("standby refill mark: between the reserve and the mark", reserve < avail.mib < at, (reserve, avail.mib, at))
-            r = ok(cli_json(A, "standby", "--template", t, "1"))
+            r = ok(set_standby(A, t, 1))
             check("standby refill mark: none starts under the mark", r["started"] == 0, r)
             time.sleep(7)  # past a maintain round
             check("standby refill mark: nor in the background", not standby_pids(A, t), standby_pids(A, t))
             avail.write(str(at + 8192))
             check("standby refill mark: refilled above it", wait_for(lambda: len(standby_pids(A, t)) == 1, 60), standby_pids(A, t))
     finally:
-        cli(A, "standby", "--template", t, "0")
+        cli(A, "pull", t, "--standby", "0")
         wait_for(lambda: not standby_pids(A, t), 30)
 
 
@@ -6363,7 +6413,7 @@ class mem_available_as:
 
 
 def reserve_of(host):
-    return ok(cli_json(host, "config"))["derived"]["reserve_mib"]
+    return ok(cli_json(host, "info"))["derived"]["reserve_mib"]
 
 
 class tight_reserve(mem_available_as):
@@ -6596,7 +6646,7 @@ def meminfo_unreadable():
     pressure = os.path.join(A.run, "standby", ".pressure")
     mtime = lambda p: os.stat(p).st_mtime if os.path.exists(p) else None
     try:
-        ok(cli_json(A, "standby", "--template", t, "1"))
+        ok(set_standby(A, t, 1))
         locks = lambda: [f for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])]
         check("meminfo: a standby ready", wait_for(lambda: len(locks()) == 1, 60), locks())
         ready, pressed = locks(), mtime(pressure)
@@ -6610,7 +6660,7 @@ def meminfo_unreadable():
         check("meminfo: still the standby", locks() == ready, locks())
     finally:
         fault(A, "no_meminfo", 0)
-        ok(cli_json(A, "standby", "--template", t, "0"))
+        ok(set_standby(A, t, 0))
         cleanup(n)
 
 
@@ -6621,7 +6671,7 @@ def standby_admission():
     t = args.template
     ok(run(A, "ft-sbadm-dup"))
     try:
-        ok(cli_json(A, "standby", "--template", t, "1"))
+        ok(set_standby(A, t, 1))
         live = lambda: len([f for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
         check("standby admission: one ready", wait_for(lambda: live() == 1, 60), live())
         with tight_reserve(256 + 48):
@@ -6631,7 +6681,7 @@ def standby_admission():
             r = run(A, "ft-sbadm")
             check("standby admission: claimed with room for a step only", r["ok"] and r["result"]["standby"] is True, r)
     finally:
-        ok(cli_json(A, "standby", "--template", t, "0"))
+        ok(set_standby(A, t, 0))
         cleanup("ft-sbadm")
         cleanup("ft-sbadm-dup")
 
@@ -6644,7 +6694,7 @@ def kill_source():
     ok(migrate(A, n, B))
     # Keep the pull from finishing (the target retries for 10 s).
     fault(A, "pages", 3000)
-    r = kill(A, n)
+    r = cli_json(A, "kill", n)
     check("kill source: refused", not r["ok"] and "source of a migration" in r.get("error", ""), r)
     check("kill source: copy still paused on A", vms(A).get(n, {}).get("state") == "source", where(n))
     st = wait_released(B, n)
@@ -6712,7 +6762,7 @@ def wildcard_listen():
         stop_listener(A)
         try:
             start_listener(A, f"{wild}:{port}")
-            underlay = ok(cli_json(A, "config"))["derived"]["underlay"]
+            underlay = ok(cli_json(A, "info"))["derived"]["underlay"]
             check(f"wildcard listen {wild}: the underlay detected", underlay == host_ip, underlay)
             n = "ft-wildcard"
             clear_log(B, n)
@@ -6768,7 +6818,7 @@ def peer_unresolvable():
     withdraw = lambda: peer(B, {"op": "route", "ip": ip, "gen": addr(B, ip).get("seen", 0) + 1})
     stop_listener(B)
     try:
-        start_listener(B, extra=("--peer", "gone-peer.invalid:7000"))
+        start_listener(B, extra={"peers": ["gone-peer.invalid:7000"]})
         # The first may wait out the name's lookup (at most ADMIT_WAIT), or be told to try again.
         r, t = {}, time.time()
         while not r.get("ok") and time.time() - t < 10:
@@ -7002,7 +7052,7 @@ def spoof_filter():
     ok(checkpoint(A, n, path))
     r = ok(restore(A, path, name=n2, ip="auto", paused=True))
     new = r["ip"]
-    code, out, err = cli(A, "resume", n2)
+    code, out, err = cli(A, "unpause", n2)
     check("spoof: restored at a new address and resumed", code == 0 and new != mine, (r, err))
     check("spoof: readdressed", wait_for(lambda: f"inet {new}/" in sh(A, n2, "ip -4 -o addr show eth0")[1], 30), sh(A, n2, "ip -4 -o addr show eth0"))
     got = send(A, n2, [new, mine, theirs])
@@ -7195,7 +7245,7 @@ def start_killed():
     scenario_vms.add(n)
     ip = A.ips.split("-")[1]  # the last of the range: free
     with armed_fault(A, "start_stall", 10000):
-        p = spawn_cli(A, "run", n, "--template", args.template, "--ip", ip)
+        p = spawn_cli(A, "run", "--name", n, "--ip", ip, args.template)
         wait_for(lambda: addr(A, ip).get("holder") == n, 20)
         gen = addr(A, ip).get("held")
         p.kill()
@@ -7279,14 +7329,14 @@ def claim_killed():
     answered: `run` says the claim is uncertain and starts nothing else."""
     n = "ft-claim-killed"
     scenario_vms.add(n)
-    code, out, err = cli(A, "standby", "--template", args.template, "1")
+    code, out, err = cli(A, "pull", args.template, "--standby", "1")
     check("claim killed: a standby vm", code == 0, err)
     # The claim parks once the VM runs, before the standby answers (`claim_stall`, a gate).
     clear_gate(A, "claim_stall")
     with armed_fault(A, "claim_stall", 60000):
         lockdir = os.path.join(standby_dir(A.run, args.template), ".locks")
         pids = [json.load(open(os.path.join(lockdir, f)))["pid"] for f in os.listdir(lockdir) if f.endswith(".lock")]
-        res, t = background(lambda: cli_json(A, "run", n, "--template", args.template, "-d"))
+        res, t = background(lambda: cli_json(A, "run", "--name", n, "-d", args.template))
         check("claim killed: the claim got to its gate", wait_for(lambda: reached(A, "claim_stall"), 60), pids)
         for p in pids:
             with suppress(OSError):
@@ -7295,31 +7345,31 @@ def claim_killed():
     r = res.get("r", {})
     check("claim killed: uncertain, not started again", not r.get("ok") and "may have started" in r.get("error", ""), r)
     check("claim killed: running nowhere", wait_for(lambda: n not in vms(A), 10), vms(A).get(n))
-    cli(A, "standby", "--template", args.template, "0")
+    cli(A, "pull", args.template, "--standby", "0")
 
 
 def standby_stop_claim():
-    """A standby VM stopped (`standby 0`) while a claim of it is under way:
+    """A standby VM stopped (`pull --standby 0`) while a claim of it is under way:
     the VM the claim made runs on, and SIGTERM suspends it. The stop reaches
     the process after the claim started (it is listed until the claim is
     done), and must not be taken for a kill of the claimed VM."""
     t, n = args.template, "ft-sb-stop-claim"
     scenario_vms.add(n)
-    ok(cli_json(A, "standby", "--template", t, "1"))
+    ok(set_standby(A, t, 1))
     res = {}
     try:
         check("standby stop claim: a standby ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
         # The claim parks once the VM is set, before the standby lets go of its lock (`claim_stall`, a gate).
         clear_gate(A, "claim_stall")
         with armed_fault(A, "claim_stall", 60000):
-            th = start_thread(target=lambda: res.update(r=cli_json(A, "run", n, "--template", t, "-d", "--", "sleep 600")))
+            th = start_thread(target=lambda: res.update(r=cli_json(A, "run", "--name", n, "-d", t, "sleep 600")))
             check("standby stop claim: the claim got to its gate", wait_for(lambda: reached(A, "claim_stall"), 60))
             # Its standby is still listed while the claim is under way: the stop signals it there.
-            ok(cli_json(A, "standby", "--template", t, "0"))
+            ok(set_standby(A, t, 0))
         th.join()
     finally:
         fault(A, "claim_stall", 0)
-        cli(A, "standby", "--template", t, "0")
+        cli(A, "pull", t, "--standby", "0")
     r = res.get("r", {})
     check("standby stop claim: claimed", r.get("ok") and r["result"].get("standby") is True, r)
     # Watched for a while: a stop taken for a kill would end it soon after the claim.
@@ -7337,7 +7387,7 @@ def standby_claim_signal():
     standby VM is under way: the VM the claim made goes, as a cold foreground
     run's would, and is not left running with no one to stop it."""
     t = args.template
-    ok(cli_json(A, "standby", "--template", t, "1"))
+    ok(set_standby(A, t, 1))
     try:
         for sig, n in ((signal.SIGINT, "ft-sb-sigint"), (signal.SIGKILL, "ft-sb-sigkill")):
             scenario_vms.add(n)
@@ -7348,7 +7398,7 @@ def standby_claim_signal():
             with armed_fault(A, "claim_stall", 60000):
                 # Output to a file: an orphaned VM would hold a pipe open, and reading it would never end.
                 out = tempfile.TemporaryFile("w+")
-                p = spawn_cli(A, "run", n, "--template", t, "--", "sleep 600", stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
+                p = spawn_cli(A, "run", "--name", n, t, "sleep 600", stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
                 # At the gate: the claim has started the VM, its answer is yet to come.
                 check(f"standby claim {what}: the claim got to its gate", wait_for(lambda: reached(A, "claim_stall"), 60))
                 p.send_signal(sig)
@@ -7369,7 +7419,7 @@ def standby_claim_signal():
             cleanup(n)
     finally:
         fault(A, "claim_stall", 0)
-        cli(A, "standby", "--template", t, "0")
+        cli(A, "pull", t, "--standby", "0")
 
 
 def standby_dir(run, t):
@@ -7395,12 +7445,51 @@ def standby_socks(host, t):
     return [f for f in os.listdir(d) if f.endswith(".sock")] if os.path.isdir(d) else []
 
 
+def standby_claim_caps():
+    """A claim's --cpus and --memory are its own: one refused at its name (taken) leaves the
+    standby it reached as it was, and the next claim of it, uncapped, sets its cgroup's cpu.max
+    to max itself; a capped claim gets its quota and its memory ceiling."""
+    t = args.template
+    ctl = "/sys/fs/cgroup/flexvm/cgroup.subtree_control"
+    if not os.path.exists(ctl) or "cpu" not in open(ctl).read().split():
+        raise Skip("no cgroup cpu controller")
+
+    def cpu_max(name):
+        cg = open(f"/proc/{fc_pid(A, name)}/cgroup").read().strip().split("::", 1)[1]
+        return open(f"/sys/fs/cgroup{cg}/cpu.max").read().strip()
+
+    held, free, capped = "ft-sbc-held", "ft-sbc-free", "ft-sbc-capped"
+    scenario_vms.update([free, capped])
+    ok(run(A, held))
+    ok(set_standby(A, t, 1))
+    live = lambda: {int(f[:-5].split("-")[0]) for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])}
+    check("standby claim caps: one ready", wait_for(lambda: len(live()) == 1, 60), live())
+    ready = live()
+    r = cli_json(A, "run", "--name", held, "-d", "--cpus", "0.5", "--memory", "1408m", t)
+    check("standby claim caps: a capped claim of a taken name is refused", not r["ok"] and "is taken" in r["error"], r)
+    check("standby claim caps: the standby it reached stays", live() == ready, (live(), ready))
+    r = ok(run(A, free))
+    check("standby claim caps: the next claim takes that standby", r["standby"] is True and r["pid"] in ready, (r, ready))
+    check("standby claim caps: uncapped, its cpu.max is max (not the refused claim's)", cpu_max(free) == "max 100000", cpu_max(free))
+    check("standby claim caps: and no cap listed", vms(A)[free].get("cpus") is None, vms(A)[free])
+    # Claimable once it listens (`PID.sock`), not as soon as its lock is held.
+    claimable = lambda: [p for p in live() if os.path.exists(os.path.join(standby_dir(A.run, t), f"{p}.sock"))]
+    check("standby claim caps: refilled", wait_for(lambda: len(claimable()) == 1, 60), (live(), claimable()))
+    r = ok(cli_json(A, "run", "--name", capped, "-d", "--cpus", "0.5", "--memory", "1408m", t))
+    v = vms(A)[capped]
+    check("standby claim caps: a capped claim gets its quota and ceiling",
+          r["standby"] is True and cpu_max(capped) == "50000 100000" and v.get("cpus") == 0.5 and v.get("max_mib") == 1408, (r.get("standby"), cpu_max(capped), v))
+    ok(set_standby(A, t, 0))
+    for n in (held, free, capped):
+        cleanup(n)
+
+
 def standby_concurrent_claims():
     """Concurrent runs claim different standby VMs at once: none queues on
     another's claim (each parks at the `claim_stall` gate, and both get there
     before either is let go)."""
     t, names = args.template, ("ft-sb-cc1", "ft-sb-cc2")
-    ok(cli_json(A, "standby", "--template", t, "2"))
+    ok(set_standby(A, t, 2))
     res = {}
     try:
         check("standby concurrent: two ready", wait_for(lambda: len(standby_socks(A, t)) == 2, 90), standby_pids(A, t))
@@ -7422,7 +7511,7 @@ def standby_concurrent_claims():
             th.join()
     finally:
         fault(A, "claim_stall", 0)
-        cli(A, "standby", "--template", t, "0")
+        cli(A, "pull", t, "--standby", "0")
     rs = [res.get(n, ({}, 0)) for n in names]
     check("standby concurrent: both claimed standbys", all(r.get("ok") and r["result"].get("standby") is True for r, _ in rs), rs)
     pids = {r.get("result", {}).get("pid") for r, _ in rs}
@@ -7440,7 +7529,7 @@ def standby_stalled():
     marks the pressure, so it is not refilled once it exits, and holds off
     neither eviction nor a controller's ticks."""
     t, n = args.template, "ft-sb-stalled"
-    ok(cli_json(A, "standby", "--template", t, "1"))
+    ok(set_standby(A, t, 1))
     check("standby stalled: one ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
     pid = standby_pids(A, t)[0]
     d = standby_dir(A.run, t)
@@ -7451,7 +7540,7 @@ def standby_stalled():
     os.kill(pid, signal.SIGTERM)
     check("standby stalled: stops under a half-sent claim", wait_for(lambda: not alive(pid), 10))
     c.close()
-    ok(cli_json(A, "standby", "--template", t, "1"))
+    ok(set_standby(A, t, 1))
     check("standby stalled: another ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
     pid = standby_pids(A, t)[0]
     os.kill(pid, signal.SIGSTOP)
@@ -7481,7 +7570,7 @@ def standby_stalled():
     check("standby stalled: and is not refilled under the pressure mark", not live, live)
     with suppress(FileNotFoundError):
         os.remove(os.path.join(A.run, "standby", ".pressure"))
-    cli(A, "standby", "--template", t, "0")
+    cli(A, "pull", t, "--standby", "0")
     check("standby stalled: stopped", wait_for(lambda: not standby_pids(A, t), 30))
 
 
@@ -7499,7 +7588,7 @@ def standby_refill_race():
     fault(A, "no_evict", 600000)
     fault(A, "standby_lock_stall", 2000)
     res, seen = {}, {}
-    th = start_thread(target=lambda: res.update(r=cli_json(A, "standby", "--template", t, "1")))
+    th = start_thread(target=lambda: res.update(r=set_standby(A, t, 1)))
     try:
         time.sleep(1)
         avail = mem_available()
@@ -7520,7 +7609,7 @@ def standby_refill_race():
     check("standby refill race: it exits", wait_for(lambda: not [p for p in pids + standby_pids(A, t) if alive(p)], 30), (pids, res))
     with suppress(FileNotFoundError):
         os.remove(pressure)
-    cli(A, "standby", "--template", t, "0")
+    cli(A, "pull", t, "--standby", "0")
 
 
 def standby_starting(host):
@@ -7554,7 +7643,7 @@ def standby_lock_timeout():
     fault(A, "no_evict", 600000)
     fault(A, "standby_lock_hang", 30000)
     res, seen, began = {}, {}, time.time()
-    th = start_thread(target=lambda: res.update(r=cli_json(A, "standby", "--template", t, "1"), took=time.time() - began))
+    th = start_thread(target=lambda: res.update(r=set_standby(A, t, 1), took=time.time() - began))
     child = None
     try:
         wait_for(lambda: standby_starting(A), 5)
@@ -7588,7 +7677,7 @@ def standby_lock_timeout():
         left = lambda: [p for p in [f"/sys/fs/cgroup/flexvm/vm-{key}", os.path.join(A.run, "w", key)] if os.path.exists(p)] + \
             [f for f in (os.listdir(d) if os.path.isdir(d) else []) if key in f]
         check("standby lock timeout: nothing left behind (the refill sweeps)", wait_for(lambda: not left(), 5), left())
-    cli(A, "standby", "--template", t, "0")
+    cli(A, "pull", t, "--standby", "0")
     check("standby lock timeout: no standby left", wait_for(lambda: not standby_starting(A), 30), standby_starting(A))
     with suppress(FileNotFoundError):
         os.remove(pressure)
@@ -7597,11 +7686,11 @@ def standby_lock_timeout():
 def fc_died():
     """A VM's Firecracker dies under it (a guest panic, an OOM kill): its
     process notices at once, cleans up as a kill would (address withdrawn,
-    route gone), exits with status 124, and `ls` shows it failed, with
-    Firecracker's exit status and the end of its log, until `kill`."""
+    route gone), exits with status 124, and `ps -a` shows it failed, with
+    Firecracker's exit status and the end of its log, until `rm`."""
     n = "ft-fc-died"
     scenario_vms.add(n)
-    p = spawn_cli(A, "run", n, "--template", args.template, stderr=subprocess.PIPE)
+    p = spawn_cli(A, "run", "--name", n, args.template, stderr=subprocess.PIPE)
     check("fc died: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     v = vms(A)[n]
     os.kill(v["firecracker"], signal.SIGKILL)
@@ -7610,22 +7699,22 @@ def fc_died():
     took = time.time() - t
     check("fc died: noticed at once, exit status 124", code == 124 and took < 2, (code, took))
     failed = vms(A).get(n, {})
-    check("fc died: ls shows it failed, saying how", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
+    check("fc died: ps -a shows it failed, saying how", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
     check("fc died: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))
     route = subprocess.run(["ip", "route", "show", f"{v['ip']}/32"], capture_output=True, text=True).stdout.strip()
     check("fc died: route gone", route == "", route)
-    ok(kill(A, n))
-    check("fc died: kill clears it", n not in vms(A), vms(A).get(n))
+    ok(cli_json(A, "rm", n))
+    check("fc died: rm clears it", n not in vms(A), vms(A).get(n))
 
 
 def fc_died_busy():
     """A Firecracker that dies while an operation holds the VM (a slow
     checkpoint copying its memory) ends the VM at once all the same: the
     death interrupts the operation instead of waiting for it. Exit status
-    124, the checkpoint fails and is never published, `ls` shows it failed."""
+    124, the checkpoint fails and is never published, `ps -a` shows it failed."""
     n, path = "ft-fc-died-busy", ckpt_path("ft-fc-died-busy")
     scenario_vms.add(n)
-    p = spawn_cli(A, "run", n, "--template", args.template)
+    p = spawn_cli(A, "run", "--name", n, args.template)
     check("fc died busy: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=300 iflag=fullblock 2>/dev/null && echo ok")
     check("fc died busy: memory written", code == 0, out)
@@ -7642,7 +7731,7 @@ def fc_died_busy():
     check("fc died busy: noticed at once, exit status 124", code == 124 and took < 2, (code, took))
     check("fc died busy: the checkpoint failed, nothing published", not res.get("r", {}).get("ok") and not os.path.exists(path), res)
     failed = vms(A).get(n, {})
-    check("fc died busy: ls shows it failed", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
+    check("fc died busy: ps -a shows it failed", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
     check("fc died busy: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))
     ok(kill(A, n))
 
@@ -7699,8 +7788,7 @@ def route_abort():
     n = "ft-route-abort"
     scenario_vms.add(n)
     gw = third_peer()
-    code, out, err = cli(B, "config", "--underlay", gw)
-    assert code == 0, err
+    configure(B, underlay=gw)
     ip = None
     try:
         m = setup(n, mib=1000)
@@ -7730,7 +7818,7 @@ def route_abort():
         check("route abort: the retry stopped with the abort", "dropped, migration" in log(A, n), log(A, n)[-1500:])
         check("route abort: md5 intact on A", md5(A, n) == m)
     finally:
-        cli(B, "config", "--underlay", "")
+        configure(B, underlay=None)
         if ip and f"via {gw}" in peer_route(ip):
             subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
@@ -7820,7 +7908,7 @@ def terminal():
     destroys it with exit status 130 and nothing left failed."""
     n = "ft-terminal"
     scenario_vms.add(n)
-    p = spawn_cli(A, "run", n, "--template", args.template, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    p = spawn_cli(A, "run", "--name", n, args.template, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     check("terminal: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     fc = vms(A)[n]["firecracker"]
     check("terminal: firecracker has a process group of its own", os.getpgid(fc) != p.pid, (os.getpgid(fc), p.pid))
@@ -7849,29 +7937,30 @@ def terminal():
 
 
 def run_status():
-    """`run -- CMD` exits with CMD's status, started cold or claiming a
+    """`run IMAGE CMD` exits with CMD's status, started cold or claiming a
     standby VM (whose exit frame may arrive before the claimer reads it)."""
     n = "ft-run-status"
     scenario_vms.add(n)
-    argv = [BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--"]
-    r = subprocess.run(argv + ["exit 7"], capture_output=True, text=True, env=ENV, timeout=120)
+    argv = [BIN, "--state", A.state, "--run", A.run, "run", "--name", n]
+    r = subprocess.run(argv + [args.template, "exit 7"], capture_output=True, text=True, env=ENV, timeout=120)
     check("run status: cold, CMD's own", r.returncode == 7, (r.returncode, r.stderr[-300:]))
-    # flexvm's own failures are 125, never a status CMD could have.
-    for bad in (["--template", "ft-no-such-template"], ["--ip", "bad"], ["--mem", "512"]):
-        r = subprocess.run(argv[:-1] + bad + ["--", "exit 0"], capture_output=True, text=True, env=ENV, timeout=120)
-        check(f"run status: {bad[0]} {bad[1]} fails with 125", r.returncode == 125, (r.returncode, r.stderr[-300:]))
-    ok(cli_json(A, "standby", "--template", args.template, "1"))
-    r = subprocess.run(argv + ["exit 5"], capture_output=True, text=True, env=ENV, timeout=120)
+    # flexvm's own failures are 125, never a status CMD could have. An image not pulled here is
+    # pulled first: one no registry has fails.
+    for bad, image in (([], "ft-no-such-template"), (["--ip", "bad"], args.template), (["--mem", "512"], args.template)):
+        r = subprocess.run(argv + bad + [image, "exit 0"], capture_output=True, text=True, env=ENV, timeout=120)
+        check(f"run status: {' '.join(bad) or image} fails with 125", r.returncode == 125, (r.returncode, r.stderr[-300:]))
+    ok(set_standby(A, args.template, 1))
+    r = subprocess.run(argv + [args.template, "exit 5"], capture_output=True, text=True, env=ENV, timeout=120)
     check("run status: claimed, CMD's own", r.returncode == 5 and '"standby":true' in r.stderr, (r.returncode, r.stderr[-300:]))
-    ok(cli_json(A, "standby", "--template", args.template, "0"))
+    ok(set_standby(A, args.template, 0))
 
 
 def unread_output():
-    """`run -- CMD` whose stdout is a pipe nobody reads (output stuck) still
+    """`run IMAGE CMD` whose stdout is a pipe nobody reads (output stuck) still
     ends at once on SIGINT, with status 130: printing never holds it up."""
     n = "ft-unread"
     scenario_vms.add(n)
-    p = spawn_cli(A, "run", n, "--template", args.template, "--",
+    p = spawn_cli(A, "run", "--name", n, args.template,
                           "head -c 1000000 /dev/zero | tr '\\0' x; sleep 600", stdout=subprocess.PIPE, start_new_session=True)
     check("unread output: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     # Stuck once the pipe is full (its 64 KiB), not after a guessed delay.
@@ -7887,8 +7976,8 @@ def unread_output():
 
 
 def suspend_slow_cmd():
-    """#505: a `run -- CMD` whose stdout drains slowly is suspended (SIGTERM) in the middle of more output
-    than the guest keeps for a session; `flexvm resume` reattaches and prints the rest. Every byte comes
+    """#505: a `run IMAGE CMD` whose stdout drains slowly is suspended (SIGTERM) in the middle of more output
+    than the guest keeps for a session; `flexvm start -a` reattaches and prints the rest. Every byte comes
     out once, and the resumed process exits with CMD's status."""
     n = "ft-susp-slow"
     scenario_vms.add(n)
@@ -7901,7 +7990,7 @@ def suspend_slow_cmd():
             out.append(d)
             time.sleep(0.01)
 
-    p = spawn_cli(A, "run", n, "--template", args.template, "--",
+    p = spawn_cli(A, "run", "--name", n, args.template,
                           f"head -c {total} /dev/zero | tr '\\0' x; exit 7", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     reader = start_thread(target=slow, args=(p,))
     started = wait_for(lambda: sum(map(len, out)) >= 1000000, 60)
@@ -7912,7 +8001,7 @@ def suspend_slow_cmd():
     first = sum(map(len, out))
     check("suspend slow cmd: SIGTERM suspends it mid-output", code == 128 + signal.SIGTERM and first < total
           and vms(A).get(n, {}).get("state") == "suspended", (code, first, vms(A).get(n), p.stderr.read()[-300:]))
-    r = spawn_cli(A, "resume", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    r = spawn_cli(A, "start", "-a", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     reader = start_thread(target=slow, args=(r,))
     code = wait_process(r, 120, kill_on_timeout=True)
     reader.join()
@@ -7925,7 +8014,7 @@ def suspend_slow_cmd():
 def suspend_killed():
     """SIGINT means destroy, and it wins over a suspend: a kill that comes
     while the suspend is publishing its checkpoint revokes the checkpoint
-    (no suspended VM is left, its address is withdrawn), and `kill` undoes a
+    (no suspended VM is left, its address is withdrawn), and `rm -f` undoes a
     suspend that finished first."""
     n = "ft-susp-killed"
     setup(n, mib=20)
@@ -7939,7 +8028,7 @@ def suspend_killed():
         check("suspend killed: the process ends", wait_for(lambda: not alive(pid), 30), pid)
     check("suspend killed: no suspended vm left", n not in vms(A) and not os.path.exists(d), (vms(A).get(n), os.path.exists(d)))
     check("suspend killed: address withdrawn", not addr(A, ip).get("holder") and addr(A, ip).get("withdrawn"), addr(A, ip))
-    # A suspend that is done before the kill: `kill` still destroys it.
+    # A suspend that is done before the kill: `rm -f` still destroys it.
     setup(n, mib=20)
     pid = vm_pid(A, n)
     os.kill(pid, signal.SIGTERM)
@@ -7948,8 +8037,8 @@ def suspend_killed():
 
 
 def suspend_cmd():
-    """SIGTERM on a `run -d -- CMD` VM suspends it, CMD and all: the command
-    keeps running in the guest's memory, and the process `flexvm resume`
+    """SIGTERM on a `run -d IMAGE CMD` VM suspends it, CMD and all: the command
+    keeps running in the guest's memory, and the process `flexvm start -a`
     starts reattaches to it, prints the rest of its output (nothing twice)
     and exits with its status."""
     n = "ft-susp-cmd"
@@ -7959,7 +8048,7 @@ def suspend_cmd():
     before, after = "susp-cmd-out-1", "susp-cmd-out-2"
     cmd = f"echo {before}; sleep 6; echo {after}; exit 7"
     clear_log(A, n)
-    ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", cmd))
+    ok(cli_json(A, "run", "--name", n, "-d", args.template, cmd))
     pid = vm_pid(A, n)
     check("suspend cmd: started", wait_for(lambda: before in log(A, n).splitlines(), 30), log(A, n)[-300:])
     t = time.time()
@@ -7968,7 +8057,7 @@ def suspend_cmd():
     check("suspend cmd: SIGTERM suspends it", gone and vms(A).get(n, {}).get("state") == "suspended" and time.time() - t < 10,
           (time.time() - t, vms(A).get(n), log(A, n)[-500:]))
     check("suspend cmd: the command was not given up", "timed out" not in log(A, n) and "being killed" not in log(A, n), log(A, n)[-500:])
-    r = subprocess.run([BIN, "--state", A.state, "--run", A.run, "resume", n], capture_output=True, text=True, timeout=120, env=ENV)
+    r = subprocess.run([BIN, "--state", A.state, "--run", A.run, "start", "-a", n], capture_output=True, text=True, timeout=120, env=ENV)
     check("suspend cmd: resumed, the command's status", r.returncode == 7, (r.returncode, r.stderr[-500:]))
     # Whatever printed it: the suspended process, or the resumed one (if the suspend outlasted the sleep).
     lines = log(A, n).splitlines() + r.stdout.splitlines()
@@ -7987,7 +8076,7 @@ def suspend_overlap():
     n = "ft-susp-overlap"
     scenario_vms.add(n)
     clear_log(A, n)
-    ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", "echo susp-overlap-start; sleep 8; exit 5"))
+    ok(cli_json(A, "run", "--name", n, "-d", args.template, "echo susp-overlap-start; sleep 8; exit 5"))
     pid = vm_pid(A, n)
     ip = vms(A)[n]["ip"]
     check("suspend overlap: started", wait_for(lambda: "susp-overlap-start" in log(A, n).splitlines(), 30), log(A, n)[-300:])
@@ -8044,20 +8133,20 @@ def first_entry(host, name, timeout=60):
 
 
 def cmd_flag():
-    """A `run -- CMD` VM is published as one from its first entry, whether it
+    """A `run IMAGE CMD` VM is published as one from its first entry, whether it
     claimed a standby VM or was resumed with its command (eviction leaves it
     alone), and `migrate` refuses it, saying why."""
     t = args.template
     n, r = "ft-cmd-flag", "ft-cmd-flag-resumed"
     scenario_vms.update({n, r})
-    ok(cli_json(A, "standby", "--template", t, "1"))
+    ok(set_standby(A, t, 1))
     try:
         live = lambda: len([f for f in os.listdir(os.path.join(standby_dir(A.run, t), ".locks")) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
         check("cmd flag: a standby ready", wait_for(lambda: live() == 1, 60), live())
         # Hold the old publish-before-bind window open deterministically.
         clear_gate(A, "claim_stall")
         with armed_fault(A, "claim_stall", 60000):
-            p = spawn_cli(A, "run", n, "--template", t, "--", "sleep 600", start_new_session=True)
+            p = spawn_cli(A, "run", "--name", n, t, "sleep 600", start_new_session=True)
             check("cmd flag: claimed VM reached the reply gate", wait_for(lambda: reached(A, "claim_stall"), 60))
             e = first_entry(A, n)
             check("cmd flag: a claimed standby is published as a cmd vm", e is not None and e.get("cmd") is True, e)
@@ -8069,15 +8158,15 @@ def cmd_flag():
         check("cmd flag: its command's end still ends it", p.wait(timeout=30) == 130)
     finally:
         fault(A, "claim_stall", 0)
-        ok(cli_json(A, "standby", "--template", t, "0"))
+        ok(set_standby(A, t, 0))
     clear_log(A, r)
-    started = ok(cli_json(A, "run", r, "--template", t, "-d", "--", "sleep 600"))
+    started = ok(cli_json(A, "run", "--name", r, "-d", t, "sleep 600"))
     pid = vm_pid(A, r)
     os.kill(pid, signal.SIGTERM)
     standby_log = os.path.join(standby_dir(A.run, t), "standby.log")
     check("cmd flag: suspended", wait_for(lambda: not alive(pid), 60) and vms(A).get(r, {}).get("state") == "suspended",
           (vms(A).get(r), started, log(A, r)[-1500:], open(standby_log).read()[-1500:] if os.path.exists(standby_log) else ""))
-    p = spawn_cli(A, "resume", r, start_new_session=True)
+    p = spawn_cli(A, "start", "-a", r, start_new_session=True)
     e = first_entry(A, r)
     check("cmd flag: a resumed one too", e is not None and e.get("cmd") is True, e)
     os.kill(p.pid, signal.SIGINT)
@@ -8085,14 +8174,14 @@ def cmd_flag():
 
 
 def pause_cmd_start():
-    """Ctrl-Z while a `run -- CMD` VM starts pauses it before its command
+    """Ctrl-Z while a `run IMAGE CMD` VM starts pauses it before its command
     is under way, which waits for the VM instead of failing (and destroying
     it); once resumed, the command runs and the process exits with its status."""
     n = "ft-pause-cmd"
     scenario_vms.add(n)
     # Its start stalls (3 s) once it holds its name: the Ctrl-Z comes before the VM runs.
     with armed_fault(A, "start_stall", 10000):
-        p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--",
+        p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", "--name", n, args.template,
                               "echo started; exit 9"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV, text=True)
         # Once it holds its name its signals are taken (blocked from its first instruction).
         lock = os.path.join(A.run, "vms", ".locks", f"{n}.lock")
@@ -8101,7 +8190,7 @@ def pause_cmd_start():
     check("pause cmd: paused", wait_for(lambda: vms(A).get(n, {}).get("state") == "paused", 30), vms(A).get(n))
     time.sleep(2)
     check("pause cmd: still there, paused", p.poll() is None and vms(A).get(n, {}).get("state") == "paused", (p.poll(), vms(A).get(n)))
-    code, out, err = cli(A, "resume", n)
+    code, out, err = cli(A, "unpause", n)
     check("pause cmd: resumed", code == 0, err)
     code = wait_process(p, 60)
     out = p.stdout.read()
@@ -8114,7 +8203,7 @@ def ctrl_z_long_op():
     the VM is destroyed at once, exit status 130, the checkpoint cancelled."""
     n, path = "ft-ctrlz-op", ckpt_path("ft-ctrlz-op")
     scenario_vms.add(n)
-    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template],
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", "--name", n, args.template],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
     check("ctrl-z long op: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=100 iflag=fullblock 2>/dev/null && echo written")
@@ -8135,7 +8224,7 @@ def ctrl_z_long_op():
 
 
 def resume_suspending():
-    """#387: `flexvm resume` during a suspend (when SIGCONT does nothing)
+    """#387: `flexvm start` (attached or not) during a suspend (when SIGCONT does nothing)
     waits it out: a suspend that finishes is resumed, its command reattached,
     exiting with the command's status; one that fails leaves the VM running,
     and resume exits 0."""
@@ -8148,14 +8237,14 @@ def resume_suspending():
         return data.get("state") if data is not None else None
 
     clear_log(A, n)
-    ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", "echo resume-susp-start; sleep 8; exit 7"))
+    ok(cli_json(A, "run", "--name", n, "-d", args.template, "echo resume-susp-start; sleep 8; exit 7"))
     pid = vm_pid(A, n)
     check("resume suspending: started", wait_for(lambda: "resume-susp-start" in log(A, n).splitlines(), 30), log(A, n)[-300:])
     # The suspend stalls 3 s once its checkpoint is published, still under way.
     with armed_fault(A, "suspend_stall", 10000):
         os.kill(pid, signal.SIGTERM)
         check("resume suspending: published as suspending", wait_for(lambda: state() == "suspending", 30), state())
-        r = subprocess.run([BIN, "--state", A.state, "--run", A.run, "resume", n], capture_output=True, text=True, timeout=120, env=ENV)
+        r = subprocess.run([BIN, "--state", A.state, "--run", A.run, "start", "-a", n], capture_output=True, text=True, timeout=120, env=ENV)
     check("resume suspending: the suspended vm resumed, the command's status", r.returncode == 7, (r.returncode, r.stderr[-500:]))
     check("resume suspending: gone after it, not left suspended",
           not alive(pid) and n not in vms(A) and not os.path.exists(os.path.join(A.state, "suspended", n)), vms(A).get(n))
@@ -8168,18 +8257,21 @@ def resume_suspending():
         end = time.time() + 10
         while state() != "suspending" and time.time() < end:
             time.sleep(0.005)
-        code, out, err = cli(A, "resume", n)
+        code, out, err = cli(A, "start", n)
     fault(A, "suspend_slow", 0)
-    check("resume suspending: a failed suspend's vm runs on, resume exits 0",
+    check("resume suspending: a failed suspend's vm runs on, start exits 0",
           code == 0 and alive(pid) and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 10), (code, err, vms(A).get(n)))
     check("resume suspending: the suspend did fail", "injected fault: writing the checkpoint failed" in log(A, n), log(A, n)[-500:])
+    # start -a attaches only to a vm it starts: a running one is refused, and runs on.
+    code, out, err = cli(A, "start", "-a", n)
+    check("resume suspending: start -a of the running vm is refused", code == 125 and "not stopped" in err and alive(pid), (code, err))
     ok(kill(A, n))
     # Resume right behind the SIGTERM, before anything is published: still waited out, the VM resumed.
     ok(run(A, n))
     pid = vm_pid(A, n)
     with armed_fault(A, "suspend_stall", 10000):
         os.kill(pid, signal.SIGTERM)
-        code, out, err = cli(A, "resume", n, "-d")
+        code, out, err = cli(A, "start", n)
     v = vms(A).get(n, {})
     check("resume suspending: a resume right behind the SIGTERM resumes the suspended vm",
           code == 0 and not alive(pid) and v.get("state") == "running" and v.get("pid") != pid, (code, err[-300:], v))
@@ -8235,7 +8327,7 @@ def quit_status():
     """Ctrl-\\ (SIGQUIT) destroys the VM as Ctrl-C does, but the exit status is 131 (128 + SIGQUIT)."""
     n = "ft-quit"
     scenario_vms.add(n)
-    p = spawn_cli(A, "run", n, "--template", args.template, start_new_session=True)
+    p = spawn_cli(A, "run", "--name", n, args.template, start_new_session=True)
     check("quit: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     fc = vms(A)[n]["firecracker"]
     os.kill(p.pid, signal.SIGQUIT)
@@ -8250,7 +8342,7 @@ def suspend_died():
     revoked and the process exits 124 with why in `.failed`, not 130."""
     n = "ft-susp-died"
     scenario_vms.add(n)
-    p = spawn_cli(A, "run", n, "--template", args.template)
+    p = spawn_cli(A, "run", "--name", n, args.template)
     check("suspend died: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     v = vms(A)[n]
     with armed_fault(A, "suspend_stall", 10000):
@@ -8261,7 +8353,7 @@ def suspend_died():
         code = wait_process(p, 30)
     check("suspend died: exit status 124", code == 124, code)
     failed = vms(A).get(n, {})
-    check("suspend died: ls shows it failed, no suspended vm", failed.get("state") == "failed" and not os.path.exists(d), (failed, os.path.exists(d)))
+    check("suspend died: ps -a shows it failed, no suspended vm", failed.get("state") == "failed" and not os.path.exists(d), (failed, os.path.exists(d)))
     check("suspend died: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))
     ok(kill(A, n))
 
@@ -8269,7 +8361,7 @@ def suspend_died():
 def suspend_debris():
     """A suspend directory that is not a suspended VM (no manifest: a revoke
     or a removal cut short; or marked STARTED by a resume killed outright) is
-    debris: `ls` never lists it, and the name's next holder removes it, so
+    debris: `ps -a` never lists it, and the name's next holder removes it, so
     run, suspend, resume and kill of that name work as if it were not there."""
     n = "ft-debris"
     d = os.path.join(A.state, "suspended", n)
@@ -8449,7 +8541,7 @@ def app_log():
     check("app log: printing after a resume", upto(last + 20), log(A, n)[-500:])
     path = ckpt_path("applog-stop")
     ok(checkpoint(A, n, path, stop=True))
-    ok(restore(A, path, name=n))  # without --name its output goes to restore-PID.log
+    ok(restore(A, path, name=n))  # its output goes to NAME.log (without --name, the checkpoint's own name)
     last = max(app_lines(log(A, n)))
     check("app log: printing after a restore", upto(last + 20), log(A, n)[-500:])
     text = log(A, n)
@@ -8584,7 +8676,7 @@ def standby_pids(host, t):
 
 def unit_restart():
     """A systemd unit restarted with KillMode=control-group, emulated: B's
-    listener, a `run -d` and a `standby` started from the unit's cgroup, and
+    listener, a `run -d` and a `pull --standby` started from the unit's cgroup, and
     everything in that cgroup killed (cgroup.kill). The VM that migrated in
     through the listener, the detached VM and the standby are each in a
     cgroup of their own (flexvm/vm-PID-START), so they run on; a new listener
@@ -8607,11 +8699,11 @@ def unit_restart():
         m = setup(n, mib=50)
         ok(migrate(A, n, B))
         check("unit restart: migrated in", wait_for(lambda: where(n) == {B: "running"}, 60), where(n))
-        r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "run", d, "--template", t, "-d"], capture_output=True,
+        r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "run", "--name", d, "-d", t], capture_output=True,
                            text=True, timeout=120, env=ENV, preexec_fn=in_cgroup(unit))
         check("unit restart: run -d from the unit", r.returncode == 0, r.stderr)
         try:
-            r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "standby", "--template", t, "1"], capture_output=True,
+            r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "pull", t, "--standby", "1"], capture_output=True,
                                text=True, timeout=120, env=ENV, preexec_fn=in_cgroup(unit))
             check("unit restart: standby from the unit", r.returncode == 0, r.stderr)
             sbs = standby_pids(B, t)
@@ -8632,7 +8724,7 @@ def unit_restart():
             check("unit restart: an empty cgroup is swept", wait_for(swept, 10), cgs[d])
             check("unit restart: a populated one is kept", os.path.exists(f"/sys/fs/cgroup{cgs['standby']}"), cgs["standby"])
         finally:
-            cli_json(B, "standby", "--template", t, "0")
+            set_standby(B, t, 0)
             wait_for(lambda: not standby_pids(B, t), 30)
     finally:
         if B.addr not in listeners:
@@ -8654,7 +8746,7 @@ def log_cap():
         if os.path.exists(os.path.join(vd, f)):
             os.unlink(os.path.join(vd, f))
     lines = 1_500_000  # ~11 MiB
-    r = cli_json(A, "run", n, "--template", args.template, "-d", "--", f"seq 1 {lines}")
+    r = cli_json(A, "run", "--name", n, "-d", args.template, f"seq 1 {lines}")
     check("log cap: started", r["ok"], r)
     pid = r["result"]["pid"] if r["ok"] else None
     check("log cap: its command ran out", wait_for(lambda: not alive(pid), 120), pid)
@@ -8784,7 +8876,7 @@ def template_tap():
     gone is swept (#581)."""
     name = f"ft-tpltap-{os.getpid()}"
     tdir = os.path.join(A.state, "templates")
-    prefix = ok(cli_json(A, "config"))["derived"]["prefix"]
+    prefix = ok(cli_json(A, "info"))["derived"]["prefix"]
     # Its tap is made before the image is read.
     p = spawn_cli(A, "pull", args.image, "--tag", name, "--vcpus", "1", "--max", "512")
     tap = f"{prefix}x{p.pid:x}"
@@ -8895,7 +8987,7 @@ def uffd_err():
     waiting for pages; the VM is reported failed at once, not hung."""
     n = "ft-uffd-err"
     scenario_vms.add(n)
-    p = spawn_cli(A, "run", n, "--template", args.template, stderr=subprocess.PIPE)
+    p = spawn_cli(A, "run", "--name", n, args.template, stderr=subprocess.PIPE)
     check("uffd err: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     # Armed until the VM process exits: whenever the pager next polls, it sees the error.
     with armed_fault(A, "uffd_err", 60000):
@@ -8904,7 +8996,7 @@ def uffd_err():
         took = time.time() - t
     check("uffd err: noticed at once (not hung), exit status 124", code == 124 and took < 15, (code, took))
     failed = vms(A).get(n, {})
-    check("uffd err: ls shows it failed, saying why", failed.get("state") == "failed" and "userfaultfd" in failed.get("error", ""), failed)
+    check("uffd err: ps -a shows it failed, saying why", failed.get("state") == "failed" and "userfaultfd" in failed.get("error", ""), failed)
     ok(kill(A, n))
     check("uffd err: kill clears it", n not in vms(A), vms(A).get(n))
 
@@ -9030,7 +9122,7 @@ def resume_listener_restart():
     own_listeners("resume listener restart")
     go = "resume-listen-done"
     cmd = f"echo resume-listen-start; while [ ! -e /tmp/go ]; do sleep 0.1; done; echo {go}; exit 7"
-    ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", cmd))
+    ok(cli_json(A, "run", "--name", n, "-d", args.template, cmd))
     code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=20 iflag=fullblock 2>/dev/null && md5sum /tmp/f")
     assert code == 0, out
     m, ip, gen = out.split()[0], vms(A)[n]["ip"], vms(A)[n]["gen"]
@@ -9046,7 +9138,7 @@ def resume_listener_restart():
         d = os.path.join(A.state, "suspended", n)
         clear_gate(A, gate)
         fault(A, gate, 600000)
-        proc = spawn_cli(A, "resume", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc = spawn_cli(A, "start", "-a", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True)
         check(f"{label}: the resume got to its gate", wait_for(lambda: reached(A, gate) == [proc.pid], 60), (reached(A, gate), proc.pid))
         started = os.path.exists(os.path.join(d, "STARTED"))
@@ -9079,7 +9171,7 @@ def resume_listener_restart():
     d = os.path.join(A.state, "suspended", n)
     clear_gate(A, "resume_ran_gate")
     fault(A, "resume_ran_gate", 600000)
-    proc = spawn_cli(A, "resume", n, "-d", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    proc = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True)
     check("resume listener restart, killed: ran (gate reached, STARTED on disk)",
           wait_for(lambda: reached(A, "resume_ran_gate"), 60) and os.path.exists(os.path.join(d, "STARTED")), reached(A, "resume_ran_gate"))
@@ -9112,7 +9204,7 @@ def resume_killed_marked():
     d = os.path.join(A.state, "suspended", n)
     clear_gate(A, gate)
     fault(A, gate, 600000)
-    proc = spawn_cli(A, "resume", n, "-d", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    proc = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True)
     check("killed marked: the resume parked at its gate", wait_for(lambda: len(reached(A, gate)) == 1, 60), reached(A, gate))
     pid = (reached(A, gate) or [None])[0]
@@ -9268,7 +9360,7 @@ def reboot():
     other = tempfile.mkdtemp(prefix="fvp-other-", dir="/var/tmp")
     other_run = None
     try:
-        ok(cli_json(B, "standby", "--template", t, "1"))
+        ok(set_standby(B, t, 1))
         check("reboot: a standby vm", wait_for(lambda: len(standby_pids(B, t)) == 1, 60), standby_pids(B, t))
         victims = [vm_pid(B, local), vm_pid(B, moved), *standby_pids(B, t)]
         listener = listeners.pop(B.addr)
@@ -9282,14 +9374,14 @@ def reboot():
         subprocess.run(["ip", "route", "del", f"{ip_peer}/32"], capture_output=True)
         check("reboot: the route is gone with it", peer_route(ip_peer) == "", peer_route(ip_peer))
         # Another state opens first, without --run: it gets a run directory of its own, never B's.
-        r = subprocess.run([BIN, "--state", other, "ls"], capture_output=True, text=True, timeout=60, env=ENV)
+        r = subprocess.run([BIN, "--state", other, "ps"], capture_output=True, text=True, timeout=60, env=ENV)
         other_run = json.load(open(os.path.join(other, "run.json"))) if os.path.exists(os.path.join(other, "run.json")) else None
         check("reboot: another state gets a run directory of its own", r.returncode == 0 and other_run and other_run != os.path.realpath(B.run)
               and not os.path.exists(os.path.join(B.run, "state.json")), (r.stderr, other_run))
-        r = subprocess.run([BIN, "--state", B.state, "ls"], capture_output=True, text=True, timeout=60, env=ENV)
+        r = subprocess.run([BIN, "--state", B.state, "ps"], capture_output=True, text=True, timeout=60, env=ENV)
         check("reboot: B's state, bound elsewhere, is refused without its --run, never defaulted", r.returncode != 0
               and f"give --run {os.path.realpath(B.run)}" in r.stderr and not os.path.exists(os.path.join(B.run, "state.json")), r.stderr)
-        r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "ls", "--json"], capture_output=True, text=True, timeout=180, env=ENV)
+        r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "ps", "-a", "--json"], capture_output=True, text=True, timeout=180, env=ENV)
         check("reboot: B's state takes its run directory back", r.returncode == 0
               and json.load(open(os.path.join(B.run, "state.json"))) == os.path.realpath(B.state), r.stderr)
         check("reboot: its recovery is marked complete", open(os.path.join(B.run, ".boot")).read() == open("/proc/sys/kernel/random/boot_id").read().strip())
@@ -9303,8 +9395,8 @@ def reboot():
         third_listed.close()
         check("reboot: the standby vm is refilled", wait_for(lambda: len(standby_pids(B, t)) == 1, 60), standby_pids(B, t))
         start_listener(B)
-        ok(kill(B, local))
-        check("reboot: kill clears a lost record", local not in vms(B) and moved in vms(B), vms(B))
+        ok(cli_json(B, "rm", local))
+        check("reboot: rm clears a lost record", local not in vms(B) and moved in vms(B), vms(B))
         n2 = "ft-reboot-again"
         scenario_vms.add(n2)
         ok(run(A, n2, ip=ip_moved))
@@ -9313,7 +9405,7 @@ def reboot():
         third_listed.close()
         if B.addr not in listeners:
             start_listener(B)
-        cli_json(B, "standby", "--template", t, "0")
+        set_standby(B, t, 0)
         wait_for(lambda: not standby_pids(B, t), 30)
         forget_peer_route(ip_peer, gen)
         if other_run:
@@ -9337,7 +9429,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
-    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=evict_latency,
+    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),

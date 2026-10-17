@@ -64,7 +64,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_rescue_fail cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare forged_vmstate slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded signals suspend_gen standby standby_vm_ips restore_ip_peer spoof_filter killed_migrated "
-          "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
+          "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims standby_claim_caps fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_slow_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
@@ -113,9 +113,10 @@ os.makedirs(args.log_dir, exist_ok=True)
 # --- CLI wrapper ---------------------------------------------------------------
 # Everything that knows how flexvm is driven lives in this section; the cases
 # below only call these methods. A host is a state and a run directory with a
-# peer listener (`flexvm listen`); every VM is a process of its own (`flexvm
-# run -d`), paused, resumed, suspended and destroyed with signals (SIGTSTP,
-# SIGCONT, SIGTERM, SIGINT).
+# peer listener (`flexvm listen`) and its settings in STATE/host.json; every VM
+# is a process of its own (`flexvm run -d`), paused and resumed with signals
+# (SIGTSTP, SIGCONT), stopped (suspended) and started again with `flexvm stop`
+# and `flexvm start`, and destroyed with `flexvm kill` (or `rm -f`).
 
 
 def flexvm(*argv, timeout=180, check=True, env=None):
@@ -164,7 +165,7 @@ class Host:
         # Inside this run's own fresh directories (see main).
         self.run_dir = os.path.join(RUN, label)
         self.state_dir = os.path.join(WORK, f"{label}-state")
-        self.prefix = None  # of its taps, derived from its state directory (`flexvm config`)
+        self.prefix = None  # of its taps, derived from its state directory (`flexvm info`)
         self.log = os.path.join(args.log_dir, f"listen-{label}.log")
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here
@@ -177,9 +178,9 @@ class Host:
         os.makedirs(self.run_dir, exist_ok=True)
         shared_state(self.state_dir)
         nets = sorted((args.net_a, args.net_b), key=lambda n: ipaddress.IPv4Address(f"{n}.0"))
-        cfg = self.cli("config", "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60",
-                       "--cluster-ips", f"{nets[0]}.2-{nets[-1]}.254", "--reserve", "256")
-        self.prefix = json.loads(cfg.stdout)["derived"]["prefix"]
+        self.configure(peers=[self.peer], vm_ips=f"{self.net}.2-{self.net}.60",
+                       cluster_ips=f"{nets[0]}.2-{nets[-1]}.254", reserve_mib=256)
+        self.prefix = self.info()["derived"]["prefix"]
         cmd = [BIN, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr]
         self.proc = subprocess.Popen(cmd, stdout=open(self.log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      env=ENV, start_new_session=True)
@@ -194,8 +195,8 @@ class Host:
         """Destroys what VMs are left and stops the listener; raises if it died early."""
         if not self.proc:
             return
-        for vm in sorted(self.ls()):
-            self.kill(vm, check=False)
+        for vm in sorted(self.ps()):
+            self.rm(vm, force=True, check=False)
         if self.proc.poll() is not None:
             raise AssertionError(f"host {self.label}'s listener died early (exit {self.proc.returncode}); see {self.log}")
         self.proc.send_signal(signal.SIGTERM)
@@ -209,31 +210,60 @@ class Host:
     def cli(self, *argv, **kw):
         return flexvm("--state", self.state_dir, "--run", self.run_dir, *argv, env=ENV, **kw)
 
+    def configure(self, **keys):
+        """Sets keys of STATE/host.json (None removes one): read, updated and replaced atomically."""
+        path = os.path.join(self.state_dir, "host.json")
+        try:
+            cfg = json.load(open(path))
+        except FileNotFoundError:
+            cfg = {}
+        for k, v in keys.items():
+            if v is None:
+                cfg.pop(k, None)
+            else:
+                cfg[k] = v
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+
+    def info(self):
+        """`flexvm info`: {"version", "config", "set", "derived", "warnings"}."""
+        return json.loads(self.cli("info").stdout)
+
     def pid(self, vm):
-        v = self.ls()[vm]
+        v = self.ps()[vm]
         self.pids.add((v["pid"], v["start"]))
         return v["pid"]
 
     def wait_state(self, vm, state, timeout=60):
-        assert wait_for(lambda: self.ls().get(vm, {}).get("state") == state, timeout), (vm, self.ls().get(vm))
+        assert wait_for(lambda: self.ps().get(vm, {}).get("state") == state, timeout), (vm, self.ps().get(vm))
 
     # VM commands
+    def run_json(self, vm=None, template=None, ip=None):
+        """Starts a VM (in the background; without a name flexvm makes one up); returns its JSON."""
+        opts = (["--name", vm] if vm else []) + (["--ip", ip] if ip else [])
+        r = json.loads(self.cli("run", *opts, "-d", template or args.template).stdout)
+        self.vms.add(r["name"])
+        self.pids.add((r["pid"], r["start"]))
+        return r
+
     def run(self, vm, template=None, ip=None):
         """Starts a VM (in the background); returns its address."""
-        extra = (["--template", template or args.template]) + (["--ip", ip] if ip else [])
         self.vms.add(vm)
-        r = json.loads(self.cli("run", vm, *extra, "-d").stdout)
-        self.pids.add((r["pid"], r["start"]))
-        return r["ip"]
+        return self.run_json(vm, template, ip)["ip"]
 
     def exec(self, vm, cmd, timeout=120):
         """Runs a shell command in the VM; returns (exit code, stdout, stderr)."""
         r = self.cli("exec", vm, cmd, check=False, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
 
-    def ls(self):
-        """{name: {"ip", "template", "state", "pid"}} from `flexvm ls`."""
-        return {v["name"]: v for v in json.loads(self.cli("ls", "--json").stdout)}
+    def ps(self, all=True):
+        """{name: {"ip", "template", "state", "pid"}} from `flexvm ps -a --json` (without all: `ps --json`,
+        which leaves out stopped VMs)."""
+        return {v["name"]: v for v in json.loads(self.cli("ps", *(["-a"] if all else []), "--json").stdout)}
 
     def pause(self, vm):
         t = time.time()
@@ -242,9 +272,9 @@ class Host:
         return {"pause_ms": round((time.time() - t) * 1000, 1)}
 
     def resume(self, vm):
-        """SIGCONT for a paused VM; `flexvm resume` for a suspended one."""
-        if self.ls().get(vm, {}).get("state") == "suspended":
-            r = json.loads(self.cli("resume", vm, "-d").stdout)
+        """SIGCONT for a paused VM; `flexvm start` for a stopped (suspended) one."""
+        if self.ps().get(vm, {}).get("state") == "suspended":
+            r = json.loads(self.cli("start", vm).stdout)
             self.pid(vm)
             return r
         t = time.time()
@@ -253,25 +283,32 @@ class Host:
         return {"resume_ms": round((time.time() - t) * 1000, 1)}
 
     def suspend(self, vm):
-        """SIGTERM: the VM is checkpointed to disk and its process exits."""
+        """`flexvm stop`: the VM is checkpointed to disk and its process exits (as on SIGTERM)."""
         pid, t = self.pid(vm), time.time()
-        os.kill(pid, signal.SIGTERM)
-        assert wait_for(lambda: not alive(pid), 120), f"{vm} did not suspend"
+        out = self.cli("stop", vm, timeout=180).stdout
+        assert out == f"{vm}\n", f"stop {vm} printed {out!r}"
+        assert wait_for(lambda: not alive(pid), 10), f"{vm}'s process outlived its stop"
         return {"suspend_ms": round((time.time() - t) * 1000, 1)}
 
     def kill(self, vm, check=True):
+        """`flexvm kill`: destroys a VM that has a process (a stopped one is refused)."""
         return self.cli("kill", vm, check=check)
+
+    def rm(self, vm, force=False, check=True):
+        """`flexvm rm`: removes a stopped VM; with force (-f) one in any state."""
+        return self.cli("rm", *(["-f"] if force else []), vm, check=check)
 
     def checkpoint(self, vm, path, stop=False, incremental=False):
         extra = (["--stop"] if stop else []) + (["--incremental"] if incremental else [])
         r = json.loads(self.cli("checkpoint", vm, path, *extra).stdout)
         if stop:
-            assert wait_for(lambda: vm not in self.ls(), 30), f"{vm} still listed after checkpoint --stop"
+            assert wait_for(lambda: vm not in self.ps(), 30), f"{vm} still listed after checkpoint --stop"
         return r
 
     def restore(self, path, name=None, ip=None):
+        """`flexvm run --checkpoint PATH -d`: a VM from a checkpoint (its name and address unless given)."""
         extra = (["--name", name] if name else []) + (["--ip", ip] if ip else [])
-        r = json.loads(self.cli("restore", path, *extra, "-d").stdout)
+        r = json.loads(self.cli("run", "--checkpoint", path, *extra, "-d").stdout)
         self.vms.add(r["name"])
         self.pid(r["name"])
         return r
@@ -435,7 +472,7 @@ def echo(conn, msg):
 
 
 def where(vm):
-    return {h.label: ls[vm]["state"] for h in (A, B) for ls in [h.ls()] if vm in ls}
+    return {h.label: vms[vm]["state"] for h in (A, B) for vms in [h.ps()] if vm in vms}
 
 
 def ckpt_dir(label):
@@ -464,16 +501,16 @@ def check(label, cond, detail=""):
 
 
 @case
-def run_exec_ls():
-    """run, then exec's stdout, stderr and exit status, and ls."""
+def run_exec_ps():
+    """run, then exec's stdout, stderr and exit status, and ps; a run without --name."""
     vm = "e2e-exec"
     t = time.time()
     ip = A.run(vm)
     print(f"  run: {ip} in {(time.time() - t) * 1000:.0f} ms")
     check("ip from A's range", ip.startswith(args.net_a + "."), ip)
-    ls = A.ls()
-    check("ls: listed running with its address", ls.get(vm, {}).get("state") == "running" and ls[vm]["ip"] == ip, ls)
-    check("ls: template", ls[vm]["template"] == args.template, ls[vm])
+    vms = A.ps(all=False)
+    check("ps: listed running with its address", vms.get(vm, {}).get("state") == "running" and vms[vm]["ip"] == ip, vms)
+    check("ps: image", vms[vm]["template"] == args.template, vms[vm])
     code, out, err = A.exec(vm, "echo to-stdout; echo to-stderr >&2; exit 7")
     check("exec: stdout", out == "to-stdout\n", repr(out))
     check("exec: stderr", err == "to-stderr\n", repr(err))
@@ -492,6 +529,11 @@ def run_exec_ls():
     check("exec: guest has its address on eth0", ip in must(A, vm, "ip -4 -o addr show eth0"))
     check("exec: unknown vm fails", A.exec("e2e-no-such-vm", "true")[0] != 0)
     A.kill(vm)
+    # Without --name, a made-up docker-style one (adjective_surname), as ps lists it.
+    r = A.run_json()
+    check("run without --name: a made-up name", re.fullmatch(r"[a-z]+_[a-z]+", r["name"]) is not None, r)
+    check("run without --name: listed under it", A.ps(all=False).get(r["name"], {}).get("ip") == r["ip"], A.ps())
+    check("kill: prints the name", A.kill(r["name"]).stdout == r["name"] + "\n")
 
 
 @case
@@ -503,10 +545,10 @@ def pause_resume():
     paused_s = 4
     c0, t0 = count(A, vm), time.time()
     A.pause(vm)
-    check("pause: ls says paused", A.ls()[vm]["state"] == "paused", A.ls()[vm])
+    check("pause: ps says paused", A.ps()[vm]["state"] == "paused", A.ps()[vm])
     time.sleep(paused_s)
     r = A.resume(vm)
-    check("resume: ls says running", A.ls()[vm]["state"] == "running", A.ls()[vm])
+    check("resume: ps says running", A.ps()[vm]["state"] == "running", A.ps()[vm])
     print(f"  resume: {r.get('resume_ms')} ms")
     c1, t1 = count(A, vm), time.time()
     # The counter ticks at most every 50 ms. Had the guest run through the pause it would
@@ -538,7 +580,7 @@ def migrate():
         print(f"  migrate {src.label} -> {dst.label}: downtime {r.get('downtime_ms')} ms")
         check(f"{src.label} -> {dst.label}: only on {dst.label}, running",
               wait_for(lambda: where(vm) == {dst.label: "running"}, 60), where(vm))
-        check(f"{src.label} -> {dst.label}: same address", dst.ls()[vm]["ip"] == ip)
+        check(f"{src.label} -> {dst.label}: same address", dst.ps()[vm]["ip"] == ip)
         check(f"{src.label} -> {dst.label}: TCP connection survived", echo(conn, b"after %s\n" % dst.label.encode()))
         check(f"{src.label} -> {dst.label}: RAM intact", md5(dst, vm) == m)
         check(f"{src.label} -> {dst.label}: same process", marker_id(dst, vm) == proc)
@@ -548,7 +590,7 @@ def migrate():
 
 @case
 def checkpoint_restore():
-    """checkpoint --stop and restore; a keep-running checkpoint restored on B as a fork."""
+    """checkpoint --stop and run --checkpoint; a keep-running checkpoint restored on B as a fork."""
     vm = "e2e-ckpt"
     ip = A.run(vm)
     m = fill(A, vm)
@@ -557,11 +599,11 @@ def checkpoint_restore():
     r = A.checkpoint(vm, path, stop=True)
     print(f"  checkpoint --stop: {r.get('checkpoint_ms')} ms, {r.get('data_mib')} MiB")
     check("checkpoint: manifest written", os.path.exists(os.path.join(path, "manifest.json")))
-    check("checkpoint --stop: VM gone from A", vm not in A.ls(), A.ls())
+    check("checkpoint --stop: VM gone from A", vm not in A.ps(), A.ps())
     # Its address is A's to give: B borrows it from A, and gives it back when the VM goes.
     r = B.restore(path)
     print(f"  restore: ready in {r.get('ready_ms')} ms")
-    check("restore on B: borrows A's address", r.get("ip") == ip and B.ls().get(vm, {}).get("ip") == ip, r)
+    check("restore on B: borrows A's address", r.get("ip") == ip and B.ps().get(vm, {}).get("ip") == ip, r)
     B.kill(vm)
     def restore_home():
         try:
@@ -569,7 +611,7 @@ def checkpoint_restore():
         except AssertionError:
             return None
     check("restore on A once B let it go", wait_for(restore_home, 10))
-    check("restore: same name and address", A.ls().get(vm, {}).get("ip") == ip, A.ls())
+    check("restore: same name and address", A.ps().get(vm, {}).get("ip") == ip, A.ps())
     check("restore: RAM intact", md5(A, vm) == m)
     check("restore: same process", marker_id(A, vm) == proc)
     c1 = count(A, vm)
@@ -578,12 +620,12 @@ def checkpoint_restore():
     # Keep-running checkpoint: the VM goes on; its copy restores as a second VM.
     path2 = ckpt_dir(vm + "-live")
     A.checkpoint(vm, path2)
-    check("checkpoint --keep-running: still running", A.ls()[vm]["state"] == "running")
+    check("checkpoint --keep-running: still running", A.ps()[vm]["state"] == "running")
     must(A, vm, "echo changed > /tmp/after")
     # On B, whose address range the original's address is not from: A would hand it out again.
     fork = vm + "-fork"
     r = B.restore(path2, name=fork, ip="auto")
-    check("fork: new address", r["ip"] != ip and B.ls()[fork]["ip"] == r["ip"], r)
+    check("fork: new address", r["ip"] != ip and B.ps()[fork]["ip"] == r["ip"], r)
     check("fork: RAM as at the checkpoint", md5(B, fork) == m)
     code, out, err = B.exec(fork, "test -e /tmp/after && echo present || echo absent")
     check("fork: later writes not in it", code == 0 and out.strip() == "absent", (code, out, err))
@@ -596,7 +638,7 @@ def checkpoint_restore():
 
 @case
 def suspend_resume():
-    """suspend frees the VM's Firecracker; resume brings back process and RAM."""
+    """stop (suspend) frees the VM's Firecracker; start brings back process and RAM; rm removes a stopped VM."""
     vm = "e2e-suspend"
     ip = A.run(vm)
     m = fill(A, vm)
@@ -605,17 +647,25 @@ def suspend_resume():
     check("found the VM's Firecracker", res["pid"] in A.firecrackers(), res)
     r = A.suspend(vm)
     print(f"  suspend: {r.get('suspend_ms')} ms, {r.get('data_mib')} MiB on disk")
-    check("suspend: ls says suspended", A.ls()[vm]["state"] == "suspended", A.ls()[vm])
-    check("suspend: its Firecracker exited", wait_for(lambda: not os.path.exists(f"/proc/{res['pid']}"), 10), res)
-    check("suspend: exec refused", A.exec(vm, "true", timeout=60)[0] != 0)
+    check("stop: ps -a says suspended", A.ps()[vm]["state"] == "suspended", A.ps()[vm])
+    check("stop: ps without -a leaves it out", vm not in A.ps(all=False), A.ps(all=False))
+    check("stop: its Firecracker exited", wait_for(lambda: not os.path.exists(f"/proc/{res['pid']}"), 10), res)
+    check("stop: exec refused", A.exec(vm, "true", timeout=60)[0] != 0)
+    k = A.kill(vm, check=False)
+    check("kill: a stopped VM is refused", k.returncode != 0 and f"vm {vm} is not running" in k.stderr
+          and f"flexvm rm {vm}" in k.stderr, (k.returncode, k.stderr))
+    check("kill: the stopped VM stays", A.ps().get(vm, {}).get("state") == "suspended", A.ps().get(vm))
     r = A.resume(vm)
-    print(f"  resume: ready in {r.get('ready_ms')} ms")
-    check("resume: running", A.ls()[vm]["state"] == "running")
-    check("resume: RAM intact", md5(A, vm) == m)
-    check("resume: same process", marker_id(A, vm) == proc)
+    print(f"  start: ready in {r.get('ready_ms')} ms")
+    check("start: running", A.ps()[vm]["state"] == "running")
+    check("start: RAM intact", md5(A, vm) == m)
+    check("start: same process", marker_id(A, vm) == proc)
     c1 = count(A, vm)
-    check("resume: process runs on", wait_for(lambda: count(A, vm) > c1, 5))
-    A.kill(vm)
+    check("start: process runs on", wait_for(lambda: count(A, vm) > c1, 5))
+    r = A.rm(vm, check=False)
+    check("rm: a running VM is refused", r.returncode != 0 and f"vm {vm} is running" in r.stderr, (r.returncode, r.stderr))
+    A.suspend(vm)
+    check("rm: removes the stopped VM", A.rm(vm).stdout == vm + "\n" and vm not in A.ps(), A.ps().get(vm))
 
 
 @case
@@ -626,7 +676,7 @@ def kill_releases():
     res = vm_resources(ip)
     check("found the VM's tap and Firecracker", res["tap"] and res["pid"], res)
     A.kill(vm)
-    check("kill: not listed", vm not in A.ls())
+    check("kill: not listed", vm not in A.ps())
     check("kill: its Firecracker exited", wait_for(lambda: not os.path.exists(f"/proc/{res['pid']}"), 10), res)
     check("kill: route gone", vm_resources(ip)["route"] == "", vm_resources(ip))
     taps = A.taps()
@@ -886,8 +936,8 @@ def worker():
                 # failure here must not stop the other cases.
                 try:
                     for h in (A, B):
-                        for vm in sorted(h.vms & set(h.ls())):
-                            h.kill(vm, check=False)
+                        for vm in sorted(h.vms & set(h.ps())):
+                            h.rm(vm, force=True, check=False)
                 except Exception:
                     traceback.print_exc()
         clean = True
@@ -907,7 +957,7 @@ def worker():
         for h in (A, B):
             try:
                 if args.own_listeners and os.path.isdir(h.state_dir):
-                    h.prefix = json.loads(h.cli("config").stdout)["derived"]["prefix"]
+                    h.prefix = h.info()["derived"]["prefix"]
                 if "faults" in args.cases and os.path.isdir(h.state_dir):
                     h.cli("debug", "gc")
             except Exception as e:

@@ -41,57 +41,76 @@ use crate::vmproc::Start;
 const USAGE: &str = "\
 flexvm: elastic Firecracker microVMs with post-copy live migration
 
-  flexvm run NAME [--template IMAGE] [--ip IP] [-d] [-- CMD...]
-                                     start a VM; the process is the VM (-d: in the background)
-                                     (no --template: ubuntu:24.04, pulled if missing)
-  flexvm ls [--json]                 list VMs (with their pids)
+  flexvm run [OPTIONS] IMAGE [CMD...]
+                                     start a VM of IMAGE (pulled first if missing); the process is the VM
+      --name NAME                    its name (without: one is made up, as docker does)
+      -d, --detach                   in the background: prints {\"name\", \"ip\", \"pid\", ...} once it runs
+      --ip IP                        its address (without: the next free one)
+      --cpus N                       cap its CPU time at N CPUs (1.5: one and a half); its vCPUs are IMAGE's
+      --memory SIZE                  cap its memory growth (512m, 2g; plain bytes, as docker): from IMAGE's
+                                     boot memory plus what its snapshot plugged, up to its ceiling
+      --checkpoint DIR               start it from a checkpoint instead of IMAGE (its name and address
+                                     unless --name and --ip IP|auto); --paused holds it until unpause
+  flexvm ps [-a] [--json]            list running VMs (-a: stopped ones too)
   flexvm exec NAME CMD...            run a shell command in a VM
-  kill -TSTP PID / kill -CONT PID    pause / resume a VM (Ctrl-Z works in the foreground)
-  kill PID                           suspend a VM to disk (SIGTERM); its memory is freed
-  flexvm resume NAME [-d]            bring a suspended VM back
-  flexvm kill NAME                   destroy a VM, running or suspended (Ctrl-C or Ctrl-\\ works too)
+  flexvm stop NAME...                suspend a VM to disk, freeing its memory (as SIGTERM to its process)
+  flexvm start [-a] NAME...          resume a stopped VM in the background (-a: in the foreground)
+  flexvm pause NAME...               pause a VM's vCPUs, keeping its memory (as SIGTSTP; Ctrl-Z works too)
+  flexvm unpause NAME...             resume a paused VM
+  flexvm kill NAME...                destroy a running VM (Ctrl-C or Ctrl-\\ in the foreground)
+  flexvm rm [-f] NAME...             remove a stopped VM (suspended, failed or lost); -f: a running one too
   flexvm checkpoint NAME DIR [--stop] [--incremental]
-                                     write the VM's state to DIR (a new directory)
-  flexvm restore DIR [--name N] [--ip IP|auto] [--paused] [-d]
-                                     start a VM from a checkpoint
+                                     write the VM's state to DIR (a new directory); run --checkpoint DIR
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
-  flexvm reclaim IP [--force GEN]    take back an address lent out with a VM that migrated away,
-                                     once its target is gone for good (without --force: say what)
-  flexvm config [--peer HOST:PORT]... [--peer-underlay HOST:PORT=IP[,IP]]... [--vm-ips CIDR|FIRST-LAST]
-                [--dns IP] [--underlay IP] [--cluster-ips CIDR|FIRST-LAST] [--announce-dev IFACE|none]
-                [--reserve MIB] [--evict-at MIB]
-                                     set this host's settings, live (no flags: show them and what is
-                                     derived for those unset); --peer replaces the list, '' unsets
-                                     --cluster-ips holds every host's VM range (unset: only --vm-ips)
-                                     --peer-underlay: a peer's next hops on another network than its
-                                     --peer address (its --underlay); replaces them all
-  flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
-  flexvm recover                     sweep and refill standby VMs now, as root (at boot, without a listener)
-  flexvm standby [--template IMAGE] [N]
-                                     keep N VMs restored and paused, so run takes ~5 ms (no N: show)
-  flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] ...
-                                     pull an image and build its template (an archive or OCI layout
-                                     directory needs --tag; see README); again: rebuilt if it changed
+  flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
+              [--standby N] ...      pull an image and build its template (an archive or OCI layout
+                                     directory needs --tag; see README); again: rebuilt if it changed;
+                                     --standby N keeps N of its VMs restored and paused (run: ~5 ms);
+                                     of an image pulled here, alone it only sets that count
   flexvm images [--json]             list pulled images
   flexvm rmi IMAGE|ID                remove an image no VM here uses
-  flexvm bench ...                   latency benchmarks (see README)
+  flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
+  flexvm info                        this host's settings (STATE/host.json, edited by hand) and what is
+                                     derived for those unset
+  flexvm reclaim IP [--force GEN]    take back an address lent out with a VM that migrated away,
+                                     once its target is gone for good (without --force: say what)
+  flexvm bench ...                   latency benchmarks, for development (see README)
 
-options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs), --run DIR (/run/flexvm, or
-         /run/flexvm-PREFIX for another --state), --version
+options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs, host.json), --run DIR
+         (/run/flexvm, or /run/flexvm-PREFIX for another --state), --version
 Each state directory is bound to its first run directory; a different --run is refused (and so is
 none, if it is bound to another than its default); /run/flexvm is /var/lib/flexvm's alone.
-run, resume and restore exit with the VM's command's status, 128+signal, 125 when flexvm
-fails, 124 when the VM dies; exec returns the command's status, or 125 when flexvm fails
+run and start exit with the VM's command's status, 128+signal, 125 when flexvm fails, 124 when
+the VM dies; exec returns the command's status, or 125 when flexvm fails
 ";
 
-const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "help", "version"];
+/// Flags that take no value (`-a`, `-f` and `--standby` depend on the command: `takes_value`).
+const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "incoming", "json", "detach", "all", "attach", "help", "version"];
 
-/// `--flag value`s: last wins. `rest` follows `--` (or `exec NAME`).
+/// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`.
 pub struct Args {
     positional: Vec<String>,
     flags: Vec<(String, String)>,
     rest: Vec<String>,
     child_args: Vec<String>,
+}
+
+/// Whether `--flag` takes a value: `--force GEN` is reclaim's (rm's is a switch), `--standby N`
+/// pull's (run's is the internal standby VM's switch).
+fn takes_value(flag: &str, cmd: Option<&str>) -> Option<bool> {
+    match flag {
+        "force" => Some(cmd == Some("reclaim")),
+        "standby" => Some(cmd == Some("pull")),
+        f if SWITCHES.contains(&f) => Some(false),
+        f if GLOBAL.contains(&f) || IMAGE_FLAGS.contains(&f) || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&f)) => Some(true),
+        _ => None,
+    }
+}
+
+/// A value that is itself a flag (or `--`) is a forgotten value, as in `--state --run X`; any
+/// other is taken as is, so argv-style ones can start with `--` (`--cmd "--port 8080"`).
+fn is_flag(v: &str) -> bool {
+    v == "--" || v.strip_prefix("--").is_some_and(|f| takes_value(f, None).is_some())
 }
 
 impl Args {
@@ -119,36 +138,41 @@ impl Args {
             if arg != "-d" && arg != "--detach" {
                 a.child_args.push(arg.clone());
             }
+            let cmd = a.positional.first().map(String::as_str);
+            let short = match arg.as_str() {
+                "-d" => Some("detach"),
+                "-h" => Some("help"),
+                "-a" => Some(if cmd == Some("start") { "attach" } else { "all" }),
+                // Not reclaim's `--force GEN`.
+                "-f" if cmd == Some("rm") => Some("force"),
+                _ => None,
+            };
             match arg.strip_prefix("--") {
                 Some("") => {
                     a.rest.extend(it.by_ref());
                     a.child_args.extend(a.rest.iter().cloned());
                 }
                 Some(f) => {
-                    let value = if SWITCHES.contains(&f) {
-                        "1".into()
-                    } else if GLOBAL.contains(&f) || IMAGE_FLAGS.contains(&f) || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&f)) {
-                        let value = it.next().filter(|v| !v.starts_with("--")).ok_or_else(|| {
-                            if f == "force" {
-                                "--force needs a generation; run flexvm reclaim IP to see GEN".to_string()
-                            } else {
-                                format!("--{f} needs a value")
-                            }
-                        })?;
-                        a.child_args.push(value.clone());
-                        value
-                    } else {
-                        bail!("unknown option --{f} (see flexvm --help)");
+                    let value = match takes_value(f, cmd) {
+                        Some(false) => "1".into(),
+                        Some(true) => {
+                            let value = it.next().filter(|v| !is_flag(v)).ok_or_else(|| match f {
+                                "force" => "--force needs a generation; run flexvm reclaim IP to see GEN".to_string(),
+                                _ => format!("--{f} needs a value"),
+                            })?;
+                            a.child_args.push(value.clone());
+                            value
+                        }
+                        None => bail!("unknown option --{f} (see flexvm --help)"),
                     };
                     a.flags.push((f.into(), value));
                 }
-                None if arg == "-d" => a.flags.push(("detach".into(), "1".into())),
-                None if arg == "-h" => a.flags.push(("help".into(), "1".into())),
+                None if short.is_some() => a.flags.push((short.unwrap_or_default().into(), "1".into())),
                 None if arg.starts_with('-') => bail!("unknown option {arg} (see flexvm --help)"),
                 None => {
                     a.positional.push(arg);
-                    if a.positional.len() == 2 && a.positional[0] == "exec" {
-                        // `exec NAME -- CMD` too, as with run.
+                    // `exec NAME CMD` and `run IMAGE CMD`: the rest is the command's (a `--` first is dropped).
+                    if a.positional.len() == 2 && matches!(a.positional[0].as_str(), "exec" | "run") {
                         let mut cmd = it.by_ref().peekable();
                         cmd.next_if_eq("--");
                         a.rest.extend(cmd);
@@ -175,6 +199,11 @@ impl Args {
     pub fn parse_or<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
         self.get(name).map_or(Ok(default), |v| v.parse().map_err(|_| format!("bad --{name} {v:?}").into()))
     }
+
+    /// The words after the command: its names.
+    fn names(&self) -> &[String] {
+        self.positional.get(1..).unwrap_or_default()
+    }
 }
 
 /// A VM's command's statuses are its own: flexvm's failures there exit 125.
@@ -192,7 +221,7 @@ fn main() {
         }
     }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
-    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "exec"));
+    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec"));
     let result = error.map_or_else(|| real_main(&args), Err);
     if let Some(sig) = template::interrupted_signal() {
         util::raise_signal(sig);
@@ -229,22 +258,26 @@ const IMAGE_FLAGS: &[&str] = &[
     "max-entries",
 ];
 
+/// Any number of names.
+const NAMES: usize = usize::MAX;
+
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
-    ("run", 2, &["template", "ip", "detach", "standby", "incoming"]),
-    ("ls", 1, &["json"]),
+    ("run", 2, &["name", "detach", "ip", "cpus", "memory", "checkpoint", "paused", "standby", "incoming"]),
+    ("ps", 1, &["all", "json"]),
     ("exec", 2, &[]),
-    ("resume", 2, &["detach"]),
-    ("kill", 2, &[]),
+    ("stop", NAMES, &[]),
+    ("start", NAMES, &["attach"]),
+    ("pause", NAMES, &[]),
+    ("unpause", NAMES, &[]),
+    ("kill", NAMES, &[]),
+    ("rm", NAMES, &["force"]),
     ("checkpoint", 3, &["stop", "incremental"]),
-    ("restore", 2, &["name", "ip", "paused", "detach"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
-    ("recover", 1, &[]),
-    ("config", 1, CONFIG_FLAGS),
-    ("standby", 2, &["template"]),
-    ("pull", 2, &["tag", "vcpus", "mem", "max", "plug"]),
+    ("info", 1, &[]),
+    ("pull", 2, &["tag", "vcpus", "mem", "max", "plug", "standby"]),
     ("images", 1, &["json"]),
     ("rmi", 2, &[]),
     (
@@ -261,25 +294,36 @@ fn check_applies(args: &Args) -> Result<()> {
     let Some(&(_, most, flags)) = COMMANDS.iter().find(|(c, ..)| c == cmd) else {
         bail!("unknown command {cmd:?} (see flexvm --help)");
     };
-    if matches!(cmd.as_str(), "run" | "resume" | "exec" | "kill" | "checkpoint" | "migrate" | "pull" | "rmi")
-        && !(cmd == "run" && (args.has("standby") || args.has("incoming")))
-        && args.positional.get(1).is_none_or(|name| name.is_empty())
-    {
-        bail!("{cmd} needs {}", if matches!(cmd.as_str(), "pull" | "rmi") { "IMAGE" } else { "NAME" });
+    let first = args.positional.get(1).filter(|w| !w.is_empty());
+    let internal = cmd == "run" && (args.has("standby") || args.has("incoming"));
+    if cmd == "run" && args.has("checkpoint") {
+        if let Some(image) = first {
+            bail!("run --checkpoint takes no IMAGE ({image:?}): the checkpoint has its own");
+        }
+    } else if cmd == "run" && args.has("paused") {
+        bail!("--paused applies to run --checkpoint");
+    } else if !internal && first.is_none() {
+        match cmd.as_str() {
+            "run" | "pull" | "rmi" => bail!("{cmd} needs IMAGE"),
+            "exec" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "checkpoint" | "migrate" => bail!("{cmd} needs NAME"),
+            _ => {}
+        }
     }
     let image = cmd == "pull";
     if let Some((f, _)) = args.flags.iter().find(|(f, _)| ![GLOBAL, flags, if image { IMAGE_FLAGS } else { &[] }].concat().contains(&f.as_str())) {
         bail!("--{f} does not apply to {cmd} (see flexvm --help)");
     }
     if let Some(extra) = args.positional.get(most) {
-        let hint = match cmd.as_str() {
-            "run" => format!("; a command goes after --: flexvm run {} -- {extra} ...", args.positional[1]),
-            _ => " (see flexvm --help)".into(),
-        };
-        bail!("{cmd} does not take {extra:?}{hint}");
+        bail!("{cmd} does not take {extra:?} (see flexvm --help)");
+    }
+    if let Some(empty) = args.names().iter().find(|n| n.is_empty()) {
+        bail!("{cmd} takes no empty word {empty:?}");
     }
     if !args.rest.is_empty() && cmd != "run" && cmd != "exec" {
         bail!("{cmd} takes no -- CMD");
+    }
+    if cmd == "start" && args.has("attach") && args.names().len() > 1 {
+        bail!("start -a takes one NAME");
     }
     Ok(())
 }
@@ -290,34 +334,21 @@ fn state(args: &Args) -> Result<PathBuf> {
 
 /// The host, recovered first until this boot's recovery is complete (`gc::after_boot`): a VM
 /// process and a template build only its local part (they leave the rest to a full pass), the
-/// listener and `recover` the rest after this; any other command all of it here.
+/// listener the rest after this; any other command all of it here.
 pub fn open_host(args: &Args) -> Result<Host> {
-    let host = open_host_only(args)?;
-    let cmd = args.positional.first().map(String::as_str);
-    // Not `config`: it may be fixing the configuration recovery goes by.
-    if cmd != Some("config") {
-        let partly = matches!(cmd, Some("run" | "resume" | "restore" | "listen" | "recover" | "pull"));
-        if let Err(e) = gc::after_boot(&host, !partly) {
-            if gc::first_boot_warning(&host, host::boot_id()) {
-                crate::log!("flexvm: recovering after boot: {e}");
-            }
-        }
-    }
-    Ok(host)
-}
-
-/// Without `--run`: the state's default run directory (`host::default_run`).
-fn open_host_only(args: &Args) -> Result<Host> {
     let state = state(args)?;
     let run = match args.get("run") {
         Some(run) => PathBuf::from(run),
         None => host::default_run(&state)?,
     };
-    // `config` is how a host.json with invalid ranges is fixed: it validates what it saves.
-    match args.positional.first().map(String::as_str) {
-        Some("config") => Host::open_unvalidated(&state, &run),
-        _ => Host::open(&state, &run),
+    let host = Host::open(&state, &run)?;
+    let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "listen" | "pull"));
+    if let Err(e) = gc::after_boot(&host, !partly) {
+        if gc::first_boot_warning(&host, host::boot_id()) {
+            crate::log!("flexvm: recovering after boot: {e}");
+        }
     }
+    Ok(host)
 }
 
 fn paths(args: &Args) -> Result<Paths> {
@@ -334,41 +365,63 @@ fn real_main(args: &Args) -> Result<()> {
     check_applies(args)?;
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
-    // An image reference, or a template's own name.
-    let template = &template::name_of(args.get("template").unwrap_or(template::DEFAULT_IMAGE))?;
     let call = |req: Value| print(vmproc::call(&open_host(args)?, name, req, None)?);
     match pos.first().copied() {
         Some("pull") => pull(args, name),
-        Some("images") => images(&paths(args)?, args.has("json")),
+        Some("images") => images(&open_host(args)?, &paths(args)?, args.has("json")),
         Some("rmi") => rmi(&open_host(args)?, &paths(args)?, name),
-        Some("run") if args.has("standby") => vmproc::main(open_host(args)?, paths(args)?, Start::Standby { template: template.into() }, notify_fd()),
+        Some("run") if args.has("standby") => {
+            let template = template::name_of(name)?;
+            vmproc::main(open_host(args)?, paths(args)?, Start::Standby { template }, notify_fd())
+        }
         Some("run") if args.has("incoming") => {
             let req: Value = serde_json::from_str(&std::env::var("FLEXVM_INCOMING").map_err(|_| "run --incoming is the listener's, for migrations")?)?;
             unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) };
             // Told once committed or refused: the listener holds an arrival slot until then.
             vmproc::main(open_host(args)?, paths(args)?, Start::Incoming { req }, notify_fd())
         }
-        Some("run") => run(args, name, template),
-        // A detached child must answer its parent through vmproc, even if another resume won meanwhile.
-        Some("resume") if std::env::var_os("FLEXVM_NOTIFY_FD").is_none() && resume(&open_host(args)?, name)? => Ok(()),
-        Some("resume") => start(args, name, Start::Resume { name: name.into() }),
-        Some("restore") => {
-            let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
-            // A detached restore logs to the VM's name, which the checkpoint has without --name.
-            let label = match args.get("name") {
-                Some(name) => name.to_string(),
-                None if args.has("detach") => checkpoint::read_manifest(&dir)?.name,
-                None => String::new(),
-            };
-            start(
-                args,
-                &label,
-                Start::Restore { dir, name: args.get("name").map(String::from), ip: args.get("ip").map(String::from), paused: args.has("paused") },
-            )
+        Some("run") if args.has("checkpoint") => run_checkpoint(args),
+        Some("run") => run(args, name),
+        Some("start") if args.has("attach") => {
+            // A detached start's VM process (`start -a`, answering on FLEXVM_NOTIFY_FD) must answer
+            // its parent through vmproc, even if another start won meanwhile.
+            if std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
+                stopped_to_attach(&open_host(args)?, name)?;
+            }
+            vmproc::main(open_host(args)?, paths(args)?, Start::Resume { name: name.into() }, notify_fd())
         }
-        Some("ls") => list(&open_host(args)?, args.has("json")),
+        Some("start") => {
+            let host = open_host(args)?;
+            each(args.names(), |n| match resume(&host, n)? {
+                true => output(format_args!("{n}\n")),
+                false => spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?),
+            })
+        }
+        Some("ps") => ps(&open_host(args)?, args.has("all"), args.has("json")),
         Some("exec") => util::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
-        Some("kill") => kill(&open_host(args)?, name),
+        Some("stop") => {
+            let host = open_host(args)?;
+            each(args.names(), |n| stop(&host, n))
+        }
+        Some("pause") => {
+            let host = open_host(args)?;
+            each(args.names(), |n| pause(&host, n))
+        }
+        Some("unpause") => {
+            let host = open_host(args)?;
+            each(args.names(), |n| match resume(&host, n)? {
+                true => output(format_args!("{n}\n")),
+                false => Err(not_running(&host, n)),
+            })
+        }
+        Some("kill") => {
+            let host = open_host(args)?;
+            each(args.names(), |n| remove(&host, n, true, false))
+        }
+        Some("rm") => {
+            let host = open_host(args)?;
+            each(args.names(), |n| remove(&host, n, args.has("force"), true))
+        }
         Some("reclaim") => {
             let gen = args.get("force").map(|v| v.parse().map_err(|_| format!("bad --force generation {v:?}"))).transpose()?;
             reclaim(&open_host(args)?, name, gen)
@@ -378,13 +431,6 @@ fn real_main(args: &Args) -> Result<()> {
             call(json!({"op": "checkpoint", "dir": dir, "stop": args.has("stop"), "incremental": args.has("incremental")}))
         }
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
-        Some("recover") => {
-            if unsafe { libc::geteuid() } != 0 {
-                bail!("recover requires root");
-            }
-            let host = open_host_only(args)?;
-            gc::recover_after_boot(&host)
-        }
         Some("listen") => {
             // Before any thread that would take these signals is started.
             util::on_signal(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP], |sig| util::raise_signal(sig));
@@ -392,24 +438,7 @@ fn real_main(args: &Args) -> Result<()> {
             let listener = configure_listener(&mut host, pos.get(1).copied(), listen::activated())?;
             listen::main(host, listener)
         }
-        Some("config") => {
-            let mut host = open_host(args)?;
-            if CONFIG_FLAGS.iter().any(|f| args.has(f)) {
-                host.configure(|c| configure(c, args))?;
-            }
-            print(config_output(&host))
-        }
-        Some("standby") if name.is_empty() => print(standby::show(&open_host(args)?)),
-        Some("standby") => {
-            let host = open_host(args)?;
-            template::check_name(template)?;
-            let n = name.parse().map_err(|_| "standby wants a count")?;
-            // Check before saving a positive count, or an unreadable template would be retried forever.
-            if n > 0 {
-                template::Template::open(&paths(args)?, template)?;
-            }
-            print(standby::set(&host, template, n)?)
-        }
+        Some("info") => print(info(&open_host(args)?)),
         Some("bench") => bench::run(args),
         // Test hooks: arm a fault for MS ms (0 disarms), hash a checkpoint, or ask a VM.
         Some("debug") => match name {
@@ -430,10 +459,35 @@ fn real_main(args: &Args) -> Result<()> {
     }
 }
 
-fn config_output(host: &Host) -> Value {
+/// `f` for each name, going on past a failure as docker does; one name's failure is its error.
+fn each(names: &[String], mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    if let [one] = names {
+        return f(one);
+    }
+    let failed = names.iter().filter(|n| f(n).inspect_err(|e| crate::log!("flexvm: {n}: {e}")).is_err()).count();
+    if failed > 0 {
+        bail!("{failed} of {} failed", names.len());
+    }
+    Ok(())
+}
+
+/// The global flags, then `words`: a command this process runs as a child.
+fn child_args(args: &Args, words: &[&str]) -> Vec<String> {
+    let mut v = Vec::new();
+    for flag in ["state", "run"] {
+        if let Some(value) = args.get(flag) {
+            v.extend([format!("--{flag}"), value.into()]);
+        }
+    }
+    v.extend(words.iter().map(|w| w.to_string()));
+    v
+}
+
+/// `info`: host.json as set, what is derived for the rest, and what looks like a mistake.
+fn info(host: &Host) -> Value {
     let c = &host.cfg;
     let derived = json!({"prefix": host.tap_prefix(), "cluster_ips": c.effective_cluster_ips(), "underlay": c.underlay(), "announce_dev": c.announce_dev(), "reserve_mib": c.reserve(), "evict_at_mib": c.evict_at()});
-    json!({"set": c, "derived": derived})
+    json!({"version": env!("CARGO_PKG_VERSION"), "config": host.state.join("host.json"), "set": c, "derived": derived, "warnings": c.warnings()})
 }
 
 /// Bind and validate before publishing any host configuration.
@@ -462,7 +516,7 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
         listener = Some(bound);
         Ok(())
     })?;
-    if let Some(warning) = host.cfg.cluster_warning() {
+    for warning in host.cfg.warnings() {
         crate::log!("{warning}");
     }
     Ok(listener.unwrap())
@@ -490,92 +544,82 @@ fn takes(local: std::net::SocketAddr, v6only: bool, ip: std::net::IpAddr) -> boo
     }
 }
 
-/// What `configure` sets.
-const CONFIG_FLAGS: &[&str] = &["peer", "peer-underlay", "vm-ips", "cluster-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at"];
-
-/// Flags not given keep their configured values; an empty one unsets it
-/// (derived again where used). --peers replace the list (`--peer ''` empties
-/// it); `--announce-dev none` turns announcements off.
-fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
-    if args.has("peer") {
-        c.peers = args.all("peer").into_iter().filter(|p| !p.is_empty()).collect();
-        if let Some(p) = c.peers.iter().find(|p| !host::is_endpoint(p)) {
-            bail!("bad --peer {p:?}: give HOST:PORT, a peer's flexvm listen address");
-        }
-    }
-    if args.has("peer-underlay") {
-        c.peer_underlays.clear();
-        for entry in args.all("peer-underlay").into_iter().filter(|e| !e.is_empty()) {
-            let bad = || format!("bad --peer-underlay {entry:?}: give HOST:PORT=IP[,IP...], a --peer and its data-plane addresses");
-            let (peer, ips) = entry.rsplit_once('=').ok_or_else(bad)?;
-            let ips: Vec<std::net::Ipv4Addr> = ips.split(',').map(|i| i.trim().parse()).collect::<std::result::Result<_, _>>().map_err(|_| bad())?;
-            if !c.peers.iter().any(|p| p == peer) {
-                bail!("--peer-underlay {entry:?}: {peer} is not a --peer");
-            }
-            if let Some(ip) = ips.iter().find(|i| i.is_unspecified() || i.is_broadcast() || i.is_multicast() || net::is_local_addr(**i).unwrap_or(true)) {
-                bail!("--peer-underlay {entry:?}: {ip} is local or not unicast");
-            }
-            c.peer_underlays.entry(peer.into()).or_default().extend(ips);
-        }
-    }
-    // A peer no longer configured takes its underlays with it.
-    let peers = c.peers.clone();
-    c.peer_underlays.retain(|p, _| peers.contains(p));
-    if let Some(r) = args.get("vm-ips") {
-        c.vm_ips = if r.is_empty() { host::Config::default().vm_ips } else { r.into() };
-        net::IpRange::parse(&c.vm_ips)?;
-    }
-    if let Some(r) = args.get("cluster-ips") {
-        c.cluster_ips = (!r.is_empty()).then(|| r.into());
-    }
-    c.validate_ranges()?;
-    if let Some(u) = args.get("underlay") {
-        c.underlay = (!u.is_empty()).then(|| u.parse()).transpose().map_err(|_| format!("bad --underlay {u:?}"))?;
-    }
-    if let Some(d) = args.get("announce-dev") {
-        if !d.is_empty() && d != "none" {
-            net::ifindex(d)?;
-        }
-        c.announce_dev = (!d.is_empty()).then(|| d.into());
-    }
-    if let Some(d) = args.get("dns") {
-        c.dns = (!d.is_empty()).then(|| d.parse::<std::net::Ipv4Addr>().map(|_| d.into())).transpose().map_err(|_| format!("bad --dns {d:?}"))?;
-    }
-    for (flag, v) in [("reserve", &mut c.reserve_mib), ("evict-at", &mut c.evict_mib)] {
-        if args.has(flag) {
-            *v = (args.get(flag) != Some("")).then(|| args.parse_or(flag, 0)).transpose()?;
-        }
-    }
-    let total = proc_kb("/proc/meminfo", "MemTotal").map_or(u64::MAX, |b| b >> 20);
-    if let Some(r) = c.reserve_mib.filter(|&r| r > total) {
-        bail!("--reserve {r} MiB is more than this host's {total} MiB of RAM");
-    }
-    if let Some(e) = c.evict_mib.filter(|&e| e < c.reserve()) {
-        crate::log!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", c.reserve());
-    }
-    if !c.peers.is_empty() && c.vm_ips == host::Config::default().vm_ips {
-        crate::log!("flexvm: warning: --vm-ips is the default {}; each peer needs a range of its own", c.vm_ips);
-    }
-    if let Some(warning) = c.cluster_warning() {
-        crate::log!("{warning}");
-    }
-    Ok(())
+/// `--cpus` and `--memory`.
+fn resources(args: &Args) -> Result<vm::Resources> {
+    let cpus = args.get("cpus").map(|v| v.parse::<f64>().ok().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| format!("bad --cpus {v:?}"))).transpose()?;
+    Ok(vm::Resources { cpus, memory_mib: args.get("memory").map(memory_mib).transpose()? })
 }
 
-/// Claims a standby VM if there is one, else becomes the VM.
-fn run(args: &Args, name: &str, template: &str) -> Result<()> {
-    let (host, paths) = (open_host(args)?, paths(args)?);
-    host::check_name(name)?;
-    // The default image, pulled the first time (a detached run's VM process finds it there).
-    if args.get("template").is_none() && std::fs::symlink_metadata(paths.templates.join(template)).is_err() {
-        pull_default(args)?;
+/// A size as docker takes it: bytes, or a number (with a fraction) and a unit of b, k, m, g or
+/// t (kb, mb, ... too; powers of 1024), any case. In MiB, rounded down.
+fn memory_mib(v: &str) -> Result<u64> {
+    let bad = || format!("bad --memory {v:?}: give a size, as 512m or 2g");
+    let lower = v.trim().to_ascii_lowercase();
+    let number = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let shift = match &lower[number.len()..] {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        "t" | "tb" | "tib" => 40,
+        _ => return Err(bad().into()),
+    };
+    let n: f64 = number.parse().ok().filter(|n: &f64| n.is_finite() && *n >= 0.0).ok_or_else(bad)?;
+    let mib = n * (1u64 << shift) as f64 / (1u64 << 20) as f64;
+    if mib >= u64::MAX as f64 {
+        return Err(bad().into());
     }
+    if shift == 0 && mib < 1.0 {
+        bail!("--memory {v} is {v} bytes: give a unit, as {v}m");
+    }
+    Ok(mib as u64)
+}
+
+/// `run IMAGE`: claims a standby VM if there is one, else becomes the VM.
+fn run(args: &Args, image: &str) -> Result<()> {
+    let (host, paths) = (open_host(args)?, paths(args)?);
+    let template = template::name_of(image)?;
+    let resources = resources(args)?;
     let ip = args.get("ip").filter(|&s| s != "auto");
     let ip: Option<std::net::Ipv4Addr> = ip.map(|s| s.parse().map_err(|_| format!("bad --ip {s:?}"))).transpose()?;
+    if let Some(name) = args.get("name") {
+        host::check_name(name)?;
+    }
+    // Pulled the first time, as docker does (a detached run's VM process finds it there).
+    if std::fs::symlink_metadata(paths.templates.join(&template)).is_err() {
+        pull_missing(args, image)?;
+    }
     let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd});
+    // A made-up name is only checked free here: one another run took meanwhile is made up
+    // again (a cold foreground run's VM process does that itself, `Proc::run`).
+    for _ in 0..20 {
+        let name = match args.get("name") {
+            Some(name) => name.to_string(),
+            None => host::generated_name(&host)?,
+        };
+        match run_as(args, &host, &paths, &template, name, ip, cmd.clone(), resources) {
+            Err(e) if args.get("name").is_none() && host::name_taken(&e) => continue,
+            r => return r,
+        }
+    }
+    bail!("every name made up was taken meanwhile: give one with --name")
+}
+
+/// `run` of VM `name`: a standby's claim, or this process becomes the VM.
+#[allow(clippy::too_many_arguments)]
+fn run_as(
+    args: &Args,
+    host: &Host,
+    paths: &Paths,
+    template: &str,
+    name: String,
+    ip: Option<std::net::Ipv4Addr>,
+    cmd: Option<String>,
+    resources: vm::Resources,
+) -> Result<()> {
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources});
     // A claimed standby VM writes where this process would, to opens made here (`own`).
-    let log = args.has("detach").then(|| log_file(&host, name)).transpose()?;
+    let log = args.has("detach").then(|| log_file(host, &name)).transpose()?;
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
@@ -583,7 +627,7 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     // A foreground claim's signals wait from before it is sent: the VM it makes gets them
     // (`follow`), as a cold start would, never orphaned by this process dying mid-claim.
     let set = (!tried && log.is_none()).then(|| util::block_signals(&FOLLOW_SIGNALS));
-    let taken = if tried { None } else { standby::take(&host, &paths, template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? };
+    let taken = if tried { None } else { standby::take(host, paths, template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? };
     if let (None, Some(set)) = (&taken, &set) {
         // No claim: this process becomes the VM, and one pending kills it as before.
         unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
@@ -595,21 +639,43 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
         }
-        (None, Some(log)) => spawn_detached(&host, name, args, &log),
-        (None, None) => vmproc::main(host, paths, Start::Run { name: name.into(), template: template.into(), ip, cmd }, notify_fd()),
+        (None, Some(log)) => {
+            // The child takes the name made up here.
+            let child = [&["--name".to_string(), name.clone()][..], &args.child_args].concat();
+            spawn_detached(host, &name, &child, &log)
+        }
+        (None, None) => {
+            let generated = args.get("name").is_none();
+            vmproc::main(host.clone(), paths.clone(), Start::Run { name, template: template.into(), ip, cmd, resources, generated }, notify_fd())
+        }
     }
+}
+
+/// `run --checkpoint DIR`: the checkpoint's name and address unless `--name`, `--ip`.
+fn run_checkpoint(args: &Args) -> Result<()> {
+    let dir = std::path::absolute(args.get("checkpoint").unwrap_or_default())?;
+    let resources = resources(args)?;
+    let s = Start::Restore {
+        dir: dir.clone(),
+        name: args.get("name").map(String::from),
+        ip: args.get("ip").map(String::from),
+        paused: args.has("paused"),
+        resources,
+    };
+    if args.has("detach") {
+        let host = open_host(args)?;
+        // A detached restore logs to the VM's name, which the checkpoint has without --name.
+        let name = match args.get("name") {
+            Some(name) => name.to_string(),
+            None => checkpoint::read_manifest(&dir)?.name,
+        };
+        return spawn_detached(&host, &name, &args.child_args, &log_file(&host, &name)?);
+    }
+    vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }
 
 /// What a foreground `run` that claimed a standby VM forwards to it (SIGHUP is ignored).
 const FOLLOW_SIGNALS: [i32; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
-
-fn start(args: &Args, name: &str, s: Start) -> Result<()> {
-    if args.has("detach") {
-        let host = open_host(args)?;
-        return spawn_detached(&host, name, args, &log_file(&host, name)?);
-    }
-    vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
-}
 
 fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     host::check_name(name)?;
@@ -622,10 +688,11 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     Ok(f)
 }
 
-fn spawn_detached(host: &Host, name: &str, args: &Args, log: &std::fs::File) -> Result<()> {
+/// Starts `child` (this binary's arguments) in the background, and prints its VM's answer.
+fn spawn_detached(host: &Host, name: &str, child: &[String], log: &std::fs::File) -> Result<()> {
     let log_path = host.vms(name, "log")?;
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
-    util::spawn_self(&args.child_args, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+    util::spawn_self(child, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
     drop(w);
     let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", log_path.display()))?;
     if reply["ok"] != json!(true) {
@@ -663,6 +730,7 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
 /// (it failed) or is suspended. Never true unless its process said so, once the
 /// VM runs: a resume that fails, or a destroy meanwhile, is an error.
 fn resume(host: &Host, name: &str) -> Result<bool> {
+    host::check_name(name)?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let req = json!({"op": "resume"});
@@ -677,11 +745,9 @@ fn resume(host: &Host, name: &str) -> Result<bool> {
             Ok(Err(e)) if host.alive(name) => return Err(format!("vm {name}: its resume was not confirmed: {e}").into()),
             // It took the request: whatever ended it meanwhile ended the resume too.
             Ok(_) => {
-                return Err(format!(
-                    "vm {name} ended before its resume was confirmed (killed or suspended meanwhile?); see {}",
-                    host.vms(name, "log")?.display()
+                return Err(
+                    format!("vm {name} ended before its resume was confirmed (killed or stopped meanwhile?); see {}", host.vms(name, "log")?.display()).into()
                 )
-                .into())
             }
             Err(_) if host.entry(name).is_err() => return Ok(false),
             Err(e) if Instant::now() >= deadline => return Err(e),
@@ -694,8 +760,94 @@ fn resume(host: &Host, name: &str) -> Result<bool> {
 /// How long `resume` waits for the VM process's answer: longer than it waits for the resume.
 const RESUME_ANSWER: Duration = Duration::from_secs(75);
 
-fn kill(host: &Host, name: &str) -> Result<()> {
+/// `start -a` attaches to a VM it starts, so only a stopped one: a stop under way is waited out,
+/// a paused or running VM refused (its command's output and status are its own process's).
+fn stopped_to_attach(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
+    let deadline = Instant::now() + STOP_WAIT;
+    while host.alive(name) {
+        match host.entry(name).map(|e| e.state) {
+            Ok(s) if s == "paused" => bail!("vm {name} is paused, not stopped: flexvm unpause {name} resumes it (start -a attaches only to a vm it starts)"),
+            // Stopping, or starting (not published yet): what it ends as decides.
+            Ok(s) if s == "suspending" && Instant::now() < deadline => {}
+            Err(_) if Instant::now() < deadline => {}
+            Ok(s) => bail!("vm {name} is {s}, not stopped: start -a attaches only to a vm it starts"),
+            Err(e) => return Err(e),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// Why a VM with no process cannot be paused or unpaused.
+fn not_running(host: &Host, name: &str) -> util::Error {
+    match host.suspended(name).map(|d| d.exists()) {
+        Ok(true) => format!("vm {name} is stopped: flexvm start {name}").into(),
+        _ => format!("no running vm named {name:?}").into(),
+    }
+}
+
+/// How long `stop` waits for a suspend: its copy of the VM's memory to disk.
+const STOP_WAIT: Duration = Duration::from_secs(600);
+
+/// SIGTERM, and waits until the VM is suspended (its process gone). A stopped VM stays so.
+fn stop(host: &Host, name: &str) -> Result<()> {
+    host::check_name(name)?;
+    let vm = match host.signal(name, libc::SIGTERM) {
+        Ok(vm) => vm,
+        Err(_) if !host.alive(name) && host.suspended(name)?.exists() => return output(format_args!("{name}\n")),
+        Err(_) => return Err(not_running(host, name)),
+    };
+    let (start, mut seen) = (Instant::now(), false);
+    while !vm.wait(Duration::from_millis(100)) {
+        let state = host.entry(name).map(|e| e.state).unwrap_or_default();
+        seen |= state == "suspending" || state == "checkpointing";
+        // Back to running: the suspend failed, and the VM runs on (its log says why).
+        let gave_up = seen && matches!(state.as_str(), "running" | "paused");
+        if gave_up || start.elapsed() > STOP_WAIT || (!seen && start.elapsed() > Duration::from_secs(10) && state != "source") {
+            return Err(format!("vm {name} did not suspend (it runs on); see {}", host.vms(name, "log")?.display()).into());
+        }
+    }
+    if host.suspended(name)?.exists() {
+        return output(format_args!("{name}\n"));
+    }
+    match std::fs::read_to_string(host.vms(name, "moved")?) {
+        Ok(to) => Err(format!("vm {name} moved to {to} before it was stopped; stop it there").into()),
+        Err(_) => Err(format!("vm {name} ended without suspending; see {}", host.vms(name, "log")?.display()).into()),
+    }
+}
+
+/// SIGTSTP, and waits until its vCPUs are paused.
+fn pause(host: &Host, name: &str) -> Result<()> {
+    host::check_name(name)?;
+    host.signal(name, libc::SIGTSTP).map_err(|_| not_running(host, name))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match host.entry(name).map(|e| e.state) {
+            Ok(s) if s == "paused" => return output(format_args!("{name}\n")),
+            Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(s) => bail!("vm {name} is still {s}; see {}", host.vms(name, "log")?.display()),
+            Err(_) => bail!("vm {name} ended before it paused; see {}", host.vms(name, "log")?.display()),
+        }
+    }
+}
+
+/// `kill` (`running`) destroys a running VM; `rm` (`stopped`) removes a stopped one (suspended,
+/// failed or lost), and with -f a running one too.
+fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
+    host::check_name(name)?;
+    let alive = host.alive(name);
+    if alive && !running {
+        bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}");
+    }
+    let records = || -> Result<bool> { Ok(host.suspended(name)?.exists() || host.vms(name, "failed")?.exists() || host.vms(name, "lost")?.exists()) };
+    if !alive && !stopped && records()? {
+        bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
+    }
+    let done = || output(format_args!("{name}\n"));
+    if !running {
+        return remove_stopped(host, name, records()?).and_then(|()| done());
+    }
     // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
     if host.entry(name).is_ok_and(|e| e.state == "source") {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
@@ -710,31 +862,51 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         }
         // A suspend that finished first is undone: the kill wins.
         if !host.suspended(name)?.exists() {
-            return Ok(());
+            return done();
         }
     }
     if host.suspended(name)?.exists() {
         let _lock = host.take_name(name, true)?;
         // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
-        if !host.suspended(name)?.exists() {
-            return Ok(());
+        if host.suspended(name)?.exists() {
+            lifecycle::revoke(host, name)??;
         }
-        return lifecycle::revoke(host, name)?;
+        return done();
     }
     if !host.alive(name) && [std::fs::remove_file(host.vms(name, "failed")?).is_ok(), std::fs::remove_file(host.vms(name, "lost")?).is_ok()].contains(&true) {
-        return Ok(());
+        return done();
     }
     if host.alive(name) {
-        return Err(format!(
-            "vm {name:?} is starting or its registry is unavailable; retry flexvm kill {name} once it is ready, or see {}",
-            host.vms(name, "log")?.display()
-        )
-        .into());
+        return Err(
+            format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()).into()
+        );
     }
     match std::fs::read_to_string(host.vms(name, "moved")?) {
         Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
         Err(_) => Err(format!("no vm named {name:?}").into()),
     }
+}
+
+/// `rm` without -f: under the name, so a `start` meanwhile either wins first (and this is
+/// refused: the VM runs) or waits until it is gone; no process is ever signalled. `had`:
+/// a stopped VM's records were there before (taking the name clears failed and lost ones).
+fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
+    if !had {
+        return match std::fs::read_to_string(host.vms(name, "moved")?) {
+            Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
+            Err(_) => Err(format!("no vm named {name:?}").into()),
+        };
+    }
+    let _lock = match host.take_name(name, true) {
+        Ok(lock) => lock,
+        Err(_) if host.alive(name) => bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"),
+        Err(e) => return Err(e),
+    };
+    // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
+    if host.suspended(name)?.exists() {
+        lifecycle::revoke(host, name)??;
+    }
+    Ok(())
 }
 
 /// Withdraws the generation an address was lent out with, everywhere, and forgets what
@@ -763,7 +935,7 @@ fn reclaim(host: &Host, ip: &str, force: Option<u64>) -> Result<()> {
     print(json!({"ip": ip.to_string(), "withdrawn_gen": gen, "forgot_migrations": forgot.iter().map(|(id, _)| id).collect::<Vec<_>>()}))
 }
 
-/// The VMs `ls` lists: registered, suspended, failed and lost.
+/// The VMs `ps -a` lists: registered, suspended, failed and lost.
 fn vms(host: &Host) -> Vec<Value> {
     let rss = |pid: Option<u32>| pid.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 20;
     let mut vms: Vec<Value> = host
@@ -791,20 +963,28 @@ fn vms(host: &Host) -> Vec<Value> {
     vms
 }
 
-fn list(host: &Host, as_json: bool) -> Result<()> {
-    let vms = vms(host);
+/// The states `ps` leaves out without `-a`: no process runs them.
+fn stopped(v: &Value) -> bool {
+    matches!(v["state"].as_str(), Some("suspended" | "quarantined" | "failed" | "lost"))
+}
+
+fn ps(host: &Host, all: bool, as_json: bool) -> Result<()> {
+    let vms: Vec<Value> = vms(host).into_iter().filter(|v| all || !stopped(v)).collect();
     if as_json {
         return print(json!(vms));
     }
     let row =
-        |c: [&str; 9]| output(format_args!("{:<16} {:<15} {:<10} {:<12} {:>8} {:>4} {:>8} {:>8} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]));
+        |c: [&str; 9]| output(format_args!("{:<24} {:<15} {:<16} {:<12} {:>8} {:>5} {:>8} {:>8} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]));
     // STARVED: refused memory here and throttled (moved to a peer if there is one).
-    row(["NAME", "IP", "TEMPLATE", "STATE", "PID", "VCPU", "RSS MiB", "MAX MiB", "STARVED"])?;
+    row(["NAME", "IP", "IMAGE", "STATE", "PID", "CPUS", "RSS MiB", "MAX MiB", "STARVED"])?;
     for v in &vms {
         let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
-        let [a, b, c, d, e, f, g, h] = ["name", "ip", "template", "state", "pid", "vcpus", "rss_mib", "max_mib"].map(s);
+        let [a, b, d, e, g, h] = ["name", "ip", "state", "pid", "rss_mib", "max_mib"].map(s);
+        let image = v["template"].as_str().map(template::image_of).unwrap_or_default();
+        // The --cpus cap, else its vCPUs.
+        let cpus = v["cpus"].as_f64().map_or_else(|| s("vcpus"), |c| c.to_string());
         let starved = if v["starved"].as_bool() == Some(true) { "yes" } else { "" };
-        row([&a, &b, &c, &d, &e, &f, &g, &h, starved])?;
+        row([&a, &b, &image, &d, &e, &cpus, &g, &h, starved])?;
     }
     Ok(())
 }
@@ -831,23 +1011,20 @@ fn template_vcpus(args: &Args) -> Result<u32> {
     Ok(cpus)
 }
 
-/// `run` without `--template`, the first time: `flexvm pull ubuntu:24.04`, its output on stderr.
-fn pull_default(args: &Args) -> Result<()> {
-    crate::log!("flexvm: pulling {} (the default image) first", template::DEFAULT_IMAGE);
+/// `run IMAGE` of an image not pulled here: `flexvm pull IMAGE` first, its output on stderr.
+fn pull_missing(args: &Args, image: &str) -> Result<()> {
+    crate::log!("flexvm: unable to find image {image} here; pulling it");
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    for flag in ["state", "run"] {
-        if let Some(v) = args.get(flag) {
-            cmd.arg(format!("--{flag}")).arg(v);
-        }
-    }
-    let status = cmd.args(["pull", template::DEFAULT_IMAGE]).stdout(std::io::stderr()).status()?;
+    cmd.args(child_args(args, &["pull", image]));
+    let status = cmd.stdout(std::io::stderr()).status()?;
     if !status.success() {
-        bail!("pulling {} failed ({status})", template::DEFAULT_IMAGE);
+        bail!("pulling {image} failed ({status})");
     }
     Ok(())
 }
 
-/// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date.
+/// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date;
+/// then `--standby N`, its count of standby VMs.
 fn pull(args: &Args, src: &str) -> Result<()> {
     let name = match args.get("tag") {
         Some(tag) => template::name_of(tag)?,
@@ -855,8 +1032,17 @@ fn pull(args: &Args, src: &str) -> Result<()> {
         None => template::name_of(src)?,
     };
     let cpus = template_vcpus(args)?;
+    let standby = args.get("standby").map(|n| n.parse::<usize>().map_err(|_| format!("bad --standby {n:?}: give a count"))).transpose()?;
     if unsafe { libc::geteuid() } != 0 {
         bail!("run flexvm as root");
+    }
+    // Of an image pulled here, `--standby N` alone (and its --tag) only sets the count: the
+    // pull's other options would have to be given again, or it would be rebuilt without them.
+    let only_standby = args.flags.iter().all(|(f, _)| matches!(f.as_str(), "standby" | "tag" | "state" | "run"));
+    if let (Some(n), true) = (standby, only_standby) {
+        if std::fs::symlink_metadata(paths(args)?.templates.join(&name)).is_ok() {
+            return print(standby::set(&open_host(args)?, &name, n)?);
+        }
     }
     util::check_kvm()?;
     // Interrupted, the build stops at its next step and removes its tap and staging (gigabytes:
@@ -889,17 +1075,27 @@ fn pull(args: &Args, src: &str) -> Result<()> {
         template::create(&paths, &name, size, &rootfs, meta, &tap)
     })();
     net::delete_tap(&tap);
-    res
+    res?;
+    match standby {
+        // Kept per image (`STATE/standby/NAME`): refilled now, and by every listener and VM process.
+        Some(n) => print(standby::set(&host, &name, n)?),
+        None => Ok(()),
+    }
 }
 
-/// `images`: a row per image (`template::images`).
-fn images(paths: &Paths, as_json: bool) -> Result<()> {
-    let images = template::images(paths)?;
+/// `images`: a row per image (`template::images`), with its standby count.
+fn images(host: &Host, paths: &Paths, as_json: bool) -> Result<()> {
+    let mut images = template::images(paths)?;
+    for v in &mut images {
+        if let Some(name) = v["name"].as_str().map(String::from) {
+            v["standby"] = json!(standby::target(host, &name));
+        }
+    }
     if as_json {
         return print(json!(images));
     }
-    let row = |c: [&str; 7]| output(format_args!("{:<32} {:<16} {:<16} {:>4} {:>8} {:>8} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6]));
-    row(["REPOSITORY", "TAG", "ID", "VCPU", "MAX MiB", "SIZE MiB", "CREATED"])?;
+    let row = |c: [&str; 8]| output(format_args!("{:<32} {:<16} {:<16} {:>4} {:>8} {:>8} {:>7} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]));
+    row(["REPOSITORY", "TAG", "ID", "VCPU", "MAX MiB", "SIZE MiB", "STANDBY", "CREATED"])?;
     for v in &images {
         let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
         let created = v["created"].as_u64().map(|t| std::time::UNIX_EPOCH + Duration::from_secs(t)).and_then(|t| t.elapsed().ok());
@@ -911,12 +1107,13 @@ fn images(paths: &Paths, as_json: bool) -> Result<()> {
         });
         let tag = s("tag");
         let tag = if tag.starts_with("sha256:") { tag[..19].to_string() } else { tag };
-        row([&s("repository"), &tag, &s("id"), &s("vcpus"), &s("max_mib"), &s("size_mib"), &ago])?;
+        row([&s("repository"), &tag, &s("id"), &s("vcpus"), &s("max_mib"), &s("size_mib"), &s("standby"), &ago])?;
     }
     Ok(())
 }
 
-/// `rmi IMAGE|ID`: refused while a VM here (running, paused or suspended) or a standby count uses it.
+/// `rmi IMAGE|ID`: refused while a VM here (running, paused or suspended) uses it. Its standby
+/// VMs go first (its count set to 0).
 fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
     let vms = vms(host);
     let in_use = || host.template_users();
@@ -927,14 +1124,20 @@ fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
     };
     let users: Vec<&str> = vms.iter().filter(|v| v["template"].as_str() == Some(name.as_str())).filter_map(|v| v["name"].as_str()).collect();
     if !users.is_empty() {
-        bail!("image {} is used by {}: kill them first", template::image_of(&name), users.join(", "));
+        bail!("image {} is used by {}: remove them first (flexvm rm -f)", template::image_of(&name), users.join(", "));
     }
-    let standby = (
-        standby::target(host, &name),
-        standby::show(host).as_array().into_iter().flatten().filter(|t| t["template"] == name.as_str()).map(|t| t["live"].as_u64().unwrap_or(0)).sum::<u64>(),
-    );
-    if standby != (0, 0) {
-        bail!("image {} keeps standby VMs (count {}, {} live): flexvm standby --template {0} 0 first", template::image_of(&name), standby.0, standby.1);
+    let live = || {
+        standby::show(host).as_array().into_iter().flatten().filter(|t| t["template"] == name.as_str()).map(|t| t["live"].as_u64().unwrap_or(0)).sum::<u64>()
+    };
+    if standby::target(host, &name) > 0 || live() > 0 {
+        standby::set(host, &name, 0)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while live() > 0 {
+            if Instant::now() > deadline {
+                bail!("image {}'s standby VMs are still there; try again", template::image_of(&name));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     let _ = std::fs::remove_file(host.state.join("standby").join(&name));
     let id = std::fs::read_link(paths.templates.join(&name))?.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1240,30 +1443,10 @@ mod exec_tests {
     }
 
     #[test]
-    fn peer_underlays_are_set_per_configured_peer() {
-        let mut c = host::Config::default();
-        let set = |c: &mut host::Config, flags: &[&str]| configure(c, &parse(flags));
-        set(&mut c, &["--peer", "192.0.2.7:7070", "--peer", "b.example:7070", "--peer-underlay", "192.0.2.7:7070=198.51.100.7,198.51.100.8"]).unwrap();
-        assert_eq!(c.underlays_of("192.0.2.7:7070"), ["198.51.100.7".parse::<std::net::Ipv4Addr>().unwrap(), "198.51.100.8".parse().unwrap()]);
-        // Replaced whole.
-        set(&mut c, &["--peer-underlay", "b.example:7070=198.51.100.9"]).unwrap();
-        assert!(c.underlays_of("192.0.2.7:7070").is_empty() && c.underlays_of("b.example:7070").len() == 1);
-        for bad in ["c.example:7070=198.51.100.9", "b.example:7070", "b.example:7070=x", "b.example:7070=127.0.0.1", "b.example:7070=224.0.0.1"] {
-            assert!(set(&mut c.clone(), &["--peer-underlay", bad]).is_err(), "{bad}");
-        }
-        // A peer dropped takes its underlays with it; '' clears them all.
-        set(&mut c, &["--peer", "192.0.2.7:7070"]).unwrap();
-        assert!(c.peer_underlays.is_empty());
-        set(&mut c, &["--peer", "192.0.2.7:7070", "--peer-underlay", "192.0.2.7:7070=198.51.100.7"]).unwrap();
-        set(&mut c, &["--peer-underlay", ""]).unwrap();
-        assert!(c.peer_underlays.is_empty());
-    }
-
-    #[test]
-    fn config_output_shows_the_effective_allowlist() {
+    fn info_shows_the_effective_allowlist() {
         let root = crate::test_util::TempDir::new("config-allowlist");
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let output = config_output(&host);
+        let output = info(&host);
         assert!(output["set"]["cluster_ips"].is_null());
         assert_eq!(output["derived"]["cluster_ips"], host.cfg.vm_ips);
         host.configure(|c| {
@@ -1271,7 +1454,7 @@ mod exec_tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(config_output(&host)["derived"]["cluster_ips"], "10.200.0.0/15");
+        assert_eq!(info(&host)["derived"]["cluster_ips"], "10.200.0.0/15");
     }
 
     #[test]
@@ -1311,57 +1494,128 @@ mod exec_tests {
     }
 
     #[test]
-    fn kill_validates_names_before_touching_files() {
+    fn kill_and_rm_validate_names_before_touching_files() {
         let root = crate::test_util::TempDir::new("kill-name");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let failed = root.join("victim.failed");
         std::fs::write(&failed, "keep").unwrap();
         for name in ["../../victim", "", ".hidden", "/tmp/x"] {
-            assert_eq!(kill(&host, name).unwrap_err().to_string(), host::check_name(name).unwrap_err().to_string());
+            for (running, stopped) in [(true, false), (true, true), (false, true)] {
+                assert_eq!(remove(&host, name, running, stopped).unwrap_err().to_string(), host::check_name(name).unwrap_err().to_string());
+            }
+            assert!(stop(&host, name).is_err() && pause(&host, name).is_err() && resume(&host, name).is_err());
         }
         assert_eq!(std::fs::read_to_string(failed).unwrap(), "keep");
     }
 
     #[test]
-    fn invalid_announce_device_is_not_saved() {
-        let root = crate::test_util::TempDir::new("announce-device");
-        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        host.configure(|_| Ok(())).unwrap();
-        let before = std::fs::read(host.state.join("host.json")).unwrap();
-        let args = parse(&["--announce-dev", "flexvm-no-such-interface"]);
-        assert!(host.configure(|c| configure(c, &args)).is_err());
-        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
-        assert!(host.cfg.announce_dev.is_none());
+    fn kill_leaves_a_stopped_vm_to_rm() {
+        let root = crate::test_util::TempDir::new("kill-stopped");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::write(host.vms("gone", "failed").unwrap(), "died").unwrap();
+        let e = remove(&host, "gone", true, false).unwrap_err().to_string();
+        assert!(e.contains("not running") && e.contains("flexvm rm gone"), "{e}");
+        remove(&host, "gone", false, true).unwrap();
+        assert!(!host.vms("gone", "failed").unwrap().exists());
+        assert_eq!(remove(&host, "gone", false, true).unwrap_err().to_string(), "no vm named \"gone\"");
     }
 
     #[test]
-    fn standby_zero_validates_template_name_before_saving() {
-        let root = crate::test_util::TempDir::new("standby-name");
-        let args =
-            parse(&["--state", root.join("state").to_str().unwrap(), "--run", root.join("run").to_str().unwrap(), "standby", "--template", ".typo", "0"]);
-        assert!(real_main(&args).unwrap_err().to_string().contains("bad template name"));
-        assert!(!root.join("state/standby/.typo").exists());
+    fn memory_sizes_are_dockers() {
+        for (v, mib) in
+            [("512m", 512), ("512M", 512), ("2g", 2048), ("2GB", 2048), ("1.5g", 1536), ("1048576", 1), ("1t", 1 << 20), ("1536k", 1), ("4096mib", 4096)]
+        {
+            assert_eq!(memory_mib(v).unwrap(), mib, "{v}");
+        }
+        for v in ["", "m", "x", "2q", "-1g", "nang", "1e30t"] {
+            assert!(memory_mib(v).is_err(), "{v}");
+        }
+        assert_eq!(memory_mib("2048").unwrap_err().to_string(), "--memory 2048 is 2048 bytes: give a unit, as 2048m");
+        assert!(resources(&parse(&["--cpus", "0"])).is_err() && resources(&parse(&["--cpus", "x"])).is_err());
+        let r = resources(&parse(&["--cpus", "1.5", "--memory", "1g"])).unwrap();
+        assert_eq!((r.cpus, r.memory_mib), (Some(1.5), Some(1024)));
     }
 
     #[test]
-    fn standby_zero_needs_no_artifacts() {
-        let root = crate::test_util::TempDir::new("standby-zero");
-        let args = parse(&["--state", root.join("state").to_str().unwrap(), "--run", root.join("run").to_str().unwrap(), "standby", "0"]);
-        real_main(&args).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("state/standby/ubuntu:24.04")).unwrap(), "0");
-        assert!(!root.join("state/artifacts").exists());
+    fn resources_fit_the_template() {
+        let meta: crate::template::Meta = serde_json::from_value(json!({
+            "compatibility": {"cpu": "test", "tsc_khz": 2000000, "tsc_control": false, "msrs": [], "firecracker": "test", "features": {}, "xsave": {}},
+            "vcpus": 4, "mem_mib": 384, "max_mib": 384 + 8192, "plugged_mib": 4096, "kernel": "/k", "rootfs": "/r", "id": "a", "components": {}
+        }))
+        .unwrap();
+        let r = |cpus: Option<f64>, memory_mib: Option<u64>| vm::Resources { cpus, memory_mib };
+        r(Some(4.0), Some(384 + 4096)).check(&meta).unwrap();
+        r(Some(0.5), Some(384 + 8192)).check(&meta).unwrap();
+        assert!(r(Some(4.5), None).check(&meta).unwrap_err().to_string().contains("4 vCPUs"));
+        let e = r(None, Some(1024)).check(&meta).unwrap_err().to_string();
+        assert!(e.contains("384 + 4096 MiB") && e.contains("4480m"), "{e}");
+        assert!(r(None, Some(384 + 8193)).check(&meta).unwrap_err().to_string().contains("ceiling"));
+        // Growth stops at the cap, in whole steps.
+        assert_eq!(r(None, Some(384 + 5000)).hotplug_cap(&meta), 4992);
+        assert_eq!(r(None, None).hotplug_cap(&meta), 8192);
+        // A stopped VM's, from its manifest's sizes (`ps -a`).
+        assert_eq!((r(None, Some(384 + 5000)).ceiling(384, 384 + 8192), r(None, None).ceiling(384, 384 + 8192)), (384 + 4992, 384 + 8192));
+        assert_eq!((r(Some(1.5), None).cpu_max(), r(None, None).cpu_max()), ("150000 100000".to_string(), "max 100000".to_string()));
+    }
+
+    #[test]
+    fn a_held_name_is_taken_and_plain_rm_or_start_a_leave_its_vm_alone() {
+        let root = crate::test_util::TempDir::new("held-name");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let lock = host.take_name("web", false).unwrap();
+        // Made up again when taken (`run`, `Proc::run`); an explicit name's error stays.
+        assert!(host::name_taken(&host.take_name("web", false).err().unwrap()));
+        assert!(!host::name_taken(&host::check_name(".x").unwrap_err()));
+        // A VM started meanwhile holds its name: a plain rm takes it to remove, so is refused,
+        // signalling nothing; the record it saw stays.
+        std::fs::write(host.vms("web", "failed").unwrap(), "died").unwrap();
+        let e = remove_stopped(&host, "web", true).unwrap_err().to_string();
+        assert!(e.contains("is running") && e.contains("rm -f web"), "{e}");
+        assert!(host.vms("web", "failed").unwrap().exists());
+        // start -a: a paused VM is unpaused, not attached to.
+        let entry = host::Entry { name: "web".into(), ident: host::Ident::me(), state: "paused".into(), ..host::Entry::default() };
+        std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
+        lock.publish(&entry).unwrap();
+        let e = stopped_to_attach(&host, "web").unwrap_err().to_string();
+        assert!(e.contains("flexvm unpause web"), "{e}");
+        drop(lock);
+        stopped_to_attach(&host, "web").unwrap();
+    }
+
+    #[test]
+    fn cpus_need_the_cpu_controller() {
+        let root = crate::test_util::TempDir::new("cpu-controller");
+        assert!(vmproc::cpu_controller(None).unwrap_err().to_string().contains("cgroup"));
+        std::fs::write(root.join("cgroup.subtree_control"), "memory cpuset\n").unwrap();
+        assert!(vmproc::cpu_controller(Some(&root)).unwrap_err().to_string().contains("cpu controller"));
+        std::fs::write(root.join("cgroup.subtree_control"), "cpuset cpu memory\n").unwrap();
+        vmproc::cpu_controller(Some(&root)).unwrap();
+    }
+
+    #[test]
+    fn generated_names_are_free_and_valid() {
+        let root = crate::test_util::TempDir::new("names");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        for _ in 0..20 {
+            let n = host::generated_name(&host).unwrap();
+            host::check_name(&n).unwrap();
+            assert!(n.contains('_'), "{n}");
+        }
     }
 
     #[test]
     fn detach_only_removes_flexvm_options_from_child_arguments() {
-        let args = parse(&["run", "web", "-d", "--detach", "--cmd", "-d", "--", "tool", "-d", "--detach", "--unknown"]);
+        let args = parse(&["run", "-d", "--detach", "--name", "web", "--ip", "10.0.0.2", "ubuntu", "tool", "-d", "--detach", "--unknown"]);
         assert!(args.has("detach"));
-        assert_eq!(args.get("cmd"), Some("-d"));
+        assert_eq!(args.positional, ["run", "ubuntu"]);
         assert_eq!(args.rest, ["tool", "-d", "--detach", "--unknown"]);
-        assert_eq!(args.child_args, ["run", "web", "--cmd", "-d", "--", "tool", "-d", "--detach", "--unknown"]);
+        assert_eq!(args.child_args, ["run", "--name", "web", "--ip", "10.0.0.2", "ubuntu", "tool", "-d", "--detach", "--unknown"]);
         let child = Args::parse(args.child_args).unwrap();
         assert!(!child.has("detach"));
         assert_eq!(child.rest, args.rest);
+        // A `--` after IMAGE is dropped, as after exec NAME.
+        assert_eq!(parse(&["run", "ubuntu", "--", "ls", "--", "-d"]).rest, ["ls", "--", "-d"]);
+        assert_eq!(child_args(&parse(&["--state", "/s", "start", "x"]), &["start", "--attach", "x"]), ["--state", "/s", "start", "--attach", "x"]);
     }
 
     #[test]
@@ -1378,15 +1632,16 @@ mod exec_tests {
 
     #[test]
     fn missing_or_empty_names_name_the_command() {
-        for cmd in ["run", "resume", "exec", "kill", "checkpoint", "migrate", "pull", "rmi"] {
-            let what = if matches!(cmd, "pull" | "rmi") { "IMAGE" } else { "NAME" };
+        for cmd in ["run", "exec", "stop", "start", "pause", "unpause", "kill", "rm", "checkpoint", "migrate", "pull", "rmi"] {
+            let what = if matches!(cmd, "run" | "pull" | "rmi") { "IMAGE" } else { "NAME" };
             for argv in [vec![cmd], vec![cmd, ""]] {
                 assert_eq!(real_main(&parse(&argv)).unwrap_err().to_string(), format!("{cmd} needs {what}"));
             }
         }
-        for flag in ["--standby", "--incoming"] {
-            check_applies(&parse(&["run", flag])).unwrap();
+        for argv in [&["run", "--standby", "t"][..], &["run", "--incoming"], &["run", "--checkpoint", "/d"]] {
+            check_applies(&parse(argv)).unwrap();
         }
+        assert!(check_applies(&parse(&["stop", "a", ""])).is_err());
     }
 
     #[test]
@@ -1400,33 +1655,25 @@ mod exec_tests {
             let error = Args::parse(["run", option, "web"].map(String::from)).err().unwrap();
             assert_eq!(error.to_string(), format!("unknown option {option} (see flexvm --help)"));
         }
-        let error = Args::parse(["run", "web", "--ip"].map(String::from)).err().unwrap();
+        let error = Args::parse(["run", "--ip"].map(String::from)).err().unwrap();
         assert_eq!(error.to_string(), "--ip needs a value");
     }
 
     #[test]
-    fn option_values_cannot_start_with_double_dash() {
-        for option in ["--state", "--run", "--ip", "--tag", "--cmd"] {
-            for value in ["--run", "--unknown", "--"] {
+    fn option_values_cannot_be_flags() {
+        for option in ["--state", "--run", "--ip", "--tag", "--cmd", "--name"] {
+            for value in ["--run", "--detach", "--standby", "--"] {
                 let error = Args::parse([option, value, "X"].map(String::from)).err().unwrap();
                 assert_eq!(error.to_string(), format!("{option} needs a value"));
             }
         }
         let error = Args::parse(["reclaim", "--force", "--state", "X"].map(String::from)).err().unwrap();
         assert_eq!(error.to_string(), "--force needs a generation; run flexvm reclaim IP to see GEN");
-    }
-
-    #[test]
-    fn recover_refuses_non_root_before_opening_the_host() {
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        let root = crate::test_util::TempDir::new("recover-non-root");
-        let state = root.join("state");
-        let run = root.join("run");
-        let args = parse(&["recover", "--state", state.to_str().unwrap(), "--run", run.to_str().unwrap()]);
-        assert_eq!(real_main(&args).unwrap_err().to_string(), "recover requires root");
-        assert!(!state.exists() && !run.exists());
+        // Argv-style values may start with `--`: a binary entrypoint's flag-only arguments.
+        let args = parse(&["pull", "app", "--cmd", "--port 8080", "--entrypoint", "--x", "--ready-cmd", "--check", "--warm"]);
+        assert_eq!((args.get("cmd"), args.get("entrypoint"), args.get("ready-cmd")), (Some("--port 8080"), Some("--x"), Some("--check")));
+        check_applies(&args).unwrap();
+        assert_eq!(image_options(&args, "app").unwrap().cmd, Some(vec!["--port".to_string(), "8080".to_string()]));
     }
 
     #[test]
@@ -1444,100 +1691,73 @@ mod exec_tests {
 
     #[test]
     fn switches_repeated_values_and_internal_flags_parse() {
-        let args = parse(&["listen", "--peer", "a:1", "--json", "--peer", "b:2", "--reserve", "123", "--reserve", "456"]);
+        let args = parse(&["pull", "x", "--env", "A=1", "--json", "--env", "B=2", "--standby", "3", "--max", "456", "--max", "789"]);
         assert!(args.has("json"));
-        assert_eq!(args.all("peer"), ["a:1", "b:2"]);
-        assert_eq!(args.parse_or::<u64>("reserve", 0).unwrap(), 456);
+        assert_eq!(args.all("env"), ["A=1", "B=2"]);
+        assert_eq!((args.get("standby"), args.parse_or::<u64>("max", 0).unwrap()), (Some("3"), 789));
         let args = parse(&["run", "--incoming", "--standby", "--paused"]);
         assert!(args.has("incoming") && args.has("standby") && args.has("paused"));
         assert!(args.rest.is_empty());
+        // -a is start's --attach and ps's --all; -f is rm's --force only.
+        assert!(parse(&["start", "-a", "x"]).has("attach") && parse(&["ps", "-a"]).has("all") && parse(&["rm", "-f", "x"]).has("force"));
+        assert!(Args::parse(["reclaim", "10.0.0.2", "-f"].map(String::from)).is_err());
     }
 
     #[test]
     fn a_parse_error_still_finds_its_command() {
-        for argv in [&["--bogus", "run", "job"][..], &["run", "job", "--bogus"], &["-x", "resume", "job"], &["--bogus", "restore", "/x", "--ip"]] {
+        for argv in [&["--bogus", "run", "job"][..], &["run", "--bogus", "job"], &["-x", "start", "job"], &["--bogus", "run", "--checkpoint", "/x", "--ip"]] {
             let (args, e) = Args::parse_partly(argv.iter().map(|a| a.to_string()));
-            assert!(e.is_some() && ["run", "resume", "restore"].contains(&args.positional[0].as_str()), "{argv:?}");
+            assert!(e.is_some() && ["run", "start"].contains(&args.positional[0].as_str()), "{argv:?}");
         }
-        let (args, e) = Args::parse_partly(["--state", "run", "ls"].map(String::from));
-        assert!(e.is_none() && args.positional == ["ls"]);
+        let (args, e) = Args::parse_partly(["--state", "run", "ps"].map(String::from));
+        assert!(e.is_none() && args.positional == ["ps"]);
     }
 
     #[test]
     fn flags_and_words_a_command_does_not_take_are_errors() {
         let err = |a: &[&str]| check_applies(&parse(a)).err().map(|e| e.to_string());
-        assert_eq!(err(&["run", "web", "--mem", "512"]).unwrap(), "--mem does not apply to run (see flexvm --help)");
-        assert!(err(&["run", "job", "make", "test"]).unwrap().contains("flexvm run job -- make ..."));
-        assert!(err(&["resume", "web", "--ip", "10.0.0.1"]).is_some());
-        assert!(err(&["restore", "/d", "--template", "t"]).is_some());
+        assert_eq!(err(&["run", "--mem", "512", "web"]).unwrap(), "--mem does not apply to run (see flexvm --help)");
+        assert!(err(&["start", "--ip", "10.0.0.1", "web"]).is_some());
+        assert!(err(&["run", "--checkpoint", "/d", "ubuntu"]).unwrap().contains("takes no IMAGE"));
+        assert_eq!(err(&["run", "--paused", "ubuntu"]).unwrap(), "--paused applies to run --checkpoint");
         assert!(err(&["kill", "web", "--", "x"]).is_some());
-        assert_eq!(err(&["run", "t", "--warm"]).unwrap(), "--warm does not apply to run (see flexvm --help)");
+        assert_eq!(err(&["run", "--warm", "t"]).unwrap(), "--warm does not apply to run (see flexvm --help)");
         assert_eq!(err(&["images", "--tag", "x"]).unwrap(), "--tag does not apply to images (see flexvm --help)");
         assert!(err(&["rmi", "a", "b"]).is_some());
-        assert_eq!(err(&["listen", "1.2.3.4:7070", "--peer", "a:1"]).unwrap(), "--peer does not apply to listen (see flexvm --help)");
+        assert!(err(&["start", "-a", "a", "b"]).unwrap().contains("one NAME"));
+        assert!(err(&["config"]).unwrap().contains("unknown command"));
+        assert!(err(&["recover"]).unwrap().contains("unknown command"));
+        assert!(Args::parse(["listen", "1.2.3.4:7070", "--peer", "a:1"].map(String::from)).is_err());
         for ok in [
-            &["--state", "/s", "run", "web", "--template", "t", "-d", "--", "make", "test"][..],
+            &["--state", "/s", "run", "--name", "web", "-d", "--cpus", "1.5", "--memory", "1g", "ubuntu:24.04", "make", "test"][..],
+            &["run", "ubuntu", "--name", "--x"],
             &["exec", "web", "ls", "-l"],
-            &["pull", "busybox", "--tag", "t", "--vcpus", "2", "--warm", "--ready-port", "80"],
+            &["pull", "busybox", "--tag", "t", "--vcpus", "2", "--warm", "--ready-port", "80", "--standby", "2"],
             &["images", "--json"],
+            &["ps", "-a", "--json"],
+            &["stop", "a", "b"],
+            &["start", "a", "b"],
+            &["start", "-a", "a"],
+            &["pause", "a"],
+            &["unpause", "a"],
+            &["kill", "a", "b"],
+            &["rm", "-f", "a", "b"],
             &["rmi", "ubuntu:24.04"],
             &["listen", "1.2.3.4:7070"],
-            &["config", "--peer", "a:1", "--evict-at", ""],
-            &["config"],
-            &["restore", "/d", "--ip", "auto", "--paused"],
+            &["info"],
+            &["run", "--checkpoint", "/d", "--ip", "auto", "--paused", "--name", "w"],
         ] {
             assert_eq!(err(ok), None, "{ok:?}");
         }
     }
 
     #[test]
-    fn cluster_range_contains_the_whole_vm_range_and_an_empty_one_resets_it() {
-        let mut c = host::Config::default();
-        configure(&mut c, &parse(&["--vm-ips", "10.9.0.0/24", "--cluster-ips", "10.9.0.0/16"])).unwrap();
-        assert_eq!(c.cluster_ips.as_deref(), Some("10.9.0.0/16"));
-        configure(&mut c, &parse(&["--cluster-ips", "10.9.0.1-10.9.0.254"])).unwrap();
-        for flags in [
-            &["--vm-ips", "10.9.0.1-10.9.1.1"][..],
-            &["--vm-ips", "10.8.255.254-10.9.0.254"],
-            &["--cluster-ips", "10.9.0.2-10.9.0.253"],
-            &["--cluster-ips", "bad"],
-        ] {
-            assert!(configure(&mut c.clone(), &parse(flags)).is_err(), "{flags:?}");
-        }
-        configure(&mut c, &parse(&["--cluster-ips", "", "--vm-ips", ""])).unwrap();
-        assert!(c.cluster_ips.is_none());
-        assert_eq!(c.vm_ips, host::Config::default().vm_ips);
-    }
-
-    #[test]
-    fn peers_are_validated_and_an_empty_one_clears_them() {
+    fn peer_endpoints_are_validated() {
         for good in ["10.0.0.2:7070", "host-b:7070", "[2001:db8::2]:7070"] {
             assert!(host::is_endpoint(good), "{good}");
         }
         for bad in ["10.0.0.2", "notahost", "10.0.0.2:0", "2001:db8::2", "[foo]:1", ":7070", "a:b"] {
             assert!(!host::is_endpoint(bad), "{bad}");
-        }
-        let mut c = host::Config::default();
-        assert!(configure(&mut c, &parse(&["--peer", "192.168.1.11"])).is_err());
-        configure(&mut c, &parse(&["--peer", "a:1", "--peer", "b:2", "--evict-at", "5000", "--reserve", "300", "--announce-dev", "none"])).unwrap();
-        assert_eq!((c.peers.len(), c.evict_mib, c.reserve_mib), (2, Some(5000), Some(300)));
-        // `none`: no announcements, whatever would be derived.
-        assert_eq!((c.announce_dev.as_deref(), c.announce_dev()), (Some("none"), None));
-        configure(&mut c, &parse(&["--vm-ips", "10.9.0.0/24"])).unwrap();
-        assert_eq!((c.peers.len(), c.reserve_mib), (2, Some(300)), "flags not given are kept");
-        configure(&mut c, &parse(&["--peer", "", "--evict-at", "", "--reserve", "", "--announce-dev", ""])).unwrap();
-        assert!(c.peers.is_empty() && c.evict_mib.is_none() && c.reserve_mib.is_none() && c.announce_dev.is_none());
-        assert_eq!(c.reserve(), host::default_reserve());
-        // An empty --vm-ips is the default again; DNS is IPv4 (the guest's resolver is set over IPv4).
-        configure(&mut c, &parse(&["--vm-ips", "", "--dns", "1.1.1.1"])).unwrap();
-        assert_eq!((c.vm_ips.as_str(), c.dns.as_deref()), (host::Config::default().vm_ips.as_str(), Some("1.1.1.1")));
-        assert!(configure(&mut c, &parse(&["--dns", "::1"])).is_err());
-        // Never a reserve above RAM, nor one that would overflow.
-        let total = proc_kb("/proc/meminfo", "MemTotal").unwrap() >> 20;
-        configure(&mut c, &parse(&["--reserve", &total.to_string()])).unwrap();
-        for over in [total + 1, u64::MAX] {
-            let e = configure(&mut c, &parse(&["--reserve", &over.to_string()])).unwrap_err().to_string();
-            assert!(e.contains("more than this host's"), "{e}");
         }
     }
 
@@ -1570,10 +1790,14 @@ mod exec_tests {
         let port = wildcard.local_addr().unwrap().port();
         drop(configure_listener(&mut host, None, Some(wildcard)).unwrap());
         assert_eq!(host.cfg.advertise().unwrap(), Some(format!("127.0.0.1:{port}")));
-        host.configure(|c| configure(c, &parse(&["--peer", "flexvm-no-such-host.invalid:7070"]))).unwrap();
+        host.configure(|c| {
+            c.peers = vec!["flexvm-no-such-host.invalid:7070".into()];
+            Ok(())
+        })
+        .unwrap();
         let before = std::fs::read(host.state.join("host.json")).unwrap();
         let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
-        assert!(configure_listener(&mut host, None, Some(wildcard)).unwrap_err().to_string().contains("--underlay"));
+        assert!(configure_listener(&mut host, None, Some(wildcard)).unwrap_err().to_string().contains("underlay"));
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
         // An ADDR other than the activated socket's is refused, saving nothing; its own is kept.
         let before = std::fs::read(host.state.join("host.json")).unwrap();
@@ -1624,12 +1848,12 @@ mod exec_tests {
         // Hold the name on the child's behalf, with its identity in both records.
         std::fs::write(host.vms("moving", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
         name.publish(&entry).unwrap();
-        let refused = kill(&host, "moving").unwrap_err().to_string();
+        let refused = remove(&host, "moving", true, false).unwrap_err().to_string();
         assert_eq!(refused, "vm moving is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)");
         assert!(child.try_wait().unwrap().is_none());
         entry.state = "reconciling".into();
         name.publish(&entry).unwrap();
-        let result = kill(&host, "moving");
+        let result = remove(&host, "moving", true, false);
         // Reap even on failure, so a failed assertion does not leave the child behind.
         let _ = child.kill();
         let status = child.wait().unwrap();

@@ -13,7 +13,7 @@ migration protocol are in [process-per-vm.md](process-per-vm.md).
 | Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. |
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. **Standby VMs** are already restored and paused, so `run` is usually just a resume. |
 | Migration | **Post-copy**: the target gets everything ready first (template, address, a Firecracker with the template's VM structure already built); then pause, save vCPU and device state only (~20–200 KiB), load it and resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
-| Pressure | If a VM needs to grow and the host would drop below `--reserve`, or the host is already below it, that VM is migrated to a peer with room. |
+| Pressure | If a VM needs to grow and the host would drop below its reserve (`reserve_mib`), or the host is already below it, that VM is migrated to a peer with room. |
 | Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. The tap's ingress (a clsact classic BPF filter) passes only IPv4 from that /32 and ARP naming it, so a guest cannot spoof another's address; it follows the address on a readdress, restore or migration. See below. |
 | Container images | `flexvm pull IMAGE` builds the root filesystem from an OCI/Docker image and snapshots a VM of it as the image's template; flexvm-init runs and supervises its entrypoint. See [images.md](images.md). |
 
@@ -51,7 +51,7 @@ not wait on the host:
   most every 50 ms per VM; the rest get `busy`. The guest's size comes from
   Firecracker, not from the guest; what it says is free only steers growth.
   Each step grows by at most a quarter of the guest. All growth, from guest
-  requests and ticks alike, is admitted against `--reserve` under the host
+  requests and ticks alike, is admitted against the reserve (`reserve_mib`) under the host
   lock, with the last 10 s of grants (`RUN/grants`, every VM process's) counted as used (plugged memory shows up
   in MemAvailable only once touched). A refused guest is told `full` and
   marked starved. Admission is not enforcement: a guest can still fill memory
@@ -284,7 +284,7 @@ starting -> running <-> paused                     (pause / resume)
 running | paused -> checkpointing -> running | paused | gone   (checkpoint [--stop])
 running | paused -> checkpointing -> suspended -> running      (suspend / resume)
 running | paused -> source (migrating) -> gone, or back if the target aborted
-any -> failed (memory lost) -> gone                (kill)
+any -> failed (memory lost) -> gone                (rm)
 ```
 
 Every lifecycle operation (and each controller resize) first reserves the
@@ -303,7 +303,7 @@ VM that is busy, paused or suspended.
   size, see below); with `--stop` it stays paused for the write (2–3 GB/s
   here) and is killed. `--incremental` writes only what changed since its
   last checkpoint, as a delta against it.
-- **restore DIR** works on any host whose template has the same content id.
+- **run --checkpoint DIR** (a restore) works on any host whose template has the same content id.
   It loads the verified state (copied to the VM's own run directory) into a
   fresh Firecracker, paused. That Firecracker's pager takes pages from the
   checkpoint's page file: on fault, and in the background (the template's
@@ -311,20 +311,20 @@ VM that is busy, paused or suspended.
   a `run`. By default it keeps its name and address. A restore refuses an
   address a peer is using; `--ip auto` picks a new one, which also makes a
   restore a fork of a running VM. `--paused` holds the restored VM paused
-  until `resume`; its memory is still paged in meanwhile.
+  until `unpause`; its memory is still paged in meanwhile.
 - **suspend** (SIGTERM) checkpoints into `STATE/suspended/NAME` (`/var/lib/flexvm` by
   default; it must be on disk, not tmpfs). Then suspend kills Firecracker, so the VM costs no memory. Memory is
   released only once the checkpoint is durable. The pager is stopped before
   Firecracker dies, so no discard event can mark a saved page as zero.
   A suspended VM's checkpoint stays in `suspended/`.
-  - **Resume** first creates a `STARTED` marker in it and fsyncs it, before
+  - **Resume** (`start`) first creates a `STARTED` marker in it and fsyncs it, before
     any vCPU runs, under the host lock of its final address check (the fence):
     marked before it, a crash while waiting for the lock would lose a VM that
-    never ran. A failed fence leaves no marker (test fault `resume_fence_fail`). It then restores lazily like `restore`, and deletes the
+    never ran. A failed fence leaves no marker (test fault `resume_fence_fail`). It then restores lazily like `run --checkpoint`, and deletes the
     checkpoint once every page is in. The pager closes the checkpoint's
     files as soon as the last page has settled (readers still busy finish
     first), so the deletion gives the disk space back while the VM runs on.
-  - **Kill** creates a `DISCARDED` marker the same way before it answers.
+  - **Removal** (`rm`) creates a `DISCARDED` marker the same way before it answers.
   - **Resume** of a checkpoint marked `STARTED` or `DISCARDED` deletes it
     instead: a resumed or killed VM never comes back.
   - **Failed resume.** If it fails before the resume request reaches
@@ -334,8 +334,8 @@ VM that is busy, paused or suspended.
     the directory fsynced before the VM goes back to suspended. If that
     fails too, the marker may or may not survive a crash: the VM (which
     never ran) is listed `quarantined` (a `QUARANTINE` file with the boot id
-    and why). It cannot be resumed; a `kill` discards it as usual, and after
-    a reboot the disk decides (marker: deleted; none: suspended again, and `ls`
+    and why). It cannot be resumed; `rm` discards it as usual, and after
+    a reboot the disk decides (marker: deleted; none: suspended again, and `ps -a`
     lists it so: a `QUARANTINE` of an earlier boot does not hold). Test faults
     `started_fsync` and `started_unmark` cover both.
 - **Device quiescing.** An API pause (`PATCH /vm Paused`) puts Firecracker's
@@ -344,7 +344,7 @@ VM that is busy, paused or suspended.
   with the vCPUs: no queue, tap, vsock backend or timer is serviced, and the
   events wait for the resume. flexvm builds on that:
   - **Loaded paused.** A load with `resume_vm: false` (a paused migration
-    target, `restore --paused`) stops only the vCPUs. The VM process follows it
+    target, `run --checkpoint --paused`) stops only the vCPUs. The VM process follows it
     at once with an API pause, so the devices are held too. The
     `held_restore_frozen` scenario shows the difference: a held restore's
     memory stays bit-identical while frames arrive on its tap, a host vsock
@@ -374,7 +374,7 @@ VM that is busy, paused or suspended.
   ms. Agents without `CLOCK` get
   no step (logged once): an exec could run late, after a snapshot.
   Across a plain pause the TSC keeps counting, so the clock stays right
-  (measured: 0 ms drift after 20 s). `resume` still checks it in the
+  (measured: 0 ms drift after 20 s). `unpause` still checks it in the
   background, at most one check per VM at a time.
 - **Paused migration.** A paused VM migrates and stays paused on the
   target, which pulls all its pages from the source. Resuming it there
@@ -556,7 +556,7 @@ through, so the checkpoint is exactly the memory at the pause.
   4 MiB, up to 64 MiB, and kept for the next checkpoint. Keeps up to twice
   that in memory per VM, allocated without admission: once allocated it is
   out of MemAvailable, which later admissions see, but allocating it can take
-  the host below `--reserve` (up to 128 MiB per VM taking keep-running
+  the host below the reserve (up to 128 MiB per VM taking keep-running
   checkpoints). Saving
   device state writes guest memory (a vsock transport reset), so the copy
   starts after it. `ckpt_stall`, 2 vCPUs × 4 MiB, 3 runs × 10 checkpoints:
@@ -687,7 +687,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
 (tap and neighbour setup), `fence` (host lock and generation check) and
 `route` (the route replacement).
 
-- **Count.** `flexvm standby [--template IMAGE] N` keeps N; each claimed one starts
+- **Count.** `flexvm pull IMAGE --standby N` keeps N; each claimed one starts
   its replacement, none start unless they leave the host's eviction mark
   available (so a refill never takes the room eviction moves VMs away to
   make), and the memory controller stops them all when the host goes under
@@ -716,7 +716,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     and checked against the directory's path, so one renamed away before the
     lock was ours fails the open. Its registry entry comes later.
   - A standby VM: its process, as a running VM. The standby count names only
-    the template name; `rmi` refuses while it or a live standby VM is nonzero.
+    the template name; `rmi` first sets it to 0 and waits for the live standby
+    VMs to go.
   - An incoming migration: the target's process, from opening the source's
     content id (`open_id`) until it is a running VM.
   - A checkpoint restore: the restoring process, from `open_id`. A checkpoint
@@ -856,7 +857,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   [Link]
   MACAddressPolicy=none
   ```
-- Addresses come from the host's `--vm-ips` range, which is authoritative:
+- Addresses come from the host's `vm_ips` range, which is authoritative:
   **every host's range must be disjoint** from the others', and only an
   address's home host hands it out, so two hosts can never pick the same
   address. An address whose VM migrated to another host stays reserved
@@ -870,31 +871,31 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   messages about older ones are ignored, and the route a peer
   announced for the newest one is put back when a claim here goes without
   its VM running (see process-per-vm.md).
-  Configure `--cluster-ips CIDR|FIRST-LAST` on every host to cover every host's
-  VM range; each host's `--vm-ips` must fit entirely inside it. Only addresses
-  in this locally configured allowlist may arrive, be routed or lent. Unset
-  (or reset with `--cluster-ips ''`), it allows only this host's `--vm-ips`;
-  peers configured without it produce a warning from both `config` and `listen`.
-  `config` reports the effective allowlist as `derived.cluster_ips`. Loading or
-  reloading `host.json` validates range syntax and containment of `vm_ips`;
-  an invalid one refuses every command but `flexvm config` (which fixes it), and
-  an invalid reload leaves the last valid configuration in use. A peer's report
+  Set `cluster_ips` (CIDR or FIRST-LAST) in every host's `host.json` to cover
+  every host's VM range; each host's `vm_ips` must fit entirely inside it. Only
+  addresses in this locally configured allowlist may arrive, be routed or lent.
+  Unset, it allows only this host's `vm_ips`; peers configured without it
+  produce a warning from both `info` and `listen`. `info` reports the effective
+  allowlist as `derived.cluster_ips`. `host.json` is edited by hand; loading or
+  reloading it validates it (`Config::validate`: range syntax, containment of
+  `vm_ips`, peers, underlays, `dns`, `announce_dev`; unknown keys refused). An
+  invalid one refuses every command, and an invalid reload leaves the last
+  valid configuration in use. A peer's report
   of its own range never authorizes an address here. Withdrawals of recorded
   generations remain accepted, including retries, after the allowlist narrows.
   A generation routed via a peer is withdrawn (same generation) only by that
   peer: the asking connection's address, and the addresses and
-  `--peer-underlay` of each configured peer it is one of; or by any peer with a
+  `peer_underlays` of each configured peer it is one of; or by any peer with a
   newer revision of it than recorded (the VM migrated on and ended there before
   its announcement arrived: withdrawals carry the revision, the durable notice
   the latest one) or a newer generation. A newer revision announced may come
   from any peer.
-  Configured `--peer-underlay` addresses count as that peer's next hops (and are
+  Configured `peer_underlays` addresses count as that peer's next hops (and are
   no VM's address); nothing is trusted for being on-link. Boot recovery stays incomplete, and the
   listener's periodic sweep tries it again, while a saved next hop is no known
-  peer address and a peer by name has none known yet; `flexvm config` runs no
-  recovery.
+  peer address and a peer by name has none known yet.
   No VM gets a local, peer, underlay or gateway address (#549), even inside
-  `--cluster-ips`. What a peer
+  `cluster_ips`. What a peer
   asks for (arrival, route, lend) is checked against the listener's own peer
   lookups, briefly waiting for one under way; a restore or resume, root's own,
   against the listener's last-known peer addresses (`RUN/peers.json`) whatever
@@ -903,7 +904,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   boot's pass tries again while a peer by name is not known yet.
   A route's `via` and a migration target's reported underlay must be the
   connection's peer address or one of the configured peers' known addresses,
-  or a configured `--peer-underlay`, and unicast (no router check: a cluster VM's
+  or a configured `peer_underlays` address, and unicast (no router check: a cluster VM's
   /32 via a peer's own address sends that VM's traffic to the peer only, which
   any peer may claim by announcing the VM); one local to this network namespace
   (hosts sharing a machine) is taken and installs no route. Route requests use the
@@ -915,7 +916,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     loopback) are skipped, so test hosts sharing a machine keep each other's
     tap routes; the first skip is logged.
   - **The LAN** (the announce device: the device of the route toward the
-    peers, or `flexvm config --announce-dev`): the host answers ARP for its VMs
+    peers, or host.json's `announce_dev`): the host answers ARP for its VMs
     (proxy ARP) and sends a gratuitous ARP whenever a VM arrives. Other
     machines on the LAN therefore follow a migrated VM without any
     configuration. Give VMs addresses from the LAN's subnet and they can use
@@ -936,8 +937,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     IPv4 address, nothing is derived and a diagnostic is logged, saying to
     start `flexvm listen` when the listener has not looked a peer up (no
     peers, or all local, uses loopback).
-    Explicit `--underlay` and `--announce-dev` settings
-    override derivation (`--announce-dev none` disables announcements).
+    Explicit `underlay` and `announce_dev` settings
+    override derivation (`announce_dev` `"none"` disables announcements).
 - On migration, the target routes the address to its new tap at the commit,
   right before the VM resumes (its neighbour entry goes on the tap while it
   prepares): an arrival that fails or dies before leaves this host's route

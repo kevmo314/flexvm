@@ -55,6 +55,9 @@ pub struct Manifest {
     /// restore follows it from there, not from the start of the ring again.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub app_log: u64,
+    /// Its `run --cpus/--memory` caps, which a restore or resume keeps.
+    #[serde(default, skip_serializing_if = "crate::vm::Resources::is_empty")]
+    pub resources: crate::vm::Resources,
 }
 
 impl Manifest {

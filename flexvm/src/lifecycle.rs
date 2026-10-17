@@ -2,7 +2,7 @@
 //!   running <-> paused                                  (SIGTSTP / SIGCONT)
 //!   running | paused -> checkpointing -> running | paused (checkpoint)
 //!                                     -> gone            (checkpoint --stop)
-//!                                     -> suspended       (SIGTERM; `flexvm resume`)
+//!                                     -> suspended       (SIGTERM or `flexvm stop`; `flexvm start`)
 //!   running | paused -> source (migrating) -> gone | running | paused
 
 use std::io::Write;
@@ -131,14 +131,14 @@ impl Proc {
     }
 
     /// Sets a pending new address (`pending_net`) in the guest; failing, it stays
-    /// pending, and the next `flexvm resume` (SIGCONT) tries again. Under `op`.
+    /// pending, and the next `flexvm unpause` (SIGCONT) tries again. Under `op`.
     fn take_address(&self, vm: &Vm) -> Result<()> {
         if !vm.pending_net.load(Ordering::SeqCst) {
             return Ok(());
         }
         let res = crate::fault_result!(fault("readdress_fail") => Err("injected fault: setting the address failed".into());
             vm.guest_net(vm.ip, self.host.config_now().dns.as_deref()));
-        res.map_err(|e| format!("vm {} runs, but setting its address {} failed: {e}; flexvm resume {} tries again", vm.name, vm.ip, vm.name))?;
+        res.map_err(|e| format!("vm {} runs, but setting its address {} failed: {e}; flexvm unpause {} tries again", vm.name, vm.ip, vm.name))?;
         vm.pending_net.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -230,7 +230,7 @@ impl Proc {
         if saved.is_ok() {
             crate::host::stall("suspend_stall");
         }
-        // As `flexvm kill` does to a suspended VM; one that cannot be revoked stays suspended.
+        // As `flexvm rm` does to a suspended VM; one that cannot be revoked stays suspended.
         // Its Firecracker dying meanwhile cancels it too: then it ends as a death does.
         if saved.is_ok() && vm.cancel_checkpoint.load(Ordering::SeqCst) > 0 {
             let how = if vm.dead() { "died" } else { "killed" };
@@ -280,12 +280,12 @@ impl Proc {
         }
         if let Ok(q) = std::fs::read_to_string(dir.join(QUARANTINE)) {
             if let Some(why) = quarantined(&q, crate::host::boot_id()) {
-                bail!("vm {name} is quarantined: {why}; kill it to discard its checkpoint");
+                bail!("vm {name} is quarantined: {why}; flexvm rm it to discard its checkpoint");
             }
             crate::util::unlink_durably(&dir.join(QUARANTINE))?;
         }
         let gen = read_gen(&dir).ok_or_else(|| {
-            format!("vm {name} is quarantined: its address generation was never recorded, so it cannot be resumed with its address; restore {dir:?} with --name NEW --ip auto (choose an unused name), or flexvm kill {name} to discard it")
+            format!("vm {name} is quarantined: its address generation was never recorded, so it cannot be resumed with its address; flexvm run --checkpoint {dir:?} --name NEW --ip auto (choose an unused name), or flexvm rm {name} to discard it")
         })?;
         let ck = Checkpoint::open(&dir)?;
         let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
@@ -294,10 +294,11 @@ impl Proc {
         // Checked again, as a restore's is: safe when suspended, it may be a peer's or local now.
         crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
+        self.set_resources(ck.manifest.resources, &tpl.meta)?;
         let claim = {
             let l = self.host.lock()?;
             if !self.host.current(&l, ip, gen)? {
-                bail!("vm {name}: {ip} generation {gen} was withdrawn or given out again meanwhile; restore {dir:?} with --name NEW --ip auto (choose an unused name), or flexvm kill {name} to discard it");
+                bail!("vm {name}: {ip} generation {gen} was withdrawn or given out again meanwhile; flexvm run --checkpoint {dir:?} --name NEW --ip auto (choose an unused name), or flexvm rm {name} to discard it");
             }
             self.host.claim_incoming(&l, name, ip, gen, None)?
         };
@@ -322,7 +323,7 @@ impl Proc {
                 *self.cmd.lock().unwrap() = None;
                 self.keep_addr();
                 let _ = crate::host::write_record(&dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()).as_bytes());
-                bail!("vm {name} is quarantined: {e}; kill it to discard its checkpoint")
+                bail!("vm {name} is quarantined: {e}; flexvm rm it to discard its checkpoint")
             }
             // Re-arming the checkpoint would replay what it did since.
             Err(Restore::Ran(e)) => {
@@ -340,7 +341,7 @@ impl Proc {
     }
 
     /// Another host's address is borrowed.
-    pub fn restore(&self, dir: &Path, name: Option<&str>, ip: Option<&str>, paused: bool) -> Result<Value> {
+    pub fn restore(&self, dir: &Path, name: Option<&str>, ip: Option<&str>, paused: bool, resources: crate::vm::Resources) -> Result<Value> {
         let mut t = Phases::new();
         let ck = Checkpoint::open(dir)?;
         t.mark("verify_checkpoint");
@@ -355,6 +356,7 @@ impl Proc {
         }
         self.set_name(self.host.take_name(&name, false)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
+        self.set_resources(resources.or(ck.manifest.resources), &tpl.meta)?;
         // Decided and claimed under one lock, by one reading of the range: a change
         // between them cannot send a local address to `claim_new` as foreign.
         let l = self.host.lock()?;
@@ -367,7 +369,7 @@ impl Proc {
             None => {
                 let claim = self.host.claim_new_in(&l, &cfg, &name, want);
                 drop(l);
-                claim.map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?
+                claim.map_err(|e| format!("{e}; run --checkpoint with --ip auto (or another address)"))?
             }
         };
         let ip = self.set_addr(claim);
@@ -426,7 +428,7 @@ impl Proc {
         ready.map_err(|e| Restore::NotRun(kill(e)))?;
         // Bound before it is published or runs (#569, as `start_guest`): failing, it never ran and its checkpoint stays.
         self.serve_control().map_err(|e| Restore::NotRun(kill(e)))?;
-        // Published paused, until SIGCONT (`flexvm resume`); `why`: a resume that failed.
+        // Published paused, until SIGCONT (`flexvm unpause`); `why`: a resume that failed.
         let keep_paused = |t: &mut Phases, why: Option<String>| {
             if ip != m.ip {
                 vm.pending_net.store(true, Ordering::SeqCst);
@@ -479,12 +481,12 @@ impl Proc {
         let unpaused = crate::fault_result!(fault("restore_unpause_fail") => Err("injected fault: resuming its vCPUs failed".into());
             vm.unpause());
         // Some of its vCPUs may have run all the same (STARTED stays): paused again, it is kept, for a
-        // `flexvm resume`; destroyed only if not even that is known.
+        // `flexvm unpause`; destroyed only if not even that is known.
         if let Err(e) = unpaused {
             drop(still);
             return match vm.state() == State::Paused && !vm.switch_unsure() {
                 true => {
-                    crate::log!("vm {name}: resuming it failed: {e}; it stays paused (flexvm resume {name} runs it)");
+                    crate::log!("vm {name}: resuming it failed: {e}; it stays paused (flexvm unpause {name} runs it)");
                     Ok(keep_paused(t, Some(e.to_string())))
                 }
                 false => Err(Restore::Ran(kill(e))),
@@ -923,7 +925,7 @@ impl PacketHold<'_> {
         let (stats, attached) = self.d.release_to_tap(self.vm, self.id);
         self.stats = stats;
         let res = self.vm.end_checkpoint(attached);
-        // Left paused by the failure: `flexvm resume` (SIGCONT) runs it again.
+        // Left paused by the failure: `flexvm unpause` (SIGCONT) runs it again.
         if res.is_err() && self.vm.state() == State::Paused {
             self.d.paused_by_request.store(true, Ordering::SeqCst);
         }
@@ -1072,7 +1074,8 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };
     Some(json!({
         "name": name, "ip": m.ip.to_string(), "template": m.template, "template_id": m.template_id,
-        "state": state, "vcpus": m.vcpus, "guest_mib": m.mem_mib.saturating_add(m.hotplug_mib), "max_mib": m.max_mib,
+        "state": state, "vcpus": m.vcpus, "cpus": m.resources.cpus, "resources": m.resources,
+        "guest_mib": m.mem_mib.saturating_add(m.hotplug_mib), "max_mib": m.resources.ceiling(m.mem_mib, m.max_mib),
         "checkpoint_mib": (m.data_pages.saturating_mul(PAGE_SIZE as u64)) >> 20,
     }))
 }

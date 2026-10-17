@@ -113,6 +113,8 @@ pub struct Vm {
     pub cancel_checkpoint: AtomicUsize,
     /// Its Firecracker died (`mark_dead`): waits on it end at once.
     dead: AtomicBool,
+    /// `run --cpus/--memory`: set before it runs here (`Proc::adopt`), kept by its checkpoints and migrations.
+    pub resources: Mutex<Resources>,
     /// Whether `state` is known after the last pause or resume (see `Unsure`).
     unsure: Mutex<Unsure>,
     /// Its tap could not be raised or routed when it resumed: the next `unpause` does that first.
@@ -178,6 +180,24 @@ impl Vm {
             Ok(None) => {}
             Err(e) => crate::log!("vm {}: admitting {more} MiB: {e}", self.name),
         }
+    }
+
+    /// The hotplug region it may grow into: the template's, less what `--memory` caps.
+    pub fn hotplug_total(&self) -> u64 {
+        self.resources.lock().unwrap().hotplug_cap(&self.template.meta)
+    }
+
+    pub fn resources(&self) -> Resources {
+        *self.resources.lock().unwrap()
+    }
+
+    pub fn cpus(&self) -> Option<f64> {
+        self.resources().cpus
+    }
+
+    /// Its memory ceiling: boot memory and `hotplug_total`.
+    pub fn max_mib(&self) -> u64 {
+        self.template.meta.mem_mib + self.hotplug_total()
     }
 
     pub fn mem_sock(&self) -> PathBuf {
@@ -424,7 +444,7 @@ impl Vm {
         // target starts so): after a pause or resume that ended unknown, Firecracker must say which.
         if self.reconcile().is_none() {
             bail!(
-                "vm {}: an earlier pause or resume ended unknown and firecracker cannot say whether it is paused; pause or resume it, then try again",
+                "vm {}: an earlier pause or resume ended unknown and firecracker cannot say whether it is paused; pause or unpause it, then try again",
                 self.name
             );
         }
@@ -696,7 +716,7 @@ impl Vm {
     fn running_here(&self) -> Result<()> {
         match self.state() {
             State::Running => {}
-            State::Paused => bail!("vm {} is paused; resume it with flexvm resume {}", self.name, self.name),
+            State::Paused => bail!("vm {} is paused; flexvm unpause {} resumes it", self.name, self.name),
             State::Checkpointing => bail!("vm {}{CHECKPOINTING}", self.name),
             _ => bail!("vm {} is not running here", self.name),
         }
@@ -907,7 +927,8 @@ impl Vm {
             "vcpus": self.template.meta.vcpus,
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
-            "max_mib": self.template.meta.max_mib,
+            "max_mib": self.max_mib(),
+            "resources": self.resources(),
             "plugged_mib": hotplug["plugged_size_mib"],
             "admitted_mib": self.limit.admitted(),
             "cgroup_mib": self.limit.used(),
@@ -925,6 +946,88 @@ fn mem_sizes(pager: &Pager, tpl: &Template, plugged: Option<u64>) -> (u64, u64) 
     let [_, present, _, remote, inflight, discarded] = pager.census();
     let need = ((present + remote + inflight + discarded) * PAGE_SIZE) as u64 >> 20;
     (need, tpl.meta.mem_mib + plugged.unwrap_or(tpl.meta.max_mib - tpl.meta.mem_mib))
+}
+
+/// What `run --cpus N --memory SIZE` caps a VM at, kept with it through suspends,
+/// checkpoints and migrations. Its vCPU count and boot memory are its template's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Resources {
+    /// CPU time, in CPUs (`cpu.max` on its Firecracker's cgroup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<f64>,
+    /// Its memory ceiling (MiB): boot memory and as much of the hotplug region as fits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u64>,
+}
+
+/// `cpu.max`'s period (µs).
+const CPU_PERIOD: u64 = 100_000;
+
+impl Resources {
+    pub fn is_empty(&self) -> bool {
+        *self == Resources::default()
+    }
+
+    /// Each of `self`'s set, else `base`'s.
+    pub fn or(self, base: Resources) -> Resources {
+        Resources { cpus: self.cpus.or(base.cpus), memory_mib: self.memory_mib.or(base.memory_mib) }
+    }
+
+    /// Within what a VM of `meta` has: at most its vCPUs, and from its boot memory plus
+    /// what its snapshot plugged (a VM never shrinks below that) to its ceiling.
+    pub fn check(&self, meta: &crate::template::Meta) -> Result<()> {
+        if let Some(c) = self.cpus {
+            if !(c.is_finite() && c >= 0.01) {
+                bail!("--cpus {c} must be at least 0.01");
+            }
+            if c > meta.vcpus as f64 {
+                bail!("--cpus {c} is more than the image's {} vCPUs (pull it with --vcpus for more)", meta.vcpus);
+            }
+        }
+        if let Some(m) = self.memory_mib {
+            let floor = meta.mem_mib + meta.plugged_mib.min(meta.max_mib - meta.mem_mib);
+            if m < floor {
+                bail!(
+                    "--memory {m} MiB is less than the image's boot memory and what its snapshot plugged ({} + {} MiB): give at least {floor}m",
+                    meta.mem_mib,
+                    floor - meta.mem_mib
+                );
+            }
+            if m > meta.max_mib {
+                bail!("--memory {m} MiB is more than the image's ceiling, {} MiB (pull it with --max for more)", meta.max_mib);
+            }
+        }
+        Ok(())
+    }
+
+    /// The hotplug region a VM of `meta` may use: up to `memory_mib`, in whole
+    /// steps, never below what the snapshot plugged.
+    pub fn hotplug_cap(&self, meta: &crate::template::Meta) -> u64 {
+        let total = meta.max_mib - meta.mem_mib;
+        self.hotplug_within(meta.mem_mib, total).max(meta.plugged_mib.min(total))
+    }
+
+    /// Of a hotplug region of `total` after `mem_mib` of boot memory: up to `memory_mib`, in whole steps.
+    fn hotplug_within(&self, mem_mib: u64, total: u64) -> u64 {
+        match self.memory_mib {
+            Some(m) => (m.saturating_sub(mem_mib) / crate::template::STEP_MIB * crate::template::STEP_MIB).min(total),
+            None => total,
+        }
+    }
+
+    /// The memory ceiling of a VM with `mem_mib` of boot memory and a template ceiling of `max_mib`
+    /// (a stopped VM's, from its manifest).
+    pub fn ceiling(&self, mem_mib: u64, max_mib: u64) -> u64 {
+        mem_mib + self.hotplug_within(mem_mib, max_mib.saturating_sub(mem_mib))
+    }
+
+    /// `cpu.max`: `QUOTA PERIOD`, or `max PERIOD`.
+    pub fn cpu_max(&self) -> String {
+        match self.cpus {
+            Some(c) => format!("{} {CPU_PERIOD}", ((c * CPU_PERIOD as f64).round() as u64).max(1000)),
+            None => format!("max {CPU_PERIOD}"),
+        }
+    }
 }
 
 /// A Firecracker with its pager started and no VM of its own yet; torn down when dropped.
@@ -1014,6 +1117,7 @@ impl Prepared {
             last_checkpoint: Mutex::new(None),
             cancel_checkpoint: AtomicUsize::new(0),
             dead: AtomicBool::new(false),
+            resources: Mutex::default(),
             unsure: Mutex::new(Unsure::Settled),
             link_down: AtomicBool::new(false),
         })
@@ -1115,8 +1219,7 @@ impl Prepared {
             // All of routing the address here but the route, alongside the load: the route waits for the fence.
             let neighbour = self.neighbour.then(|| std::thread::spawn(move || crate::net::neighbour(ip, &tap)));
             // Before `left` is read: the deadline covers it too.
-            fc.join_cgroup();
-            let loaded = fc.load_snapshot(&path, &self.template.vmstate(), &fc.tap, Some(clock_realtime), left(API_TIMEOUT));
+            let loaded = fc.join_cgroup().and_then(|()| fc.load_snapshot(&path, &self.template.vmstate(), &fc.tap, Some(clock_realtime), left(API_TIMEOUT)));
             if matches!(vmstate, Snapshot::Bytes(_)) {
                 let _ = std::fs::remove_file(&path);
             }

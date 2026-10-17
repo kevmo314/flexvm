@@ -42,14 +42,22 @@ fv() {
     "$flexvm" --state "/run/flexvm-lab-$h/state" --run "/run/flexvm-lab-$h/run" "$@"
 }
 
+# Host $1's STATE/host.json, written whole and atomically (a fresh lab has none to merge with).
+host_json() {
+  local f=/run/flexvm-lab-$1/state/host.json
+  printf '%s\n' "$2" > "$f.tmp"
+  chmod 644 "$f.tmp"
+  mv -f "$f.tmp" "$f"
+}
+
 listeners() {
   for h in A B; do
     mkdir -p "/run/flexvm-lab-$h/state"
     ln -sfn "$state/artifacts" "/run/flexvm-lab-$h/state/artifacts"
     ln -sfn "$state/templates" "/run/flexvm-lab-$h/state/templates"
   done
-  fv A config --peer 192.168.100.2:7070 --vm-ips 192.168.100.128-192.168.100.191 --cluster-ips 192.168.100.128-192.168.100.250 > /dev/null
-  fv B config --peer 192.168.100.1:7070 --vm-ips 192.168.100.192-192.168.100.250 --cluster-ips 192.168.100.128-192.168.100.250 > /dev/null
+  host_json A '{"peers": ["192.168.100.2:7070"], "vm_ips": "192.168.100.128-192.168.100.191", "cluster_ips": "192.168.100.128-192.168.100.250"}'
+  host_json B '{"peers": ["192.168.100.1:7070"], "vm_ips": "192.168.100.192-192.168.100.250", "cluster_ips": "192.168.100.128-192.168.100.250"}'
   fv A listen 192.168.100.1:7070 > "$root/listen-A.log" 2>&1 &
   fv B listen 192.168.100.2:7070 > "$root/listen-B.log" 2>&1 &
   sleep 1

@@ -290,16 +290,8 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
     };
     let started = (|| {
         let (r, w) = UnixStream::pair()?;
-        let args = [
-            "--state".as_ref(),
-            host.state.as_os_str(),
-            "--run".as_ref(),
-            host.run.as_os_str(),
-            "run".as_ref(),
-            "--standby".as_ref(),
-            "--template".as_ref(),
-            template.as_ref(),
-        ];
+        let args =
+            ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--standby".as_ref(), template.as_ref()];
         crate::util::start_reaper()?;
         let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &[("FLEXVM_NOTIFY_FD", "3")])?;
         drop(w);
@@ -521,6 +513,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             }
             Err((e, retry)) => {
                 *p.cmd.lock().unwrap() = None;
+                // Nor its caps (`--memory` included): the next claim sets its own.
+                let _ = p.keep_resources(crate::vm::Resources::default());
                 let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": retry}));
                 if p.standby.lock().unwrap().is_none() {
                     p.finish(op, End::NotStarted, crate::vmproc::FAILED, None);
@@ -541,6 +535,20 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         None => None,
     };
     let mut t = Phases::new();
+    // Checked against this standby's own generation; a refusal leaves it for another claim.
+    let resources: crate::vm::Resources = serde_json::from_value(req["resources"].clone()).map_err(|e| (format!("bad resources: {e}").into(), false))?;
+    let tpl = p.standby.lock().unwrap().as_ref().map(|s| s.template()).ok_or_else(|| ("standby vm gone".into(), true))?;
+    p.set_resources(resources, &tpl.meta).map_err(|e| (e, false))?;
+    // Taken ahead of any claim: every claim sets its cgroup's cap, `max` for none, so one an
+    // earlier claim that failed set (after this point) never carries over to this VM.
+    {
+        let s = p.standby.lock().unwrap();
+        let fc = s.as_ref().ok_or_else(|| ("standby vm gone".into(), true))?.firecracker();
+        match fc.set_cpu_max(&resources.cpu_max()) {
+            Err(e) if resources.cpus.is_some() => return Err((e, false)),
+            _ => {}
+        }
+    }
     let lock = host.take_name(name, false).map_err(|e| (e, false))?;
     // Its memory is already out of MemAvailable: only the step is charged. Sized
     // as it was loaded (`serve`), and admitted before the address is claimed.
@@ -653,7 +661,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         let reply = match answer {
             Ok(r) => r,
             Err(e) => {
-                let started = host.entry(name).map(|e| format!("it did: pid {}", e.ident.pid)).unwrap_or_else(|_| "see flexvm ls".into());
+                let started = host.entry(name).map(|e| format!("it did: pid {}", e.ident.pid)).unwrap_or_else(|_| "see flexvm ps".into());
                 bail!("claiming standby vm {} as {name}: {e}; it may have started the vm ({started}), so it is not started again", sock.display());
             }
         };
