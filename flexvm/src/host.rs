@@ -2410,9 +2410,6 @@ fn dead_taps_at(run: &Path, net: &Path) -> Vec<(String, u32, Ident)> {
     taps_of_at(run, net, true).into_iter().filter(|(_, _, owner)| owner.liveness() == Liveness::Gone).collect()
 }
 
-/// A detached VM process's own cgroup (`vm-PID-START`, `util::spawn_self`)
-/// goes once nothing is in it: never killed, so a process that just joined
-/// one is never touched. (`rmdir` refuses a populated cgroup anyway.)
 /// A VM a sweep found dead and withdrew: (name, address, generation).
 pub type Withdrawn = (String, Ipv4Addr, u64);
 
@@ -2521,9 +2518,25 @@ fn default_run_of(state: &Path) -> PathBuf {
 }
 
 fn sweep_scope(dir: &Path) {
+    sweep_scope_with(dir, |dir| {
+        let _ = std::fs::remove_dir(dir);
+    });
+}
+
+/// Keep a live owner's scope even when empty: `join_cgroup` may need it for rollback.
+/// Never kill its occupants; `rmdir` also refuses a cgroup populated since the read.
+fn sweep_scope_with(dir: &Path, remove: impl FnOnce(&Path)) {
+    let Some((pid, start)) = dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("vm-")).and_then(|n| n.split_once('-')) else {
+        return;
+    };
+    let (Ok(pid), Ok(start)) = (pid.parse(), start.parse()) else { return };
+    let owner = Ident { pid, start, boot: boot_id().into() };
+    if owner.liveness() != Liveness::Gone {
+        return;
+    }
     let events = std::fs::read_to_string(dir.join("cgroup.events")).unwrap_or_default();
     if events.lines().any(|l| l == "populated 0") {
-        let _ = std::fs::remove_dir(dir);
+        remove(dir);
     }
 }
 
@@ -5620,6 +5633,33 @@ mod tests {
         assert!(busy.exists() && unread.exists(), "populated or unreadable: kept");
         assert!(!busy.join("cgroup.kill").exists(), "never killed");
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn an_empty_scope_stays_available_for_its_live_owners_rollback() {
+        let d = crate::test_util::TempDir::new("scope-owner");
+        let me = Ident::me();
+        // The same pid with another start time is a dead owner, even though the pid is alive.
+        let reused = Ident { start: me.start + 1, ..me.clone() };
+        for (name, events, expected) in [
+            (format!("vm-{}", me.key()), Some("populated 0\n"), false),
+            (format!("vm-{}", reused.key()), Some("populated 0\n"), true),
+            (format!("vm-{}", reused.key()), Some("populated 1\n"), false),
+            (format!("vm-{}", reused.key()), None, false),
+            ("vm-invalid".into(), Some("populated 0\n"), false),
+            (format!("vm-{}-extra", reused.key()), Some("populated 0\n"), false),
+        ] {
+            let cg = d.join(name);
+            std::fs::create_dir_all(&cg).unwrap();
+            if let Some(events) = events {
+                std::fs::write(cg.join("cgroup.events"), events).unwrap();
+            }
+            // Ordinary directories cannot emulate cgroupfs's removal with virtual files present.
+            let mut removed = false;
+            sweep_scope_with(&cg, |_| removed = true);
+            assert_eq!(removed, expected, "{}", cg.display());
+            std::fs::remove_dir_all(&cg).unwrap();
+        }
     }
 
     #[test]
