@@ -74,10 +74,10 @@ impl Resolver for DeadlineResolver {
         #[cfg(test)]
         let found = match tests::fake_dns(&addr) {
             Some(found) => found,
-            None => crate::util::resolve(&addr, self.deadline)?,
+            None => crate::util::resolve_until(&addr, self.deadline, &cancelled)?,
         };
         #[cfg(not(test))]
-        let found = crate::util::resolve(&addr, self.deadline)?;
+        let found = crate::util::resolve_until(&addr, self.deadline, &cancelled)?;
         for a in reachable(&found, self.public_only).take(16) {
             addrs.push(a);
         }
@@ -176,7 +176,7 @@ impl Connector<()> for PeerConnector {
                 let left = b.saturating_sub(start.elapsed());
                 if i + 1 < n { left / 2 } else { left }.max(Duration::from_millis(10))
             });
-            match per.map_or_else(|| TcpStream::connect(addr), |t| TcpStream::connect_timeout(addr, t)) {
+            match connect_cancellable(addr, per) {
                 Ok(stream) => {
                     stream.set_nodelay(details.config.no_delay())?;
                     *self.0.lock().unwrap() = Some(stream.peer_addr()?);
@@ -200,6 +200,83 @@ impl Connector<()> for PeerConnector {
     }
 }
 
+/// An interrupted pull, as an I/O error that is not `ErrorKind::Interrupted` (which is retried).
+fn cancelled() -> std::io::Result<()> {
+    crate::template::interrupted().map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// `TcpStream::connect_timeout` (no limit without `timeout`), polled so an interrupted pull stops waiting within
+/// `CANCEL_POLL`.
+fn connect_cancellable(addr: &std::net::SocketAddr, timeout: Option<Duration>) -> std::io::Result<TcpStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        std::net::SocketAddr::V4(a) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as _,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) },
+                sin_zero: [0; 8],
+            };
+            unsafe { std::ptr::write((&mut sa as *mut libc::sockaddr_storage).cast(), sin) };
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        std::net::SocketAddr::V6(a) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as _,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: a.flowinfo(),
+                sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+                sin6_scope_id: a.scope_id(),
+            };
+            unsafe { std::ptr::write((&mut sa as *mut libc::sockaddr_storage).cast(), sin6) };
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    cancelled()?;
+    let fd = unsafe { libc::socket(sa.ss_family.into(), libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if unsafe { libc::connect(fd.as_raw_fd(), (&sa as *const libc::sockaddr_storage).cast(), len as _) } < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(e);
+        }
+        let until = timeout.map(|t| Instant::now() + t);
+        loop {
+            cancelled()?;
+            let wait = match until {
+                Some(until) => match until.saturating_duration_since(Instant::now()) {
+                    left if left.is_zero() => return Err(std::io::ErrorKind::TimedOut.into()),
+                    left => left.min(CANCEL_POLL),
+                },
+                None => CANCEL_POLL,
+            };
+            let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+            match unsafe { libc::poll(&mut pfd, 1, wait.as_millis().max(1) as i32) } {
+                0 => continue,
+                n if n > 0 => break,
+                _ => match std::io::Error::last_os_error() {
+                    e if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    e => return Err(e),
+                },
+            }
+        }
+        let (mut err, mut n): (libc::c_int, libc::socklen_t) = (0, std::mem::size_of::<libc::c_int>() as _);
+        if unsafe { libc::getsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, (&mut err as *mut libc::c_int).cast(), &mut n) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if err != 0 {
+            return Err(std::io::Error::from_raw_os_error(err));
+        }
+    }
+    let stream = TcpStream::from(fd);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
 /// A plain TCP connection (ureq's own is not nameable outside it).
 #[derive(Debug)]
 struct PeerTcp {
@@ -220,7 +297,7 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 fn network_wait<T>(timeout: NextTimeout, mut io: impl FnMut(Duration) -> std::io::Result<T>) -> std::result::Result<T, ureq::Error> {
     let until = Instant::now() + timeout.not_zero().map_or(IDLE, |t| *t);
     loop {
-        crate::template::interrupted().map_err(|e| std::io::Error::other(e.to_string()))?;
+        cancelled()?;
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(ureq::Error::Timeout(timeout.reason));
@@ -297,7 +374,7 @@ struct Deadlined<T> {
 
 impl<T> Deadlined<T> {
     fn timeout(&self, next: NextTimeout) -> std::result::Result<NextTimeout, ureq::Error> {
-        crate::template::interrupted().map_err(|e| std::io::Error::other(e.to_string()))?;
+        cancelled()?;
         let left = self.deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(ureq::Error::Timeout(Timeout::Global))?;
         let idle = NextTimeout { after: next.after.min(IDLE.into()), reason: next.reason };
         Ok(if idle.after > left.into() { NextTimeout { after: left.into(), reason: Timeout::Global } } else { idle })
@@ -902,7 +979,29 @@ pub(super) mod tests {
         assert!(!path.exists());
         assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 0);
         assert!(retry_sleep(MAX_RETRY_AFTER).unwrap_err().to_string().contains("interrupted"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let err = connect_cancellable(&listener.local_addr().unwrap(), None).unwrap_err();
+        assert!(err.to_string().contains("interrupted"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancellable_connect_connects_and_reports_refusal() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut stream = connect_cancellable(&addr, Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), addr);
+        let (mut accepted, _) = listener.accept().unwrap();
+        accepted.write_all(b"ok").unwrap();
+        let mut got = [0; 2];
+        stream.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ok");
+        drop(listener);
+        let err = connect_cancellable(&addr, Some(Duration::from_secs(5))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        if let Ok(v6) = std::net::TcpListener::bind("[::1]:0") {
+            connect_cancellable(&v6.local_addr().unwrap(), None).unwrap();
+        }
     }
 
     /// A registry is local by the address its answer came from: one reached on a private address by name may use a
