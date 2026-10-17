@@ -17,7 +17,7 @@ const EVERY: Duration = Duration::from_secs(30);
 /// An arrival's log, unlocked, is its dead arrival's only after this: the
 /// listener creates it a moment before locking it.
 const ARRIVAL_GRACE: Duration = Duration::from_secs(5);
-/// How long `NAME.moved` keeps telling `ps -a` and `exec` where a VM went.
+/// How long `NAME.moved` keeps telling `stop`, `rm` and `exec` where a VM went.
 const MOVED_TTL: Duration = Duration::from_secs(3600);
 /// A log of a name with nothing left here (no VM, suspended VM, failed or
 /// moved record) goes once unwritten this long.

@@ -3005,7 +3005,7 @@ fn collect_owned(run: &Path) {
         }
     }
     // Names whose holder was killed: taken (so no one else holds them) and let go,
-    // as `NameLock` would have. `failed` and `moved` records stay for `ps -a`.
+    // as `NameLock` would have. `failed` records stay for `ps -a`, `moved` ones for `stop`, `rm` and `exec`.
     let vms = run.join("vms");
     for e in std::fs::read_dir(locks(&vms)).into_iter().flatten().flatten() {
         let path = e.path();
