@@ -688,9 +688,13 @@ impl Room {
                 return;
             }
         }
+        // Only if no refresh came between the claim and the sample (one from a refresher held up meanwhile would
+        // make memory taken since spendable again): what was taken since is in `recent`.
+        let word = self.word();
+        let at = epoch(word.load(Ordering::SeqCst));
         let mib = mib();
-        let _ = self.word().fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
-            Some(pack(epoch(w).wrapping_add(1), 0, mib.map_or(0, |m| room_of(m.saturating_sub(recent(w))))))
+        let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| {
+            (epoch(w) == at).then(|| pack(at.wrapping_add(1), 0, mib.map_or(0, |m| room_of(m.saturating_sub(recent(w))))))
         });
     }
 
@@ -715,6 +719,15 @@ impl Room {
             })
             .ok()
             .map(|_| at)
+    }
+
+    /// Takes `mib` from the host's room whether or not there is that much (to none left): memory admission granted a
+    /// guest, which the next refresh counts (`Host::promised`), and until then this.
+    pub fn debit_host(host: &crate::hostmem::Shared, mib: u64) {
+        let _ = host.room.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |w| match room_field(w) {
+            0 => None,
+            r => Some(pack(epoch(w), recent(w) + mib.min(FIELD), r.saturating_sub(mib).max(1))),
+        });
     }
 
     /// Gives back `mib` taken from it `at` (its memory is unmapped again, or never was): unless it was refreshed since,
@@ -903,10 +916,19 @@ mod tests {
         a.refresh(|| Some(50));
         a.give(10, at);
         assert_eq!(b.get(), 40);
+        // A refresher held up between its claim and its sample while another refreshed: its sample is not published
+        // (memory taken since would be spendable again).
+        due();
+        a.refresh(|| {
+            due();
+            b.refresh(|| Some(30));
+            Some(500)
+        });
+        assert_eq!(a.get(), 30, "the newer refresh stands");
         // A process not attached keeps its own.
         let own = Room::default();
         own.set(5);
-        assert_eq!((own.get(), a.get()), (5, 40));
+        assert_eq!((own.get(), a.get()), (5, 30));
         assert!(own.take(5).is_some() && own.take(1).is_none());
     }
 

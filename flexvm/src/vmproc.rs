@@ -1429,7 +1429,8 @@ impl Proc {
             let mut avail = host_available_mib();
             let (reserve, at, _) = self.host.config_now().evict_marks();
             // Memory VM processes keep for their next checkpoint never moves a VM away: it goes back first (#648).
-            if avail.is_some_and(|a| a < at) && crate::hostmem::release_kept(&self.host.run, None) {
+            if avail.is_some_and(|a| a < at) {
+                crate::hostmem::release_kept(&self.host.run, None);
                 avail = host_available_mib();
             }
             if let Ok(s) = crate::hostmem::at(&self.host.run) {

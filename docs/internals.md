@@ -56,10 +56,14 @@ not wait on the host:
   in MemAvailable only once touched). A refused guest is told `full` and
   marked starved. Before it refuses, every VM process is asked (a futex in
   `RUN/.locks/memory-BOOT`) to release the memory it keeps for its next
-  checkpoint, waiting up to 200 ms for each, and MemAvailable is read again:
-  that memory is not admitted, so it never refuses a grant (#648). Eviction
-  and the standby pool ask the same before they react to the host running
-  short. Admission is not enforcement: a guest can still fill memory
+  checkpoint, waiting up to 200 ms for each (not for one that is stopped), and
+  MemAvailable is read again whoever answered: that memory is not admitted,
+  so it never refuses a grant (#648). Eviction and the standby pool ask the
+  same before they react to the host running short. A request within a
+  second of the last is not made again (the memory went back then), so
+  callers queued on the host lock do not each wait. A grant also comes out
+  of the room checkpoint memory grows within (below) at once, so the two
+  never spend the same memory above the reserve. Admission is not enforcement: a guest can still fill memory
   that is already plugged, the 4 GiB pre-plug included (#54).
 - **Wait, don't die.** Allocations that outrun the plug are throttled by the
   kernel at `memory.high` rather than OOM-killed. Memory block uevents move
@@ -562,7 +566,9 @@ through, so the checkpoint is exactly the memory at the pause.
   process's controller refreshes it from MemAvailable less the reserve and
   the grants guests have yet to touch, taking off again what was taken since
   the refresh before (it may not show in MemAvailable yet); it is debited as
-  they grow. Without room for a block of copies, faults ask the writers for
+  they grow, and by admission's grants. A refresh whose sample was taken
+  before another refresh landed is dropped. The file is refused unless it is
+  this user's (or root's), writable by no one else, with no other link. Without room for a block of copies, faults ask the writers for
   their pages and wait for them as over budget, and the pause protects
   pages it would have copied hot; no checkpoint fails for it. Under the
   eviction mark (or with the VM starved), or when another process asks

@@ -489,7 +489,8 @@ fn under_reserve(host: &Host, template: &str) -> bool {
     let Some(mut avail) = crate::vmproc::host_available_mib() else { return false };
     let reserve = host.config_now().reserve();
     // Memory VM processes keep for their next checkpoint goes back first (#648).
-    if avail < reserve && crate::hostmem::release_kept(&host.run, None) {
+    if avail < reserve {
+        crate::hostmem::release_kept(&host.run, None);
         avail = crate::vmproc::host_available_mib().unwrap_or(avail);
     }
     if avail >= reserve {

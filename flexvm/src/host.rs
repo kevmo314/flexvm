@@ -1462,6 +1462,7 @@ impl Host {
             drop(hold);
             return Err(e);
         }
+        self.debit_room(mib);
         Ok(Ok((id, hold)))
     }
 
@@ -1501,7 +1502,8 @@ impl Host {
         let need = floor.saturating_add(pending).saturating_add(mib);
         let mut avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         // Memory VM processes keep for their next checkpoint is not admitted: it goes back rather than refuse (#648).
-        if avail < need && crate::hostmem::release_kept(&self.run, deadline) {
+        if avail < need {
+            crate::hostmem::release_kept(&self.run, deadline);
             avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         }
         if avail < need {
@@ -1549,7 +1551,17 @@ impl Host {
             return Ok(Err(why));
         }
         h.resize(h.mib.saturating_add(mib))?;
+        self.debit_room(mib);
         Ok(Ok(()))
+    }
+
+    /// A grant of `mib` comes out of the room checkpoint memory grows within too (`cow::Room`), at once: until the
+    /// next refresh counts it (`promised`), the two would spend the same memory above the reserve.
+    fn debit_room(&self, mib: u64) {
+        match crate::hostmem::at(&self.run) {
+            Ok(s) => crate::cow::Room::debit_host(s, mib),
+            Err(e) => crate::log!("admission: the checkpoint memory room is not debited: {e}"),
+        }
     }
 
     // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
@@ -6753,13 +6765,45 @@ mod tests {
         assert!(h.grant_inner(AVAIL - 100, Floor::Reserve, false, None, avail).unwrap().is_ok());
         assert_eq!(kept.load(SeqCst), 0, "released on request");
         // Nothing kept to give: still refused.
+        shared.forget_release();
         kept.store(50, SeqCst);
         assert!(h.grant_inner(200, Floor::Reserve, false, None, avail).unwrap().is_err());
+        // Asked again within a second: not asked, but MemAvailable is read again all the same.
+        kept.store(80, SeqCst);
+        let reads = std::sync::atomic::AtomicU64::new(0);
+        let later = || Some(AVAIL - [80, 0][(reads.fetch_add(1, SeqCst) as usize).min(1)]);
+        assert!(h.grant_inner(10, Floor::Reserve, false, None, later).unwrap().is_ok(), "read again");
+        assert_eq!(kept.load(SeqCst), 80, "not asked");
         // A held grant grows the same way.
+        shared.forget_release();
         let hold = Mutex::new(Some(h.grant_inner(10, Floor::Reserve, true, None, || Some(AVAIL)).unwrap().unwrap().1.unwrap()));
         kept.store(80, SeqCst);
-        assert!(h.grow_hold_inner(&hold, 30, Floor::Reserve, None, avail).unwrap().is_ok());
+        assert!(h.grow_hold_inner(&hold, 20, Floor::Reserve, None, avail).unwrap().is_ok());
         assert_eq!(kept.load(SeqCst), 0);
+    }
+
+    /// A grant comes out of the room checkpoint memory grows within at once (#648): until a refresh counts it as
+    /// promised, the two would spend the same memory above the reserve.
+    #[test]
+    fn grants_come_out_of_the_checkpoint_memory_room() {
+        let (_h_dir, mut h) = host("grant-debits-room");
+        h.cfg.reserve_mib = Some(0);
+        pin_clock(boottime_ms());
+        let room = crate::cow::Room::default();
+        room.attach(crate::hostmem::at(&h.run).unwrap());
+        room.set(1000);
+        assert!(h.grant_inner(300, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
+        assert_eq!(room.get(), 700);
+        let hold = Mutex::new(Some(h.grant_inner(100, Floor::Reserve, true, None, || Some(AVAIL)).unwrap().unwrap().1.unwrap()));
+        assert!(h.grow_hold_inner(&hold, 50, Floor::Reserve, None, || Some(AVAIL)).unwrap().is_ok());
+        assert_eq!(room.get(), 550, "held, and grown");
+        // More than is left: none left (not refused for it: admission has its own bound).
+        assert!(h.grant_inner(600, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
+        assert_eq!(room.get(), 0);
+        // Refused: nothing taken.
+        room.set(1000);
+        assert!(h.grant_inner(AVAIL, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_err());
+        assert_eq!(room.get(), 1000);
     }
 
     #[test]
