@@ -927,6 +927,8 @@ mod tests {
         output.read_line(&mut ready).unwrap();
         assert_eq!(ready, "ready\n");
         let id = Ident::of(child.id()).unwrap();
+        // The pool's `.locks`, made as a refill makes it (0700).
+        crate::host::private_file(&crate::host::locks(&d).join("refill")).unwrap();
         let record = crate::host::locks(&d).join(format!("{}.lock", id.key()));
         crate::host::write_record(&record, &serde_json::to_vec(&id).unwrap()).unwrap();
         let _held = Flock::new(crate::host::open_record(&record).unwrap(), libc::LOCK_EX).unwrap();
