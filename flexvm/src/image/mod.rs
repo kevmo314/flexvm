@@ -335,17 +335,14 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path) -> Result<Removal> {
     }
     let pinned = crate::host::Directory::open(&dir)?;
     let cached = pinned.path.join(rootfs.file_name().unwrap());
-    let nowait = |name: &str| match crate::host::lock_at(crate::host::host_locks()?, name, libc::LOCK_EX | libc::LOCK_NB) {
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        r => r.map(Some),
-    };
-    let Some(_lock) = nowait(&key_lock(&pinned, &cached)?)? else { return Ok(Removal::InUse) };
+    let key = key_lock(&pinned, &cached)?;
+    let Some(_lock) = crate::host::try_lock_at(crate::host::host_locks()?, &key)? else { return Ok(Removal::InUse) };
     let st = match File::open(&cached) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Absent),
         f => crate::util::fstat(f?.as_raw_fd())?,
     };
     // Kept while a pull builds a template of it (`Cached::reserved`).
-    let Some(_use) = nowait(&crate::host::use_lock(&st))? else { return Ok(Removal::InUse) };
+    let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else { return Ok(Removal::InUse) };
     for ext in ["ok", "ext4", "conf"] {
         match std::fs::remove_file(cached.with_extension(ext)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

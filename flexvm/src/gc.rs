@@ -17,7 +17,7 @@ const EVERY: Duration = Duration::from_secs(30);
 /// An arrival's log, unlocked, is its dead arrival's only after this: the
 /// listener creates it a moment before locking it.
 const ARRIVAL_GRACE: Duration = Duration::from_secs(5);
-/// How long `NAME.moved` keeps telling `ls` and `exec` where a VM went.
+/// How long `NAME.moved` keeps telling `stop`, `rm` and `exec` where a VM went.
 const MOVED_TTL: Duration = Duration::from_secs(3600);
 /// A log of a name with nothing left here (no VM, suspended VM, failed or
 /// moved record) goes once unwritten this long.
@@ -45,7 +45,7 @@ pub fn periodic(host: Host) {
 }
 
 /// Until this boot's recovery is complete, every opener of the host as root: `Host::after_boot`,
-/// which records the VMs lost in the reboot for `ls`, withdraws what they held and puts back the
+/// which records the VMs lost in the reboot for `ps -a`, withdraws what they held and puts back the
 /// routes to peers' VMs. With `rest`, then the forwarding settings flexvm needs and `recover`; the
 /// recovery is marked complete (`Host::mark_recovered`) only after all of it, and only if each
 /// step succeeded (delivery and settlement are retried from their records by every sweep). VM
@@ -83,14 +83,6 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     }
     host.mark_recovered()?;
     Ok(true)
-}
-
-/// `after_boot` with the rest, or `recover` if it did not run: listener startup.
-pub fn recover_after_boot(host: &Host) -> Result<()> {
-    if !after_boot(host, true)? {
-        recover(host);
-    }
-    Ok(())
 }
 
 /// Whether this is the first foreground warning in this boot (`RUN/.warned-BOOT`), so a failed
@@ -276,20 +268,20 @@ mod tests {
     }
 
     #[test]
-    fn initial_recovery_sweeps_even_when_the_host_lock_cannot_open() {
+    fn boot_recovery_sweeps_even_when_the_host_lock_cannot_open() {
         let d = dir("boot-lock-error");
         let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
         let lock = host.lock_file();
         let _ = std::fs::remove_file(&lock);
         std::fs::create_dir(&lock).unwrap();
         assert!(!host.run.join(".gc").exists());
-        let result = recover_after_boot(&host);
+        let result = after_boot(&host, true);
         if unsafe { libc::geteuid() } == 0 {
             assert!(result.is_err(), "root must report the failed boot recovery");
         } else {
-            assert!(result.is_ok(), "non-root skips boot recovery");
+            assert!(matches!(result, Ok(false)), "non-root skips boot recovery");
         }
-        assert!(host.run.join(".gc").exists(), "the initial sweep still ran");
+        assert_eq!(host.run.join(".gc").exists(), unsafe { libc::geteuid() } == 0, "root still ran the recovery sweep");
         assert!(!host.run.join(".boot").exists(), "failed recovery is retried");
     }
 

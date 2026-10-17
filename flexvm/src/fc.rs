@@ -511,9 +511,8 @@ impl Spawner {
             fc.cgroup = cgroup.clone();
             fc.tap = tap.clone();
             let cg = cgroup.as_ref().ok_or("--cpus needs per-VM cgroups (cgroup2 at /sys/fs/cgroup), which this host does not have")?;
-            std::fs::create_dir(cg)
-                .and_then(|()| std::fs::write(cg.join("cpu.max"), max))
-                .map_err(|e| format!("--cpus not applied: {}: {e}", cg.join("cpu.max").display()))?;
+            std::fs::create_dir(cg).map_err(|e| format!("--cpus not applied: {}: {e}", cg.join("cpu.max").display()))?;
+            fc.set_cpu_max(max)?;
         }
         if let Some(cg) = cgroup.clone() {
             let pid = fc.pid();

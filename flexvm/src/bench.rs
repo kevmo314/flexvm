@@ -92,7 +92,7 @@ pub fn run(args: &Args) -> Result<()> {
     };
     let timeout = Duration::from_secs(args.parse_or::<u64>("timeout", 120)?.max(1));
     let hosts = Hosts { a, b, to, timeout };
-    let template = &crate::template::name_of(args.get("template").unwrap_or(crate::template::DEFAULT_IMAGE))?;
+    let template = &crate::template::name_of(args.get("template").unwrap_or("ubuntu:24.04"))?;
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
     let id = format!("{}-{}", std::process::id(), crate::migrate::migration_id());
     let (report, suffix) = match args.get("lifecycle") {
