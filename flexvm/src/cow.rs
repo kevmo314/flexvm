@@ -669,7 +669,9 @@ impl Room {
     /// Attached: what is left as sampled now (`mib`: MemAvailable less the reserve and the grants guests have yet to
     /// touch, read without the host lock; None if it cannot be read: none), for `get` until the next take.
     pub fn refresh(&self, mib: impl FnOnce() -> Option<u64>) {
-        if self.0.host.get().is_some() {
+        if let Some(h) = self.0.host.get() {
+            // Takes populated whose mark found the host lock busy (`Host::settle_room`).
+            h.settle_room(std::time::Duration::from_millis(1));
             self.0.left.store(mib().unwrap_or(0), Ordering::SeqCst);
         }
     }

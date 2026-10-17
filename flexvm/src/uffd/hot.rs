@@ -169,18 +169,23 @@ impl Pager {
     pub fn host_memory(&self, room: impl FnOnce() -> Option<u64>, short: bool) {
         self.mem_room.refresh(room);
         if short {
-            self.release_kept();
+            let _ = self.release_kept();
         }
     }
 
-    /// Releases the memory kept for the next checkpoint: rescue memory and hot pages' (a request from another
-    /// process, `hostmem`, or the host is short).
-    pub fn release_kept(&self) {
+    /// Releases the memory kept for the next checkpoint (a request from another process, `hostmem`, or the host is
+    /// short): rescue memory, hot pages', and the last checkpoint's hot pages, which the next one compares its own with
+    /// (#691): without them it writes its hot pages, as it does after the arm. Whether no copy was running, before or
+    /// after (one that ended meanwhile keeps its memory for the next): all this process took from the room is unmapped
+    /// then, or goes with the checkpoint that holds it.
+    pub fn release_kept(&self) -> bool {
         let slots = self.slot_spare.lock().unwrap().take();
         let hot = self.hot_spare.lock().unwrap().take();
-        if slots.as_ref().is_some_and(|s| s.mapped_bytes() > 0) || hot.is_some() {
+        let prev = self.hot_prev.lock().unwrap().take();
+        if slots.as_ref().is_some_and(|s| s.mapped_bytes() > 0) || hot.is_some() || prev.is_some() {
             crate::log!("uffd: the host is short of memory: memory kept for the next checkpoint released");
         }
+        self.cow().is_none() && self.slot_spare.lock().unwrap().is_none() && self.hot_spare.lock().unwrap().is_none()
     }
 
     /// The memory of hot pages no checkpoint needs any more is the next one's (`prepare_hot`), unless it has larger.

@@ -568,22 +568,26 @@ through, so the checkpoint is exactly the memory at the pause.
   budget). Reading on more threads at once was slower. Neither this memory
   nor the hot pages' nor the writers' huge-page buffers is admitted like a
   guest's, so each keeps out of the host's reserve instead: each take is
-  checked against MemAvailable less the reserve and the grants guests have
-  yet to touch, and mapped and populated, under the host lock, so VMs
-  copying at once, and admission, see what the others took and never take
-  more than there is together (#648). The take is debited under the lock
-  (`RUN/room-debits-BOOT`, as boot-clock time and MiB) and populated after
-  it goes. Linux folds each CPU's counter deltas into MemAvailable only
-  every `vm.stat_interval` (or past a threshold), so memory populated just
-  now may not show for a while: a debit counts in full for 2 s (it may
-  still be populating) and, up to twice the interval, together with the
-  other older ones for at most what those deltas can hide (the zones'
+  checked against MemAvailable less the reserve, the grants guests have
+  yet to touch and what was taken lately, and debited, under the host lock
+  (`RUN/room-debits-BOOT`, with the process that took it), so VMs copying
+  at once, and admission, see what the others took and never take more
+  than there is together (#648). It is populated after the lock goes. A
+  debit counts in full until its process marks it populated (under the
+  lock again, tried as a take is: else at its next take or controller
+  tick), however long that takes, or is proven gone (#691). Linux folds
+  each CPU's counter deltas into MemAvailable only every
+  `vm.stat_interval` (or past a threshold), so memory populated just now
+  may not show for a while: populated debits count, up to twice the
+  interval, together for at most what those deltas can hide (the zones'
   thresholds in /proc/zoneinfo, about 15 MiB on 24 CPUs; in full where
-  zoneinfo cannot be read). Admission counts
-  them too. Debits expire by age, so a process that dies leaves nothing to
-  reclaim (#677). A take never waits on the lock (a fault may be waiting
-  on it): it tries for 1 ms, past another take's few tens of µs, and
-  busy past that it takes nothing and the fault leaves its pages to the
+  zoneinfo cannot be read). Admission counts them too. A VM process that
+  releases its kept memory on request with no copy running retires its
+  populated debits from before (what they covered is unmapped), and
+  admission counts again after the release (#691). A take never waits on
+  the lock (a fault may be waiting on it): it tries for 1 ms, past another
+  take's few tens of µs, and busy past that it takes nothing and the fault
+  leaves its pages to the
   writers. A take whose MemAvailable or grants cannot be read takes
   nothing, and so does one whose debits cannot be read until a whole
   window has passed since they were last written. Each VM process's controller samples what is left about every
@@ -595,13 +599,15 @@ through, so the checkpoint is exactly the memory at the pause.
   mapped `RUN/.locks/memory-v2-BOOT` room, which neither sees these takes
   nor answers these requests: after an upgrade, restart or migrate them;
   until then the reserve may be overcommitted.
-  Writer buffers are populated as they are made (written page by page
+  Each writer populates its buffer as it starts (written page by page
   where the kernel cannot). Without room for a block of copies, faults ask the writers for
   their pages and wait for them as over budget, and the pause protects
   pages it would have copied hot; no checkpoint fails for it. Under the
   eviction mark (or with the VM starved), or when another process asks
   (admission before it refuses, above), the memory kept for the next
-  checkpoint is released, and a copy that ends under the reserve keeps none.
+  checkpoint is released (rescue chunks, hot pages' memory, and the last
+  checkpoint's hot pages, so the next one writes its hot pages without
+  comparing them), and a copy that ends under the reserve keeps none.
 - **Hot pages** (#235). Every `UFFDIO_WRITEPROTECT`, protect or unprotect,
   makes KVM zap its mappings of the whole range (6.18 ignores the notifier's
   event type) and flush every vCPU's TLB: after the resume the guest
