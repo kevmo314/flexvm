@@ -18,8 +18,10 @@ use std::{
 };
 
 const UNIT: usize = 256;
-/// Most writer threads; a few saturate the disk.
-const MAX_WRITERS: usize = 12;
+/// Most writer threads. A few saturate the disk: past 4-6 the copy is no faster and each
+/// writer only adds lock contention in the filesystem (4 GiB guest here: 12 writers spend
+/// about 7% more CPU than 6 for the same time).
+const MAX_WRITERS: usize = 6;
 
 pub(crate) trait GuestPages: Sync {
     fn region_end(&self, page: usize) -> Option<usize>;
@@ -83,11 +85,22 @@ impl PagesFile {
     }
 
     /// Allocates room for `pages` pages so writes run in parallel (ext4 with O_DIRECT).
+    /// A unit at a time: ext4 takes each request on its own, and one larger than the free
+    /// extents near its goal falls through to scanning every group for space (with a
+    /// bitmap prefetch over all of them each time). On a fragmented disk that cost 1-1.6 s
+    /// of CPU for 2 GiB in one call, against 0.2-0.8 s in 1 MiB requests, which find their
+    /// goal or a free extent of their size straight away. On a disk with room each continues
+    /// the last one's extent: 2 GiB took 15-20 ms against 6-8 ms in one call, in as few extents.
     pub(super) fn reserve(&self, pages: usize) {
-        let have = self.allocated.load(Ordering::Relaxed);
-        let (off, len) = ((have * PAGE_SIZE) as libc::off_t, (pages.saturating_sub(have) * PAGE_SIZE) as libc::off_t);
-        if pages > have && unsafe { libc::fallocate(self.file.as_raw_fd(), 0, off, len) } == 0 {
-            self.allocated.store(pages, Ordering::Relaxed);
+        let fd = self.file.as_raw_fd();
+        let mut have = self.allocated.load(Ordering::Relaxed);
+        while have < pages {
+            let n = UNIT.min(pages - have);
+            if unsafe { libc::fallocate(fd, 0, (have * PAGE_SIZE) as libc::off_t, (n * PAGE_SIZE) as libc::off_t) } != 0 {
+                break;
+            }
+            have += n;
+            self.allocated.store(have, Ordering::Relaxed);
         }
     }
 
@@ -145,6 +158,51 @@ pub(crate) fn aligned(n: usize) -> io::Result<Vec<Page>> {
     Ok(v)
 }
 
+/// A writer's buffer: `pages` pages at the start of a 2 MiB-aligned mapping, backed by a
+/// transparent huge page where the host allows (`madvise` mode included). Each direct write
+/// then pins one folio rather than every page and goes out in fewer, larger segments: on a
+/// 4 GiB guest here the copy took about 12% less CPU and 30% less time.
+struct Buf {
+    ptr: *mut u8,
+    map: usize,
+    len: usize,
+}
+
+const HUGE: usize = 2 << 20;
+
+impl Buf {
+    fn new(pages: usize) -> io::Result<Buf> {
+        let len = pages * PAGE_SIZE;
+        let map = len.next_multiple_of(HUGE);
+        // Room to align the start, the excess unmapped again.
+        let raw = unsafe { libc::mmap(std::ptr::null_mut(), map + HUGE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"));
+        }
+        let (raw, start) = (raw as usize, (raw as usize).next_multiple_of(HUGE));
+        unsafe {
+            if start > raw {
+                libc::munmap(raw as *mut _, start - raw);
+            }
+            libc::munmap((start + map) as *mut _, raw + HUGE - start);
+            // Only a hint: without it the buffer is ordinary pages.
+            libc::madvise(start as *mut _, map, libc::MADV_HUGEPAGE);
+        }
+        Ok(Buf { ptr: start as *mut u8, map, len })
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        // Mapped, initialized (zero) and ours alone.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr.cast(), self.map) };
+    }
+}
+
 pub(crate) fn as_bytes(pages: &mut [Page]) -> &mut [u8] {
     // `Page` is PAGE_SIZE initialized bytes with no padding.
     unsafe { std::slice::from_raw_parts_mut(pages.as_mut_ptr().cast(), std::mem::size_of_val(pages)) }
@@ -177,7 +235,7 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
         (0..).map(|_| next.fetch_add(1, Ordering::Relaxed)).take_while(|&k| k < units.len()).find(|&k| !taken[k].swap(true, Ordering::SeqCst))
     };
     let work = || -> Result<()> {
-        let mut buf = aligned(UNIT)?;
+        let mut buf = Buf::new(UNIT)?;
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         let mut scratch = Vec::with_capacity(UNIT);
         loop {
@@ -186,7 +244,7 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
             }
             let Some(k) = pick() else { return Ok(()) };
             let (first, n) = units[k];
-            let bytes = &mut as_bytes(&mut buf)[..n * PAGE_SIZE];
+            let bytes = &mut buf.bytes()[..n * PAGE_SIZE];
             src.read(first, bytes)?;
             let mut unit = Unit { first, kinds: Vec::with_capacity(n), sums: Vec::new(), at: 0 };
             iov.clear();

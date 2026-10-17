@@ -747,3 +747,19 @@ fn template_users_count_every_suspended_vm() {
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222"].map(String::from).into();
     assert_eq!(host.template_users(), want);
 }
+
+#[test]
+fn reserve_allocates_in_units_up_to_what_is_asked() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tmp("reserve");
+    let path = dir.join("pages");
+    let file = pages_file(&path);
+    let allocated = |f: &PagesFile| f.file.metadata().unwrap().blocks() * 512;
+    // Not a whole number of units, then more on top: what was there stays, the rest is added.
+    file.reserve(600);
+    assert!(allocated(&file) >= 600 * PAGE_SIZE as u64, "{}", allocated(&file));
+    file.reserve(100);
+    file.reserve(1000);
+    assert!(allocated(&file) >= 1000 * PAGE_SIZE as u64, "{}", allocated(&file));
+    assert_eq!(file.file.metadata().unwrap().len(), 1000 * PAGE_SIZE as u64);
+}
