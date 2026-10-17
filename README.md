@@ -110,7 +110,7 @@ web                      10.200.0.1      nginx:1.27       running         41522 
 | `lost` | ran here when the host went down (a reboot, or its process was SIGKILLed); its address is withdrawn, until `flexvm rm` |
 
 The last four are stopped: `ps` lists them with `-a`. Standby VMs are not
-listed: `flexvm images` counts them.
+listed: `flexvm images` shows their configured count in `STANDBY`.
 
 ```sh
 flexvm exec web 'free -m'       # a shell command in the guest; exits with its status
@@ -145,7 +145,8 @@ As in Docker, `kill` is for a running VM and `rm` for a stopped one: `kill`
 of a stopped VM and `rm` of a running one are refused, saying so, and `rm -f`
 does either. `stop`, `start`, `pause`, `unpause`, `kill` and `rm` take
 several names, go on past one that fails, and print each name done (`start`
-prints the VM's JSON instead). A VM is its process, so the signals in
+prints the VM's JSON when restoring a stopped VM, and its name when already
+running or paused). A VM is its process, so the signals in
 parentheses work as well, sent to the pid `ps` shows.
 
 A stopped VM keeps its name and address. `start` restores it in a new
@@ -228,7 +229,7 @@ warnings about likely mistakes.
 
 Every command checks the file as it loads it (`Config::validate`): a key it
 does not know, a malformed address or range, a `peers` entry that is not
-`HOST:PORT`, a `peer_underlays` address that is local or not unicast, a
+`HOST:PORT`, a `peer_underlays` address that is loopback or not unicast, a
 non-IPv4 `dns`, or a `vm_ips` not inside `cluster_ips` makes every command
 refuse to start, naming the file and the problem, until it is fixed. A
 running process keeps the last valid configuration meanwhile, so an edit
@@ -236,7 +237,10 @@ mid-write is never taken. Write it whole (an editor's save, or a temporary
 file renamed over it); it must be a regular file, not a link, that no one
 but its owner (root) may write. A new `vm_ips` or `dns` applies to
 addresses handed out and guests set up after it (standby VMs' claims
-included); running VMs keep theirs.
+included); running VMs keep theirs. Whether a peer underlay is local depends
+on the current interfaces: `info` and the listener (after writing its config)
+warn if it is local or the interface lookup fails, without refusing commands
+or configuration reloads.
 
 There is no `config` command: the file is the interface, and a reload is
 how every process already picks up changes, so a command would only write
