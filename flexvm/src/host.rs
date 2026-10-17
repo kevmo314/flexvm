@@ -3635,37 +3635,73 @@ pub fn tripped(name: &str) -> bool {
 /// wait for all of them), and one latch: once the marker is removed, the gate stays open for that arming, so a
 /// thread that gets here late never parks on a marker it made after the release.
 pub fn hold(name: &str) {
-    /// One arming's latch, shared by a process's threads at one gate.
-    struct Latch {
-        until: u64,
-        parked: usize,
-        open: bool,
-    }
-    static GATES: Mutex<Option<HashMap<String, Latch>>> = Mutex::new(None);
+    static GATES: Latches = Mutex::new(None);
     let Some(until) = armed_until(name) else { return };
-    let Some(marker) = RUN_DIR.get().map(|r| r.join("gates").join(format!("{name}.{}", std::process::id()))) else { return };
+    let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) else { return };
+    let _ = host_dir(&dir, 0o700);
+    park_at(&GATES, name, until, &dir.join(format!("{name}.{}", std::process::id())), Duration::from_secs(600));
+}
+
+/// One arming's latch, shared by a process's threads at one gate (`hold`).
+struct Latch {
+    until: u64,
+    parked: usize,
+    open: bool,
+}
+
+type Latches = Mutex<Option<HashMap<String, Latch>>>;
+
+/// `hold`'s parking at gate `name`, armed until `until`, on `marker`, for at most `cap`. Only the first arrival makes
+/// the marker; a later one updates its count only if it is still there, and one gone is a release. Every parked
+/// thread leaves once the marker is gone or another thread opened the latch.
+fn park_at(latches: &Latches, name: &str, until: u64, marker: &Path, cap: Duration) {
+    let open = |latches: &Latches| {
+        let mut g = latches.lock().unwrap();
+        if let Some(l) = g.as_mut().and_then(|g| g.get_mut(name)).filter(|l| l.until == until) {
+            l.open = true;
+        }
+    };
     {
-        let mut gates = GATES.lock().unwrap();
-        let l = gates.get_or_insert_with(HashMap::new).entry(name.into()).or_insert(Latch { until, parked: 0, open: false });
+        let mut g = latches.lock().unwrap();
+        let l = g.get_or_insert_with(HashMap::new).entry(name.into()).or_insert(Latch { until, parked: 0, open: false });
         if l.until != until {
             *l = Latch { until, parked: 0, open: false };
         }
-        // Released: by the latch, or the marker gone with others parked (before they noticed).
-        if l.open || (l.parked > 0 && !marker.exists()) {
+        if l.open {
+            return;
+        }
+        let n = (l.parked + 1).to_string();
+        let wrote = match l.parked {
+            0 => write_record(marker, n.as_bytes()),
+            _ => update_record(marker, n.as_bytes()),
+        };
+        if wrote.is_err() && l.parked > 0 {
+            // Removed since the first arrival made it: released.
             l.open = true;
             return;
         }
         l.parked += 1;
-        reached_count(name, l.parked);
     }
-    let end = std::time::Instant::now() + Duration::from_secs(600);
-    while marker.exists() && std::time::Instant::now() < end {
+    let end = std::time::Instant::now() + cap;
+    loop {
+        let released = latches.lock().unwrap().as_ref().and_then(|g| g.get(name)).is_none_or(|l| l.until != until || l.open);
+        if released {
+            return;
+        }
+        if !marker.exists() {
+            return open(latches);
+        }
+        if std::time::Instant::now() >= end {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let mut gates = GATES.lock().unwrap();
-    if let Some(l) = gates.as_mut().and_then(|g| g.get_mut(name)).filter(|l| l.until == until) {
-        l.open = true;
-    }
+}
+
+/// Rewrites `path` only if it exists (never makes it).
+fn update_record(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    File::options().write(true).truncate(true).custom_flags(libc::O_NOFOLLOW).open(path)?.write_all(data)
 }
 
 /// Test hook: tells a test this process got to `name` (RUN/gates/NAME.PID), so it acts there, not after a guessed delay.
@@ -3673,14 +3709,6 @@ fn reached(name: &str) {
     if let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) {
         let _ = host_dir(&dir, 0o700);
         let _ = write_record(&dir.join(format!("{name}.{}", std::process::id())), b"");
-    }
-}
-
-/// `reached`, saying how many of this process's threads are parked there (`hold`).
-fn reached_count(name: &str, n: usize) {
-    if let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) {
-        let _ = host_dir(&dir, 0o700);
-        let _ = write_record(&dir.join(format!("{name}.{}", std::process::id())), n.to_string().as_bytes());
     }
 }
 
@@ -3703,6 +3731,85 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parks `n` threads at gate `g` on `marker` (one latch set), returning once the marker counts all of them.
+    fn parked(latches: &'static Latches, marker: &Path, n: usize) -> Vec<std::thread::JoinHandle<()>> {
+        let ths: Vec<_> = (0..n)
+            .map(|_| {
+                let m = marker.to_path_buf();
+                std::thread::spawn(move || park_at(latches, "g", 7, &m, Duration::from_secs(60)))
+            })
+            .collect();
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(marker).ok().as_deref() != Some(n.to_string().as_str()) {
+            assert!(std::time::Instant::now() < end, "never all {n} parked: {:?}", std::fs::read_to_string(marker));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ths
+    }
+
+    fn all_leave(ths: Vec<std::thread::JoinHandle<()>>) {
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while !ths.iter().all(|t| t.is_finished()) {
+            assert!(std::time::Instant::now() < end, "a parked thread was left parked");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_hold_counts_its_parked_threads_and_one_release_lets_them_all_go() {
+        static L: Latches = Mutex::new(None);
+        let dir = crate::test_util::TempDir::new("hold-count");
+        let marker = dir.join("g.1");
+        let ths = parked(&L, &marker, 4);
+        std::fs::remove_file(&marker).unwrap();
+        all_leave(ths);
+    }
+
+    #[test]
+    fn a_late_arrival_after_the_release_never_parks_or_remakes_the_marker() {
+        static L: Latches = Mutex::new(None);
+        let dir = crate::test_util::TempDir::new("hold-late");
+        let marker = dir.join("g.1");
+        let ths = parked(&L, &marker, 1);
+        // Released, then another thread gets there at once (before the parked one may have noticed).
+        std::fs::remove_file(&marker).unwrap();
+        let t = std::time::Instant::now();
+        park_at(&L, "g", 7, &marker, Duration::from_secs(60));
+        assert!(t.elapsed() < Duration::from_secs(5), "the late arrival parked");
+        assert!(!marker.exists(), "the late arrival made the marker again");
+        all_leave(ths);
+        // And later ones of the same arming pass straight through too.
+        park_at(&L, "g", 7, &marker, Duration::from_secs(60));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn parked_threads_leave_on_the_latch_even_if_the_marker_is_back() {
+        static L: Latches = Mutex::new(None);
+        let dir = crate::test_util::TempDir::new("hold-latch");
+        let marker = dir.join("g.1");
+        let ths = parked(&L, &marker, 2);
+        std::fs::remove_file(&marker).unwrap();
+        // A late arrival opens the latch (or a parked thread did, on seeing the marker gone): a marker made again
+        // after that keeps no one parked.
+        park_at(&L, "g", 7, &marker, Duration::from_secs(60));
+        std::fs::write(&marker, b"").unwrap();
+        all_leave(ths);
+        // A new arming is a new latch: it parks again until released.
+        std::fs::remove_file(&marker).unwrap();
+        let m = marker.clone();
+        let th = std::thread::spawn(move || park_at(&L, "g", 8, &m, Duration::from_secs(60)));
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(std::time::Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!th.is_finished(), "a new arming did not park");
+        std::fs::remove_file(&marker).unwrap();
+        all_leave(vec![th]);
+    }
 
     #[test]
     fn cluster_defaults_are_visible_and_warn_with_peers() {
