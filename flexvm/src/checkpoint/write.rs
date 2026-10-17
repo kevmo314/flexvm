@@ -187,23 +187,23 @@ fn populate(ptr: *mut u8, len: usize) {
 impl Buf {
     #[cfg(test)]
     fn new(room: &Room) -> io::Result<Buf> {
-        Ok(Buf::many(room, 1)?.pop().unwrap())
+        let b = Buf::many(room, 1)?.pop().unwrap();
+        b.populate();
+        Ok(b)
     }
 
     /// Buffers for `n` writers: huge ones for as many as the room shows space for, in one take (a checkpoint's
-    /// writers take the host lock once, not each: a fault may be trying for it, #677), the rest ordinary.
+    /// writers take the host lock once, not each: a fault may be trying for it, #677), the rest ordinary. Each
+    /// writer populates its own (`populate`) as it starts, which the take's debit counts until MemAvailable shows it.
     fn many(room: &Room, n: usize) -> io::Result<Vec<Buf>> {
         let (len, huge) = (UNIT * PAGE_SIZE, (UNIT * PAGE_SIZE).next_multiple_of(HUGE));
         let mib = (huge >> 20) as u64;
         let fit = n.min(usize::try_from(room.get() / mib).unwrap_or(usize::MAX));
-        // Populated within the take, so the room sees it taken, not with its first write (#672).
         let one = || -> io::Result<Buf> {
             let ptr = Buf::map(huge, len, HUGE)?;
-            let b = Buf { ptr, map: huge, len };
             // Only a hint: without it the buffer is ordinary pages.
             unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
-            populate(ptr, huge);
-            Ok(b)
+            Ok(Buf { ptr, map: huge, len })
         };
         let mut out = match fit {
             0 => Vec::new(),
@@ -213,6 +213,13 @@ impl Buf {
             out.push(Buf::plain(UNIT)?);
         }
         Ok(out)
+    }
+
+    /// Faults a huge one in at once, before its first write (#672); an ordinary one faults in as it is written.
+    fn populate(&self) {
+        if self.map == HUGE {
+            populate(self.ptr, self.map);
+        }
     }
 
     /// Ordinary page-aligned storage, taking no room.
@@ -297,6 +304,7 @@ pub(super) fn write_pages(
     let bufs = Mutex::new(Buf::many(room, threads)?);
     let work = || -> Result<()> {
         let mut buf = bufs.lock().unwrap().pop().map_or_else(|| Buf::plain(UNIT), Ok)?;
+        buf.populate();
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         let mut scratch = Vec::with_capacity(UNIT);
         loop {
@@ -436,10 +444,10 @@ mod buf_tests {
         assert_eq!(Buf::new(&room).unwrap().map, HUGE);
     }
 
-    /// A writer buffer is populated within its take, also where the kernel cannot populate it at once (#674): every
-    /// page is in before the room is let go.
+    /// A writer buffer is populated before its first write, also where the kernel cannot populate it at once (#674):
+    /// every page is in.
     #[test]
-    fn a_writer_buffer_is_populated_within_its_take() {
+    fn a_writer_buffer_is_populated_before_its_first_write() {
         let room = Room::default();
         FAIL_POPULATE.with(|f| f.set(true));
         let b = Buf::new(&room).unwrap();

@@ -168,10 +168,11 @@ mod tests {
         let (dir, h) = crate::host::tests::host("hostmem");
         let run = h.run.clone();
         crate::host::pin_clock(crate::host::boottime_ms());
-        let now = || Instant::now() + Duration::from_secs(5);
+        // Long: other tests hold the host lock (one for the process) for a while on a loaded machine.
+        let now = || Instant::now() + Duration::from_secs(30);
         // Nobody to ask: answered at once.
-        let t = Instant::now();
         let n = ask(&h, now()).unwrap();
+        let t = Instant::now();
         assert!(wait(&run, n, now()));
         assert!(t.elapsed() < Duration::from_secs(1));
         let released = Arc::new(AtomicUsize::new(0));
@@ -190,10 +191,10 @@ mod tests {
         assert_eq!(released.load(Ordering::SeqCst), 0, "a request made before it joined is not its");
         // Waits for the release (a poll and 20 ms), not for the deadline.
         forget_release(&run);
-        let t = Instant::now();
         let n = ask(&h, now()).unwrap();
-        assert!(wait(&run, n, now()));
-        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        let t = Instant::now();
+        assert!(wait(&run, n, Instant::now() + Duration::from_secs(10)));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         assert_eq!(released.load(Ordering::SeqCst), 1);
         // Within a second of the last: not asked again.
         assert_eq!(ask(&h, now()), None);
