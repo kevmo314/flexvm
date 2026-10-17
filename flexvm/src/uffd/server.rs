@@ -219,6 +219,11 @@ fn read_request(stream: &mut impl Read, req: &mut [u8; 12], stop: &impl Fn() -> 
 }
 
 impl Pager {
+    /// Host memory that checkpoint memory may still take (`host_memory`).
+    pub fn mem_room(&self) -> &crate::cow::Room {
+        &self.mem_room
+    }
+
     pub fn read_guest(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         Ok(self.read_at(offset, &[libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() }])?)
     }

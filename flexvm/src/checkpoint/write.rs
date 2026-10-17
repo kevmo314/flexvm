@@ -4,6 +4,7 @@ use super::{
     format::{DATA, MAGIC, TEMPLATE, ZERO},
 };
 use crate::{
+    cow::Room,
     crc32c,
     template::Template,
     uffd::{Pager, Runs, REMOTE},
@@ -161,34 +162,52 @@ pub(crate) fn aligned(n: usize) -> io::Result<Vec<Page>> {
 /// A writer's buffer: `pages` pages at the start of a 2 MiB-aligned mapping, backed by a
 /// transparent huge page where the host allows (`madvise` mode included). Each direct write
 /// then pins one folio rather than every page and goes out in fewer, larger segments: on a
-/// 4 GiB guest here the copy took about 12% less CPU and 30% less time.
+/// 4 GiB guest here the copy took about 12% less CPU and 30% less time. The huge page is
+/// all of the rounded-up mapping, which counts against the host's memory room as rescued
+/// copies do (`cow::Room`); without that much room the buffer is ordinary pages, just `pages`.
 struct Buf {
     ptr: *mut u8,
     map: usize,
     len: usize,
+    /// Whether it took room for a huge page (tests look).
+    #[cfg_attr(not(test), allow(dead_code))]
+    huge: bool,
 }
 
 const HUGE: usize = 2 << 20;
 
 impl Buf {
-    fn new(pages: usize) -> io::Result<Buf> {
+    fn new(pages: usize, room: &Room) -> io::Result<Buf> {
         let len = pages * PAGE_SIZE;
-        let map = len.next_multiple_of(HUGE);
-        // Room to align the start, the excess unmapped again.
-        let raw = unsafe { libc::mmap(std::ptr::null_mut(), map + HUGE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
-        if raw == libc::MAP_FAILED {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"));
+        let huge = len.next_multiple_of(HUGE);
+        if !room.take((huge >> 20) as u64) {
+            return Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len, huge: false });
         }
-        let (raw, start) = (raw as usize, (raw as usize).next_multiple_of(HUGE));
+        let ptr = Buf::map(huge, len, HUGE)?;
+        // Only a hint: without it the buffer is ordinary pages.
+        unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
+        Ok(Buf { ptr, map: huge, len, huge: true })
+    }
+
+    /// `map` bytes of anonymous memory, at a multiple of `align` (0: anywhere).
+    fn map(map: usize, len: usize, align: usize) -> io::Result<*mut u8> {
+        let full = map + align;
+        let raw = unsafe { libc::mmap(std::ptr::null_mut(), full, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, format!("cannot allocate checkpoint buffer of {len} bytes")));
+        }
+        let raw = raw as usize;
+        let start = if align == 0 { raw } else { raw.next_multiple_of(align) };
+        // The excess around the aligned start, unmapped again.
         unsafe {
             if start > raw {
                 libc::munmap(raw as *mut _, start - raw);
             }
-            libc::munmap((start + map) as *mut _, raw + HUGE - start);
-            // Only a hint: without it the buffer is ordinary pages.
-            libc::madvise(start as *mut _, map, libc::MADV_HUGEPAGE);
+            if raw + full > start + map {
+                libc::munmap((start + map) as *mut _, raw + full - start - map);
+            }
         }
-        Ok(Buf { ptr: start as *mut u8, map, len })
+        Ok(start as *mut u8)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -210,7 +229,16 @@ pub(crate) fn as_bytes(pages: &mut [Page]) -> &mut [u8] {
 
 /// Writes the REMOTE pages of `runs` into `out` and builds the page map; with `explicit`
 /// (a delta), listed template pages get TEMPLATE runs.
-pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &PagesFile, threads: usize, explicit: bool) -> Result<Written> {
+/// Writer buffers take `room` (see `Buf`).
+pub(super) fn write_pages(
+    template: &Template,
+    src: &dyn GuestPages,
+    runs: &Runs,
+    out: &PagesFile,
+    threads: usize,
+    explicit: bool,
+    room: &Room,
+) -> Result<Written> {
     let mut units: Vec<(usize, usize)> = Vec::new();
     for &(first, count, _) in runs.iter().filter(|r| r.2 == REMOTE) {
         let (mut p, end) = (first as usize, (first + count) as usize);
@@ -235,7 +263,7 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
         (0..).map(|_| next.fetch_add(1, Ordering::Relaxed)).take_while(|&k| k < units.len()).find(|&k| !taken[k].swap(true, Ordering::SeqCst))
     };
     let work = || -> Result<()> {
-        let mut buf = Buf::new(UNIT)?;
+        let mut buf = Buf::new(UNIT, room)?;
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         let mut scratch = Vec::with_capacity(UNIT);
         loop {
@@ -323,4 +351,42 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
     w.map.extend(words.flat_map(u64::to_le_bytes));
     w.map.extend(sums.iter().flat_map(|s| s.to_le_bytes()));
     Ok(w)
+}
+
+#[cfg(test)]
+mod buf_tests {
+    use super::*;
+
+    #[test]
+    fn writer_buffers_are_huge_only_with_room_for_the_whole_huge_page() {
+        let room = Room::default();
+        for (have, huge, left) in [(0, false, 0), (1, false, 1), (5, true, 3)] {
+            room.set(have);
+            let mut b = Buf::new(UNIT, &room).unwrap();
+            assert_eq!((b.huge, room.get()), (huge, left), "room {have} MiB");
+            // A huge one is all of an aligned 2 MiB; an ordinary one only what it holds,
+            // which no huge page fits in.
+            assert_eq!(b.map, if huge { HUGE } else { UNIT * PAGE_SIZE });
+            assert_eq!(b.ptr as usize % if huge { HUGE } else { PAGE_SIZE }, 0);
+            let bytes = b.bytes();
+            assert_eq!(bytes.len(), UNIT * PAGE_SIZE);
+            assert!(bytes.iter().all(|&x| x == 0));
+            bytes.fill(7);
+            if !huge {
+                assert_eq!(anon_huge_kib(b.ptr as usize), 0, "an ordinary buffer took a huge page");
+            }
+        }
+        // Unknown room (as a pager starts): no bound.
+        let unbounded = Room::default();
+        assert!(Buf::new(UNIT, &unbounded).unwrap().huge);
+    }
+
+    /// AnonHugePages of the mapping starting at `addr`, from /proc/self/smaps.
+    fn anon_huge_kib(addr: usize) -> u64 {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let start = format!("{addr:x}-");
+        let mut lines = smaps.lines().skip_while(|l| !l.starts_with(&start)).skip(1);
+        let line = lines.find(|l| l.starts_with("AnonHugePages:")).expect("mapping in smaps");
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
 }
