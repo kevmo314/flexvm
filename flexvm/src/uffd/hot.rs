@@ -132,7 +132,7 @@ impl Pager {
         }
         *spare = None;
         // Not into the host's reserve (see `host_memory`): the pause protects these pages instead.
-        if !self.mem_room.take(((want * PAGE_SIZE) >> 20) as u64 + 1) {
+        if self.mem_room.take(((want * PAGE_SIZE) >> 20) as u64 + 1).is_none() {
             crate::log!("uffd: no room for hot pages ({want} pages): the host is near its reserve");
             return;
         }
@@ -164,18 +164,25 @@ impl Pager {
         copy(buf, prev, hot, |p| next_to(self.mappings(), p), read).inspect_err(|e| crate::log!("uffd: hot pages not copied, protecting them: {e}")).ok()
     }
 
-    /// The VM process's memory controller, every second: `room` is what host memory is left above its reserve (MiB;
-    /// None if unknown), which rescue memory and hot pages' memory grow within, as they are not admitted like a
-    /// guest's; and while the host is `short` (under its eviction mark, or this VM starved) the memory kept for the
-    /// next checkpoint (both of those) goes back. A copy running on keeps what it has until it ends.
-    pub fn host_memory(&self, room: Option<u64>, short: bool) {
-        self.mem_room.set(room.unwrap_or(u64::MAX));
+    /// The VM process's memory controller, every second: `room` gives what host memory is left above its reserve and
+    /// the grants guests have yet to touch (MiB; None if unknown), which rescue memory and hot pages' memory grow
+    /// within, as they are not admitted like a guest's (`cow::Room`, the host's once attached); and while the host is
+    /// `short` (under its eviction mark, or this VM starved) the memory kept for the next checkpoint (both of those)
+    /// goes back. A copy running on keeps what it has until it ends.
+    pub fn host_memory(&self, room: impl FnOnce() -> Option<u64>, short: bool) {
+        self.mem_room.refresh(room);
         if short {
-            let slots = self.slot_spare.lock().unwrap().take();
-            let hot = self.hot_spare.lock().unwrap().take();
-            if slots.as_ref().is_some_and(|s| s.mapped_bytes() > 0) || hot.is_some() {
-                crate::log!("uffd: the host is short of memory: memory kept for the next checkpoint released");
-            }
+            self.release_kept();
+        }
+    }
+
+    /// Releases the memory kept for the next checkpoint: rescue memory and hot pages' (a request from another
+    /// process, `hostmem`, or the host is short).
+    pub fn release_kept(&self) {
+        let slots = self.slot_spare.lock().unwrap().take();
+        let hot = self.hot_spare.lock().unwrap().take();
+        if slots.as_ref().is_some_and(|s| s.mapped_bytes() > 0) || hot.is_some() {
+            crate::log!("uffd: the host is short of memory: memory kept for the next checkpoint released");
         }
     }
 

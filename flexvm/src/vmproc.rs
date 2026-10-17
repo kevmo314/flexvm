@@ -1068,6 +1068,7 @@ impl Proc {
             thread::spawn(move || f(p));
         };
         spawn(Proc::controller);
+        spawn(Proc::release_on_request);
         spawn(Proc::serve_memory);
         spawn(Proc::watch_memory);
         if self.vm().template.meta.image.as_ref().is_some_and(|i| i.has_app()) {
@@ -1425,9 +1426,18 @@ impl Proc {
                 published = vm.starving();
                 self.publish();
             }
-            let avail = host_available_mib();
+            let mut avail = host_available_mib();
             let (reserve, at, _) = self.host.config_now().evict_marks();
-            vm.pager.host_memory(avail.map(|a| a.saturating_sub(reserve)), avail.is_some_and(|a| a < at) || vm.starving());
+            // Memory VM processes keep for their next checkpoint never moves a VM away: it goes back first (#648).
+            if avail.is_some_and(|a| a < at) && crate::hostmem::release_kept(&self.host.run, None) {
+                avail = host_available_mib();
+            }
+            if let Ok(s) = crate::hostmem::at(&self.host.run) {
+                vm.pager.mem_room().attach(s);
+            }
+            // Out of what admission promised guests too; none if that cannot be read.
+            let room = || Some(avail?.saturating_sub(reserve).saturating_sub(self.host.promised().unwrap_or(u64::MAX)));
+            vm.pager.host_memory(room, avail.is_some_and(|a| a < at) || vm.starving());
             relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
             if let Some(dev) = self.host.config_now().announce_dev() {
@@ -1446,6 +1456,16 @@ impl Proc {
         match *vm.cow_copy.lock().unwrap() {
             true => resize(vm, &self.host, hint, true),
             false => Ok(Resized::Busy),
+        }
+    }
+
+    /// Answers other processes' requests that this one release the memory it keeps for the next checkpoint
+    /// (`hostmem`): admission asks before it refuses, eviction and the standby pool before they react to the host
+    /// running short.
+    fn release_on_request(self: Arc<Self>) {
+        match crate::hostmem::at(&self.host.run) {
+            Ok(s) => s.serve(|| self.vm().pager.release_kept()),
+            Err(e) => crate::log!("vm {}: memory kept for checkpoints is not released on request: {e}", self.vm().name),
         }
     }
 

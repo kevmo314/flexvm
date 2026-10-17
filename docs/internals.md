@@ -54,7 +54,12 @@ not wait on the host:
   requests and ticks alike, is admitted against the reserve (`reserve_mib`) under the host
   lock, with the last 10 s of grants (`RUN/grants`, every VM process's) counted as used (plugged memory shows up
   in MemAvailable only once touched). A refused guest is told `full` and
-  marked starved. Admission is not enforcement: a guest can still fill memory
+  marked starved. Before it refuses, every VM process is asked (a futex in
+  `RUN/.locks/memory-BOOT`) to release the memory it keeps for its next
+  checkpoint, waiting up to 200 ms for each, and MemAvailable is read again:
+  that memory is not admitted, so it never refuses a grant (#648). Eviction
+  and the standby pool ask the same before they react to the host running
+  short. Admission is not enforcement: a guest can still fill memory
   that is already plugged, the 4 GiB pre-plug included (#54).
 - **Wait, don't die.** Allocations that outrun the plug are throttled by the
   kernel at `memory.high` rather than OOM-killed. Memory block uevents move
@@ -549,14 +554,20 @@ through, so the checkpoint is exactly the memory at the pause.
   VM taking keep-running checkpoints: fresh memory faulted in here cost
   more than the copy itself (1.3–2.5 µs a page, 60 ms of a 150 ms fault
   budget). Reading on more threads at once was slower. Neither this memory
-  nor the hot pages' is admitted like a guest's, so each keeps out of the
-  host's reserve instead: the VM process's memory controller tells the
-  pager every second how much is left above it, and they grow only within
-  that (debited as they grow). Without room for a block of copies, faults
-  wait for the writers as over budget, and the pause protects pages it
-  would have copied hot; no checkpoint fails for it. Under the eviction
-  mark (or with the VM starved) the memory kept for the next checkpoint is
-  released, and a copy that ends under the reserve keeps none.
+  nor the hot pages' nor the writers' huge-page buffers is admitted like a
+  guest's, so each keeps out of the host's reserve instead: they grow only
+  within one room for the host, shared by its VM processes
+  (`RUN/.locks/memory-BOOT`, mapped by each), so VMs copying at once never
+  take more than there is together (#648). About every second the first VM
+  process's controller refreshes it from MemAvailable less the reserve and
+  the grants guests have yet to touch, taking off again what was taken since
+  the refresh before (it may not show in MemAvailable yet); it is debited as
+  they grow. Without room for a block of copies, faults ask the writers for
+  their pages and wait for them as over budget, and the pause protects
+  pages it would have copied hot; no checkpoint fails for it. Under the
+  eviction mark (or with the VM starved), or when another process asks
+  (admission before it refuses, above), the memory kept for the next
+  checkpoint is released, and a copy that ends under the reserve keeps none.
 - **Hot pages** (#235). Every `UFFDIO_WRITEPROTECT`, protect or unprotect,
   makes KVM zap its mappings of the whole range (6.18 ignores the notifier's
   event type) and flush every vCPU's TLB: after the resume the guest
@@ -574,10 +585,8 @@ through, so the checkpoint is exactly the memory at the pause.
   per page of buffer (discarded ones included), so it may copy fewer. The
   buffer is allocated before the pause for twice the pages dirty then plus
   4 MiB, up to 64 MiB, and kept for the next checkpoint. Keeps up to twice
-  that in memory per VM, allocated without admission: once allocated it is
-  out of MemAvailable, which later admissions see, but allocating it can take
-  the host below the reserve (up to 128 MiB per VM taking keep-running
-  checkpoints). Saving
+  that in memory per VM, allocated without admission but within the host's
+  room (as rescue memory is, above), and released like it. Saving
   device state writes guest memory (a vsock transport reset), so the copy
   starts after it. `ckpt_stall`, 2 vCPUs × 4 MiB, 3 runs × 10 checkpoints:
   quiet, stall p50 23.8 → 14.5 ms (p90 30.6 → 22.3), pause 7.1 → 9.4 ms, the

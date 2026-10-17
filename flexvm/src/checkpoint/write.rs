@@ -4,7 +4,7 @@ use super::{
     format::{DATA, MAGIC, TEMPLATE, ZERO},
 };
 use crate::{
-    cow::Room,
+    cow::{Epoch, Room},
     crc32c,
     template::Template,
     uffd::{Pager, Runs, REMOTE},
@@ -174,21 +174,22 @@ struct Buf {
     charge: Option<Charge>,
 }
 
-/// `mib` taken from a room, given back on drop: a buffer unmapped, or never mapped.
+/// `mib` taken from a room `at`, given back on drop: a buffer unmapped, or never mapped.
 struct Charge {
     room: Room,
     mib: u64,
+    at: Epoch,
 }
 
 impl Charge {
     fn take(room: &Room, mib: u64) -> Option<Charge> {
-        room.take(mib).then(|| Charge { room: room.clone(), mib })
+        room.take(mib).map(|at| Charge { room: room.clone(), mib, at })
     }
 }
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        self.room.give(self.mib);
+        self.room.give(self.mib, self.at);
     }
 }
 

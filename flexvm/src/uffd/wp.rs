@@ -97,22 +97,16 @@ impl Pager {
         }
         // Over budget, nothing more is copied here, and only the least block is unprotected.
         let over = cow.as_ref().is_some_and(|c| c.over_budget());
-        let (first, end) = self.wp_block(page, m, !over);
+        let (mut first, mut end) = self.wp_block(page, m, !over);
         if let Some(cow) = &cow {
             // Test fault `ckpt_wp_race`: a writer claims the faulting page right here (#88).
             self.wp_race(cow, page, &[PENDING]);
-            // Over budget, nothing more is copied here: unsaved pages of the block stay protected, and the writers take
-            // them first.
-            if over {
-                let unsaved: Vec<usize> = (first..end).filter(|&p| cow.state(p) == PENDING).collect();
-                unsaved.iter().for_each(|&p| cow.want(p));
-                if unsaved.contains(&page) {
-                    cow.wait_for(page, PENDING);
-                    return Ok(Served::Writer(cow.clone()));
-                }
-            }
             let start = Instant::now();
-            let rescued = if over { 0 } else { self.rescue(cow, first, end)? };
+            let least = || self.wp_block(page, m, false);
+            let Some((rescued, block)) = rescue_or_want(cow, page, over, (first, end), least, |f, e| self.rescue(cow, f, e))? else {
+                return Ok(Served::Writer(cow.clone()));
+            };
+            (first, end) = block;
             if rescued > 0 {
                 let ns = start.elapsed().as_nanos() as u64;
                 let s = &cow.stats;
@@ -197,9 +191,10 @@ impl Pager {
     }
 
     /// Saves the pages of `first..end` (within one region) that the copy has yet to save out of the guest into `cow`.
-    /// Returns how many. Never reads a page that may be missing, which would fault back to the event thread: only pages
-    /// the pagemap shows populated are read (a missing one was missing, so zero, at the pause).
-    fn rescue(&self, cow: &Cow, first: usize, end: usize) -> io::Result<usize> {
+    /// Returns how many, None if there is no memory for their copies now (`Room`). Never reads a page that may be
+    /// missing, which would fault back to the event thread: only pages the pagemap shows populated are read (a missing
+    /// one was missing, so zero, at the pause).
+    fn rescue(&self, cow: &Cow, first: usize, end: usize) -> io::Result<Option<usize>> {
         let map = |claimed: &[usize]| self.rescue_fail(cow, claimed).and_then(|()| self.pagemap(first, end - first));
         rescue_block(cow, first, end, map, |p, local| self.read_at((p * PAGE_SIZE) as u64, local))
     }
@@ -260,7 +255,7 @@ impl Pager {
                     if cow.left() == 0 || !cow.active() {
                         return;
                     }
-                    if let Ok(n) = self.rescue(cow, first, end) {
+                    if let Ok(Some(n)) = self.rescue(cow, first, end) {
                         cow.stats.held_pages.fetch_add(n as u64, Ordering::Relaxed);
                     }
                 });
@@ -424,7 +419,9 @@ impl Pager {
             *self.hot_dirty.lock().unwrap() = dirty.clone();
         }
         let cow = cow.then(|| {
-            let c = Cow::new(pages.len(), &out).keep_slots(self.slot_spare.clone(), self.mem_room.clone());
+            let c = Cow::new(pages.len(), &out)
+                .keep_slots(self.slot_spare.clone(), self.mem_room.clone())
+                .count_rescue_waits(self.rescue_fail.load(Ordering::Relaxed));
             hot.iter().for_each(|h| c.hold(h.held.clone()));
             Arc::new(c)
         });
@@ -506,27 +503,55 @@ fn block_at(page: usize, (from, to): (usize, usize), size: usize) -> (usize, usi
     (first, (first + size).min(to))
 }
 
+/// For a fault on `page`, rescues its `block` with `rescue` unless `over` budget. Over budget, or without memory for
+/// the copies (`rescue` gives None; on the `least` block then), nothing more is copied here: the unsaved pages of the
+/// block stay protected, and the writers take them first. None if the fault waits for them (its page is one); else the
+/// pages rescued and the block to unprotect around `page`.
+fn rescue_or_want(
+    cow: &Cow,
+    page: usize,
+    over: bool,
+    block: (usize, usize),
+    least: impl FnOnce() -> (usize, usize),
+    rescue: impl FnOnce(usize, usize) -> io::Result<Option<usize>>,
+) -> io::Result<Option<(usize, (usize, usize))>> {
+    let (first, end) = match over {
+        true => block,
+        false => match rescue(block.0, block.1)? {
+            Some(n) => return Ok(Some((n, block))),
+            None => least(),
+        },
+    };
+    let unsaved: Vec<usize> = (first..end).filter(|&p| cow.state(p) == PENDING).collect();
+    unsaved.iter().for_each(|&p| cow.want(p));
+    if unsaved.contains(&page) {
+        cow.wait_for(page, PENDING);
+        return Ok(None);
+    }
+    Ok(Some((0, (first, end))))
+}
+
 /// `Pager::rescue` of `first..end`, with `map` giving their pagemap entries (once it has claimed the pages it gets),
-/// and `read` (see `fill_slots`).
+/// and `read` (see `fill_slots`). None if there is no memory for their copies now.
 fn rescue_block(
     cow: &Cow,
     first: usize,
     end: usize,
     map: impl FnOnce(&[usize]) -> io::Result<Vec<u64>>,
     read: impl FnMut(usize, &[libc::iovec]) -> io::Result<()>,
-) -> io::Result<usize> {
+) -> io::Result<Option<usize>> {
     // Only pages no one saved or is saving: a writer may hold some (READING), or have saved them, or they are hot.
     let claimed: Vec<usize> = (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect();
     if claimed.is_empty() {
-        return Ok(0);
+        return Ok(Some(0));
     }
     let slots = match cow.take_slots(claimed.len()) {
         Ok(Some(s)) => s,
-        // No memory for them now (`Room`): they stay protected for the writers, and the fault waits for them as over
-        // budget (`Cow::over_budget` says so too now).
+        // No memory for them now (`Room`): they stay protected for the writers, and the fault asks for them and waits
+        // as over budget (`Cow::over_budget` says so too now).
         Ok(None) => {
             cow.unclaim_many(&claimed);
-            return Ok(0);
+            return Ok(None);
         }
         Err(e) => {
             cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
@@ -542,7 +567,7 @@ fn rescue_block(
         return Err(e);
     }
     cow.rescue_many(first, end, claimed.iter().copied().zip(slots));
-    Ok(claimed.len())
+    Ok(Some(claimed.len()))
 }
 
 /// Fills `slots[i]` with the pause-time contents of page `claimed[i]` (ascending): runs of consecutive `present` pages
@@ -555,6 +580,8 @@ fn fill_slots(
     mut read: impl FnMut(usize, &[libc::iovec]) -> io::Result<()>,
 ) -> io::Result<()> {
     assert_eq!(claimed.len(), slots.len());
+    // One for every run: a run's slots are mostly next to each other, so it rarely grows.
+    let mut local: Vec<libc::iovec> = Vec::new();
     let mut i = 0;
     while i < claimed.len() {
         if !present(claimed[i]) {
@@ -566,7 +593,7 @@ fn fill_slots(
         while j < claimed.len() && j - i < 1024 && claimed[j] == claimed[j - 1] + 1 && present(claimed[j]) {
             j += 1;
         }
-        let mut local: Vec<libc::iovec> = Vec::new();
+        local.clear();
         for s in &slots[i..j] {
             match local.last_mut() {
                 Some(v) if v.iov_base as usize + v.iov_len == s.as_mut_ptr() as usize => v.iov_len += PAGE_SIZE,
@@ -691,13 +718,13 @@ mod tests {
         let left = cow.left();
         // Page 6 was missing at the pause: zero.
         let map = |_: &[usize]| Ok((0..16).map(|i| if i == 6 { 0 } else { PM_PRESENT }).collect());
-        assert_eq!(rescue_block(&cow, 0, 16, map, guest_read(&mem)).unwrap(), 13);
+        assert_eq!(rescue_block(&cow, 0, 16, map, guest_read(&mem)).unwrap(), Some(13));
         assert_eq!(cow.left(), left - 13);
         assert!([0, 4, 5, 6, 15].iter().all(|&p| cow.state(p) == RESCUED));
         assert_eq!((cow.state(1), cow.state(2), cow.state(3)), (CLEAN, HELD, READING));
         // Another fault on the block saves nothing again; the block's end is the next one's start.
-        assert_eq!(rescue_block(&cow, 0, 16, |_| panic!("nothing to read"), |_, _| panic!()).unwrap(), 0);
-        assert_eq!(rescue_block(&cow, 16, 18, |_| Ok(vec![PM_PRESENT; 2]), guest_read(&mem)).unwrap(), 2);
+        assert_eq!(rescue_block(&cow, 0, 16, |_| panic!("nothing to read"), |_, _| panic!()).unwrap(), Some(0));
+        assert_eq!(rescue_block(&cow, 16, 18, |_| Ok(vec![PM_PRESENT; 2]), guest_read(&mem)).unwrap(), Some(2));
         // A failed read gives its pages and slots back.
         let fail = |_: usize, _: &[libc::iovec]| Err(io::Error::other("gone"));
         assert!(rescue_block(&cow, 18, 24, |_| Ok(vec![PM_PRESENT; 6]), fail).is_err());
@@ -766,7 +793,7 @@ mod tests {
                         let page = n - 1 - (x as usize % n) / 2 - i * 4 % (n / 2);
                         let first = page - page % size;
                         let map = |_: &[usize]| Ok(vec![PM_PRESENT; size]);
-                        rescued.fetch_add(rescue_block(&cow, first, (first + size).min(n), map, guest_read(&guest.0)).unwrap(), Ordering::Relaxed);
+                        rescued.fetch_add(rescue_block(&cow, first, (first + size).min(n), map, guest_read(&guest.0)).unwrap().unwrap(), Ordering::Relaxed);
                     }
                 });
                 for unit in (0..n).step_by(32) {
@@ -807,12 +834,12 @@ mod tests {
         room.set(3);
         assert!(!cow.over_budget());
         let present = |c: &[usize]| Ok(vec![PM_PRESENT; c.len().max(512)]);
-        assert_eq!(rescue_block(&cow, 512, 1024, present, guest_read(&mem)).unwrap(), 512);
+        assert_eq!(rescue_block(&cow, 512, 1024, present, guest_read(&mem)).unwrap(), Some(512));
         assert_eq!(room.get(), 1, "a chunk taken out of the room");
         // No room for another chunk: the pages stay unsaved (and protected) for the writers; nothing fails.
         assert!(cow.over_budget(), "faults wait for the writers");
         let left = cow.left();
-        assert_eq!(rescue_block(&cow, 1024, 1536, present, |_, _| panic!("nothing read")).unwrap(), 0);
+        assert_eq!(rescue_block(&cow, 1024, 1536, present, |_, _| panic!("nothing read")).unwrap(), None, "no room");
         assert_eq!(cow.left(), left);
         assert!((1024..1536).all(|p| cow.state(p) == PENDING));
         // Once the writer takes the copies, their slots serve the next rescue without more room.
@@ -820,7 +847,7 @@ mod tests {
         crate::checkpoint::GuestPages::read(&pages, 512, &mut buf).unwrap();
         assert!(buf == mem[512 * PAGE_SIZE..1024 * PAGE_SIZE]);
         assert!(!cow.over_budget());
-        assert_eq!(rescue_block(&cow, 1024, 1536, present, guest_read(&mem)).unwrap(), 512);
+        assert_eq!(rescue_block(&cow, 1024, 1536, present, guest_read(&mem)).unwrap(), Some(512));
         assert_eq!(room.get(), 1);
         crate::checkpoint::GuestPages::read(&pages, 1024, &mut buf).unwrap();
         assert!(buf == mem[1024 * PAGE_SIZE..1536 * PAGE_SIZE]);
@@ -832,7 +859,37 @@ mod tests {
         none.set(0);
         let early = early.keep_slots(Arc::new(Mutex::new(None)), none);
         assert!(!early.over_budget());
-        assert_eq!(rescue_block(&early, 0, 512, present, guest_read(&mem)).unwrap(), 512);
+        assert_eq!(rescue_block(&early, 0, 512, present, guest_read(&mem)).unwrap(), Some(512));
+    }
+
+    /// A fault whose rescue finds no memory for its copies (the room went between `over_budget` and the take, as the
+    /// host's is shared) asks the writers for the unsaved pages of its least block and waits for them, as over budget:
+    /// not for the writers to reach them in order (#648).
+    #[test]
+    fn a_fault_without_room_for_its_copies_asks_the_writers_for_its_pages() {
+        use crate::cow::Room;
+        let n = 2048;
+        let mem = guest_mem(n);
+        let room = Room::default();
+        let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), room.clone());
+        cow.start_writing();
+        room.set(0);
+        let present = |c: &[usize]| Ok(vec![PM_PRESENT; c.len().max(512)]);
+        let rescue = |f, e| rescue_block(&cow, f, e, present, |_, _| panic!("nothing read"));
+        assert_eq!(rescue_or_want(&cow, 700, false, (512, 1024), || (688, 704), rescue).unwrap(), None, "the fault waits");
+        assert_eq!(cow.wanted_pages(), (688..704).collect::<Vec<_>>(), "the least block, asked for");
+        assert!((512..1024).all(|p| cow.state(p) == PENDING));
+        // Its page saved already: nothing to wait for, the least block unprotected around it.
+        cow.claim(720, PENDING, READING);
+        let rescue = |f, e| rescue_block(&cow, f, e, present, |_, _| panic!("nothing read"));
+        assert_eq!(rescue_or_want(&cow, 720, false, (512, 1024), || (720, 736), rescue).unwrap(), Some((0, (720, 736))));
+        // With room, the whole block is rescued and nothing asked for.
+        room.set(10);
+        let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), room.clone());
+        cow.start_writing();
+        let rescue = |f, e| rescue_block(&cow, f, e, present, guest_read(&mem));
+        assert_eq!(rescue_or_want(&cow, 700, false, (512, 1024), || panic!("not the least"), rescue).unwrap(), Some((512, (512, 1024))));
+        assert!(cow.wanted_pages().is_empty());
     }
 
     #[test]
@@ -875,16 +932,16 @@ mod tests {
         pager.prepare_hot();
         let kept = || (pager.slot_spare.lock().unwrap().as_ref().map_or(0, |s| s.mapped_bytes()), pager.hot_spare.lock().unwrap().is_some());
         assert_eq!(kept(), (2 << 20, true));
-        pager.host_memory(Some(1000), false);
+        pager.host_memory(|| Some(1000), false);
         assert_eq!(kept(), (2 << 20, true), "kept while there is room");
-        pager.host_memory(Some(0), true);
+        pager.host_memory(|| Some(0), true);
         assert_eq!(kept(), (0, false), "released when short");
         // Under the reserve: no hot pages' memory, and a copy keeps none of its rescue memory.
         pager.prepare_hot();
         keep();
         assert_eq!(kept(), (0, false));
         // Unknown: no bound.
-        pager.host_memory(None, false);
+        pager.host_memory(|| None, false);
         pager.prepare_hot();
         assert!(kept().1);
     }

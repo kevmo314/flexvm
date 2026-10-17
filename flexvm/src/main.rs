@@ -11,6 +11,7 @@ mod gc;
 mod guest;
 mod hold;
 mod host;
+mod hostmem;
 mod image;
 mod lifecycle;
 mod limit;
