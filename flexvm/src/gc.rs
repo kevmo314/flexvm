@@ -130,9 +130,9 @@ pub fn sweep_now(host: &Host) -> Result<()> {
 
 fn sweep_within(host: &Host, wait: Duration) -> Result<()> {
     let lock = gc_lock(host, Some(wait))?;
-    cleanup_locked(host, lock);
+    let cleaned = cleanup_locked(host, lock);
     network(host);
-    Ok(())
+    cleaned
 }
 
 fn network(host: &Host) {
@@ -145,7 +145,7 @@ fn network(host: &Host) {
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
     if let Ok(Some(lock)) = gc_lock(host, None) {
-        cleanup_locked(host, Some(lock));
+        cleanup_locked(host, Some(lock)).unwrap_or_else(|e| crate::log!("garbage collection: {e}"));
     }
 }
 
@@ -169,11 +169,9 @@ fn gc_lock(host: &Host, wait: Option<Duration>) -> Result<Option<Flock>> {
     }
 }
 
-fn cleanup_locked(host: &Host, lock: Option<Flock>) {
-    let Some(_lock) = lock else { return };
-    if let Err(e) = host.collect_garbage() {
-        crate::log!("garbage collection: {e}");
-    }
+fn cleanup_locked(host: &Host, lock: Option<Flock>) -> Result<()> {
+    let Some(_lock) = lock else { return Ok(()) };
+    let collected = host.collect_garbage();
     vm_files(host);
     orphan_log_locks(&host.run.join("vms"));
     for e in std::fs::read_dir(host.run.join("standby")).into_iter().flatten().flatten() {
@@ -183,6 +181,7 @@ fn cleanup_locked(host: &Host, lock: Option<Flock>) {
         }
     }
     load_sets(&host.run.join("standby"));
+    collected.map(|_| ())
 }
 
 /// `.loadset-ID` (`standby::save_load_set`) neither read nor written for `LOADSET_TTL`:
@@ -412,6 +411,38 @@ mod tests {
         // Let go explicitly: another test's child, forked but not yet exec'd, may share it.
         let gc = File::open(crate::host::locks(&host.run).join("gc")).unwrap();
         assert!(flock(&gc, libc::LOCK_EX | libc::LOCK_NB).is_ok(), "the sweep let go of its lock");
+    }
+
+    #[test]
+    fn an_asked_for_sweep_reports_collection_errors() {
+        let d = dir("sweep-error");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let addr_path = host.state.join("addrs/10.9.1.1");
+        let addr = crate::host::Addr {
+            seen: 4,
+            holder: Some("dead".into()),
+            holder_id: Some(Ident { pid: 999_999_951, start: 1, boot: boot_id().into() }),
+            held: 4,
+            ..Default::default()
+        };
+        crate::host::store(&addr_path, &addr, false).unwrap();
+        // Corrupt records must fail the foreground barrier, even though other cleanup continues.
+        for records in ["owed", "migs"] {
+            let bad = host.state.join(records).join("5");
+            std::fs::write(&bad, b"{not json").unwrap();
+            let e = sweep_now(&host).unwrap_err().to_string();
+            assert!(e.contains(&bad.display().to_string()), "{records}: {e}");
+            sweep(&host); // Background sweeps still log rather than fail their caller.
+            assert_eq!(crate::host::load::<crate::host::Addr>(&addr_path).unwrap().unwrap(), addr);
+            std::fs::remove_file(bad).unwrap();
+        }
+        let lock = host.lock_file();
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(sweep_now(&host).is_err(), "a host-lock failure must fail the foreground barrier");
+        sweep(&host);
+        std::fs::remove_dir(lock).unwrap();
+        sweep_now(&host).unwrap();
     }
 
     #[test]

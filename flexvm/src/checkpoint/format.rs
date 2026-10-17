@@ -166,15 +166,14 @@ pub(super) type Run = (u64, u64, u64, usize, u64);
 
 /// TEMPLATE runs are allowed only in a delta.
 pub(super) fn parse_pagemap(map: &[u8], guest_pages: u64, delta: bool, ck: usize) -> Result<(Vec<Run>, Vec<u32>)> {
-    let word = |i: usize| -> Result<u64> { Ok(u64::from_le_bytes(map.get(i * 8..i * 8 + 8).ok_or("pagemap truncated")?.try_into()?)) };
     ensure!(map.len() >= 24 && &map[..8] == MAGIC, "bad pagemap header");
-    let (nruns, ndata) = (word(1)?, word(2)?);
+    let mut words = map[8..].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap()));
+    let (nruns, ndata) = (words.next().unwrap(), words.next().unwrap());
     ensure!(Some(map.len() as u64) == nruns.checked_mul(32).zip(ndata.checked_mul(4)).and_then(|(r, d)| (24 + r).checked_add(d)), "bad pagemap length");
     let nruns = nruns as usize;
     let (mut runs, mut next) = (Vec::with_capacity(nruns), 0u64);
     for r in 0..nruns {
-        let [first, count, kind, at] = [0, 1, 2, 3].map(|i| word(3 + 4 * r + i));
-        let (first, count, kind, at) = (first?, count?, kind?, at?);
+        let [first, count, kind, at] = std::array::from_fn(|_| words.next().unwrap());
         let end = first.checked_add(count).filter(|&e| count > 0 && first >= next && e <= guest_pages);
         let Some(end) = end else { bail!("page run {r} out of order or bounds") };
         next = end;
