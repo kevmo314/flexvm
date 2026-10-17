@@ -881,18 +881,8 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     net::create_tap(&tap, &host::tap_alias(&host.run, &me))?;
     let res = (|| {
         let init = args.get("init").map(PathBuf::from);
-        let prepare = || image::prepare(&state(args)?.join("images"), init.as_deref(), &opts);
-        let (rootfs, meta) = prepare()?;
         // Held until the template is published: `rmi` leaves the root filesystem to this build.
-        // One removed between the two is built again.
-        let (rootfs, meta, _reserved) = match image::reserve_rootfs(&rootfs) {
-            Ok(r) => (rootfs, meta, r),
-            Err(_) => {
-                let (rootfs, meta) = prepare()?;
-                let r = image::reserve_rootfs(&rootfs)?;
-                (rootfs, meta, r)
-            }
-        };
+        let (rootfs, meta, _reserved) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
         if let Some(id) = template::up_to_date(&paths, &name, size, &rootfs, &meta) {
             return output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)));
         }
@@ -929,7 +919,7 @@ fn images(paths: &Paths, as_json: bool) -> Result<()> {
 /// `rmi IMAGE|ID`: refused while a VM here (running, paused or suspended) or a standby count uses it.
 fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
     let vms = vms(host);
-    let in_use: std::collections::BTreeSet<String> = vms.iter().filter_map(|v| v["template_id"].as_str().map(String::from)).collect();
+    let in_use = || host.template_users();
     let linked = template::name_of(what).ok().filter(|n| std::fs::symlink_metadata(paths.templates.join(n)).is_ok());
     let Some(name) = linked else {
         let id = template::generation_by_prefix(paths, what).map_err(|e| format!("{e} (see flexvm images)"))?;

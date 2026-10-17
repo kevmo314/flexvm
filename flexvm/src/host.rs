@@ -691,6 +691,22 @@ impl Host {
         dir.join("manifest.json").is_file() && !dir.join("STARTED").exists() && !dir.join("DISCARDED").exists()
     }
 
+    /// The template content ids VMs here use as far as their records say: registered VMs, and
+    /// every suspended (or quarantined) one, even one a live process holds the name of (a resume
+    /// that has not opened its template yet). `rmi` reads it again under a generation's exclusive
+    /// use lock: a suspend publishes its checkpoint before its process lets the lock go, and a resume
+    /// takes the lock before it marks the checkpoint STARTED, so one of the two shows every such VM.
+    pub fn template_users(&self) -> std::collections::BTreeSet<String> {
+        let mut ids: std::collections::BTreeSet<String> = self.entries().into_iter().map(|e| e.template_id).filter(|id| !id.is_empty()).collect();
+        let suspended = std::fs::read_dir(self.state.join("suspended")).into_iter().flatten().flatten();
+        for name in suspended.filter_map(|e| e.file_name().into_string().ok()).filter(|n| !n.starts_with('.')) {
+            if let (true, Ok(dir)) = (self.is_suspended(&name), self.suspended(&name)) {
+                ids.extend(crate::checkpoint::read_manifest(&dir).ok().map(|m| m.template_id));
+            }
+        }
+        ids
+    }
+
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
@@ -3152,29 +3168,27 @@ pub fn lock_at(dir: OwnedFd, name: &str, how: i32) -> std::io::Result<HeldLock> 
 
 /// Like `lock_at`, with an interruptible or bounded acquisition.
 pub fn lock_at_with(dir: OwnedFd, name: &str, take: impl Fn(&File) -> std::io::Result<()>) -> std::io::Result<HeldLock> {
-    let c = std::ffi::CString::new(name)?;
-    loop {
-        let file = open_lock(&dir, std::ffi::OsStr::new(name))?;
-        take(&file)?;
-        let (now, mine) = (crate::util::stat_at(dir.as_raw_fd(), &c), file.metadata()?);
-        if now.is_some_and(|st| st.st_ino == mine.ino() && st.st_dev == mine.dev()) {
-            return Ok(HeldLock { dir, name: c, file });
-        }
-        let _ = flock(&file, libc::LOCK_UN);
-    }
+    let file = acquire(&dir, name.as_ref(), take)?;
+    Ok(HeldLock { name: std::ffi::CString::new(name)?, dir, file })
 }
 
 /// A shared hold on `name` in `dir` that, unlike `HeldLock`, leaves the file for the other
 /// holders when let go. Whoever removes what it guards takes it exclusively with `lock_at` (whose
 /// drop unlinks it), so a holder that locked the file it unlinked tries again on the new one.
 pub fn shared_at(dir: &OwnedFd, name: &str) -> std::io::Result<Flock> {
-    let c = std::ffi::CString::new(name)?;
+    acquire(dir, name.as_ref(), |file| flock(file, libc::LOCK_SH)).map(Flock)
+}
+
+/// `name` in `dir` (made if missing), locked by `take`, and still the file the name links to:
+/// a holder may unlink it just before we lock (`HeldLock`), so tried again on the new one.
+fn acquire(dir: &OwnedFd, name: &std::ffi::OsStr, take: impl Fn(&File) -> std::io::Result<()>) -> std::io::Result<File> {
+    let c = std::ffi::CString::new(name.as_encoded_bytes())?;
     loop {
-        let file = open_lock(dir, std::ffi::OsStr::new(name))?;
-        flock(&file, libc::LOCK_SH)?;
+        let file = open_lock(dir, name)?;
+        take(&file)?;
         let (now, mine) = (crate::util::stat_at(dir.as_raw_fd(), &c), file.metadata()?);
         if now.is_some_and(|st| st.st_ino == mine.ino() && st.st_dev == mine.dev()) {
-            return Ok(Flock(file));
+            return Ok(file);
         }
         let _ = flock(&file, libc::LOCK_UN);
     }
@@ -3340,16 +3354,7 @@ pub fn probe(f: &File, how: i32) -> std::io::Result<()> {
 /// A holder may unlink the file just before we lock: retry until it is the path's.
 pub fn lock_path(path: &Path, how: i32) -> std::io::Result<File> {
     let (dir, name) = split(path)?;
-    let dir = lock_dir(dir)?;
-    loop {
-        let f = open_lock(&dir, name)?;
-        flock(&f, how)?;
-        let c = std::ffi::CString::new(name.as_encoded_bytes())?;
-        if crate::util::stat_at(dir.as_raw_fd(), &c).is_some_and(|st| f.metadata().is_ok_and(|m| m.ino() == st.st_ino && m.dev() == st.st_dev)) {
-            return Ok(f);
-        }
-        let _ = flock(&f, libc::LOCK_UN);
-    }
+    acquire(&lock_dir(dir)?, name, |f| flock(f, how))
 }
 
 /// Every error, and anything unparsable, is unknown.

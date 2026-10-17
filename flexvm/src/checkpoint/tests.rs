@@ -729,3 +729,21 @@ fn instances_with_different_run_directories_share_a_destinations_lock() {
     drop(held);
     drop(super::staging::parent_lock(&st(&dest), libc::LOCK_EX | libc::LOCK_NB).unwrap());
 }
+
+/// #631: what `rmi` reads under a generation's exclusive use lock. A suspended VM has no process,
+/// so its record is all that keeps its generation; one being resumed (its name held by a live
+/// process that may not have opened its template yet) counts too, while `ls` lists it as the process.
+#[test]
+fn template_users_count_every_suspended_vm() {
+    let root = tmp("template-users");
+    let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+    for (name, id) in [("a", "aaaa1111"), ("b", "bbbb2222"), ("c", "cccc3333")] {
+        link(&host.suspended(name).unwrap(), None, |m| m.template_id = id.into());
+    }
+    // A resume's own, consumed (marked STARTED): its process holds the generation itself.
+    fs::write(host.suspended("c").unwrap().join("STARTED"), b"").unwrap();
+    let _resuming = host.take_name("b", true).unwrap();
+    assert!(host.alive("b"));
+    let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222"].map(String::from).into();
+    assert_eq!(host.template_users(), want);
+}
