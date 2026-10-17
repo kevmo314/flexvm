@@ -2242,7 +2242,7 @@ fn rank(mut vms: Vec<Entry>, rss: impl Fn(&Entry) -> u64) -> Vec<Entry> {
     vms
 }
 
-/// Per VM and peer (a peer may refuse a big VM but take a small one), in
+/// Per VM process identity and peer (a peer may refuse a big VM but take a small one), in
 /// RUN/evict.backoff under STATE/.locks/evict, so changing deciders share it and a
 /// reboot clears it. Deadlines use boot-clock seconds and the boot id also
 /// expires old wall-clock records. An entry a minute past its cooldown is forgotten.
@@ -2402,7 +2402,12 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
     let Ok(saved) = crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&backoff_path) else { return };
     let mut backoff = saved.unwrap_or_default();
     let now = eviction_time();
-    backoff.retain(|_, b| b.recent(now));
+    let instances: std::collections::HashSet<_> = vms.iter().map(|vm| vm.ident.key()).collect();
+    let before = backoff.len();
+    backoff.retain(|key, b| b.recent(now) && key.split_once(' ').is_some_and(|(id, _)| instances.contains(id)));
+    if backoff.len() != before && crate::host::store(&backoff_path, &backoff, false).is_err() {
+        return;
+    }
     for vm in vms {
         let why = match (vm.starved, growth_bucket(vm.growth_mib_s)) {
             (true, _) => "cannot grow here".to_string(),
@@ -2410,7 +2415,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
             (false, _) => format!("the host is low on memory and it grows {} MiB/s", vm.growth_mib_s),
         };
         for peer in peers {
-            let key = format!("{} {peer}", vm.name);
+            let key = format!("{} {peer}", vm.ident.key());
             if backoff.get(&key).is_some_and(|b| !b.ready(eviction_time())) {
                 continue;
             }
@@ -3814,6 +3819,28 @@ mod tests {
         assert!(!host.run.join("evict.backoff").exists(), "a replaced candidate is skipped without backing off peers");
     }
 
+    #[test]
+    fn eviction_expires_backoffs_for_previous_instances_even_without_a_request() {
+        let root = crate::test_util::TempDir::new("fv-evict-backoff");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let vm = Entry { name: "ev".into(), ident: Ident::me(), ..Entry::default() };
+        let mut previous = vm.ident.clone();
+        previous.start += 1; // Even the same pid with a different start is another instance.
+        let path = host.run.join("evict.backoff");
+        let current = format!("{} p1", vm.ident.key());
+        let mut saved = std::collections::HashMap::new();
+        for key in [current.clone(), format!("{} p1", previous.key()), "ev p1".into()] {
+            let mut b = PeerBackoff::default();
+            b.refuse(eviction_time());
+            saved.insert(key, b);
+        }
+        crate::host::store(&path, &saved, false).unwrap();
+        evict(&host, &[], &[vm], 100, Instant::now() + Duration::from_secs(5));
+        let saved = crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&path).unwrap().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(!saved[&current].ready(eviction_time()), "the current instance keeps its cooldown");
+    }
+
     /// #599: a peer answering every eviction with this host's busy text is a refusal
     /// like any other (backed off, the next peer tried); only the VM's own `busy`
     /// reply (a `Busy` error here) skips the rest of the peers.
@@ -3848,14 +3875,21 @@ mod tests {
         let vm = Entry { name: "ev".into(), ident: Ident::me(), state: "running".into(), ..Entry::default() };
         let at = || Instant::now() + Duration::from_secs(10);
         let backoff = || crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&host.run.join("evict.backoff")).unwrap().unwrap_or_default();
+        // #658: a replacement using the same name and pid starts with no cooldown.
+        let previous = Ident { start: vm.ident.start + 1, ..vm.ident.clone() };
+        let old_key = format!("{} p1", previous.key());
+        let mut old = PeerBackoff::default();
+        old.refuse(eviction_time());
+        crate::host::store(&host.run.join("evict.backoff"), &std::collections::HashMap::from([(old_key.clone(), old)]), false).unwrap();
         evict(&host, &["p1".into(), "p2".into()], std::slice::from_ref(&vm), 100, at());
         assert_eq!(*asked.lock().unwrap(), ["p1", "p2"], "the next peer is tried");
-        assert!(backoff().get("ev p1").is_some_and(|b| !b.ready(eviction_time())), "and the refusing one backed off");
+        assert!(!backoff().contains_key(&old_key), "the previous instance's record expires");
+        assert!(backoff().get(&format!("{} p1", vm.ident.key())).is_some_and(|b| !b.ready(eviction_time())), "and the refusing one backed off");
         // The VM busy here: no other peer is asked, and none is backed off for it.
         asked.lock().unwrap().clear();
-        evict(&host, &["busy".into(), "p3".into()], std::slice::from_ref(&vm), 100, at());
+        evict(&host, &["p1".into(), "busy".into(), "p3".into()], std::slice::from_ref(&vm), 100, at());
         assert_eq!(*asked.lock().unwrap(), ["busy"]);
-        assert!(!backoff().contains_key("ev busy"));
+        assert!(!backoff().contains_key(&format!("{} busy", vm.ident.key())));
         let e = call(&host, "ev", json!({"op": "migrate", "to": "stop"}), Some(at())).unwrap_err();
         assert!(!e.is::<Busy>(), "{e}");
         stub.join().unwrap();
