@@ -578,13 +578,15 @@ through, so the checkpoint is exactly the memory at the pause.
   now may not show for a while: a debit counts in full for 2 s (it may
   still be populating) and, up to twice the interval, together with the
   other older ones for at most what those deltas can hide (the zones'
-  thresholds in /proc/zoneinfo, about 15 MiB on 24 CPUs). Admission counts
+  thresholds in /proc/zoneinfo, about 15 MiB on 24 CPUs; in full where
+  zoneinfo cannot be read). Admission counts
   them too. Debits expire by age, so a process that dies leaves nothing to
   reclaim (#677). A take never waits on the lock (a fault may be waiting
   on it): it tries for 1 ms, past another take's few tens of µs, and
   busy past that it takes nothing and the fault leaves its pages to the
   writers. A take whose MemAvailable or grants cannot be read takes
-  nothing; unreadable debits count as that most the deltas can hide. Each VM process's controller samples what is left about every
+  nothing, and so does one whose debits cannot be read until a whole
+  window has passed since they were last written. Each VM process's controller samples what is left about every
   second, which faults look at to tell whether a block of copies may still
   be had; a take checks again. Rescue chunks are kept from one copy for
   the next, so most copies take none. A VM process takes nothing before

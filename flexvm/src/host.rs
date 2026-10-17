@@ -1553,15 +1553,11 @@ impl Host {
     /// deltas in only every `vm.stat_interval` (or once one passes its threshold), so memory populated just now may
     /// not show for a while: a debit younger than `DEBIT_FULL_MS` counts in full (its memory may still be being
     /// populated), and older ones up to twice the interval count together for no more than those deltas can hide
-    /// (`vmstat_drift_mib`). They expire by age: a process gone leaves nothing to clean. Unreadable: None, counting
-    /// that bound.
+    /// (`vmstat_drift_mib`), or in full where that cannot be told. They expire by age: a process gone leaves nothing
+    /// to clean.
     fn recent_debits(&self, _l: &Locked, now: u64) -> (Option<Debits>, u64) {
-        let Ok(debits) = load::<Debits>(&self.debits()) else { return (None, vmstat_drift_mib()) };
-        let mut debits = debits.unwrap_or_default();
-        debits.retain(|&(t, _)| t <= now && now - t < debit_window_ms());
-        let sum = |young: bool| debits.iter().filter(|d| (now - d.0 < DEBIT_FULL_MS) == young).fold(0u64, |a, d| a.saturating_add(d.1));
-        let taken = sum(true).saturating_add(sum(false).min(vmstat_drift_mib()));
-        (Some(debits), taken)
+        let path = self.debits();
+        debits_taken(load::<Debits>(&path).ok(), unwritten_for(&path), now, debit_window_ms(), vmstat_drift_mib())
     }
 
     /// Memory not admitted like a guest's (checkpoint rescue memory, hot pages', writer buffers: `cow::Room`), which
@@ -2015,18 +2011,39 @@ fn debit_window_ms() -> u64 {
     })
 }
 
+/// `Host::recent_debits` of what was read (None: unreadable), its file unwritten for that long (None: unknown), at
+/// `now` with debits counting for `window` ms, the older ones for at most `cap` MiB together (None: no cap). An
+/// unreadable file counts as all taken until a whole window has passed since its last write (every debit it held
+/// has expired then): None then, and the next take writes a new one.
+fn debits_taken(read: Option<Option<Debits>>, unwritten: Option<Duration>, now: u64, window: u64, cap: Option<u64>) -> (Option<Debits>, u64) {
+    let Some(debits) = read else {
+        let expired = unwritten.is_some_and(|d| d.as_millis() as u64 >= window);
+        return (None, if expired { 0 } else { u64::MAX });
+    };
+    let mut debits = debits.unwrap_or_default();
+    debits.retain(|&(t, _)| t <= now && now - t < window);
+    let sum = |young: bool| debits.iter().filter(|d| (now - d.0 < DEBIT_FULL_MS) == young).fold(0u64, |a, d| a.saturating_add(d.1));
+    let taken = sum(true).saturating_add(cap.map_or(sum(false), |c| sum(false).min(c)));
+    (Some(debits), taken)
+}
+
+/// How long since `path` was last written: None if that cannot be told.
+fn unwritten_for(path: &Path) -> Option<Duration> {
+    SystemTime::now().duration_since(std::fs::metadata(path).ok()?.modified().ok()?).ok()
+}
+
 /// The most memory (MiB) the per-CPU counter deltas Linux has yet to fold in can hide from MemAvailable: the sum of
-/// every zone's and CPU's threshold (/proc/zoneinfo); without it, the kernel's largest threshold (125 pages) for each
-/// CPU and two zones.
-fn vmstat_drift_mib() -> u64 {
-    static MIB: OnceLock<u64> = OnceLock::new();
-    *MIB.get_or_init(|| {
-        let zoneinfo = std::fs::read_to_string("/proc/zoneinfo").unwrap_or_default();
-        let pages = zoneinfo.lines().filter_map(|l| l.trim().strip_prefix("vm stats threshold:")?.trim().parse::<u64>().ok()).sum::<u64>();
-        let cpus = std::thread::available_parallelism().map_or(64, |n| n.get() as u64);
-        let pages = if pages > 0 { pages } else { cpus * 125 * 2 };
-        (pages * crate::util::PAGE_SIZE as u64).div_ceil(1 << 20)
-    })
+/// every zone's and CPU's threshold (/proc/zoneinfo). None if it cannot be read: debits then count in full.
+fn vmstat_drift_mib() -> Option<u64> {
+    static MIB: OnceLock<Option<u64>> = OnceLock::new();
+    *MIB.get_or_init(|| drift_mib(&std::fs::read_to_string("/proc/zoneinfo").ok()?))
+}
+
+/// `vmstat_drift_mib` from /proc/zoneinfo's text: None if it shows no threshold.
+fn drift_mib(zoneinfo: &str) -> Option<u64> {
+    let thresholds: Vec<u64> = zoneinfo.lines().filter_map(|l| l.trim().strip_prefix("vm stats threshold:")?.trim().parse().ok()).collect();
+    let pages = thresholds.iter().fold(0u64, |a, &t| a.saturating_add(t));
+    (!thresholds.is_empty()).then(|| pages.saturating_mul(crate::util::PAGE_SIZE as u64).div_ceil(1 << 20))
 }
 
 /// Keeps the grants of the last `GRANT_WINDOW`, ignoring future stamps so they cannot extend the cooldown indefinitely.
@@ -7051,16 +7068,42 @@ pub(crate) mod tests {
         // (twice vm.stat_interval: none past DEBIT_FULL_MS where that is 1 s); past the window, nothing.
         pin_clock(t0 + DEBIT_FULL_MS);
         let window = GRANT_WINDOW.as_millis() as u64;
-        let older = if debit_window_ms() > DEBIT_FULL_MS { vmstat_drift_mib().min(6000) } else { 0 };
+        let older = if debit_window_ms() > DEBIT_FULL_MS { vmstat_drift_mib().map_or(6000, |c| c.min(6000)) } else { 0 };
         assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 3000 - older);
         pin_clock(t0 + debit_window_ms().max(window) + DEBIT_FULL_MS);
         assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000, "expired by age, grants too");
-        // Unreadable: nothing taken, and none left (never no bound); unreadable debits count the drift bound.
+        // Unreadable: nothing taken, and none left (never no bound); unreadable debits written just now leave none.
         assert_eq!(take_at(&h, 1, || None, || panic!("nothing populated")), (0, None));
         std::fs::write(h.debits(), "{").unwrap();
-        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - vmstat_drift_mib());
+        assert_eq!(take_at(&h, 1, read, || panic!("nothing populated")), (0, None));
         std::fs::write(h.grants(), "{").unwrap();
         assert_eq!(take_at(&h, 1, read, || panic!("nothing populated")), (0, None));
+    }
+
+    /// What debits count as taken (#677): the young in full, the older together up to what the per-CPU counters can
+    /// hide; in full where that cannot be told (an unreadable /proc/zoneinfo: never a guess from this process's CPUs).
+    /// An unreadable ledger is all taken until a window has passed since its last write.
+    #[test]
+    fn debits_count_in_full_unless_the_drift_bound_is_known() {
+        let (now, window) = (100_000, 60_000);
+        let debits = Some(Some(vec![(now - 100, 10), (now - 30_000, 500), (now - 40_000, 300), (now - 70_000, 999), (now + 5, 7)]));
+        assert_eq!(debits_taken(debits.clone(), None, now, window, Some(15)).1, 10 + 15, "older ones capped; expired and future out");
+        assert_eq!(debits_taken(debits.clone(), None, now, window, None).1, 10 + 500 + 300, "no bound known: in full");
+        assert_eq!(debits_taken(debits, None, now, window, Some(5000)).1, 810, "never more than they are");
+        assert_eq!(debits_taken(Some(None), None, now, window, None), (Some(vec![]), 0));
+        let unreadable = |d| debits_taken(None, d, now, window, Some(15));
+        assert_eq!(unreadable(Some(Duration::from_secs(1))), (None, u64::MAX), "written lately: all taken");
+        assert_eq!(unreadable(None), (None, u64::MAX), "unknown: all taken");
+        assert_eq!(unreadable(Some(Duration::from_secs(61))), (None, 0), "every debit it held expired");
+        // The bound only from what zoneinfo shows.
+        assert_eq!(
+            drift_mib(
+                "Node 0, zone Normal\n  pagesets\n    cpu: 0\n              vm stats threshold: 256\n    cpu: 1\n              vm stats threshold: 256\n"
+            ),
+            Some(2)
+        );
+        assert_eq!(drift_mib(""), None);
+        assert_eq!(drift_mib("garbage"), None);
     }
 
     /// A take never waits for the host lock (a fault may be waiting on it): busy, it is refused at once.
