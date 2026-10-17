@@ -799,6 +799,14 @@ impl Host {
         }
     }
 
+    /// Reaps only a proven dead holder, even when no stopped VM remains to remove.
+    pub fn reap_dead_holder(&self, name: &str) -> Result<()> {
+        if let Some(owner) = lock_holder(&self.vms(name, "lock")?)?.filter(|o| o.liveness() == Liveness::Gone) {
+            reap(&self.run, &owner)?;
+        }
+        Ok(())
+    }
+
     /// `RUN/.logs.lock`: held shared while a log is opened for a start,
     /// exclusively while garbage collection decides on one and removes it.
     /// Never a name's lock, which a start takes without waiting.
@@ -2362,7 +2370,7 @@ impl PidFd {
     }
 }
 
-/// Kills and waits for a dead process's Firecrackers: they die with it, but not at once.
+/// Removes a dead process's taps and kills and waits for its Firecrackers: they die with it, but not at once.
 /// Anything it cannot read is an error, never nothing to reap.
 pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     match owner.liveness() {
@@ -2372,6 +2380,7 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     }
     trusted_root(run)?;
     trusted_dir(&run.join("w"))?;
+    collect_dead_taps(run, Some(owner));
     let dir = owner.work_dir(run);
     match trusted_dir(&dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2460,9 +2469,17 @@ fn taps_of_at(run: &Path, net: &Path, orphaned: bool) -> Vec<(String, u32, Ident
     taps
 }
 
-/// GC also collects taps from deleted private/test run directories, once their owner is gone.
-fn dead_taps_at(run: &Path, net: &Path) -> Vec<(String, u32, Ident)> {
-    taps_of_at(run, net, true).into_iter().filter(|(_, _, owner)| owner.liveness() == Liveness::Gone).collect()
+/// A dead holder's taps here; a sweep (no holder) also collects taps from deleted run directories.
+fn dead_taps_at(run: &Path, net: &Path, holder: Option<&Ident>) -> Vec<(String, u32, Ident)> {
+    taps_of_at(run, net, holder.is_none()).into_iter().filter(|(_, _, owner)| holder.is_none_or(|h| h == owner) && owner.liveness() == Liveness::Gone).collect()
+}
+
+/// A holder's taps, or a sweep's (including orphaned hosts). Deleting a tap also
+/// withdraws its routes, without touching a route since moved to another tap.
+fn collect_dead_taps(run: &Path, holder: Option<&Ident>) {
+    for (name, index, _) in dead_taps_at(run, Path::new("/sys/class/net"), holder) {
+        crate::net::delete_link(index, &name);
+    }
 }
 
 /// A VM a sweep found dead and withdrew: (name, address, generation).
@@ -2692,10 +2709,7 @@ impl Host {
     }
 
     fn collect_garbage_with(&self, lost: bool) -> Result<Vec<Withdrawn>> {
-        // Deleted by index and name: a tap made since under a dead one's name is another.
-        for (name, index, _owner) in dead_taps_at(&self.run, Path::new("/sys/class/net")) {
-            crate::net::delete_link(index, &name);
-        }
+        collect_dead_taps(&self.run, None);
         collect_owned(&self.run);
         // What a write killed midway left of the per-boot records: unsynced-claim markers
         // (`RUN/claims`) and the generation cursor (`RUN/.gens.next`).
@@ -5798,6 +5812,39 @@ mod tests {
     }
 
     #[test]
+    fn reaping_taps_selects_only_the_dead_holder_of_this_host() {
+        let d = crate::test_util::TempDir::new("reap-taps");
+        let run = d.join("run");
+        std::fs::create_dir(&run).unwrap();
+        let net = d.join("net");
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        let reused = Ident { start: 2, ..dead.clone() };
+        let other = Ident { pid: 999_999_932, ..dead.clone() };
+        let live = Ident::me();
+        let orphan = d.join("missing");
+        for (name, index, run, owner) in [
+            ("dead-0", 10, &run, &dead),
+            ("dead-1", 11, &run, &dead),
+            ("reused", 12, &run, &reused),
+            ("other", 13, &run, &other),
+            ("live", 14, &run, &live),
+            ("orphan", 15, &orphan, &dead),
+        ] {
+            let dev = net.join(name);
+            std::fs::create_dir_all(&dev).unwrap();
+            std::fs::write(dev.join("ifindex"), index.to_string()).unwrap();
+            std::fs::write(dev.join("ifalias"), tap_alias(run, owner)).unwrap();
+            std::fs::write(dev.join("tun_flags"), "0x1802\n").unwrap();
+        }
+        let mut taps = dead_taps_at(&run, &net, Some(&dead));
+        taps.sort_by_key(|t| t.1);
+        assert_eq!(taps, vec![("dead-0".into(), 10, dead.clone()), ("dead-1".into(), 11, dead.clone())]);
+        assert!(dead_taps_at(&run, &net, Some(&live)).is_empty(), "a live holder's taps stay");
+        assert!(dead_taps_at(&run, &net, Some(&Ident { boot: String::new(), ..dead })).is_empty(), "unknown is not proof of death");
+        assert_eq!(dead_taps_at(&run, &net, None).len(), 5, "the sweep also collects other dead holders and orphaned hosts");
+    }
+
+    #[test]
     fn gc_collects_taps_from_deleted_run_dirs_only_after_the_owner_is_gone() {
         let d = crate::test_util::TempDir::new("orphan-taps");
         let run = d.join("run");
@@ -5814,9 +5861,9 @@ mod tests {
                 std::fs::write(dev.join("tun_flags"), "0x1802\n").unwrap();
             }
         }
-        assert!(dead_taps_at(&run, &net).is_empty(), "another existing host's taps stay");
+        assert!(dead_taps_at(&run, &net, None).is_empty(), "another existing host's taps stay");
         std::fs::remove_dir(&other).unwrap();
-        assert_eq!(dead_taps_at(&run, &net), vec![("dead".into(), 10, dead)]);
+        assert_eq!(dead_taps_at(&run, &net, None), vec![("dead".into(), 10, dead)]);
         assert!(taps_of_at(&run, &net, false).is_empty(), "pid-reuse cleanup still only selects this host's taps");
     }
 
