@@ -423,7 +423,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // Under `.locks/publish`, a lock (not `*.lock`, which names a standby) a sweep holds: none finds this pid's socket stale and unlinks it after the bind.
     let publish = crate::host::Flock::new(crate::host::private_file(&l.join("publish"))?, libc::LOCK_EX)?;
     let _ = std::fs::remove_file(&sock); // A previous process with this pid may have left it.
-    let listener = bind_claims(&sock)?;
+    let listener = bind_claims(&l.join(format!(".{}.sock", me.pid)), &sock)?;
     // A claimer refused by a dead standby of this pid may unlink the path after this bind.
     let bound = std::fs::metadata(&sock)?.ino();
     drop(publish);
@@ -558,11 +558,17 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     }
 }
 
-/// Private even with a permissive umask; peer credentials also cover the bind/chmod window.
-fn bind_claims(sock: &std::path::Path) -> std::io::Result<UnixListener> {
-    let listener = UnixListener::bind(sock)?;
-    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+/// Bound at `private` (in a 0700 directory, so nobody else can connect while its mode is the
+/// umask's), made 0600 there, then moved to `sock`: never reachable by others at any mode.
+fn bind_claims(private: &std::path::Path, sock: &std::path::Path) -> std::io::Result<UnixListener> {
+    crate::socket::check(private)?;
+    let _ = std::fs::remove_file(private);
+    let listener = UnixListener::bind(private)?;
+    let placed = std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o600)).and_then(|()| std::fs::rename(private, sock));
+    if placed.is_err() {
+        let _ = std::fs::remove_file(private);
+    }
+    placed.map(|()| listener)
 }
 
 /// The claimer's pid and pidfd, if it runs as `uid`.
@@ -819,9 +825,11 @@ mod tests {
     #[test]
     fn claims_use_a_private_socket_and_require_the_same_uid() {
         let root = crate::test_util::TempDir::new("claim-peer");
-        let sock = root.join("claim.sock");
-        let listener = bind_claims(&sock).unwrap();
+        let (private, sock) = (root.join("private"), root.join("claim.sock"));
+        std::fs::create_dir(&private).unwrap();
+        let listener = bind_claims(&private.join(".1.sock"), &sock).unwrap();
         assert_eq!(std::fs::metadata(&sock).unwrap().mode() & 0o777, 0o600);
+        assert!(!private.join(".1.sock").exists(), "moved, not linked");
         // Credentials still reject other users if permissions were permissive at connect time.
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o777)).unwrap();
         let _c = UnixStream::connect(&sock).unwrap();
