@@ -951,7 +951,12 @@ fn vms(host: &Host) -> Vec<Value> {
         })
         .collect();
     let names = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned());
-    vms.extend(names(host.state.join("suspended")).filter(|n| !n.starts_with('.') && !host.alive(n)).filter_map(|n| lifecycle::describe_suspended(host, &n)));
+    // A name lock alone need not mean a registered VM: a resume may not have published yet.
+    for n in names(host.state.join("suspended")).filter(|n| !n.starts_with('.')) {
+        if !vms.iter().any(|v| v["name"] == n) {
+            vms.extend(lifecycle::describe_suspended(host, &n));
+        }
+    }
     for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".failed").map(String::from)).filter(|n| !host.alive(n)) {
         let Ok(failed) = host.vms(&n, "failed") else { continue };
         vms.push(json!({"name": n, "state": "failed", "error": std::fs::read_to_string(failed).unwrap_or_default()}));
@@ -1507,6 +1512,42 @@ mod exec_tests {
         remove(&host, "gone", false, true).unwrap();
         assert!(!host.vms("gone", "failed").unwrap().exists());
         assert_eq!(remove(&host, "gone", false, true).unwrap_err().to_string(), "no vm named \"gone\"");
+    }
+
+    #[test]
+    fn ps_lists_a_suspended_vm_while_its_name_is_held() {
+        let root = crate::test_util::TempDir::new("ps-held");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let dir = host.suspended("vm").unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        let body = serde_json::to_vec(&json!({
+            "format": checkpoint::FORMAT, "created_unix_ms": 0, "name": "vm", "ip": "10.0.0.1",
+            "template": "tpl", "template_id": "id", "vcpus": 1, "mem_mib": 1, "max_mib": 1,
+            "hotplug_mib": 0, "guest_pages": 256, "data_pages": 0, "zero_pages": 0, "files": {}
+        }))
+        .unwrap();
+        let mut hash = template::Hash::new();
+        hash.update(&body);
+        std::fs::write(dir.join("manifest.json"), [format!("{}\n", hash.finish()).as_bytes(), &body].concat()).unwrap();
+        std::fs::write(dir.join("GEN"), "1").unwrap();
+        let suspended = vms(&host);
+        assert_eq!(suspended.len(), 1);
+        assert_eq!(suspended[0]["state"], "suspended");
+
+        let name = host.take_name("vm", true).unwrap();
+        assert!(host.alive("vm") && host.entries().is_empty());
+        assert_eq!(vms(&host), suspended);
+        assert!(remove(&host, "vm", false, true).unwrap_err().to_string().contains("is running"));
+        assert_eq!(host.take_name("vm", true).err().unwrap().to_string(), "vm name \"vm\" is taken");
+        assert!(host.is_suspended("vm"));
+
+        name.publish(&host::Entry { name: "vm".into(), ident: host::Ident::me(), state: "starting".into(), ..host::Entry::default() }).unwrap();
+        let listed = vms(&host);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "vm");
+        assert_eq!(listed[0]["state"], "starting");
+        drop(name);
+        assert_eq!(vms(&host), suspended);
     }
 
     #[test]
