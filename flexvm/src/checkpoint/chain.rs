@@ -157,6 +157,18 @@ pub fn chain_ids(dir: &Path) -> Result<Vec<String>> {
     Ok(open_chain(dir, false)?.0.into_iter().map(|l| l.id).collect())
 }
 
+/// Checks chain metadata without flattening the memory overlay, unless page verification is requested.
+/// Returns IDs nearest first, remaining metadata budget and the head's VM state size.
+pub fn inspect_chain(dir: &Path, verify_data: bool) -> Result<(Vec<String>, u64, u64)> {
+    let (links, meta_left) = open_chain(dir, true)?;
+    let ids = links.iter().map(|l| l.id.clone()).collect();
+    let vmstate_len = links[0].vmstate.len() as u64;
+    if verify_data {
+        Checkpoint::from_links(links, meta_left).verify_data()?;
+    }
+    Ok((ids, meta_left, vmstate_len))
+}
+
 pub fn parent_path(child: &Path, parent: &Path) -> PathBuf {
     match (child.parent(), parent.parent(), parent.file_name()) {
         (Some(a), Some(b), Some(name)) if a == b => Path::new("..").join(name),
@@ -167,14 +179,18 @@ pub fn parent_path(child: &Path, parent: &Path) -> PathBuf {
 impl Checkpoint {
     /// Opens the chain ending at `dir`, verifying restore metadata; page data is checked as read.
     pub fn open(dir: &Path) -> Result<Checkpoint> {
-        let (mut links, meta_left) = open_chain(dir, true)?;
+        let (links, meta_left) = open_chain(dir, true)?;
+        Ok(Self::from_links(links, meta_left))
+    }
+
+    fn from_links(mut links: Vec<Link>, meta_left: u64) -> Checkpoint {
         let layers: Vec<Vec<Run>> = links.iter_mut().rev().map(|l| std::mem::take(&mut l.map)).collect();
         let (files, sums) = links.iter_mut().map(|l| (l.file.take().unwrap(), std::mem::take(&mut l.sums))).unzip();
         let mut links = links.into_iter();
         let Link { dir, manifest, id, vmstate, .. } = links.next().unwrap();
         let (chain, chain_ids) = links.map(|l| (l.dir, l.id)).unzip();
         let (runs, file) = flatten(&layers, files, sums);
-        Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids, meta_left })
+        Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids, meta_left }
     }
 
     fn each_page(&self, drop_cache: bool, mut f: impl FnMut(usize, &[u8])) -> Result<()> {

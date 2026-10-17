@@ -656,11 +656,12 @@ impl Proc {
                 let Some((dir, id)) = vm.last_checkpoint.lock().unwrap().clone().filter(|_| vm.pager.tracking()) else {
                     bail!("vm {} has no checkpoint to build on: take a full one with flexvm checkpoint NAME DIR first (without --stop) (an incremental checkpoint builds on the last one taken of the vm on this host, since it was last restored or migrated, that the vm ran on after)", vm.name)
                 };
-                let ck = Checkpoint::open(&dir).map_err(|e| last(&e))?;
-                if ck.id != id {
+                // Never stop a VM onto a chain that cannot restore.
+                let (ids, meta_left, vmstate_len) = crate::checkpoint::inspect_chain(&dir, !cow).map_err(|e| last(&e))?;
+                if ids[0] != id {
                     bail!("{}", last(&format!("{} has changed", dir.display())));
                 }
-                if ck.chain.len() + 2 > crate::checkpoint::MAX_CHAIN {
+                if ids.len() + 1 > crate::checkpoint::MAX_CHAIN {
                     bail!(
                         "vm {}: a delta on {} would make a chain of more than {} checkpoints; take a full one",
                         vm.name,
@@ -668,17 +669,14 @@ impl Proc {
                         crate::checkpoint::MAX_CHAIN
                     );
                 }
-                // Never stop a VM onto a chain that cannot restore.
                 if !cow {
-                    ck.verify_data().map_err(|e| last(&e))?;
                     t.mark("verify_chain");
                 }
                 // A delta has about its parent's VM state: refuse it before the pause.
-                if ck.meta_left < ck.vmstate.len() as u64 {
+                if meta_left < vmstate_len {
                     bail!("vm {}: the chain of {} has no metadata budget left; take a full one", vm.name, dir.display());
                 }
-                staging.meta_left = ck.meta_left;
-                let ids: Vec<String> = std::iter::once(ck.id.clone()).chain(ck.chain_ids.iter().cloned()).collect();
+                staging.meta_left = meta_left;
                 Some((crate::checkpoint::Parent { path: crate::checkpoint::parent_path(staging.dest(), &dir), id }, ids))
             }
         };

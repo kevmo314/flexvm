@@ -137,6 +137,18 @@ fn manifest_covers_pagemap_without_a_pages_hash() {
 }
 
 #[test]
+fn staging_vmstate_read_is_capped() {
+    use std::io::{Cursor, Read};
+    assert_eq!(staging::read_vmstate(Cursor::new(b"state")).unwrap(), b"state");
+    // An infinite source proves that the reader stops after the cap plus one byte.
+    let mut source = std::io::repeat(0).take(MAX_VMSTATE * 2);
+    let e = staging::read_vmstate(&mut source).unwrap_err().to_string();
+    assert!(e.contains(&format!("over {MAX_VMSTATE} bytes")), "{e}");
+    assert_eq!(source.limit(), MAX_VMSTATE - 1);
+    assert_eq!(staging::read_vmstate(std::io::repeat(0).take(MAX_VMSTATE)).unwrap().len() as u64, MAX_VMSTATE);
+}
+
+#[test]
 fn metadata_is_bounded_before_reading() {
     let dir = tmp("lengths");
     type Edit = fn(&mut Manifest);
@@ -156,6 +168,8 @@ fn metadata_is_bounded_before_reading() {
     let ids = chain(&dir, 3);
     let top = dir.join("ck2");
     let ck = Checkpoint::open(&top).unwrap();
+    assert_eq!(inspect_chain(&top, false).unwrap(), (ids.clone(), ck.meta_left, ck.vmstate.len() as u64));
+    assert_eq!(inspect_chain(&top, true).unwrap(), inspect_chain(&top, false).unwrap());
     assert_eq!((ck.chain.len(), &ck.chain_ids[..], chain_ids(&top).unwrap()), (2, &ids[1..], ids.clone()));
     let cost = chain_meta_budget() - ck.meta_left;
     Link::open(&top, 0, Some(&mut { cost })).unwrap();
