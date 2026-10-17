@@ -581,10 +581,10 @@ through, so the checkpoint is exactly the memory at the pause.
   may not show for a while: populated debits count, up to twice the
   interval, together for at most what those deltas can hide (the zones'
   thresholds in /proc/zoneinfo, about 15 MiB on 24 CPUs; in full where
-  zoneinfo cannot be read). Admission counts them too. A VM process that
-  releases its kept memory on request with no copy running retires its
-  populated debits from before (what they covered is unmapped), and
-  admission counts again after the release (#691). A take never waits on
+  zoneinfo cannot be read). Admission counts them too, and counts again
+  after a release (#691). Debits of memory released are not retired: they
+  age out, so kept memory taken lately may still count for a while after
+  it goes (never less than there is). A take never waits on
   the lock (a fault may be waiting on it): it tries for 1 ms, past another
   take's few tens of µs, and busy past that it takes nothing and the fault
   leaves its pages to the

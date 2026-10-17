@@ -5,12 +5,12 @@
 //!
 //! A request is a number in `RUN/.locks/release-BOOT`, raised under the host lock; each VM process looks every
 //! `POLL` and, once it has released, writes the number it answered to its own file in `RUN/.locks/released-BOOT/`
-//! (named by its `Ident::key`), with when it released and whether no copy was running then. A requester waits for
-//! those that still run (not one stopped: it cannot answer), and removes the files of those proven gone. Then it
-//! retires the debits of each that had no copy running (`Host::retire_debits`, #691): what they covered is unmapped.
-//! The room that memory grows within is not here: each take is checked and debited under the host lock, and
-//! populated after it (`Host::take_room`).
-
+//! (named by its `Ident::key`). A requester waits for those that still run (not one stopped: it cannot answer), and
+//! removes the files of those proven gone. Debits of what they released are not retired: they age out
+//! (`Host::recent_debits`), so kept memory taken lately may count a little while longer. The room that memory grows
+//! within is not here: each take is checked and debited under the host lock, and populated after it
+//! (`Host::take_room`).
+//!
 //! VM processes started by a flexvm before #677 keep its mapped `memory-v2-BOOT` room, which neither sees these
 //! takes nor answers these requests, and those started before #691 their own `room-debits-BOOT` ledger: after an
 //! upgrade, restart or migrate them; until then the reserve may be overcommitted.
@@ -26,16 +26,9 @@ pub const RELEASE_WAIT: Duration = Duration::from_millis(200);
 /// the host lock would each wait again.
 const RELEASE_GAP_MS: u64 = 1000;
 
-/// How long a requester whose wait used its deadline may still wait for the host lock to retire debits.
-const RETIRE_WAIT: Duration = Duration::from_millis(50);
-
 /// How often a VM process looks for a request: within `RELEASE_WAIT`, with time left to release. A look costs about
 /// 6 us (and a wakeup): well under 1 ms of CPU a second per VM process.
 const POLL: Duration = Duration::from_millis(100);
-
-/// A process's answer: the number of the request, when it released (boottime ms), and whether no copy was running
-/// then (all it took from the room was unmapped, or is with its copy gone).
-type Answer = (u64, u64, bool);
 
 /// The last request: its number and when it was made (boottime ms).
 fn request(run: &Path) -> PathBuf {
@@ -51,17 +44,17 @@ fn last(run: &Path) -> Option<(u64, u64)> {
     load(&request(run)).ok().flatten()
 }
 
-/// Answers release requests for the life of this process, calling `release` for each (one at a time), which says
-/// whether no copy was running. It joins as it starts: requests made before have no kept memory of its to ask for,
-/// and none waits on it before it can answer. Returns at once if it cannot join.
-pub fn serve(run: &Path, release: impl Fn() -> bool) {
+/// Answers release requests for the life of this process, calling `release` for each (one at a time). It joins as it
+/// starts: requests made before have no kept memory of its to ask for, and none waits on it before it can answer.
+/// Returns at once if it cannot join.
+pub fn serve(run: &Path, release: impl Fn()) {
     let dir = answers(run);
     if let Err(e) = crate::host::private_dir(&dir) {
         crate::log!("hostmem: {}: {e}: memory kept for checkpoints is not released on request", dir.display());
         return;
     }
     let mine = dir.join(Ident::me().key());
-    let mut answered: Answer = (last(run).map_or(0, |r| r.0), 0, false);
+    let mut answered = last(run).map_or(0, |r| r.0);
     loop {
         if let Err(e) = store(&mine, &answered, false) {
             crate::log!("hostmem: {e}: requests do not wait for this process");
@@ -69,9 +62,9 @@ pub fn serve(run: &Path, release: impl Fn() -> bool) {
         loop {
             std::thread::sleep(POLL);
             // Unreadable: as no new request (the next one replaces it).
-            if let Some((n, _)) = last(run).filter(|r| r.0 != answered.0) {
-                let at = crate::host::boottime_ms();
-                answered = (n, at, release());
+            if let Some((n, _)) = last(run).filter(|r| r.0 != answered) {
+                release();
+                answered = n;
                 break;
             }
         }
@@ -85,8 +78,7 @@ pub fn release_kept(host: &Host, deadline: Option<Instant>) {
     let by = Instant::now() + RELEASE_WAIT;
     let by = deadline.map_or(by, |d| d.min(by));
     if let Some(n) = ask(host, by) {
-        let (_, released) = wait(&host.run, n, by);
-        host.retire_debits(&released, by.max(Instant::now() + RETIRE_WAIT));
+        wait(&host.run, n, by);
     }
 }
 
@@ -110,11 +102,10 @@ fn ask(host: &Host, by: Instant) -> Option<u64> {
 }
 
 /// Waits until every process that answers requests has answered `n` or a later one, or `by`. Not for one stopped (it
-/// cannot answer); the files of those proven gone are removed. Whether every one answered, and those that had no copy
-/// running, with when they released.
-fn wait(run: &Path, n: u64, by: Instant) -> (bool, Vec<(Ident, u64)>) {
-    let Ok(entries) = std::fs::read_dir(answers(run)) else { return (true, Vec::new()) };
-    let (mut all, mut released) = (true, Vec::new());
+/// cannot answer); the files of those proven gone are removed. Whether every one answered.
+fn wait(run: &Path, n: u64, by: Instant) -> bool {
+    let Ok(entries) = std::fs::read_dir(answers(run)) else { return true };
+    let mut all = true;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(id) =
@@ -123,10 +114,7 @@ fn wait(run: &Path, n: u64, by: Instant) -> (bool, Vec<(Ident, u64)>) {
             continue;
         };
         loop {
-            if let Some((_, at, idle)) = load::<Answer>(&e.path()).ok().flatten().filter(|a| a.0 >= n) {
-                if idle {
-                    released.push((id.clone(), at));
-                }
+            if load::<u64>(&e.path()).ok().flatten().is_some_and(|a| a >= n) {
                 break;
             }
             match id.liveness() {
@@ -146,7 +134,7 @@ fn wait(run: &Path, n: u64, by: Instant) -> (bool, Vec<(Ident, u64)>) {
             }
         }
     }
-    (all, released)
+    all
 }
 
 /// Whether `pid` is stopped (or traced): it cannot answer then.
@@ -174,7 +162,7 @@ mod tests {
 
     fn member(run: &Path, id: &Ident, answered: u64) {
         crate::host::private_dir(&answers(run)).unwrap();
-        store(&answers(run).join(id.key()), &(answered, 0u64, false), false).unwrap();
+        store(&answers(run).join(id.key()), &answered, false).unwrap();
     }
 
     #[test]
@@ -187,7 +175,7 @@ mod tests {
         // Nobody to ask: answered at once.
         let n = ask(&h, now()).unwrap();
         let t = Instant::now();
-        assert!(wait(&run, n, now()).0);
+        assert!(wait(&run, n, now()));
         assert!(t.elapsed() < Duration::from_secs(1));
         let released = Arc::new(AtomicUsize::new(0));
         let (r, served) = (released.clone(), run.clone());
@@ -195,7 +183,6 @@ mod tests {
             serve(&served, || {
                 std::thread::sleep(Duration::from_millis(20));
                 r.fetch_add(1, Ordering::SeqCst);
-                false
             })
         });
         let t = Instant::now();
@@ -208,14 +195,14 @@ mod tests {
         forget_release(&run);
         let n = ask(&h, now()).unwrap();
         let t = Instant::now();
-        assert!(wait(&run, n, Instant::now() + Duration::from_secs(10)).0);
+        assert!(wait(&run, n, Instant::now() + Duration::from_secs(10)));
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         assert_eq!(released.load(Ordering::SeqCst), 1);
         // Within a second of the last: not asked again.
         assert_eq!(ask(&h, now()), None);
         forget_release(&run);
         let n = ask(&h, now()).unwrap();
-        assert!(wait(&run, n, now()).0);
+        assert!(wait(&run, n, now()));
         assert_eq!(released.load(Ordering::SeqCst), 2);
         // A member that runs and does not answer: given up on at the deadline, and it stays a member.
         let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("30").spawn().unwrap());
@@ -225,7 +212,7 @@ mod tests {
         forget_release(&run);
         let n = ask(&h, now()).unwrap();
         let t = Instant::now();
-        assert!(!wait(&run, n, Instant::now() + Duration::from_millis(50)).0, "the silent one did not answer");
+        assert!(!wait(&run, n, Instant::now() + Duration::from_millis(50)), "the silent one did not answer");
         assert!(t.elapsed() < Duration::from_secs(2));
         assert!(answers(&run).join(silent.key()).exists());
         // Stopped: it cannot answer, so it is not waited for (but it stays a member).
@@ -236,7 +223,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let t = Instant::now();
-        assert!(!wait(&run, n, now()).0, "not every one answered");
+        assert!(!wait(&run, n, now()), "not every one answered");
         assert!(t.elapsed() < Duration::from_secs(1), "not waited for");
         assert!(answers(&run).join(silent.key()).exists());
         // Gone: not waited for, and its file removed. Its pid may be another's by now: still gone (its start differs).
@@ -245,7 +232,7 @@ mod tests {
         let gone = Ident { pid: (1 << 22) - 2, start: 1, boot: silent.boot.clone() };
         member(&run, &gone, 0);
         let t = Instant::now();
-        assert!(wait(&run, n, now()).0);
+        assert!(wait(&run, n, now()));
         assert!(t.elapsed() < Duration::from_secs(1));
         assert!(!answers(&run).join(gone.key()).exists() && !answers(&run).join(silent.key()).exists(), "pruned");
         drop(dir);
@@ -261,6 +248,6 @@ mod tests {
         let b = ask(&h, by).unwrap();
         assert_eq!(b, a + 1);
         member(&h.run, &Ident::me(), b);
-        assert!(wait(&h.run, a, by).0, "a later answer answers it");
+        assert!(wait(&h.run, a, by), "a later answer answers it");
     }
 }

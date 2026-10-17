@@ -1518,7 +1518,7 @@ impl Host {
         let mut need = floor.saturating_add(pending).saturating_add(mib);
         let mut avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         // Memory VM processes keep for their next checkpoint is not admitted: it goes back rather than refuse (#648),
-        // with its debits (#691).
+        // and what is pending is counted again (#691).
         if avail < need {
             crate::hostmem::release_kept(self, deadline);
             let (g, pending, _) = self.pending(l)?;
@@ -1572,36 +1572,31 @@ impl Host {
         }
         if let Some(l) = self.try_lock_for(tries) {
             if let (Some(mut debits), _) = self.recent_debits(&l, boottime_ms()) {
-                self.mark_populated(&mut debits, boottime_ms());
-                let _ = store(&self.debits(), &debits, false);
+                let marked = self.mark_populated(&mut debits, boottime_ms());
+                if store(&self.debits(), &debits, false).is_ok() {
+                    self.forget_marked(&marked);
+                }
             }
         }
     }
 
-    /// Marks this process's takes in `debits` (its ledger) populated at `now` that `UNMARKED` lists, and forgets them
-    /// there (ones no longer in it, unreadable meanwhile or gone with the file, have nothing to mark).
-    fn mark_populated(&self, debits: &mut Debits, now: u64) {
+    /// Marks this process's takes in `debits` (its ledger) populated at `now` that `UNMARKED` lists: those listed,
+    /// for `forget_marked` once the ledger is stored (ones no longer in it, unreadable meanwhile or gone with the
+    /// file, have nothing to mark).
+    fn mark_populated(&self, debits: &mut Debits, now: u64) -> Vec<u64> {
         let (me, path) = (Ident::me(), self.debits());
-        let mut unmarked = UNMARKED.lock().unwrap();
-        for d in debits.iter_mut().filter(|d| !d.populated && (d.pid, d.start) == (me.pid, me.start)) {
-            if unmarked.iter().any(|u| u.0 == path && u.1 == d.id) {
-                (d.populated, d.at) = (true, now);
-            }
+        let listed: Vec<u64> = UNMARKED.lock().unwrap().iter().filter(|u| u.0 == path).map(|u| u.1).collect();
+        for d in debits.iter_mut().filter(|d| !d.populated && (d.pid, d.start) == (me.pid, me.start) && listed.contains(&d.id)) {
+            (d.populated, d.at) = (true, now);
         }
-        unmarked.retain(|u| u.0 != path);
+        listed
     }
 
-    /// Retires the populated debits of `released` (each a VM process, and when it released what it kept for its
-    /// next checkpoint with no copy running): what they covered is unmapped, or will be (#691).
-    pub fn retire_debits(&self, released: &[(Ident, u64)], deadline: std::time::Instant) {
-        if released.is_empty() {
-            return;
-        }
-        let Ok(l) = self.lock_by(Some(deadline)) else { return };
-        let (Some(mut debits), _) = self.recent_debits(&l, boottime_ms()) else { return };
-        self.mark_populated(&mut debits, boottime_ms());
-        debits.retain(|d| !(d.populated && released.iter().any(|(id, at)| (id.pid, id.start) == (d.pid, d.start) && d.at <= *at)));
-        let _ = store(&self.debits(), &debits, false);
+    /// Forgets the takes `marked` (`mark_populated`) once the ledger saying so is stored: not before, or one whose
+    /// store failed would count in full for the life of its process.
+    fn forget_marked(&self, marked: &[u64]) {
+        let path = self.debits();
+        UNMARKED.lock().unwrap().retain(|u| u.0 != path || !marked.contains(&u.1));
     }
 
     /// Memory not admitted like a guest's (checkpoint rescue memory, hot pages', writer buffers: `cow::Room`), which
@@ -1626,11 +1621,12 @@ impl Host {
         static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (me, id) = (Ident::me(), ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let mut debits = debits.unwrap_or_default();
-        self.mark_populated(&mut debits, boottime_ms());
+        let marked = self.mark_populated(&mut debits, boottime_ms());
         debits.push(Debit { at: boottime_ms(), mib, pid: me.pid, start: me.start, id, populated: false });
         if store(&self.debits(), &debits, false).is_err() {
             return (Some(0), None);
         }
+        self.forget_marked(&marked);
         drop(l);
         let r = populate();
         // Counted in full until marked (a failed populate too: as if it had come). Marked now only if the lock is
@@ -7077,12 +7073,7 @@ pub(crate) mod tests {
         pin_clock(boottime_ms());
         let kept: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(300)));
         let run = h.run.clone();
-        std::thread::spawn(move || {
-            crate::hostmem::serve(&run, || {
-                kept.store(0, SeqCst);
-                false
-            })
-        });
+        std::thread::spawn(move || crate::hostmem::serve(&run, || kept.store(0, SeqCst)));
         let t = std::time::Instant::now();
         while !crate::hostmem::joined(&h.run) {
             assert!(t.elapsed() < Duration::from_secs(5));
@@ -7156,15 +7147,11 @@ pub(crate) mod tests {
         settle(&h);
         pin_clock(t0 + debit_window_ms());
         assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000, "expired by age");
-        // Not populated: in full while its process runs, gone with it; populated ones of a process that released with
-        // no copy running, from before it, retired.
-        let (me, now) = (Ident::me(), t0 + debit_window_ms());
+        // Not populated: in full while its process runs, gone with it.
+        let me = Ident::me();
         let gone = Ident { pid: (1 << 22) - 2, start: 1, boot: me.boot.clone() };
-        let init = Ident::of(1).unwrap();
-        let ledger = vec![debit(700, t0, &gone, false), debit(300, t0, &me, false), debit(200, now, &me, true), debit(100, now, &init, true)];
-        store(&h.debits(), &ledger, false).unwrap();
-        h.retire_debits(&[(me.clone(), now)], std::time::Instant::now() + Duration::from_secs(30));
-        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 300 - capped(100));
+        store(&h.debits(), &vec![debit(700, t0, &gone, false), debit(300, t0, &me, false)], false).unwrap();
+        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 300);
         // Unreadable: nothing taken, and none left (never no bound); unreadable debits written just now leave none.
         assert_eq!(take_at(&h, 1, || None, || panic!("nothing populated")), (0, None));
         std::fs::write(h.debits(), "{").unwrap();
@@ -7173,25 +7160,47 @@ pub(crate) mod tests {
         assert_eq!(take_at(&h, 1, read, || panic!("nothing populated")), (0, None));
     }
 
-    /// Memory released on request takes its debits with it (#691): admission counts again after the release, and a
-    /// grant that fits only without them is not refused.
+    /// Admission counts again after a release (#691): what it found pending before is not what decides.
     #[test]
-    fn released_memory_takes_its_debits_with_it() {
-        let (_h_dir, mut h) = host("release-debits");
+    fn admission_counts_again_after_a_release() {
+        let (_h_dir, mut h) = host("release-recount");
         h.cfg.reserve_mib = Some(0);
         pin_clock(boottime_ms());
-        let capped = vmstat_drift_mib().map_or(500, |c| c.min(500));
-        store(&h.debits(), &vec![debit(500, boottime_ms(), &Ident::me(), true)], false).unwrap();
+        let path = h.debits();
+        store(&path, &vec![debit(500, boottime_ms(), &Ident::me(), false)], false).unwrap();
         let run = h.run.clone();
-        std::thread::spawn(move || crate::hostmem::serve(&run, || true));
+        // Stands in for what goes meanwhile: the debit.
+        std::thread::spawn(move || crate::hostmem::serve(&run, || store(&path, &Vec::<Debit>::new(), false).unwrap()));
         let t = std::time::Instant::now();
         while !crate::hostmem::joined(&h.run) {
             assert!(t.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(1));
         }
         let deadline = Some(std::time::Instant::now() + Duration::from_secs(30));
-        assert!(h.grant_inner(AVAIL - capped + 1, Floor::Reserve, false, deadline, || Some(AVAIL)).unwrap().is_ok());
-        assert_eq!(load::<Debits>(&h.debits()).unwrap(), Some(vec![]), "retired");
+        assert!(h.grant_inner(AVAIL - 499, Floor::Reserve, false, deadline, || Some(AVAIL)).unwrap().is_ok());
+    }
+
+    /// The marks of populated takes are forgotten only once the ledger saying so is stored: one whose store failed
+    /// is marked by the next settle, not counted in full for the life of its process.
+    #[test]
+    fn a_mark_whose_store_failed_is_made_again() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes through the mode
+        }
+        let (_h_dir, h) = host("mark-retry");
+        let id = u64::MAX - 1;
+        let me = Ident::me();
+        store(&h.debits(), &vec![Debit { id, ..debit(500, boottime_ms(), &me, false) }], false).unwrap();
+        UNMARKED.lock().unwrap().push((h.debits(), id));
+        let mode = |m| std::fs::set_permissions(&h.run, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o500);
+        h.settle_room(Duration::from_secs(30));
+        mode(0o700);
+        assert!(UNMARKED.lock().unwrap().contains(&(h.debits(), id)), "kept: the store failed");
+        assert!(!load::<Debits>(&h.debits()).unwrap().unwrap()[0].populated);
+        settle(&h);
+        assert!(load::<Debits>(&h.debits()).unwrap().unwrap()[0].populated);
     }
 
     /// What debits count as taken: ones not yet populated in full unless their process is gone; populated ones within
