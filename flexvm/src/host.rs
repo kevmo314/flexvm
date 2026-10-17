@@ -1254,6 +1254,7 @@ impl Host {
     /// `RUN/live` entries no live process will remove: published by a dead process the record no
     /// longer names (one it names goes with its claim, `withdraw_dead`), unreadable ones, and a
     /// dead writer's temporary files (`.IP.PID.tmp`, from `util::write_file`).
+    /// An unreadable address keeps its entry; sweep the rest before returning the error.
     fn sweep_live(&self) -> Result<()> {
         let dir = self.run.join("live");
         let entries = match std::fs::read_dir(&dir) {
@@ -1262,12 +1263,20 @@ impl Host {
             Err(e) => bail!("cannot read {}: {e}", dir.display()),
         };
         let l = self.lock()?;
+        let mut unreadable = None;
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let stale = match name.strip_prefix('.') {
                 Some(_) => write_debris_of(&e.path()),
                 None => match (name.parse::<Ipv4Addr>(), load::<Live>(&e.path())) {
-                    (Ok(ip), Ok(Some(live))) => live.id.liveness() == Liveness::Gone && self.addr(&l, ip)?.holder_id.as_ref() != Some(&live.id),
+                    (Ok(ip), Ok(Some(live))) if live.id.liveness() == Liveness::Gone => match self.addr(&l, ip) {
+                        Ok(a) => a.holder_id.as_ref() != Some(&live.id),
+                        Err(e) => {
+                            unreadable.get_or_insert(e);
+                            continue;
+                        }
+                    },
+                    (Ok(_), Ok(Some(_))) => false,
                     (Ok(_), Ok(None)) => false,
                     _ => true,
                 },
@@ -1276,7 +1285,10 @@ impl Host {
                 let _ = std::fs::remove_file(e.path());
             }
         }
-        Ok(())
+        match unreadable {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// The revision of the newest generation of `ip` its holder here runs at, as it published it:
@@ -2729,10 +2741,11 @@ impl Host {
         remove_write_debris(&self.run, |n| n.starts_with("..gens.next."));
         let withdrawn = self.withdraw_dead(lost);
         // After the sweep of dead holders, whose claims took their published revisions with them.
-        if let Err(e) = self.sweep_live() {
-            crate::log!("garbage collection: {e}");
+        match (withdrawn, self.sweep_live()) {
+            (Ok(withdrawn), Ok(())) => Ok(withdrawn),
+            (Err(e), Ok(())) | (Ok(_), Err(e)) => Err(e),
+            (Err(withdraw), Err(live)) => Err(format!("{withdraw}; sweeping live revisions: {live}").into()),
         }
-        withdrawn
     }
 
     /// Addresses whose holder died without withdrawing them (SIGKILLed, or a
@@ -6497,6 +6510,62 @@ mod tests {
         let mut left: Vec<_> = std::fs::read_dir(&live).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
         assert_eq!(left, [mine, y.to_string(), z.to_string()]);
+    }
+
+    #[test]
+    fn live_sweep_skips_unreadable_addresses_and_sweeps_the_rest() {
+        let (_dir, h) = host("live-unreadable");
+        let gone = dead_owner(&h, 999_999_932, &[]);
+        let live = h.run.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        for x in [ip("10.9.6.1"), ip("10.9.6.2"), ip("10.9.6.3")] {
+            store(&h.live_path(x), &Live { id: gone.clone(), gen: 7, rev: 4 }, false).unwrap();
+        }
+        // Make the first entry unreadable regardless of the filesystem's iteration order.
+        let first = std::fs::read_dir(&live).unwrap().next().unwrap().unwrap().file_name();
+        let bad = h.state.join("addrs").join(&first);
+        std::fs::write(&bad, b"{not json").unwrap();
+        let e = h.sweep_live().unwrap_err().to_string();
+        assert!(e.contains(&bad.display().to_string()), "{e}");
+        let left: Vec<_> = std::fs::read_dir(&live).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [first], "only the unreadable address's live entry stays");
+        std::fs::remove_file(bad).unwrap();
+        h.sweep_live().unwrap();
+        assert_eq!(std::fs::read_dir(live).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn debug_gc_reports_live_sweep_errors_and_combines_withdrawal_errors() {
+        let (_dir, h) = host("live-gc-error");
+        let x = ip("10.9.6.1");
+        let gone = dead_owner(&h, 999_999_933, &[]);
+        std::fs::create_dir_all(h.run.join("live")).unwrap();
+        store(&h.live_path(x), &Live { id: gone.clone(), gen: 7, rev: 4 }, false).unwrap();
+        let bad = h.addr_path(x);
+        std::fs::write(&bad, b"{not json").unwrap();
+        let e = crate::gc::sweep_now(&h).unwrap_err().to_string();
+        assert!(e.contains(&bad.display().to_string()), "{e}");
+        crate::gc::sweep(&h); // Background sweeps still log the failure.
+        assert!(h.live_path(x).exists());
+
+        // Both passes fail: preserve both errors for the foreground caller.
+        h.put_addr(ip("10.9.6.2"), &Addr { holder_id: Some(gone), ..Default::default() }, false).unwrap();
+        let owed = h.state.join("owed/5");
+        std::fs::write(&owed, b"{not json").unwrap();
+        let e = crate::gc::sweep_now(&h).unwrap_err().to_string();
+        assert!(e.contains(&bad.display().to_string()) && e.contains(&owed.display().to_string()), "{e}");
+        std::fs::remove_file(owed).unwrap();
+        std::fs::remove_file(h.addr_path(ip("10.9.6.2"))).unwrap();
+        std::fs::remove_file(bad).unwrap();
+
+        // No dead holder needs the host lock: only sweep_live fails to acquire it.
+        let lock = h.lock_file();
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(crate::gc::sweep_now(&h).is_err(), "a live-sweep lock failure must fail debug gc");
+        std::fs::remove_dir(lock).unwrap();
+        crate::gc::sweep_now(&h).unwrap();
+        assert!(!h.live_path(x).exists());
     }
 
     #[test]
