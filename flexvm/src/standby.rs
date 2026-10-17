@@ -4,14 +4,14 @@
 //! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, generation}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows. An
-//! `attached` claim (a foreground `run`'s, with its `cgroup`, which the VM joins) ends the
+//! `attached` claim (a foreground `run`'s, with its cgroup directory fd, which the VM joins) ends the
 //! VM if the claimer hangs up first.
 
 use std::fs::File;
 use std::io::BufReader;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -423,7 +423,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // Under `.locks/publish`, a lock (not `*.lock`, which names a standby) a sweep holds: none finds this pid's socket stale and unlinks it after the bind.
     let publish = crate::host::Flock::new(crate::host::private_file(&l.join("publish"))?, libc::LOCK_EX)?;
     let _ = std::fs::remove_file(&sock); // A previous process with this pid may have left it.
-    let listener = UnixListener::bind(&sock)?;
+    let listener = bind_claims(&sock)?;
     // A claimer refused by a dead standby of this pid may unlink the path after this bind.
     let bound = std::fs::metadata(&sock)?.ino();
     drop(publish);
@@ -456,6 +456,9 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             continue;
         }
         let Ok((c, _)) = listener.accept() else { continue };
+        if !claim_peer(&c, unsafe { libc::geteuid() }) {
+            continue;
+        }
         // In short waits, minding stops: a claimer stopped mid-request must not keep this one.
         let at = Instant::now() + HANDSHAKE_TIMEOUT;
         let ready = || loop {
@@ -505,9 +508,9 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 let attached = req["attached"] == json!(true);
                 // In the claimer's cgroup, as a cold foreground run's VM process is (its Firecracker
                 // has its own either way). This process moves itself: its own pid is never a reused one.
-                if let (true, Some(cg)) = (attached, req["cgroup"].as_str()) {
+                if let (true, Some(cg)) = (attached, fds.get(2)) {
                     if let Err(e) = crate::util::join_cgroup(cg) {
-                        crate::log!("vm {}: not moved to its claimer's cgroup {cg:?}: {e}", req["name"].as_str().unwrap_or(""));
+                        crate::log!("vm {}: not moved to its claimer's cgroup: {e}", req["name"].as_str().unwrap_or(""));
                     }
                 }
                 let watch = attached.then(|| c.try_clone());
@@ -554,6 +557,17 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             }
         }
     }
+}
+
+/// Private even with a permissive umask; peer credentials also cover the bind/chmod window.
+fn bind_claims(sock: &std::path::Path) -> std::io::Result<UnixListener> {
+    let listener = UnixListener::bind(sock)?;
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+fn claim_peer(c: &UnixStream, uid: libc::uid_t) -> bool {
+    crate::util::peer_cred(c).is_ok_and(|cred| cred.uid == uid)
 }
 
 /// On failure, the flag says whether another standby (or a cold start) may
@@ -800,6 +814,21 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claims_use_a_private_socket_and_require_the_same_uid() {
+        let root = crate::test_util::TempDir::new("claim-peer");
+        let sock = root.join("claim.sock");
+        let listener = bind_claims(&sock).unwrap();
+        assert_eq!(std::fs::metadata(&sock).unwrap().mode() & 0o777, 0o600);
+        // Credentials still reject other users if permissions were permissive at connect time.
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let _c = UnixStream::connect(&sock).unwrap();
+        let (c, _) = listener.accept().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert!(claim_peer(&c, uid));
+        assert!(!claim_peer(&c, uid.wrapping_add(1)));
+    }
 
     /// A host with template `default` (generation `a`) and its pool's directory.
     fn pool(tag: &str) -> (crate::test_util::TempDir, Host, Paths, PathBuf) {

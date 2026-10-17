@@ -711,12 +711,16 @@ pub fn send_unix(path: &std::path::Path, line: &[u8], fds: &[RawFd], at: Instant
 
 /// The pid of the process that made the socket `s` is connected to (for a listener's, the one that listened).
 pub fn peer_pid(s: &UnixStream) -> io::Result<u32> {
+    Ok(peer_cred(s)?.pid as u32)
+}
+
+pub fn peer_cred(s: &UnixStream) -> io::Result<libc::ucred> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     if unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(cred.pid as u32)
+    Ok(cred)
 }
 
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
@@ -761,29 +765,31 @@ pub fn wait_hung_up(fd: &impl AsRawFd) {
     }
 }
 
-/// This process's cgroup2 path (`/proc/self/cgroup`'s `0::` entry), if cgroup2 is mounted at /sys/fs/cgroup.
-pub fn my_cgroup() -> Option<String> {
-    if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+/// This process's cgroup2 directory, resolved in its own cgroup and mount namespaces.
+pub fn my_cgroup() -> Option<OwnedFd> {
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
         return None;
     }
     let mine = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    mine.lines().find_map(|l| l.strip_prefix("0::")).map(String::from)
+    let cg = mine.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let dir = cgroup_dir(cg)?;
+    openat(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes()).ok()?, libc::O_PATH | libc::O_DIRECTORY).ok()
 }
 
-/// `cgroup.procs` of cgroup2 path `cg` (as `my_cgroup` gives it): None unless absolute, of plain components.
-fn cgroup_procs(cg: &str) -> Option<std::path::PathBuf> {
+/// A cgroup2 path: None unless absolute, of plain components.
+fn cgroup_dir(cg: &str) -> Option<std::path::PathBuf> {
     let rel = cg.strip_prefix('/')?.trim_end_matches('/');
     let plain = |c: &str| !c.is_empty() && c != "." && c != ".." && !c.contains(['\0', '\n']);
     if !rel.is_empty() && !rel.split('/').all(plain) {
         return None;
     }
-    Some(std::path::Path::new("/sys/fs/cgroup").join(rel).join("cgroup.procs"))
+    Some(Path::new("/sys/fs/cgroup").join(rel))
 }
 
-/// Moves this process (all its threads) into cgroup2 path `cg`.
-pub fn join_cgroup(cg: &str) -> io::Result<()> {
-    let procs = cgroup_procs(cg).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a cgroup path"))?;
-    std::fs::write(procs, std::process::id().to_string())
+/// Moves this process (all its threads) into the claimer's cgroup directory.
+pub fn join_cgroup(cg: &impl AsRawFd) -> io::Result<()> {
+    let procs = openat(cg.as_raw_fd(), c"cgroup.procs", libc::O_WRONLY | libc::O_NOFOLLOW)?;
+    std::fs::File::from(procs).write_all(std::process::id().to_string().as_bytes())
 }
 
 /// After a failed `accept`: one worth retrying at once (interrupted, the
@@ -1475,12 +1481,39 @@ mod tests {
 
     #[test]
     fn a_claimer_cgroup_is_an_absolute_path_of_plain_components() {
-        let procs = |cg| cgroup_procs(cg).map(|p| p.display().to_string());
-        assert_eq!(procs("/").as_deref(), Some("/sys/fs/cgroup/cgroup.procs"));
-        assert_eq!(procs("/system.slice/ci.service").as_deref(), Some("/sys/fs/cgroup/system.slice/ci.service/cgroup.procs"));
+        let dir = |cg| cgroup_dir(cg).map(|p| p.display().to_string());
+        assert_eq!(dir("/").as_deref(), Some("/sys/fs/cgroup/"));
+        assert_eq!(dir("/system.slice/ci.service").as_deref(), Some("/sys/fs/cgroup/system.slice/ci.service"));
         for bad in ["", "system.slice", "/a/../b", "/..", "/a//b", "/./a", "/a\nb"] {
-            assert_eq!(procs(bad), None, "{bad:?}");
+            assert_eq!(dir(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_cgroup_fd_survives_passing_and_path_replacement() {
+        let root = crate::test_util::TempDir::new("claim-cgroup");
+        let dir = root.join("cgroup");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("cgroup.procs"), b"").unwrap();
+        let cg = openat(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes()).unwrap(), libc::O_PATH | libc::O_DIRECTORY).unwrap();
+        assert_ne!(unsafe { libc::fcntl(cg.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH, 0);
+        let (a, b) = UnixStream::pair().unwrap();
+        send_with_fds(&a, b"claim\n", &[1, 2, cg.as_raw_fd()], Instant::now() + Duration::from_secs(5)).unwrap();
+        let (_, fds) = recv_with_fds(&b, 1024, || Ok(())).unwrap();
+        assert_eq!(fds.len(), 3);
+        drop(cg);
+        std::fs::rename(&dir, root.join("original")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("cgroup.procs"), b"unrelated").unwrap();
+        join_cgroup(&fds[2]).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("original/cgroup.procs")).unwrap(), std::process::id().to_string());
+        assert_eq!(std::fs::read(dir.join("cgroup.procs")).unwrap(), b"unrelated");
+        // A directory without cgroup.procs is not populated, nor is a symlink followed.
+        std::fs::remove_file(root.join("original/cgroup.procs")).unwrap();
+        assert!(join_cgroup(&fds[2]).is_err());
+        std::os::unix::fs::symlink(dir.join("cgroup.procs"), root.join("original/cgroup.procs")).unwrap();
+        assert!(join_cgroup(&fds[2]).is_err());
+        assert_eq!(std::fs::read(dir.join("cgroup.procs")).unwrap(), b"unrelated");
     }
 
     #[test]

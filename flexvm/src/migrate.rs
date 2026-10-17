@@ -326,7 +326,8 @@ impl Proc {
             Err(r) => {
                 vm.set_failed();
                 self.publish();
-                return format!("{e}; and whether its address went to another vm cannot be told ({r}), so it stays paused, failed").into();
+                return self
+                    .abort_error(op, format!("{e}; and whether its address went to another vm cannot be told ({r}), so it stays paused, failed").into());
             }
         };
         // Past the revision its target took (and may have announced, if it committed): published or
@@ -335,7 +336,10 @@ impl Proc {
             drop(l);
             vm.set_failed();
             self.publish();
-            return format!("{e}; and its revision past its target's could be neither published nor recorded here ({r}), so it stays paused, failed").into();
+            return self.abort_error(
+                op,
+                format!("{e}; and its revision past its target's could be neither published nor recorded here ({r}), so it stays paused, failed").into(),
+            );
         }
         let (_, attached) = self.release_to_tap(vm, mig);
         let (s, e) = match vm.resume(attached) {
@@ -373,10 +377,14 @@ impl Proc {
         if s == State::Running {
             self.sync_clock_later();
         }
-        // Its foreground claimer was killed while it migrated (the destroy was refused): back
-        // here, it goes as the destroy would have, not on with no one to stop it.
+        self.abort_error(op, e)
+    }
+
+    /// An aborted migration, even one left failed and paused, no longer needs to keep
+    /// memory for its target. A killed foreground claimer must not leave it behind.
+    pub(crate) fn abort_error(&self, op: &Op, e: Error) -> Error {
         if self.claimer_gone.load(Ordering::SeqCst) {
-            crate::log!("vm {}: {e}; its claimer (a foreground run) is gone, so it is destroyed", vm.name);
+            crate::log!("vm {}: {e}; its claimer (a foreground run) is gone, so it is destroyed", self.name());
             self.finish(op, End::Gone, crate::vmproc::FAILED, None)
         }
         e
