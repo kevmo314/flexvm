@@ -179,10 +179,23 @@ impl Drop for Charge {
 thread_local! {
     /// Tests: the next `Buf::map` on this thread fails.
     static FAIL_MAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: the next `populate` on this thread finds the kernel cannot (as before 5.14).
+    static FAIL_POPULATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 const HUGE: usize = 2 << 20;
 const MADV_POPULATE_WRITE: libc::c_int = 23;
+
+/// Faults in `len` bytes from `ptr` for writing: at once where the kernel can, else a write to each page.
+fn populate(ptr: *mut u8, len: usize) {
+    #[cfg(test)]
+    let fail = FAIL_POPULATE.with(|f| f.replace(false));
+    #[cfg(not(test))]
+    let fail = false;
+    if fail || unsafe { libc::madvise(ptr.cast(), len, MADV_POPULATE_WRITE) } != 0 {
+        (0..len).step_by(PAGE_SIZE).for_each(|o| unsafe { ptr.add(o).write_volatile(0) });
+    }
+}
 
 impl Buf {
     fn new(room: &Room) -> io::Result<Buf> {
@@ -202,9 +215,8 @@ impl Buf {
         };
         // Only a hint: without it the buffer is ordinary pages.
         unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
-        // Populated now, so its reservation in the room ends here, not with its first write (#672). Only a hint too:
-        // where the kernel cannot, the first write faults it in.
-        unsafe { libc::madvise(ptr.cast(), huge, MADV_POPULATE_WRITE) };
+        // Populated now, so its reservation in the room ends here, not with its first write (#672).
+        populate(ptr, huge);
         let charge = Charge { room: room.clone(), mib, at: reserved.populated() };
         Ok(Buf { ptr, map: huge, len, charge: Some(charge) })
     }
@@ -422,6 +434,24 @@ mod buf_tests {
         // And the next one maps (huge) as usual.
         let b = Buf::new(&room).unwrap();
         assert_eq!((b.charge.is_some(), room.get()), (true, 3));
+    }
+
+    /// A writer buffer is populated before its reservation in the room ends, also where the kernel cannot populate it
+    /// at once (#674): every page is in, and nothing stays reserved.
+    #[test]
+    fn a_writer_buffer_is_populated_before_its_reservation_ends() {
+        let dir = crate::test_util::TempDir::new("buf-populate");
+        let host = crate::hostmem::at(&dir).unwrap();
+        let room = Room::default();
+        assert!(room.attach(host));
+        room.set(100);
+        FAIL_POPULATE.with(|f| f.set(true));
+        let b = Buf::new(&room).unwrap();
+        assert!(b.charge.is_some() && !FAIL_POPULATE.with(|f| f.get()), "huge, and the populate failed");
+        assert_eq!(host.outstanding(), 0, "its reservation ended");
+        let mut vec = vec![0u8; b.map / PAGE_SIZE];
+        assert_eq!(unsafe { libc::mincore(b.ptr.cast(), b.map, vec.as_mut_ptr()) }, 0);
+        assert!(vec.iter().all(|&v| v & 1 == 1), "every page in");
     }
 
     /// AnonHugePages of the mapping starting at `addr`, from /proc/self/smaps.

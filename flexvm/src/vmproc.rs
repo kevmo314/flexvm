@@ -1395,6 +1395,7 @@ impl Proc {
 
     fn controller(self: Arc<Self>) {
         let (mut published, mut growth, mut stopping) = (false, Growth::default(), None::<Stopping>);
+        let mut told_unattached = false;
         loop {
             thread::sleep(Duration::from_secs(1));
             // Standby VMs signalled last tick had that sleep: other processes may stop them now, however long this tick blocks.
@@ -1433,11 +1434,17 @@ impl Proc {
                 crate::hostmem::release_kept(&self.host.run, None);
                 avail = host_available_mib();
             }
-            if let Ok(s) = crate::hostmem::at(&self.host.run) {
-                vm.pager.mem_room().attach(s);
+            // Until it attaches (retried every tick), none: what it took could not be counted host-wide (#674).
+            let attached = crate::hostmem::at(&self.host.run).is_ok_and(|s| vm.pager.mem_room().attach(s));
+            if !attached && !std::mem::replace(&mut told_unattached, true) {
+                crate::log!("vm {}: no slot in the host's memory file: no memory for checkpoint copies until there is", vm.name);
             }
             let room = room_sample(reserve, host_available_mib, || self.host.promised());
-            vm.pager.host_memory(room, avail.is_some_and(|a| a < at) || vm.starving());
+            let short = avail.is_some_and(|a| a < at) || vm.starving();
+            match attached {
+                true => vm.pager.host_memory(room, short),
+                false => vm.pager.host_memory(|| Some(0), short),
+            }
             relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
             if let Some(dev) = self.host.config_now().announce_dev() {
