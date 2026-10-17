@@ -799,12 +799,38 @@ fn cgroup_dir(cg: &str) -> Option<std::path::PathBuf> {
 /// Moves this process (all its threads) into cgroup directory `cg`, a claimer's, only if the
 /// claimer (`pid`, its `pidfd` opened when it connected) is in it: one it passed may name any.
 pub fn join_cgroup(cg: &impl AsRawFd, pid: u32, pidfd: &OwnedFd) -> io::Result<()> {
+    // Where it goes back to if the claimer leaves `cg` during the move: opened before it.
+    let mine = std::fs::read_to_string("/proc/self/cgroup")?;
+    let prev = mine
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .and_then(cgroup_dir)
+        .and_then(|d| CString::new(d.as_os_str().as_bytes()).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this process's own cgroup is not known, so it could not go back"))?;
+    let prev = openat(libc::AT_FDCWD, &prev, libc::O_PATH | libc::O_DIRECTORY)?;
+    join_checked(cg, &prev, pid, pidfd, || ())
+}
+
+/// `join_cgroup` from `prev`, this process's cgroup; `moved` runs between its move and the recheck.
+fn join_checked(cg: &impl AsRawFd, prev: &impl AsRawFd, pid: u32, pidfd: &OwnedFd, moved: impl FnOnce()) -> io::Result<()> {
     // Alive after the read: the pid listed is still the claimer's, not a reuse.
-    if !in_cgroup(cg, pid)? || pidfd_signal(pidfd, 0).is_err() {
+    let claimers = || Ok::<_, io::Error>(in_cgroup(cg, pid)? && pidfd_signal(pidfd, 0).is_ok());
+    if !claimers()? {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the cgroup passed is not the claimer's"));
     }
-    let procs = openat(cg.as_raw_fd(), c"cgroup.procs", libc::O_WRONLY | libc::O_NOFOLLOW)?;
-    std::fs::File::from(procs).write_all(std::process::id().to_string().as_bytes())
+    let into = |d: &dyn AsRawFd| {
+        let procs = openat(d.as_raw_fd(), c"cgroup.procs", libc::O_WRONLY | libc::O_NOFOLLOW)?;
+        std::fs::File::from(procs).write_all(std::process::id().to_string().as_bytes())
+    };
+    into(cg)?;
+    moved();
+    // The claimer may have moved itself out between the check and the move: then it was not
+    // its cgroup this joined, and it goes back.
+    if claimers().unwrap_or(false) {
+        return Ok(());
+    }
+    let back = into(prev).map_or_else(|e| format!("; and going back failed: {e}"), |()| ", so it went back".into());
+    Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("the claimer left the cgroup passed during the move{back}")))
 }
 
 /// After a failed `accept`: one worth retrying at once (interrupted, the
@@ -1511,8 +1537,12 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let me = std::process::id();
         let pidfd = pidfd_open(me).unwrap();
+        // Its own cgroup, gone back to if the claimer leaves (a fake: never this process's real one).
+        std::fs::create_dir(root.join("prev")).unwrap();
+        let prev = openat(libc::AT_FDCWD, &CString::new(root.join("prev").as_os_str().as_bytes()).unwrap(), libc::O_PATH | libc::O_DIRECTORY).unwrap();
+        let join = |cg: &OwnedFd| join_checked(cg, &prev, me, &pidfd, || ());
         // Listed, as the claimer is in its own cgroup.
-        std::fs::write(dir.join("cgroup.procs"), format!("1\n{me}\n")).unwrap();
+        std::fs::write(dir.join("cgroup.procs"), format!("{me}\n1\n")).unwrap();
         let cg = openat(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes()).unwrap(), libc::O_PATH | libc::O_DIRECTORY).unwrap();
         assert_ne!(unsafe { libc::fcntl(cg.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH, 0);
         let (a, b) = UnixStream::pair().unwrap();
@@ -1523,19 +1553,42 @@ mod tests {
         std::fs::rename(&dir, root.join("original")).unwrap();
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("cgroup.procs"), format!("{me}\nunrelated")).unwrap();
-        join_cgroup(&fds[2], me, &pidfd).unwrap();
+        join(&fds[2]).unwrap();
         assert!(std::fs::read_to_string(root.join("original/cgroup.procs")).unwrap().starts_with(&me.to_string()));
         assert_eq!(std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(), format!("{me}\nunrelated"));
         // A cgroup the claimer is not in (one it opened elsewhere, or by a path not its own) is refused.
         std::fs::write(root.join("original/cgroup.procs"), b"1\n").unwrap();
-        assert!(join_cgroup(&fds[2], me, &pidfd).is_err());
+        assert!(join(&fds[2]).is_err());
         assert_eq!(std::fs::read(root.join("original/cgroup.procs")).unwrap(), b"1\n");
         // A directory without cgroup.procs is not populated, nor is a symlink followed.
         std::fs::remove_file(root.join("original/cgroup.procs")).unwrap();
-        assert!(join_cgroup(&fds[2], me, &pidfd).is_err());
+        assert!(join(&fds[2]).is_err());
         std::os::unix::fs::symlink(dir.join("cgroup.procs"), root.join("original/cgroup.procs")).unwrap();
-        assert!(join_cgroup(&fds[2], me, &pidfd).is_err());
+        assert!(join(&fds[2]).is_err());
         assert_eq!(std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(), format!("{me}\nunrelated"));
+    }
+
+    #[test]
+    fn a_claimer_that_leaves_its_cgroup_during_the_move_sends_this_process_back() {
+        let root = crate::test_util::TempDir::new("claim-cgroup-recheck");
+        let (a, prev) = (root.join("a"), root.join("prev"));
+        let me = std::process::id();
+        let pidfd = pidfd_open(me).unwrap();
+        let open = |d: &Path| {
+            std::fs::create_dir(d).unwrap();
+            openat(libc::AT_FDCWD, &CString::new(d.as_os_str().as_bytes()).unwrap(), libc::O_PATH | libc::O_DIRECTORY).unwrap()
+        };
+        let (cg, back) = (open(&a), open(&prev));
+        let listed = format!("{me}\n");
+        std::fs::write(prev.join("cgroup.procs"), b"").unwrap();
+        // Still there after the move: joined, and nothing written back.
+        std::fs::write(a.join("cgroup.procs"), &listed).unwrap();
+        join_checked(&cg, &back, me, &pidfd, || ()).unwrap();
+        assert_eq!(std::fs::read(prev.join("cgroup.procs")).unwrap(), b"");
+        // Gone from it once this process moved in: back to where it was.
+        let e = join_checked(&cg, &back, me, &pidfd, || std::fs::write(a.join("cgroup.procs"), b"1\n").unwrap()).unwrap_err();
+        assert!(e.to_string().contains("so it went back"), "{e}");
+        assert_eq!(std::fs::read_to_string(prev.join("cgroup.procs")).unwrap(), me.to_string());
     }
 
     #[test]
