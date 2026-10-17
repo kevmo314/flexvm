@@ -622,8 +622,7 @@ fn run_as(
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
-    let req =
-        json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "attached": log.is_none(), "cgroup": cgroup});
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "attached": log.is_none()});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
@@ -631,7 +630,9 @@ fn run_as(
     // A foreground claim's signals wait from before it is sent: the VM it makes gets them
     // (`follow`), as a cold start would, never orphaned by this process dying mid-claim.
     let set = (!tried && log.is_none()).then(|| util::block_signals(&FOLLOW_SIGNALS));
-    let taken = if tried { None } else { standby::take(host, paths, template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? };
+    let fds: Vec<_> = outs.iter().map(|f| f.as_raw_fd()).chain(cgroup.iter().map(|f| f.as_raw_fd())).collect();
+    let taken = if tried { None } else { standby::take(host, paths, template, &req, &fds)? };
+    drop(cgroup);
     if let (None, Some(set)) = (&taken, &set) {
         // No claim: this process becomes the VM, and one pending kills it as before.
         unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };

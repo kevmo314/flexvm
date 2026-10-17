@@ -24,7 +24,7 @@ a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
 """
 from contextlib import ExitStack, contextmanager, suppress
 
-import argparse, base64, fcntl, ipaddress, json, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, base64, fcntl, ipaddress, json, shlex, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -7515,6 +7515,59 @@ def standby_claim_orphan():
         clear_standby(A, t)
 
 
+def standby_claim_cgroupns():
+    """A foreground claim from a private cgroup namespace (#649): its VM process joins the cgroup
+    the claimer is in, and never another that its namespace-relative path names here. Without its
+    own cgroup2 mount (`unshare -C`), its "/sub" names a decoy: the host's /sub, which the VM process
+    must not join (it is moved nowhere). With one (`unshare -Cm`, as a container has), it joins the
+    claimer's."""
+    t = args.template
+    sub = f"fvp-cgns-sub-{os.getpid()}"
+    cg, decoy = f"/sys/fs/cgroup/fvp-cgns-{os.getpid()}", f"/sys/fs/cgroup/{sub}"
+    made = [cg, f"{cg}/{sub}", decoy]
+    for d in made:
+        os.mkdir(d)
+    try:
+        # Each with the path its child's cgroup.procs has inside.
+        cases = (("ft-sb-cgns", lambda c: f"unshare -C {c}", f"{cg}/{sub}"),
+                 ("ft-sb-cgns-m", lambda c: "unshare -Cm sh -c " + shlex.quote(f"umount -l /sys/fs/cgroup && mount -t cgroup2 cgroup2 /sys/fs/cgroup && exec {c}"),
+                  f"/sys/fs/cgroup/{sub}"))
+        for n, wrap, inner in cases:
+            scenario_vms.add(n)
+            check(f"standby claim cgroupns {n}: a standby ready", fresh_standby(A, t, 1), standby_pids(A, t))
+            standby = open(f"/proc/{standby_pids(A, t)[0]}/cgroup").read()
+            cmd = shlex.join([BIN, "--state", A.state, "--run", A.run, "run", "--name", n, t, "sleep 600"])
+            # A namespace rooted at the test cgroup, then into its child: inside, its cgroup is "/sub".
+            enter = f"echo $$ > {inner}/cgroup.procs && exec {cmd}"
+            script = f"echo $$ > {cg}/cgroup.procs && exec " + wrap("sh -c " + shlex.quote(enter))
+            out = tempfile.TemporaryFile("w+")
+            p = subprocess.Popen(["sh", "-c", script], stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True, env=ENV)
+
+            def said():
+                out.seek(0)
+                return out.read()
+            check(f"standby claim cgroupns {n}: the foreground run claims the standby", wait_for(lambda: '"standby":true' in said().replace(" ", ""), 60), said()[-800:])
+            check(f"standby claim cgroupns {n}: the claimed vm runs", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+            pid = vms(A)[n]["pid"]
+            got = open(f"/proc/{pid}/cgroup").read()
+            check(f"standby claim cgroupns {n}: not moved to the decoy its path names here", got != f"0::/{sub}\n", got)
+            if n.endswith("-m"):
+                check(f"standby claim cgroupns {n}: in its claimer's cgroup", got == f"0::/{os.path.basename(cg)}/{sub}\n", got)
+            else:
+                check(f"standby claim cgroupns {n}: left where the standby was", got == standby, (got, standby))
+            check(f"standby claim cgroupns {n}: no move tried", "not moved" not in said(), said()[-800:])
+            p.kill()
+            p.wait()
+            check(f"standby claim cgroupns {n}: the claimed vm is destroyed", wait_for(lambda: n not in vms(A) and not alive(pid), 30), (vms(A).get(n), log(A, n)[-1500:]))
+            cleanup(n)
+    finally:
+        clear_standby(A, t)
+        for d in reversed(made):
+            wait_for(lambda: not open(f"{d}/cgroup.procs").read().strip(), 30)
+            with suppress(OSError):
+                os.rmdir(d)
+
+
 def standby_claim_orphan_migrating():
     """A foreground claim's VM is a migration's source when its run is SIGKILLed: the destroy is
     refused (the target may be pulling its memory), but the hang-up is kept. The target then dies
@@ -9561,7 +9614,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
-    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_claim_orphan_migrating=standby_claim_orphan_migrating, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
+    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_claim_cgroupns=standby_claim_cgroupns, standby_claim_orphan_migrating=standby_claim_orphan_migrating, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),

@@ -3179,6 +3179,39 @@ mod tests {
         (p, root)
     }
 
+    #[test]
+    fn an_abort_error_destroys_a_vm_whose_claimer_is_gone() {
+        const CHILD: &str = "FLEXVM_TEST_ABORT_ERROR";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            let p = Proc::new(host, Paths::new(&root)).unwrap();
+            p.set_name(p.host.take_name("aborted", false).unwrap());
+            let claim = p.host.claim_new(&p.host.lock().unwrap(), "aborted", None).unwrap();
+            let ip = p.set_addr(claim);
+            std::fs::write(root.join("ip"), ip.to_string()).unwrap();
+            p.claimer_gone.store(std::env::var_os("FLEXVM_TEST_CLAIMER_GONE").is_some(), Ordering::SeqCst);
+            let op = p.op();
+            let e = p.abort_error(&op, "abort failed".into());
+            assert_eq!(e.to_string(), "abort failed");
+            assert!(!p.claimer_gone.load(Ordering::SeqCst), "a gone claimer must end the process");
+            return;
+        }
+        for gone in [false, true] {
+            let root = crate::test_util::TempDir::new("abort-error");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "vmproc::tests::an_abort_error_destroys_a_vm_whose_claimer_is_gone", "--nocapture"]);
+            child.env(CHILD, root.as_os_str()).env_remove("FLEXVM_TEST_CLAIMER_GONE");
+            if gone {
+                child.env("FLEXVM_TEST_CLAIMER_GONE", "1");
+            }
+            assert_eq!(child.status().unwrap().code(), Some(if gone { FAILED } else { 0 }));
+            let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            let ip = std::fs::read_to_string(root.join("ip")).unwrap().parse().unwrap();
+            assert_eq!(host.addr(&host.lock().unwrap(), ip).unwrap().withdrawn, gone, "the gone claimer's address is withdrawn");
+        }
+    }
+
     /// #509: a revision retry holding the host lock and a process ending (its claim's
     /// release takes the host lock) never wait on each other: the end lets go of `addr`
     /// before it takes the host lock, so the retry, parked holding it, gets on.
