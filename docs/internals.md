@@ -546,10 +546,17 @@ through, so the checkpoint is exactly the memory at the pause.
   full ones), the pause unchanged. Rescues copy
   into 2 MiB chunks of memory (huge pages) kept from one copy for the
   next, as much as the last one held at once, up to the 256 MiB budget, per
-  VM taking keep-running checkpoints, outside admission like the hot
-  pages': fresh memory faulted in here cost more than the copy itself
-  (1.3–2.5 µs a page, 60 ms of a 150 ms fault budget). Reading on more
-  threads at once was slower.
+  VM taking keep-running checkpoints: fresh memory faulted in here cost
+  more than the copy itself (1.3–2.5 µs a page, 60 ms of a 150 ms fault
+  budget). Reading on more threads at once was slower. Neither this memory
+  nor the hot pages' is admitted like a guest's, so each keeps out of the
+  host's reserve instead: the VM process's memory controller tells the
+  pager every second how much is left above it, and they grow only within
+  that (debited as they grow). Without room for a block of copies, faults
+  wait for the writers as over budget, and the pause protects pages it
+  would have copied hot; no checkpoint fails for it. Under the eviction
+  mark (or with the VM starved) the memory kept for the next checkpoint is
+  released, and a copy that ends under the reserve keeps none.
 - **Hot pages** (#235). Every `UFFDIO_WRITEPROTECT`, protect or unprotect,
   makes KVM zap its mappings of the whole range (6.18 ignores the notifier's
   event type) and flush every vCPU's TLB: after the resume the guest

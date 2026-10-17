@@ -419,7 +419,7 @@ impl Pager {
             *self.hot_dirty.lock().unwrap() = dirty.clone();
         }
         let cow = cow.then(|| {
-            let c = Cow::new(pages.len(), &out).keep_slots(self.slot_spare.clone());
+            let c = Cow::new(pages.len(), &out).keep_slots(self.slot_spare.clone(), self.mem_room.clone());
             hot.iter().for_each(|h| c.hold(h.held.clone()));
             Arc::new(c)
         });
@@ -516,7 +516,13 @@ fn rescue_block(
         return Ok(0);
     }
     let slots = match cow.take_slots(claimed.len()) {
-        Ok(s) => s,
+        Ok(Some(s)) => s,
+        // No memory for them now (`Room`): they stay protected for the writers, and the fault waits for them as over
+        // budget (`Cow::over_budget` says so too now).
+        Ok(None) => {
+            cow.unclaim_many(&claimed);
+            return Ok(0);
+        }
         Err(e) => {
             cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
             cow.unclaim_many(&claimed);
@@ -634,10 +640,10 @@ mod tests {
         let cow = Cow::new(16, &vec![(0, 16, crate::uffd::REMOTE)]);
         let mem = guest_mem(16);
         // Slots used before hold old copies: an absent page's must not show through.
-        let old = cow.take_slots(5).unwrap();
+        let old = cow.take_slots(5).unwrap().unwrap();
         old.iter().for_each(|s| unsafe { std::ptr::write_bytes(s.as_mut_ptr(), 0xee, PAGE_SIZE) });
         cow.give_slots(old);
-        let slots = cow.take_slots(5).unwrap();
+        let slots = cow.take_slots(5).unwrap().unwrap();
         let claimed = [3, 4, 5, 9, 10];
         let reads = Mutex::new(Vec::new());
         let read = guest_read(&mem);
@@ -769,6 +775,112 @@ mod tests {
             assert!(rescued.into_inner() > 0, "some pages rescued");
             assert_eq!(cow.rescued_mib(), 0.0);
         }
+    }
+
+    #[test]
+    fn no_room_for_rescue_memory_leaves_pages_to_the_writers() {
+        use crate::cow::{CowPages, Room, CLEAN};
+        let n = 2048;
+        let mem = guest_mem(n);
+        let room = Room::default();
+        let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), room.clone());
+        // Writing: rescue memory grows only within the room, 2 MiB a chunk.
+        struct Mem<'a>(&'a [u8]);
+        impl crate::checkpoint::GuestPages for Mem<'_> {
+            fn region_end(&self, _: usize) -> Option<usize> {
+                None
+            }
+            fn read(&self, page: usize, buf: &mut [u8]) -> crate::util::Result<()> {
+                buf.copy_from_slice(&self.0[page * PAGE_SIZE..page * PAGE_SIZE + buf.len()]);
+                Ok(())
+            }
+        }
+        let guest = Mem(&mem);
+        let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+        crate::checkpoint::GuestPages::read(&pages, 0, &mut vec![0u8; PAGE_SIZE]).unwrap();
+        room.set(3);
+        assert!(!cow.over_budget());
+        let present = |c: &[usize]| Ok(vec![PM_PRESENT; c.len().max(512)]);
+        assert_eq!(rescue_block(&cow, 512, 1024, present, guest_read(&mem)).unwrap(), 512);
+        assert_eq!(room.get(), 1, "a chunk taken out of the room");
+        // No room for another chunk: the pages stay unsaved (and protected) for the writers; nothing fails.
+        assert!(cow.over_budget(), "faults wait for the writers");
+        let left = cow.left();
+        assert_eq!(rescue_block(&cow, 1024, 1536, present, |_, _| panic!("nothing read")).unwrap(), 0);
+        assert_eq!(cow.left(), left);
+        assert!((1024..1536).all(|p| cow.state(p) == PENDING));
+        // Once the writer takes the copies, their slots serve the next rescue without more room.
+        let mut buf = vec![0u8; 512 * PAGE_SIZE];
+        crate::checkpoint::GuestPages::read(&pages, 512, &mut buf).unwrap();
+        assert!(buf == mem[512 * PAGE_SIZE..1024 * PAGE_SIZE]);
+        assert!(!cow.over_budget());
+        assert_eq!(rescue_block(&cow, 1024, 1536, present, guest_read(&mem)).unwrap(), 512);
+        assert_eq!(room.get(), 1);
+        crate::checkpoint::GuestPages::read(&pages, 1024, &mut buf).unwrap();
+        assert!(buf == mem[1024 * PAGE_SIZE..1536 * PAGE_SIZE]);
+        assert!((0..1).chain(512..1536).all(|p| cow.state(p) == CLEAN));
+        assert!((1..512).all(|p| cow.state(p) == PENDING));
+        // Before the writers start, the faults of the resume rescue past the room, up to `PRE_WRITER_MIB`.
+        let early = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), Room::default());
+        let none = Room::default();
+        none.set(0);
+        let early = early.keep_slots(Arc::new(Mutex::new(None)), none);
+        assert!(!early.over_budget());
+        assert_eq!(rescue_block(&early, 0, 512, present, guest_read(&mem)).unwrap(), 512);
+    }
+
+    #[test]
+    fn memory_kept_for_the_next_checkpoint_goes_back_when_the_host_is_short() {
+        let dir = crate::test_util::TempDir::new("host-memory");
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "compatibility": {"cpu": "test", "tsc_khz": 2000000, "tsc_control": false,
+                    "msrs": [], "firecracker": "test", "features": {}, "xsave": {}},
+                "vcpus": 1, "mem_mib": 1, "max_mib": 64, "plugged_mib": 0,
+                "kernel": "/k", "rootfs": "/r", "id": "a", "components": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::File::create(dir.join("mem")).unwrap().set_len(PAGE_SIZE as u64).unwrap();
+        let n = 4096;
+        let pager = Pager {
+            base: crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap(),
+            runtime: Runtime {
+                pages: Pages::new(n).into(),
+                mappings: vec![Mapping { offset: 0, size: n * PAGE_SIZE, base_host_virt_addr: 0 }].into(),
+                tracking: true.into(),
+                ..Runtime::default()
+            },
+            fault_stats: FaultStats::new(),
+            lanes: Default::default(),
+            steer: Mutex::new((0, 0)),
+            collapse_report: Mutex::new(None),
+            collapse_gate: Default::default(),
+        };
+        // A copy that rescued pages leaves their memory for the next one; so does a checkpoint its hot pages'.
+        let keep = || {
+            let cow = Cow::new(n, &vec![]).keep_slots(pager.slot_spare.clone(), pager.mem_room.clone());
+            let s = cow.take_slots(3).unwrap().unwrap();
+            cow.give_slots(s);
+        };
+        keep();
+        pager.prepare_hot();
+        let kept = || (pager.slot_spare.lock().unwrap().as_ref().map_or(0, |s| s.mapped_bytes()), pager.hot_spare.lock().unwrap().is_some());
+        assert_eq!(kept(), (2 << 20, true));
+        pager.host_memory(Some(1000), false);
+        assert_eq!(kept(), (2 << 20, true), "kept while there is room");
+        pager.host_memory(Some(0), true);
+        assert_eq!(kept(), (0, false), "released when short");
+        // Under the reserve: no hot pages' memory, and a copy keeps none of its rescue memory.
+        pager.prepare_hot();
+        keep();
+        assert_eq!(kept(), (0, false));
+        // Unknown: no bound.
+        pager.host_memory(None, false);
+        pager.prepare_hot();
+        assert!(kept().1);
     }
 
     #[test]

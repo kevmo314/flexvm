@@ -242,6 +242,8 @@ pub struct Runtime {
     hot_spare: Mutex<Option<hot::Buf>>,
     /// Memory for rescued copies, kept from one checkpoint copy for the next (`Cow::keep_slots`).
     slot_spare: Arc<Mutex<Option<crate::cow::Slots>>>,
+    /// Host memory that memory may still take (`Pager::host_memory`).
+    mem_room: crate::cow::Room,
     hot_prev: Mutex<Option<Arc<Held>>>,
     /// The previous interval's snapshot, shared with Frozen for rollback, and sparse words for kept hot pages.
     hot_dirty: Mutex<Arc<pages::DirtyBits>>,

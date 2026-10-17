@@ -152,11 +152,13 @@ impl Cow {
 
     /// Rescues write into the memory `home` holds from the last copy, if any, and hand it back there, trimmed to what
     /// this copy used at most, once it is dropped: memory faulted in fresh costs a rescue several times what copying
-    /// into it does here (#630), and a guest that wrote much during one copy tends to again.
-    pub fn keep_slots(mut self, home: Arc<Mutex<Option<Slots>>>) -> Cow {
+    /// into it does here (#630), and a guest that wrote much during one copy tends to again. It grows only within
+    /// `room`.
+    pub fn keep_slots(mut self, home: Arc<Mutex<Option<Slots>>>, room: Room) -> Cow {
         if let Some(s) = home.lock().unwrap().take() {
             self.slots = s;
         }
+        self.slots.room = room;
         self.home = Some(home);
         self
     }
@@ -281,14 +283,23 @@ impl Cow {
     /// Whether rescued copies fill the budget, so faults wait for the writers rather than save more. At least
     /// `PRE_WRITER_MIB` before the writers have started: the faults of the resume would wait for writers that start
     /// only after it.
+    /// Also while there is memory for no whole block (`SLOT_CHUNK`) of copies: no free slots, and the host has no room
+    /// for more (`Room`).
     pub fn over_budget(&self) -> bool {
         let budget = if self.writing() { self.budget } else { self.budget.max(PRE_WRITER_MIB << 20) };
-        self.rescued_bytes.load(Ordering::SeqCst) >= budget
+        self.rescued_bytes.load(Ordering::SeqCst) >= budget || !self.slots.can_take(SLOT_CHUNK / PAGE_SIZE, self.unbounded())
     }
 
-    /// Memory for `n` pages' copies: slots for `rescue_many`, or back with `give_slots`.
-    pub fn take_slots(&self, n: usize) -> std::io::Result<Vec<Slot>> {
-        self.slots.take(n)
+    /// Before the writers have started, rescue memory grows past the host's room up to `PRE_WRITER_MIB`: the faults of
+    /// the resume must not wait for them.
+    fn unbounded(&self) -> bool {
+        !self.writing() && self.slots.mapped_bytes() < PRE_WRITER_MIB << 20
+    }
+
+    /// Memory for `n` pages' copies: slots for `rescue_many`, or back with `give_slots`. None if there are not that many
+    /// free and the host has no room for more.
+    pub fn take_slots(&self, n: usize) -> std::io::Result<Option<Vec<Slot>>> {
+        self.slots.take(n, self.unbounded())
     }
 
     pub fn give_slots(&self, slots: Vec<Slot>) {
@@ -564,6 +575,7 @@ impl Slot {
 pub struct Slots {
     chunks: Mutex<Vec<usize>>,
     free: Mutex<Vec<Slot>>,
+    room: Room,
     /// Slots taken and not given back, and the most at once.
     used: AtomicUsize,
     peak: AtomicUsize,
@@ -572,10 +584,54 @@ pub struct Slots {
 const SLOT_CHUNK: usize = 2 << 20;
 const MADV_POPULATE_WRITE: libc::c_int = 23;
 
+/// What host memory rescue memory may still take, in MiB above the host's reserve: as the VM process's memory
+/// controller last read it (`Pager::host_memory`, every second), less what was mapped since. Unknown (as it starts):
+/// no bound. Rescue memory is not admitted like a guest's (its copy would wait), so it keeps out of the reserve instead.
+#[derive(Clone)]
+pub struct Room(Arc<AtomicU64>);
+
+impl Default for Room {
+    fn default() -> Room {
+        Room(Arc::new(AtomicU64::new(u64::MAX)))
+    }
+}
+
+impl Room {
+    pub fn set(&self, mib: u64) {
+        self.0.store(mib, Ordering::SeqCst)
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Takes `mib` of it, if there is that much.
+    pub fn take(&self, mib: u64) -> bool {
+        self.0.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| r.checked_sub(mib)).is_ok()
+    }
+}
+
+const CHUNK_MIB: u64 = (SLOT_CHUNK >> 20) as u64;
+
 impl Slots {
-    /// `n` slots, ascending where they come from a new chunk.
-    fn take(&self, n: usize) -> std::io::Result<Vec<Slot>> {
+    /// Whether `take` would give `n` slots now: free ones, or room to map more (or `unbounded`).
+    fn can_take(&self, n: usize, unbounded: bool) -> bool {
+        let short = n.saturating_sub(self.free.lock().unwrap().len());
+        short == 0 || unbounded || self.room.get() >= short.div_ceil(SLOT_CHUNK / PAGE_SIZE) as u64 * CHUNK_MIB
+    }
+
+    pub fn mapped_bytes(&self) -> usize {
+        self.chunks.lock().unwrap().len() * SLOT_CHUNK
+    }
+
+    /// `n` slots, ascending where they come from a new chunk. None if there are not that many free and the host has no
+    /// `room` to map more (but for `unbounded`): nothing is taken then.
+    fn take(&self, n: usize, unbounded: bool) -> std::io::Result<Option<Vec<Slot>>> {
         let mut free = self.free.lock().unwrap();
+        let short = n.saturating_sub(free.len()).div_ceil(SLOT_CHUNK / PAGE_SIZE) as u64 * CHUNK_MIB;
+        if short > 0 && !unbounded && !self.room.take(short) {
+            return Ok(None);
+        }
         while free.len() < n {
             let c = map_chunk()?;
             self.chunks.lock().unwrap().push(c);
@@ -587,7 +643,7 @@ impl Slots {
         out.reverse();
         let used = self.used.fetch_add(n, Ordering::Relaxed) + n;
         self.peak.fetch_max(used, Ordering::Relaxed);
-        Ok(out)
+        Ok(Some(out))
     }
 
     fn give(&self, slots: Vec<Slot>) {
@@ -598,11 +654,12 @@ impl Slots {
     }
 
     /// Once nothing uses any slot (the copy is gone): keeps as many chunks as were in use at most at once, up to the
-    /// budget of rescued copies (a held-back discard rescues past it, `Pager::save_rest`), every slot free, and forgets
-    /// that most.
+    /// budget of rescued copies (a held-back discard rescues past it, `Pager::save_rest`), none while the host has no
+    /// room (under its reserve), every slot free, and forgets that most.
     fn trim(&mut self) {
         let chunks = self.chunks.get_mut().unwrap();
-        let keep = self.peak.get_mut().div_ceil(SLOT_CHUNK / PAGE_SIZE).min(chunks.len()).min((BUDGET_MIB << 20) / SLOT_CHUNK);
+        let cap = if self.room.get() == 0 { 0 } else { (BUDGET_MIB << 20) / SLOT_CHUNK };
+        let keep = self.peak.get_mut().div_ceil(SLOT_CHUNK / PAGE_SIZE).min(chunks.len()).min(cap);
         for &c in &chunks[keep..] {
             unsafe { libc::munmap(c as *mut _, SLOT_CHUNK) };
         }
@@ -661,7 +718,7 @@ impl Cow {
     /// `rescue_many` from copies in hand.
     pub fn rescue_copies(&self, first: usize, end: usize, pages: impl IntoIterator<Item = (usize, Box<[u8]>)>) {
         let pages: Vec<(usize, Box<[u8]>)> = pages.into_iter().collect();
-        let slots = self.take_slots(pages.len()).unwrap();
+        let slots = self.take_slots(pages.len()).unwrap().unwrap();
         for ((_, copy), slot) in pages.iter().zip(&slots) {
             unsafe { std::ptr::copy_nonoverlapping(copy.as_ptr(), slot.as_mut_ptr(), PAGE_SIZE) };
         }
@@ -917,37 +974,37 @@ mod tests {
         let home = Arc::new(Mutex::new(None));
         let per = SLOT_CHUNK / PAGE_SIZE;
         {
-            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone());
-            let a = cow.take_slots(per + 1).unwrap();
+            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone(), Room::default());
+            let a = cow.take_slots(per + 1).unwrap().unwrap();
             assert_eq!(cow.slots.mapped(), 2 * per);
             assert!(a.windows(2).take(per - 1).all(|w| w[1].0 == w[0].0 + PAGE_SIZE), "ascending within a chunk");
             cow.give_slots(a);
-            let b = cow.take_slots(2 * per).unwrap();
+            let b = cow.take_slots(2 * per).unwrap().unwrap();
             assert_eq!(cow.slots.mapped(), 2 * per, "freed slots reused");
             cow.give_slots(b);
             // Taken and never given back (a copy that failed): still free for the next copy.
-            let _lost = cow.take_slots(3).unwrap();
+            let _lost = cow.take_slots(3).unwrap().unwrap();
         }
         assert_eq!(home.lock().unwrap().as_ref().unwrap().mapped(), 2 * per);
         {
-            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone());
+            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone(), Room::default());
             assert!(home.lock().unwrap().is_none(), "one copy at a time uses it");
-            let a = cow.take_slots(2 * per).unwrap();
+            let a = cow.take_slots(2 * per).unwrap().unwrap();
             assert_eq!(cow.slots.mapped(), 2 * per, "all of it free again");
             cow.give_slots(a);
-            let a = cow.take_slots(1).unwrap();
+            let a = cow.take_slots(1).unwrap().unwrap();
             cow.give_slots(a);
         }
         // This copy used both chunks at once: kept.
         assert_eq!(home.lock().unwrap().as_ref().unwrap().mapped(), 2 * per);
         {
-            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone());
-            let a = cow.take_slots(10).unwrap();
+            let cow = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone(), Room::default());
+            let a = cow.take_slots(10).unwrap().unwrap();
             cow.give_slots(a);
         }
         assert_eq!(home.lock().unwrap().as_ref().unwrap().mapped(), per, "trimmed to the last copy's peak");
         {
-            let _idle = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone());
+            let _idle = Cow::new(4, &vec![(0, 4, REMOTE)]).keep_slots(home.clone(), Room::default());
         }
         assert_eq!(home.lock().unwrap().as_ref().unwrap().mapped(), 0, "an idle copy keeps none");
     }

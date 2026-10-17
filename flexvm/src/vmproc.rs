@@ -1385,7 +1385,10 @@ impl Proc {
                 published = vm.starving();
                 self.publish();
             }
-            relieve(&self.host, host_available_mib(), vm.starving(), &mut stopping);
+            let avail = host_available_mib();
+            let (reserve, at, _) = self.host.config_now().evict_marks();
+            vm.pager.host_memory(avail.map(|a| a.saturating_sub(reserve)), avail.is_some_and(|a| a < at) || vm.starving());
+            relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
             if let Some(dev) = self.host.config_now().announce_dev() {
                 crate::net::proxy_arp(&dev);
