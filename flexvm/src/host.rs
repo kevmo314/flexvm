@@ -1547,9 +1547,10 @@ impl Host {
         Ok((grants, pending, debits))
     }
 
-    /// Checkpoint memory taken lately (`take_room`), under the host lock: `RUN/room-debits-BOOT`.
+    /// Checkpoint memory taken lately (`take_room`), under the host lock: `RUN/room-ledger-BOOT`. Not the
+    /// `room-debits-BOOT` of a flexvm before #691, whose entries name no process: it would be unreadable here.
     fn debits(&self) -> PathBuf {
-        self.run.join(format!("room-debits-{}", boot_id()))
+        self.run.join(format!("room-ledger-{}", boot_id()))
     }
 
     /// The debits MemAvailable may not show yet, and what they count as taken (#677, #691): one not yet populated in

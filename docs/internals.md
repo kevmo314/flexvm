@@ -570,7 +570,7 @@ through, so the checkpoint is exactly the memory at the pause.
   guest's, so each keeps out of the host's reserve instead: each take is
   checked against MemAvailable less the reserve, the grants guests have
   yet to touch and what was taken lately, and debited, under the host lock
-  (`RUN/room-debits-BOOT`, with the process that took it), so VMs copying
+  (`RUN/room-ledger-BOOT`, with the process that took it), so VMs copying
   at once, and admission, see what the others took and never take more
   than there is together (#648). It is populated after the lock goes. A
   debit counts in full until its process marks it populated (under the
@@ -597,7 +597,8 @@ through, so the checkpoint is exactly the memory at the pause.
   its controller has attached its room to the host (its room is closed
   until then). VM processes started by a flexvm before #677 keep its
   mapped `RUN/.locks/memory-v2-BOOT` room, which neither sees these takes
-  nor answers these requests: after an upgrade, restart or migrate them;
+  nor answers these requests, and those started before #691 their own
+  `RUN/room-debits-BOOT` ledger: after an upgrade, restart or migrate them;
   until then the reserve may be overcommitted.
   Each writer populates its buffer as it starts (written page by page
   where the kernel cannot). Without room for a block of copies, faults ask the writers for

@@ -12,8 +12,8 @@
 //! populated after it (`Host::take_room`).
 
 //! VM processes started by a flexvm before #677 keep its mapped `memory-v2-BOOT` room, which neither sees these
-//! takes nor answers these requests: after an upgrade, restart or migrate them; until then the reserve may be
-//! overcommitted.
+//! takes nor answers these requests, and those started before #691 their own `room-debits-BOOT` ledger: after an
+//! upgrade, restart or migrate them; until then the reserve may be overcommitted.
 
 use crate::host::{load, locks, store, Host, Ident, Liveness};
 use std::path::{Path, PathBuf};
