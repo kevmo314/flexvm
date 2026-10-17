@@ -613,10 +613,12 @@ const MADV_POPULATE_WRITE: libc::c_int = 23;
 
 /// What host memory rescue memory, hot pages' memory and writer buffers may still take, in MiB. That memory is not
 /// admitted like a guest's (its copy would wait), so it keeps out of the host's reserve instead: once `attach`ed, each
-/// take is the host's (`Host::take_room`), checked against MemAvailable less the reserve and the grants guests have
-/// yet to touch, and populated, under the host lock. VM processes taking at once, and admission, each see what the
-/// others took then, and nothing is counted on a take's behalf to be left over if its process dies (#677).
-/// Unattached, a bound of its own (tests; and none for a VM process's until it is attached, `closed`).
+/// take is the host's (`Host::take_room`), checked against MemAvailable less the reserve, the grants guests have yet
+/// to touch and what was taken lately, and debited, under the host lock. VM processes taking at once, and admission,
+/// each see what the others took then, and nothing taken is left to reclaim if its process dies (#677). A take never
+/// waits for the lock: a fault may be waiting on it, so a busy lock is no room for `BUSY_MS` and the fault leaves
+/// its pages to the writers. Unattached, a bound of its own (tests; and none for a VM process's until it is attached,
+/// `closed`).
 #[derive(Clone)]
 pub struct Room(Arc<RoomCell>);
 
@@ -624,11 +626,13 @@ struct RoomCell {
     /// Attached: what was left as last seen (by a take, or the controller's `refresh`), only for `get`.
     /// Unattached: the bound (u64::MAX: none).
     left: AtomicU64,
+    /// Until when (boottime ms) a take found the host lock busy: none left meanwhile.
+    busy: AtomicU64,
     host: OnceLock<crate::host::Host>,
 }
 
-/// How long a take waits for the host lock: a fault may be waiting on it. Busy: none left until the next refresh.
-const TAKE_WAIT: Duration = Duration::from_millis(if cfg!(test) { 5000 } else { 50 });
+/// How long a take that found the host lock busy leaves none: faults go to the writers meanwhile, not try again.
+const BUSY_MS: u64 = 10;
 
 /// No bound.
 impl Default for Room {
@@ -639,7 +643,7 @@ impl Default for Room {
 
 impl Room {
     fn with(mib: u64) -> Room {
-        Room(Arc::new(RoomCell { left: AtomicU64::new(mib), host: OnceLock::new() }))
+        Room(Arc::new(RoomCell { left: AtomicU64::new(mib), busy: AtomicU64::new(0), host: OnceLock::new() }))
     }
 
     /// One with no room until attached: a VM process's, so nothing is taken before its takes are the host's (#674),
@@ -669,16 +673,23 @@ impl Room {
         }
     }
 
-    /// What is left: as last seen once attached (a take checks again), else its bound.
+    /// What is left: as last seen once attached (a take checks again; none while the host lock was just busy), else
+    /// its bound.
     pub fn get(&self) -> u64 {
+        if self.0.busy.load(Ordering::SeqCst) > crate::host::boottime_ms() {
+            return 0;
+        }
         self.0.left.load(Ordering::SeqCst)
     }
 
     /// Runs `populate`, which maps and populates `mib`, if there is that much: its result, or None (nothing run).
     pub fn take<R>(&self, mib: u64, populate: impl FnOnce() -> R) -> Option<R> {
         if let Some(h) = self.0.host.get() {
-            let (left, r) = h.take_room(mib, Instant::now() + TAKE_WAIT, populate);
-            self.0.left.store(if r.is_some() { left - mib } else { left }, Ordering::SeqCst);
+            let (left, r) = h.take_room(mib, populate);
+            match left {
+                Some(left) => self.0.left.store(if r.is_some() { left - mib } else { left }, Ordering::SeqCst),
+                None => self.0.busy.store(crate::host::boottime_ms() + BUSY_MS, Ordering::SeqCst),
+            }
             return r;
         }
         self.0.left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| if l == u64::MAX { Some(l) } else { l.checked_sub(mib) }).ok()?;
@@ -844,7 +855,11 @@ mod tests {
         assert_eq!(room.get(), 0, "not opened by a refresh");
         room.attach(&h);
         let populated = std::cell::Cell::new(false);
-        assert!(room.take(1, || populated.set(true)).is_some() && populated.get());
+        // Again while another test has the host lock (a take never waits for it).
+        while room.take(1, || populated.set(true)).is_none() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(populated.get());
         assert!(room.get() < u64::MAX, "what was left");
         room.refresh(|| Some(5));
         assert_eq!(room.get(), 5);
@@ -856,6 +871,26 @@ mod tests {
         short.attach(&h);
         assert!(short.take(1, || panic!("nothing populated")).is_none());
         assert_eq!(short.get(), 0);
+        // The host lock busy (another thread has it): refused at once, nothing populated, and none left for a moment
+        // so faults go to the writers rather than try again.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = h.clone();
+        let t = std::thread::spawn(move || {
+            let _l = holder.lock().unwrap();
+            held_tx.send(()).unwrap();
+            rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        h.cfg.reserve_mib = Some(0);
+        let busy = Room::default();
+        busy.attach(&h);
+        let start = std::time::Instant::now();
+        assert!(busy.take(1, || panic!("nothing populated")).is_none());
+        assert!(start.elapsed() < Duration::from_millis(BUSY_MS * 5), "never waits: {:?}", start.elapsed());
+        assert_eq!(busy.get(), 0, "none while busy");
+        tx.send(()).unwrap();
+        t.join().unwrap();
         // Its own bound.
         let own = Room::default();
         own.set(5);
