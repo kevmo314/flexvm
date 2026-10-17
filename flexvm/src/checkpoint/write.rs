@@ -204,10 +204,7 @@ impl Buf {
 
     /// Ordinary page-aligned storage, without a huge-page room charge.
     pub(crate) fn plain(pages: usize) -> io::Result<Buf> {
-        let len = pages
-            .checked_mul(PAGE_SIZE)
-            .filter(|&len| len <= isize::MAX as usize)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"))?;
+        let len = pages * PAGE_SIZE;
         Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len, charge: None })
     }
 
@@ -423,8 +420,13 @@ mod buf_tests {
     /// AnonHugePages of the mapping starting at `addr`, from /proc/self/smaps.
     fn anon_huge_kib(addr: usize) -> u64 {
         let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-        let start = format!("{addr:x}-");
-        let mut lines = smaps.lines().skip_while(|l| !l.starts_with(&start)).skip(1);
+        // The mapping holding `addr`: another test's plain buffer mapped next to it may have merged with it.
+        let range = |l: &str| -> Option<(usize, usize)> {
+            let (s, e) = l.split(' ').next()?.split_once('-')?;
+            Some((usize::from_str_radix(s, 16).ok()?, usize::from_str_radix(e, 16).ok()?))
+        };
+        let holds = |l: &str| range(l).is_some_and(|(s, e)| (s..e).contains(&addr));
+        let mut lines = smaps.lines().skip_while(|l| !holds(l)).skip(1);
         let line = lines.find(|l| l.starts_with("AnonHugePages:")).expect("mapping in smaps");
         line.split_whitespace().nth(1).unwrap().parse().unwrap()
     }

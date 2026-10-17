@@ -320,14 +320,10 @@ impl Pager {
     /// Starts the working-set prefetch once it is `due` and, while learning the load set, the snapshot is `loaded`.
     fn start_prefetch(self: &Arc<Self>, loaded: bool, due: bool) {
         if self.prefetch.lock().unwrap().request(loaded, due) {
-            self.spawn_prefetch();
+            self.prefetching.store(RUNNING, Ordering::SeqCst);
+            let p = self.clone();
+            thread::spawn(move || p.prefetch());
         }
-    }
-
-    fn spawn_prefetch(self: &Arc<Self>) {
-        self.prefetching.store(RUNNING, Ordering::SeqCst);
-        let p = self.clone();
-        thread::spawn(move || p.prefetch());
     }
 
     /// Waits for the pager thread to finish, after `stop` (or Firecracker's exit).
@@ -676,7 +672,9 @@ impl Pager {
             return;
         }
         if self.prefetch_cut.swap(false, Ordering::SeqCst) {
-            self.spawn_prefetch();
+            self.prefetching.store(RUNNING, Ordering::SeqCst);
+            let p = self.clone();
+            thread::spawn(move || p.prefetch());
         }
         if self.collapse_quiesced() {
             let p = self.clone();

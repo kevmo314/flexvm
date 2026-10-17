@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::checkpoint::{Checkpoint, CommitError, Manifest, Staging};
+use crate::checkpoint::{read_manifest, Checkpoint, CommitError, Manifest, Staging};
 use crate::host::{fault, Host};
 use crate::template::Template;
 use crate::uffd::{Frozen, Origin};
@@ -1017,7 +1017,7 @@ fn remove_durably(dir: &Path) -> std::io::Result<()> {
 /// disk), so its generation is withdrawn, which also ends a home host's loan of it (#556).
 pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
     let dir = host.suspended(name)?;
-    let ip = crate::checkpoint::read_manifest(&dir).ok().map(|m| m.ip);
+    let ip = read_manifest(&dir).ok().map(|m| m.ip);
     let stale = std::fs::read_to_string(dir.join(QUARANTINE)).is_ok_and(|q| quarantined(&q, crate::host::boot_id()).is_none());
     let gen = if stale { read_gen(&dir) } else { None };
     remove_durably(&dir).map_err(|e| format!("vm {name}: removing what is left of its suspended checkpoint {}: {e}", dir.display()))?;
@@ -1030,7 +1030,7 @@ pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
 /// claim finishes that).
 pub fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
     let dir = host.suspended(name)?;
-    let (ip, gen) = (crate::checkpoint::read_manifest(&dir).ok().map(|m| m.ip), read_gen(&dir));
+    let (ip, gen) = (read_manifest(&dir).ok().map(|m| m.ip), read_gen(&dir));
     mark_durably(&dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
     delete_consumed(name, &dir);
     Ok(free_address(host, name, ip, gen))
@@ -1064,7 +1064,7 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
         return None;
     }
     let dir = host.suspended(name).ok()?;
-    let m = crate::checkpoint::read_manifest(&dir).ok()?;
+    let m = read_manifest(&dir).ok()?;
     // A quarantine from an earlier boot no longer holds (`resume_suspended` drops it).
     let held = std::fs::read_to_string(dir.join(QUARANTINE)).is_ok_and(|q| quarantined(&q, crate::host::boot_id()).is_some());
     let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };

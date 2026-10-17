@@ -2395,13 +2395,11 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
 
 fn prune_peer_backoffs(backoff: &mut std::collections::HashMap<String, PeerBackoff>, now: u64) {
     // Candidates are only this tick's subset: a live VM keeps its peer cooldown even when omitted.
-    backoff.retain(|key, b| {
-        b.recent(now)
-            && key.split_once(' ').and_then(|(id, _)| id.split_once('-')).is_some_and(|(pid, start)| match (pid.parse(), start.parse()) {
-                (Ok(pid), Ok(start)) => Ident { pid, start, boot: b.boot.clone() }.alive(),
-                _ => false,
-            })
-    });
+    let live = |key: &str, b: &PeerBackoff| -> Option<bool> {
+        let (pid, start) = key.split_once(' ')?.0.split_once('-')?;
+        Some(Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: b.boot.clone() }.alive())
+    };
+    backoff.retain(|key, b| b.recent(now) && live(key, b) == Some(true));
 }
 
 /// Moves the first of `vms` that a peer takes, and waits (until `deadline`)

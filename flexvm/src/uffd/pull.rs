@@ -30,9 +30,6 @@ impl Pager {
         // The connection made for the snapshot load goes to a fault fetcher.
         let mut link = self.remote.lock().unwrap().take();
         let source = link.as_ref().map(|l| l.source.clone());
-        if file.is_none() && source.is_none() {
-            return self.fail("remote pages but nowhere to pull them from".into());
-        }
         for i in 0..FAULT_FETCHERS + PULL_THREADS {
             let (p, puller) = (self.clone(), i >= FAULT_FETCHERS);
             // Reads from the checkpoint file (directly, or evicting what it read for a puller where that is buffered) or
@@ -50,7 +47,7 @@ impl Pager {
                     let p = self.clone();
                     Box::new(move |off, buf, stop, progress| link.fetch_with(Some(&p.lanes[i]), off, buf, stop, progress))
                 }
-                (None, None) => unreachable!("source checked before spawning pullers"),
+                (None, None) => return self.fail("remote pages but nowhere to pull them from".into()),
             };
             let file = file.clone();
             thread::spawn(move || match puller {
