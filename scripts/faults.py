@@ -8827,6 +8827,61 @@ def template_tap():
         subprocess.run(["rm", "-rf", os.path.join(tdir, f".{name}.new-{p.pid}"), other])
 
 
+def lock_holders(path):
+    """Pids holding a flock on the host lock directory's use lock of `path` (`host::use_lock`)."""
+    st = os.stat(path)
+    try:
+        ino = os.stat(f"/run/flexvm-locks/use-{st.st_dev}-{st.st_ino}").st_ino
+    except FileNotFoundError:
+        return []
+    return [l.split()[4] for l in open("/proc/locks") if l.split()[5].endswith(f":{ino}")]
+
+
+def rmi_suspend():
+    """#631: `flexvm rmi IMAGE` parked after its own checks (`rmi_hold`) while a VM of the image
+    starts and suspends. The suspended VM has no process left to hold the generation's use lock,
+    so only its record keeps the generation: rmi removes the name and keeps it ("used by a VM
+    here"), and the VM resumes. An rmi by id once the VM is gone removes it."""
+    n, tpl = "ft-rmi-suspend", f"ft-rmi-{os.getpid()}"
+    tdir = os.path.join(A.state, "templates")
+    code, out, err = cli(A, "pull", args.image, "--tag", tpl, "--vcpus", "1", "--max", "512", timeout=600)
+    assert code == 0, err or out
+    gid = os.path.basename(os.readlink(os.path.join(tdir, tpl)))
+    gen = os.path.join(tdir, ".gen", gid)
+    p = None
+    try:
+        with armed_fault(A, "rmi_hold", 300_000):
+            clear_gate(A, "rmi_hold")
+            p = spawn_cli(A, "rmi", tpl, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            check("rmi suspend: rmi parked after its checks", wait_for(lambda: reached(A, "rmi_hold"), 30), reached(A, "rmi_hold"))
+            ok(run(A, n, template=tpl))
+            suspend(A, n)
+            check("rmi suspend: the VM suspended meanwhile", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+            # Its process reads as gone (a zombie leader) while its other threads may still close the lock.
+            check("rmi suspend: nothing holds the generation's use lock", wait_for(lambda: not lock_holders(gen), 10), lock_holders(gen))
+            clear_gate(A, "rmi_hold")
+            out, err = communicate_process(p, 60)
+        r = json.loads(out) if p.returncode == 0 and out.strip().startswith("{") else {}
+        check("rmi suspend: the name went, the generation stayed for the VM",
+              r.get("untagged") == tpl and r.get("kept") == gid and r.get("reason") == "used by a VM here", (p.returncode, out, err))
+        check("rmi suspend: its generation is there", os.path.isdir(gen), os.listdir(os.path.join(tdir, ".gen")))
+        ok(resume_suspended(A, n))
+        code, out = sh(A, n, "echo resumed")
+        check("rmi suspend: the VM resumed", code == 0 and "resumed" in out, (code, out))
+        ok(kill(A, n))
+        code, out, err = cli(A, "rmi", gid)
+        check("rmi suspend: removed by id once unused", code == 0 and not os.path.exists(gen), (code, out, err))
+    finally:
+        if p and p.poll() is None:
+            p.kill()
+            p.wait()
+        kill(A, n)
+        with suppress(OSError):
+            os.unlink(os.path.join(tdir, tpl))
+        if os.path.isdir(gen):
+            cli(A, "rmi", gid)
+
+
 def starttime_of(pid):
     try:
         return int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19])
@@ -9302,7 +9357,7 @@ SCENARIOS = dict(
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
-    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap,
+    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, rmi_suspend=rmi_suspend,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,

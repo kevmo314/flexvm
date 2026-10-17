@@ -703,20 +703,75 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   a generation: VMs, migrations, standby VMs and checkpoints refer to them
   by content id. Standby VMs of an older generation exit; running VMs keep
   theirs. An incoming migration uses the generation with the source's
-  content id if the host has it. `flexvm rmi` removes a name and, under the
-  templates lock (exclusive, so no pull publishes meanwhile), its generation
-  once no other name links to it and no VM here (running, paused or
-  suspended) has its content id, and then the image root filesystem no
-  generation left uses, its `.ok` marker first and under the cache key's
-  lock, so a pull waiting for that lock builds it again. Use locks cover what
-  the registry does not show yet: every process that opens a generation (a
-  VM starting, standing by, restoring or arriving) holds its use lock
-  (`host::use_lock`, by the directory's dev and inode, in the host's lock
-  directory) shared for as long as it has it open, and a pull holds its root
-  filesystem's from `prepare` until the template is published. `rmi` takes
-  each exclusively without waiting and keeps what is held; an opener or a
-  pull that locks only after `rmi` removed it finds it gone and fails (the
-  pull builds the root filesystem again).
+  content id if the host has it. `flexvm rmi` removes a name and the
+  generation and root filesystem nothing uses any more: see below.
+- **Image removal: users and locks.** What uses a template generation
+  (`templates/.gen/ID`), and what shows it:
+  - A running or paused VM: its process holds the generation's use lock
+    (`host::use_lock`, by the directory's dev and inode, in the host's lock
+    directory) shared for as long as it has it open; its registry entry names
+    the content id.
+  - A starting VM (cold run, standby claim, restore, resume, arrival): the
+    use lock, taken by `Template::open*` right after opening the directory
+    and checked against the directory's path, so one renamed away before the
+    lock was ours fails the open. Its registry entry comes later.
+  - A standby VM: its process, as a running VM. The standby count names only
+    the template name; `rmi` refuses while it or a live standby VM is nonzero.
+  - An incoming migration: the target's process, from opening the source's
+    content id (`open_id`) until it is a running VM.
+  - A checkpoint restore: the restoring process, from `open_id`. A checkpoint
+    at rest (`checkpoint`, `checkpoint --stop`) does not keep its generation:
+    like an exported image it names it by content id, and restoring it after
+    `rmi` fails until the image is pulled again (the same inputs make the same
+    content id).
+  - A suspended VM: no process, only its record, the published checkpoint in
+    `STATE/suspended/NAME` (a manifest, neither STARTED nor DISCARDED) whose
+    manifest names the content id. A suspend publishes it before its process
+    exits and lets go of the use lock, and a resume opens the generation
+    before it marks the checkpoint STARTED, so the lock or the record shows it
+    at every moment.
+
+  What uses an image root filesystem (`images/rootfs/KEY.ext4`):
+  - Generations, by `meta.json`'s `rootfs`; one whose metadata cannot be read
+    counts as using every root filesystem.
+  - A pull in progress: its key's lock (`image-DEV-INO-KEY.lock`) from the
+    cache check through the build and publication, then the root filesystem's
+    use lock shared (`image::Cached::reserved`), taken under the key's lock
+    and with `.conf` read under it, until the template is published (its
+    generation keeps it then) or the pull ends.
+  - Tombstones (`templates/.gen/.ID.rm-NONCE`): a removed generation's, kept
+    with only its `meta.json` while a pull holds its root filesystem, and
+    decided again by every sweep, so a pull that fails leaves nothing that no
+    sweep removes.
+
+  The locks, in the order they are taken:
+  1. The templates lock (`templates-DEV-INO`): exclusive for `rmi` and
+     sweeps, shared while a build makes its staging directory and publishes.
+  2. A generation's use lock: shared by its users (waiting), exclusive for
+     `rmi` (never waiting: held, the generation stays).
+  3. An image key's lock: exclusive for a pull (waiting, until interrupted),
+     and for `rmi` and sweeps (never waiting: held, a pull uses the root
+     filesystem).
+  4. A root filesystem's use lock: shared by a pull under 3, exclusive for
+     `rmi` under 3 (never waiting).
+
+  A VM takes only 2. Only shared holds wait behind a later lock's holder,
+  and every exclusive one after the first never waits, so a pull holding 4
+  while it waits for 1 (its sweep, staging and publication) deadlocks
+  nothing. `rmi` takes 1 exclusively and finishes earlier tombstones (the
+  sweep), checks that the name still links to the content id and removes
+  the link, and keeps the generation if another name links to it. It then
+  takes 2 exclusively, and only with 2 held reads the VMs' records
+  (`Host::template_users`: registry entries and every published suspended
+  checkpoint, also one whose name a resuming process holds). A VM that
+  suspended or started resuming since the command looked shows up there.
+  Either a held 2 or a record keeps the generation; otherwise `rmi` renames
+  it to a tombstone. If no generation's metadata names the tombstone's root
+  filesystem, `rmi` takes 3 and 4 and removes the `.ok` marker first, then
+  `.ext4` and `.conf`; if either is held, the tombstone is kept as above.
+  Then the tombstone goes. Sweeps, at every build's start and every `rmi`,
+  finish tombstones the same way under 1. A pull whose key lock waited for
+  an `rmi` finds no marker and builds the root filesystem again.
 - **Component identity.** The content id includes the kernel's hash from build
   time, but migration, resume and restore don't check the kernel file again: the
   running kernel is already in guest memory, so replacing `artifacts/vmlinux`
