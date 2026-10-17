@@ -150,6 +150,9 @@ pub struct Runtime {
     pub lent_here: AtomicBool,
     pub standby: Mutex<Option<crate::vm::Prepared>>,
     pub claimer: Mutex<Option<UnixStream>>,
+    /// An attached claimer (a foreground `run`) hung up before it was told the status: the VM
+    /// goes, and one a migration kept (refusing the destroy) goes once it runs here again (`abort`).
+    pub claimer_gone: AtomicBool,
     pub cmd: Mutex<Option<String>>,
     /// `run --cpus/--memory` (or a checkpoint's, an arrival's): the VM's once it is adopted.
     pub resources: Mutex<crate::vm::Resources>,

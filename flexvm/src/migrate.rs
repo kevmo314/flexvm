@@ -369,6 +369,12 @@ impl Proc {
         if s == State::Running {
             self.sync_clock_later();
         }
+        // Its foreground claimer was killed while it migrated (the destroy was refused): back
+        // here, it goes as the destroy would have, not on with no one to stop it.
+        if self.claimer_gone.load(Ordering::SeqCst) {
+            crate::log!("vm {}: {e}; its claimer (a foreground run) is gone, so it is destroyed", vm.name);
+            self.finish(op, End::Gone, crate::vmproc::FAILED, None)
+        }
         e
     }
 

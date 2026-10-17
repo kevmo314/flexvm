@@ -748,6 +748,44 @@ pub fn hung_up(fd: &impl AsRawFd) -> bool {
     n > 0 && pfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
 }
 
+/// Waits until the peer of `fd` hangs up (or resets); what it sends meanwhile is left unread.
+pub fn wait_hung_up(fd: &impl AsRawFd) {
+    let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLRDHUP, revents: 0 };
+    loop {
+        match eintr(|| unsafe { libc::poll(&mut pfd, 1, -1) }) {
+            Ok(n) if n > 0 && pfd.revents != 0 => return,
+            Ok(_) => {}
+            // Out of memory, say: not a hang-up.
+            Err(_) => std::thread::sleep(Duration::from_secs(1)),
+        }
+    }
+}
+
+/// This process's cgroup2 path (`/proc/self/cgroup`'s `0::` entry), if cgroup2 is mounted at /sys/fs/cgroup.
+pub fn my_cgroup() -> Option<String> {
+    if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        return None;
+    }
+    let mine = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    mine.lines().find_map(|l| l.strip_prefix("0::")).map(String::from)
+}
+
+/// `cgroup.procs` of cgroup2 path `cg` (as `my_cgroup` gives it): None unless absolute, of plain components.
+fn cgroup_procs(cg: &str) -> Option<std::path::PathBuf> {
+    let rel = cg.strip_prefix('/')?.trim_end_matches('/');
+    let plain = |c: &str| !c.is_empty() && c != "." && c != ".." && !c.contains(['\0', '\n']);
+    if !rel.is_empty() && !rel.split('/').all(plain) {
+        return None;
+    }
+    Some(std::path::Path::new("/sys/fs/cgroup").join(rel).join("cgroup.procs"))
+}
+
+/// Moves this process (all its threads) into cgroup2 path `cg`.
+pub fn join_cgroup(cg: &str) -> io::Result<()> {
+    let procs = cgroup_procs(cg).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a cgroup path"))?;
+    std::fs::write(procs, std::process::id().to_string())
+}
+
 /// After a failed `accept`: one worth retrying at once (interrupted, the
 /// peer gone) returns; anything else (out of fds) waits rather than spins.
 pub fn accept_failed(what: &str, e: &io::Error) {
@@ -1434,6 +1472,30 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claimer_cgroup_is_an_absolute_path_of_plain_components() {
+        let procs = |cg| cgroup_procs(cg).map(|p| p.display().to_string());
+        assert_eq!(procs("/").as_deref(), Some("/sys/fs/cgroup/cgroup.procs"));
+        assert_eq!(procs("/system.slice/ci.service").as_deref(), Some("/sys/fs/cgroup/system.slice/ci.service/cgroup.procs"));
+        for bad in ["", "system.slice", "/a/../b", "/..", "/a//b", "/./a", "/a\nb"] {
+            assert_eq!(procs(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_hang_up_ends_the_wait_and_input_does_not() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            wait_hung_up(&a);
+            tx.send(()).unwrap();
+        });
+        std::io::Write::write_all(&mut &b, b"{\"exit\":0}\n").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "input is not a hang-up");
+        drop(b);
+        rx.recv_timeout(Duration::from_secs(5)).expect("the hang-up ends the wait");
+    }
 
     #[test]
     fn fault_results_evaluate_only_the_selected_branch() {

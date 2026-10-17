@@ -617,9 +617,13 @@ fn run_as(
     cmd: Option<String>,
     resources: vm::Resources,
 ) -> Result<()> {
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources});
     // A claimed standby VM writes where this process would, to opens made here (`own`).
     let log = args.has("detach").then(|| log_file(host, &name)).transpose()?;
+    // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
+    // And joins this process's cgroup, where a cold run's VM process (this one) would be.
+    let cgroup = log.is_none().then(util::my_cgroup).flatten();
+    let req =
+        json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "attached": log.is_none(), "cgroup": cgroup});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
