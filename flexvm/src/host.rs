@@ -1514,12 +1514,15 @@ impl Host {
             Floor::EvictMark if self.evicting(l) => return Ok(Err("this host is moving vms away itself".into())),
             Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
         };
-        let (grants, pending, _) = self.pending(l)?;
-        let need = floor.saturating_add(pending).saturating_add(mib);
+        let (mut grants, pending, _) = self.pending(l)?;
+        let mut need = floor.saturating_add(pending).saturating_add(mib);
         let mut avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
-        // Memory VM processes keep for their next checkpoint is not admitted: it goes back rather than refuse (#648).
+        // Memory VM processes keep for their next checkpoint is not admitted: it goes back rather than refuse (#648),
+        // and what is pending is counted again (#691).
         if avail < need {
             crate::hostmem::release_kept(self, deadline);
+            let (g, pending, _) = self.pending(l)?;
+            (grants, need) = (g, floor.saturating_add(pending).saturating_add(mib));
             avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         }
         if avail < need {
@@ -1544,20 +1547,56 @@ impl Host {
         Ok((grants, pending, debits))
     }
 
-    /// Checkpoint memory taken lately (`take_room`), as (boottime ms, MiB), under the host lock: `RUN/room-debits-BOOT`.
+    /// Checkpoint memory taken lately (`take_room`), under the host lock: `RUN/room-ledger-BOOT`. Not the
+    /// `room-debits-BOOT` of a flexvm before #691, whose entries name no process: it would be unreadable here.
     fn debits(&self) -> PathBuf {
-        self.run.join(format!("room-debits-{}", boot_id()))
+        self.run.join(format!("room-ledger-{}", boot_id()))
     }
 
-    /// The debits MemAvailable may not show yet, and what they count as taken (#677). Linux folds each CPU's counter
-    /// deltas in only every `vm.stat_interval` (or once one passes its threshold), so memory populated just now may
-    /// not show for a while: a debit younger than `DEBIT_FULL_MS` counts in full (its memory may still be being
-    /// populated), and older ones up to twice the interval count together for no more than those deltas can hide
-    /// (`vmstat_drift_mib`), or in full where that cannot be told. They expire by age: a process gone leaves nothing
-    /// to clean.
+    /// The debits MemAvailable may not show yet, and what they count as taken (#677, #691): one not yet populated in
+    /// full, until its process marks it populated or is proven gone; populated ones, until twice `vm.stat_interval`
+    /// after (Linux folds each CPU's counter deltas in only that often, or once one passes its threshold), together
+    /// for no more than those deltas can hide (`vmstat_drift_mib`), or in full where that cannot be told.
     fn recent_debits(&self, _l: &Locked, now: u64) -> (Option<Debits>, u64) {
         let path = self.debits();
-        debits_taken(load::<Debits>(&path).ok(), unwritten_for(&path), now, debit_window_ms(), vmstat_drift_mib())
+        let read = load::<Debits>(&path).ok();
+        let gone = |d: &Debit| Ident { pid: d.pid, start: d.start, boot: boot_id().into() }.liveness() == Liveness::Gone;
+        debits_taken(read, unwritten_for(&path), now, debit_window_ms(), vmstat_drift_mib(), gone)
+    }
+
+    /// Marks this process's takes populated whose population ended (`UNMARKED`), if the host lock is free within
+    /// `tries`; else they wait for the next take, or the controller's next tick (`cow::Room::refresh`).
+    pub fn settle_room(&self, tries: Duration) {
+        if !UNMARKED.lock().unwrap().iter().any(|u| u.0 == self.debits()) {
+            return;
+        }
+        if let Some(l) = self.try_lock_for(tries) {
+            if let (Some(mut debits), _) = self.recent_debits(&l, boottime_ms()) {
+                let marked = self.mark_populated(&mut debits, boottime_ms());
+                if store(&self.debits(), &debits, false).is_ok() {
+                    self.forget_marked(&marked);
+                }
+            }
+        }
+    }
+
+    /// Marks this process's takes in `debits` (its ledger) populated at `now` that `UNMARKED` lists: those listed,
+    /// for `forget_marked` once the ledger is stored (ones no longer in it, unreadable meanwhile or gone with the
+    /// file, have nothing to mark).
+    fn mark_populated(&self, debits: &mut Debits, now: u64) -> Vec<u64> {
+        let (me, path) = (Ident::me(), self.debits());
+        let listed: Vec<u64> = UNMARKED.lock().unwrap().iter().filter(|u| u.0 == path).map(|u| u.1).collect();
+        for d in debits.iter_mut().filter(|d| !d.populated && (d.pid, d.start) == (me.pid, me.start) && listed.contains(&d.id)) {
+            (d.populated, d.at) = (true, now);
+        }
+        listed
+    }
+
+    /// Forgets the takes `marked` (`mark_populated`) once the ledger saying so is stored: not before, or one whose
+    /// store failed would count in full for the life of its process.
+    fn forget_marked(&self, marked: &[u64]) {
+        let path = self.debits();
+        UNMARKED.lock().unwrap().retain(|u| u.0 != path || !marked.contains(&u.1));
     }
 
     /// Memory not admitted like a guest's (checkpoint rescue memory, hot pages', writer buffers: `cow::Room`), which
@@ -1579,13 +1618,22 @@ impl Host {
         if left < mib {
             return (Some(left), None);
         }
+        static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (me, id) = (Ident::me(), ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let mut debits = debits.unwrap_or_default();
-        debits.push((boottime_ms(), mib));
+        let marked = self.mark_populated(&mut debits, boottime_ms());
+        debits.push(Debit { at: boottime_ms(), mib, pid: me.pid, start: me.start, id, populated: false });
         if store(&self.debits(), &debits, false).is_err() {
             return (Some(0), None);
         }
+        self.forget_marked(&marked);
         drop(l);
-        (Some(left), Some(populate()))
+        let r = populate();
+        // Counted in full until marked (a failed populate too: as if it had come). Marked now only if the lock is
+        // free at once: a fault may be waiting on the take.
+        UNMARKED.lock().unwrap().push((self.debits(), id));
+        self.settle_room(Duration::ZERO);
+        (Some(left), Some(r))
     }
 
     /// The host lock if it is free now, or within `tries` (it is tried again every 50 us, never waited on): None if
@@ -1992,38 +2040,58 @@ impl Host {
 /// Recent grants, as (boot-clock ms, MiB, id).
 type Grants = Vec<(u64, u64, u64)>;
 
-/// Checkpoint memory taken lately, as (boot-clock ms, MiB): `Host::recent_debits`.
-type Debits = Vec<(u64, u64)>;
+/// Checkpoint memory taken lately: `Host::recent_debits`.
+type Debits = Vec<Debit>;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Debit {
+    /// When it was taken, or once `populated`, when that was marked (boot-clock ms).
+    at: u64,
+    mib: u64,
+    /// The process that took it (`Ident`), and its own number for the take.
+    pid: u32,
+    start: u64,
+    id: u64,
+    populated: bool,
+}
+
+/// This process's takes whose memory is populated and not yet marked so, by ledger (`Host::settle_room`).
+static UNMARKED: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
 /// How long a take tries for the host lock: past another take's (tens of us, its memory populated after), never as
 /// long as a holder that waits (admission asking for kept memory back): a fault may be waiting on the take.
 const TAKE_TRIES: Duration = Duration::from_millis(1);
 
-/// How long a debit counts in full: its memory may still be being populated.
-const DEBIT_FULL_MS: u64 = 2000;
-
-/// How long a debit counts at all: twice `vm.stat_interval`, at least `DEBIT_FULL_MS`.
+/// How long a populated debit counts: twice `vm.stat_interval`, at least 2 s.
 fn debit_window_ms() -> u64 {
     static MS: OnceLock<u64> = OnceLock::new();
     *MS.get_or_init(|| {
         let secs = std::fs::read_to_string("/proc/sys/vm/stat_interval").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(1);
-        secs.saturating_mul(2000).max(DEBIT_FULL_MS)
+        secs.saturating_mul(2000).max(2000)
     })
 }
 
 /// `Host::recent_debits` of what was read (None: unreadable), its file unwritten for that long (None: unknown), at
-/// `now` with debits counting for `window` ms, the older ones for at most `cap` MiB together (None: no cap). An
-/// unreadable file counts as all taken until a whole window has passed since its last write (every debit it held
-/// has expired then): None then, and the next take writes a new one.
-fn debits_taken(read: Option<Option<Debits>>, unwritten: Option<Duration>, now: u64, window: u64, cap: Option<u64>) -> (Option<Debits>, u64) {
+/// `now`: unpopulated ones in full unless their process is `gone`; populated ones for `window` ms, together for at
+/// most `cap` MiB (None: no cap). An unreadable file counts as all taken until a whole window has passed since its
+/// last write (every debit it held has expired then, but one still to populate: which it was cannot be told, so it
+/// is lost then).
+fn debits_taken(
+    read: Option<Option<Debits>>,
+    unwritten: Option<Duration>,
+    now: u64,
+    window: u64,
+    cap: Option<u64>,
+    gone: impl Fn(&Debit) -> bool,
+) -> (Option<Debits>, u64) {
     let Some(debits) = read else {
         let expired = unwritten.is_some_and(|d| d.as_millis() as u64 >= window);
         return (None, if expired { 0 } else { u64::MAX });
     };
     let mut debits = debits.unwrap_or_default();
-    debits.retain(|&(t, _)| t <= now && now - t < window);
-    let sum = |young: bool| debits.iter().filter(|d| (now - d.0 < DEBIT_FULL_MS) == young).fold(0u64, |a, d| a.saturating_add(d.1));
-    let taken = sum(true).saturating_add(cap.map_or(sum(false), |c| sum(false).min(c)));
+    debits.retain(|d| if d.populated { d.at <= now && now - d.at < window } else { !gone(d) });
+    let sum = |populated: bool| debits.iter().filter(|d| d.populated == populated).fold(0u64, |a, d| a.saturating_add(d.mib));
+    let taken = sum(false).saturating_add(cap.map_or(sum(true), |c| sum(true).min(c)));
     (Some(debits), taken)
 }
 
@@ -7044,34 +7112,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// Marks this process's populated takes, again while another test has the host lock.
+    fn settle(h: &Host) {
+        while UNMARKED.lock().unwrap().iter().any(|u| u.0 == h.debits()) {
+            h.settle_room(TAKE_TRIES);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn debit(mib: u64, at: u64, owner: &Ident, populated: bool) -> Debit {
+        Debit { at, mib, pid: owner.pid, start: owner.start, id: u64::MAX, populated }
+    }
+
     /// Checkpoint memory is taken against what admission counts (#677): MemAvailable above the reserve, less the
-    /// grants guests have yet to touch and what was taken lately, which MemAvailable may not show for a while
-    /// (Linux folds per-CPU counters in late): two takes with room for one never both succeed, however MemAvailable
-    /// moves. Unreadable MemAvailable or grants take nothing.
+    /// grants guests have yet to touch and what was taken lately. A take still populating counts in full however
+    /// long that takes (#691), until its process marks it populated or is proven gone; then only what the per-CPU
+    /// counters can hide of it, until twice vm.stat_interval after. Two takes with room for one never both succeed,
+    /// however MemAvailable moves. Unreadable MemAvailable or grants take nothing.
     #[test]
     fn checkpoint_memory_is_taken_against_what_admission_counts() {
         let (_h_dir, mut h) = host("take-room");
         h.cfg.reserve_mib = Some(1000);
         let t0 = boottime_ms();
         pin_clock(t0);
-        // MemAvailable as Linux may show it right after: unchanged.
+        let capped = |mib: u64| vmstat_drift_mib().map_or(mib, |c| mib.min(c));
+        // MemAvailable as Linux may show it while populating, and right after: unchanged.
         let read = || Some(AVAIL);
-        assert_eq!(take_at(&h, 500, read, || 7), (AVAIL - 1000, Some(7)));
-        assert_eq!(take_at(&h, 500, read, || ()).0, AVAIL - 1500, "the first is debited though MemAvailable did not move");
-        assert!(h.grant_inner(3000, Floor::Reserve, false, None, read).unwrap().is_ok());
-        // Left: AVAIL - 1000 reserve - 1000 taken - 3000 granted.
-        assert_eq!(take_at(&h, 5001, read, || panic!("nothing populated")), (5000, None), "more than is left");
-        assert!(take_at(&h, 5000, read, || ()).1.is_some());
-        assert_eq!(take_at(&h, 1, read, || panic!("nothing populated")), (0, None), "none left: one at a time");
-        assert!(h.grant_inner(1, Floor::Reserve, false, None, read).unwrap().is_err(), "admission counts the debits too");
-        // Older than DEBIT_FULL_MS: together at most what the per-CPU counters can hide, while within the window
-        // (twice vm.stat_interval: none past DEBIT_FULL_MS where that is 1 s); past the window, nothing.
-        pin_clock(t0 + DEBIT_FULL_MS);
-        let window = GRANT_WINDOW.as_millis() as u64;
-        let older = if debit_window_ms() > DEBIT_FULL_MS { vmstat_drift_mib().map_or(6000, |c| c.min(6000)) } else { 0 };
-        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 3000 - older);
-        pin_clock(t0 + debit_window_ms().max(window) + DEBIT_FULL_MS);
-        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000, "expired by age, grants too");
+        let (left, during) = take_at(&h, 500, read, || take_at(&h, 1, read, || ()).0);
+        assert_eq!((left, during), (AVAIL - 1000, Some(AVAIL - 1500)), "one still populating counts in full");
+        settle(&h);
+        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - capped(501), "populated: what the counters can hide");
+        assert!(h.grant_inner(AVAIL - 1000 - capped(502) + 1, Floor::Reserve, false, None, read).unwrap().is_err(), "admission counts them too");
+        // Past the window, nothing.
+        settle(&h);
+        pin_clock(t0 + debit_window_ms());
+        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000, "expired by age");
+        // Not populated: in full while its process runs, gone with it.
+        let me = Ident::me();
+        let gone = Ident { pid: (1 << 22) - 2, start: 1, boot: me.boot.clone() };
+        store(&h.debits(), &vec![debit(700, t0, &gone, false), debit(300, t0, &me, false)], false).unwrap();
+        assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 300);
         // Unreadable: nothing taken, and none left (never no bound); unreadable debits written just now leave none.
         assert_eq!(take_at(&h, 1, || None, || panic!("nothing populated")), (0, None));
         std::fs::write(h.debits(), "{").unwrap();
@@ -7080,18 +7160,72 @@ pub(crate) mod tests {
         assert_eq!(take_at(&h, 1, read, || panic!("nothing populated")), (0, None));
     }
 
-    /// What debits count as taken (#677): the young in full, the older together up to what the per-CPU counters can
-    /// hide; in full where that cannot be told (an unreadable /proc/zoneinfo: never a guess from this process's CPUs).
-    /// An unreadable ledger is all taken until a window has passed since its last write.
+    /// Admission counts again after a release (#691): what it found pending before is not what decides.
+    #[test]
+    fn admission_counts_again_after_a_release() {
+        let (_h_dir, mut h) = host("release-recount");
+        h.cfg.reserve_mib = Some(0);
+        pin_clock(boottime_ms());
+        let path = h.debits();
+        store(&path, &vec![debit(500, boottime_ms(), &Ident::me(), false)], false).unwrap();
+        let run = h.run.clone();
+        // Stands in for what goes meanwhile: the debit.
+        std::thread::spawn(move || crate::hostmem::serve(&run, || store(&path, &Vec::<Debit>::new(), false).unwrap()));
+        let t = std::time::Instant::now();
+        while !crate::hostmem::joined(&h.run) {
+            assert!(t.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let deadline = Some(std::time::Instant::now() + Duration::from_secs(30));
+        assert!(h.grant_inner(AVAIL - 499, Floor::Reserve, false, deadline, || Some(AVAIL)).unwrap().is_ok());
+    }
+
+    /// The marks of populated takes are forgotten only once the ledger saying so is stored: one whose store failed
+    /// is marked by the next settle, not counted in full for the life of its process.
+    #[test]
+    fn a_mark_whose_store_failed_is_made_again() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes through the mode
+        }
+        let (_h_dir, h) = host("mark-retry");
+        let id = u64::MAX - 1;
+        let me = Ident::me();
+        store(&h.debits(), &vec![Debit { id, ..debit(500, boottime_ms(), &me, false) }], false).unwrap();
+        UNMARKED.lock().unwrap().push((h.debits(), id));
+        let mode = |m| std::fs::set_permissions(&h.run, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o500);
+        h.settle_room(Duration::from_secs(30));
+        mode(0o700);
+        assert!(UNMARKED.lock().unwrap().contains(&(h.debits(), id)), "kept: the store failed");
+        assert!(!load::<Debits>(&h.debits()).unwrap().unwrap()[0].populated);
+        settle(&h);
+        assert!(load::<Debits>(&h.debits()).unwrap().unwrap()[0].populated);
+    }
+
+    /// What debits count as taken: ones not yet populated in full unless their process is gone; populated ones within
+    /// the window, together up to what the per-CPU counters can hide, or in full where that cannot be told (an
+    /// unreadable /proc/zoneinfo: never a guess from this process's CPUs). An unreadable ledger is all taken until a
+    /// window has passed since its last write.
     #[test]
     fn debits_count_in_full_unless_the_drift_bound_is_known() {
         let (now, window) = (100_000, 60_000);
-        let debits = Some(Some(vec![(now - 100, 10), (now - 30_000, 500), (now - 40_000, 300), (now - 70_000, 999), (now + 5, 7)]));
-        assert_eq!(debits_taken(debits.clone(), None, now, window, Some(15)).1, 10 + 15, "older ones capped; expired and future out");
-        assert_eq!(debits_taken(debits.clone(), None, now, window, None).1, 10 + 500 + 300, "no bound known: in full");
-        assert_eq!(debits_taken(debits, None, now, window, Some(5000)).1, 810, "never more than they are");
-        assert_eq!(debits_taken(Some(None), None, now, window, None), (Some(vec![]), 0));
-        let unreadable = |d| debits_taken(None, d, now, window, Some(15));
+        let (me, gone) = (Ident::me(), Ident { pid: 7, start: 7, boot: String::new() });
+        let debits = Some(Some(vec![
+            debit(10, now - 100, &me, true),
+            debit(500, now - 30_000, &me, true),
+            debit(300, now - 90_000, &me, false),
+            debit(999, now - 70_000, &me, true),
+            debit(7, now + 5, &me, true),
+            debit(40, now, &gone, false),
+        ]));
+        let is_gone = |d: &Debit| d.pid == 7;
+        assert_eq!(debits_taken(debits.clone(), None, now, window, Some(15), is_gone).1, 300 + 15, "populated capped; expired, future, gone out");
+        assert_eq!(debits_taken(debits.clone(), None, now, window, None, is_gone).1, 300 + 510, "no bound known: in full");
+        assert_eq!(debits_taken(debits.clone(), None, now, window, Some(5000), is_gone).1, 810, "never more than they are");
+        assert_eq!(debits_taken(debits, None, now, window, Some(15), |_| false).1, 340 + 15, "not gone: in full however old");
+        assert_eq!(debits_taken(Some(None), None, now, window, None, is_gone), (Some(vec![]), 0));
+        let unreadable = |d| debits_taken(None, d, now, window, Some(15), is_gone);
         assert_eq!(unreadable(Some(Duration::from_secs(1))), (None, u64::MAX), "written lately: all taken");
         assert_eq!(unreadable(None), (None, u64::MAX), "unknown: all taken");
         assert_eq!(unreadable(Some(Duration::from_secs(61))), (None, 0), "every debit it held expired");

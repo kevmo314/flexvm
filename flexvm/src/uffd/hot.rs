@@ -173,12 +173,14 @@ impl Pager {
         }
     }
 
-    /// Releases the memory kept for the next checkpoint: rescue memory and hot pages' (a request from another
-    /// process, `hostmem`, or the host is short).
+    /// Releases the memory kept for the next checkpoint (a request from another process, `hostmem`, or the host is
+    /// short): rescue memory, hot pages', and the last checkpoint's hot pages, which the next one compares its own with
+    /// (#691): without them it writes its hot pages, as it does after the arm.
     pub fn release_kept(&self) {
         let slots = self.slot_spare.lock().unwrap().take();
         let hot = self.hot_spare.lock().unwrap().take();
-        if slots.as_ref().is_some_and(|s| s.mapped_bytes() > 0) || hot.is_some() {
+        let prev = self.hot_prev.lock().unwrap().take();
+        if slots.as_ref().is_some_and(|s| s.mapped_bytes() > 0) || hot.is_some() || prev.is_some() {
             crate::log!("uffd: the host is short of memory: memory kept for the next checkpoint released");
         }
     }

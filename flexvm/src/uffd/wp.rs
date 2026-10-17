@@ -936,6 +936,11 @@ mod tests {
         assert_eq!(kept(), (2 << 20, true), "kept while there is room");
         pager.host_memory(|| Some(0), true);
         assert_eq!(kept(), (0, false), "released when short");
+        // The last checkpoint's hot pages go too (#691): the next compares with none.
+        keep();
+        *pager.hot_prev.lock().unwrap() = Some(Arc::new(Held::of(&[(2, 3)])));
+        pager.release_kept();
+        assert!(pager.hot_prev.lock().unwrap().is_none() && kept() == (0, false));
         // Under the reserve: no hot pages' memory, and a copy keeps none of its rescue memory.
         pager.mem_room.set(0);
         pager.prepare_hot();

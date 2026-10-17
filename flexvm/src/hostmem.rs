@@ -6,12 +6,14 @@
 //! A request is a number in `RUN/.locks/release-BOOT`, raised under the host lock; each VM process looks every
 //! `POLL` and, once it has released, writes the number it answered to its own file in `RUN/.locks/released-BOOT/`
 //! (named by its `Ident::key`). A requester waits for those that still run (not one stopped: it cannot answer), and
-//! removes the files of those proven gone. The room that memory grows within is not here: each take is checked and
-//! populated under the host lock (`Host::take_room`), so nothing taken is left for anyone to count.
+//! removes the files of those proven gone. Debits of what they released are not retired: they age out
+//! (`Host::recent_debits`), so kept memory taken lately may count a little while longer. The room that memory grows
+//! within is not here: each take is checked and debited under the host lock, and populated after it
+//! (`Host::take_room`).
 //!
 //! VM processes started by a flexvm before #677 keep its mapped `memory-v2-BOOT` room, which neither sees these
-//! takes nor answers these requests: after an upgrade, restart or migrate them; until then the reserve may be
-//! overcommitted.
+//! takes nor answers these requests, and those started before #691 their own `room-debits-BOOT` ledger: after an
+//! upgrade, restart or migrate them; until then the reserve may be overcommitted.
 
 use crate::host::{load, locks, store, Host, Ident, Liveness};
 use std::path::{Path, PathBuf};
