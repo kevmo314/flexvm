@@ -456,9 +456,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             continue;
         }
         let Ok((c, _)) = listener.accept() else { continue };
-        if !claim_peer(&c, unsafe { libc::geteuid() }) {
-            continue;
-        }
+        // Each connection's: only this user's processes claim it (their pidfd guards the cgroup move).
+        let Some(peer) = claim_peer(&c, unsafe { libc::geteuid() }) else { continue };
         // In short waits, minding stops: a claimer stopped mid-request must not keep this one.
         let at = Instant::now() + HANDSHAKE_TIMEOUT;
         let ready = || loop {
@@ -509,7 +508,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 // In the claimer's cgroup, as a cold foreground run's VM process is (its Firecracker
                 // has its own either way). This process moves itself: its own pid is never a reused one.
                 if let (true, Some(cg)) = (attached, fds.get(2)) {
-                    if let Err(e) = crate::util::join_cgroup(cg) {
+                    if let Err(e) = crate::util::join_cgroup(cg, peer.0, &peer.1) {
                         crate::log!("vm {}: not moved to its claimer's cgroup: {e}", req["name"].as_str().unwrap_or(""));
                     }
                 }
@@ -566,8 +565,10 @@ fn bind_claims(sock: &std::path::Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-fn claim_peer(c: &UnixStream, uid: libc::uid_t) -> bool {
-    crate::util::peer_cred(c).is_ok_and(|cred| cred.uid == uid)
+/// The claimer's pid and pidfd, if it runs as `uid`.
+fn claim_peer(c: &UnixStream, uid: libc::uid_t) -> Option<(u32, std::os::fd::OwnedFd)> {
+    let cred = crate::util::peer_cred(c).ok().filter(|cred| cred.uid == uid)?;
+    Some((cred.pid as u32, crate::util::pidfd_open(cred.pid as u32).ok()?))
 }
 
 /// On failure, the flag says whether another standby (or a cold start) may
@@ -826,8 +827,8 @@ mod tests {
         let _c = UnixStream::connect(&sock).unwrap();
         let (c, _) = listener.accept().unwrap();
         let uid = unsafe { libc::geteuid() };
-        assert!(claim_peer(&c, uid));
-        assert!(!claim_peer(&c, uid.wrapping_add(1)));
+        assert_eq!(claim_peer(&c, uid).map(|p| p.0), Some(std::process::id()));
+        assert!(claim_peer(&c, uid.wrapping_add(1)).is_none());
     }
 
     /// A host with template `default` (generation `a`) and its pool's directory.

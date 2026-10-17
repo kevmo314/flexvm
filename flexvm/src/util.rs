@@ -773,7 +773,17 @@ pub fn my_cgroup() -> Option<OwnedFd> {
     let mine = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let cg = mine.lines().find_map(|l| l.strip_prefix("0::"))?;
     let dir = cgroup_dir(cg)?;
-    openat(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes()).ok()?, libc::O_PATH | libc::O_DIRECTORY).ok()
+    let fd = openat(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes()).ok()?, libc::O_PATH | libc::O_DIRECTORY).ok()?;
+    // In a cgroup namespace without its own cgroup2 mount (`unshare -C`), the path names another
+    // cgroup (the host's root, for "/"): none is sent rather than that one.
+    in_cgroup(&fd, std::process::id()).ok()?.then_some(fd)
+}
+
+/// Whether `pid` (in this process's pid namespace) is listed in the `cgroup.procs` of cgroup directory `cg`.
+fn in_cgroup(cg: &impl AsRawFd, pid: u32) -> io::Result<bool> {
+    let mut procs = String::new();
+    std::fs::File::from(openat(cg.as_raw_fd(), c"cgroup.procs", libc::O_RDONLY | libc::O_NOFOLLOW)?).read_to_string(&mut procs)?;
+    Ok(procs.lines().any(|l| l.trim().parse() == Ok(pid)))
 }
 
 /// A cgroup2 path: None unless absolute, of plain components.
@@ -786,8 +796,13 @@ fn cgroup_dir(cg: &str) -> Option<std::path::PathBuf> {
     Some(Path::new("/sys/fs/cgroup").join(rel))
 }
 
-/// Moves this process (all its threads) into the claimer's cgroup directory.
-pub fn join_cgroup(cg: &impl AsRawFd) -> io::Result<()> {
+/// Moves this process (all its threads) into cgroup directory `cg`, a claimer's, only if the
+/// claimer (`pid`, its `pidfd` opened when it connected) is in it: one it passed may name any.
+pub fn join_cgroup(cg: &impl AsRawFd, pid: u32, pidfd: &OwnedFd) -> io::Result<()> {
+    // Alive after the read: the pid listed is still the claimer's, not a reuse.
+    if !in_cgroup(cg, pid)? || pidfd_signal(pidfd, 0).is_err() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the cgroup passed is not the claimer's"));
+    }
     let procs = openat(cg.as_raw_fd(), c"cgroup.procs", libc::O_WRONLY | libc::O_NOFOLLOW)?;
     std::fs::File::from(procs).write_all(std::process::id().to_string().as_bytes())
 }
@@ -1494,7 +1509,10 @@ mod tests {
         let root = crate::test_util::TempDir::new("claim-cgroup");
         let dir = root.join("cgroup");
         std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("cgroup.procs"), b"").unwrap();
+        let me = std::process::id();
+        let pidfd = pidfd_open(me).unwrap();
+        // Listed, as the claimer is in its own cgroup.
+        std::fs::write(dir.join("cgroup.procs"), format!("1\n{me}\n")).unwrap();
         let cg = openat(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes()).unwrap(), libc::O_PATH | libc::O_DIRECTORY).unwrap();
         assert_ne!(unsafe { libc::fcntl(cg.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH, 0);
         let (a, b) = UnixStream::pair().unwrap();
@@ -1504,16 +1522,20 @@ mod tests {
         drop(cg);
         std::fs::rename(&dir, root.join("original")).unwrap();
         std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("cgroup.procs"), b"unrelated").unwrap();
-        join_cgroup(&fds[2]).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("original/cgroup.procs")).unwrap(), std::process::id().to_string());
-        assert_eq!(std::fs::read(dir.join("cgroup.procs")).unwrap(), b"unrelated");
+        std::fs::write(dir.join("cgroup.procs"), format!("{me}\nunrelated")).unwrap();
+        join_cgroup(&fds[2], me, &pidfd).unwrap();
+        assert!(std::fs::read_to_string(root.join("original/cgroup.procs")).unwrap().starts_with(&me.to_string()));
+        assert_eq!(std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(), format!("{me}\nunrelated"));
+        // A cgroup the claimer is not in (one it opened elsewhere, or by a path not its own) is refused.
+        std::fs::write(root.join("original/cgroup.procs"), b"1\n").unwrap();
+        assert!(join_cgroup(&fds[2], me, &pidfd).is_err());
+        assert_eq!(std::fs::read(root.join("original/cgroup.procs")).unwrap(), b"1\n");
         // A directory without cgroup.procs is not populated, nor is a symlink followed.
         std::fs::remove_file(root.join("original/cgroup.procs")).unwrap();
-        assert!(join_cgroup(&fds[2]).is_err());
+        assert!(join_cgroup(&fds[2], me, &pidfd).is_err());
         std::os::unix::fs::symlink(dir.join("cgroup.procs"), root.join("original/cgroup.procs")).unwrap();
-        assert!(join_cgroup(&fds[2]).is_err());
-        assert_eq!(std::fs::read(dir.join("cgroup.procs")).unwrap(), b"unrelated");
+        assert!(join_cgroup(&fds[2], me, &pidfd).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(), format!("{me}\nunrelated"));
     }
 
     #[test]
