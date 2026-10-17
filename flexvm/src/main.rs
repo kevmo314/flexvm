@@ -1130,22 +1130,8 @@ fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
     if !users.is_empty() {
         bail!("image {} is used by {}: remove them first (flexvm rm -f)", template::image_of(&name), users.join(", "));
     }
-    let live = || {
-        standby::show(host).as_array().into_iter().flatten().filter(|t| t["template"] == name.as_str()).map(|t| t["live"].as_u64().unwrap_or(0)).sum::<u64>()
-    };
-    if standby::target(host, &name) > 0 || live() > 0 {
-        standby::set(host, &name, 0)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while live() > 0 {
-            if Instant::now() > deadline {
-                bail!("image {}'s standby VMs are still there; try again", template::image_of(&name));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    let _ = std::fs::remove_file(host.state.join("standby").join(&name));
     let id = std::fs::read_link(paths.templates.join(&name))?.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    print(template::remove(paths, &host.state.join("images"), Some(&name), &id, &in_use)?)
+    print(standby::removing(host, paths, &name, |paths| template::remove_locked(paths, &host.state.join("images"), Some(&name), &id, &in_use))?)
 }
 
 fn image_options(args: &Args, src: &str) -> Result<image::Options> {

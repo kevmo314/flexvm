@@ -736,8 +736,12 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     and checked against the directory's path, so one renamed away before the
     lock was ours fails the open. Its registry entry comes later.
   - A standby VM: its process, as a running VM. The standby count names only
-    the template name; `rmi` first sets it to 0 and waits for the live standby
-    VMs to go.
+    the template name; under the exclusive templates lock, `rmi` waits for
+    any refill in progress, saves the count, sets it to 0, and stops the live
+    standby VMs. It waits on their pidfds for process exit (their pool lock
+    files disappear before they release the generation's use lock). It deletes
+    the count only after the name's link is gone, or restores it if the name
+    survives, including on timeout or a failed removal.
   - An incoming migration: the target's process, from opening the source's
     content id (`open_id`) until it is a running VM.
   - A checkpoint restore: the restoring process, from `open_id`. A checkpoint
@@ -767,7 +771,12 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
 
   The locks, in the order they are taken:
   1. The templates lock (`templates-DEV-INO`): exclusive for `rmi` and
-     sweeps, shared while a build makes its staging directory and publishes.
+     sweeps, shared while a build makes its staging directory and publishes,
+     and while `standby::set` checks the name and writes its count. `set` drops
+     it before refilling; `rmi` takes the pool's refill lock under it, so no
+     refill can start a standby between its snapshot and removal. A refill
+     never takes the templates lock, so waiting for it does not reverse this
+     order.
   2. A generation's use lock: shared by its users (waiting), exclusive for
      `rmi` (never waiting: held, the generation stays).
   3. An image key's lock: exclusive for a pull (waiting, until interrupted),
@@ -777,7 +786,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
      `rmi` under 3 (never waiting).
 
   A VM takes only 2. Only shared holds wait behind a later lock's holder,
-  and every exclusive one after the first never waits, so a pull holding 4
+  and exclusive holds of 2–4 by `rmi` never wait, so a pull holding 4
   while it waits for 1 (its sweep, staging and publication) deadlocks
   nothing. `rmi` takes 1 exclusively and finishes earlier tombstones (the
   sweep), checks that the name still links to the content id and removes

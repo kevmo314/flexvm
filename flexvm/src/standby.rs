@@ -124,20 +124,69 @@ pub fn templates(host: &Host) -> Vec<String> {
 }
 
 pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
-    crate::util::write_file(&host.state.join("standby"), template, n.to_string().as_bytes(), true)?;
-    for id in live(host, template).iter().skip(n) {
-        stop(id);
+    {
+        let paths = Paths::new(&host.state);
+        let parent = crate::host::Directory::open(&paths.templates)?;
+        let paths = Paths { templates: parent.path.clone(), ..paths };
+        let _lock = crate::template::templates_lock(&paths, libc::LOCK_SH)?;
+        Template::resolve(&paths, template)?;
+        crate::util::write_file(&host.state.join("standby"), template, n.to_string().as_bytes(), true)?;
+        for id in live(host, template).iter().skip(n) {
+            stop(id);
+        }
     }
     let started = refill(host, template)?;
     Ok(json!({"template": template, "standby": n, "started": started}))
 }
 
-/// Each template's count and its standby VMs now.
-pub fn show(host: &Host) -> Value {
-    json!(templates(host)
-        .iter()
-        .map(|t| json!({"template": t, "standby": target(host, t), "live": live(host, t).len(), "dir": dir(host, t)}))
-        .collect::<Vec<_>>())
+/// Stop a name's pool before removal, under the templates lock. Keep its count if the
+/// name survives, including a failed removal; no `set` may write it between these decisions.
+pub(crate) fn removing<T>(host: &Host, paths: &Paths, template: &str, remove: impl FnOnce(&Paths) -> Result<T>) -> Result<T> {
+    let parent = crate::host::Directory::open(&paths.templates)?;
+    let paths = Paths { templates: parent.path.clone(), ..paths.clone() };
+    let _lock = crate::template::templates_lock(&paths, libc::LOCK_EX)?;
+    // Finish any refill already in progress before taking the pool's pidfds.
+    let d = create_dir(host, template)?;
+    let _refill = Flock::new(crate::host::private_file(&crate::host::locks(&d).join("refill"))?, libc::LOCK_EX)?;
+    let count = host.state.join("standby").join(template);
+    let saved = match std::fs::read(&count) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    // Capture before publishing 0: a standby can notice it and unlink its record itself.
+    let mut waiting = Vec::new();
+    for id in live(host, template) {
+        if let Some(fd) = PidFd::open(&id)? {
+            waiting.push(fd);
+        }
+    }
+    let result = (|| {
+        crate::util::write_file(&host.state.join("standby"), template, b"0", true)?;
+        for fd in &waiting {
+            if let Err(e) = fd.signal(libc::SIGUSR1) {
+                if !fd.wait(Duration::ZERO) {
+                    return Err(e);
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for fd in waiting {
+            if !fd.wait(deadline.saturating_duration_since(Instant::now())) {
+                bail!("image {}'s standby VMs are still there; try again", crate::template::image_of(template));
+            }
+        }
+        remove(&paths)
+    })();
+    let gone = std::fs::symlink_metadata(paths.templates.join(template)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    match saved.filter(|_| !gone) {
+        Some(bytes) => crate::util::write_file(&host.state.join("standby"), template, &bytes, true)?,
+        None => match std::fs::remove_file(&count) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            r => r?,
+        },
+    }
+    result
 }
 
 /// Periodic recovery, run by listeners and running VM processes. A
@@ -814,6 +863,96 @@ mod tests {
     }
 
     #[test]
+    fn removal_restores_the_count_only_while_the_name_survives() {
+        let (_root, host, paths, _d) = pool("standby-rmi-count");
+        let count = host.state.join("standby/default");
+        crate::util::write_file(&host.state.join("standby"), "default", b"3\n", true).unwrap();
+        for repulled in [false, true] {
+            let result: Result<()> = removing(&host, &paths, "default", |paths| {
+                assert_eq!(target(&host, "default"), 0);
+                if repulled {
+                    std::fs::remove_file(paths.templates.join("default"))?;
+                    std::os::unix::fs::symlink(".gen/b", paths.templates.join("default"))?;
+                }
+                Err("removal failed".into())
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&count).unwrap(), b"3\n");
+        }
+        // Even an error after unlinking must leave no count for refills to discover.
+        let result: Result<()> = removing(&host, &paths, "default", |paths| {
+            std::fs::remove_file(paths.templates.join("default"))?;
+            Err("sync failed".into())
+        });
+        assert!(result.is_err());
+        assert!(!count.exists());
+        std::os::unix::fs::symlink(".gen/a", paths.templates.join("default")).unwrap();
+        removing(&host, &paths, "default", |_| Ok(())).unwrap();
+        assert!(!count.exists(), "an unset count stays absent when the name survives");
+    }
+
+    #[test]
+    fn set_waits_for_removal_and_cannot_leave_a_count_for_a_missing_name() {
+        let (_root, host, paths, _d) = pool("standby-rmi-set");
+        // `set` uses the host's templates directory.
+        std::os::unix::fs::symlink(&paths.templates, host.state.join("templates")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let setter_host = host.clone();
+        let setter = removing(&host, &paths, "default", |paths| {
+            let setter = std::thread::spawn(move || tx.send(set(&setter_host, "default", 0)).unwrap());
+            assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+            std::fs::remove_file(paths.templates.join("default"))?;
+            Ok(setter)
+        })
+        .unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        setter.join().unwrap();
+        assert!(!host.state.join("standby/default").exists());
+    }
+
+    #[test]
+    fn removal_waits_for_process_exit_after_its_pool_lock_disappears() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let (_root, host, paths, d) = pool("standby-rmi-exit");
+        let mut child = Command::new("sh")
+            .args(["-c", "trap 'echo stopped' USR1; echo ready; while :; do read line && exit; done"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        let id = Ident::of(child.id()).unwrap();
+        let record = crate::host::locks(&d).join(format!("{}.lock", id.key()));
+        crate::host::write_record(&record, &serde_json::to_vec(&id).unwrap()).unwrap();
+        let _held = Flock::new(crate::host::open_record(&record).unwrap(), libc::LOCK_EX).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let removing_host = host.clone();
+        let worker = std::thread::spawn(move || {
+            removing(&removing_host, &paths, "default", |_| {
+                tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+        // A signal handler acknowledges the stop after removal captured its pidfd.
+        ready.clear();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready, "stopped\n");
+        std::fs::remove_file(&record).unwrap();
+        assert!(live(&host, "default").is_empty());
+        let early = rx.recv_timeout(Duration::from_millis(100));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(early.is_err(), "removal returned while the process still held its template");
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
     fn a_dead_standby_exits_124_and_only_leaving_the_pool_exits_0() {
         assert_eq!(leave_status(false, false), None);
         assert_eq!(leave_status(false, true), Some(0));
@@ -1095,6 +1234,8 @@ mod tests {
         assert!(start.elapsed() < LOCKED_TIMEOUT + Duration::from_secs(1), "{:?}", start.elapsed());
         Flock::new(stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
         // Saving a count also succeeds if its first refill hits the same timeout.
+        std::fs::create_dir_all(host.state.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", host.state.join("templates/default")).unwrap();
         assert_eq!(set(&host, "default", 1).unwrap()["started"], json!(0));
         assert_eq!(target(&host, "default"), 1);
         drop(held);
