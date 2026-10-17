@@ -54,16 +54,19 @@ not wait on the host:
   requests and ticks alike, is admitted against the reserve (`reserve_mib`) under the host
   lock, with the last 10 s of grants (`RUN/grants`, every VM process's) counted as used (plugged memory shows up
   in MemAvailable only once touched). A refused guest is told `full` and
-  marked starved. Before it refuses, every VM process is asked (a futex in
-  `RUN/.locks/memory-v2-BOOT`) to release the memory it keeps for its next
-  checkpoint, waiting up to 200 ms for each (not for one that is stopped), and
-  MemAvailable is read again whoever answered: that memory is not admitted,
-  so it never refuses a grant (#648). Eviction and the standby pool ask the
-  same before they react to the host running short. A request within a
-  second of the last is not made again (the memory went back then), so
-  callers queued on the host lock do not each wait. A grant also comes out
-  of the room checkpoint memory grows within (below) at once, so the two
-  never spend the same memory above the reserve. Admission is not enforcement: a guest can still fill memory
+  marked starved. Before it refuses, every VM process is asked to release
+  the memory it keeps for its next checkpoint: the request is a number in
+  `RUN/.locks/release-BOOT`, raised under the host lock, which each VM
+  process looks for every 50 ms, answering in its own file in
+  `RUN/.locks/released-BOOT/`. The request waits up to 200 ms for each that
+  runs (not for one that is stopped; the files of those proven gone are
+  removed), and MemAvailable is read again whoever answered: that memory is
+  not admitted, so it never refuses a grant (#648, #677). Eviction and the
+  standby pool ask the same before they react to the host running short. A
+  request within a second of the last is not made again (the memory went
+  back then), so callers queued on the host lock do not each wait.
+  Checkpoint memory (below) is taken under the same lock against the same
+  count, so the two never spend the same memory above the reserve. Admission is not enforcement: a guest can still fill memory
   that is already plugged, the 4 GiB pre-plug included (#54).
 - **Wait, don't die.** Allocations that outrun the plug are throttled by the
   kernel at `memory.high` rather than OOM-killed. Memory block uevents move
@@ -564,25 +567,24 @@ through, so the checkpoint is exactly the memory at the pause.
   more than the copy itself (1.3–2.5 µs a page, 60 ms of a 150 ms fault
   budget). Reading on more threads at once was slower. Neither this memory
   nor the hot pages' nor the writers' huge-page buffers is admitted like a
-  guest's, so each keeps out of the host's reserve instead: they grow only
-  within one room for the host, shared by its VM processes
-  (`RUN/.locks/memory-v2-BOOT`, mapped by each), so VMs copying at once never
-  take more than there is together (#648). About every second the first VM
-  process's controller refreshes it from MemAvailable less the reserve and
-  the grants guests have yet to touch, taking off again what was taken since
-  the refresh before (it may not show in MemAvailable yet); it is debited as
-  they grow, and by admission's grants. A refresh whose sample was taken
-  before another refresh landed is dropped. Memory taken and not yet
-  populated (MemAvailable still shows it) stays reserved in the file, under
-  its process, until it is: every refresh and admission count it as used
-  however long that takes, and a process gone has its reservations
-  reclaimed (#672). Each process's slot is one word (its tag and what it
-  has reserved), so a claim, a reservation and a reclaim are each one
-  compare-and-swap, and a reclaim never takes a new owner's (#674). A
-  process with no slot (every one another's that runs) takes no checkpoint
-  memory until it has one. Writer buffers are populated as they are made
-  (written page by page where the kernel cannot). The file is refused unless it is
-  this user's (or root's), writable by no one else, with no other link. Without room for a block of copies, faults ask the writers for
+  guest's, so each keeps out of the host's reserve instead: each take is
+  checked against MemAvailable less the reserve and the grants guests have
+  yet to touch, and mapped and populated, under the host lock, so VMs
+  copying at once, and admission, see what the others took and never take
+  more than there is together (#648). Nothing is recorded for a take, so
+  nothing is left to count or reclaim when a process dies; a take whose
+  lock stays busy for 50 ms, or whose MemAvailable or grants cannot be read,
+  takes nothing (#677). Each VM process's controller samples what is left
+  about every second, which faults look at to tell whether a block of
+  copies may still be had; a take checks again. Rescue chunks cost one
+  take per 2 MiB, and are kept from one copy for the next, so most copies
+  take none. A VM process takes nothing before its controller has
+  attached its room to the host (its room is closed until then). An older
+  flexvm's VM processes (`RUN/.locks/memory-BOOT` or `memory-v2-BOOT`) are
+  not asked to release theirs until they exit: their own controllers
+  release it when the host is short.
+  Writer buffers are populated within their take (written page by page
+  where the kernel cannot). Without room for a block of copies, faults ask the writers for
   their pages and wait for them as over budget, and the pause protects
   pages it would have copied hot; no checkpoint fails for it. Under the
   eviction mark (or with the VM starved), or when another process asks

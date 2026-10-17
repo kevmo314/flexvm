@@ -937,11 +937,12 @@ mod tests {
         pager.host_memory(|| Some(0), true);
         assert_eq!(kept(), (0, false), "released when short");
         // Under the reserve: no hot pages' memory, and a copy keeps none of its rescue memory.
+        pager.mem_room.set(0);
         pager.prepare_hot();
         keep();
         assert_eq!(kept(), (0, false));
-        // Unknown: no bound.
-        pager.host_memory(|| None, false);
+        // No bound.
+        pager.mem_room.set(u64::MAX);
         pager.prepare_hot();
         assert!(kept().1);
     }

@@ -4,7 +4,7 @@ use super::{
     format::{DATA, MAGIC, TEMPLATE, ZERO},
 };
 use crate::{
-    cow::{Epoch, Room},
+    cow::Room,
     crc32c,
     template::Template,
     uffd::{Pager, Runs, REMOTE},
@@ -157,22 +157,6 @@ pub(crate) struct Buf {
     ptr: *mut u8,
     map: usize,
     len: usize,
-    /// The room a huge one took, given back when it goes (held for its drop; tests look).
-    #[cfg_attr(not(test), allow(dead_code))]
-    charge: Option<Charge>,
-}
-
-/// `mib` taken from a room `at`, given back on drop: a buffer unmapped, or never mapped.
-struct Charge {
-    room: Room,
-    mib: u64,
-    at: Epoch,
-}
-
-impl Drop for Charge {
-    fn drop(&mut self) {
-        self.room.give(self.mib, self.at);
-    }
 }
 
 #[cfg(test)]
@@ -201,30 +185,24 @@ impl Buf {
     fn new(room: &Room) -> io::Result<Buf> {
         let len = UNIT * PAGE_SIZE;
         let huge = len.next_multiple_of(HUGE);
-        let mib = (huge >> 20) as u64;
-        let Some(reserved) = room.take(mib) else {
-            return Buf::plain(UNIT);
-        };
-        let ptr = match Buf::map(huge, len, HUGE) {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                // Never mapped: the room is back.
-                room.give(mib, reserved.populated());
-                return Err(e);
-            }
-        };
-        // Only a hint: without it the buffer is ordinary pages.
-        unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
-        // Populated now, so its reservation in the room ends here, not with its first write (#672).
-        populate(ptr, huge);
-        let charge = Charge { room: room.clone(), mib, at: reserved.populated() };
-        Ok(Buf { ptr, map: huge, len, charge: Some(charge) })
+        // Populated within the take, so the room sees it taken in MemAvailable, not with its first write (#672).
+        let mapped = room.take((huge >> 20) as u64, || {
+            let ptr = Buf::map(huge, len, HUGE)?;
+            // Only a hint: without it the buffer is ordinary pages.
+            unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
+            populate(ptr, huge);
+            Ok(ptr)
+        });
+        match mapped {
+            Some(ptr) => ptr.map(|ptr| Buf { ptr, map: huge, len }),
+            None => Buf::plain(UNIT),
+        }
     }
 
-    /// Ordinary page-aligned storage, without a huge-page room charge.
+    /// Ordinary page-aligned storage, taking no room.
     pub(crate) fn plain(pages: usize) -> io::Result<Buf> {
         let len = pages * PAGE_SIZE;
-        Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len, charge: None })
+        Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len })
     }
 
     /// `map` bytes of anonymous memory, at a multiple of `align` (0: anywhere).
@@ -260,7 +238,6 @@ impl Buf {
 
 impl Drop for Buf {
     fn drop(&mut self) {
-        // Unmapped first, then `charge` gives its room back.
         unsafe { libc::munmap(self.ptr.cast(), self.map) };
     }
 }
@@ -397,15 +374,18 @@ mod buf_tests {
 
     #[test]
     fn writer_buffers_are_huge_only_with_room_for_the_whole_huge_page() {
-        let room = Room::default();
         for (have, huge, left) in [(0, false, 0), (1, false, 1), (5, true, 3)] {
+            let room = Room::default();
             room.set(have);
-            let mut b = Buf::new(&room).unwrap();
-            assert_eq!((b.charge.is_some(), room.get()), (huge, left), "room {have} MiB");
+            let b = Buf::new(&room).unwrap();
+            assert_eq!((b.map == HUGE, room.get()), (huge, left), "room {have} MiB");
             // A huge one is all of an aligned 2 MiB; an ordinary one only what it holds,
             // which no huge page fits in.
-            assert_eq!(b.map, if huge { HUGE } else { UNIT * PAGE_SIZE });
+            if !huge {
+                assert_eq!(b.map, UNIT * PAGE_SIZE);
+            }
             assert_eq!(b.ptr as usize % if huge { HUGE } else { PAGE_SIZE }, 0);
+            let mut b = b;
             let bytes = b.bytes();
             assert_eq!(bytes.len(), UNIT * PAGE_SIZE);
             assert!(bytes.iter().all(|&x| x == 0));
@@ -413,42 +393,29 @@ mod buf_tests {
             if !huge {
                 assert_eq!(anon_huge_kib(b.ptr as usize), 0, "an ordinary buffer took a huge page");
             }
-            drop(b);
-            assert_eq!(room.get(), have, "room {have} MiB: given back once unmapped");
         }
-        // Unknown room (as a pager starts): no bound, and still unknown after.
-        let unbounded = Room::default();
-        let b = Buf::new(&unbounded).unwrap();
-        assert!(b.charge.is_some());
-        drop(b);
-        assert_eq!(unbounded.get(), u64::MAX);
+        // No bound: huge.
+        assert_eq!(Buf::new(&Room::default()).unwrap().map, HUGE);
     }
 
     #[test]
-    fn a_failed_buffer_map_gives_its_room_back() {
+    fn a_failed_buffer_map_fails_the_buffer() {
         let room = Room::default();
         room.set(5);
         FAIL_MAP.with(|f| f.set(true));
         assert!(Buf::new(&room).is_err());
-        assert_eq!(room.get(), 5);
         // And the next one maps (huge) as usual.
-        let b = Buf::new(&room).unwrap();
-        assert_eq!((b.charge.is_some(), room.get()), (true, 3));
+        assert_eq!(Buf::new(&room).unwrap().map, HUGE);
     }
 
-    /// A writer buffer is populated before its reservation in the room ends, also where the kernel cannot populate it
-    /// at once (#674): every page is in, and nothing stays reserved.
+    /// A writer buffer is populated within its take, also where the kernel cannot populate it at once (#674): every
+    /// page is in before the room is let go.
     #[test]
-    fn a_writer_buffer_is_populated_before_its_reservation_ends() {
-        let dir = crate::test_util::TempDir::new("buf-populate");
-        let host = crate::hostmem::at(&dir).unwrap();
+    fn a_writer_buffer_is_populated_within_its_take() {
         let room = Room::default();
-        assert!(room.attach(host));
-        room.set(100);
         FAIL_POPULATE.with(|f| f.set(true));
         let b = Buf::new(&room).unwrap();
-        assert!(b.charge.is_some() && !FAIL_POPULATE.with(|f| f.get()), "huge, and the populate failed");
-        assert_eq!(host.outstanding(), 0, "its reservation ended");
+        assert!(b.map == HUGE && !FAIL_POPULATE.with(|f| f.get()), "huge, and the populate failed");
         let mut vec = vec![0u8; b.map / PAGE_SIZE];
         assert_eq!(unsafe { libc::mincore(b.ptr.cast(), b.map, vec.as_mut_ptr()) }, 0);
         assert!(vec.iter().all(|&v| v & 1 == 1), "every page in");

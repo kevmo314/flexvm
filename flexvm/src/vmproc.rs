@@ -1397,7 +1397,6 @@ impl Proc {
 
     fn controller(self: Arc<Self>) {
         let (mut published, mut growth, mut stopping) = (false, Growth::default(), None::<Stopping>);
-        let mut told_unattached = false;
         loop {
             thread::sleep(Duration::from_secs(1));
             // Standby VMs signalled last tick had that sleep: other processes may stop them now, however long this tick blocks.
@@ -1433,13 +1432,11 @@ impl Proc {
             let (_, at, _) = self.host.config_now().evict_marks();
             // Memory VM processes keep for their next checkpoint never moves a VM away: it goes back first (#648).
             if avail.is_some_and(|a| a < at) {
-                crate::hostmem::release_kept(&self.host.run, None);
+                crate::hostmem::release_kept(&self.host, None);
                 avail = host_available_mib();
             }
             let short = avail.is_some_and(|a| a < at) || vm.starving();
-            if !self.ready_room(short) && !std::mem::replace(&mut told_unattached, true) {
-                crate::log!("vm {}: no slot in the host's memory file: no memory for checkpoint copies until there is", vm.name);
-            }
+            self.ready_room(short);
             relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
             if let Some(dev) = self.host.config_now().announce_dev() {
@@ -1461,28 +1458,22 @@ impl Proc {
         }
     }
 
-    /// Attaches the VM's checkpoint memory room to the host's (`cow::Room::attach`) and refreshes it (`ready_room`),
-    /// and while the host is `short` releases what is kept for the next checkpoint (`Pager::host_memory`). Whether it
-    /// is attached.
+    /// Attaches the VM's checkpoint memory room to the host's (`cow::Room::attach`) and refreshes what it shows left,
+    /// and while the host is `short` releases what is kept for the next checkpoint (`Pager::host_memory`).
     /// None yet (bound before a resume or restore has its VM): its room stays closed (`cow::Room::closed`) until
     /// the controller's first tick.
-    fn ready_room(&self, short: bool) -> bool {
-        let Some(vm) = self.vm.get() else { return false };
+    fn ready_room(&self, short: bool) {
+        let Some(vm) = self.vm.get() else { return };
         let reserve = self.host.config_now().reserve();
-        let attached = crate::hostmem::at(&self.host.run).is_ok_and(|s| vm.pager.mem_room().attach(s));
-        let sample = room_sample(reserve, host_available_mib, || self.host.promised());
-        vm.pager.host_memory(attached_sample(attached, sample), short);
-        attached
+        vm.pager.mem_room().attach(&self.host);
+        vm.pager.host_memory(room_sample(reserve, host_available_mib, || self.host.promised()), short);
     }
 
     /// Answers other processes' requests that this one release the memory it keeps for the next checkpoint
     /// (`hostmem`): admission asks before it refuses, eviction and the standby pool before they react to the host
     /// running short.
     fn release_on_request(self: Arc<Self>) {
-        match crate::hostmem::at(&self.host.run) {
-            Ok(s) => s.serve(|| self.vm().pager.release_kept()),
-            Err(e) => crate::log!("vm {}: memory kept for checkpoints is not released on request: {e}", self.vm().name),
-        }
+        crate::hostmem::serve(&self.host.run, || self.vm().pager.release_kept());
     }
 
     fn watch_memory(self: Arc<Self>) {
@@ -1992,17 +1983,10 @@ fn arrival_more(granted: u64, (need, cap): (u64, u64)) -> u64 {
     crate::limit::allowance(need).min(cap.max(need)).saturating_sub(granted)
 }
 
-/// The room checkpoint memory grows within (`cow::Room::refresh`): MemAvailable above `reserve`, less what admission
-/// promised guests (none if that cannot be read). Read only when called, which a refresh does once it has claimed its
-/// epoch: a sample read before would be published after a newer refresh by a controller held up meanwhile.
+/// What the room checkpoint memory grows within shows left (`cow::Room::refresh`): MemAvailable above `reserve`, less
+/// what admission promised guests (none if that cannot be read).
 fn room_sample(reserve: u64, available: impl FnOnce() -> Option<u64>, promised: impl FnOnce() -> Option<u64>) -> impl FnOnce() -> Option<u64> {
     move || Some(available()?.saturating_sub(reserve).saturating_sub(promised().unwrap_or(u64::MAX)))
-}
-
-/// What a room refreshes to: `sample` once attached to the host's, else none (retried at the next refresh): memory
-/// taken from a room of its own could not be counted host-wide (#674).
-fn attached_sample(attached: bool, sample: impl FnOnce() -> Option<u64>) -> impl FnOnce() -> Option<u64> {
-    move || if attached { sample() } else { Some(0) }
 }
 
 /// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`;
@@ -2808,65 +2792,14 @@ fn call_checked(host: &Host, name: &str, req: Value, at: Option<Instant>, check:
 mod tests {
     use super::*;
 
-    /// A checkpoint asked for as the VM process starts (before its controller's first tick) takes no memory that is
-    /// not counted host-wide (#674): its room is closed until it attaches, which happens before the control socket
-    /// serves; with no slot to be had it stays at none, and attached it is the host's, refreshed.
+    /// What the controller shows left: MemAvailable above the reserve less what admission promised; unreadable
+    /// promises leave none, unreadable MemAvailable leaves it unknown (none, `cow::Room::refresh`).
     #[test]
-    fn a_checkpoint_right_after_start_takes_only_counted_memory() {
-        let dir = crate::test_util::TempDir::new("room-start");
-        let host = crate::hostmem::at(&dir).unwrap();
-        let room = crate::cow::Room::closed();
-        assert!(room.take(1).is_none(), "closed as it starts");
-        // No slot: not attached, and refreshed to none.
-        host.occupy_all();
-        assert!(!room.attach(host));
-        room.refresh(attached_sample(false, || Some(5000)));
-        assert!(room.take(1).is_none(), "none without a slot");
-        // A slot: the host's, refreshed from the sample; what it takes is counted there.
-        host.free(0);
-        assert!(room.attach(host));
-        host.stamp.store(0, Ordering::SeqCst);
-        room.refresh(attached_sample(true, || Some(100)));
-        let r = room.take(40).unwrap();
-        assert_eq!((room.get(), host.outstanding()), (60, 40));
-        drop(r);
-    }
-
-    /// The controller's room sample is read only once its refresh has claimed its epoch (#648): read before, a
-    /// controller held up while another refreshed would publish a stale, higher sample. Here the other refreshes
-    /// between the claim and the read: the sample is MemAvailable as read after, and the claimed refresh is dropped.
-    #[test]
-    fn the_room_is_sampled_after_its_refresh_claims_it() {
-        use std::sync::atomic::AtomicU64;
-        let dir = crate::test_util::TempDir::new("room-sample");
-        let host = crate::hostmem::at(&dir).unwrap();
-        let (a, b) = (crate::cow::Room::default(), crate::cow::Room::default());
-        a.attach(host);
-        b.attach(host);
-        let avail = AtomicU64::new(5000);
-        let reads = AtomicU64::new(0);
-        let read = || {
-            reads.fetch_add(1, Ordering::SeqCst);
-            Some(avail.load(Ordering::SeqCst))
-        };
-        let sample = room_sample(1000, read, || Some(500));
-        assert_eq!(reads.load(Ordering::SeqCst), 0, "not read until the refresh calls it");
-        host.stamp.store(0, Ordering::SeqCst);
-        a.refresh(sample);
-        assert_eq!((reads.load(Ordering::SeqCst), a.get()), (1, 3500));
-        // Claimed, and held up before its read while another refreshes with less available: dropped, not published.
-        host.stamp.store(0, Ordering::SeqCst);
-        a.refresh(|| {
-            host.stamp.store(0, Ordering::SeqCst);
-            avail.store(2000, Ordering::SeqCst);
-            b.refresh(room_sample(1000, read, || Some(500)));
-            room_sample(1000, || Some(9000), || Some(500))()
-        });
-        assert_eq!(b.get(), 500, "the newer sample stands");
-        // Unreadable promises: no room, not all of it.
-        host.stamp.store(0, Ordering::SeqCst);
-        a.refresh(room_sample(1000, read, || None));
-        assert_eq!(a.get(), 0);
+    fn the_room_sample_leaves_out_the_reserve_and_promises() {
+        assert_eq!(room_sample(1000, || Some(5000), || Some(500))(), Some(3500));
+        assert_eq!(room_sample(1000, || Some(500), || Some(0))(), Some(0));
+        assert_eq!(room_sample(1000, || Some(5000), || None)(), Some(0));
+        assert_eq!(room_sample(1000, || None, || Some(0))(), None);
     }
 
     #[test]
