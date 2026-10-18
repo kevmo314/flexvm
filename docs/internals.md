@@ -1187,6 +1187,20 @@ acknowledges the status, finds nothing new and returns. The patch has a
 unit test of the re-raise; there is no deterministic end-to-end case, as
 losing the interrupt on purpose would need a debug hook in Firecracker.
 
+`firecracker/0006-sparse-full-snapshot.patch`: a full snapshot of anonymous
+guest memory with no userfaultfd (the template's boot, the only full snapshot
+flexvm takes) seeks over the pages `/proc/self/pagemap` reports neither in RAM
+nor swapped out: never touched, or discarded by free page reporting
+(`MADV_DONTNEED`). Those read as zero, so the memory file keeps holes there and
+is truncated first, so a file left from before reads as zero too. Stock
+Firecracker writes every plugged byte: for an ubuntu:24.04 template, ~6 GB, of
+which 5.7 GB are zeroes that `sparsify` then punched out again (10-34 s of
+snapshot plus 2.5-3 s of punching; with the patch 0.2-1.1 s plus ~30 ms, for
+the same bytes: #764). `mincore(2)` would not do: it reports a swapped-out page
+as absent. Memory mapped from a file (a restore without UFFD), served by a
+userfaultfd handler, or a memfd can hold data where this process maps nothing,
+so those, and a Firecracker without `/proc`, still write every page.
+
 ### Kernel patches (optional, host kernel)
 
 `kernel/` carries two patches against Linux v6.18 for the host kernel, applied
