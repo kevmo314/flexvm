@@ -11,7 +11,7 @@
 //! the next checkpoint copies them again. That one compares them with what this one saved: pages that did not change are left out of an incremental
 //! checkpoint (their contents at the pause are byte for byte what the last checkpoint has), and protected again where a
 //! whole block of them did not (`HOT_BLOCK`). The copies are kept for that comparison only once their checkpoint is
-//! the delta base (`commit_copy`); any other end drops them, and the next checkpoint leaves none out. A VM taking
+//! the delta base (`commit_copy`); a failed read keeps the previous copies for rollback if that base is unchanged. A VM taking
 //! keep-running checkpoints holds up to twice `HOT_MIB` for this: the last checkpoint's copies and the memory for the
 //! next one's.
 
@@ -74,6 +74,9 @@ impl Held {
     }
 }
 
+/// A delta base's generation and its hot snapshot, taken together under `hot_prev`.
+pub(super) type Previous = (u64, Option<Arc<Held>>);
+
 /// A failed copy still owns both allocations so the pager can recycle them.
 struct CopyError {
     error: io::Error,
@@ -124,10 +127,10 @@ impl Pager {
 
     /// For the freeze of a keep-running checkpoint, the VM paused and its state saved (saving device state writes
     /// guest memory): copies its hot pages into what `prepare_hot` allocated, comparing them with the last checkpoint's
-    /// if that is the delta base. None if there is nothing to copy them into, or the copy failed: the freeze protects
-    /// every dirty page then. Not under the fault lock: a read that faulted would wait for a fault handler.
-    pub(super) fn copy_hot(&self) -> Option<Hot> {
-        let buf = self.hot_spare.lock().unwrap().take()?;
+    /// if that is the delta base. A failed read returns the previous snapshot for rollback; the freeze protects every
+    /// dirty page then. Not under the fault lock: a read that faulted would wait for a fault handler.
+    pub(super) fn copy_hot(&self) -> Result<Option<Hot>, Previous> {
+        let Some(buf) = self.hot_spare.lock().unwrap().take() else { return Ok(None) };
         // Written in two intervals in a row: one written once (a file being written, say) is better left to the writers.
         let before = self.hot_dirty.lock().unwrap().clone();
         // This is only a candidate scan: it clears no dirty bits. Freeze later takes the authoritative snapshot
@@ -135,19 +138,21 @@ impl Pager {
         let pages = self.pages();
         let spans: Vec<(usize, usize)> = self.mappings().iter().map(|m| m.span()).collect();
         let eligible = |p: usize| pages.get(p) == PRESENT && spans.iter().any(|&(a, b)| (a..b).contains(&p));
-        // Taken: unless this checkpoint is taken, the next one has nothing to compare with.
-        let prev = self.hot_prev.lock().unwrap().take();
+        // Pair the snapshot with its delta base's generation, for rollback after a read failure.
+        let (generation, prev) = {
+            let mut prev = self.hot_prev.lock().unwrap();
+            (prev.0, prev.1.take())
+        };
         let hot_before = |p: usize| before.bits.get(p / 64).is_some_and(|w| w >> (p % 64) & 1 != 0);
         let candidate = |p: usize| pages.is_dirty(p) && hot_before(p) && eligible(p);
         let hot = select_hot(pages.hot_pages(&before.bits), prev.as_ref().map_or(&[], |h| h.pages()), candidate, buf.pages());
         let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
         match copy(buf, prev, hot, |p| next_to(self.mappings(), p), read) {
-            Ok(hot) => Some(hot),
+            Ok(hot) => Ok(Some(hot)),
             Err(CopyError { error, buf, prev }) => {
                 crate::log!("uffd: hot pages not copied, protecting them: {error}");
                 self.recycle_buf(buf);
-                self.recycle(prev);
-                None
+                Err((generation, prev))
             }
         }
     }
@@ -170,7 +175,11 @@ impl Pager {
     pub fn release_kept(&self) {
         let slots = self.slot_spare.lock().unwrap().take();
         let hot = self.hot_spare.lock().unwrap().take();
-        let prev = self.hot_prev.lock().unwrap().take();
+        let prev = {
+            let mut prev = self.hot_prev.lock().unwrap();
+            prev.0 = prev.0.checked_add(1).unwrap();
+            prev.1.take()
+        };
         if slots.as_ref().is_some_and(|s| s.mapped_bytes() > 0) || hot.is_some() || prev.is_some() {
             crate::log!("uffd: the host is short of memory: memory kept for the next checkpoint released");
         }
