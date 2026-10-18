@@ -145,7 +145,11 @@ fn tail_files(files: &[(&std::fs::File, u64)], n: usize) -> Result<Vec<u8>> {
             }
             let start = end.saturating_sub(64 << 10);
             let mut b = vec![0; (end - start) as usize];
-            std::os::unix::fs::FileExt::read_exact_at(f, &mut b, start)?;
+            match std::os::unix::fs::FileExt::read_exact_at(f, &mut b, start) {
+                // Truncated meanwhile: what was read is all of it (following rewinds it).
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break 'files,
+                r => r?,
+            }
             last = last.or(b.last().copied());
             breaks += b.iter().filter(|&&c| c == b'\n').count();
             blocks.push(b);
@@ -766,6 +770,8 @@ mod tests {
         std::fs::write(root.join("c"), b"a\nb\nc\n").unwrap();
         let f = std::fs::File::open(root.join("c")).unwrap();
         assert_eq!(tail_files(&[(&f, 3)], 5).unwrap(), b"a\nb");
+        // Shorter than it was: no error.
+        assert_eq!(tail_files(&[(&f, 1 << 20)], 5).unwrap(), b"");
     }
 
     #[test]

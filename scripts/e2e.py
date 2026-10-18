@@ -613,6 +613,11 @@ def app_lifecycle():
     # --rm: no record once it exits.
     run_d("e2e-app-rm", "--rm", *entry("exit 0"))
     check("--rm: gone once its app exits", wait_for(lambda: "e2e-app-rm" not in A.ps(), 30), A.ps().get("e2e-app-rm"))
+    # -d -i: no client to wait for, so it exits as soon as its app does.
+    began = time.monotonic()
+    run_d("e2e-app-di", "-i", *entry("exit 2"))
+    check("-d -i: exited at once", wait_for(lambda: exited("e2e-app-di"), 30) and time.monotonic() - began < 8, (time.monotonic() - began, A.ps().get("e2e-app-di")))
+    A.rm("e2e-app-di")
 
     # --keep: up once its app exited, to exec into.
     run_d("e2e-app-keep", "--keep", *entry("echo kept; exit 4"))
