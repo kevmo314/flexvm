@@ -8428,7 +8428,10 @@ def suspend_overlap():
         fault(A, "ckpt_fail_write", 0)
     check("suspend overlap: suspends failed meanwhile", "injected fault: writing the checkpoint failed" in log(A, n), log(A, n)[-500:])
     check("suspend overlap: overlapping SIGTERMs were taken into one suspend", "already under way" in log(A, n), log(A, n)[-500:])
-    check("suspend overlap: not suspended, not listed", n not in vms(A) and not os.path.exists(os.path.join(A.state, "suspended", n)), vms(A).get(n))
+    # A background VM whose command exited is an exited record (#711), never a suspended one.
+    check("suspend overlap: not suspended, exited with its command's status", vms(A).get(n, {}).get("state") == "exited" and vms(A)[n].get("status") == 5
+          and not os.path.exists(os.path.join(A.state, "suspended", n)), vms(A).get(n))
+    cli(A, "rm", n)
     a = addr(A, ip)
     check("suspend overlap: its address withdrawn, no holder", a.get("withdrawn") and not a.get("holder"), a)
 
