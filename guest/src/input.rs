@@ -7,9 +7,9 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -172,6 +172,29 @@ pub(crate) fn openpty(size: Option<(u16, u16)>) -> io::Result<(File, File)> {
     let (rows, cols) = size.unwrap_or((24, 80));
     set_size(&master, rows, cols);
     Ok((master, slave))
+}
+
+/// The child's stdio: the pty's slave (`controlling_terminal`), else pipes, its stdin one if `stdin` (else none).
+pub(crate) fn stdio(cmd: &mut Command, slave: Option<&File>, stdin: bool) -> io::Result<()> {
+    match slave {
+        Some(slave) => controlling_terminal(cmd, slave),
+        None => {
+            cmd.stdin(if stdin { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+            Ok(())
+        }
+    }
+}
+
+/// Output pipes (or a pty's master), by frame kind.
+pub(crate) type Streams = Vec<(File, u8)>;
+
+/// What a child spawned with `stdio` gives: its output streams, by frame kind, and its stdin, from the pty's
+/// `master` or its pipes.
+pub(crate) fn streams(child: &mut Child, master: Option<File>) -> io::Result<(Streams, Option<Stdin>)> {
+    Ok(match master {
+        Some(m) => (vec![(m.try_clone()?, crate::FRAME_STDOUT)], Some(Stdin::new(m.try_clone()?, Some(m))?)),
+        None => (crate::outputs(child), child.stdin.take().map(|s| Stdin::new(File::from(OwnedFd::from(s)), None)).transpose()?),
+    })
 }
 
 /// The child's stdio is the pty's slave: it starts a session of its own, with the pty as its terminal.

@@ -42,13 +42,15 @@ fn config() -> io::Result<&'static Conf> {
 
 pub const VERBS: [&str; 8] = ["APP", "APPSTATUS", "LOGS", "APPIN", "PROBE", "CHECK", "QUIESCE", "SIGNAL"];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 enum State {
+    #[default]
     Idle,
     Running(i32),
     Exited(i32),
 }
 
+#[derive(Default)]
 struct App {
     state: State,
     /// The running app's reaper token: a signal reaches it only while it is unreaped (`kill_running`).
@@ -65,12 +67,6 @@ struct App {
 
 static APP: LazyLock<Mutex<App>> = LazyLock::new(|| Mutex::new(App::default()));
 static CHANGED: Condvar = Condvar::new();
-
-impl Default for App {
-    fn default() -> App {
-        App { state: State::Idle, token: 0, output: Output::default(), stdin: None, tty: false, appin: None, appins: 0 }
-    }
-}
 
 impl App {
     fn push(&mut self, kind: u8, data: &[u8]) {
@@ -91,7 +87,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
     // Bounds writes, so a host that stops reading cannot park this thread;
     // `LOGS` may legitimately wait on a slow reader, holding no lock while writing.
     if verb != "LOGS" {
-        crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Duration::from_secs(5));
+        crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Some(Duration::from_secs(5)));
     }
     let reply = match verb {
         // `applied`: the run's settings were (an older agent ignored them).
@@ -224,7 +220,7 @@ static RUN: Mutex<Option<Conf>> = Mutex::new(None);
 
 /// An exec's command: argv with no shell, run as the app is (its environment, directory and
 /// credentials, without its own session), with `-u`, `-w` and `-e` overriding those for it alone. Its
-/// credentials are `exec_credentials`', applied once the caller has done what needs root (its cgroup).
+/// credentials are `credentials`' (without a session of its own), applied once the caller has done what needs root (its cgroup).
 pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)> {
     let base = RUN.lock().unwrap().clone();
     let base = match base {
@@ -236,14 +232,10 @@ pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)
     Ok((command(&c, &e.argv), c))
 }
 
-pub(crate) fn exec_credentials(cmd: &mut Command, c: &Conf) {
-    credentials(cmd, c, false);
-}
-
 /// `APPIN`: feeds the app's stdin until the connection closes, a newer one takes over or the app exits.
 /// `pending`: input that came with the request.
 pub(crate) fn appin(arg: &str, out: &File, pending: &[u8]) -> io::Result<()> {
-    crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Duration::from_secs(5));
+    crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Some(Duration::from_secs(5)));
     let stream = arg.trim().parse::<u64>().map_err(|_| io::Error::other(format!("bad stream {arg:?}")))?;
     let (stdin, me) = {
         let mut app = APP.lock().unwrap();
@@ -258,7 +250,7 @@ pub(crate) fn appin(arg: &str, out: &File, pending: &[u8]) -> io::Result<()> {
         (stdin, me)
     };
     msg(out, format!("ok {} {}", stdin.taken(stream), u8::from(stdin.tty())))?;
-    crate::untimed_reads(out);
+    crate::sock_timeout(out.as_raw_fd(), libc::SO_RCVTIMEO, None);
     let current = || {
         let app = APP.lock().unwrap();
         app.appin.as_ref().is_some_and(|(id, _)| *id == me) && matches!(app.state, State::Running(_))
@@ -327,7 +319,7 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         Some(g) => mem::enter(&mut cmd, g.procs.clone(), true),
         None => mem::work_procs().into_iter().for_each(|work| mem::enter(&mut cmd, work, false)),
     }
-    restrict(&mut cmd, c);
+    credentials(&mut cmd, c, true);
     let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
     let pid = child.id() as i32;
     let code = wait_exit(statuses, token, Some(Instant::now() + Duration::from_millis(ms)));
@@ -454,13 +446,9 @@ impl Drop for CheckGroup {
     }
 }
 
-/// Own session, the app's credentials and, if non-root, no capabilities and no_new_privs; done by
-/// hand because CommandExt::uid would clear the supplementary groups.
-fn restrict(cmd: &mut Command, c: &Conf) {
-    credentials(cmd, c, true);
-}
-
-fn credentials(cmd: &mut Command, c: &Conf, own_session: bool) {
+/// A session of its own if `own_session`, the app's credentials and, if non-root, no capabilities and
+/// no_new_privs; done by hand because CommandExt::uid would clear the supplementary groups.
+pub(crate) fn credentials(cmd: &mut Command, c: &Conf, own_session: bool) {
     let (uid, gid, groups) = (c.uid, c.gid, c.groups.clone());
     unsafe {
         cmd.pre_exec(move || {
@@ -499,11 +487,7 @@ fn start(settings: &str, statuses: &Statuses) -> io::Result<i32> {
     }
     let pty = c.tty.then(|| crate::input::openpty(None)).transpose()?;
     let mut cmd = command(c, &c.argv);
-    if let Some((_, slave)) = &pty {
-        crate::input::controlling_terminal(&mut cmd, slave)?;
-    } else if c.stdin {
-        cmd.stdin(Stdio::piped());
-    }
+    crate::input::stdio(&mut cmd, pty.as_ref().map(|(_, slave)| slave), c.stdin)?;
     if let Some(work) = mem::work_procs() {
         mem::enter(&mut cmd, work, true);
     }
@@ -521,22 +505,13 @@ fn start(settings: &str, statuses: &Statuses) -> io::Result<i32> {
 
 /// Its supervisor (returned) logs output as an exec session's: until its exit and `DRAIN` more, then
 /// discarded, so descendants that hold the pipes never write into the log once it is marked exited.
-/// `pty`: its master, the slave the command's stdio already (else its output is piped here, and its stdin is
-/// what the caller made it).
+/// Its stdio is `input::stdio`'s; `pty`, its master.
 fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses, pty: Option<File>) -> io::Result<(i32, thread::JoinHandle<()>)> {
-    if pty.is_none() {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    }
+    let tty = pty.is_some();
     let (mut child, exited, token) = spawn_watched(cmd, statuses, true)?;
     let pid = child.id() as i32;
     let Some(exited) = exited else { return Err(unwatched(statuses, pid, token, io::Error::other("cannot open a pidfd to watch it"))) };
-    let mut inputs = |master: &Option<File>| -> io::Result<_> {
-        Ok(match master {
-            Some(m) => (vec![(m.try_clone()?, FRAME_STDOUT)], Some(Stdin::new(m.try_clone()?, Some(m.try_clone()?))?)),
-            None => (crate::outputs(&mut child), child.stdin.take().map(|s| Stdin::new(File::from(std::os::fd::OwnedFd::from(s)), None)).transpose()?),
-        })
-    };
-    let (streams, stdin) = inputs(&pty).map_err(|e| unwatched(statuses, pid, token, e))?;
+    let (streams, stdin) = crate::input::streams(&mut child, pty).map_err(|e| unwatched(statuses, pid, token, e))?;
     let watched = statuses.clone();
     let supervisor = thread::Builder::new()
         .spawn(move || {
@@ -553,7 +528,7 @@ fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses, pty: Option<Fil
             app.push(FRAME_NOTE, format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
         })
         .map_err(|e| unwatched(statuses, pid, token, e))?;
-    (app.state, app.token, app.tty, app.stdin) = (State::Running(pid), token, pty.is_some(), stdin.map(Arc::new));
+    (app.state, app.token, app.tty, app.stdin) = (State::Running(pid), token, tty, stdin.map(Arc::new));
     Ok((pid, supervisor))
 }
 
@@ -572,7 +547,7 @@ fn signal_app(app: &App, arg: &str, statuses: &Statuses) -> io::Result<String> {
 }
 
 /// Without a pidfd or supervisor thread the app cannot be watched: its session is killed and reaped.
-fn unwatched(statuses: &Statuses, pid: i32, token: u64, error: io::Error) -> io::Error {
+pub(crate) fn unwatched(statuses: &Statuses, pid: i32, token: u64, error: io::Error) -> io::Error {
     // By group even if the leader exited at once and was reaped: no new process gets the group's id while
     // a member lives, and once none does the pid comes back only after the pid space wraps, not since the spawn.
     unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -813,6 +788,7 @@ mod tests {
         for _ in 0..3 {
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", "echo early; (sleep 3; echo late) & exit 0"]);
+            crate::input::stdio(&mut cmd, None, false).unwrap();
             let begun = Instant::now();
             let (_, supervisor) = launch(&mut APP.lock().unwrap(), &mut cmd, &statuses, None).unwrap();
             supervisor.join().unwrap();

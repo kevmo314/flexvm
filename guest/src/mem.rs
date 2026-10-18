@@ -275,7 +275,7 @@ fn ask() -> Reply {
     let reply = (|| -> io::Result<String> {
         let mut s = File::from(crate::vsock_socket()?);
         let addr = crate::vsock_addr(libc::VMADDR_CID_HOST, crate::proto::MEM_PORT);
-        crate::sock_timeout(s.as_raw_fd(), libc::SO_RCVTIMEO, Duration::from_secs(2));
+        crate::sock_timeout(s.as_raw_fd(), libc::SO_RCVTIMEO, Some(Duration::from_secs(2)));
         os(unsafe { libc::connect(s.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) })?;
         s.write_all(format!("MEM {avail} {total}\n").as_bytes())?;
         let mut buf = [0u8; 64];

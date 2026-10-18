@@ -1,4 +1,4 @@
-//! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ARGV <id> <len>` (JSON argv and options), `ATTACH <id> <offset>`,
+//! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ARGV <id> <len>` (its argv and options, NUL-separated fields), `ATTACH <id> <offset>`,
 //! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
 //! After an exit, the client may send SESSION_DONE on the attachment, within `ACK_WAIT`, to release the
 //! session; without that acknowledgement the exit stays available for reattachment.
@@ -23,7 +23,7 @@ use std::hash::{BuildHasher, BuildHasherDefault};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -615,19 +615,17 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                     }
                 })
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
-            match &pty {
-                // Its own session, the pty its terminal; its process group is its pid all the same.
-                Some((_, slave)) => crate::input::controlling_terminal(&mut cmd, slave)?,
-                None => {
-                    cmd.stdin(if stdin { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
-                }
+            // A pty's is its own session; its process group is its pid all the same.
+            crate::input::stdio(&mut cmd, pty.as_ref().map(|(_, slave)| slave), stdin)?;
+            if pty.is_none() {
+                cmd.process_group(0);
             }
             if let Some(work) = crate::mem::work_procs() {
                 crate::mem::enter(&mut cmd, work, false);
             }
             // After entering the cgroup, which needs root.
             if let Some(c) = &exec {
-                crate::app::exec_credentials(&mut cmd, c);
+                crate::app::credentials(&mut cmd, c, false);
             }
             // argv commands also work in images without a shell.
             let (mut child, exited, token) = spawn_watched(&mut cmd, statuses, true).map_err(|e| {
@@ -644,12 +642,12 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             })?;
             // The slave's copies go with the command: the pty's master reads EOF (EIO) once its last user is gone.
             drop(cmd);
-            let (streams, input) = match pty {
-                Some((master, _)) => (vec![(master.try_clone()?, FRAME_STDOUT)], Some(Stdin::new(master.try_clone()?, Some(master))?)),
-                None => (crate::outputs(&mut child), child.stdin.take().map(|s| Stdin::new(File::from(OwnedFd::from(s)), None)).transpose()?),
-            };
+            // Failing from here on, the command is killed: left running, it would be no session's.
+            let pid = child.id() as i32;
+            let (streams, input) =
+                crate::input::streams(&mut child, pty.map(|(master, _)| master)).map_err(|e| crate::app::unwatched(statuses, pid, token, e))?;
             output.0.lock().unwrap().input = input.map(Arc::new);
-            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
+            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: pid, token });
             // Attached before any output, so none is overwritten before it is sent.
             let attached = attach(&output, 0, conn);
             let _ = tx.send((streams, exited, token));
@@ -700,7 +698,7 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
 /// leaves the command running as a detached exec's (its output dropped, never reclaimed while it runs).
 fn take_input(conn: &mut io::Chain<&[u8], File>, output: &Session, input: &Stdin, me: u64) {
     // Its request's read timeout no longer applies: input comes when the user types.
-    crate::untimed_reads(conn.get_ref().1);
+    crate::sock_timeout(conn.get_ref().1.as_raw_fd(), libc::SO_RCVTIMEO, None);
     let current = || {
         let ring = output.0.lock().unwrap();
         !ring.closed && ring.attached.as_ref().is_some_and(|a| a.id == me)

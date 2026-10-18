@@ -7,7 +7,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 const BLOCK: usize = 512;
@@ -159,7 +159,8 @@ pub fn create(src: &str, out: &mut dyn Write) -> io::Result<()> {
     if name == "." && node.kind() != libc::S_IFDIR {
         return Err(with(src, io::Error::from_raw_os_error(libc::ENOTDIR)));
     }
-    walk(out, node, Path::new(path), name.into_bytes())?;
+    let dev = node.st.st_dev;
+    walk(out, node, Path::new(path), name.into_bytes(), dev)?;
     out.write_all(&[0; BLOCK * 2])?;
     out.flush()
 }
@@ -237,35 +238,15 @@ impl Node {
 
 /// The names in the directory open at `d`, sorted, without `.` and `..`.
 fn names(d: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
-    // Its own descriptor (closedir closes it), reading from the start.
-    let dup = os(unsafe { libc::openat(d.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })?;
-    let dir = unsafe { libc::fdopendir(dup) };
-    if dir.is_null() {
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(dup) };
-        return Err(e);
-    }
-    let mut v = Vec::new();
-    let res = loop {
-        // Only errno tells the end from an error.
-        unsafe { *libc::__errno_location() = 0 };
-        let ent = unsafe { libc::readdir(dir) };
-        if ent.is_null() {
-            let e = io::Error::last_os_error();
-            break if e.raw_os_error() == Some(0) { Ok(()) } else { Err(e) };
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            v.push(name.to_vec());
-        }
-    };
-    unsafe { libc::closedir(dir) };
-    res?;
+    // Through its /proc magic link: that very directory, read from the start on a descriptor of its own.
+    let mut v = std::fs::read_dir(format!("/proc/self/fd/{}", d.as_raw_fd()))?.map(|e| Ok(e?.file_name().into_vec())).collect::<io::Result<Vec<_>>>()?;
     v.sort();
     Ok(v)
 }
 
-fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>) -> io::Result<()> {
+/// `dev`: the device the copy started on. A directory on another (/proc, /sys, /dev under `cp vm:/`) is
+/// archived as an empty one, as `tar --one-file-system` does.
+fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>, dev: libc::dev_t) -> io::Result<()> {
     let header = |st: &libc::stat, path: Vec<u8>| Header {
         path,
         mode: st.st_mode,
@@ -280,7 +261,7 @@ fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>) -> io::Resu
             let (d, st) = node.read().map_err(|e| with(path.display(), e))?;
             // One descriptor per level of the walk: the directory's, which its entries are opened from.
             drop(node);
-            let entries = names(&d).map_err(|e| with(path.display(), e))?;
+            let entries = if st.st_dev == dev { names(&d).map_err(|e| with(path.display(), e))? } else { Vec::new() };
             let h = header(&st, name);
             let mut dir = h.clone();
             (dir.kind, dir.path) = (b'5', [&h.path[..], b"/"].concat());
@@ -293,7 +274,7 @@ fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>) -> io::Resu
                     Err(err) if err.raw_os_error() == Some(libc::ENOENT) => continue,
                     r => r.map_err(|err| with(p.display(), err))?,
                 };
-                walk(out, child, &p, [&h.path[..], b"/", &e].concat())?;
+                walk(out, child, &p, [&h.path[..], b"/", &e].concat(), dev)?;
             }
             Ok(())
         }
@@ -398,17 +379,9 @@ impl Reader<'_> {
         // What an entry's extended headers hold, in all: each one is `MAX_RECORD` at most, and so are they all.
         let mut extended = 0;
         loop {
-            let mut b = [0u8; BLOCK];
-            let mut got = 0;
-            while got < BLOCK {
-                match self.r.read(&mut b[got..]) {
-                    Ok(0) => break,
-                    Ok(n) => got += n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            match got {
+            let mut b = Vec::with_capacity(BLOCK);
+            (&mut *self.r).take(BLOCK as u64).read_to_end(&mut b)?;
+            match b.len() {
                 // Without its end-of-archive block: cut short (its maker failed), never taken as complete.
                 0 => return Err(invalid("the archive was cut short")),
                 BLOCK => {}

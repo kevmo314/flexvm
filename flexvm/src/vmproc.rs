@@ -1872,7 +1872,12 @@ impl Proc {
             let res = {
                 let _op = p.op();
                 match vm.state() {
-                    State::Running => vm.sync_clock(Instant::now() + CLOCK_DEADLINE).map(Some),
+                    State::Running => {
+                        let off = vm.sync_clock(Instant::now() + CLOCK_DEADLINE).map(Some);
+                        // A rename while it was paused reaches the guest now.
+                        vm.set_hostname(&p.name());
+                        off
+                    }
                     _ => Ok(None),
                 }
             };

@@ -37,33 +37,41 @@ pub fn is_tty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
-/// Stdin's terminal in raw mode until dropped (or `restore_terminal`): keys, Ctrl-C too, go to the guest.
-pub struct Raw(());
+/// Stdin's terminal as `change` made it until dropped (or `restore_terminal`, which a panic's hook calls too).
+pub struct Term(());
 
-pub fn raw() -> Result<Raw> {
+pub fn term(change: impl FnOnce(&mut libc::termios)) -> Result<Term> {
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(0, &mut t) } != 0 {
         return Err(format!("the terminal: {}", std::io::Error::last_os_error()).into());
     }
-    *SAVED.lock().unwrap() = Some(t);
-    let mut r = t;
-    unsafe { libc::cfmakeraw(&mut r) };
-    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &r) } != 0 {
-        SAVED.lock().unwrap().take();
+    // Held until changed: a signal's `restore_terminal` meanwhile waits, then puts it back.
+    let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+    *saved = Some(t);
+    change(&mut t);
+    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) } != 0 {
+        saved.take();
         return Err(format!("the terminal: {}", std::io::Error::last_os_error()).into());
     }
-    Ok(Raw(()))
+    Ok(Term(()))
 }
 
-impl Drop for Raw {
+/// Raw mode: keys, Ctrl-C too, go to the guest.
+pub fn raw() -> Result<Term> {
+    term(|t| unsafe { libc::cfmakeraw(t) })
+}
+
+impl Drop for Term {
     fn drop(&mut self) {
         restore_terminal();
     }
 }
 
-/// Puts the terminal back as it was before `raw`, however the process ends (a panic's hook calls it too).
+/// Puts the terminal back as it was before `term`, however the process ends (a panic's hook calls it too).
 pub fn restore_terminal() {
-    if let Some(t) = SAVED.try_lock().ok().and_then(|mut s| s.take()) {
+    // Waits for a `term` under way (never long: nothing in it panics), so what it changes is put back too.
+    let saved = SAVED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(t) = saved {
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
     }
 }
@@ -336,12 +344,12 @@ pub fn detach_later() {
 struct Pinned {
     host: Host,
     name: String,
-    pin: Arc<Mutex<crate::Pin>>,
+    pin: Arc<Mutex<Shared>>,
 }
 
 impl Pinned {
     fn name(&self) -> String {
-        self.pin.lock().unwrap().name(&self.host, &self.name)
+        self.pin.lock().unwrap().pin.name(&self.host, &self.name)
     }
 
     fn alive(&self) -> bool {
@@ -350,11 +358,34 @@ impl Pinned {
 
     fn connect(&self, req: &Value) -> Result<UnixStream> {
         let name = self.name();
-        let mut pin = self.pin.lock().unwrap().clone();
-        let c = crate::connect_same(&self.host, &name, req, Instant::now() + Duration::from_secs(5), &mut pin);
-        *self.pin.lock().unwrap() = pin;
-        c
+        repin(&self.pin, |pin| crate::connect_same(&self.host, &name, req, Instant::now() + Duration::from_secs(5), pin))
     }
+}
+
+/// The pin the stdin, signal and output threads share, and which of their connects set it.
+#[derive(Default)]
+struct Shared {
+    pin: crate::Pin,
+    /// Connects begun, and the number of the latest begun of those whose pin is kept.
+    begun: u64,
+    kept: u64,
+}
+
+/// `connect` on a copy of the pin (not held locked through it), kept only if it succeeded and no connect
+/// begun after it was kept already: one that failed, or reached the process before a resume made another,
+/// would otherwise put back the process a newer connect replaced.
+fn repin<T>(shared: &Mutex<Shared>, connect: impl FnOnce(&mut crate::Pin) -> Result<T>) -> Result<T> {
+    let (mut pin, me) = {
+        let mut s = shared.lock().unwrap();
+        s.begun += 1;
+        (s.pin.clone(), s.begun)
+    };
+    let c = connect(&mut pin)?;
+    let mut s = shared.lock().unwrap();
+    if me > s.kept {
+        (s.pin, s.kept) = (pin, me);
+    }
+    Ok(c)
 }
 
 fn replaced(e: &util::Error) -> bool {
@@ -374,7 +405,7 @@ fn open(vm: &Pinned, req: &Value) -> Result<BufReader<UnixStream>> {
 fn gone(vm: &Pinned) -> Result<i32> {
     let (host, name) = (&vm.host, &vm.name());
     // The process last reached: only its own end is told (one made again under the name since may have ended too).
-    let process = vm.pin.lock().unwrap().process.clone();
+    let process = vm.pin.lock().unwrap().pin.process.clone();
     let last = crate::containers::exit_record(host, name).map(|e| e.ident);
     if process.is_some() && last.is_some() && last != process {
         bail!("vm {name} was killed and made again since this attached; the vm it attached to is gone");
@@ -637,6 +668,56 @@ mod tests {
         (u64::from_le_bytes(f.1[..8].try_into().unwrap()), f.1[8..].to_vec())
     }
 
+    /// A stdin connect begun before a resume ends after the output thread pinned the new process: that pin stays.
+    #[test]
+    fn a_stale_failed_connect_never_undoes_a_fresh_pin() {
+        fn process(pid: u32) -> crate::host::Ident {
+            crate::host::Ident { pid, start: 1, boot: "boot".into() }
+        }
+        // Stale ones failing, and succeeding (they reached the process before the resume).
+        for fails in [true, false] {
+            let shared = Arc::new(Mutex::new(Shared::default()));
+            let (began, began_rx) = std::sync::mpsc::channel();
+            let (go, go_rx) = std::sync::mpsc::channel::<()>();
+            let stale = std::thread::spawn({
+                let shared = shared.clone();
+                move || {
+                    repin(&shared, |pin| {
+                        began.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                        pin.process = Some(process(1));
+                        if fails {
+                            return Err("connection refused".into());
+                        }
+                        Ok(())
+                    })
+                }
+            });
+            began_rx.recv().unwrap();
+            let fresh = std::thread::spawn({
+                let shared = shared.clone();
+                move || {
+                    repin(&shared, |pin| {
+                        pin.process = Some(process(2));
+                        Ok(())
+                    })
+                }
+            });
+            assert!(fresh.join().unwrap().is_ok());
+            go.send(()).unwrap();
+            assert_eq!(stale.join().unwrap().is_err(), fails);
+            assert_eq!(shared.lock().unwrap().pin.process, Some(process(2)), "stale one failing: {fails}");
+        }
+        // Alone, a connect's pin is kept.
+        let shared = Mutex::new(Shared::default());
+        repin(&shared, |pin| {
+            pin.process = Some(process(3));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(shared.lock().unwrap().pin.process, Some(process(3)));
+    }
+
     #[test]
     fn unacknowledged_stdin_is_sent_again_on_the_next_connection() {
         let feed = Feed::start(Some(Box::new(&b"hello world"[..])), false, false, || ()).unwrap();
@@ -718,7 +799,7 @@ mod tests {
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let ours = crate::host::Ident { pid: 999_999_901, start: 1, boot: crate::host::boot_id().into() };
         let vm = Pinned { host: host.clone(), name: "web".into(), pin: Arc::default() };
-        vm.pin.lock().unwrap().process = Some(ours.clone());
+        vm.pin.lock().unwrap().pin.process = Some(ours.clone());
         let rec = crate::app::Exited::new(0, "t".into(), None, Default::default(), Default::default(), 0);
         crate::host::write_record(&host.vms("web", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
         // Killed, then another VM made under the name exited: its records are not this attach's VM's.
