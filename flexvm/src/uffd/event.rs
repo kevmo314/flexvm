@@ -266,17 +266,22 @@ impl Pager {
         Some((((addr - m.base_host_virt_addr + m.offset) as usize) / PAGE_SIZE, m))
     }
 
+    /// Applies a REMOVE of `[start, end)`, a mapping at a time.
     fn discard(&self, removing: &RwLockWriteGuard<'_, ()>, start: u64, end: u64) -> usize {
         self.discards.fetch_add(1, Ordering::SeqCst);
         let cow = self.cow();
-        let mut resolved = 0;
-        for a in (start & !(PAGE_SIZE as u64 - 1)..end).step_by(PAGE_SIZE) {
-            if let Some((p, _)) = self.page_of(a) {
-                if let Some(cow) = cow.as_ref().filter(|c| matches!(c.state(p), PENDING | READING | RESCUING)) {
-                    cow.invalidate(&format!("page {p} was discarded before it was saved"));
-                }
-                resolved += self.pages().discard(removing, p) as usize;
+        let (mut a, mut resolved) = (start & !(PAGE_SIZE as u64 - 1), 0);
+        while a < end {
+            let Some((first, m)) = self.page_of(a) else {
+                a += PAGE_SIZE as u64;
+                continue;
+            };
+            let n = ((end.min(m.base_host_virt_addr + m.size as u64) - a) as usize).div_ceil(PAGE_SIZE);
+            if let Some((cow, p)) = cow.as_ref().and_then(|c| Some((c, (first..first + n).find(|&p| matches!(c.state(p), PENDING | READING | RESCUING))?))) {
+                cow.invalidate(&format!("page {p} was discarded before it was saved"));
             }
+            resolved += self.pages().discard(removing, first, first + n);
+            a += (n * PAGE_SIZE) as u64;
         }
         resolved
     }

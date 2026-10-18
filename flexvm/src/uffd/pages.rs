@@ -340,16 +340,25 @@ impl Pages {
         n
     }
 
-    /// Applies a REMOVE of `page`. Returns whether it resolved a REMOTE page.
-    pub fn discard(&self, _removing: &RwLockWriteGuard<'_, ()>, page: usize) -> bool {
-        self.touch(page);
+    /// Applies a REMOVE of pages `[first, end)`, a dirty word at a time (its chunk touched first, as `mark_dirty`).
+    /// Returns how many REMOTE pages it resolved.
+    pub fn discard(&self, _removing: &RwLockWriteGuard<'_, ()>, mut first: usize, end: usize) -> usize {
+        let (end, mut resolved) = (end.min(self.len()), 0);
         let claimed = |s| s == INFLIGHT || s == DISCARDED;
-        let old = self.states[page].fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| Some(if claimed(s) { DISCARDED } else { ZERO }));
-        self.mark_dirty(page);
-        if !claimed(old.unwrap()) {
-            self.forget_failure(page);
+        while first < end {
+            let word = end.min((first / 64 + 1) * 64);
+            self.touch(first);
+            for page in first..word {
+                let old = self.states[page].fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| Some(if claimed(s) { DISCARDED } else { ZERO }));
+                if !claimed(old.unwrap()) {
+                    self.forget_failure(page);
+                }
+                resolved += (old == Ok(REMOTE)) as usize;
+            }
+            self.dirty[first / 64].fetch_or((u64::MAX >> (64 - (word - first))) << (first % 64), Ordering::SeqCst);
+            first = word;
         }
-        old == Ok(REMOTE)
+        resolved
     }
 
     /// Claimed REMOTE `page` failed to install: notes since when, unless it already kept failing. Only while it is
@@ -412,14 +421,14 @@ impl Pages {
 
     /// Installs claimed pages `[first, first + n)` with `populate(page, count)`, which returns how many pages from
     /// `page` it populated (UFFDIO_COPY may stop part way) and wakes their waiters. Pages discarded before their copy
-    /// are skipped; EEXIST counts as populated. EAGAIN is retried until `stop` is set, or without `stop` ends the
+    /// are skipped; EEXIST counts as populated. EAGAIN is retried until `stop` says to, or without `stop` ends the
     /// install. Unfinished pages are given back. Returns the REMOTE pages resolved and the error, if any.
     pub fn install(
         &self,
         first: usize,
         n: usize,
         from: u8,
-        stop: Option<&AtomicBool>,
+        stop: Option<&dyn Fn() -> bool>,
         mut populate: impl FnMut(usize, usize) -> io::Result<usize>,
     ) -> (usize, io::Result<()>) {
         let (end, mut resolved, mut i) = (first + n, 0, first);
@@ -445,7 +454,7 @@ impl Pages {
                     resolved += self.settle(i, true, from) as usize;
                     i += 1;
                 }
-                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s.load(Ordering::SeqCst)) => {
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s()) => {
                     drop(installing);
                     self.install_eagain.fetch_add(1, Ordering::Relaxed);
                     self.wait_events_read(gen)
@@ -592,6 +601,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual REMOVE microbenchmark; run with --release --ignored --nocapture"]
+    fn remove_benchmark() {
+        // A 128 MiB unplug of installed pages, as the event thread applies it with the events write lock held.
+        let (first, n) = (1 << 18, (128 << 20) / crate::util::PAGE_SIZE);
+        let mut pages = Pages::new(1 << 20);
+        let start = Instant::now();
+        for _ in 0..50 {
+            pages.fill(first, n, PRESENT);
+            let removing = pages.removing();
+            assert_eq!(std::hint::black_box(pages.discard(&removing, first, first + n)), 0);
+        }
+        println!("128 MiB REMOVE: {:?} per event", start.elapsed() / 50);
+    }
+
+    #[test]
     fn install_uses_full_capped_runs() {
         let mut pages = Pages::new(513);
         pages.fill(0, 513, REMOTE);
@@ -614,7 +638,7 @@ mod tests {
             assert_eq!(pages.claim(0, n, REMOTE, |_| true), n);
             {
                 let removing = pages.removing();
-                pages.discard(&removing, n / 2);
+                pages.discard(&removing, n / 2, n / 2 + 1);
             }
             let mut copied = 0;
             let (resolved, result) = pages.install(0, n, REMOTE, None, |p, count| {

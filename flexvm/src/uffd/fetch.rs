@@ -1,5 +1,5 @@
 use super::event::{FETCH, FIRST, QUEUED};
-use super::{os, Pager, Pages, Source, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
+use super::{os, Pager, Pages, Source, FAULT_FETCHERS, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
 use crate::checkpoint::Buf;
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
@@ -49,7 +49,7 @@ impl Pages {
         // Installs pages `from..to` (counted from `first`) out of `data`, which holds them from page `base` on.
         let mut install = |from: usize, to: usize, data: &[u8], base: usize| {
             let src = |p: usize, c: usize| &data[(p - first - base) * PAGE_SIZE..(p - first - base + c) * PAGE_SIZE];
-            self.install(first + from, to - from, REMOTE, Some(stop), |p, c| populate(p, c, src(p, c)))
+            self.install(first + from, to - from, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |p, c| populate(p, c, src(p, c)))
         };
         // Pages from `first` installed (or given back by a failed install).
         let (mut done, mut resolved) = (0, 0);
@@ -127,7 +127,7 @@ impl Pager {
     /// passing over one busy writing requests.
     pub(super) fn queue_fault(&self, job: Job) {
         let queued = |l: &Lane| l.q.try_lock().map_or(usize::MAX, |q| q.jobs.len());
-        let lane = self.lanes.iter().min_by_key(|l| queued(l)).unwrap();
+        let lane = self.lanes[..FAULT_FETCHERS].iter().min_by_key(|l| queued(l)).unwrap();
         lane.push(job);
     }
 
@@ -218,16 +218,21 @@ impl Pager {
                     // What went back to REMOTE may have no fault waiting on it any more (the faulting page went in
                     // first) and the pullers may be past it: queue it again, with its failure history, so it is not
                     // stranded.
-                    let mut i = page;
-                    while i < page + n {
-                        match pages.claim(i, page + n - i, REMOTE, |_| true) {
-                            0 => i += 1,
-                            k => {
-                                self.queue_fault((i, k, Instant::now()));
-                                i += k;
-                            }
-                        }
-                    }
+                    self.reclaim(page, n, |job| self.queue_fault(job));
+                }
+            }
+        }
+    }
+
+    /// Claims again what of `[page, page + n)` went back to REMOTE, a run at a time, for `queue`.
+    pub(super) fn reclaim(&self, page: usize, n: usize, mut queue: impl FnMut(Job)) {
+        let mut i = page;
+        while i < page + n {
+            match self.pages().claim(i, page + n - i, REMOTE, |_| true) {
+                0 => i += 1,
+                k => {
+                    queue((i, k, Instant::now()));
+                    i += k;
                 }
             }
         }
@@ -302,6 +307,12 @@ impl Lane {
             }
         }
         self.cv.notify_one();
+    }
+
+    /// The front job, and how many are queued.
+    pub(super) fn front(&self) -> (Option<Job>, usize) {
+        let q = self.q.lock().unwrap();
+        (q.jobs.front().map(|j| j.job), q.jobs.len())
     }
 
     /// The fetcher is done with the front job.
@@ -696,7 +707,7 @@ pub(super) type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[
 /// `Fetch`, borrowed and not necessarily `Send`.
 type FetchAny<'a> = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> + 'a;
 /// A run of REMOTE pages a fault claimed, `(first, count)`, and when it was queued.
-type Job = (usize, usize, Instant);
+pub(super) type Job = (usize, usize, Instant);
 
 /// Errors after which the pager gives up on the VM: its migration source has been gone too long, or its checkpoint file
 /// is unreadable or corrupt.

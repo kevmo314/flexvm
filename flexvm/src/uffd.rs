@@ -79,6 +79,8 @@ const REMOTE_FAULT_RUN: usize = 64;
 const PULL_RUN: usize = 256;
 /// Threads fetching pages for faults, each with its own connection.
 const FAULT_FETCHERS: usize = 8;
+/// Threads pulling every REMOTE page in the background, each with its own connection too.
+const PULL_THREADS: usize = 4;
 /// How long Firecracker has, once it unmapped guest memory, to exit or answer the request that failed, before the pager
 /// kills it.
 const UNMAPPED_GRACE: Duration = Duration::from_secs(2);
@@ -180,8 +182,9 @@ pub struct Pager {
     base: Arc<Template>,
     runtime: Runtime,
     pub fault_stats: FaultStats,
-    /// Runs of REMOTE pages faults claimed, per fault fetcher (`fetch_faults`).
-    lanes: [Lane; FAULT_FETCHERS],
+    /// Runs of REMOTE pages faults claimed, per fault fetcher (`fetch_faults`), then those each background puller
+    /// claimed (`pull`).
+    lanes: [Lane; FAULT_FETCHERS + PULL_THREADS],
     /// Pages `[next, end)` past the latest REMOTE fault, which the pullers take before going on with their share
     /// (`steered`).
     steer: Mutex<(usize, usize)>,
@@ -480,7 +483,7 @@ impl Pager {
                 let n = pages.claim(i, end - i, BASE, |p| self.base.has_data(p) == data);
                 if n > 0 {
                     let src = |p: usize, c: usize| data.then(|| self.base.pages(p, c));
-                    let _ = pages.install(i, n, BASE, None, |p, c| self.populate(p, c, src(p, c)));
+                    let _ = pages.install(i, n, BASE, Some(&|| self.quiesce.load(Ordering::SeqCst)), |p, c| self.populate(p, c, src(p, c)));
                 }
                 i += n.max(1);
             }
@@ -531,19 +534,16 @@ impl Pager {
                     Some(REMOTE) => {
                         let n = pages.claim(page, end - index, REMOTE, |_| true);
                         if n > 0 {
-                            let gen = pages.read_gen.load(Ordering::SeqCst);
                             let src = |p: usize, c: usize| &data[(index + p - page) * PAGE_SIZE..(index + p - page + c) * PAGE_SIZE];
-                            let (resolved, res) = pages.install(page, n, REMOTE, None, |p, c| self.populate(p, c, Some(src(p, c))));
+                            let (resolved, res) =
+                                pages.install(page, n, REMOTE, Some(&|| self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline), |p, c| {
+                                    self.populate(p, c, Some(src(p, c)))
+                                });
                             self.pulled(resolved);
                             installed += resolved;
-                            match res {
-                                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pages.wait_events_read(gen),
-                                r => {
-                                    r?;
-                                    index += n;
-                                    continue;
-                                }
-                            }
+                            res?;
+                            index += n;
+                            continue;
                         }
                     }
                     Some(INFLIGHT | DISCARDED) => {}
