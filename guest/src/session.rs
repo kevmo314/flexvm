@@ -19,8 +19,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault};
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::{self, Read, Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -479,6 +479,32 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
 
 type Attached = (Session, u64);
 
+/// Source the command without putting it in argv or consuming the command's stdin.
+fn shell_command(command: &str) -> io::Result<Command> {
+    if command.contains('\0') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "command contains a nul byte"));
+    }
+    let fd = unsafe { libc::memfd_create(c"flexvm-session".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut script = unsafe { File::from_raw_fd(fd) };
+    script.write_all(command.as_bytes())?;
+    script.rewind()?;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", &format!(". /proc/self/fd/{fd}")]);
+    // Keep the file alive through spawn; only this child inherits it across exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(script.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(cmd)
+}
+
 fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions, statuses: &Statuses) -> io::Result<Option<(&'a str, u64, Attached)>> {
     let gone = || io::Error::other("session closed");
     let unknown = || io::Error::other("unknown session");
@@ -515,14 +541,16 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                     }
                 })
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
-            let mut cmd = Command::new("/bin/sh");
-            cmd.args(["-c", command]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+            let mut cmd = shell_command(command)?;
+            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
             if let Some(work) = crate::mem::work_procs() {
                 crate::mem::enter(&mut cmd, work, false);
             }
             // Minimal images (distroless, scratch) have no shell.
-            let (child, exited, token) = spawn_watched(&mut cmd, statuses, true)
-                .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
+            let (child, exited, token) = spawn_watched(&mut cmd, statuses, true).map_err(|e| {
+                let hint = if e.kind() == io::ErrorKind::NotFound { " (does the image have a shell?)" } else { "" };
+                io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}{hint}"))
+            })?;
             table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
             // Attached before any output, so none is overwritten before it is sent.
             let attached = attach(&output, 0, conn);
@@ -1039,6 +1067,25 @@ mod tests {
         let _ = handle(disconnected, command, None, &format!("SESSION {id} {}", command.len()), sessions, statuses);
         let table = sessions.lock().unwrap();
         (table.live[id].output.clone(), table.live[id].group)
+    }
+
+    #[test]
+    fn a_512_kib_command_preserves_stdin_and_exit_status() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let mut command = String::from("if read -r line; then exit 99; fi; printf '%s' \"$0\"\n#");
+        let tail = "\nprintf ' done'; exit 7";
+        command.extend(std::iter::repeat_n('x', 512 * 1024 - command.len() - tail.len()));
+        command.push_str(tail);
+        assert_eq!(command.len(), 512 * 1024);
+        let (output, group) = start(&sessions, &statuses, "large", command.as_bytes());
+        let status = reap(&statuses, group);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 7);
+        let ring = output.0.lock().unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        assert!(!timeout.timed_out(), "exit never recorded");
+        assert_eq!(ring.exit, Some(7));
+        assert_eq!(ring.read_chunk(0), Some((FRAME_STDOUT, &b"/bin/sh done"[..])));
     }
 
     #[test]
