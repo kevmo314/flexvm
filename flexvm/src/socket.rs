@@ -3,7 +3,7 @@
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,14 +25,20 @@ pub fn check(path: &Path) -> io::Result<()> {
 }
 
 /// Bound at `private` (in a 0700 directory, so nobody else can connect while its mode is the
-/// umask's), made 0600 there, then moved to `sock`: never reachable by others at any mode.
+/// umask's), made 0600 there, then moved to `sock`: never reachable by others at any mode. Bound
+/// through its directory's fd, so the private path is no longer than `sock` needs.
 pub fn bind_private(private: &Path, sock: &Path) -> io::Result<std::os::unix::net::UnixListener> {
-    check(private)?;
-    let _ = fs::remove_file(private);
-    let listener = std::os::unix::net::UnixListener::bind(private)?;
-    let placed = fs::set_permissions(private, fs::Permissions::from_mode(0o600)).and_then(|()| fs::rename(private, sock));
+    use std::os::fd::AsRawFd;
+    check(sock)?;
+    let (dir, name) = (private.parent().unwrap_or(Path::new(".")), private.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?);
+    let dir = fs::File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC).open(dir)?;
+    let short = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
+    check(&short)?;
+    let _ = fs::remove_file(&short);
+    let listener = std::os::unix::net::UnixListener::bind(&short)?;
+    let placed = fs::set_permissions(&short, fs::Permissions::from_mode(0o600)).and_then(|()| fs::rename(&short, sock));
     if placed.is_err() {
-        let _ = fs::remove_file(private);
+        let _ = fs::remove_file(&short);
     }
     placed.map(|()| listener)
 }
@@ -160,6 +166,24 @@ mod tests {
     fn fixture() -> crate::test_util::TempDir {
         // Leave room for the longest socket suffix regardless of TMPDIR's length.
         crate::test_util::TempDir::new_in(Path::new("/tmp"), "socket")
+    }
+
+    #[test]
+    fn private_binds_need_only_a_short_destination() {
+        let t = fixture();
+        let deep = t.join("d".repeat(60)).join("e".repeat(60));
+        DirBuilder::new().recursive(true).mode(0o700).create(&deep).unwrap();
+        let private = deep.join(".1.sock");
+        assert!(check(&private).is_err(), "longer than a socket path");
+        let sock = t.join("c.sock");
+        let _l = bind_private(&private, &sock).unwrap();
+        assert_eq!(fs::metadata(&sock).unwrap().mode() & 0o777, 0o600);
+        assert!(!private.exists());
+        std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        // One that could not be connected to is never published.
+        let long = deep.join("c.sock");
+        assert_eq!(bind_private(&private, &long).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(!long.exists() && !private.exists());
     }
 
     #[test]
