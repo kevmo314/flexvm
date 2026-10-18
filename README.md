@@ -339,7 +339,7 @@ without, its app's;
 migrated away or `checkpoint --stop` stopped it. flexvm's own failures use
 the range shells and container runtimes keep for themselves: 125 when it
 could not start the VM (or gave it up; also for `run -d` and `start`), 124
-when the VM died under it (`flexvm ps -a` then shows it `failed`, and `ps -a
+when the VM died under it, even before its start was done (`flexvm ps -a` then shows it `failed`, and `ps -a
 --json` why, until `flexvm rm`). For a VM with neither they are the same, so a script
 can tell a VM that never ran (125) from one that did. `flexvm exec` returns
 the command's status, 127 when it is not found, 126 when it cannot be run (or

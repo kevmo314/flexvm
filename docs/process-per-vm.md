@@ -53,7 +53,9 @@ could not start the VM, or gave it up); 124 when it died under the process
 noticed at once whatever operation is in progress, which is interrupted
 rather than waited for (`Vm::mark_dead`: guest calls fail without retrying,
 waits on Firecracker give up, the pager stops, a checkpoint is cancelled;
-a suspend that published meanwhile is revoked and ends as a death, not a kill),
+a suspend that published meanwhile is revoked and ends as a death, not a kill;
+a start not yet done once its VM ran is one too, watched from the moment it runs:
+its starter, a standby's claimer or `run -d`, exits 124 as well),
 then cleaned up as a
 kill, with why (Firecracker's exit status and the end of its log, the
 guest's console) in `RUN/vms/NAME.failed`, which `ps -a` shows as `failed`
@@ -540,7 +542,8 @@ pool's stop (SIGUSR1), its template changed, the pool is over its target, its
 socket is gone, or the host is under its reserve. SIGINT, SIGQUIT and SIGTERM destroy it with 128 + the
 signal (SIGTERM too: there is nothing worth suspending), and its Firecracker
 dying (or its memory lost) ends it with 124, as for any VM. A claim that
-fails and gives the VM up ends it with 125.
+fails and gives the VM up ends it with 125, unless its Firecracker died once
+the claimed VM ran: then it ends with 124, and its claimer too.
 
 ## Memory controller and eviction
 
