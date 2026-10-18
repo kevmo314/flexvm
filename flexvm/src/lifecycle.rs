@@ -102,7 +102,8 @@ impl Proc {
         if let Err(e) = self.take_address(vm) {
             drop(op);
             // Retried with the address; an existing worker may be retrying the address alone.
-            if !self.finish_later(vm.clone(), true, true) {
+            // Not answered: its hostname is sent again too (renamed while paused).
+            if !self.finish_later(vm.clone(), false, true) {
                 self.sync_clock_later();
             }
             return Err(e);

@@ -193,6 +193,8 @@ or on the target). `attach NAME` shows the app's output from then on; with `-i`
 it is also the app's stdin. `cp` streams a tar through flexvm-init (images need
 no `tar`): guest paths are resolved in the guest, files land there as root, and
 what comes out is unpacked without following its links, setuid bits or devices.
+A copy stays on its source's filesystem: `cp web:/ -` has /proc, /sys and /dev
+as empty directories.
 
 As with ssh, the words of `run IMAGE CMD` are joined with spaces for the guest's
 shell, so quote a command that has its own quoting:
@@ -222,6 +224,8 @@ its log holds only what came after a closed terminal. Foreground `run`,
 `start -a` and `attach` print only the app's output, errors and warnings;
 flexvm's and flexvm-init's informational messages go to the log alone, and
 also to stderr with the global `--verbose` (`-v`) or `FLEXVM_LOG=debug`.
+After `run`, `-v` is docker's volume flag, which flexvm refuses (volumes are
+not supported yet, #717): put `-v` before the command (`flexvm -v run ...`).
 
 The guest's hostname is the VM's name (`root@web` in a shell's prompt), with
 an /etc/hosts entry for it; a rename sets it in the guest too. Templates pulled

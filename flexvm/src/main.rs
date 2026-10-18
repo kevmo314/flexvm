@@ -226,6 +226,8 @@ impl Args {
                 "-p" => Some("publish"),
                 "-h" => Some("help"),
                 "-q" => Some("quiet"),
+                // docker's volumes: SRC:DST would be taken as the image.
+                "-v" if cmd == Some("run") => bail!("volumes (-v) are not supported (#717); for verbose output, -v or --verbose goes before the command"),
                 "-v" => Some("verbose"),
                 "-a" => Some(if cmd == Some("start") { "attach" } else { "all" }),
                 "-i" if matches!(cmd, Some("run" | "exec")) => Some("interactive"),
@@ -1971,7 +1973,9 @@ mod exec_tests {
         let args = parse(&["run", "image", "--verbose", "-v"]);
         assert!(!args.has("verbose"));
         assert_eq!(args.rest, ["--verbose", "-v"]);
-        assert!(parse(&["run", "-v", "-d", "image"]).child_args.contains(&"-v".into()));
+        assert!(parse(&["-v", "run", "-d", "image"]).child_args.contains(&"-v".into()));
+        let refused = Args::parse(["run", "-v", "/src:/dst", "image"].map(String::from)).err().unwrap().to_string();
+        assert!(refused.contains("volumes (-v) are not supported"), "{refused}");
     }
 
     #[test]

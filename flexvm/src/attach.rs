@@ -37,31 +37,35 @@ pub fn is_tty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
-/// Stdin's terminal in raw mode until dropped (or `restore_terminal`): keys, Ctrl-C too, go to the guest.
-pub struct Raw(());
+/// Stdin's terminal as `change` made it until dropped (or `restore_terminal`, which a panic's hook calls too).
+pub struct Term(());
 
-pub fn raw() -> Result<Raw> {
+pub fn term(change: impl FnOnce(&mut libc::termios)) -> Result<Term> {
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(0, &mut t) } != 0 {
         return Err(format!("the terminal: {}", std::io::Error::last_os_error()).into());
     }
     *SAVED.lock().unwrap() = Some(t);
-    let mut r = t;
-    unsafe { libc::cfmakeraw(&mut r) };
-    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &r) } != 0 {
+    change(&mut t);
+    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) } != 0 {
         SAVED.lock().unwrap().take();
         return Err(format!("the terminal: {}", std::io::Error::last_os_error()).into());
     }
-    Ok(Raw(()))
+    Ok(Term(()))
 }
 
-impl Drop for Raw {
+/// Raw mode: keys, Ctrl-C too, go to the guest.
+pub fn raw() -> Result<Term> {
+    term(|t| unsafe { libc::cfmakeraw(t) })
+}
+
+impl Drop for Term {
     fn drop(&mut self) {
         restore_terminal();
     }
 }
 
-/// Puts the terminal back as it was before `raw`, however the process ends (a panic's hook calls it too).
+/// Puts the terminal back as it was before `term`, however the process ends (a panic's hook calls it too).
 pub fn restore_terminal() {
     if let Some(t) = SAVED.try_lock().ok().and_then(|mut s| s.take()) {
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
@@ -350,11 +354,17 @@ impl Pinned {
 
     fn connect(&self, req: &Value) -> Result<UnixStream> {
         let name = self.name();
-        let mut pin = self.pin.lock().unwrap().clone();
-        let c = crate::connect_same(&self.host, &name, req, Instant::now() + Duration::from_secs(5), &mut pin);
-        *self.pin.lock().unwrap() = pin;
-        c
+        repin(&self.pin, |pin| crate::connect_same(&self.host, &name, req, Instant::now() + Duration::from_secs(5), pin))
     }
+}
+
+/// `connect` on a copy of the pin (not held locked through it), kept only if it succeeded: a failed one,
+/// begun before another thread's success, would otherwise put back the process that thread replaced.
+fn repin<T>(shared: &Mutex<crate::Pin>, connect: impl FnOnce(&mut crate::Pin) -> Result<T>) -> Result<T> {
+    let mut pin = shared.lock().unwrap().clone();
+    let c = connect(&mut pin)?;
+    *shared.lock().unwrap() = pin;
+    Ok(c)
 }
 
 fn replaced(e: &util::Error) -> bool {
@@ -635,6 +645,42 @@ mod tests {
     fn data(f: &(u8, Vec<u8>)) -> (u64, Vec<u8>) {
         assert_eq!(f.0, IN_DATA);
         (u64::from_le_bytes(f.1[..8].try_into().unwrap()), f.1[8..].to_vec())
+    }
+
+    /// A stdin connect begun before a resume fails after the output thread pinned the new process: that pin stays.
+    #[test]
+    fn a_stale_failed_connect_never_undoes_a_fresh_pin() {
+        fn process(pid: u32) -> crate::host::Ident {
+            crate::host::Ident { pid, start: 1, boot: "boot".into() }
+        }
+        let shared = Arc::new(Mutex::new(crate::Pin::default()));
+        let (began, began_rx) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let stale = std::thread::spawn({
+            let shared = shared.clone();
+            move || {
+                repin(&shared, |pin| {
+                    began.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    pin.process = Some(process(1));
+                    Err::<(), _>("connection refused".into())
+                })
+            }
+        });
+        began_rx.recv().unwrap();
+        let fresh = std::thread::spawn({
+            let shared = shared.clone();
+            move || {
+                repin(&shared, |pin| {
+                    pin.process = Some(process(2));
+                    Ok(())
+                })
+            }
+        });
+        assert!(fresh.join().unwrap().is_ok());
+        go.send(()).unwrap();
+        assert!(stale.join().unwrap().is_err());
+        assert_eq!(shared.lock().unwrap().process, Some(process(2)));
     }
 
     #[test]

@@ -403,7 +403,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             continue;
         }
         // The host sends its request with the connection; don't let a silent one stall accepting.
-        sock_timeout(conn, libc::SO_RCVTIMEO, Duration::from_secs(1));
+        sock_timeout(conn, libc::SO_RCVTIMEO, Some(Duration::from_secs(1)));
         let Ok(mut r) = stream.try_clone().map(BufReader::new) else { continue };
         let line = match request_line(&mut r) {
             Ok(line) => line,
@@ -450,18 +450,12 @@ fn serve(statuses: Statuses) -> io::Result<()> {
     }
 }
 
-/// Sets a socket's SO_RCVTIMEO or SO_SNDTIMEO (at least 1 us: 0 means forever).
-fn sock_timeout(fd: RawFd, opt: libc::c_int, t: Duration) {
-    let tv = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros().max(u32::from(t.is_zero())) as _ };
+/// Sets a socket's SO_RCVTIMEO or SO_SNDTIMEO; None: none, its reads (writes) wait however long it takes.
+fn sock_timeout(fd: RawFd, opt: libc::c_int, t: Option<Duration>) {
+    // 0 is none: a timeout is at least 1 us.
+    let t = t.map_or(Duration::ZERO, |t| t.max(Duration::from_micros(1)));
+    let tv = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros() as _ };
     unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&tv as *const libc::timeval).cast(), std::mem::size_of_val(&tv) as _) };
-}
-
-/// Clears a connection's SO_RCVTIMEO: its reads wait for input however long it takes.
-fn untimed_reads(conn: &impl AsRawFd) {
-    let forever = libc::timeval { tv_sec: 0, tv_usec: 0 };
-    unsafe {
-        libc::setsockopt(conn.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&forever as *const libc::timeval).cast(), std::mem::size_of_val(&forever) as _)
-    };
 }
 
 /// Refused while `MAX_BODY_READERS` commands are still arriving: the host waits for a slot.
@@ -494,7 +488,7 @@ fn read_body(r: &mut impl Read, fd: RawFd, len: usize, at: Instant) -> io::Resul
         if left.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "the command did not arrive in time"));
         }
-        sock_timeout(fd, libc::SO_RCVTIMEO, left);
+        sock_timeout(fd, libc::SO_RCVTIMEO, Some(left));
         let want = (len - body.len()).min(buf.len());
         match r.read(&mut buf[..want]) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
@@ -541,13 +535,40 @@ fn set_hostname(name: &str) -> io::Result<()> {
         return Err(io::Error::other(format!("bad hostname {name:?}")));
     }
     os(unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) })?;
-    if let Ok(hosts) = std::fs::read_to_string("/etc/hosts") {
-        let new = with_hostname(&hosts, name);
-        if new != hosts {
-            let _ = std::fs::write("/etc/hosts", new);
-        }
-    }
+    let _ = name_in_hosts(std::path::Path::new("/etc/hosts"), name);
     Ok(())
+}
+
+/// Most of `/etc/hosts` that is read.
+const MAX_HOSTS: u64 = 1 << 20;
+
+/// `hosts` (a regular file: no link followed, nothing else opened but to be refused) rewritten
+/// `with_hostname`, replaced whole by a renamed copy, so a lookup sees the old file or the new one.
+fn name_in_hosts(hosts: &std::path::Path, name: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let f = File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY).open(hosts)?;
+    let meta = f.metadata()?;
+    let mut old = String::new();
+    if !meta.is_file() || f.take(MAX_HOSTS + 1).read_to_string(&mut old)? as u64 > MAX_HOSTS {
+        return Err(io::Error::other("not a regular file of at most 1 MiB"));
+    }
+    let new = with_hostname(&old, name);
+    if new == old {
+        return Ok(());
+    }
+    let tmp = hosts.with_file_name(".hosts.flexvm");
+    let _ = std::fs::remove_file(&tmp);
+    let res = (|| {
+        let mut t = File::options().write(true).create_new(true).open(&tmp)?;
+        t.write_all(new.as_bytes())?;
+        std::os::unix::fs::fchown(&t, Some(meta.uid()), Some(meta.gid()))?;
+        t.set_permissions(meta.permissions())?;
+        std::fs::rename(&tmp, hosts)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// `hosts` with its 127.0.1.1 lines (or a new one) naming `name` alone.
@@ -631,6 +652,44 @@ mod tests {
         assert_eq!(super::with_hostname("127.0.0.1 localhost", "web"), "127.0.0.1 localhost\n127.0.1.1\tweb\n");
         assert_eq!(super::with_hostname("127.0.1.1 a\n127.0.1.1 b\n", "web"), "127.0.1.1\tweb\n");
         assert!(super::set_hostname(&"x".repeat(65)).is_err() && super::set_hostname("a b").is_err());
+    }
+
+    /// Replaced whole, mode kept; a FIFO (never waited on), a link (never followed) or an endless file is refused.
+    #[test]
+    fn hosts_is_rewritten_only_as_a_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("flexvm-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let hosts = dir.join("hosts");
+        std::fs::write(&hosts, "127.0.0.1\tlocalhost\n").unwrap();
+        std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o604)).unwrap();
+        super::name_in_hosts(&hosts, "web").unwrap();
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), "127.0.0.1\tlocalhost\n127.0.1.1\tweb\n");
+        assert_eq!(std::fs::metadata(&hosts).unwrap().permissions().mode() & 0o7777, 0o604);
+        assert!(!dir.join(".hosts.flexvm").exists());
+
+        let target = dir.join("target");
+        std::fs::write(&target, "127.0.0.1\tlocalhost\n").unwrap();
+        std::fs::remove_file(&hosts).unwrap();
+        std::os::unix::fs::symlink(&target, &hosts).unwrap();
+        assert!(super::name_in_hosts(&hosts, "web").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "127.0.0.1\tlocalhost\n");
+        assert!(std::fs::symlink_metadata(&hosts).unwrap().file_type().is_symlink());
+
+        std::fs::remove_file(&hosts).unwrap();
+        let c = std::ffi::CString::new(hosts.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let start = std::time::Instant::now();
+        assert!(super::name_in_hosts(&hosts, "web").is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&std::fs::symlink_metadata(&hosts).unwrap().file_type()));
+
+        std::fs::remove_file(&hosts).unwrap();
+        std::fs::write(&hosts, vec![b'#'; (super::MAX_HOSTS + 1) as usize]).unwrap();
+        assert!(super::name_in_hosts(&hosts, "web").is_err());
+        assert_eq!(std::fs::metadata(&hosts).unwrap().len(), super::MAX_HOSTS + 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

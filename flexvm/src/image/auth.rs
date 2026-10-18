@@ -1,7 +1,6 @@
 //! flexvm's registry credentials. Only verified credentials are published, atomically and root-only.
 use std::fs::File;
 use std::io::{IsTerminal, Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -75,41 +74,22 @@ fn update(state: &Path, registry: &str, auth: Option<&str>) -> Result<()> {
     result
 }
 
-/// Restore terminal echo even if reading the password fails.
-struct Echo {
-    fd: i32,
-    old: libc::termios,
-}
-impl Drop for Echo {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.old);
-        }
-    }
-}
-
 fn prompt(label: &str, secret: bool) -> Result<String> {
     if !std::io::stdin().is_terminal() {
         bail!("login needs --username and --password-stdin without a terminal");
     }
     output(format_args!("{label}: "))?;
     std::io::stdout().flush()?;
-    let fd = std::io::stdin().as_raw_fd();
-    let echo = if secret {
-        let mut old = std::mem::MaybeUninit::uninit();
-        if unsafe { libc::tcgetattr(fd, old.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let old = unsafe { old.assume_init() };
-        let mut new = old;
-        new.c_lflag &= !libc::ECHO;
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &new) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Some(Echo { fd, old })
-    } else {
-        None
-    };
+    // Echo comes back however the read ends: an error, or Ctrl-C (its waiter restores it, then dies of it).
+    let echo = secret
+        .then(|| {
+            crate::util::on_signal(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], |sig| {
+                crate::attach::restore_terminal();
+                crate::util::raise_signal(sig)
+            });
+            crate::attach::term(|t| t.c_lflag &= !libc::ECHO)
+        })
+        .transpose()?;
     let mut value = String::new();
     let result = std::io::stdin().read_line(&mut value);
     drop(echo);
