@@ -114,7 +114,7 @@ impl Drop for Wait {
     }
 }
 
-pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()> {
+pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<Cached> {
     let local = listener.local_addr()?;
     // Bounded: this runs under the host lock. Seeds `PEER_CACHE` before the advertised
     // address is derived from it (a wildcard listener's underlay): at a first start or
@@ -144,7 +144,7 @@ pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()>
     if let Some(e) = loopback_with_remote(local, toward) {
         bail!("{e}");
     }
-    Ok(())
+    Ok(Cached { names: cfg.peers.iter().cloned().zip(found).filter_map(|(n, a)| a.map(|a| (n, a))).collect() })
 }
 
 /// A loopback listener is reachable, and a loopback underlay usable, only by peers on this machine.
@@ -156,7 +156,7 @@ fn loopback_with_remote(local: SocketAddr, toward: impl FnOnce() -> crate::host:
     Some(format!("{local} is loopback, but peer {peer} is elsewhere and cannot reach it; listen on 0.0.0.0 or this host's address toward it"))
 }
 
-pub fn main(host: Host, listener: TcpListener) -> Result<()> {
+pub fn main(host: Host, listener: TcpListener, validated: Cached) -> Result<()> {
     crate::net::ip_forward()?;
     let dev = host.cfg.announce_dev();
     if let Some(dev) = &dev {
@@ -174,7 +174,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     });
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
-    let peers = Peers::watch(host.clone());
+    let peers = Peers::watch(host.clone(), validated);
     let (waits, moved) = (Waiting::new(MAX_WAITING, MAX_WAITING_FROM), Waiting::new(MAX_MOVED, MAX_MOVED_FROM));
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
@@ -318,15 +318,14 @@ const LOOKUP_EVERY: Duration = Duration::from_secs(2);
 const ADMIT_WAIT: Duration = Duration::from_millis(1500);
 
 impl Peers {
-    /// The listener's, from what `validate` seeded or an earlier listener left: a first
-    /// lookup to end writes the others' entries back, not only its own.
-    fn listener(host: &Host) -> Peers {
+    /// Admission starts with this validation's lookups; the disk cache also keeps earlier ones.
+    fn listener(host: &Host, validated: Cached) -> Peers {
         let cache = Some((host.run.join(PEER_CACHE), Mutex::new(Cached::read(&host.run, &host.config_now().peers))));
-        Peers(Arc::new(PeersInner { cache, ..Default::default() }))
+        Peers(Arc::new(PeersInner { resolved: RwLock::new(validated.names), cache, ..Default::default() }))
     }
 
-    fn watch(host: Host) -> Peers {
-        let peers = Peers::listener(&host);
+    fn watch(host: Host, validated: Cached) -> Peers {
+        let peers = Peers::listener(&host, validated);
         let p = peers.clone();
         std::thread::spawn(move || loop {
             let names = host.config_now().peers;
@@ -1213,7 +1212,7 @@ mod tests {
         // Seeded even when refused: a name that does not resolve gets an empty entry, the others keep theirs.
         let e = host.configure(|cfg| {
             cfg.peers = vec!["localhost:7107".into(), "never.invalid:7107".into(), "10.98.0.1:7107".into()];
-            validate(&listener, cfg)
+            validate(&listener, cfg).map(|_| ())
         });
         assert!(e.is_err(), "a loopback listener with a peer elsewhere");
         let peers = ["localhost:7107".to_string(), "never.invalid:7107".into()];
@@ -1227,9 +1226,39 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        Peers::listener(&host).cache(|c| drop(c.names.insert("never.invalid:7107".into(), vec!["10.93.0.1".parse().unwrap()])));
+        Peers::listener(&host, Cached::default()).cache(|c| drop(c.names.insert("never.invalid:7107".into(), vec!["10.93.0.1".parse().unwrap()])));
         let after = Cached::read(&host.run, &peers);
         assert!(after.addrs("localhost:7107").unwrap().iter().any(|a| a.is_loopback()), "{after:?}");
+    }
+
+    #[test]
+    fn validated_peers_are_admitted_without_another_lookup() {
+        let root = crate::test_util::TempDir::new("listen-admission-seed");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut validated = Cached::default();
+        host.configure(|cfg| {
+            cfg.listen = Some(listener.local_addr()?.to_string());
+            cfg.peers = vec!["localhost:7107".into()];
+            validated = validate(&listener, cfg)?;
+            cfg.peers.push("old.invalid:1".into());
+            Ok(())
+        })
+        .unwrap();
+        let from = validated.names["localhost:7107"][0];
+        // An earlier listener's cached lookup is not this validation's.
+        let mut cached = Cached::read(&host.run, &host.cfg.peers);
+        cached.names.insert("old.invalid:1".into(), vec!["10.93.0.1".parse().unwrap()]);
+        cached.write(&host.run.join(PEER_CACHE));
+        let p = Peers::listener(&host, validated);
+        // Simulate a failed refresh: it keeps the validated addresses.
+        for name in &host.cfg.peers {
+            p.0.lookups.lock().unwrap().insert(name.clone(), Some(Instant::now()));
+        }
+        assert!(matches!(p.check(&host.cfg.peers, from), Admission::Peer));
+        assert!(!p.0.resolved.read().unwrap().contains_key("old.invalid:1"));
+        assert!(p.0.lookups.lock().unwrap()["localhost:7107"].is_some());
+        assert!(matches!(p.check(&[], from), Admission::Refused));
     }
 
     /// A name the listener is to look up has an entry, empty until its lookup ends, so other
@@ -1238,7 +1267,7 @@ mod tests {
     fn a_new_peer_name_gets_an_empty_entry_before_its_lookup() {
         let root = crate::test_util::TempDir::new("listen-new-name");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let p = Peers::listener(&host);
+        let p = Peers::listener(&host, Cached::default());
         p.cache(|c| drop(c.names.insert("old.invalid:1".into(), vec!["10.93.0.1".parse().unwrap()])));
         let names = ["old.invalid:1".to_string(), "new.invalid:1".into(), "10.98.0.1:1".into()];
         // As if its lookup were under way already: none is started, the entry is still written.

@@ -587,6 +587,10 @@ impl Root {
             check(unsafe { libc::fchmodat(dfd, name, h.mode()? & 0o7777, 0) }, "chmod", rel)?;
             for (key, value) in &m.xattrs {
                 if let Err(e) = at.set_xattr(key, value) {
+                    // Only user metadata may be dropped; all other namespaces can affect execution or access.
+                    if !key.starts_with("user.") {
+                        bail!("xattr {key} on {rel:?}: {e}");
+                    }
                     crate::log!("image: xattr {key} on {rel:?}: {e}");
                 }
             }
@@ -946,6 +950,47 @@ pub(super) mod tests {
         let data = "x".repeat((512 << 10) + 123);
         s.open().apply_layer(&layer(&[("large", 'f', &data)])[..]).unwrap();
         assert_eq!(s.read("large").unwrap(), data);
+    }
+
+    #[test]
+    fn functional_xattr_failures_abort_the_layer() {
+        for key in [
+            "security.capability",
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+            "security.selinux",
+            "trusted.overlay.opaque",
+            "unknown.attribute",
+            "user.note",
+        ] {
+            let s = Sandbox::new("xattr");
+            let mut b = tar::Builder::new(Vec::new());
+            // Too large for any Linux xattr, regardless of privileges or filesystem support.
+            let value = vec![b'x'; 65537];
+            b.append_pax_extensions([(format!("SCHILY.xattr.{key}").as_str(), value.as_slice())]).unwrap();
+            let bytes = layer(&[("file", 'f', "contents")]);
+            b.get_mut().extend_from_slice(&bytes);
+            let bytes = b.into_inner().unwrap();
+            let result = s.open().apply_layer(bytes.as_slice());
+            if key.starts_with("user.") {
+                result.unwrap();
+                assert_eq!(s.read("file").as_deref(), Some("contents"));
+            } else {
+                let e = result.unwrap_err().to_string();
+                assert!(e.contains(key) && e.contains("file"), "{e}");
+                let cached = s.dir.join("cache/key.ext4");
+                let result = super::super::cached_rootfs(
+                    &cached,
+                    |_| {
+                        s.open().apply_layer(bytes.as_slice())?;
+                        panic!("lost functional xattrs must fail before building the rootfs");
+                    },
+                    crate::util::sync_dir,
+                );
+                assert!(result.err().unwrap().to_string().contains(key));
+                assert!(["ext4", "conf", "ok"].iter().all(|e| !cached.with_extension(e).exists()));
+            }
+        }
     }
 
     #[test]

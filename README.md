@@ -166,12 +166,12 @@ flexvm exec -d -e MODE=worker -w /srv -u app:staff web ./worker
 `exec [OPTIONS] NAME CMD...` preserves each argument, including spaces and empty
 arguments. Options go before NAME: `-d` / `--detach` starts the command and returns
 0 without output; `-e` / `--env K=V` is repeatable; `-w` / `--workdir DIR` and
-`-u` / `--user USER[:GROUP]` override the image defaults for this command.
+`-u` / `--user USER[:GROUP]` override the run's effective config for this command.
 Users and groups are resolved inside the guest as `pull` resolves the image's
 `User` (a numeric uid or gid need no entry; supplementary groups only without an
 explicit group), and `-u` sets `HOME` to that user's. Exec otherwise runs as the
-image's user, with its environment and working directory. Use `sh -c '...'` for
-pipelines, redirects and shell syntax.
+run's user, with its environment (including `run -e`) and working directory.
+Use `sh -c '...'` for pipelines, redirects and shell syntax.
 
 ```sh
 flexvm exec -it web bash                   # a shell on a pty; Ctrl-P Ctrl-Q detaches, leaving it running
