@@ -58,10 +58,13 @@ pub struct Meta {
     /// `recipe()` of the build: a pull of the same image skips the build only if it matches.
     #[serde(default)]
     pub recipe: String,
-    /// A received generation's SHA-256 digests (`digests`): its content id is no check against a peer that
-    /// made files to match it, so a source finding it here compares its own. None for one built here.
+    /// SHA-256 `digests` of its files and metadata, from its build or its receipt (None if built by v0.1.0):
+    /// the content id is no check against a peer that made files to match it. Checkpoints record them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub received: Option<BTreeMap<String, String>>,
+    pub digests: Option<BTreeMap<String, String>>,
+    /// Received from a peer (`receive`): used only for a source or checkpoint whose `digests` match.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub received: bool,
 }
 
 pub const FORMAT_VERSION: u64 = 2;
@@ -191,7 +194,7 @@ fn nonzero_pages(file: &File, mut f: impl FnMut(u64, &[u8])) -> Result<()> {
 }
 
 /// The SHA-256 digests of a generation's files and of what its metadata says beyond its content id
-/// (its host's CPU and Firecracker, sizes, image, recipe), which `received` records.
+/// (its host's CPU and Firecracker, sizes, image, recipe), which `Meta::digests` records.
 fn digests(meta: &Meta, vmstate: &Path, mem: &Path, rootfs: &Path) -> Result<BTreeMap<String, String>> {
     use sha2::Digest;
     let said =
@@ -529,9 +532,21 @@ impl Template {
         Ok(())
     }
 
-    /// `digests` of this generation, as a source compares them with a target's received copy.
+    /// `digests` of this generation, as a source compares them with a target's received copy: recorded,
+    /// or for one built by v0.1.0, computed.
     pub fn digests(&self) -> Result<BTreeMap<String, String>> {
-        digests(&self.meta, &self.vmstate(), &self.fixed.join("mem"), &self.meta.rootfs)
+        match &self.meta.digests {
+            Some(d) => Ok(d.clone()),
+            None => digests(&self.meta, &self.vmstate(), &self.fixed.join("mem"), &self.meta.rootfs),
+        }
+    }
+
+    /// Refuses a received generation unless `vouched` (a source's or a checkpoint's digests) matches it.
+    pub fn check_vouched(&self, vouched: Option<&BTreeMap<String, String>>, by: &str) -> Result<()> {
+        if self.meta.received && vouched != self.meta.digests.as_ref() {
+            bail!("template {} here was received from a peer, and {by} does not vouch for its files (SHA-256 digests)", self.meta.id);
+        }
+        Ok(())
     }
 
     /// Whether its snapshot names its root filesystem by its path (built by v0.1.0), which v0.1.0 needs.
@@ -1121,14 +1136,20 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
         |r: &mut _, name: &str, len| receive_file(r, &staging.dir.join(name), len, &mut budget).map_err(|e| format!("template {id}: its {name}: {e}"));
     file(r, "vmstate", 0..=MAX_VMSTATE)?;
     // Older generations name the root filesystem by its path (not `ROOTFS`), which must hold it here too.
+    // Its use lock held through publication, as a pull holds it (`image::Cached::reserved`): no `rmi` removes it meanwhile.
     let local = match names_by_path(&std::fs::read(staging.dir.join("vmstate"))?, &meta.rootfs) {
         false => None,
         true => Some(
-            Some(&meta.rootfs)
-                .filter(|p| p.is_file())
-                .and_then(|p| hash_file(p).ok())
-                .filter(|c| c.hash == meta.components["rootfs"].hash)
-                .ok_or_else(|| format!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display()))?,
+            (|| -> Result<_> {
+                let st = crate::util::fstat(File::open(&meta.rootfs)?.as_raw_fd())?;
+                let held = crate::host::shared_at(&crate::host::host_locks()?, &crate::host::use_lock(&st))?;
+                let c = hash_file(&meta.rootfs)?;
+                let same = meta.rootfs.is_file() && (c.metadata.device, c.metadata.inode) == (st.st_dev, st.st_ino);
+                Ok((same && c.hash == meta.components["rootfs"].hash).then_some((c, held)))
+            })()
+            .ok()
+            .flatten()
+            .ok_or_else(|| format!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display()))?,
         ),
     };
     file(r, "rootfs", 0..=MAX_FILE)?;
@@ -1138,15 +1159,15 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
     file(r, "mem", meta.max_mib << 20..=meta.max_mib << 20)?;
     let staged = |n: &str| staging.dir.join(n);
     let rootfs = local.as_ref().map_or(staged("rootfs"), |_| meta.rootfs.clone());
-    meta.received = Some(digests(&meta, &staged("vmstate"), &staged("mem"), &rootfs)?);
-    let rootfs = match local {
-        Some(have) => {
+    (meta.digests, meta.received) = (Some(digests(&meta, &staged("vmstate"), &staged("mem"), &rootfs)?), true);
+    let (rootfs, _rootfs_use) = match local {
+        Some((have, held)) => {
             std::fs::remove_file(staged("rootfs"))?;
-            have
+            (have, Some(held))
         }
         None => {
             meta.rootfs = gen.join("rootfs");
-            hash_file(&staged("rootfs"))?
+            (hash_file(&staged("rootfs"))?, None)
         }
     };
     let got = [
@@ -1179,18 +1200,8 @@ fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
     Ok(out)
 }
 
-/// Blocks receives here are yet to write, which each one's room check counts as taken (those written
-/// are out of the filesystem's room already).
-static RESERVED: Mutex<u64> = Mutex::new(0);
-
-/// Blocks of one file's, given back once it is written (or not).
-struct Reserved(u64);
-
-impl Drop for Reserved {
-    fn drop(&mut self) {
-        *RESERVED.lock().unwrap() -= self.0;
-    }
-}
+/// Taken while a receive checks its filesystem's room and allocates a file's blocks, so the next one's check sees them gone.
+static ADMIT: Mutex<()> = Mutex::new(());
 
 /// One of `send`'s files, written to a new `path` with the same length (one of `lens`) and holes, within
 /// what is left of the generation's `budget` (`MAX_DATA`) and of its filesystem's room, by blocks.
@@ -1204,18 +1215,26 @@ fn receive_file(r: &mut impl Read, path: &Path, lens: std::ops::RangeInclusive<u
         bail!("bad extents");
     }
     let file = File::options().write(true).create_new(true).open(path)?;
+    file.set_len(len)?;
+    let admit = ADMIT.lock().unwrap();
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     crate::util::check(unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) })?;
     let block = st.f_frsize.max(PAGE_SIZE as u64);
     let blocks: u64 = extents.iter().map(|(s, e)| (e.div_ceil(block) - s / block) * block).sum();
-    let mut reserved = RESERVED.lock().unwrap();
-    if blocks > *budget || st.f_bavail.saturating_mul(st.f_frsize) < *reserved + blocks + KEEP_FREE {
+    if blocks > *budget || st.f_bavail.saturating_mul(st.f_frsize) < blocks + KEEP_FREE {
         bail!("{blocks} bytes of blocks are past the limit, or would leave less than {} MiB free", KEEP_FREE >> 20);
     }
-    (*reserved, *budget) = (*reserved + blocks, *budget - blocks);
-    drop(reserved);
-    let _reserved = Reserved(blocks);
-    file.set_len(len)?;
+    *budget -= blocks;
+    // Allocated now, under the lock (where the filesystem can: else only checked).
+    for &(start, end) in &extents {
+        if unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, start as i64, (end - start) as i64) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                return Err(e.into());
+            }
+        }
+    }
+    drop(admit);
     let mut buf = vec![0u8; 1 << 20];
     for (mut off, end) in extents {
         while off < end {
@@ -1313,9 +1332,11 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
         components: BTreeMap::new(),
         image: Some(image),
         recipe: recipe(),
-        received: None,
+        digests: None,
+        received: false,
     };
     meta.identify(paths, dir)?;
+    meta.digests = Some(digests(&meta, &dir.join("vmstate"), &dir.join("mem"), &meta.rootfs)?);
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     let _ = std::fs::remove_file(dir.join("wset"));
     interrupted()?;
@@ -1677,7 +1698,8 @@ mod tests {
                 components: BTreeMap::new(),
                 image: None,
                 recipe: String::new(),
-                received: None,
+                digests: None,
+                received: false,
             };
             for (name, path) in meta.files(&paths, &dir) {
                 std::fs::write(path, name.as_bytes()).unwrap();
@@ -1763,7 +1785,8 @@ mod tests {
         assert_eq!(images(&paths).unwrap()[0]["name"], Value::Null);
         assert!(Template::open_id(&paths, "t", &tpl.meta.id).is_ok());
         // What a source compares: a copy made to match the content id, or with other metadata, differs.
-        assert_eq!(got.meta.received.as_ref(), Some(&tpl.digests().unwrap()));
+        assert!(got.meta.received && got.meta.digests.as_ref() == Some(&tpl.digests().unwrap()));
+        assert!(got.check_vouched(None, "a v0.1.0 source").is_err() && got.check_vouched(Some(&tpl.digests().unwrap()), "it").is_ok());
         let (_other, elsewhere_paths) = elsewhere(&f);
         let mut meta = tpl.meta.clone();
         meta.compatibility.cpu = "another".into();
@@ -1774,7 +1797,7 @@ mod tests {
         ]
         .concat();
         let poisoned = receive(&elsewhere_paths, &mut &forged[..], &tpl.meta.id).unwrap();
-        assert_ne!(poisoned.meta.received.as_ref(), Some(&tpl.digests().unwrap()));
+        assert!(poisoned.check_vouched(Some(&tpl.digests().unwrap()), "a checkpoint of it").is_err());
         // An identical one arriving again keeps the first.
         drop(got);
         receive(&paths, &mut &buf[..], &tpl.meta.id).unwrap();

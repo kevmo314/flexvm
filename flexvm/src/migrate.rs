@@ -118,13 +118,14 @@ impl Proc {
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.can_leave()?;
         vm.template.verify(&self.paths)?;
+        let settle = Instant::now();
+        vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
+        let settle = settle.elapsed();
+        // Right before the prepare, which opens it there (`listen::PUSH_HOLD`).
         let pushed = push_template(to, &vm.template)?;
         if pushed.is_none() && !vm.template.names_rootfs_by_path()? {
             bail!("{to} runs flexvm v0.1.0, which cannot load template {} (built since): upgrade it first", vm.template.meta.id);
         }
-        let settle = Instant::now();
-        vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
-        let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let vouched = pushed.as_ref().map_or(Value::Null, |p| p.1.clone());
         let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict, vouched).map_err(|e| match &pushed {
@@ -873,12 +874,7 @@ impl Proc {
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         // One received from a peer only for a source with the same files: its content id proves none.
-        if tpl.meta.received.is_some() && req["template_digests"] != json!(tpl.meta.received) {
-            bail!(
-                "template {} here was received from a peer, and this source does not vouch for its files (one older than this host's flexvm cannot)",
-                tpl.meta.id
-            );
-        }
+        tpl.check_vouched(serde_json::from_value(req["template_digests"].clone()).ok().as_ref(), "this source (a v0.1.0 one cannot)")?;
         // Its caps move with it (the same template: they fit).
         // Refused before the source pauses: a capped VM never runs uncapped here.
         self.keep_resources(serde_json::from_value(req["resources"].clone()).unwrap_or_default())?;
@@ -1035,6 +1031,8 @@ impl Proc {
 fn push_template(to: &str, tpl: &Template) -> Result<Option<(Value, Value)>> {
     let (start, at) = (Instant::now(), Instant::now() + crate::listen::PUSH_WAIT);
     let fail = |e: Error| -> Error { format!("cannot send template {} to {to}: {e}", tpl.meta.id).into() };
+    // Before the request: once answered, the target holds the generation only so long (`listen::PUSH_HOLD`).
+    let ours = json!(tpl.digests()?);
     let (conn, mut reply) = match crate::util::rpc(to, Duration::from_secs(2), at, &json!({"op": "template", "id": tpl.meta.id})) {
         Err(e) if e.to_string().contains("unknown op \"template\"") => return Ok(None),
         r => r.map_err(fail)?,
@@ -1046,10 +1044,7 @@ fn push_template(to: &str, tpl: &Template) -> Result<Option<(Value, Value)>> {
         reply = crate::util::recv_json(&mut BufReader::new(By { s: &conn, at })).and_then(|r| crate::util::answer(r, to, "refused")).map_err(fail)?;
         sent = n.map_err(fail)?;
     }
-    let digests = match reply["digests"].is_null() {
-        true => Value::Null,
-        false => json!(tpl.digests()?),
-    };
+    let digests = if reply["digests"].is_null() { Value::Null } else { ours };
     if digests != reply["digests"] {
         bail!("{to} has a copy of template {} received from a peer whose files differ from this host's: remove it there (flexvm rmi {0})", tpl.meta.id);
     }

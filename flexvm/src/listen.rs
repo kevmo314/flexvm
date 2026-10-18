@@ -802,7 +802,7 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         let held = HELD.lock().unwrap().get(id).map(|h| h.0.clone());
         if let Some(tpl) = held.map(Ok).or_else(|| crate::template::Template::generation(&paths, id).map(|dir| crate::template::Template::open_dir(id, dir))) {
             // A received one's digests, for the source to compare: its content id is no proof of its files.
-            return tpl.inspect(|t| drop(answer(&Ok(json!({"have": true, "digests": t.meta.received})))));
+            return tpl.inspect(|t| drop(answer(&Ok(json!({"have": true, "digests": t.meta.received.then_some(&t.meta.digests)})))));
         }
         answer(&Ok(json!({"have": false})))?;
         asked = true;
@@ -811,7 +811,7 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     match got {
         Ok(tpl) => {
             if asked {
-                answer(&Ok(json!({"received": true, "digests": tpl.meta.received})))?;
+                answer(&Ok(json!({"received": true, "digests": tpl.meta.digests})))?;
             }
             hold(tpl);
         }

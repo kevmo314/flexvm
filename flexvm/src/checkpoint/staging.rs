@@ -241,6 +241,7 @@ impl Staging {
             parent,
             app_log: self.app_log,
             resources: vm.resources(),
+            template_digests: meta.digests.clone(),
         };
         let body = serde_json::to_vec_pretty(&manifest)?;
         let id = sum(&body);

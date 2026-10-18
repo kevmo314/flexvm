@@ -805,9 +805,25 @@ def migrate_unpulled():
         r = A.migrate(vm, B)
         check("A -> B again: nothing sent", r.get("template_push", {}).get("sent_mib") == 0, r)
         moved(A, B, vm, m, proc)
+        # A checkpoint of it records the template's digests, which its restore onto the received copy needs.
+        path = ckpt_dir(vm)
+        B.checkpoint(vm, path, stop=True)
+        check("B: its checkpoint vouches for the received template", want in open(os.path.join(path, "manifest.json")).read()
+              and '"template_digests"' in open(os.path.join(path, "manifest.json")).read())
+        B.restore(path)
+        check("B: restored onto the received copy", md5(B, vm) == m and marker_id(B, vm) == proc)
+        shutil.rmtree(path, ignore_errors=True)
         B.kill(vm)
+        # Stored checkpoints of it (the restore's) keep it too.
+        for ck in B.cli("checkpoint", "ls", "-q").stdout.split():
+            B.cli("checkpoint", "rm", "-f", ck)
         # Once the listener lets go of it too (it holds it for the arrival to open).
-        check("B: the generation is pruned once unused", wait_for(lambda: "deleted" in B.cli("image", "prune", "-f").stdout, 40, 2) and generations(templates) == [])
+        pruned = []
+
+        def prune():
+            pruned.append(B.cli("image", "prune", "-f"))
+            return "deleted" in pruned[-1].stdout
+        check("B: the generation is pruned once unused", wait_for(prune, 40, 2) and generations(templates) == [], (pruned[-1].stdout, B.ps()))
 
 
 @case
