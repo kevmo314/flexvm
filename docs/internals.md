@@ -297,8 +297,8 @@ target's reply to them.
    answers `unknown op`: the migration goes on and needs the generation there,
    as before, and one built since (whose snapshot names `rootfs`, which v0.1.0
    does not link) is refused at once. Disk room is checked and each file's
-   blocks allocated (`fallocate`) under one lock, so pushes at once see each
-   other's; a reused v0.1.0 root filesystem's use lock is held through the
+   blocks allocated (`fallocate`; a templates filesystem without it takes no
+   pushes) under one lock, so pushes at once see each other's; a reused v0.1.0 root filesystem's use lock is held through the
    publication; a received memory file must be its guest's size (at most
    2 TiB), and the listener holds at most 16 generations for arrivals. All of this happens while the VM runs: none of it is downtime.
 1. Before the pause, over one connection (`migrate_in`): the target checks the

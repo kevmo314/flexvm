@@ -1225,14 +1225,10 @@ fn receive_file(r: &mut impl Read, path: &Path, lens: std::ops::RangeInclusive<u
         bail!("{blocks} bytes of blocks are past the limit, or would leave less than {} MiB free", KEEP_FREE >> 20);
     }
     *budget -= blocks;
-    // Allocated now, under the lock (where the filesystem can: else only checked).
+    // Allocated now, under the lock: a filesystem that cannot (EOPNOTSUPP) takes no pushes.
     for &(start, end) in &extents {
-        if unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, start as i64, (end - start) as i64) } != 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::EOPNOTSUPP) {
-                return Err(e.into());
-            }
-        }
+        crate::util::check(unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, start as i64, (end - start) as i64) })
+            .map_err(|e| format!("allocating its blocks: {e}"))?;
     }
     drop(admit);
     let mut buf = vec![0u8; 1 << 20];
