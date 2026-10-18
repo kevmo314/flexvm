@@ -187,14 +187,12 @@ fn populate(ptr: *mut u8, len: usize) {
 impl Buf {
     #[cfg(test)]
     fn new(room: &Room) -> io::Result<Buf> {
-        let b = Buf::many(room, 1)?.pop().unwrap();
-        b.populate();
-        Ok(b)
+        Ok(Buf::many(room, 1)?.pop().unwrap())
     }
 
     /// Buffers for `n` writers: huge ones for as many as the room shows space for, in one take (a checkpoint's
-    /// writers take the host lock once, not each: a fault may be trying for it, #677), the rest ordinary. Each
-    /// writer populates its own (`populate`) as it starts, which the take's debit counts until MemAvailable shows it.
+    /// writers take the host lock once, not each: a fault may be trying for it, #677), the rest ordinary. Huge
+    /// buffers are populated inside the take, after the host lock is dropped, before its debit is marked populated.
     fn many(room: &Room, n: usize) -> io::Result<Vec<Buf>> {
         let (len, huge) = (UNIT * PAGE_SIZE, (UNIT * PAGE_SIZE).next_multiple_of(HUGE));
         let mib = (huge >> 20) as u64;
@@ -203,7 +201,9 @@ impl Buf {
             let ptr = Buf::map(huge, len, HUGE)?;
             // Only a hint: without it the buffer is ordinary pages.
             unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
-            Ok(Buf { ptr, map: huge, len })
+            let buf = Buf { ptr, map: huge, len };
+            populate(buf.ptr, buf.map);
+            Ok(buf)
         };
         let mut out = match fit {
             0 => Vec::new(),
@@ -213,13 +213,6 @@ impl Buf {
             out.push(Buf::plain(UNIT)?);
         }
         Ok(out)
-    }
-
-    /// Faults a huge one in at once, before its first write (#672); an ordinary one faults in as it is written.
-    fn populate(&self) {
-        if self.map == HUGE {
-            populate(self.ptr, self.map);
-        }
     }
 
     /// Ordinary page-aligned storage, taking no room.
@@ -304,7 +297,6 @@ pub(super) fn write_pages(
     let bufs = Mutex::new(Buf::many(room, threads)?);
     let work = || -> Result<()> {
         let mut buf = bufs.lock().unwrap().pop().map_or_else(|| Buf::plain(UNIT), Ok)?;
-        buf.populate();
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         let mut scratch = Vec::with_capacity(UNIT);
         loop {
@@ -431,6 +423,11 @@ mod buf_tests {
         let bufs = Buf::many(&room, 4).unwrap();
         assert_eq!(bufs.iter().map(|b| b.map == HUGE).collect::<Vec<_>>(), [true, true, false, false]);
         assert_eq!(room.get(), 1);
+        for b in bufs.iter().filter(|b| b.map == HUGE) {
+            let mut resident = vec![0u8; b.map / PAGE_SIZE];
+            assert_eq!(unsafe { libc::mincore(b.ptr.cast(), b.map, resident.as_mut_ptr()) }, 0);
+            assert!(resident.iter().all(|&v| v & 1 == 1), "the whole huge buffer is populated when the take returns");
+        }
         assert_eq!(Buf::many(&room, 3).unwrap().iter().filter(|b| b.map == HUGE).count(), 0, "no room left");
     }
 
