@@ -630,7 +630,7 @@ def app_lifecycle():
     check("kill -s: prints the name", A.cli("kill", "-s", "SIGTERM", vm).stdout == vm + "\n")
     check("kill -s: the app took it, the vm exits with it", wait_for(lambda: exited(vm), 30) and A.ps()[vm].get("status") == 7,
           (A.ps().get(vm), A.logs(vm)[-2000:]))
-    check("kill -s: the app's handler ran", said("got-term"), A.logs(vm)[-2000:])
+    check("kill -s: the app's handler ran", wait_for(lambda: said("got-term"), 10), A.logs(vm)[-2000:])
     A.rm(vm)
 
     # Foreground: run returns the app's status; an app that exits at once without a terminal gets the hint.
