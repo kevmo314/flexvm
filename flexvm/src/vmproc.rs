@@ -114,7 +114,7 @@ pub const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
 const SIGNALS: [i32; 7] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP, libc::SIGUSR1];
 const MAX_CONTROL: usize = 256;
 static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Long sessions leave room for control requests once parsed.
+/// exec, attach and stdin sessions, once parsed: not on `MAX_CONTROL`, so they never shut out control requests (#749).
 const MAX_SESSIONS: usize = 256;
 static SESSIONS: AtomicUsize = AtomicUsize::new(0);
 /// Page-server requests (peers', forwarded by the listener) refused or served at once: not on `MAX_CONTROL`, so they
@@ -1114,9 +1114,8 @@ impl Proc {
         let mut t = Phases::new();
         let mut name = name.to_string();
         let mut record = None;
-        let mut attempts = 0;
+        let mut tries = 0;
         let lock = loop {
-            attempts += 1;
             let taken = match rerun {
                 true => self.host.take_rerun_name(&name).map(|(lock, path)| {
                     record = Some(path);
@@ -1125,10 +1124,8 @@ impl Proc {
                 false => self.host.take_name(&name, false),
             };
             match taken {
-                Err(e) if generated && crate::host::name_taken(&e) => {
-                    if attempts >= 100 {
-                        bail!("could not take a free name: give one with --name");
-                    }
+                Err(e) if generated && tries < 100 && crate::host::name_taken(&e) => {
+                    tries += 1;
                     name = crate::host::generated_name(&self.host)?;
                 }
                 r => break r?,
@@ -1407,7 +1404,8 @@ impl Proc {
         })
     }
 
-    /// Parsed sessions and page requests trade their control slot for their own budget.
+    /// `slot`: its place among `MAX_CONTROL`, which a session trades for one among `MAX_SESSIONS`
+    /// once parsed, and a page-server request for one among `MAX_PAGES`.
     fn control(self: &Arc<Self>, c: UnixStream, slot: Slot) {
         let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
         let got = crate::util::recv_with_fds(&c, crate::util::MAX_LINE as usize, || Ok(()))
@@ -1418,21 +1416,17 @@ impl Proc {
         };
         let _ = c.set_read_timeout(None);
         let op = req["op"].as_str().unwrap_or("");
-        if matches!(op, "exec" | "attach" | "stdin") {
-            let session = Slot::take(&SESSIONS, MAX_SESSIONS);
-            drop(slot);
-            let Some(_session) = session else {
-                return drop(send_json(&mut &c, &json!({"ok": false, "error": "busy", "busy": true})));
-            };
-            if self.vm.get().is_none() {
-                return drop(send_json(&mut &c, &control_reply(&Err(Busy(format!("vm {} is starting", self.name())).into()))));
-            }
-            return match op {
-                "exec" => self.exec(&req, c),
-                _ => self.attach(&req, c),
-            };
-        }
         let reply = match op {
+            "exec" | "attach" | "stdin" => {
+                let session = Slot::take(&SESSIONS, MAX_SESSIONS);
+                drop(slot);
+                match (session, self.vm.get()) {
+                    (None, _) => Err(Busy("busy".into()).into()),
+                    (Some(_), None) => Err(Busy(format!("vm {} is starting", self.name())).into()),
+                    (Some(_session), Some(_)) if op == "exec" => return self.exec(&req, c),
+                    (Some(_session), Some(_)) => return self.attach(&req, c),
+                }
+            }
             // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
             "checkpoint" | "migrate" | "debug" | "resume" | "signal" | "rename" if self.vm.get().is_none() => {
                 Err(Busy(format!("vm {} is starting", self.name())).into())
@@ -3862,37 +3856,38 @@ mod tests {
         assert_eq!(COUNT.load(Ordering::SeqCst), MAX_CONTROL);
     }
 
+    /// #749: a session gives up its control slot once parsed, before it waits on the client,
+    /// and is refused busy once `MAX_SESSIONS` run.
     #[test]
-    fn parsed_sessions_release_control_slots_before_waiting_on_clients() {
+    fn sessions_leave_control_slots() {
         use std::io::Write;
         static COUNT: AtomicUsize = AtomicUsize::new(0);
         let (p, _root) = test_proc("session-slots", None);
         for op in ["exec", "attach", "stdin"] {
-            let (mut client, mut server) = UnixStream::pair().unwrap();
-            // A full send buffer holds even the starting-VM reply in the session.
+            let (client, mut server) = UnixStream::pair().unwrap();
+            send_json(&mut &client, &json!({"op": op})).unwrap();
+            // A full send buffer holds even the starting-VM reply.
             server.set_nonblocking(true).unwrap();
-            loop {
-                match server.write(&[0; 4096]) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => panic!("{e}"),
-                }
-            }
+            while server.write(&[0; 4096]).is_ok() {}
             server.set_nonblocking(false).unwrap();
-            send_json(&mut client, &json!({"op": op})).unwrap();
-            let q = p.clone();
-            let slot = Slot::take(&COUNT, MAX_CONTROL).unwrap();
+            let (q, slot) = (p.clone(), Slot::take(&COUNT, MAX_CONTROL).unwrap());
             let worker = thread::spawn(move || q.control(server, slot));
             let until = Instant::now() + Duration::from_secs(5);
             while COUNT.load(Ordering::SeqCst) != 0 && Instant::now() < until {
                 thread::sleep(Duration::from_millis(1));
             }
-            let released = COUNT.load(Ordering::SeqCst) == 0;
-            let waiting = !worker.is_finished() && SESSIONS.load(Ordering::SeqCst) > 0;
+            assert!(COUNT.load(Ordering::SeqCst) == 0 && !worker.is_finished(), "{op}");
             drop(client);
             worker.join().unwrap();
-            assert!(released && waiting, "{op}: control released {released}, session waiting {waiting}");
         }
+        SESSIONS.store(MAX_SESSIONS, Ordering::SeqCst);
+        let (client, server) = UnixStream::pair().unwrap();
+        send_json(&mut &client, &json!({"op": "exec"})).unwrap();
+        p.control(server, Slot::take(&COUNT, MAX_CONTROL).unwrap());
+        let reply = crate::util::recv_json(&mut BufReader::new(client)).unwrap().unwrap();
+        assert_eq!(reply, json!({"ok": false, "error": "busy", "busy": true}));
+        assert_eq!((COUNT.load(Ordering::SeqCst), SESSIONS.load(Ordering::SeqCst)), (0, MAX_SESSIONS));
+        SESSIONS.store(0, Ordering::SeqCst);
     }
 
     #[test]
