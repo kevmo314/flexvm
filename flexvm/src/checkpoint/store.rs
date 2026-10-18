@@ -44,9 +44,43 @@ impl Entry {
     fn label(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
     }
+}
 
-    fn builds_on(&self, id: &str) -> bool {
-        self.manifest.parent.as_ref().is_some_and(|p| p.id == id)
+/// Dependency links by position in `list`, so leaf selection keeps its ordering.
+struct Index<'a> {
+    ids: BTreeMap<&'a str, usize>,
+    parents: Vec<Option<usize>>,
+    children: Vec<Vec<usize>>,
+}
+
+impl<'a> Index<'a> {
+    fn new(all: &'a [Entry]) -> Self {
+        let ids: BTreeMap<&str, usize> = all.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
+        let parents: Vec<Option<usize>> = all.iter().map(|e| e.manifest.parent.as_ref().and_then(|p| ids.get(p.id.as_str()).copied())).collect();
+        let mut children = vec![vec![]; all.len()];
+        for (i, parent) in parents.iter().enumerate() {
+            if let Some(p) = parent {
+                children[*p].push(i);
+            }
+        }
+        Self { ids, parents, children }
+    }
+
+    /// `doomed`, each after every doomed checkpoint built on it; among those ready, first in `list`.
+    fn leaf_first(&self, doomed: &BTreeSet<usize>) -> Vec<usize> {
+        let mut waiting: Vec<usize> = self.children.iter().map(|cs| cs.iter().filter(|c| doomed.contains(c)).count()).collect();
+        let mut ready: BTreeSet<usize> = doomed.iter().copied().filter(|i| waiting[*i] == 0).collect();
+        let mut order = vec![];
+        while let Some(i) = ready.pop_first() {
+            order.push(i);
+            if let Some(p) = self.parents[i].filter(|p| doomed.contains(p)) {
+                waiting[p] -= 1;
+                if waiting[p] == 0 {
+                    ready.insert(p);
+                }
+            }
+        }
+        order
     }
 }
 
@@ -109,18 +143,8 @@ pub fn link(state: &Path, name: &str, id: &str) -> Result<()> {
 pub fn remove(state: &Path, whats: &[String], force: bool) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
     let all = list(state);
-    let mut doomed: BTreeSet<&str> = whats.iter().map(|w| Ok(find(&all, w)?.id.as_str())).collect::<Result<_>>()?;
-    loop {
-        let more: Vec<&Entry> = all.iter().filter(|e| !doomed.contains(e.id.as_str()) && doomed.iter().any(|d| e.builds_on(d))).collect();
-        let Some(first) = more.first() else { break };
-        if !force {
-            let parent = all.iter().find(|p| first.builds_on(&p.id)).map_or("", Entry::label);
-            let children: Vec<&str> = more.iter().map(|e| e.label()).collect();
-            bail!("checkpoint {parent} has checkpoints built on it ({}): remove them first, or -f removes them too", children.join(", "));
-        }
-        doomed.extend(more.iter().map(|e| e.id.as_str()));
-    }
-    delete(state, &all, doomed)
+    let order = removal(&all, whats, force)?;
+    delete(state, &all, order)
 }
 
 /// `checkpoint prune`: every checkpoint created before `before` (Unix ms; all without), unless
@@ -128,24 +152,60 @@ pub fn remove(state: &Path, whats: &[String], force: bool) -> Result<Vec<Value>>
 pub fn prune(state: &Path, before: Option<u64>) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
     let all = list(state);
-    let mut doomed: BTreeSet<&str> = all.iter().filter(|e| before.is_none_or(|b| e.manifest.created_unix_ms < b)).map(|e| e.id.as_str()).collect();
-    while let Some(kept) = all.iter().find(|p| doomed.contains(p.id.as_str()) && all.iter().any(|e| !doomed.contains(e.id.as_str()) && e.builds_on(&p.id))) {
-        doomed.remove(kept.id.as_str());
+    let order = pruning(&all, before);
+    delete(state, &all, order)
+}
+
+/// What `remove` deletes, as positions in `all`, in the order it deletes them.
+pub(super) fn removal(all: &[Entry], whats: &[String], force: bool) -> Result<Vec<usize>> {
+    let index = Index::new(all);
+    let mut doomed: BTreeSet<usize> = whats.iter().map(|w| Ok(index.ids[find(all, w)?.id.as_str()])).collect::<Result<_>>()?;
+    let more: BTreeSet<usize> = doomed.iter().flat_map(|i| &index.children[*i]).copied().filter(|i| !doomed.contains(i)).collect();
+    if let Some(&first) = more.first().filter(|_| !force) {
+        let parent = index.parents[first].map_or("", |p| all[p].label());
+        let children: Vec<&str> = more.iter().map(|i| all[*i].label()).collect();
+        bail!("checkpoint {parent} has checkpoints built on it ({}): remove them first, or -f removes them too", children.join(", "));
     }
-    delete(state, &all, doomed)
+    let mut pending: Vec<usize> = more.into_iter().collect();
+    while let Some(i) = pending.pop() {
+        if doomed.insert(i) {
+            pending.extend(&index.children[i]);
+        }
+    }
+    Ok(index.leaf_first(&doomed))
+}
+
+/// What `prune` deletes, as positions in `all`, in the order it deletes them.
+pub(super) fn pruning(all: &[Entry], before: Option<u64>) -> Vec<usize> {
+    let index = Index::new(all);
+    let mut doomed: BTreeSet<usize> = (0..all.len()).filter(|i| before.is_none_or(|b| all[*i].manifest.created_unix_ms < b)).collect();
+    let mut kept: Vec<usize> = (0..all.len()).filter(|i| !doomed.contains(i)).collect();
+    while let Some(i) = kept.pop() {
+        if let Some(p) = index.parents[i].filter(|p| doomed.remove(p)) {
+            kept.push(p);
+        }
+    }
+    index.leaf_first(&doomed)
 }
 
 /// Leaf-first, under the lock: a crash midway leaves whole chains.
-fn delete(state: &Path, all: &[Entry], mut doomed: BTreeSet<&str>) -> Result<Vec<Value>> {
+fn delete(state: &Path, all: &[Entry], order: Vec<usize>) -> Result<Vec<Value>> {
     let store = dir(state);
     for e in std::fs::read_dir(&store)?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(REMOVED) || is_id(&name) && std::fs::symlink_metadata(e.path().join("manifest.json")).is_err() {
+        // Only a missing manifest is a revoked publication: any other error keeps it, and stops.
+        let revoked = is_id(&name)
+            && match std::fs::symlink_metadata(e.path().join("manifest.json")) {
+                Ok(_) => false,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                Err(err) => return Err(std::io::Error::new(err.kind(), format!("checking checkpoint {}: {err}", e.path().display())).into()),
+            };
+        if name.starts_with(REMOVED) || revoked {
             std::fs::remove_dir_all(e.path())?;
         }
     }
     let mut out = vec![];
-    while let Some(e) = all.iter().find(|e| doomed.contains(e.id.as_str()) && !all.iter().any(|c| doomed.contains(c.id.as_str()) && c.builds_on(&e.id))) {
+    for e in order.into_iter().map(|i| &all[i]) {
         if let Some(name) = &e.name {
             crate::util::unlink_durably(&store.join(NAMES).join(name))?;
         }
@@ -153,7 +213,6 @@ fn delete(state: &Path, all: &[Entry], mut doomed: BTreeSet<&str>) -> Result<Vec
         std::fs::rename(&e.dir, &gone)?;
         crate::util::sync_dir(&store)?;
         std::fs::remove_dir_all(&gone)?;
-        doomed.remove(e.id.as_str());
         out.push(json!({"deleted": e.id, "name": e.name}));
     }
     Ok(out)
