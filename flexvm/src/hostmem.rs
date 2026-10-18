@@ -72,7 +72,7 @@ pub fn serve(run: &Path, release: impl Fn()) {
 }
 
 /// Asks every VM process of `host` to release the memory it keeps for its next checkpoint, and waits until each that
-/// runs has, up to `RELEASE_WAIT` (or `deadline`, if sooner); not if a request was made within `RELEASE_GAP_MS`.
+/// runs has, up to `RELEASE_WAIT` (or `deadline`, if sooner). Reuses a request made within `RELEASE_GAP_MS`.
 /// Callers read MemAvailable again after it whatever it found: some may have answered.
 pub fn release_kept(host: &Host, deadline: Option<Instant>) {
     let by = Instant::now() + RELEASE_WAIT;
@@ -82,14 +82,14 @@ pub fn release_kept(host: &Host, deadline: Option<Instant>) {
     }
 }
 
-/// Raises the request's number, under the host lock (each request's is new): None if one was made within
-/// `RELEASE_GAP_MS`, or it cannot be.
+/// Raises the request's number under the host lock, or returns the existing number within `RELEASE_GAP_MS`
+/// so callers still wait for its outstanding answers. None if the lock cannot be taken or the request written.
 fn ask(host: &Host, by: Instant) -> Option<u64> {
     let _l = host.lock_by(Some(by)).ok()?;
     let (n, at) = last(&host.run).unwrap_or_default();
     let now = crate::host::boottime_ms();
     if at != 0 && now.wrapping_sub(at) < RELEASE_GAP_MS {
-        return None;
+        return Some(n);
     }
     let path = request(&host.run);
     match crate::host::private_dir(&locks(&host.run)).map_err(Into::into).and_then(|()| store(&path, &(n + 1, now), false)) {
@@ -194,12 +194,14 @@ mod tests {
         // Waits for the release (a poll and 20 ms), not for the deadline.
         forget_release(&run);
         let n = ask(&h, now()).unwrap();
+        let repeated = ask(&h, now()).expect("a caller within the gap must still wait for outstanding answers");
+        assert_eq!(repeated, n);
         let t = Instant::now();
-        assert!(wait(&run, n, Instant::now() + Duration::from_secs(10)));
+        assert!(wait(&run, repeated, Instant::now() + Duration::from_secs(10)));
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         assert_eq!(released.load(Ordering::SeqCst), 1);
-        // Within a second of the last: not asked again.
-        assert_eq!(ask(&h, now()), None);
+        // Within a second of the last: reuse the answered request without asking again.
+        assert_eq!(ask(&h, now()), Some(n));
         forget_release(&run);
         let n = ask(&h, now()).unwrap();
         assert!(wait(&run, n, now()));
@@ -236,6 +238,24 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(1));
         assert!(!answers(&run).join(gone.key()).exists() && !answers(&run).join(silent.key()).exists(), "pruned");
         drop(dir);
+    }
+
+    #[test]
+    fn requests_within_the_gap_reuse_the_outstanding_number() {
+        let (_dir, h) = crate::host::tests::host("hostmem-gap");
+        let by = Instant::now() + Duration::from_secs(30);
+        let at = 10_000;
+        crate::host::pin_clock(at);
+        member(&h.run, &Ident::me(), 0);
+        let n = ask(&h, by).unwrap();
+        crate::host::pin_clock(at + RELEASE_GAP_MS - 1);
+        assert_eq!(ask(&h, by), Some(n));
+        assert_eq!(last(&h.run), Some((n, at)), "reusing a request does not extend its gap");
+        assert!(!wait(&h.run, n, Instant::now()), "the outstanding answer is still required");
+        member(&h.run, &Ident::me(), n);
+        assert!(wait(&h.run, ask(&h, by).unwrap(), by));
+        crate::host::pin_clock(at + RELEASE_GAP_MS);
+        assert_eq!(ask(&h, by), Some(n + 1), "a fresh request at the gap boundary");
     }
 
     /// A request's number only grows (it is raised under the host lock), so an answer to a later one answers it too.
