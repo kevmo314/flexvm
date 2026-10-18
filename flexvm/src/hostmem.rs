@@ -261,13 +261,16 @@ mod tests {
     /// A request's number only grows (it is raised under the host lock), so an answer to a later one answers it too.
     #[test]
     fn requests_are_numbered_in_order() {
+        // Keep request and answer files private to this test, including when hostmem tests run in parallel.
         let (_dir, h) = crate::host::tests::host("hostmem-order");
-        let by = Instant::now() + Duration::from_secs(5);
+        let by = Instant::now() + Duration::from_secs(30);
+        let at = 10_000;
+        crate::host::pin_clock(at);
         let a = ask(&h, by).unwrap();
-        forget_release(&h.run);
+        crate::host::pin_clock(at + RELEASE_GAP_MS);
         let b = ask(&h, by).unwrap();
         assert_eq!(b, a + 1);
         member(&h.run, &Ident::me(), b);
-        assert!(wait(&h.run, a, by), "a later answer answers it");
+        assert!(wait(&h.run, a, Instant::now()), "a later answer answers it without waiting");
     }
 }
