@@ -1432,6 +1432,7 @@ impl Proc {
 
     /// `kill -s SIGNAL`: to the VM's app, not the VM.
     fn signal_app(&self, req: &Value) -> Result<Value> {
+        let _op = self.op_unless_destroyed()?;
         let vm = self.vm();
         if !self.spec.lock().unwrap().has_app(vm.template.meta.image.as_ref()) {
             bail!("vm {} has no app to signal (its image has no entrypoint or command); flexvm kill {} destroys it", vm.name, vm.name);
@@ -3681,6 +3682,27 @@ mod tests {
             worker.join().unwrap();
             assert_eq!(COUNT.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn signalling_an_app_waits_for_an_operation_and_yields_to_destroy() {
+        let (p, _root) = test_proc("signal-op", None);
+        let held = p.op();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (done, reply) = std::sync::mpsc::channel();
+        let q = p.clone();
+        let signal = thread::spawn(move || {
+            started.send(()).unwrap();
+            done.send(q.signal_app(&json!({"signal": libc::SIGTERM})).map_err(|e| e.to_string())).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(reply.recv_timeout(Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        // A destroy requested during the operation wins before the signal reaches the VM.
+        p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
+        drop(held);
+        let e = reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+        assert!(e.contains("being destroyed"), "{e}");
+        signal.join().unwrap();
     }
 
     #[test]
