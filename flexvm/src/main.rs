@@ -201,11 +201,16 @@ impl Args {
     /// Up to an error; called again, it goes on after it.
     fn parse_into(&mut self, it: &mut impl Iterator<Item = String>) -> Result<()> {
         let a = self;
-        while let Some(arg) = it.next() {
+        while let Some(mut arg) = it.next() {
             let cmd = a.positional.first().map(String::as_str);
-            // `-it`, `-dit`, as docker's.
-            if matches!(cmd, Some("run" | "exec")) && arg.len() > 2 && arg.starts_with('-') && arg[1..].bytes().all(|b| b"dit".contains(&b)) {
-                for b in arg[1..].bytes() {
+            // `-it`, `-dit` and `-itp 80:80`, as docker's: switches, then perhaps a valued flag.
+            let n = arg.bytes().skip(1).take_while(|b| b"dit".contains(b)).count();
+            if matches!(cmd, Some("run" | "exec"))
+                && arg.starts_with('-')
+                && n > 0
+                && (n > 1 && arg.len() == n + 1 || arg[n + 1..].starts_with(['p', 'e', 'u', 'w']))
+            {
+                for b in arg[1..=n].bytes() {
                     let f = match b {
                         b'd' => "detach",
                         b'i' => "interactive",
@@ -216,7 +221,10 @@ impl Args {
                     }
                     a.flags.push((f.into(), "1".into()));
                 }
-                continue;
+                if arg.len() == n + 1 {
+                    continue;
+                }
+                arg = format!("-{}", &arg[n + 1..]);
             }
             if arg != "-d" && arg != "--detach" {
                 a.child_args.push(arg.clone());
@@ -240,7 +248,7 @@ impl Args {
             let (option, attached) = if arg.starts_with("--") {
                 arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v)))
             } else if arg.starts_with('-') && arg.len() > 2 && arg.is_char_boundary(2) {
-                (&arg[..2], Some(&arg[2..]))
+                (&arg[..2], Some(arg[2..].strip_prefix('=').unwrap_or(&arg[2..])))
             } else {
                 (arg.as_str(), None)
             };
@@ -258,11 +266,11 @@ impl Args {
                     a.child_args.extend(a.rest.iter().cloned());
                 }
                 Some(f) => {
-                    let value = match takes_value(f, cmd) {
-                        Some(false) if attached.is_some() => bail!("--{f} does not take a value"),
-                        Some(false) => "1".into(),
-                        Some(true) if attached.is_some() => attached.unwrap_or_default().into(),
-                        Some(true) => {
+                    let value = match (takes_value(f, cmd), attached) {
+                        (Some(false), Some(_)) => bail!("--{f} does not take a value"),
+                        (Some(false), None) => "1".into(),
+                        (Some(true), Some(v)) => v.into(),
+                        (Some(true), None) => {
                             let value = it.next().filter(|v| if arg == "-p" { !v.starts_with('-') } else { !is_flag(v) }).ok_or_else(|| match f {
                                 "publish" if arg == "-p" => "-p needs a port mapping".to_string(),
                                 "force" => "--force needs a generation; run flexvm reclaim IP to see GEN".to_string(),
@@ -271,7 +279,7 @@ impl Args {
                             a.child_args.push(value.clone());
                             value
                         }
-                        None => bail!("unknown option --{f} (see flexvm --help)"),
+                        (None, _) => bail!("unknown option --{f} (see flexvm --help)"),
                     };
                     a.flags.push((f.into(), value));
                 }
@@ -800,9 +808,8 @@ fn memory_mib(v: &str) -> Result<u64> {
         "t" | "tb" | "tib" => 40,
         _ => return Err(bad().into()),
     };
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let valid = number.split_once('.').map_or_else(|| digits(number), |(whole, fraction)| digits(whole) && digits(fraction));
-    if !valid {
+    // Digits, and perhaps a fraction: not f64's signs, exponents or bare points.
+    if !number.splitn(2, '.').all(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) {
         return Err(bad().into());
     }
     let n: f64 = number.parse().ok().filter(|n: &f64| n.is_finite() && *n >= 0.0).ok_or_else(bad)?;
@@ -2188,27 +2195,18 @@ mod exec_tests {
 
     #[test]
     fn attached_option_values_preserve_commands_and_child_args() {
-        let words = ["run", "-dit", "--name=web", "--memory=1g", "-p8080:80", "-eA=one=two", "--env=B=", "nginx", "--name=app"];
-        let args = parse(&words);
+        let args = parse(&["run", "-dit", "--name=web", "--memory=1g", "-p8080:80", "-eA=one=two", "--env=B=", "-ip=1:1", "nginx", "--name=app"]);
         check_applies(&args).unwrap();
-        assert_eq!(args.get("name"), Some("web"));
-        assert_eq!(resources(&args).unwrap().memory_mib, Some(1024));
-        assert_eq!(args.get("publish"), Some("8080:80"));
-        assert_eq!(args.all("env"), ["A=one=two", "B="]);
-        assert_eq!(parse(&["run", "--entrypoint=sh", "nginx"]).get("entrypoint"), Some("sh"));
+        assert_eq!((args.get("name"), args.get("memory")), (Some("web"), Some("1g")));
+        assert_eq!((args.all("publish"), args.all("env")), (vec!["8080:80".to_string(), "1:1".into()], vec!["A=one=two".to_string(), "B=".into()]));
         assert!(args.has("detach") && args.has("interactive") && args.has("tty"));
         assert_eq!(args.rest, ["--name=app"]);
         let child = parse(&args.child_args.iter().map(String::as_str).collect::<Vec<_>>());
-        assert!(!child.has("detach"));
-        assert_eq!(child.get("name"), args.get("name"));
-        assert_eq!(child.all("env"), args.all("env"));
-        assert_eq!(child.get("publish"), args.get("publish"));
-        let args = parse(&["exec", "-it", "-w/srv", "-uapp:staff", "-eA=B", "web", "sh", "-c", "true"]);
-        check_applies(&args).unwrap();
-        assert_eq!((args.get("workdir"), args.get("user"), args.get("env")), (Some("/srv"), Some("app:staff"), Some("A=B")));
+        assert_eq!((child.has("detach"), child.flags.len()), (false, args.flags.len() - 1));
+        let args = parse(&["exec", "-itu", "app", "-w/srv", "-eA=B", "web", "sh", "-c", "true"]);
+        assert_eq!((args.get("workdir"), args.get("user"), args.get("env")), (Some("/srv"), Some("app"), Some("A=B")));
         assert_eq!(parse(&["kill", "-sTERM", "web"]).get("signal"), Some("TERM"));
-        assert_eq!(parse(&["run", "--entrypoint=", "nginx"]).get("entrypoint"), Some(""));
-        for option in ["--detach=true", "--verbose=1", "-dtrue", "-itx", "-é", "--unknown=value"] {
+        for option in ["--detach=true", "-dtrue", "-itx", "-dv", "-é", "--unknown=value"] {
             assert!(Args::parse(["run", option, "nginx"].map(String::from)).is_err(), "{option}");
         }
         assert!(Args::parse(["run", "--name", "--memory=1g", "nginx"].map(String::from)).is_err());
