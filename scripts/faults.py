@@ -874,17 +874,27 @@ def quiet_source():
     t = tx()
     time.sleep(0.3)
     check("quiet source: flood reaches the tap while running", tx() > t + 10, (t, tx()))
-    r = ok(migrate(A, n, B))
-    paused = where(n).get(A) == "source"
-    flags = int(open(f"{sysfs}/flags").read(), 16) if os.path.exists(sysfs) else 0
-    routed = to_tap()
-    t0 = tx() if os.path.exists(sysfs) else None
-    time.sleep(0.3)
-    t1 = tx() if os.path.exists(sysfs) else None
+    # Every page reply a second late: the target's pull is unfinished, so the source stays
+    # (paused, its tap there) through the sampling, rather than for as long as the pull happens to take.
+    # (The downtime printed below includes the slowed preload.)
+    with armed_fault(A, "pages_slow", 120000):
+        r = ok(migrate(A, n, B))
+        paused = where(n).get(A) == "source"
+        # Each sample needs the tap: one gone reads as down, unroutable and quiet, and proves nothing.
+        there = os.path.exists(sysfs)
+        flags = int(open(f"{sysfs}/flags").read(), 16) if there else None
+        routed = to_tap()
+        t0 = tx() if there else None
+        time.sleep(0.3)
+        there = there and os.path.exists(sysfs)
+        t1 = tx() if there else None
+        paused = paused and where(n).get(A) == "source"
     check("quiet source: still paused while sampled", paused, where(n))
-    check("quiet source: tap down while paused", flags & 1 == 0, hex(flags))
-    check("quiet source: cannot route to the tap while paused", routed.returncode != 0, routed.stderr.strip())
-    check("quiet source: no packets to the tap while paused", t0 == t1, (t0, t1))
+    check("quiet source: its tap still there while paused", there, tap)
+    check("quiet source: tap down while paused", flags is not None and flags & 1 == 0, flags is not None and hex(flags))
+    check("quiet source: cannot route to the tap while paused", there and routed.returncode != 0 and "Cannot find device" not in routed.stderr,
+          routed.stderr.strip())
+    check("quiet source: no packets to the tap while paused", t0 is not None and t0 == t1, (t0, t1))
     # The source closed its side; the exec client, which reaches this host
     # only, ends saying where the VM went (the command runs on there).
     _, err = communicate_process(session, 60)
@@ -943,7 +953,7 @@ def target_killed():
         fault(B, "status", 0)
         st = peer(B, {"op": "migration", "mig": int(newest)})
         check("target killed: aborted, only once its firecracker is dead",
-              st.get("ok") and st["result"]["outcome"] == "aborted" and not any(alive(p) for p in fcs), (st, fcs))
+              st.get("ok") and st["result"]["outcome"] == "aborted" and fcs and not any(alive(p) for p in fcs), (st, fcs))
         # The listener restarts too: nothing it knows is in memory.
         restart_listeners("target killed")
     check("target killed: the source never lets go, and runs its copy again",
@@ -1335,7 +1345,10 @@ def exec_background():
             buf = receive_until(s, lambda buf: until not in buf)
             return buf
 
-    started = session({"action": "start", "cmd": {"argv": ["sh", "-c", "echo ready; sleep 8; echo done"]}}, b"ready")
+    # Still running after the resume: it ends only once told to, after the reattach (a command that
+    # ended during the pause would leave no running session to sweep, and prove nothing).
+    go = "/tmp/exec-bg-go"
+    started = session({"action": "start", "cmd": {"argv": ["sh", "-c", f"echo ready; while [ ! -e {go} ]; do sleep 0.1; done; echo done"]}}, b"ready")
     check("exec bg: a session started, then its client left", b"ready" in started, started[-200:])
     # Heartbeats find the client gone within about 2 s.
     time.sleep(4)
@@ -1346,8 +1359,18 @@ def exec_background():
     resume(A, n)
     counted = uptime() - before
     check("exec bg: the guest's clock counted the pause", counted >= 12, counted)
-    out = session({"action": "attach", "offset": 0}, b"done")
-    check("exec bg: a session whose client left just before a long pause reattaches after it", b"done" in out, out[-200:])
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(30)
+        s.connect(sock)
+        s.sendall((json.dumps({"op": "exec", "session": sid, "action": "attach", "offset": 0}) + "\n").encode())
+        out = receive_until(s, lambda buf: b"ready" not in buf)
+        running = b"ready" in out and b"done" not in out
+        if running:
+            sh(A, n, f"touch {go}")
+            out += receive_until(s, lambda buf: b"done" not in buf)
+    check("exec bg: a session whose client left just before a long pause reattaches after it, still running",
+          running and b"done" in out, out[-200:])
+    sh(A, n, f"rm -f {go}")
     sh(A, n, f"rm -f {knob}")
 
 
@@ -1663,7 +1686,8 @@ def abort_superseded():
     r = res.get("r", {})
     check("abort superseded: migration failed", not r.get("ok"), r)
     check("abort superseded: source not resumed, destroyed", wait_for(lambda: n not in vms(A), 10), where(n))
-    check("abort superseded: says why", "superseded" in log(A, n), log(A, n)[-300:])
+    # Not just "superseded": the VM's name (ft-superseded) is on every line.
+    check("abort superseded: says why", "was superseded meanwhile" in log(A, n), log(A, n)[-300:])
     check("abort superseded: running nowhere", where(n) == {}, where(n))
     route = subprocess.run(["ip", "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
     check("abort superseded: the address routes to the replacement, not the hold", f"via {gw}" in route, route)
@@ -4835,8 +4859,9 @@ def cow_collapsed():
         raise Skip("transparent huge pages are disabled here")
     n, paths = "ft-huge", [ckpt_path("ft-huge0"), ckpt_path("ft-huge1")]
     ok(run(A, n))
-    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 2>/dev/null; md5sum /tmp/f")
-    m = out.split()[0]
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 iflag=fullblock 2>/dev/null && wc -c </tmp/f && md5sum /tmp/f")
+    assert code == 0 and out.split()[0] == str(200 << 20), (code, out)
+    m = out.split()[1]
     start_writer(A, n, mib=64)
     ok(migrate(A, n, B))
     st = wait_released(B, n)
@@ -5123,6 +5148,8 @@ def cow_crash():
     r = restore(B, path, ip="auto")
     check("cow crash: nothing to restore", not r["ok"], r)
     partial = [os.path.join(args.ckpt_dir, f, "ck") for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    # The killed copy's staging is left (nothing ran to remove it): else the checks of it below check nothing.
+    check("cow crash: the killed copy left its staging directory", partial, os.listdir(args.ckpt_dir))
     for f in partial:
         r = restore(B, f, ip="auto")
         check("cow crash: the partial directory does not restore", not r["ok"], r)
@@ -5203,8 +5230,9 @@ def ckpt_incremental():
     ok(run(A, n))
     r = checkpoint(A, n, paths[0], incremental=True)
     check("incremental: refused without a base", not r["ok"] and "build on" in r["error"], r)
-    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 2>/dev/null; md5sum /tmp/f")
-    m = out.split()[0]
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 iflag=fullblock 2>/dev/null && wc -c </tmp/f && md5sum /tmp/f")
+    assert code == 0 and out.split()[0] == str(200 << 20), (code, out)
+    m = out.split()[1]
     start_writer(A, n, mib=4)
     with armed_fault(A, "ckpt_memhash", 120000):
         res = []
@@ -5223,7 +5251,7 @@ def ckpt_incremental():
     for i, x in ((2, "ft-inc3"), (1, "ft-inc2")):
         ok(restore(B, paths[i], name=x, ip="auto"))
         errors, _, out = writer_check(B, x)
-        check(f"incremental: restore of link {i} intact", errors == 0 and md5(B, x).startswith(m), out)
+        check(f"incremental: restore of link {i} intact", errors == 0 and md5(B, x) == m, out)
         cleanup(x)
     # A VM that stops is never stopped onto a chain whose page data is bad. Every 64th page
     # of the base is: the deltas replace some of its pages, never all of these (/tmp/f's).
@@ -6173,6 +6201,8 @@ class Watch:
     def __init__(self, host, names):
         self.host, self.stop = host, threading.Event()
         self.socks, self.ticks, self.asks, self.avail = {}, {n: [] for n in names}, {n: [] for n in names}, []
+        # Polls of its controller that went unanswered while it still ran here (a timeout is one).
+        self.stuck = {n: [] for n in names}
         for n in names:
             v = vms(host)[n]
             total = v["guest_mib"]
@@ -6209,12 +6239,23 @@ class Watch:
 
     def tick(self, n):
         while not self.stop.wait(0.25):
+            t = time.time()
             try:
                 r = control(self.host, n, {"op": "debug", "what": "status"}, timeout=10)
-            except OSError:
-                return
+            except (OSError, ValueError) as e:
+                # Gone from here (moved away): no controller left to poll. A poll that timed out
+                # waited on a controller that never answered: never polling on would hide that.
+                if not isinstance(e, TimeoutError) and registry_state(self.host, n) != "running":
+                    return
+                self.stuck[n].append((round((time.time() - t) * 1000), f"{type(e).__name__}: {e}"))
+                continue
             if r.get("ok") and r["result"].get("controller"):
                 self.ticks[n].append(r["result"]["controller"])
+            elif registry_state(self.host, n) == "running":
+                # An error reply (a hang-up, say) from a VM still running here is no tick either.
+                self.stuck[n].append((round((time.time() - t) * 1000), f"reply: {json.dumps(r)[:200]}"))
+            else:
+                return
 
     def mem(self):
         while not self.stop.wait(0.1):
@@ -6230,7 +6271,9 @@ class Watch:
             during = [g for t, g in gaps.items() if seen and t > seen[0]["ticks"]]
             overdue = max((c["since_last_ms"] or 0 for c in seen), default=0)
             lat = sorted(a[0] * 1000 for a in self.asks[n])
-            out[n] = {"tick_gap_max_ms": round(max(during + [overdue], default=0)), "ticks": len(during),
+            # An unanswered poll counts as a gap as long as it waited.
+            out[n] = {"tick_gap_max_ms": round(max(during + [overdue] + [ms for ms, _ in self.stuck[n]], default=0)), "ticks": len(during),
+                      "stuck": self.stuck[n][:3],
                       "asks": len(lat), "ask_max_ms": round(max(lat, default=0), 1),
                       "ask_p50_ms": round(lat[len(lat) // 2], 1) if lat else None,
                       "replies": sorted(set(a[1] for a in self.asks[n]))}
@@ -6384,7 +6427,7 @@ def evict_grower():
     check("evict grower: the bigger, static vms stayed", all(where(n) == {A: "running"} for n in big), {n: where(n) for n in big})
     check("evict grower: moved under the high-water mark, above the reserve", moved is not None and reserve < moved[1] < high + 200, moved)
     check("evict grower: the host never got to its reserve", min(a for _, a in w.avail) > reserve, min(a for _, a in w.avail))
-    check("evict grower: every controller ticked within 2.5 s", all(r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
+    check("evict grower: every controller ticked within 2.5 s", all(r["ticks"] > 0 and not r["stuck"] and r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
     check("evict grower: memory requests answered within the guest's 2 s",
           all(r["asks"] > 0 and r["ask_max_ms"] < 2000 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
     check("evict grower: md5s intact", md5(B, g) == sums[g] and all(md5(A, n) == sums[n] for n in big))
@@ -6441,6 +6484,8 @@ def evict_peer_busy():
     is a refusal like any other: backed off, and the VM moves to the next peer."""
     n = "ft-ev-peer-busy"
     m = setup(n, mib=1)
+    # The backoff is keyed by the deciding VM process's identity (`Ident::key`: PID-START) and the peer.
+    v = vms(A)[n]
     with busy_peer() as stub:
         configure(A, peers=[stub.addr, B.addr])
         try:
@@ -6452,7 +6497,7 @@ def evict_peer_busy():
         backoff = json.load(f)
     check("evict peer busy: the stub was asked", "migrate_in" in stub.asked, stub.asked)
     check("evict peer busy: moved to the next peer", moved, (where(n), log(A, n)[-1500:]))
-    check("evict peer busy: the stub is backed off", f"{n} {stub.addr}" in backoff, backoff)
+    check("evict peer busy: the stub is backed off", f"{v['pid']}-{v['start']} {stub.addr}" in backoff, backoff)
     check("evict peer busy: md5 intact", md5(B, n) == m)
     cleanup(n)
 
@@ -6526,7 +6571,7 @@ def evict_latency():
     fault(B, "incoming_stall", 0)
     rep = w.report("evict latency: during the eviction")
     check("evict latency: moved to B", moved, (where(n), log(A, n)[-1500:]))
-    check("evict latency: every controller ticked within 2.5 s", all(r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
+    check("evict latency: every controller ticked within 2.5 s", all(r["ticks"] > 0 and not r["stuck"] and r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
     check("evict latency: memory requests answered within the guest's 2 s",
           all(r["asks"] > 0 and r["ask_max_ms"] < 2000 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
     # Its source, paused at its mark through the pull, is not starved: nothing else moves for it.
@@ -7212,11 +7257,12 @@ def spoof_filter():
     def send(h, vm, sources):
         """From each source (added to eth0 for the send if the guest lacks it), three datagrams
         to the host's tap address; returns {source: what the host got from where}."""
-        cmd = "; ".join(f"ip addr add {src}/32 dev eth0 2>/dev/null && added=1 || added=0; "
-                        f"for i in 1 2 3; do echo {src} | socat -u - UDP-SENDTO:169.254.1.2:{port},bind={src}; done; "
-                        f"[ $added = 1 ] && ip addr del {src}/32 dev eth0" for src in sources) + "; true"
+        # Each send must leave the guest (`sent SRC 3`): one that failed there is no proof of a drop at the tap.
+        cmd = "; ".join(f"ip addr add {src}/32 dev eth0 2>/dev/null && added=1 || added=0; sent=0; "
+                        f"for i in 1 2 3; do echo {src} | socat -u - UDP-SENDTO:169.254.1.2:{port},bind={src} && sent=$((sent + 1)); done; "
+                        f"if [ $added = 1 ]; then ip addr del {src}/32 dev eth0; fi; echo sent {src} $sent" for src in sources)
         code, out = sh(h, vm, cmd)
-        assert code == 0, out
+        assert code == 0 and out.splitlines() == [f"sent {src} 3" for src in sources], out
         got, end = {}, time.time() + 1.5
         while time.time() < end:
             try:
@@ -7410,14 +7456,16 @@ def incoming_killed():
         holder = json.load(open(lock))
         pid, work = holder["pid"], os.path.join(B.run, "w", f"{holder['pid']}-{holder['start']}")
         time.sleep(1)
-        fcs = [json.load(open(os.path.join(d, "fc")))["pid"] for d in
-               [os.path.join(work, e) for e in os.listdir(work)] if os.path.exists(os.path.join(d, "fc"))]
+        find = lambda: [json.load(open(os.path.join(d, "fc")))["pid"] for d in
+                        [os.path.join(work, e) for e in os.listdir(work)] if os.path.exists(os.path.join(d, "fc"))]
+        # Its Firecracker found, or the check that it is gone below is over none.
+        fcs = wait_for(lambda: find() if os.path.isdir(work) else [], 10) or []
         os.kill(pid, signal.SIGKILL)
         t.join()
     check("incoming killed: addressed held at the kill", addr(B, ip).get("holder") == n, addr(B, ip))
     st = peer(B, {"op": "migration", "mig": mig[0]})
     check("incoming killed: its migration is aborted, once its firecracker is gone",
-          st.get("ok") and st["result"]["outcome"] == "aborted" and not any(alive(p) for p in fcs), (st, fcs))
+          st.get("ok") and st["result"]["outcome"] == "aborted" and fcs and not any(alive(p) for p in fcs), (st, fcs))
     r2 = run(B, n, ip=None)
     check("incoming killed: the name is usable", r2["ok"], r2)
     kill(B, n)
@@ -7908,7 +7956,7 @@ def standby_stalled():
         rep = w.report("standby stalled: under the reserve")
         check("standby stalled: under the reserve, one that cannot exit still marks the pressure", marked and alive(pid), (before, mtime(pressure)))
         check("standby stalled: and holds eviction off no longer", evicting)
-        check("standby stalled: the controller ticks on meanwhile", all(r["tick_gap_max_ms"] < 1600 for r in rep.values()), rep)
+        check("standby stalled: the controller ticks on meanwhile", all(r["ticks"] > 0 and not r["stuck"] and r["tick_gap_max_ms"] < 1600 for r in rep.values()), rep)
     finally:
         os.kill(pid, signal.SIGCONT)
     check("standby stalled: it exits once it can", wait_for(lambda: not alive(pid), 10))
@@ -9335,7 +9383,8 @@ def rmi_suspend():
     here"), and the VM resumes. An rmi by id once the VM is gone removes it."""
     n, tpl = "ft-rmi-suspend", f"ft-rmi-{os.getpid()}"
     tdir = os.path.join(A.state, "templates")
-    code, out, err = cli(A, "pull", args.image, "--tag", tpl, "--vcpus", "1", "--max", "512", timeout=600)
+    # An app that runs on (the image's own, a shell with no input, exits at once, and its VM with it).
+    code, out, err = cli(A, "pull", args.image, "--tag", tpl, "--vcpus", "1", "--max", "512", "--cmd", json.dumps(["sleep", "1000000"]), timeout=600)
     assert code == 0, err or out
     gid = os.path.basename(os.readlink(os.path.join(tdir, tpl)))
     gen = os.path.join(tdir, ".gen", gid)

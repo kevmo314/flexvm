@@ -160,10 +160,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // root: auth.json's owner must be root (CI's root step runs it)
     fn credentials_are_private_and_logout_preserves_other_registries() {
-        if unsafe { libc::geteuid() } != 0 {
-            return;
-        }
+        crate::test_util::assert_root();
         let dir = crate::test_util::TempDir::new("auth");
         update(&dir, "ghcr.io", Some("first")).unwrap();
         update(&dir, "registry-1.docker.io", Some("second")).unwrap();

@@ -6,6 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 
+/// An `#[ignore]`d test that needs root fails, not passes, without it: CI runs them under sudo
+/// (`cargo test -- --ignored`), and one that returned early there would check nothing.
+#[allow(dead_code)] // not every crate that shares this file has one
+pub fn assert_root() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "a root-only test: run it as root (cargo test -- --ignored, under sudo)");
+}
+
 /// Kills and reaps a helper process even when its test unwinds.
 pub struct ChildGuard(pub std::process::Child);
 
