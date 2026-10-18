@@ -1,6 +1,7 @@
 //! The prebuilt patched Firecracker and guest kernel: on first use, a missing `STATE/artifacts/firecracker` or
 //! `vmlinux` is downloaded from the release scripts/versions.sh names (`ARTIFACTS_TAG`), checked against the sha256
-//! scripts/checksums.sha256 pins for it (build.rs), and renamed into place. A file already there must match the pin.
+//! scripts/checksums.sha256 pins for it (build.rs), and renamed into place. A file already there must match the pin,
+//! and a VM process checks its Firecracker against it too (`check_pinned`).
 //! Only a build without a pin accepts a recorded file, built with the scripts or copied in for an offline host: `NAME.sha256`
 //! beside it holds the sha256 of a file the scripts built or verified (scripts/build-firecracker.sh and fetch.sh
 //! write it), which is all a build pinning no release can go by. Anything else (a corrupted or replaced download, a
@@ -14,6 +15,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use crate::bail;
+use crate::template::Stamp;
 use crate::util::{sync_dir, Result};
 
 /// flexvm-init (guest/), static, as build.rs built it: PID 1 and the guest agent, written into every image template.
@@ -81,6 +83,33 @@ fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> R
     Ok(())
 }
 
+/// A VM process's Firecracker must be the pinned one too: `ensure` checks only when a template is built, so after
+/// an upgrade to a build pinning another release, the old binary would go on running every VM of an old template
+/// (and their migrations fail on hosts with the pinned one). Its sha256 is cached in the run directory by the
+/// file's stat, as compat caches its identity, so only a changed file is hashed again.
+pub fn check_pinned(path: &Path, asset: &Asset) -> Result<()> {
+    match if cfg!(test) { None } else { asset.sha256 } {
+        Some(pin) => check_pinned_with(path, asset, pin, crate::host::run_dir()),
+        None => Ok(()),
+    }
+}
+
+fn check_pinned_with(path: &Path, asset: &Asset, pin: &str, run: Option<&Path>) -> Result<()> {
+    let stamp = || -> Result<Stamp> { Ok(Stamp::of(&std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?)) };
+    let before = stamp()?;
+    let cache = format!("{}.pinned.json", asset.name);
+    let cached = run.and_then(|d| std::fs::read(d.join(&cache)).ok()).and_then(|b| serde_json::from_slice::<(Stamp, String)>(&b).ok());
+    if cached.is_some_and(|(s, p)| s == before && p == pin) {
+        return Ok(());
+    }
+    check_existing(path, asset, Some(pin))?;
+    // Cached only if the file hashed was the one stat-ed.
+    if let Some(run) = run.filter(|_| stamp().is_ok_and(|after| after == before)) {
+        let _ = crate::util::write_file(run, &cache, &serde_json::to_vec(&(before, pin))?, false);
+    }
+    Ok(())
+}
+
 /// Where the sha256 (hex) of a file the scripts built or verified at `path` is recorded: the first word of a line.
 fn record_path(path: &Path) -> std::path::PathBuf {
     let mut record = path.as_os_str().to_owned();
@@ -100,7 +129,12 @@ fn check_existing(path: &Path, asset: &Asset, sha256: Option<&str>) -> Result<()
         if got == pin {
             return Ok(());
         }
-        bail!("{}: not the pinned {} (sha256 {got}, pinned {pin}), so it is not run. Remove it to download the pinned one.", path.display(), asset.name);
+        bail!(
+            "{}: not the pinned {} (sha256 {got}, pinned {pin}: from another release, or built here), so it is not run. \
+             Remove it to download the pinned one, then pull templates built with it again.",
+            path.display(),
+            asset.name
+        );
     }
     let record = record_path(path);
     let recorded = std::fs::read_to_string(&record).unwrap_or_default();
@@ -252,6 +286,35 @@ mod tests {
         assert!(!error.contains("record it"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), b"old release");
         ensure_one(&path, &FIRECRACKER, None, "http://127.0.0.1:1").unwrap();
+    }
+
+    #[test]
+    fn a_vm_runs_only_the_pinned_firecracker_and_caches_the_check_by_stat() {
+        let dir = crate::test_util::TempDir::new("artifacts-run");
+        let run = dir.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let path = dir.join("firecracker");
+        let (old, pin) = (hex(b"old release"), hex(b"new release"));
+        std::fs::write(&path, b"old release").unwrap();
+        std::fs::write(record_path(&path), format!("{old}  downloaded by flexvm from an older release\n")).unwrap();
+        let error = check_pinned_with(&path, &FIRECRACKER, &pin, Some(&run)).unwrap_err().to_string();
+        assert!(error.contains(&format!("sha256 {old}, pinned {pin}")) && error.contains("Remove it"), "{error}");
+        assert!(!run.join("firecracker.pinned.json").exists());
+        // The pinned one: checked once, then trusted while its stat is unchanged.
+        std::fs::write(dir.join("new"), b"new release").unwrap();
+        std::fs::rename(dir.join("new"), &path).unwrap();
+        check_pinned_with(&path, &FIRECRACKER, &pin, Some(&run)).unwrap();
+        assert!(run.join("firecracker.pinned.json").exists());
+        check_pinned_with(&path, &FIRECRACKER, &pin, Some(&run)).unwrap();
+        // The cache names the pin it checked: another one checks again.
+        assert!(check_pinned_with(&path, &FIRECRACKER, &old, Some(&run)).is_err());
+        // Replaced (a new inode): hashed again, and refused.
+        std::fs::write(dir.join("new"), b"old release").unwrap();
+        std::fs::rename(dir.join("new"), &path).unwrap();
+        assert!(check_pinned_with(&path, &FIRECRACKER, &pin, Some(&run)).is_err());
+        // No run directory: checked every time.
+        assert!(check_pinned_with(&path, &FIRECRACKER, &pin, None).is_err());
+        check_pinned_with(&path, &FIRECRACKER, &old, None).unwrap();
     }
 
     #[test]

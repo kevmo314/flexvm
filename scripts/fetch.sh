@@ -98,9 +98,11 @@ record() {
 firecracker_fetched() {
   if [[ $FC_URL != *.tgz ]]; then fetched firecracker "$FC_URL"; return; fi
   local checksum
-  checksum=$(sudo awk 'NR == 1 {print $1}' "$out/firecracker.sha256" 2> /dev/null) || return 1
-  [[ $checksum =~ ^[[:xdigit:]]{64}$ ]] || return 1
-  printf '%s  %s\n' "$checksum" "$out/firecracker" | sudo sha256sum --check --status
+  checksum=$(sudo awk 'NR == 1 {print $1}' "$out/firecracker.sha256" 2> /dev/null) || checksum=
+  if ! [[ $checksum =~ ^[[:xdigit:]]{64}$ ]] || ! printf '%s  %s\n' "$checksum" "$out/firecracker" | sudo sha256sum --check --status; then
+    echo "$out/firecracker is not recorded in firecracker.sha256; fetching it again"
+    return 1
+  fi
 }
 
 if [ -z "$only_kernel" ]; then
