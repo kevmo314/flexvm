@@ -897,8 +897,9 @@ def port_forward():
     check("migrate: freed on the source", wait_for(lambda: free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM), 60))
     check("migrate: none on the target", not B.ps()[vm].get("ports"), B.ps()[vm])
     B.kill(vm)
-    # The source's process lets the name go once the move is final.
-    check("migrate: the source lets the name go", wait_for(lambda: vm not in A.ps(), 60), A.ps().get(vm))
+    # The source's process lets the name go once the move is final: its lock file goes last.
+    lock = os.path.join(A.run_dir, "vms", ".locks", f"{vm}.lock")
+    check("migrate: the source lets the name go", wait_for(lambda: not os.path.exists(lock), 60), A.ps().get(vm))
     A.run_json(vm, extra=fwd)
     A.kill(vm)
     check("kill: frees the ports", free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM))
