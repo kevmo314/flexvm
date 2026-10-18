@@ -891,6 +891,19 @@ mod tests {
 
     #[test]
     fn a_new_name_with_a_record_is_refused_and_the_record_kept() {
+        const CHILD: &str = "FLEXVM_TEST_UNRECORDED_NAME";
+        if std::env::var_os(CHILD).is_none() {
+            // A refused name closes its flock without an explicit unlock. Another
+            // test's fork can inherit that descriptor until exec, making alive()
+            // briefly true even though these Host directories are unique.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "containers::tests::a_new_name_with_a_record_is_refused_and_the_record_kept"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "unrecorded name child: {status}");
+            return;
+        }
         let (_d, host) = host("unrecorded");
         std::fs::write(host.vms("db", "lost").unwrap(), "rebooted").unwrap();
         assert!(host.take_unrecorded_name("db").err().unwrap().to_string().contains("lost"));
