@@ -4,7 +4,7 @@ name: Release artifacts
 # release flexvm downloads from on first use. The tag must be ARTIFACTS_TAG in scripts/versions.sh at the
 # tagged commit. Afterwards, scripts/pin-artifacts.sh pins the assets' sha256 in scripts/checksums.sha256
 # (a follow-up commit) once their build provenance (attested here) verifies: from then on, flexvm builds
-# download them. A release's assets never change.
+# download them. A release's assets never change. The steps: RELEASING in README.md.
 
 on:
   push:
@@ -20,6 +20,7 @@ concurrency:
 jobs:
   release:
     name: build and publish ${{ github.ref_name }}
+    # The runner image is one of the release's inputs (scripts/pin-artifacts.sh reads this line).
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -49,26 +50,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      # Firecracker builds with the toolchain its own rust-toolchain.toml pins (rustup installs it).
-      - name: Build Firecracker
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
-          ./scripts/build-firecracker.sh --state "$RUNNER_TEMP/state"
-
-      - name: Fetch the kernel
-        run: ./scripts/fetch.sh --state "$RUNNER_TEMP/state" --kernel
-
-      - name: Assets
-        run: |
-          out=$RUNNER_TEMP/assets
-          mkdir -p "$out"
-          install -m 755 "$RUNNER_TEMP/state/artifacts/firecracker" "$out/firecracker"
-          install -m 644 "$RUNNER_TEMP/state/artifacts/vmlinux" "$out/vmlinux"
-          ./scripts/pin-artifacts.sh --inputs > "$out/inputs.txt"
-          (cd "$out" && sha256sum firecracker vmlinux inputs.txt > SHA256SUMS)
-          "$out/firecracker" --version
-          cat "$out/inputs.txt" "$out/SHA256SUMS"
+      # The recipe (hashed into inputs.txt, with this job's runs-on: scripts/pin-artifacts.sh --inputs).
+      - name: Build the assets
+        run: ./scripts/release-assets.sh "$RUNNER_TEMP/state" "$RUNNER_TEMP/assets"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

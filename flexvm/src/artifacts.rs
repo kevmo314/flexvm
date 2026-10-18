@@ -1,7 +1,8 @@
 //! The prebuilt patched Firecracker and guest kernel: on first use, a missing `STATE/artifacts/firecracker` or
 //! `vmlinux` is downloaded from the release scripts/versions.sh names (`ARTIFACTS_TAG`), checked against the sha256
 //! scripts/checksums.sha256 pins for it (build.rs), and renamed into place. A file already there is used as it is:
-//! one built with the scripts, or copied in for an offline host. Every host that migrates VMs to another needs
+//! one built with the scripts, or copied in for an offline host; it is checked against the pin, and one that differs
+//! is used with a warning (a host's own build never matches it). Every host that migrates VMs to another needs
 //! byte-identical Firecracker; hosts built from the same pins get it.
 
 use std::fs::File;
@@ -54,6 +55,18 @@ pub fn ensure(want: &[(&Path, &Asset)]) -> Result<()> {
 
 fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> Result<()> {
     if path.exists() {
+        if let Some(sha256) = sha256 {
+            match pinned_file(path, sha256) {
+                Ok(None) => {}
+                Ok(Some(got)) => crate::log!(
+                    "flexvm: warning: {} is not the pinned {} ({got}, pinned sha256:{sha256}): using it as it is (one built or copied \
+                     by hand?); remove it to download the pinned one",
+                    path.display(),
+                    asset.name
+                ),
+                Err(e) => crate::log!("flexvm: warning: {}: cannot check it against its pinned sha256: {e}", path.display()),
+            }
+        }
         return Ok(());
     }
     let Some(sha256) = sha256 else {
@@ -76,6 +89,14 @@ fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> R
     })?;
     crate::log!("flexvm: installed {}", path.display());
     Ok(())
+}
+
+/// `None` if the file at `path` has the pinned sha256, or the digest it has instead.
+fn pinned_file(path: &Path, sha256: &str) -> Result<Option<String>> {
+    let mut f = crate::image::Hashed::new(File::open(path)?);
+    std::io::copy(&mut f, &mut std::io::sink())?;
+    let got = f.digest();
+    Ok((got.strip_prefix("sha256:") != Some(sha256)).then_some(got))
 }
 
 /// `url` into `path`, written to a part of its own beside it and renamed over it once its sha256 checks: a
@@ -165,7 +186,8 @@ mod tests {
         ensure_one(&path, &FIRECRACKER, Some(&hex(b"patched firecracker")), &format!("{base}/moved")).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"patched firecracker");
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
-        // There now: never fetched again (the server is gone), whatever its content.
+        // There now: never fetched again (the server is gone), whatever its content (one that differs from the pin is
+        // used with a warning).
         std::fs::write(&path, b"built by hand").unwrap();
         ensure_one(&path, &FIRECRACKER, Some(&hex(b"other")), "http://127.0.0.1:1").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"built by hand");
@@ -183,6 +205,18 @@ mod tests {
         assert!(!path.exists());
         // Nothing left beside it either.
         assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_existing_file_is_checked_against_its_pin() {
+        let dir = crate::test_util::TempDir::new("artifacts-existing");
+        let path = dir.join("firecracker");
+        std::fs::write(&path, b"patched firecracker").unwrap();
+        assert_eq!(pinned_file(&path, &hex(b"patched firecracker")).unwrap(), None);
+        // Cut short, or built by hand: its own digest.
+        std::fs::write(&path, b"patched").unwrap();
+        assert_eq!(pinned_file(&path, &hex(b"patched firecracker")).unwrap(), Some(format!("sha256:{}", hex(b"patched"))));
+        assert!(pinned_file(&dir.join("missing"), &hex(b"x")).is_err());
     }
 
     #[test]

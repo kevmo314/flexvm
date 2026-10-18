@@ -44,6 +44,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The whole history: "Pinned artifacts release" tells how long a release has been pending from it.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -61,10 +63,32 @@ jobs:
         run: |
           sudo modprobe tun
           cargo test -p flexvm -p flexvm-init --config 'target.x86_64-unknown-linux-gnu.runner="sudo -E"' -- --ignored
-      # The pinned artifacts release (what `cargo build` users download) must be pinned, and built from
-      # this checkout's Firecracker patches and kernel; a change to them needs a new one (scripts/versions.sh).
+      # The artifacts release (what `cargo build` users download) must be built from this checkout's inputs
+      # (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG in the same change, or fails
+      # here, PR or main. A bumped tag is pending until it is released and pinned (RELEASING in README.md): a
+      # warning, but on main (push, nightly) a failure once it has been pending for the release window.
       - name: Pinned artifacts release
-        run: ./scripts/pin-artifacts.sh --check || echo "::warning::the artifacts release is not pinned, or is stale; see scripts/versions.sh"
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          status=0
+          ./scripts/pin-artifacts.sh --check || status=$?
+          case $status in
+            0) ;;
+            3) echo "::warning::the artifacts release is pending: tag, release and pin it (RELEASING in README.md)" ;;
+            4)
+              if [ "$EVENT" = pull_request ]; then
+                echo "::warning::the artifacts release has been pending for longer than the release window (RELEASING in README.md)"
+              else
+                echo "::error::the artifacts release has been pending for longer than the release window: tag, release and pin it (RELEASING in README.md)"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::the artifacts release is stale (built from other inputs than this checkout's) or its pins are broken: bump ARTIFACTS_TAG in scripts/versions.sh (RELEASING in README.md)"
+              exit 1
+              ;;
+          esac
       - name: e2e scheduler self-test
         # Fake templates and workers, one of which cannot be spawned: its cases must fail.
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
@@ -117,7 +141,7 @@ jobs:
       # Cache keys: the build inputs in the repo, what fetch.sh resolves (versions and
       # URLs, plus the ETags of the unversioned S3 objects), and the build environment
       # (runner image; Firecracker's toolchain is
-      # pinned by its tag, which the URL list carries).
+      # pinned by its commit, FC_COMMIT in scripts/versions.sh, part of the Firecracker cache key).
       - name: Cache keys
         id: keys
         run: |
