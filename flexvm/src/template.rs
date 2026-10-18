@@ -1046,7 +1046,9 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
     if len > MAX_META {
         bail!("template {id}: {len} bytes of metadata");
     }
-    let mut meta: Meta = serde_json::from_slice(&read_vec(r, len)?).map_err(|e| format!("template {id}: its metadata: {e}"))?;
+    let mut bytes = vec![0u8; len as usize];
+    r.read_exact(&mut bytes)?;
+    let mut meta: Meta = serde_json::from_slice(&bytes).map_err(|e| format!("template {id}: its metadata: {e}"))?;
     if meta.id != id || !meta.identified() {
         bail!("template {id}: the metadata sent is not that template's");
     }
@@ -1117,12 +1119,6 @@ fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
         *w = u64::from_le_bytes(b);
     }
     Ok(out)
-}
-
-fn read_vec(r: &mut impl Read, len: u64) -> Result<Vec<u8>> {
-    let mut v = vec![0u8; len as usize];
-    r.read_exact(&mut v)?;
-    Ok(v)
 }
 
 /// One of `send`'s files, written to a new `path` with the same length and holes, within `max` and
