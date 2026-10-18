@@ -216,7 +216,7 @@ of its output and exits with its status. `start` of a paused VM unpauses it;
 one (`unpause` that), after waiting out a stop under way.
 
 `start` of an `exited` VM runs it again: a new VM of its image under its
-name, with what it was run with (its command, `-e`, `--entrypoint`, `--keep`,
+name, with what it was run with (its command, `-p`, `-e`, `--entrypoint`, `--keep`,
 `--rm`, `--cpus`, `--memory`, and its `--ip` if one was given). A VM has no
 disk of its own: its root is the image's read-only filesystem with an overlay
 in the guest's memory, so what it wrote ends when it exits (a `stop` keeps it,

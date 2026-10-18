@@ -120,6 +120,9 @@ pub struct Exited {
     pub resources: crate::vm::Resources,
     #[serde(default)]
     pub spec: RunSpec,
+    /// `run -p`: forwarded again when it runs again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<crate::ports::Port>,
     /// When it exited (seconds since the epoch).
     #[serde(default)]
     pub at: u64,
@@ -258,7 +261,7 @@ mod tests {
         assert_eq!(serde_json::from_value::<RunSpec>(serde_json::to_value(&s).unwrap()).unwrap(), s);
         assert_eq!(serde_json::to_string(&RunSpec::default()).unwrap(), "{}");
         assert_eq!(serde_json::from_str::<RunSpec>("{}").unwrap(), RunSpec::default());
-        let e = Exited { status: 3, template: "t".into(), cmd: None, resources: Default::default(), spec: s, at: 5 };
+        let e = Exited { status: 3, template: "t".into(), cmd: None, resources: Default::default(), spec: s, ports: vec!["8080:80".parse().unwrap()], at: 5 };
         let dir = crate::test_util::TempDir::new("exited-record");
         std::fs::write(dir.join("x.exited"), serde_json::to_vec(&e).unwrap()).unwrap();
         assert_eq!(Exited::read(&dir.join("x.exited")).unwrap(), e);

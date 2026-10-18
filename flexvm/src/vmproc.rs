@@ -815,7 +815,8 @@ impl Proc {
         }
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let cmd = self.cmd.lock().unwrap().clone();
-        let rec = crate::app::Exited { status: code, template: vm.template.name.clone(), cmd, resources: vm.resources(), spec, at };
+        let ports = self.ports.lock().unwrap().clone();
+        let rec = crate::app::Exited { status: code, template: vm.template.name.clone(), cmd, resources: vm.resources(), spec, ports, at };
         if let Err(e) = serde_json::to_vec(&rec).map_err(Error::from).and_then(|b| Ok(crate::host::write_record(&path, &b)?)) {
             crate::log!("vm {}: its exited record {}: {e}", vm.name, path.display());
         }
@@ -1048,6 +1049,7 @@ impl Proc {
                 let r = crate::app::Exited::read(path)?;
                 *self.cmd.lock().unwrap() = r.cmd;
                 *self.resources.lock().unwrap() = r.resources;
+                *self.ports.lock().unwrap() = r.ports;
                 let ip = r.spec.ip;
                 *self.spec.lock().unwrap() = r.spec;
                 (r.template, ip)
