@@ -257,7 +257,7 @@ class Host:
 
     def exec(self, vm, cmd, timeout=120):
         """Runs a shell command in the VM; returns (exit code, stdout, stderr)."""
-        r = self.cli("exec", vm, cmd, check=False, timeout=timeout)
+        r = self.cli("exec", vm, "sh", "-c", cmd, check=False, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
 
     def ps(self, all=True):

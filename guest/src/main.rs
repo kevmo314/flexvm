@@ -21,6 +21,7 @@ mod net;
 #[allow(dead_code)]
 mod proto;
 mod session;
+mod user;
 
 use proto::{write_frame, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, TRY_AGAIN};
 
@@ -417,7 +418,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         let _ = thread::Builder::new().spawn(move || {
             match line.split_whitespace().next() {
                 Some("SESSIONS") => return drop(msg(&stream, session::counts(&sessions))),
-                Some("SESSION" | "ATTACH" | "CLOSE") => {}
+                Some("SESSION" | "ARGV" | "ATTACH" | "CLOSE") => {}
                 _ => return drop(handle(&stream, &line, &statuses)),
             }
             // A session's command arrives a round trip later, which a guest faulting in memory can stretch past a second.

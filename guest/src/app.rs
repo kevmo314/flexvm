@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::proto::FRAME_LOST;
 use crate::session::{Output, DRAIN};
+use crate::user::resolve_user;
 use crate::{fail, kill_running, mem, msg, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
 
 const CONF: &str = "/etc/flexvm/app.conf";
@@ -181,6 +182,29 @@ fn command<S: AsRef<std::ffi::OsStr>>(c: &Conf, argv: &[S]) -> Command {
     cmd
 }
 
+/// Exec inherits the image's environment, directory and credentials; overrides affect only this child.
+pub(crate) fn configure_exec(cmd: &mut Command, env: &[String], cwd: Option<&str>, user: Option<&str>) -> io::Result<()> {
+    let mut c = config()?.clone();
+    if let Some(user) = user {
+        let (uid, gid, _, groups) =
+            resolve_user(user, &std::fs::read_to_string("/etc/passwd").unwrap_or_default(), &std::fs::read_to_string("/etc/group").unwrap_or_default())?;
+        c.uid = uid;
+        c.gid = gid;
+        c.groups = groups;
+    }
+    configure_exec_with(cmd, &c, env, cwd)
+}
+
+fn configure_exec_with(cmd: &mut Command, c: &Conf, env: &[String], cwd: Option<&str>) -> io::Result<()> {
+    cmd.env_clear().envs(c.env.iter().map(|(k, v)| (k, v))).current_dir(cwd.unwrap_or(&c.cwd));
+    for kv in env {
+        let (k, v) = kv.split_once('=').filter(|(k, _)| !k.is_empty()).ok_or_else(|| io::Error::other("exec env needs K=V"))?;
+        cmd.env(k, v);
+    }
+    credentials(cmd, c, false);
+    Ok(())
+}
+
 /// Runs a readiness command as the app would (`ok`, `exit <code>` or `timeout`) in its own cgroup, killed,
 /// checked empty and removed at the end; failed cleanup is an error, never `ok`. A non-root check fails
 /// closed without that cgroup; a root check is trusted, and without cgroup2 its session is killed instead.
@@ -330,10 +354,16 @@ impl Drop for CheckGroup {
 /// Own session, the app's credentials and, if non-root, no capabilities and no_new_privs; done by
 /// hand because CommandExt::uid would clear the supplementary groups.
 fn restrict(cmd: &mut Command, c: &Conf) {
+    credentials(cmd, c, true);
+}
+
+fn credentials(cmd: &mut Command, c: &Conf, own_session: bool) {
     let (uid, gid, groups) = (c.uid, c.gid, c.groups.clone());
     unsafe {
         cmd.pre_exec(move || {
-            crate::os(libc::setsid())?;
+            if own_session {
+                crate::os(libc::setsid())?;
+            }
             if uid != 0 {
                 // No way back to root: drop the bounding set (EINVAL: past the kernel's last capability).
                 for cap in 0..64 {
@@ -469,6 +499,36 @@ fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn exec_inherits_image_defaults_and_applies_env_and_directory_overrides() {
+        let c = parse_conf("arg /app\nenv K=image\nenv KEEP=yes\ncwd /srv\nuid 1000\ngid 2000\ngroups 2000 42\n").unwrap();
+        let mut cmd = Command::new("true");
+        configure_exec_with(&mut cmd, &c, &["K=first".into(), "K=last=two".into(), "EMPTY=".into()], Some("/tmp")).unwrap();
+        assert_eq!(cmd.get_current_dir().unwrap(), std::path::Path::new("/tmp"));
+        let env: std::collections::BTreeMap<_, _> = cmd.get_envs().map(|(k, v)| (k.to_str().unwrap(), v.unwrap().to_str().unwrap())).collect();
+        assert_eq!(env, [("EMPTY", ""), ("K", "last=two"), ("KEEP", "yes")].into());
+        let mut inherited = Command::new("true");
+        configure_exec_with(&mut inherited, &c, &[], None).unwrap();
+        assert_eq!(inherited.get_current_dir().unwrap(), std::path::Path::new("/srv"));
+        assert_eq!(c.env[0], ("K".into(), "image".into()));
+        assert!(configure_exec_with(&mut Command::new("true"), &c, &["BAD".into()], None).is_err());
+    }
+
+    #[test]
+    fn exec_users_resolve_numeric_names_and_explicit_groups() {
+        let passwd = "app:x:1000:1000::/home/app:/bin/sh\n";
+        let groups = "app:x:1000:\nstaff:x:2000:app\nextra:x:42:app\n";
+        for user in ["app", "1000", "app:"] {
+            assert_eq!(resolve_user(user, passwd, groups).unwrap(), (1000, 1000, "/home/app".into(), vec![1000, 2000, 42]));
+        }
+        for user in ["app:staff", "1000:2000"] {
+            assert_eq!(resolve_user(user, passwd, groups).unwrap(), (1000, 2000, "/home/app".into(), vec![2000]));
+        }
+        assert_eq!(resolve_user("9999:42", "", "").unwrap(), (9999, 42, "/".into(), vec![42]));
+        assert!(resolve_user("missing", passwd, groups).is_err());
+        assert!(resolve_user("app:missing", passwd, groups).is_err());
+    }
 
     #[test]
     fn readiness_token_is_forgotten_even_if_reaped_during_timeout() {

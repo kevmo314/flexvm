@@ -191,11 +191,11 @@ threading.Thread(target=tcp, daemon=True).start()
 open("/tmp/fv-server-ready", "w").write("ready")
 udp()
 PY
-cli "${P}A" "$dir_A" exec "$name" "sysctl -qw net.core.rmem_max=33554432 2>/dev/null || echo 33554432 > /proc/sys/net/core/rmem_max; cat > /tmp/fv-server.py <<'PY'
+cli "${P}A" "$dir_A" exec "$name" sh -c "sysctl -qw net.core.rmem_max=33554432 2>/dev/null || echo 33554432 > /proc/sys/net/core/rmem_max; cat > /tmp/fv-server.py <<'PY'
 $(cat "$work/server.py")
 PY
 python3 /tmp/fv-server.py </dev/null >/tmp/fv-server.log 2>&1 &"
-wait_for cli "${P}A" "$dir_A" exec "$name" 'test -f /tmp/fv-server-ready'
+wait_for cli "${P}A" "$dir_A" exec "$name" sh -c 'test -f /tmp/fv-server-ready'
 
 cat > "$work/client.py" <<'PY'
 import pathlib, socket, struct, sys, time
@@ -291,8 +291,8 @@ for round in $(seq 1 "$ROUNDS"); do
     touch "$work/stop"
     wait "$client_pid" || { cat "$work/client-$round.log" >&2; die 'client failed'; }
     wait "$udp_pid" || { cat "$work/udp-$round.log" >&2; die 'udp sender failed'; }
-    wait_for cli "${P}A" "$dir_A" exec "$name" "test -f /tmp/udp-$round.json"
-    udp=$(cli "${P}A" "$dir_A" exec "$name" "cat /tmp/udp-$round.json")
+    wait_for cli "${P}A" "$dir_A" exec "$name" sh -c "test -f /tmp/udp-$round.json"
+    udp=$(cli "${P}A" "$dir_A" exec "$name" sh -c "cat /tmp/udp-$round.json")
     sed -n 's/^stalls/  TCP stalls/p' "$work/client-$round.log" >&2
     python3 - "$work/client-$round.log" "$work/downtime-$round" "$udp" "$MAX_UDP_LOSS" "$round" <<'PY' || failures=$((failures + 1))
 import json, re, sys

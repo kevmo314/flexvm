@@ -140,13 +140,23 @@ The last five are stopped: `ps` lists them with `-a`. Standby VMs are not
 listed: `flexvm images` shows their configured count in `STANDBY`.
 
 ```sh
-flexvm exec web 'free -m'       # a shell command in the guest; exits with its status
+flexvm exec web free -m        # argv passed as-is; exits with the command's status
+flexvm exec web sh -c 'free -m; echo done'  # explicitly request a shell
+flexvm exec -d -e MODE=worker -w /srv -u app:staff web ./worker
 ```
 
-As with ssh, the words of `run IMAGE CMD` and `exec NAME CMD` are joined
-with spaces for the guest's shell, so quote a command that has its own
-quoting: `flexvm run ubuntu:24.04 "sh -c 'echo -d'"`. Flags after IMAGE (or
-after `exec NAME`) belong to CMD; a `--` there is dropped.
+`exec [OPTIONS] NAME CMD...` preserves each argument, including spaces and empty
+arguments. Options go before NAME: `-d` / `--detach` starts the command and returns
+0 without output; `-e` / `--env K=V` is repeatable; `-w` / `--workdir DIR` and
+`-u` / `--user USER[:GROUP]` override the image defaults for this command.
+Users and groups are resolved inside the guest, including supplementary groups
+when no explicit group is given. Exec inherits the image's environment and
+working directory. Use `sh -c '...'` for pipelines, redirects and shell syntax.
+
+As with ssh, the words of `run IMAGE CMD` are joined with spaces for the guest's
+shell, so quote a command that has its own quoting:
+`flexvm run ubuntu:24.04 "sh -c 'echo -d'"`. Flags after IMAGE (or after `exec NAME`)
+belong to CMD; a `--` there is dropped.
 
 A background VM's output (an image app's stdout and stderr, flexvm's own
 messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: past

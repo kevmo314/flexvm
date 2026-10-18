@@ -113,6 +113,11 @@ pub fn untimed(r: &BufReader<UnixStream>) -> Result<()> {
     Ok(r.get_ref().set_write_timeout(None)?)
 }
 
+/// Shell strings remain available to internal run/readiness callers.
+pub fn command_body(cmd: &serde_json::Value) -> String {
+    cmd.as_str().map_or_else(|| cmd.to_string(), str::to_owned)
+}
+
 pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
     session_on(action, id, offset, cmd, |line| request_on(s, line, timeout))
 }
@@ -135,16 +140,17 @@ fn session_on<S: Read + Write>(action: &str, id: &str, offset: u64, cmd: &str, o
         bail!("bad session id");
     }
     let line = match action {
-        "start" => {
+        "start" | "argv" => {
             fits(cmd)?;
-            format!("SESSION {id} {}", cmd.len())
+            let verb = if action == "argv" { "ARGV" } else { "SESSION" };
+            format!("{verb} {id} {}", cmd.len())
         }
         "attach" => format!("ATTACH {id} {offset}"),
         "close" => format!("CLOSE {id}"),
         _ => bail!("bad session action"),
     };
     let mut r = open(&line)?;
-    if action == "start" {
+    if matches!(action, "start" | "argv") {
         r.get_mut().write_all(cmd.as_bytes())?;
     }
     Ok(r)
@@ -419,6 +425,23 @@ mod tests {
         assert!(app_started("ok 42", true).unwrap_err().to_string().contains("pull its image again"), "an older agent ignores them");
         assert!(app_started("error: no app", false).unwrap_err().to_string().contains("no app"));
         assert!(app_started("ok x", false).is_err());
+    }
+
+    #[test]
+    fn argv_wire_preserves_words_and_checks_serialized_size() {
+        let cmd = serde_json::json!({"argv": ["printf", "%s", "a b", "", "$HOME"], "env": ["K=v"], "detach": true});
+        let body = command_body(&cmd);
+        let stream = std::io::Cursor::new(Vec::new());
+        let sent = session_on("argv", "id", 0, &body, |line| {
+            assert_eq!(line, format!("ARGV id {}", body.len()));
+            Ok(BufReader::new(stream))
+        })
+        .unwrap()
+        .into_inner()
+        .into_inner();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&sent).unwrap(), cmd);
+        let too_large = command_body(&serde_json::json!({"argv": ["x".repeat(MAX_BODY)]}));
+        assert!(session_on("argv", "id", 0, &too_large, |_| -> Result<BufReader<std::io::Cursor<Vec<u8>>>> { panic!("must not connect") }).is_err());
     }
 
     #[test]
