@@ -27,6 +27,12 @@ pub fn lock(state: &Path, how: i32) -> Result<Flock> {
     Ok(Flock::new(crate::host::private_file(&crate::host::locks(&dir).join("store"))?, how)?)
 }
 
+/// The lock (shared) of the store `dir` is in, whichever state's: none for a directory elsewhere.
+pub fn holding(dir: &Path) -> Result<Option<Flock>> {
+    let store = dir.canonicalize().ok().and_then(|d| d.parent().filter(|p| p.ends_with("checkpoints") && p.join(NAMES).is_dir()).map(Path::to_path_buf));
+    store.map(|s| lock(s.parent().unwrap_or(Path::new("/")), libc::LOCK_SH)).transpose()
+}
+
 pub struct Entry {
     pub id: String,
     pub name: Option<String>,
