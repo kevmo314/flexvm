@@ -15,5 +15,5 @@ CI=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$CI_VERSION/$ARCH
 # (scripts/pin-artifacts.sh writes those lines). A change to what a release is built from (scripts/pin-artifacts.sh
 # --inputs: Firecracker's version, commit and patches, the build recipe, the kernel) bumps this in the same change;
 # see RELEASING in README.md. A release's assets never change.
-ARTIFACTS_TAG=${ARTIFACTS_TAG:-artifacts-3}
+ARTIFACTS_TAG=${ARTIFACTS_TAG:-artifacts-4}
 ARTIFACTS_URL=https://github.com/kevmo314/flexvm/releases/download/$ARTIFACTS_TAG

@@ -1986,6 +1986,20 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn snapshot_load_confines_received_and_relative_rootfs_generations() {
+        for received in [false, true] {
+            for relative in [false, true] {
+                let mut f = Fixture::new();
+                f.meta.received = received;
+                let named = if relative { ROOTFS.to_string() } else { f.meta.rootfs.display().to_string() };
+                let (tpl, _) = sent(&mut f, &named);
+                let body = crate::fc::snapshot_load_body(Path::new("vmstate"), &tpl, "tap0", Path::new("vsock"), Path::new("uffd")).unwrap();
+                assert_eq!(body["confined_pmem"], received || relative, "received={received}, relative={relative}");
+            }
+        }
+    }
+
     /// A generation in `f.dir` with a sparse memory file and a vmstate naming `rootfs` as given, sent.
     fn sent(f: &mut Fixture, rootfs_named: &str) -> (Arc<Template>, Vec<u8>) {
         std::fs::write(f.dir.join("vmstate"), format!("state, pmem at {rootfs_named}")).unwrap();
