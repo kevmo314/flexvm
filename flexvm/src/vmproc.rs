@@ -3165,6 +3165,7 @@ fn call_checked(host: &Host, name: &str, req: Value, at: Option<Instant>, check:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{wait_until, JoinWithin, WAIT};
 
     /// What the controller shows left: MemAvailable above the reserve less what admission promised; unreadable
     /// promises leave none, unreadable MemAvailable leaves it unknown (none, `cow::Room::refresh`).
@@ -3231,7 +3232,7 @@ mod tests {
         each_peer(vec!["hung".into(), "fast".into()], t + Duration::from_millis(200), move |p| {
             if p == "hung" {
                 // Bounded, so one that waited for it fails below rather than hangs.
-                let _ = hung.lock().unwrap().recv_timeout(Duration::from_secs(30));
+                let _ = hung.lock().unwrap().recv_timeout(WAIT);
             }
         });
         let took = t.elapsed();
@@ -3268,12 +3269,12 @@ mod tests {
         a.tell(vec![peer.clone()], route(4));
         a.tell(vec![peer.clone()], route(2));
         assert!(t.elapsed() < Duration::from_secs(5), "the caller does not wait");
-        let (mut c, _) = l.accept().unwrap();
+        let (mut c, _) = crate::test_util::accept_tcp(&l);
         let req = crate::util::recv_json(&mut BufReader::new(c.try_clone().unwrap())).unwrap().unwrap();
         writeln!(c, "{}", json!({"ok": true, "result": null})).unwrap();
         assert_eq!(req, route(4), "the newest generation");
         assert!(SPAWNS.load(Ordering::SeqCst) >= 4 && CALLS.load(Ordering::SeqCst) >= 3);
-        let end = Instant::now() + Duration::from_secs(5);
+        let end = Instant::now() + WAIT;
         while !a.pending.lock().unwrap().is_empty() {
             assert!(Instant::now() < end, "delivered, no longer pending");
             thread::sleep(Duration::from_millis(10));
@@ -3334,7 +3335,7 @@ mod tests {
                     if started.replace(true) {
                         results.send((watched.admitted(), watched.throttled.load(Ordering::SeqCst))).unwrap();
                     }
-                    if command_rx.recv().is_err() {
+                    if command_rx.recv_timeout(WAIT).is_err() {
                         return false;
                     }
                     revision.set(revision.get() + 1);
@@ -3403,7 +3404,7 @@ mod tests {
         assert!(std::fs::read_to_string(cg.join("memory.high")).unwrap().trim().parse::<u64>().unwrap() > original_high.trim().parse::<u64>().unwrap());
         assert_eq!(first.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "removed peers receive no new routes");
         drop(commands);
-        controller.join().unwrap();
+        controller.join_within().unwrap();
     }
 
     /// A failed revision write is tried again, backing off, until it is recorded or there is nothing to record (#499).
@@ -3453,7 +3454,7 @@ mod tests {
         .unwrap();
         let calls = |p: &str| CALLS.lock().unwrap().iter().filter(|c| *c == p).count();
         let until = |done: &dyn Fn() -> bool| {
-            let end = Instant::now() + Duration::from_secs(10);
+            let end = Instant::now() + WAIT;
             while !done() {
                 assert!(Instant::now() < end);
                 thread::sleep(Duration::from_millis(1));
@@ -3464,9 +3465,11 @@ mod tests {
         a.tell(peers, json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
         until(&|| calls("gone") > 0);
         configured.lock().unwrap().retain(|p| p != "gone");
+        // At most the one call under way, or due by a list read before this, follows.
+        let removed = calls("gone");
         until(&|| a.pending.lock().unwrap().is_empty());
         let gone = calls("gone");
-        assert!(gone < 10, "pruned once no longer configured: {gone}");
+        assert!(gone <= removed + 1, "pruned once no longer configured: {removed} then {gone}");
         assert_eq!(calls("down"), 41, "tried until delivered, then no more");
         thread::sleep(Duration::from_millis(100));
         assert_eq!((calls("gone"), calls("down")), (gone, 41), "and never called again");
@@ -3504,8 +3507,12 @@ mod tests {
         .unwrap();
         me.set(Arc::downgrade(&a)).unwrap();
         armed.store(true, Ordering::SeqCst);
-        a.tell(Vec::new(), json!({}));
-        let end = Instant::now() + Duration::from_secs(5);
+        // Woken, not told: a tell landing after b's would prune b by its own (empty) list.
+        wait_until("the announcer to read the peers", || {
+            a.wake.notify_all();
+            !armed.load(Ordering::SeqCst)
+        });
+        let end = Instant::now() + WAIT;
         while !CALLS.lock().unwrap().contains(&"b".to_string()) {
             assert!(Instant::now() < end, "b was told");
             thread::sleep(Duration::from_millis(5));
@@ -3568,14 +3575,11 @@ mod tests {
                     workers.fetch_sub(1, Ordering::SeqCst);
                 });
             }
-            while workers.load(Ordering::SeqCst) > 0 && i % 100 == 0 {
-                thread::yield_now();
+            if i % 100 == 0 {
+                wait_until("pause workers to finish", || workers.load(Ordering::SeqCst) == 0);
             }
         }
-        let end = Instant::now() + Duration::from_secs(5);
-        while (workers.load(Ordering::SeqCst) > 0 || l.busy.load(Ordering::SeqCst)) && Instant::now() < end {
-            thread::yield_now();
-        }
+        wait_until("last pause offer to finish", || workers.load(Ordering::SeqCst) == 0 && !l.busy.load(Ordering::SeqCst));
         assert_eq!(handled.load(Ordering::SeqCst), libc::SIGCONT, "the last offer was handled");
         assert_eq!(l.wanted.load(Ordering::SeqCst), 0);
     }
@@ -3593,7 +3597,9 @@ mod tests {
             .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut source = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let conn = listener.accept().unwrap().0;
+        source.set_read_timeout(Some(WAIT)).unwrap();
+        source.set_write_timeout(Some(WAIT)).unwrap();
+        let conn = crate::test_util::accept_tcp(&listener).0;
         let e = p.migrate_in(&json!({"ip": ip, "mig": 7, "gen": 99, "name": "forged"}), conn).unwrap_err();
         assert!(e.to_string().contains("not a vm's address"), "{e}");
         let reply = crate::util::recv_json(&mut std::io::BufReader::new(&mut source)).unwrap().unwrap();
@@ -3656,11 +3662,12 @@ mod tests {
             p.finish(&p.op(), End::NotStarted, FAILED, Some((&mut reply, json!({"ok": false, "error": "refused"}))));
         }
         let root = crate::test_util::TempDir::new("start-failure-reply");
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "vmproc::tests::a_start_failure_is_answered_after_releasing_its_name", "--nocapture"])
-            .env(CHILD, root.as_os_str())
-            .status()
-            .unwrap();
+        let status = crate::test_util::status(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "vmproc::tests::a_start_failure_is_answered_after_releasing_its_name", "--nocapture"])
+                .env(CHILD, root.as_os_str()),
+        )
+        .unwrap();
         assert_eq!(status.code(), Some(FAILED));
     }
 
@@ -3706,7 +3713,7 @@ mod tests {
             if gone {
                 child.env("FLEXVM_TEST_CLAIMER_GONE", "1");
             }
-            assert_eq!(child.status().unwrap().code(), Some(if gone { FAILED } else { 0 }));
+            assert_eq!(crate::test_util::status(&mut child).unwrap().code(), Some(if gone { FAILED } else { 0 }));
             let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
             let ip = std::fs::read_to_string(root.join("ip")).unwrap().parse().unwrap();
             assert_eq!(host.addr(&host.lock().unwrap(), ip).unwrap().withdrawn, gone, "the gone claimer's address is withdrawn");
@@ -3726,7 +3733,7 @@ mod tests {
         let wait = Mutex::new(wait);
         *p.record_hook.lock().unwrap() = Some(Box::new(move || {
             parked.send(()).unwrap();
-            wait.lock().unwrap().recv_timeout(Duration::from_secs(30)).unwrap();
+            wait.lock().unwrap().recv_timeout(WAIT).unwrap();
         }));
         let (q, (done, ended)) = (p.clone(), channel());
         let d = done.clone();
@@ -3739,7 +3746,7 @@ mod tests {
             q.end_claim(End::Owed, false);
             done.send(("end", true)).unwrap();
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         let let_go = loop {
             if let Ok(a) = p.addr.try_lock() {
                 if a.is_none() {
@@ -3880,13 +3887,13 @@ mod tests {
         p.serve_control().unwrap();
         assert_eq!(std::fs::metadata(&sock).unwrap().ino(), inode);
         let mut c = UnixStream::connect(&sock).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.set_read_timeout(Some(WAIT)).unwrap();
         send_json(&mut c, &json!({"op": "unknown"})).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
         assert_eq!(reply["error"], "unknown op \"unknown\"");
         // Bound before a resume or restore has its VM: asked for it, the socket says it is starting.
         let mut c = UnixStream::connect(&sock).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.set_read_timeout(Some(WAIT)).unwrap();
         send_json(&mut c, &json!({"op": "debug", "what": "status"})).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
         assert_eq!(reply["error"], "vm bound is starting");
@@ -3897,11 +3904,11 @@ mod tests {
         use std::os::fd::AsRawFd;
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = std::net::TcpStream::connect(tcp.local_addr().unwrap()).unwrap();
-        let (server, _) = tcp.accept().unwrap();
+        let (server, _) = crate::test_util::accept_tcp(&tcp);
         let at = Instant::now() + Duration::from_secs(5);
         drop(connect(&p.host, "bound", &json!({"op": "pages", "mig": 7}), &[server.as_raw_fd()], at, None).unwrap());
         drop(server);
-        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(&mut client)).unwrap().unwrap();
         assert_eq!(reply["error"], "vm \"bound\" is not the source of migration 7");
     }
@@ -3910,7 +3917,7 @@ mod tests {
     fn full_control_slots_reply_busy() {
         static COUNT: AtomicUsize = AtomicUsize::new(MAX_CONTROL);
         let (client, server) = UnixStream::pair().unwrap();
-        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
         assert!(control_slot(&server, &COUNT).is_none());
         let reply = crate::util::recv_json(&mut BufReader::new(client)).unwrap().unwrap();
         assert_eq!(reply, json!({"ok": false, "error": "busy", "busy": true}));
@@ -3933,13 +3940,13 @@ mod tests {
             server.set_nonblocking(false).unwrap();
             let (q, slot) = (p.clone(), Slot::take(&COUNT, MAX_CONTROL).unwrap());
             let worker = thread::spawn(move || q.control(server, slot));
-            let until = Instant::now() + Duration::from_secs(5);
+            let until = Instant::now() + WAIT;
             while COUNT.load(Ordering::SeqCst) != 0 && Instant::now() < until {
                 thread::sleep(Duration::from_millis(1));
             }
             assert!(COUNT.load(Ordering::SeqCst) == 0 && !worker.is_finished(), "{op}");
             drop(client);
-            worker.join().unwrap();
+            worker.join_within().unwrap();
         }
         SESSIONS.store(MAX_SESSIONS, Ordering::SeqCst);
         let (client, server) = UnixStream::pair().unwrap();
@@ -3973,8 +3980,8 @@ mod tests {
         assert!(large.len() > 1 << 20 && large.len() < crate::util::MAX_LINE as usize);
         for (request, error) in [("{invalid".to_string(), "bad request:"), (large, "unknown op")] {
             let (mut client, server) = UnixStream::pair().unwrap();
-            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            client.set_write_timeout(Some(WAIT)).unwrap();
             let q = p.clone();
             let slot = Slot::take(&COUNT, MAX_CONTROL).unwrap();
             let worker = thread::spawn(move || q.control(server, slot));
@@ -3983,7 +3990,7 @@ mod tests {
             let reply = crate::util::recv_json(&mut BufReader::new(client)).unwrap().unwrap();
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().starts_with(error), "{reply}");
-            worker.join().unwrap();
+            worker.join_within().unwrap();
             assert_eq!(COUNT.load(Ordering::SeqCst), 0);
         }
     }
@@ -3999,14 +4006,14 @@ mod tests {
             started.send(()).unwrap();
             done.send(q.signal_app(&json!({"signal": libc::SIGTERM})).map_err(|e| e.to_string())).unwrap();
         });
-        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiting.recv_timeout(WAIT).unwrap();
         assert!(matches!(reply.recv_timeout(Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
         // A destroy requested during the operation wins before the signal reaches the VM.
         p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
         drop(held);
-        let e = reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+        let e = reply.recv_timeout(WAIT).unwrap().unwrap_err();
         assert!(e.contains("being destroyed"), "{e}");
-        signal.join().unwrap();
+        signal.join_within().unwrap();
     }
 
     #[test]
@@ -4019,7 +4026,7 @@ mod tests {
         // As `destroy` does before it waits for `op`; the pause gets it first.
         p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
         drop(held);
-        assert!(pause.join().unwrap().unwrap_err().contains("being destroyed"));
+        assert!(pause.join_within().unwrap().unwrap_err().contains("being destroyed"));
         assert_eq!(p.destroy_code(), Some(131), "a kill that cancels a suspend reports it");
         // Refused (`destroy` takes its code back): the next pause goes ahead.
         let _ = p.destroying.compare_exchange(131, 0, Ordering::SeqCst, Ordering::SeqCst);
@@ -4039,7 +4046,7 @@ mod tests {
         assert!(!asked.is_finished(), "waits for the signal thread");
         *p.suspending.lock().unwrap() = Suspend::Suspending;
         drop(taking);
-        assert!(asked.join().unwrap().is_none());
+        assert!(asked.join_within().unwrap().is_none());
         *p.suspending.lock().unwrap() = Suspend::Idle;
         p.early.lock().unwrap().push(libc::SIGTERM);
         assert!(p.ask_resume().is_none(), "queued at startup, still to be replayed");
@@ -4120,7 +4127,7 @@ mod tests {
             r.answer(upto, sig, Ok(()));
             assert_eq!(r.wait(ticket, Duration::ZERO), Some(Ok(())));
         })
-        .join()
+        .join_within()
         .unwrap();
     }
 
@@ -4139,7 +4146,7 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(1));
             while crate::util::take_signal(&set).is_some() {}
         })
-        .join()
+        .join_within()
         .unwrap();
     }
 
@@ -4153,7 +4160,7 @@ mod tests {
             assert_eq!(crate::util::wait_signal(&set), libc::SIGUSR2);
             assert!(!crate::util::signal_pending(libc::SIGUSR2));
         })
-        .join()
+        .join_within()
         .unwrap();
     }
 
@@ -4363,8 +4370,8 @@ mod tests {
         std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&sock).unwrap();
         let stub = thread::spawn(move || {
-            let (c, _) = listener.accept().unwrap();
-            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (c, _) = crate::test_util::accept_unix(&listener);
+            c.set_read_timeout(Some(WAIT)).unwrap();
             let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap();
             // Let a regressed sender finish so the assertion reports the unwanted request.
             if req.is_some() {
@@ -4375,7 +4382,7 @@ mod tests {
             listener
         });
         evict(&host, &["p1".into(), "p2".into()], &[vm], 100, Instant::now() + Duration::from_secs(5));
-        let listener = stub.join().unwrap();
+        let listener = stub.join_within().unwrap();
         assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "no further peers are tried for the replacement");
         assert!(!host.run.join("evict.backoff").exists(), "a replaced candidate is skipped without backing off peers");
     }
@@ -4444,20 +4451,18 @@ mod tests {
         // (as `prepare_target` passes it on), p2 takes the VM; "busy" answers busy itself.
         let stub = {
             let asked = asked.clone();
-            thread::spawn(move || {
-                for c in listener.incoming() {
-                    let c = c.unwrap();
-                    let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
-                    let to = req["to"].as_str().unwrap().to_string();
-                    asked.lock().unwrap().push(to.clone());
-                    let reply = match to.as_str() {
-                        "p1" => control_reply(&Err(format!("p1: vm ev: {BUSY}").into())),
-                        "busy" => control_reply(&Err(Busy(format!("vm ev: {BUSY}")).into())),
-                        "stop" => return,
-                        _ => control_reply(&Ok(json!({}))),
-                    };
-                    send_json(&mut &c, &reply).unwrap();
-                }
+            thread::spawn(move || loop {
+                let (c, _) = crate::test_util::accept_unix(&listener);
+                let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
+                let to = req["to"].as_str().unwrap().to_string();
+                asked.lock().unwrap().push(to.clone());
+                let reply = match to.as_str() {
+                    "p1" => control_reply(&Err(format!("p1: vm ev: {BUSY}").into())),
+                    "busy" => control_reply(&Err(Busy(format!("vm ev: {BUSY}")).into())),
+                    "stop" => return,
+                    _ => control_reply(&Ok(json!({}))),
+                };
+                send_json(&mut &c, &reply).unwrap();
             })
         };
         let vm = Entry { name: "ev".into(), ident: Ident::me(), state: "running".into(), ..Entry::default() };
@@ -4480,7 +4485,7 @@ mod tests {
         assert!(!backoff().contains_key(&format!("{} busy", vm.ident.key())));
         let e = call(&host, "ev", json!({"op": "migrate", "to": "stop"}), Some(at())).unwrap_err();
         assert!(!e.is::<Busy>(), "{e}");
-        stub.join().unwrap();
+        stub.join_within().unwrap();
     }
 
     #[test]
@@ -4661,6 +4666,7 @@ mod tests {
 #[cfg(test)]
 mod session_relay_tests {
     use super::*;
+    use crate::test_util::{JoinWithin, WAIT};
     use std::io::{self, Cursor};
 
     struct Duplex {
@@ -4708,23 +4714,28 @@ mod session_relay_tests {
         let exit = guest::frame(guest::FRAME_EXIT, &[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()]);
         let mut guest = BufReader::new(Duplex { input: Cursor::new(exit.clone()), output: Vec::new() });
         let (relay, mut client) = UnixStream::pair().unwrap();
-        // Reads the exit, then neither acknowledges nor hangs up.
+        // Reads the exit, then neither acknowledges nor hangs up until released.
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        client.set_read_timeout(Some(WAIT)).unwrap();
         let silent = thread::spawn(move || {
             let mut got = vec![0; exit.len()];
             client.read_exact(&mut got).unwrap();
-            thread::sleep(Duration::from_secs(6));
+            let _ = wait.recv_timeout(WAIT);
         });
         let t = Instant::now();
         relay_session(&mut guest, &mut &relay, CLIENT_STALL, false).unwrap();
         assert!(t.elapsed() < Duration::from_secs(4), "the relay waited {:?}", t.elapsed());
+        drop(release);
         assert!(guest.get_ref().output.is_empty());
-        silent.join().unwrap();
+        silent.join_within().unwrap();
     }
 
     #[test]
     fn a_stalled_client_is_dropped_after_its_deadline() {
         // The guest has output to spare; the client never reads.
         let (relay_end, mut agent) = UnixStream::pair().unwrap();
+        relay_end.set_read_timeout(Some(WAIT)).unwrap();
+        agent.set_write_timeout(Some(WAIT)).unwrap();
         let writer = thread::spawn(move || {
             for i in 0..1024u64 {
                 if agent.write_all(&guest::frame(guest::FRAME_STDOUT, &[&(i * 65536).to_le_bytes()[..], &[b'x'; 65536]])).is_err() {
@@ -4740,6 +4751,6 @@ mod session_relay_tests {
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         // Dropped, the guest's connection ends unacknowledged: the session stays for a reattach.
         drop(guest);
-        writer.join().unwrap();
+        writer.join_within().unwrap();
     }
 }

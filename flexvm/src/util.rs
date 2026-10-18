@@ -1635,6 +1635,7 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{JoinWithin, WAIT};
 
     #[test]
     fn a_claimer_cgroup_is_an_absolute_path_of_plain_components() {
@@ -2206,11 +2207,11 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         let reader = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(10));
-            assert!(matches!(rx.recv().unwrap(), LogMsg::Line(line) if line == "first"));
-            assert!(matches!(rx.recv().unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
+            assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line == "first"));
+            assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
         });
-        assert!(send_log_by(&tx, LogMsg::Line("x".repeat(LOG_LINE_MAX + 1)), Instant::now() + LOG_FLUSH));
-        reader.join().unwrap();
+        assert!(send_log_by(&tx, LogMsg::Line("x".repeat(LOG_LINE_MAX + 1)), Instant::now() + WAIT));
+        reader.join_within().unwrap();
     }
 
     #[test]
@@ -2286,24 +2287,41 @@ mod tests {
         // made unlocked, and nothing rotated meanwhile.
         let held = open();
         crate::host::flock(&held, libc::LOCK_SH).unwrap();
-        let start = std::time::Instant::now();
+        let timed = |l: std::path::PathBuf| {
+            let t = Instant::now();
+            (output::append_capped(&l, b"six six\n", 10), t.elapsed())
+        };
         let (l1, l2) = (log.clone(), log.clone());
-        let w = std::thread::spawn(move || output::append_capped(&l1, b"six six\n", 10));
-        assert!(output::append_capped(&l2, b"six six\n", 10) && w.join().unwrap());
-        assert!(start.elapsed() < std::time::Duration::from_millis(1800), "{:?}", start.elapsed());
+        let w = std::thread::spawn(move || timed(l1));
+        // Each call waits out its own `STALL` (1 s); in turn, the second would take 2 s.
+        for (written, took) in [timed(l2), w.join_within().unwrap()] {
+            assert!(written && took < Duration::from_millis(1900), "{took:?}");
+        }
         assert_eq!(read("vm.log"), "five\nsix six\nsix six\n");
         crate::host::flock(&held, libc::LOCK_UN).unwrap();
         assert!(output::append_capped(&log, b"seven\n", 10) && read("vm.log.1") == "five\nsix six\nsix six\nseven\n");
         // A holder that rotates and stalls before letting go: a writer waiting
-        // meanwhile goes on in the new log, never into `.1`.
-        assert!(output::append_capped(&log, b"eight\n", 10));
+        // meanwhile goes on in the new log, never into `.1`. Only a rename within
+        // the writer's `STALL` shows that; a round slowed past it is tried again.
         let held = open();
         crate::host::flock(&held, libc::LOCK_EX).unwrap();
-        let (l, start) = (log.clone(), std::time::Instant::now());
-        let w = std::thread::spawn(move || output::append_capped(&l, b"nine\n", 10));
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        std::fs::rename(&log, d.join("vm.log.1")).unwrap();
-        assert!(w.join().unwrap() && start.elapsed() < std::time::Duration::from_millis(1800), "{:?}", start.elapsed());
+        for round in 1.. {
+            std::fs::write(&log, "eight\n").unwrap();
+            let (l, (started, start)) = (log.clone(), std::sync::mpsc::channel());
+            let w = std::thread::spawn(move || {
+                started.send(Instant::now()).unwrap();
+                output::append_capped(&l, b"nine\n", 10)
+            });
+            let start = start.recv_timeout(WAIT).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::rename(&log, d.join("vm.log.1")).unwrap();
+            let waiting = start.elapsed() < Duration::from_secs(1);
+            assert!(w.join_within().unwrap());
+            if waiting {
+                break;
+            }
+            assert!(round < 10, "never renamed within the writer's stall");
+        }
         assert_eq!((read("vm.log.1"), read("vm.log")), ("eight\n".into(), "nine\n".into()));
     }
 
@@ -2846,6 +2864,7 @@ pub mod output {
 
     #[test]
     fn a_retargeted_full_pipe_keeps_the_fallback_output() {
+        use crate::test_util::{wait_until, JoinWithin};
         let full = || {
             let mut p = [0; 2];
             assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
@@ -2859,14 +2878,14 @@ pub mod output {
         };
         let (_old, target, _) = full();
         let (mut next, fallback, filled) = full();
-        TARGETS.lock().unwrap()[0] = Some(target);
+        TARGETS.lock().unwrap()[0] = Some(target.clone());
         let relay = std::thread::spawn(|| relay(0, b"kept"));
-        std::thread::sleep(Duration::from_millis(100));
-        TARGETS.lock().unwrap()[0] = Some(fallback);
-        std::thread::sleep(STALL);
+        wait_until("relay to take the old target", || Arc::strong_count(&target) == 3);
+        TARGETS.lock().unwrap()[0] = Some(fallback.clone());
+        wait_until("relay to take the fallback", || Arc::strong_count(&fallback) == 3);
         next.read_exact(&mut vec![0; filled]).unwrap();
-        relay.join().unwrap();
-        assert!(super::readable(&next, Duration::from_millis(100)).unwrap());
+        relay.join_within().unwrap();
+        assert!(super::readable(&next, Duration::ZERO).unwrap(), "the finished relay left no fallback output");
         let mut data = [0; 4];
         next.read_exact(&mut data).unwrap();
         assert_eq!(&data, b"kept");
