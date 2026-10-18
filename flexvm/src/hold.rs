@@ -705,8 +705,8 @@ fn report(ip: Ipv4Addr, dev: &str, g: &Gone) {
     let after = format!("{dev} after it let go of the address ({} ms ago)", g.at.elapsed().as_millis());
     match (g.resent, g.dropped) {
         (0, 0) => {}
-        (r, 0) => crate::log!("hold {ip}: re-sent {r} packets that reached {after}"),
-        (r, d) => crate::log!("hold {ip}: dropped {d} packets that reached {after}, re-sent {r}"),
+        (r, 0) => crate::info!("hold {ip}: re-sent {r} packets that reached {after}"),
+        (r, d) => crate::info!("hold {ip}: dropped {d} packets that reached {after}, re-sent {r}"),
     }
 }
 

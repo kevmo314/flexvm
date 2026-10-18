@@ -504,7 +504,7 @@ pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
     // Not knowing is no reason to leave a peer's VM unrouted.
     if is_local_addr(via).unwrap_or(false) {
         static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| crate::log!("not routing {ip} via {via}: a local address (hosts sharing a network namespace); this is logged once"));
+        LOGGED.call_once(|| crate::info!("not routing {ip} via {via}: a local address (hosts sharing a network namespace); this is logged once"));
         return Ok(());
     }
     let mut route = rtmsg(RT_SCOPE_UNIVERSE);

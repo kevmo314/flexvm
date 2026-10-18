@@ -637,6 +637,8 @@ def app_lifecycle():
     check("foreground: run exits with the app's status", r.returncode == 5, (r.returncode, r.stderr[-2000:]))
     check("foreground: the hint", "sh exited at once (it needs a terminal?): use flexvm run -it" in r.stderr, r.stderr[-2000:])
     check("foreground: no exited record", "e2e-app-fg" not in A.ps())
+    check("foreground: no informational output", not r.stdout and "flexvm-init:" not in r.stderr and "guest clock" not in r.stderr, (r.stdout, r.stderr))
+    check("foreground: diagnostics kept in log", "exited with status 5" in A.logs("e2e-app-fg"), A.logs("e2e-app-fg")[-2000:])
 
     # A standby VM's claim carries the run's settings.
     try:

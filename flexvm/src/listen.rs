@@ -163,7 +163,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         let _ = crate::net::proxy_arp(dev);
     }
     let underlay = host.cfg.underlay().map_or("none".into(), |u| u.to_string());
-    crate::log!("flexvm listening on {} (underlay {underlay}, announce device {})", listener.local_addr()?, dev.as_deref().unwrap_or("none"));
+    crate::info!("flexvm listening on {} (underlay {underlay}, announce device {})", listener.local_addr()?, dev.as_deref().unwrap_or("none"));
     // A sweep and a refill now, not after the first period: a listener started at boot is
     // what recovers a quiet host (#555).
     let first = host.clone();
@@ -796,7 +796,7 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
     let _l = host_lock(host)?;
     if req["done"] == json!(true) {
         if host.mig_done(mig)? {
-            crate::log!("migration {mig}: its source says done; forgetting it");
+            crate::info!("migration {mig}: its source says done; forgetting it");
         }
         return Ok(json!({"done": true}));
     }
@@ -874,7 +874,7 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
             Ok(_) => "taken".to_string(),
             Err(e) => format!("refused: {e}"),
         };
-        crate::log!("route {ip} via {via} generation {gen} revision {rev}: held announcement answered: {how}");
+        crate::info!("route {ip} via {via} generation {gen} revision {rev}: held announcement answered: {how}");
     }
     answer
 }

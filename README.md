@@ -218,7 +218,14 @@ starts on the new one) and restarts (a VM started again appends to its log);
 it ends once the name has no VM left (`kill`, `rm`, a `--rm` VM's command
 or app that ended; an exited VM's log stays, to read, until `rm`) or its
 reader is gone. A foreground VM's output is its terminal's, so
-its log holds only what came after a closed terminal.
+its log holds only what came after a closed terminal. Foreground `run`,
+`start -a` and `attach` print only the app's output, errors and warnings;
+flexvm's and flexvm-init's informational messages go to the log alone, and
+also to stderr with the global `--verbose` (`-v`) or `FLEXVM_LOG=debug`.
+
+The guest's hostname is the VM's name (`root@web` in a shell's prompt), with
+an /etc/hosts entry for it; a rename sets it in the guest too. Templates pulled
+before this need pulling again for it.
 
 ## Forward host ports
 

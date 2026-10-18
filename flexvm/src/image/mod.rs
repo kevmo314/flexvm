@@ -691,7 +691,7 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     }
     let (uid, gid, home, groups) = resolve_user(root, &app.user)?;
     let mut env = app.env.clone();
-    for (k, v) in [("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"), ("HOME", &home), ("HOSTNAME", "flexvm")] {
+    for (k, v) in [("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"), ("HOME", &home)] {
         if !env.iter().any(|e| env_key(e) == k) {
             env.push(format!("{k}={v}"));
         }

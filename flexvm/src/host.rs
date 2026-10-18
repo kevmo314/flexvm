@@ -1428,7 +1428,7 @@ impl Host {
             return Ok(false);
         }
         crate::net::route_via(ip, via)?;
-        crate::log!("put back route {ip} via {via} (generation {})", a.seen);
+        crate::info!("put back route {ip} via {via} (generation {})", a.seen);
         Ok(true)
     }
 
@@ -1998,7 +1998,7 @@ impl Host {
                         continue;
                     }
                     if crate::util::unlink_durably(&path).is_ok() {
-                        crate::log!("migration {id}: {} has the vm; {} stays lent to it", o.to, o.ip);
+                        crate::info!("migration {id}: {} has the vm; {} stays lent to it", o.to, o.ip);
                         done(&o.to, id);
                     }
                 }
@@ -2015,7 +2015,7 @@ impl Host {
                     });
                     match freed {
                         Ok(()) => {
-                            crate::log!("migration {id}: {} aborted it, and its source is gone; {} generation {} withdrawn", o.to, o.ip, o.gen);
+                            crate::info!("migration {id}: {} aborted it, and its source is gone; {} generation {} withdrawn", o.to, o.ip, o.gen);
                             withdrawn(o.ip, o.gen);
                             let _ = crate::util::unlink_durably(&path);
                         }
@@ -2132,7 +2132,7 @@ impl Host {
             }
             match query(&source, &by) {
                 Ok(true) => {
-                    crate::log!("migration {id}: its source at {source} is gone; forgetting it");
+                    crate::info!("migration {id}: its source at {source} is gone; forgetting it");
                     let _ = self.mig_done(id);
                 }
                 Ok(false) => (),
@@ -3023,7 +3023,7 @@ impl Host {
                 }
             }
             match route(ip, via) {
-                Ok(()) => crate::log!("after boot: put back route {ip} via {via} (generation {})", a.seen),
+                Ok(()) => crate::info!("after boot: put back route {ip} via {via} (generation {})", a.seen),
                 Err(e) => {
                     crate::log!("after boot: route {ip} via {via}: {e}; tried again on the next open");
                     ok = false;
@@ -3114,7 +3114,7 @@ impl Host {
                 // Its generation withdrawn or superseded: nothing is owed, the claim just goes (#570).
                 if !a.current(gen) && self.dead_and_reaped(&a, true) {
                     match self.release(&l, ip, name, Some(by)) {
-                        Ok(()) => crate::log!(
+                        Ok(()) => crate::info!(
                             "vm {name} died as the source of migration {} to {}: {ip} generation {gen} is withdrawn or superseded, so nothing is owed",
                             left.mig,
                             left.to
@@ -3130,7 +3130,7 @@ impl Host {
                         self.release(&l, ip, name, Some(by))
                     };
                     match owe() {
-                        Ok(()) => crate::log!(
+                        Ok(()) => crate::info!(
                             "vm {name} died as the source of migration {} to {}: {ip} (generation {gen}) is owed until {} says what became of it",
                             left.mig,
                             left.to,
@@ -3162,7 +3162,7 @@ impl Host {
             if let Some(id) = a.holder_id.as_ref() {
                 self.unpublish(&l, ip, id);
             }
-            crate::log!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
+            crate::info!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
             crate::net::unroute(ip);
             withdrawn.push((name.to_string(), ip, gen));
         }
@@ -3329,7 +3329,7 @@ impl Host {
             n.peers.retain(|u| {
                 let kept = peers.contains(&u.peer);
                 if !kept {
-                    crate::log!("{ip} generation {} is withdrawn; {} is no longer a peer, so it is not told", n.gen, u.peer);
+                    crate::info!("{ip} generation {} is withdrawn; {} is no longer a peer, so it is not told", n.gen, u.peer);
                 }
                 kept
             });
@@ -3424,7 +3424,7 @@ fn wall_ms() -> u64 {
 pub fn clear_taps(run: &Path, me: &Ident) {
     for (name, index, owner) in taps_of(run) {
         if owner.pid == me.pid && owner.liveness() == Liveness::Gone {
-            crate::log!("removing tap {name}, a dead process's with this pid");
+            crate::info!("removing tap {name}, a dead process's with this pid");
             crate::net::delete_link(index, &name);
         }
     }

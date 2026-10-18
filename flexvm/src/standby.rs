@@ -616,6 +616,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
         // The claim's app settings are applied as it starts the app (`start_guest`), its ports as it claims.
         *p.spec.lock().unwrap() = claim_spec(&req);
+        crate::util::set_verbose(req["verbose"] == json!(true));
         p.tty.store(req["tty"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         p.attached.store(req["attached"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         match claim(p, &req) {

@@ -262,7 +262,7 @@ impl Proc {
         match saved {
             Ok((m, _)) => {
                 let data = (m.data_pages * PAGE_SIZE as u64) >> 20;
-                crate::log!(
+                crate::info!(
                     "{}",
                     json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name.get()).ok(), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()})
                 );
@@ -557,6 +557,10 @@ impl Proc {
             Some(e) => Err(format!("guest agent not answering: {e}").into()),
         };
         t.mark("clock");
+        // Renamed since it was saved, or restored under another name.
+        if guest_error.is_none() {
+            vm.set_hostname(name);
+        }
         if let Some(e) = &address_error {
             crate::log!("vm {name}: {e}");
         }
@@ -612,18 +616,19 @@ impl Proc {
                     if !answered {
                         crate::guest::ping(&vm.vsock)?;
                         answered = true;
-                        crate::log!("vm {}: its guest agent answered {} ms after it resumed", vm.name, ms(start.elapsed()));
+                        crate::info!("vm {}: its guest agent answered {} ms after it resumed", vm.name, ms(start.elapsed()));
+                        vm.set_hostname(&p.name());
                     }
                     // The clock is not held up by an address that keeps failing.
                     let address = match vm.pending_net.load(Ordering::SeqCst) {
-                        true => p.op_within().and_then(|_op| p.take_address(&vm)).map(|()| crate::log!("vm {}: took its address {}", vm.name, vm.ip)),
+                        true => p.op_within().and_then(|_op| p.take_address(&vm)).map(|()| crate::info!("vm {}: took its address {}", vm.name, vm.ip)),
                         false => Ok(()),
                     };
                     if clock {
                         let _op = p.op_within()?;
                         if vm.state() == State::Running {
                             let off = vm.sync_clock(Instant::now() + CLOCK_DEADLINE)?;
-                            crate::log!("vm {}: guest clock synced ({off:.1} ms off)", vm.name);
+                            crate::info!("vm {}: guest clock synced ({off:.1} ms off)", vm.name);
                             clock = false;
                         }
                     }
@@ -653,7 +658,7 @@ impl Proc {
         let p = self.arc();
         thread::spawn(move || {
             let pulled = p.as_ref().map_or_else(|| vm.pager.wait_pulled(None), |p| p.wait_pulled(&vm));
-            crate::log!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
+            crate::info!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
             if let Some(p) = p {
                 // Not under `op`: the memory is in, whatever operation runs.
                 if pulled && p.pulled_all() {

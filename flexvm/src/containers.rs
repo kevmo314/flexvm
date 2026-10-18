@@ -493,7 +493,10 @@ impl Proc {
         self.publish();
         // Its registry entry and lock go (its socket moved already).
         drop(old);
-        crate::log!("vm {from}: renamed {to}");
+        if vm.state() == State::Running {
+            vm.set_hostname(to);
+        }
+        crate::info!("vm {from}: renamed {to}");
         Ok(json!({"name": to, "was": from}))
     }
 }

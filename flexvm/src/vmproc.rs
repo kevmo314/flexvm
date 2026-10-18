@@ -438,7 +438,7 @@ impl Proc {
             bail!("its memory grew to {} MiB since it was admitted here for {granted} MiB: {e}", sizes.0);
         }
         self.granted.fetch_add(more, Ordering::SeqCst);
-        crate::log!("vm {}: admitted {more} MiB more: it grew to {} MiB since its preflight", self.name(), sizes.0);
+        crate::info!("vm {}: admitted {more} MiB more: it grew to {} MiB since its preflight", self.name(), sizes.0);
         Ok(())
     }
 
@@ -632,7 +632,7 @@ impl Proc {
         }
         self.publish_rev(&l)?;
         if self.record_rev(&l)? {
-            crate::log!("vm {}: recorded its revision {} after all", self.name(), self.rev());
+            crate::info!("vm {}: recorded its revision {} after all", self.name(), self.rev());
         }
         // Under the host lock, as `advance` sets it: a failure after this starts another thread.
         self.recording.store(false, Ordering::SeqCst);
@@ -854,7 +854,7 @@ impl Proc {
                 if let Ok(moved) = self.host.vms(&self.name(), "moved") {
                     let _ = crate::host::write_record(&moved, to.as_bytes());
                 }
-                crate::log!("vm {}: moved to {to}", self.name());
+                crate::info!("vm {}: moved to {to}", self.name());
             }
             // Never ran here, or (`Owed`) may run at its target: a peer's route for it comes back, any loan stays.
             (_, Some(a)) => {
@@ -1131,6 +1131,7 @@ impl Proc {
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();
         }
+        vm.set_hostname(&self.name());
         let spec = self.spec.lock().unwrap().clone();
         if spec.starts_app(vm.template.meta.image.as_ref()) {
             vm.start_app(&spec.app_settings()).map_err(|e| format!("{e} (see the vm's output)"))?;
@@ -1302,12 +1303,12 @@ impl Proc {
             libc::SIGCONT if !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) => Ok(()),
             libc::SIGCONT => self.resume().map(drop),
             libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
-                crate::log!("vm {}: migrating away; it ends once the target has its memory", vm.name);
+                crate::info!("vm {}: migrating away; it ends once the target has its memory", vm.name);
                 Ok(())
             }
             libc::SIGTERM => match self.reserve_suspend() {
                 None => {
-                    crate::log!("vm {}: a suspend is already under way, or the vm is ending", vm.name);
+                    crate::info!("vm {}: a suspend is already under way, or the vm is ending", vm.name);
                     Ok(())
                 }
                 // Off the signal thread, which a later SIGINT needs. Unspawned, the closure and its reservation are dropped.
@@ -1584,7 +1585,7 @@ impl Proc {
             if let Ok(_op) = self.op.try_lock() {
                 if vm.release_pending() && matches!(vm.state(), State::Running | State::Paused) {
                     match vm.release_reports(Duration::from_millis(500)) {
-                        Ok(()) => crate::log!("vm {}: released free page reports", vm.name),
+                        Ok(()) => crate::info!("vm {}: released free page reports", vm.name),
                         Err(e) => crate::log!("vm {}: releasing free page reports: {e}", vm.name),
                     }
                 }
@@ -1727,19 +1728,29 @@ impl Proc {
                     if kind == guest::FRAME_MSG {
                         let status = String::from_utf8_lossy(&data);
                         if !status.starts_with("running") {
-                            crate::log!("vm {}: app {}", vm.name, status.rsplit_once(' ').map(|(s, _)| s).unwrap_or(&status));
+                            crate::info!("vm {}: app {}", vm.name, status.rsplit_once(' ').map(|(s, _)| s).unwrap_or(&status));
                             vm.untrack_exec(id);
                             return self.app_exited(&status);
                         }
                         break;
                     }
+                    // Serialize the bytes and their offset with checkpoint/migration capture.
                     let mut out = std::io::stdout().lock();
                     while crate::lifecycle::APP_LOG_HELD.load(Ordering::SeqCst) {
                         drop(out);
                         thread::sleep(Duration::from_millis(10));
                         out = std::io::stdout().lock();
                     }
-                    let _ = out.write_all(&data).and_then(|()| out.flush());
+                    match kind {
+                        guest::FRAME_NOTE => crate::util::info_line(String::from_utf8_lossy(&data).into_owned()),
+                        guest::FRAME_STDERR => {
+                            let mut err = std::io::stderr().lock();
+                            let _ = err.write_all(&data).and_then(|()| err.flush());
+                        }
+                        _ => {
+                            let _ = out.write_all(&data).and_then(|()| out.flush());
+                        }
+                    }
                     self.app_log.fetch_add(data.len() as u64, Ordering::SeqCst);
                 }
                 vm.untrack_exec(id);
@@ -1868,7 +1879,7 @@ impl Proc {
             vm.clock_pending.store(false, Ordering::SeqCst);
             match res {
                 Ok(Some(off)) if off.abs() > CLOCK_TOLERANCE.as_secs_f64() * 1e3 => {
-                    crate::log!("vm {}: guest clock was {off:.1} ms off after resuming; stepped it", vm.name)
+                    crate::info!("vm {}: guest clock was {off:.1} ms off after resuming; stepped it", vm.name)
                 }
                 Ok(_) => {}
                 Err(e) => crate::log!("vm {}: checking the guest clock: {e}", vm.name),
@@ -2149,7 +2160,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let reply = crate::util::reply(&res);
     match notify.take() {
         Some(mut f) => drop(send_json(&mut f, &reply)),
-        None if res.is_ok() && !reply["result"].is_null() => crate::log!("{}", reply["result"]),
+        None if res.is_ok() && !reply["result"].is_null() => crate::info!("{}", reply["result"]),
         None => {}
     }
     if let Err(e) = res {
@@ -2293,7 +2304,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
                 crate::log!("vm {}: starved: the host's reserve refused it {} MiB; it stays throttled (no peers to move it to)", vm.name, plan.charge)
             }
             true => crate::log!("vm {}: starved: the host's reserve refused it {} MiB; it stays throttled until it grows or moves", vm.name, plan.charge),
-            false => crate::log!("vm {}: no longer starved", vm.name),
+            false => crate::info!("vm {}: no longer starved", vm.name),
         }
     }
     let new = if refused { plugged } else { plan.new };
@@ -2305,7 +2316,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
         } else {
             "tick"
         };
-        crate::log!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
+        crate::info!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
         if new > requested {
             vm.limit.plug(meta.mem_mib + new, if refused { 0 } else { plan.charge });
         }
@@ -2577,10 +2588,12 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     let pressure = avail < until && (evicting || avail < at);
     if pressure && !evicting {
         let _ = crate::host::write_record(&active, b"");
-        crate::log!("host has {avail} MiB available, under its {at} MiB high-water mark ({reserve} MiB reserve): moving vms to peers until it has {until} MiB");
+        crate::info!(
+            "host has {avail} MiB available, under its {at} MiB high-water mark ({reserve} MiB reserve): moving vms to peers until it has {until} MiB"
+        );
     } else if !pressure && evicting {
         let _ = std::fs::remove_file(&active);
-        crate::log!("host has {avail} MiB available, {until} MiB or more: eviction stops");
+        crate::info!("host has {avail} MiB available, {until} MiB or more: eviction stops");
     }
     if !pressure && !starved_here {
         return;
@@ -2641,7 +2654,7 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
         }
         *stopping = None;
         if stopped > 0 {
-            crate::log!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {stopped} standby vms");
+            crate::info!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {stopped} standby vms");
         }
         return stopped > 0;
     }
@@ -2694,7 +2707,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
             if Instant::now() >= deadline {
                 return;
             }
-            crate::log!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
+            crate::info!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
             let mut replaced = false;
             let mut check = |c: &UnixStream| {
                 if Ident::of(crate::util::peer_pid(c)?).as_ref() != Some(&vm.ident) {
@@ -2707,7 +2720,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
                 Ok(_) => {
                     backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
-                    crate::log!("vm {}: migrated to {peer}", vm.name);
+                    crate::info!("vm {}: migrated to {peer}", vm.name);
                     while host.entry(&vm.name).is_ok_and(|e| e.ident == vm.ident) {
                         if Instant::now() >= deadline {
                             return crate::log!("vm {}: its copy here still serves pages to {peer} at the eviction's deadline", vm.name);
@@ -2934,7 +2947,7 @@ impl Announcer {
             _ if e.req != *req => {}
             Ok(()) => {
                 if e.tries > 0 {
-                    crate::log!("{what}: delivered after {} failed tries", e.tries);
+                    crate::info!("{what}: delivered after {} failed tries", e.tries);
                 }
                 p.remove(peer);
             }

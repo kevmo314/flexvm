@@ -408,7 +408,7 @@ impl Proc {
                 }
                 match o {
                     Some(Outcome::Committed(target)) => {
-                        crate::log!("vm {}: migration {mig} to {to} committed", p.name());
+                        crate::info!("vm {}: migration {mig} to {to} committed", p.name());
                         if let (_, Err(e)) = p.reroute(mig, &to, &target, None, false) {
                             crate::log!("vm {}: migration {mig} to {to}: rerouting failed: {e}", p.name());
                         }
@@ -530,8 +530,8 @@ impl Proc {
                 return;
             }
             match p.take_pending_route(mig) {
-                Some(_) => crate::log!("{what}: done"),
-                None => crate::log!("{what}: dropped, migration {mig} no longer owes it"),
+                Some(_) => crate::info!("{what}: done"),
+                None => crate::info!("{what}: dropped, migration {mig} no longer owes it"),
             }
         });
     }
@@ -816,7 +816,7 @@ impl Proc {
             vm.restore_devices();
             let start = Instant::now();
             p.wait_pulled(&vm);
-            crate::log!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
+            crate::info!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
             // Unless an operation settled it first, or the VM ended (its source's
             // copy runs again). `op` is let go between tries, for a kill.
             loop {

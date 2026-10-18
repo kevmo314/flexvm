@@ -427,7 +427,7 @@ impl Vm {
             std::thread::sleep(Duration::from_millis(1));
         }
         if queued {
-            crate::log!("vm {}: its guest took what was queued on its tap in {:.1} ms before the pause", self.name, start.elapsed().as_secs_f64() * 1e3);
+            crate::info!("vm {}: its guest took what was queued on its tap in {:.1} ms before the pause", self.name, start.elapsed().as_secs_f64() * 1e3);
         }
         true
     }
@@ -912,6 +912,13 @@ impl Vm {
             self.clock_unsure.store(true, Ordering::SeqCst);
         }
         res
+    }
+
+    /// Logged, not fatal: the VM runs on with its old hostname.
+    pub fn set_hostname(&self, name: &str) {
+        if let Err(e) = self.running_here().and_then(|()| crate::guest::set_hostname(&self.vsock, name)) {
+            crate::log!("vm {name}: {e}");
+        }
     }
 
     pub fn start_app(&self, settings: &str) -> Result<u32> {

@@ -128,7 +128,7 @@ impl Limit {
             let cg = self.cgroup.as_deref().unwrap_or(std::path::Path::new("")).display();
             match throttled {
                 true => crate::log!("{cg}: throttled at its mark: the host's reserve refused it more"),
-                false => crate::log!("{cg}: no longer throttled"),
+                false => crate::info!("{cg}: no longer throttled"),
             }
         }
     }
