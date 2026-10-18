@@ -847,7 +847,7 @@ impl Proc {
     }
 
     /// The one way the process ends, holding `op`.
-    pub fn finish(&self, _op: &Op, end: End, code: i32, last: Option<(&UnixStream, Value)>) -> ! {
+    pub fn finish(&self, _op: &Op, end: End, code: i32, last: Option<(&mut dyn std::io::Write, Value)>) -> ! {
         if matches!(end, End::NotStarted) {
             self.refund_start();
         }
@@ -1139,7 +1139,8 @@ impl Proc {
                 r => break r?,
             }
         };
-        self.set_name(lock);
+        // Keep the name local through admission: a refusal drops it before the starter is
+        // answered, so `ps -a` sees the old exited record even while this process cleans up.
         let name = name.as_str();
         // A rerun is what its record says, read under the name: never one another start replaced meanwhile.
         let (template, want) = match &record {
@@ -1162,6 +1163,7 @@ impl Proc {
         self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
         self.bind_ports()?;
         let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
+        self.set_name(lock);
         let ip = self.set_addr(claim);
         self.serve_ports(ip)?;
         t.mark("claim_ip");
@@ -1447,7 +1449,7 @@ impl Proc {
                 }
                 let v = self.checkpoint(&op, req["dir"].as_str().unwrap_or(""), stop, req["incremental"] == true)?;
                 if stop {
-                    self.finish(&op, End::Gone, 0, Some((&c, json!({"ok": true, "result": v}))));
+                    self.finish(&op, End::Gone, 0, Some((&mut &c, json!({"ok": true, "result": v}))));
                 }
                 Ok(v)
             }),
@@ -2283,17 +2285,23 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     if died {
         reply["died"] = json!(true);
     }
-    match notify.take() {
-        Some(mut f) => drop(send_json(&mut f, &reply)),
-        None if res.is_ok() && !reply["result"].is_null() => crate::info!("{}", reply["result"]),
-        None => {}
-    }
     if let Err(e) = res {
         crate::log!("flexvm: {e}");
         if died {
+            if let Some(mut f) = notify.take() {
+                let _ = send_json(&mut f, &reply);
+            }
             p.end_died(&op);
         }
-        p.finish(&op, End::NotStarted, FAILED, None);
+        // A refused start is answered only after its ports, address and name are
+        // released: callers can immediately inspect or retry the exited VM.
+        let last = notify.as_mut().map(|f| (f as &mut dyn std::io::Write, reply));
+        p.finish(&op, End::NotStarted, FAILED, last);
+    }
+    match notify.take() {
+        Some(mut f) => drop(send_json(&mut f, &reply)),
+        None if !reply["result"].is_null() => crate::info!("{}", reply["result"]),
+        None => {}
     }
     drop(op);
     p.serve()
@@ -3623,6 +3631,76 @@ mod tests {
             p.set_name(p.host.take_name(name, false).unwrap());
         }
         (p, root)
+    }
+
+    #[test]
+    fn a_refused_rerun_is_exited_before_process_cleanup() {
+        let (p, root) = test_proc("rerun-refused", None);
+        let ip = "10.200.0.2".parse().unwrap();
+        let spec = crate::app::RunSpec { ip: Some(ip), ..Default::default() };
+        let record = crate::app::Exited::new(2, "default".into(), Some("false".into()), Default::default(), spec, 1);
+        let path = p.host.vms("job", "exited").unwrap();
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        // Enough of a template to reach admission, without a Firecracker or guest.
+        let dir = root.join("templates/.gen/a");
+        let meta = json!({
+            "compatibility": {"cpu": "", "tsc_khz": 0, "tsc_control": false, "msrs": [], "firecracker": "", "features": {}, "xsave": {}},
+            "vcpus": 1, "mem_mib": 256, "max_mib": 1024, "plugged_mib": 0,
+            "kernel": "", "rootfs": "", "id": "a", "components": {}
+        });
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(dir.join("mem"), []).unwrap();
+        let _other = p.host.take_name("other", false).unwrap();
+        let _claim = p.host.claim_new(&p.host.lock().unwrap(), "other", Some(ip)).unwrap();
+        let e = p.run("job", "", None, false, true).unwrap_err();
+        assert!(e.to_string().contains("is in use"), "{e}");
+        // The process is still alive, as it is when main sends the failure reply.
+        assert!(!p.host.alive("job"));
+        let vms = crate::vms(&p.host);
+        let job = vms.iter().find(|v| v["name"] == "job").unwrap();
+        assert_eq!((job["state"].as_str(), job["status"].as_i64()), (Some("exited"), Some(2)));
+        assert_eq!(std::fs::read(path).unwrap(), bytes, "the old record is unchanged");
+        assert!(p.name.lock().unwrap().is_none());
+        p.refund_start();
+        p.drop_ports();
+    }
+
+    #[test]
+    fn a_start_failure_is_answered_after_releasing_its_name() {
+        const CHILD: &str = "FLEXVM_TEST_START_FAILURE_REPLY";
+        if let Some(root) = std::env::var_os(CHILD) {
+            struct Reply(Host);
+            impl std::io::Write for Reply {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    let vms = crate::vms(&self.0);
+                    let job = vms.iter().find(|v| v["name"] == "job").unwrap();
+                    assert_eq!((job["state"].as_str(), job["status"].as_i64()), (Some("exited"), Some(2)));
+                    assert!(!self.0.alive("job"), "released before any reply bytes");
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let root = PathBuf::from(root);
+            let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            let p = Proc::new(host, Paths::new(&root)).unwrap();
+            let rec = crate::app::Exited::new(2, "default".into(), None, Default::default(), Default::default(), 1);
+            std::fs::write(p.host.vms("job", "exited").unwrap(), serde_json::to_vec(&rec).unwrap()).unwrap();
+            let (lock, _) = p.host.take_rerun_name("job").unwrap();
+            p.set_name(lock);
+            assert!(!crate::vms(&p.host).iter().any(|v| v["name"] == "job"), "the pre-cleanup window");
+            let mut reply = Reply(p.host.clone());
+            p.finish(&p.op(), End::NotStarted, FAILED, Some((&mut reply, json!({"ok": false, "error": "refused"}))));
+        }
+        let root = crate::test_util::TempDir::new("start-failure-reply");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "vmproc::tests::a_start_failure_is_answered_after_releasing_its_name", "--nocapture"])
+            .env(CHILD, root.as_os_str())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(FAILED));
     }
 
     #[test]
