@@ -222,7 +222,7 @@ fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()> +
         }
         let status = guest::app_status(vsock)?;
         if status.starts_with("exited") || start.elapsed() > meta.ready_timeout {
-            let logs = read_logs(vsock)?;
+            let logs = read_logs(vsock, Instant::now() + LOGS_TIMEOUT, &stop)?;
             let tail = String::from_utf8_lossy(&logs[logs.len().saturating_sub(4096)..]).into_owned();
             bail!("app not ready ({:?}) after {} ms, status {status}; its output:\n{tail}", meta.ready, ms(start.elapsed()));
         }
@@ -230,11 +230,18 @@ fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()> +
     }
 }
 
-fn read_logs(vsock: &Path) -> Result<Vec<u8>> {
+/// The guest keeps 1 MiB of app output: far less than this takes to send.
+const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// All by `deadline`, and given up once `stop` fails: an image's app can stream output without end.
+fn read_logs(vsock: &Path, deadline: Instant, stop: impl Fn() -> Result<()>) -> Result<Vec<u8>> {
     const KEEP: usize = 64 << 10;
-    let mut r = guest::start_logs(crate::util::connect_unix(vsock, guest::TIMEOUT)?, 0, false, guest::TIMEOUT)?;
+    let s = guest::start_logs(crate::util::connect_unix(vsock, guest::TIMEOUT)?, 0, false, guest::TIMEOUT)?;
+    let mut r = crate::util::By { s, at: deadline };
     let mut out = Vec::new();
-    while let Some((kind, data)) = guest::read_frame(&mut r)? {
+    loop {
+        stop()?;
+        let Some((kind, data)) = guest::read_frame(&mut r).map_err(|e| format!("reading the app's output: {e}"))? else { break };
         if kind == guest::FRAME_MSG {
             return Ok(out);
         }
@@ -836,6 +843,44 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn endless_app_output_is_read_by_a_deadline_and_until_stopped() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // An app's output that never ends: frames keep coming, never the closing status.
+        let endless = |listener: &UnixListener| {
+            let (stream, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            assert_eq!(line, "LOGS 0 0\n");
+            r.get_mut().write_all(b"OK 1\n").unwrap();
+            while guest::write_frame(r.get_mut(), guest::FRAME_STDOUT, &[b'x'; 4096]).is_ok() {}
+        };
+        let dir = tmpdir("endless-logs");
+        let path = dir.join("vsock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| endless(&listener));
+            let start = Instant::now();
+            let e = read_logs(&path, Instant::now() + Duration::from_millis(300), || Ok(())).unwrap_err();
+            assert!(e.to_string().contains("deadline passed"), "{e}");
+            assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+            server.join().unwrap();
+
+            let server = scope.spawn(|| endless(&listener));
+            let checks = AtomicUsize::new(0);
+            let stop = || if checks.fetch_add(1, Ordering::Relaxed) >= 100 { Err("interrupted".into()) } else { Ok(()) };
+            let e = read_logs(&path, Instant::now() + Duration::from_secs(60), stop).unwrap_err();
+            assert_eq!(e.to_string(), "interrupted");
+            server.join().unwrap();
+        });
     }
 
     #[test]

@@ -1257,6 +1257,8 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
 /// suspend, and its VM goes with it anyway. `patient` (a VM's main command):
 /// a paused or checkpointing VM is waited for even before the command started.
 pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>, patient: bool) -> Result<i32> {
+    // Otherwise the VM's refusal would be retried until the deadline.
+    guest::fits(cmd)?;
     let id = session.lock().unwrap().id.clone();
     let mut error = String::new();
     let mut deadline = Instant::now() + Duration::from_secs(30);
@@ -1294,7 +1296,7 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
                 // main command) waits for its VM to resume, or for a checkpoint (a
                 // suspend's too) to finish.
                 let msg = e.to_string();
-                if msg.contains(" is paused; ") || msg.contains(vm::CHECKPOINTING) {
+                if guest::transient(&msg) {
                     if !started && !patient {
                         return Err(e);
                     }
@@ -1425,7 +1427,11 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
                 )
             }
             guest::FRAME_MSG if data == b"waiting" && s.started => {}
-            // Before the id echo the request itself failed: not retried.
+            // Before the id echo the request itself failed: not retried, unless the guest was only busy
+            // (it never took the command, so it is started again).
+            guest::FRAME_MSG if !s.started && guest::transient(&String::from_utf8_lossy(&data)) => {
+                return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned()))
+            }
             guest::FRAME_MSG if !s.started => return Err(guest::refusal(&data).into()),
             guest::FRAME_MSG => return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned())),
             _ => return Err(format!("unknown session frame {kind}").into()),
@@ -2037,6 +2043,31 @@ mod exec_tests {
         let input = frames(&[(guest::FRAME_MSG, b"error: session closed")]);
         let e = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).err().unwrap();
         assert!(e.to_string().contains("after byte 5 of output"), "{e}");
+    }
+
+    #[test]
+    fn a_busy_agent_is_asked_again_and_other_refusals_are_final() {
+        let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
+        // As flexvm-init words it when all its body readers are taken.
+        let busy = format!("error: too many commands arriving at once{}", guest::TRY_AGAIN);
+        let input = frames(&[(guest::FRAME_MSG, busy.as_bytes())]);
+        let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).unwrap();
+        assert!(matches!(end, StreamEnd::Disconnected(ref why) if *why == busy));
+        // Never taken by the guest, so the retry starts it again.
+        assert!(!session.lock().unwrap().started);
+        let input = frames(&[(guest::FRAME_MSG, b"error: too many sessions: 64 commands are running or awaiting their client")]);
+        assert!(exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).is_err());
+    }
+
+    #[test]
+    fn an_oversized_command_fails_before_any_request() {
+        let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
+        let root = crate::test_util::TempDir::new("exec-oversized");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let start = Instant::now();
+        let e = exec_session(&host, "vm", &"x".repeat(guest::MAX_BODY + 1), &session, false).unwrap_err();
+        assert!(e.to_string().contains("the guest takes at most"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

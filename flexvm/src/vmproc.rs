@@ -28,6 +28,8 @@ use crate::vm::{Snapshot, State, Vm};
 /// A client that takes no output for this long is dropped, freeing its relay and control slot; its
 /// session stays in the guest for a reattach.
 const CLIENT_STALL: Duration = Duration::from_secs(60);
+/// How long app output may go silent before it is asked for again: the guest sends a keepalive every 5 s.
+const APP_LOG_SILENCE: Duration = Duration::from_secs(15);
 
 /// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
 /// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session.
@@ -1533,7 +1535,7 @@ impl Proc {
             // Refused while it is not running here.
             let got = vm.exec(|s| guest::start_logs(s, self.app_log.load(Ordering::SeqCst), true, guest::TIMEOUT));
             if let Ok((mut g, id)) = got {
-                let _ = g.get_ref().set_read_timeout(None);
+                let _ = g.get_ref().set_read_timeout(Some(APP_LOG_SILENCE));
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut g) {
                     // The guest's ring moved past us (or we asked past its end): it goes on from there.
                     if kind == guest::FRAME_LOST {

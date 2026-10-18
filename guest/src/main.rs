@@ -22,7 +22,7 @@ mod net;
 mod proto;
 mod session;
 
-use proto::{write_frame, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
+use proto::{write_frame, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, TRY_AGAIN};
 
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// CHECK hex-encodes a command of up to MAX_BODY bytes on its request line.
@@ -424,7 +424,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             let body = match session::parse(&line) {
                 Ok(session::Request::Start { len, .. }) => match BodyReader::admit() {
                     Some(_reader) => read_body(&mut r, conn, len, at),
-                    None => Err(io::Error::other("too many commands arriving at once; try again")),
+                    None => Err(io::Error::other(busy())),
                 },
                 _ => Ok(Vec::new()),
             };
@@ -441,6 +441,11 @@ fn serve(statuses: Statuses) -> io::Result<()> {
 fn sock_timeout(fd: RawFd, opt: libc::c_int, t: Duration) {
     let tv = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros().max(u32::from(t.is_zero())) as _ };
     unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&tv as *const libc::timeval).cast(), std::mem::size_of_val(&tv) as _) };
+}
+
+/// Refused while `MAX_BODY_READERS` commands are still arriving: the host waits for a slot.
+fn busy() -> String {
+    format!("too many commands arriving at once{TRY_AGAIN}")
 }
 
 struct BodyReader;
@@ -640,6 +645,11 @@ mod tests {
         }
         backoff = Duration::ZERO;
         assert_eq!(accept_delay(&mut backoff), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn a_busy_refusal_carries_the_hosts_try_again_marker() {
+        assert!(busy().ends_with(TRY_AGAIN));
     }
 
     #[test]

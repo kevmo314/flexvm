@@ -89,8 +89,18 @@ fn awake() -> Duration {
     Duration::from_millis(AWAKE_MS.load(Ordering::Relaxed))
 }
 
+/// `ABANDONED_RUNNING_KNOB` (seconds) as `cleanup` last read it; `u64::MAX` while it is not set.
+static KNOB: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Reads the knob file: by `cleanup` only, once a sweep, outside the sessions lock.
+fn read_knob() -> Option<Duration> {
+    let secs = std::fs::read_to_string(ABANDONED_RUNNING_KNOB).ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&s| s != u64::MAX);
+    KNOB.store(secs.unwrap_or(u64::MAX), Ordering::Relaxed);
+    secs.map(Duration::from_secs)
+}
+
 fn knob() -> Option<Duration> {
-    std::fs::read_to_string(ABANDONED_RUNNING_KNOB).ok().and_then(|s| s.trim().parse().ok()).map(Duration::from_secs)
+    Some(KNOB.load(Ordering::Relaxed)).filter(|&s| s != u64::MAX).map(Duration::from_secs)
 }
 
 /// How long the sweeper sleeps between `cleanup`s.
@@ -161,6 +171,19 @@ impl Table {
             }
             self.closed.insert(id.to_string(), awake());
         }
+    }
+
+    /// Gives back a reservation whose shell could not be run, leaving no tombstone: a retry may
+    /// try again. An attachment taken meanwhile (a retried start) is told the session closed.
+    fn unreserve(&mut self, id: &str, output: &Session) {
+        if self.live.get(id).is_some_and(|e| Arc::ptr_eq(&e.output, output)) {
+            self.live.remove(id);
+        }
+        let mut o = output.0.lock().unwrap();
+        o.closed = true;
+        o.reservation.release();
+        drop(o);
+        output.1.notify_all();
     }
 
     fn ended(&self, id: &str) -> bool {
@@ -427,8 +450,9 @@ pub fn counts(sessions: &Sessions) -> String {
 }
 
 pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
+    let running_after = read_knob().unwrap_or(ABANDONED_RUNNING);
     let mut table = sessions.lock().unwrap();
-    table.reclaim(statuses);
+    table.reclaim_after(statuses, running_after, awake());
     let now = awake();
     table.closed.retain(|_, at| now.saturating_sub(*at) < RETENTION);
     table.cancelled.retain(|_, at| now.saturating_sub(*at) < RETENTION);
@@ -467,6 +491,35 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
 }
 
 type Attached = (Session, u64);
+type Spawned = (Child, Option<OwnedFd>, u64);
+
+/// Runs `command` in a shell whose output goes to `output`; the pump gets the child through the sender.
+fn run(command: &str, output: &Session, statuses: &Statuses) -> io::Result<(Spawned, mpsc::SyncSender<Spawned>)> {
+    // Start the pump first: if no thread can be had, nothing has run yet.
+    let (tx, rx) = mpsc::sync_channel::<Spawned>(1);
+    let (pumped, statuses_) = (output.clone(), statuses.clone());
+    thread::Builder::new()
+        .spawn(move || {
+            if let Ok((mut child, exited, token)) = rx.recv() {
+                let rest = crate::pump_until(child.stdout.take(), child.stderr.take(), exited, DRAIN, |kind, data| deliver(&pumped, kind, data));
+                // Closed, they would kill a background process's next write with SIGPIPE.
+                crate::discard(rest);
+                // By token: the pid may be another child's by now, however long the client took.
+                pumped.0.lock().unwrap().exit = wait_exit(&statuses_, token, None);
+                pumped.1.notify_all();
+            }
+        })
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", command]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    if let Some(work) = crate::mem::work_procs() {
+        crate::mem::enter(&mut cmd, work, false);
+    }
+    // Minimal images (distroless, scratch) have no shell.
+    let child =
+        spawn_watched(&mut cmd, statuses, true).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
+    Ok((child, tx))
+}
 
 fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions, statuses: &Statuses) -> io::Result<Option<(&'a str, u64, Attached)>> {
     let gone = || io::Error::other("session closed");
@@ -475,47 +528,44 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
         Request::Start { id, len } => {
             let command = body.get(..len).ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
             let fingerprint = fingerprint(command);
-            // Lookup and spawn under one lock: a retried creation cannot spawn twice.
-            let mut table = sessions.lock().unwrap();
-            if table.ended(id) {
-                return Err(gone());
-            }
-            if let Some(entry) = table.live.get(id) {
-                if entry.command != fingerprint {
-                    return Err(io::Error::other("session id already used for another command"));
+            // The id is reserved under the lock, so a retried creation cannot spawn twice; the shell is
+            // spawned outside it, so other sessions' requests and the sweeper do not wait on a fork.
+            let (output, attached) = {
+                let mut table = sessions.lock().unwrap();
+                if table.ended(id) {
+                    return Err(gone());
                 }
-                return Ok(Some((id, 0, attach(&entry.output, 0, conn))));
-            }
-            table.admit(statuses)?;
-            let command = std::str::from_utf8(command).map_err(io::Error::other)?;
-            let output = session(table.new_output());
-            // Start the pump first: if no thread can be had, nothing has run yet.
-            let (tx, rx) = mpsc::sync_channel::<(Child, Option<OwnedFd>, u64)>(1);
-            let (pumped, statuses_) = (output.clone(), statuses.clone());
-            thread::Builder::new()
-                .spawn(move || {
-                    if let Ok((mut child, exited, token)) = rx.recv() {
-                        let rest = crate::pump_until(child.stdout.take(), child.stderr.take(), exited, DRAIN, |kind, data| deliver(&pumped, kind, data));
-                        // Closed, they would kill a background process's next write with SIGPIPE.
-                        crate::discard(rest);
-                        // By token: the pid may be another child's by now, however long the client took.
-                        pumped.0.lock().unwrap().exit = wait_exit(&statuses_, token, None);
-                        pumped.1.notify_all();
+                if let Some(entry) = table.live.get(id) {
+                    if entry.command != fingerprint {
+                        return Err(io::Error::other("session id already used for another command"));
                     }
-                })
-                .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
-            let mut cmd = Command::new("/bin/sh");
-            cmd.args(["-c", command]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
-            if let Some(work) = crate::mem::work_procs() {
-                crate::mem::enter(&mut cmd, work, false);
+                    return Ok(Some((id, 0, attach(&entry.output, 0, conn))));
+                }
+                table.admit(statuses)?;
+                let output = session(table.new_output());
+                // Its process group and token are filled in once it runs; until then a close kills nothing.
+                table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: 0, token: 0 });
+                // Attached before any output, so none is overwritten before it is sent.
+                (output.clone(), attach(&output, 0, conn))
+            };
+            let started = std::str::from_utf8(command).map_err(io::Error::other).and_then(|command| run(command, &output, statuses));
+            let mut table = sessions.lock().unwrap();
+            let reserved = table.live.get_mut(id).filter(|e| Arc::ptr_eq(&e.output, &output));
+            match (started, reserved) {
+                (Ok((child, tx)), Some(entry)) => {
+                    (entry.group, entry.token) = (child.0.id() as i32, child.2);
+                    let _ = tx.send(child);
+                }
+                // Closed while the shell was being spawned: it is killed, as the close would have.
+                (Ok((child, tx)), None) => {
+                    kill_running(statuses, child.0.id() as i32, child.2, true, libc::SIGKILL);
+                    let _ = tx.send(child);
+                }
+                (Err(e), _) => {
+                    table.unreserve(id, &output);
+                    return Err(e);
+                }
             }
-            // Minimal images (distroless, scratch) have no shell.
-            let (child, exited, token) = spawn_watched(&mut cmd, statuses, true)
-                .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
-            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
-            // Attached before any output, so none is overwritten before it is sent.
-            let attached = attach(&output, 0, conn);
-            let _ = tx.send((child, exited, token));
             (id, 0, attached)
         }
         Request::Attach { id, offset } => {
@@ -1134,6 +1184,60 @@ mod tests {
         let last = format!("c{}", MAX_CANCELLED * 2 - 1);
         assert!(request(&sessions, &statuses, &format!("SESSION {last} 4"), b"true").ends_with(b"session closed"));
         assert!(request(&sessions, &statuses, &format!("ATTACH {last} 0"), b"").ends_with(b"session closed"));
+    }
+
+    #[test]
+    fn the_shell_is_spawned_outside_the_sessions_lock_and_a_close_meanwhile_kills_it() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        // Held, it stops the spawn between the reservation and the fork.
+        let held = statuses.0.lock().unwrap();
+        let starting = {
+            let (sessions, statuses) = (sessions.clone(), statuses.clone());
+            thread::spawn(move || request(&sessions, &statuses, "SESSION spawning 9", b"sleep 100"))
+        };
+        // Reserved, and the sessions lock is free while the spawn waits.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sessions.lock().unwrap().live.contains_key("spawning") {
+            assert!(Instant::now() < deadline, "the session was never reserved");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(sessions.lock().unwrap().live["spawning"].token, 0);
+        // A retried start meanwhile spawns nothing more; it takes over the attachment.
+        let retry = {
+            let (sessions, statuses) = (sessions.clone(), statuses.clone());
+            thread::spawn(move || request(&sessions, &statuses, "SESSION spawning 9", b"sleep 100"))
+        };
+        let reserved = sessions.lock().unwrap().live["spawning"].output.clone();
+        while reserved.0.lock().unwrap().attachments < 2 {
+            assert!(Instant::now() < deadline, "the retry never attached");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Closing before the shell runs has nothing to kill yet (its token is unknown).
+        sessions.lock().unwrap().close("spawning", None);
+        drop(held);
+        // The first attachment, replaced by the retry's, just ends.
+        starting.join().unwrap();
+        assert!(retry.join().unwrap().ends_with(b"error: session closed"));
+        let pid = *statuses.0.lock().unwrap().running.keys().next().expect("the shell ran");
+        let status = reap(&statuses, pid);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL, "the shell outlived its close");
+        assert!(statuses.0.lock().unwrap().running.is_empty(), "the retry spawned a second shell");
+        assert!(sessions.lock().unwrap().closed.contains_key("spawning"));
+    }
+
+    #[test]
+    fn a_shell_that_cannot_run_gives_its_reservation_back() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        assert!(request(&sessions, &statuses, "SESSION bad 2", b"\xff\xfe").starts_with(&[FRAME_MSG]));
+        {
+            let table = sessions.lock().unwrap();
+            assert!(table.live.is_empty() && !table.ended("bad"), "a failed start left the id taken");
+            assert_eq!(table.pool.load(Ordering::Relaxed), POOL);
+        }
+        // The id can still be started.
+        let (_, group) = start(&sessions, &statuses, "bad", b"exit 3");
+        assert_eq!(reap(&statuses, group), 3 << 8);
+        request(&sessions, &statuses, "CLOSE bad", b"");
     }
 
     #[test]
