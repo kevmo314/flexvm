@@ -40,6 +40,12 @@ pub struct RunSpec {
     /// restore of a checkpoint (`run --checkpoint` gives its own) takes them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<crate::ports::Port>,
+    /// `-i`: the app's stdin stays open, for `attach` (and the foreground `run -i` that is one).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stdin: bool,
+    /// `-t`: the app runs on a pty.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tty: bool,
 }
 
 /// The most of the app's settings sent to the guest (hex-encoded on its request line).
@@ -55,6 +61,11 @@ impl RunSpec {
         for kv in &self.env {
             s += &format!("env {}\n", crate::image::escape(kv));
         }
+        for (on, line) in [(self.stdin, "stdin\n"), (self.tty, "tty\n")] {
+            if on {
+                s += line;
+            }
+        }
         s
     }
 
@@ -64,7 +75,7 @@ impl RunSpec {
     }
 
     pub fn changes_app(&self) -> bool {
-        self.entrypoint.is_some() || !self.env.is_empty()
+        self.entrypoint.is_some() || !self.env.is_empty() || self.stdin || self.tty
     }
 
     /// Whether the VM has an app to follow (and start at run).
@@ -89,8 +100,11 @@ impl RunSpec {
             return Ok(());
         }
         match image {
-            None => bail!("-e, --env-file and --entrypoint apply to an image's app; this template is not an image's"),
-            Some(i) if i.warm => bail!("the image's app starts before its snapshot (pull --warm), so -e, --env-file and --entrypoint cannot change it per run"),
+            None => bail!("-e, --env-file, --entrypoint, -i and -t apply to an image's app; this template is not an image's"),
+            Some(i) if i.warm => {
+                bail!("the image's app starts before its snapshot (pull --warm), so -e, --env-file, --entrypoint, -i and -t cannot change it per run")
+            }
+            Some(i) if (self.stdin || self.tty) && !self.has_app(Some(i)) => bail!("-i and -t apply to the image's app, and it has none: give CMD"),
             Some(_) if self.app_settings().len() > MAX_SETTINGS => bail!("-e, --env-file and --entrypoint come to more than {} KiB", MAX_SETTINGS >> 10),
             Some(_) => Ok(()),
         }
@@ -244,6 +258,7 @@ mod tests {
         };
         assert_eq!(s.app_settings(), "arg /bin/sh\narg -c\narg echo a\\nb\nenv A=1\nenv B=x\\ny\\\\z\n");
         assert_eq!(RunSpec::default().app_settings(), "");
+        assert_eq!(RunSpec { stdin: true, tty: true, ..Default::default() }.app_settings(), "stdin\ntty\n");
     }
 
     #[test]
@@ -265,6 +280,10 @@ mod tests {
         assert!(env.check(Some(&image(&["x"], false))).is_ok());
         assert!(env.check(Some(&image(&["x"], true))).unwrap_err().to_string().contains("--warm"));
         assert!(env.check(None).unwrap_err().to_string().contains("not an image's"));
+        let it = RunSpec { stdin: true, tty: true, ..Default::default() };
+        assert!(it.check(Some(&image(&["bash"], false))).is_ok());
+        assert!(it.check(Some(&image(&["bash"], true))).unwrap_err().to_string().contains("--warm"));
+        assert!(it.check(Some(&image(&[], false))).unwrap_err().to_string().contains("give CMD"), "no app to talk to");
         assert!(RunSpec { keep: true, rm: true, ..Default::default() }.check(None).is_ok(), "only app settings need an image");
         for bad in [vec![], vec![String::new()]] {
             assert!(RunSpec { entrypoint: Some(bad), ..Default::default() }.check(Some(&image(&[], false))).is_err());
@@ -287,6 +306,8 @@ mod tests {
             rm: true,
             ip: Some("10.0.0.9".parse().unwrap()),
             ports: ports.clone(),
+            stdin: true,
+            tty: true,
         };
         assert_eq!(serde_json::from_value::<RunSpec>(serde_json::to_value(&s).unwrap()).unwrap(), s);
         assert_eq!(serde_json::to_string(&RunSpec::default()).unwrap(), "{}");

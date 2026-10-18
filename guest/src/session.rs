@@ -15,20 +15,22 @@
 //! from a shared pool; an unacknowledged session's output is all from the pool (the oldest such are
 //! closed to make room for it): at most `MAX_LIVE * BASE + POOL` (plus a partial `BLOCK` each).
 //! One attachment per session; a new one shuts the old one down. Output waits for it rather than
-//! overwrite unsent bytes; writers never hold the ring lock.
+//! overwrite unsent bytes; writers never hold the ring lock. An interactive session (`i`, `t`) also reads
+//! input frames on its attachment (input.rs), and acknowledges the stdin it took (FRAME_ACK) on it.
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::proto::{frame, valid_session_id, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, SESSION_DONE};
+use crate::input::{feed, Fed, Stdin};
+use crate::proto::{frame, valid_session_id, FRAME_ACK, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, SESSION_DONE};
 use crate::{fail, kill_running, msg, spawn_watched, wait_exit, Statuses};
 
 const CAPACITY: usize = 4 * 1024 * 1024;
@@ -357,6 +359,12 @@ pub(crate) struct Output {
     delivered: Option<u64>,
     reservation: Reservation,
     detached: bool,
+    /// An interactive session's stdin.
+    input: Option<Arc<Stdin>>,
+    /// The stdin taken that the current attachment was last told of.
+    acked: Option<u64>,
+    /// The attachment that sent SESSION_DONE (an interactive one's, read by its feeder).
+    done: Option<u64>,
 }
 
 impl Output {
@@ -453,12 +461,30 @@ pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
 }
 
 /// Request errors become a message frame; write errors just end the stream (a frame may be cut short).
-/// `conn` duplicates `w`'s connection so a later attachment can shut it down.
+/// `conn` duplicates `w`'s connection so a later attachment can shut it down. `body` is the command, then
+/// whatever came after the request already (an interactive session's first input).
 pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, sessions: &Sessions, statuses: &Statuses) -> io::Result<()> {
+    let reader = conn.as_ref().and_then(|c| c.try_clone().ok());
+    // Its feeder holds the connection open: shut down once this attachment ends, it ends too.
+    let _closer = reader.as_ref().and_then(|r| r.try_clone().ok()).map(Closer);
     match open(body, conn, line, sessions, statuses) {
         Ok(Some((id, offset, (output, me)))) => {
-            if output.0.lock().unwrap().detached {
-                return msg(&mut w, id);
+            let (detached, input) = {
+                let ring = output.0.lock().unwrap();
+                (ring.detached, ring.input.clone())
+            };
+            if detached {
+                // An interactive one's client detached it: told so again, should that answer have been lost.
+                return msg(&mut w, id).and_then(|()| if input.is_some() { msg(&mut w, "detached") } else { Ok(()) });
+            }
+            if let (Some(input), Some(reader)) = (input, reader) {
+                let fed = output.clone();
+                // Without a thread, the session gets no input on this attachment; its client may come again.
+                let pending = match parse(line) {
+                    Ok(Request::Start { len, .. }) => body.get(len..).unwrap_or_default().to_vec(),
+                    _ => body.to_vec(),
+                };
+                let _ = thread::Builder::new().spawn(move || take_input(&mut (&pending[..]).chain(reader), &fed, &input, me));
             }
             let result = msg(&mut w, id).and_then(|_| drain(&mut w, &output, offset, me));
             if matches!(result, Ok(true)) {
@@ -488,6 +514,15 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
 }
 
 type Attached = (Session, u64);
+
+/// Shuts its connection down when dropped.
+struct Closer(File);
+
+impl Drop for Closer {
+    fn drop(&mut self) {
+        unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+}
 
 /// The refusal of a command that cannot be run, carrying the status its client exits with.
 pub(crate) fn cannot_run(code: i32, e: impl std::fmt::Display) -> io::Error {
@@ -555,14 +590,16 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 None => (shell_command(command)?, None),
             };
             let detached = spec.as_ref().is_some_and(|s| s.detach);
-            let output = session(Output { detached, gone: detached.then(awake), ..table.new_output() });
+            let (stdin, tty) = spec.as_ref().map_or((false, false), |s| (s.stdin, s.tty));
+            let pty = tty.then(|| crate::input::openpty(spec.as_ref().and_then(|s| s.size))).transpose()?;
             // Start the pump first: if no thread can be had, nothing has run yet.
-            let (tx, rx) = mpsc::sync_channel::<(Child, Option<OwnedFd>, u64)>(1);
+            let (tx, rx) = mpsc::sync_channel::<(Vec<(File, u8)>, Option<OwnedFd>, u64)>(1);
+            let output = session(Output { detached, gone: detached.then(awake), ..table.new_output() });
             let (pumped, statuses_) = (output.clone(), statuses.clone());
             thread::Builder::new()
                 .spawn(move || {
-                    if let Ok((mut child, exited, token)) = rx.recv() {
-                        let rest = crate::pump_until(child.stdout.take(), child.stderr.take(), exited, DRAIN, |kind, data| deliver(&pumped, kind, data));
+                    if let Ok((streams, exited, token)) = rx.recv() {
+                        let rest = crate::pump_until(streams, exited, DRAIN, |kind, data| deliver(&pumped, kind, data));
                         // Closed, they would kill a background process's next write with SIGPIPE.
                         crate::discard(rest);
                         // By token: the pid may be another child's by now, however long the client took.
@@ -578,7 +615,13 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                     }
                 })
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+            match &pty {
+                // Its own session, the pty its terminal; its process group is its pid all the same.
+                Some((_, slave)) => crate::input::controlling_terminal(&mut cmd, slave)?,
+                None => {
+                    cmd.stdin(if stdin { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+                }
+            }
             if let Some(work) = crate::mem::work_procs() {
                 crate::mem::enter(&mut cmd, work, false);
             }
@@ -587,7 +630,7 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 crate::app::exec_credentials(&mut cmd, c);
             }
             // argv commands also work in images without a shell.
-            let (child, exited, token) = spawn_watched(&mut cmd, statuses, true).map_err(|e| {
+            let (mut child, exited, token) = spawn_watched(&mut cmd, statuses, true).map_err(|e| {
                 let program = cmd.get_program().to_string_lossy().into_owned();
                 match (&spec, e.kind()) {
                     // The directory was checked: not found is the program (or its interpreter).
@@ -599,10 +642,17 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                     }
                 }
             })?;
+            // The slave's copies go with the command: the pty's master reads EOF (EIO) once its last user is gone.
+            drop(cmd);
+            let (streams, input) = match pty {
+                Some((master, _)) => (vec![(master.try_clone()?, FRAME_STDOUT)], Some(Stdin::new(master.try_clone()?, Some(master))?)),
+                None => (crate::outputs(&mut child), child.stdin.take().map(|s| Stdin::new(File::from(OwnedFd::from(s)), None)).transpose()?),
+            };
+            output.0.lock().unwrap().input = input.map(Arc::new);
             table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
             // Attached before any output, so none is overwritten before it is sent.
             let attached = attach(&output, 0, conn);
-            let _ = tx.send((child, exited, token));
+            let _ = tx.send((streams, exited, token));
             (id, 0, attached)
         }
         Request::Attach { id, offset } => {
@@ -634,8 +684,8 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
     ring.attachments += 1;
     let id = ring.attachments;
     let previous = ring.attached.replace(Attachment { id, conn });
-    // Its exit is not sent until this attachment sends it.
-    ring.delivered = None;
+    // Its exit is not sent until this attachment sends it, nor its stdin's acknowledgement.
+    (ring.delivered, ring.acked) = (None, None);
     ring.sent = offset.clamp(ring.start, ring.end);
     drop(ring);
     output.1.notify_all();
@@ -644,6 +694,34 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
         unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
     }
     (output.clone(), id)
+}
+
+/// Feeds attachment `me`'s input frames to the session's stdin while it is the attachment. Detaching
+/// leaves the command running as a detached exec's (its output dropped, never reclaimed while it runs).
+fn take_input(conn: &mut io::Chain<&[u8], File>, output: &Session, input: &Stdin, me: u64) {
+    // Its request's read timeout no longer applies: input comes when the user types.
+    crate::untimed_reads(conn.get_ref().1);
+    let current = || {
+        let ring = output.0.lock().unwrap();
+        !ring.closed && ring.attached.as_ref().is_some_and(|a| a.id == me)
+    };
+    let fed = feed(conn, input, 0, &current, &mut |_| output.1.notify_all());
+    let mut ring = output.0.lock().unwrap();
+    if ring.attached.as_ref().is_some_and(|a| a.id == me) {
+        match fed {
+            Ok(Fed::Done) => ring.done = Some(me),
+            Ok(Fed::Detach) if ring.exit.is_none() => {
+                (ring.detached, ring.gone) = (true, Some(awake()));
+                ring.chunks = VecDeque::new();
+                ring.start = ring.end;
+            }
+            // A bad frame: this attachment ends (its client may come again).
+            Err(_) => drop(ring.attached.as_ref().and_then(|a| a.conn.as_ref()).map(|c| unsafe { libc::shutdown(c.as_raw_fd(), libc::SHUT_RDWR) })),
+            _ => {}
+        }
+    }
+    drop(ring);
+    output.1.notify_all();
 }
 
 /// Returns how long it waited for the client.
@@ -671,6 +749,13 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
 /// SESSION_DONE from the client on attachment `me`, within `ACK_WAIT` of its exit frame (a newer attachment
 /// shuts it down). A client acknowledges once it wrote all output out: a slow reader's comes too late.
 fn acknowledge(output: &Session, me: u64) -> bool {
+    let ring = output.0.lock().unwrap();
+    if ring.input.is_some() {
+        // Its feeder reads the connection.
+        return output.1.wait_timeout_while(ring, ACK_WAIT, |r| r.done != Some(me) && r.attached.as_ref().is_some_and(|a| a.id == me)).unwrap().0.done
+            == Some(me);
+    }
+    drop(ring);
     let conn = output.0.lock().unwrap().attached.as_ref().filter(|a| a.id == me).and_then(|a| a.conn.as_ref()).and_then(|c| c.try_clone().ok());
     let Some(mut conn) = conn else { return false };
     let mut ready = libc::pollfd { fd: conn.as_raw_fd(), events: libc::POLLIN, revents: 0 };
@@ -681,7 +766,7 @@ fn acknowledge(output: &Session, me: u64) -> bool {
 fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::Result<bool> {
     loop {
         let data = {
-            let ring = output.0.lock().unwrap();
+            let mut ring = output.0.lock().unwrap();
             if ring.attached.as_ref().is_none_or(|a| a.id != me) {
                 // Replaced; the newer attachment owns the cursor now.
                 return Ok(false);
@@ -691,7 +776,16 @@ fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::
                 drop(ring);
                 return fail(w, e).map(|_| false);
             }
-            if offset < ring.start {
+            // Its client detached: the command runs on, which the client is told.
+            if ring.detached {
+                drop(ring);
+                return msg(w, "detached").map(|()| false);
+            }
+            let taken = ring.input.as_ref().map(|i| i.last()).filter(|&t| ring.acked != Some(t));
+            if let Some(taken) = taken {
+                ring.acked = Some(taken);
+                frame(FRAME_ACK, &[&taken.to_le_bytes()])
+            } else if offset < ring.start {
                 frame(FRAME_LOST, &[&ring.start.to_le_bytes()])
             } else if let Some((kind, data)) = ring.read_chunk(offset) {
                 frame(kind, &[&offset.to_le_bytes(), data])
@@ -812,6 +906,63 @@ mod tests {
         output.0.lock().unwrap().attached = None;
         output.1.notify_all();
         t.join().unwrap();
+    }
+
+    fn read_frames(peer: &mut UnixStream, until: impl Fn(&[(u8, Vec<u8>)]) -> bool) -> Vec<(u8, Vec<u8>)> {
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut frames = Vec::new();
+        while !until(&frames) {
+            let mut hdr = [0; 5];
+            peer.read_exact(&mut hdr).unwrap();
+            let mut body = vec![0; u32::from_le_bytes(hdr[1..].try_into().unwrap()) as usize];
+            peer.read_exact(&mut body).unwrap();
+            frames.push((hdr[0], body));
+        }
+        frames
+    }
+
+    fn acked(frames: &[(u8, Vec<u8>)]) -> Option<u64> {
+        frames.iter().rev().find(|(k, _)| *k == FRAME_ACK).map(|(_, b)| u64::from_le_bytes(b[..].try_into().unwrap()))
+    }
+
+    #[test]
+    fn interactive_stdin_is_taken_once_across_attachments_and_detaching_keeps_it_running() {
+        use crate::proto::{IN_DATA, IN_DETACH};
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (mut r, w) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        let output = live(&mut sessions.lock().unwrap(), "s", Output { input: Some(Arc::new(Stdin::new(w, None).unwrap())), ..Default::default() });
+        let data = |offset: u64, bytes: &[u8]| frame(IN_DATA, &[&offset.to_le_bytes(), bytes]);
+        // Input that came with the request (read ahead with it) is fed too.
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        let dup = File::from(OwnedFd::from(conn.try_clone().unwrap()));
+        let (s2, st2) = (sessions.clone(), statuses.clone());
+        let first = thread::spawn(move || handle(conn, &data(0, b"hello "), Some(dup), "ATTACH s 0", &s2, &st2));
+        assert_eq!(acked(&read_frames(&mut peer, |f| acked(f) == Some(6))), Some(6));
+        // The connection is lost after more was sent, unacknowledged: the new attachment's client sends it all again.
+        peer.write_all(&data(6, b"wor")).unwrap();
+        let mut got = [0; 9];
+        r.read_exact(&mut got).unwrap();
+        let (second, mut peer2) = handler(&sessions, &statuses, "ATTACH s 0".into());
+        assert!(first.join().unwrap().is_ok(), "the replaced handler ends");
+        assert_eq!(acked(&read_frames(&mut peer2, |f| acked(f).is_some())), Some(9));
+        peer2.write_all(&data(6, b"world")).unwrap();
+        assert_eq!(acked(&read_frames(&mut peer2, |f| acked(f) == Some(11))), Some(11));
+        let mut rest = [0; 2];
+        r.read_exact(&mut rest).unwrap();
+        assert_eq!([&got[..], &rest[..]].concat(), b"hello world", "each byte once, in order");
+        peer2.write_all(&frame(IN_DETACH, &[])).unwrap();
+        let frames = read_frames(&mut peer2, |f| f.iter().any(|(k, _)| *k == FRAME_MSG));
+        assert!(frames.contains(&(FRAME_MSG, b"detached".to_vec())), "the client is told it took: {frames:?}");
+        second.join().unwrap().unwrap();
+        // Asked again (its answer lost), it says so again.
+        assert_eq!(request(&sessions, &statuses, "ATTACH s 0", b""), [frame(FRAME_MSG, &[b"s"]), frame(FRAME_MSG, &[b"detached"])].concat());
+        let ring = output.0.lock().unwrap();
+        assert!(ring.detached && ring.attached.is_none());
+        drop(ring);
+        sessions.lock().unwrap().reclaim_after(&statuses, Duration::ZERO, Duration::from_secs(1000));
+        assert!(sessions.lock().unwrap().live.contains_key("s"), "a detached command runs on");
     }
 
     #[test]

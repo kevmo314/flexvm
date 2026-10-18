@@ -9,18 +9,20 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::process::{Child, ChildStderr, ChildStdout, Command};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 mod app;
+mod input;
 mod mem;
 mod net;
 #[allow(dead_code)]
 mod proto;
 mod session;
+mod tar;
 mod user;
 
 use proto::{write_frame, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, TRY_AGAIN};
@@ -58,6 +60,10 @@ impl Children {
 static TOKENS: AtomicU64 = AtomicU64::new(1);
 
 fn main() {
+    // `cp`'s tar ends, run in a session as /proc/self/exe.
+    if let Some(code) = tar::tool_main(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     if unsafe { libc::getpid() } == 1 {
         if let Err(e) = setup_root() {
             log(&format!("root setup failed: {e}"));
@@ -222,18 +228,16 @@ fn kill_running(statuses: &Statuses, pid: i32, token: u64, group: bool, sig: lib
     unsafe { libc::kill(if group { -pid } else { pid }, sig) == 0 }
 }
 
-/// Pumps output until EOF or, once `exited` (a pidfd) is readable, `drain` more:
-/// background processes may hold the pipes open for good. `deliver` returns how long it waited
+/// A child's output pipes, by frame kind.
+fn outputs(child: &mut Child) -> Vec<(File, u8)> {
+    let out = child.stdout.take().map(|s| (File::from(OwnedFd::from(s)), FRAME_STDOUT));
+    out.into_iter().chain(child.stderr.take().map(|s| (File::from(OwnedFd::from(s)), FRAME_STDERR))).collect()
+}
+
+/// Pumps output (`outputs`, or a pty's master) until EOF or, once `exited` (a pidfd) is readable, `drain`
+/// more: background processes may hold the pipes open for good. `deliver` returns how long it waited
 /// for its reader, which is not counted. Returns the pipes still open.
-fn pump_until(
-    stdout: Option<ChildStdout>,
-    stderr: Option<ChildStderr>,
-    mut exited: Option<OwnedFd>,
-    drain: Duration,
-    mut deliver: impl FnMut(u8, &[u8]) -> Duration,
-) -> Vec<File> {
-    let out = stdout.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDOUT));
-    let mut streams: Vec<(File, u8)> = out.into_iter().chain(stderr.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDERR))).collect();
+fn pump_until(mut streams: Vec<(File, u8)>, mut exited: Option<OwnedFd>, drain: Duration, mut deliver: impl FnMut(u8, &[u8]) -> Duration) -> Vec<File> {
     let mut buf = [0; 16 * 1024];
     let mut left: Option<Duration> = None;
     while !streams.is_empty() {
@@ -256,7 +260,8 @@ fn pump_until(
                     match streams[i].0.read(&mut buf) {
                         Ok(0) => drop(streams.remove(i)),
                         Ok(n) => waited += deliver(streams[i].1, &buf[..n]),
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        // A pty's master is non-blocking, for its writer.
+                        Err(e) if matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) => {}
                         Err(_) => drop(streams.remove(i)),
                     }
                 }
@@ -419,6 +424,8 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             match line.split_whitespace().next() {
                 Some("SESSIONS") => return drop(msg(&stream, session::counts(&sessions))),
                 Some("SESSION" | "ARGV" | "ATTACH" | "CLOSE") => {}
+                // Its input may have come with the request, read ahead into `r`.
+                Some("APPIN") => return drop(app::appin(line.trim_end().split_once(' ').map_or("", |(_, a)| a), &stream, r.buffer())),
                 _ => return drop(handle(&stream, &line, &statuses)),
             }
             // A session's command arrives a round trip later, which a guest faulting in memory can stretch past a second.
@@ -429,6 +436,11 @@ fn serve(statuses: Statuses) -> io::Result<()> {
                 },
                 _ => Ok(Vec::new()),
             };
+            // After the command, input an interactive session's client sent at once (read ahead into `r`) is its feeder's.
+            let body = body.map(|mut body| {
+                body.extend_from_slice(r.buffer());
+                body
+            });
             // Kept by the session, so that a later ATTACH can shut this one down.
             let _ = match body.and_then(|body| Ok((body, stream.try_clone()?))) {
                 Ok((body, conn)) => session::handle(&stream, &body, Some(conn), &line, &sessions, &statuses),
@@ -442,6 +454,14 @@ fn serve(statuses: Statuses) -> io::Result<()> {
 fn sock_timeout(fd: RawFd, opt: libc::c_int, t: Duration) {
     let tv = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros().max(u32::from(t.is_zero())) as _ };
     unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&tv as *const libc::timeval).cast(), std::mem::size_of_val(&tv) as _) };
+}
+
+/// Clears a connection's SO_RCVTIMEO: its reads wait for input however long it takes.
+fn untimed_reads(conn: &impl AsRawFd) {
+    let forever = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    unsafe {
+        libc::setsockopt(conn.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&forever as *const libc::timeval).cast(), std::mem::size_of_val(&forever) as _)
+    };
 }
 
 /// Refused while `MAX_BODY_READERS` commands are still arriving: the host waits for a slot.

@@ -1,24 +1,28 @@
 //! The image's entrypoint, supervised by flexvm-init. `/etc/flexvm/app.conf` (written at build) has one
 //! `key value` per line, `\` and newline escaped as `\\` and `\n`: `arg`/`env` (repeated), `cwd`, `uid`,
 //! `gid`, `groups`. Requests: `APP [<hex settings>]`, `APPSTATUS`, `LOGS <offset> <follow 0|1>`,
-//! `PROBE <port>`, `CHECK <timeout ms> <hex shell command>`, `QUIESCE`, `SIGNAL <signo>`. `APP`'s settings
-//! are a run's (`run -e`, `--entrypoint`), in app.conf's form: `env` lines replace the image's of their
-//! key, `arg` lines (if any) its whole argv. `SIGNAL` goes to the app's process alone, as docker kill's
-//! does. A non-root app runs with no_new_privs and an empty bounding set, so setuid binaries and file
+//! `APPIN <stream>`, `PROBE <port>`, `CHECK <timeout ms> <hex shell command>`, `QUIESCE`, `SIGNAL <signo>`.
+//! `APP`'s settings are a run's (`run -e`, `--entrypoint`, `-i`, `-t`), in app.conf's form: `env` lines
+//! replace the image's of their key, `arg` lines (if any) its whole argv, `stdin` keeps its stdin open
+//! (for `APPIN`), `tty` gives it a pty. `LOGS` frames are the app's stdout and stderr (a pty's output is
+//! stdout) and FRAME_NOTE, flexvm-init's lines. `APPIN` (input.rs) feeds client `stream`'s input frames to
+//! the app's stdin, answering `ok <taken> <tty 0|1>` (or `closed <tty>`), then FRAME_ACK as it takes
+//! them; a newer `APPIN` takes over. `SIGNAL` goes to the app's process alone, as docker kill's does. A non-root app runs with no_new_privs and an empty bounding set, so setuid binaries and file
 //! capabilities cannot take it back to root.
 
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::proto::FRAME_LOST;
+use crate::input::{feed, Stdin};
+use crate::proto::{FRAME_ACK, FRAME_LOST, FRAME_NOTE};
 use crate::session::{cannot_run, Output, DRAIN};
 use crate::user::resolve_user;
 use crate::{fail, kill_running, mem, msg, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
@@ -36,7 +40,7 @@ fn config() -> io::Result<&'static Conf> {
     CONFIG.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
-pub const VERBS: [&str; 7] = ["APP", "APPSTATUS", "LOGS", "PROBE", "CHECK", "QUIESCE", "SIGNAL"];
+pub const VERBS: [&str; 8] = ["APP", "APPSTATUS", "LOGS", "APPIN", "PROBE", "CHECK", "QUIESCE", "SIGNAL"];
 
 #[derive(Clone, Copy)]
 enum State {
@@ -50,14 +54,27 @@ struct App {
     /// The running app's reaper token: a signal reaches it only while it is unreaped (`kill_running`).
     token: u64,
     output: Output,
+    /// `run -i`'s: the running app's stdin.
+    stdin: Option<Arc<Stdin>>,
+    /// `run -t`'s.
+    tty: bool,
+    /// The `APPIN` feeding it (a duplicate of its connection, to shut it down when replaced), by number.
+    appin: Option<(u64, File)>,
+    appins: u64,
 }
 
-static APP: LazyLock<Mutex<App>> = LazyLock::new(|| Mutex::new(App { state: State::Idle, token: 0, output: Output::default() }));
+static APP: LazyLock<Mutex<App>> = LazyLock::new(|| Mutex::new(App::default()));
 static CHANGED: Condvar = Condvar::new();
 
+impl Default for App {
+    fn default() -> App {
+        App { state: State::Idle, token: 0, output: Output::default(), stdin: None, tty: false, appin: None, appins: 0 }
+    }
+}
+
 impl App {
-    fn push(&mut self, data: &[u8]) {
-        self.output.push(FRAME_STDOUT, data, RING_BYTES);
+    fn push(&mut self, kind: u8, data: &[u8]) {
+        self.output.push(kind, data, RING_BYTES);
         CHANGED.notify_all();
     }
 
@@ -87,6 +104,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
             let offset = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             return logs(out, offset, a.next() == Some("1"));
         }
+        "APPIN" => return appin(arg, out, &[]),
         "PROBE" => match arg.trim().parse::<u16>() {
             Ok(port) => TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), Duration::from_millis(500)).map(|_| "ok".into()),
             Err(_) => Err(io::Error::other(format!("bad port {arg:?}"))),
@@ -111,6 +129,9 @@ pub(crate) struct Conf {
     uid: u32,
     gid: u32,
     groups: Vec<u32>,
+    /// A run's `-i` and `-t`.
+    stdin: bool,
+    tty: bool,
 }
 
 fn unescape(s: &str) -> String {
@@ -127,7 +148,7 @@ fn unescape(s: &str) -> String {
 }
 
 fn parse_conf(text: &str) -> io::Result<Conf> {
-    let mut c = Conf { argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![] };
+    let mut c = Conf { argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![], stdin: false, tty: false };
     let num = |v: &str| v.trim().parse::<u32>().map_err(|_| io::Error::other(format!("{CONF}: bad id {v:?}")));
     // Only LF delimits records; str::lines() also removes a value's trailing CR.
     for line in text.split('\n') {
@@ -158,6 +179,8 @@ fn with_settings(c: &Conf, text: &str) -> io::Result<Conf> {
         match k {
             "arg" => argv.get_or_insert_with(Vec::new).push(unescape(v)),
             "env" => set_env(&mut c, &unescape(v)),
+            "stdin" => c.stdin = true,
+            "tty" => c.tty = true,
             _ => return Err(io::Error::other(format!("unknown app setting {k:?}"))),
         }
     }
@@ -168,6 +191,13 @@ fn with_settings(c: &Conf, text: &str) -> io::Result<Conf> {
 }
 
 /// `K=V` (or a bare `K`, empty) in place of `c`'s `K`: a run's `-e`, and an exec's on top of it.
+/// With a pty, as docker's -t: TERM, unless set.
+fn terminal_env(c: &mut Conf) {
+    if !c.env.iter().any(|(k, _)| k == "TERM") {
+        set_env(c, "TERM=xterm");
+    }
+}
+
 fn set_env(c: &mut Conf, kv: &str) {
     let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
     c.env.retain(|(e, _)| e != k);
@@ -206,6 +236,43 @@ pub(crate) fn exec_credentials(cmd: &mut Command, c: &Conf) {
     credentials(cmd, c, false);
 }
 
+/// `APPIN`: feeds the app's stdin until the connection closes, a newer one takes over or the app exits.
+/// `pending`: input that came with the request.
+pub(crate) fn appin(arg: &str, out: &File, pending: &[u8]) -> io::Result<()> {
+    crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Duration::from_secs(5));
+    let stream = arg.trim().parse::<u64>().map_err(|_| io::Error::other(format!("bad stream {arg:?}")))?;
+    let (stdin, me) = {
+        let mut app = APP.lock().unwrap();
+        let Some(stdin) = app.stdin.clone().filter(|_| matches!(app.state, State::Running(_))) else {
+            return msg(out, format!("closed {}", u8::from(app.tty)));
+        };
+        app.appins += 1;
+        let me = app.appins;
+        if let Some((_, old)) = app.appin.replace((me, out.try_clone()?)) {
+            unsafe { libc::shutdown(old.as_raw_fd(), libc::SHUT_RDWR) };
+        }
+        (stdin, me)
+    };
+    msg(out, format!("ok {} {}", stdin.taken(stream), u8::from(stdin.tty())))?;
+    crate::untimed_reads(out);
+    let current = || {
+        let app = APP.lock().unwrap();
+        app.appin.as_ref().is_some_and(|(id, _)| *id == me) && matches!(app.state, State::Running(_))
+    };
+    let mut ack_error = None;
+    let fed = feed(&mut pending.chain(out.try_clone()?), &stdin, stream, &current, &mut |taken| {
+        if let Err(e) = write_frame(out, FRAME_ACK, &taken.to_le_bytes()) {
+            ack_error.get_or_insert(e);
+        }
+    });
+    let mut app = APP.lock().unwrap();
+    if app.appin.as_ref().is_some_and(|(id, _)| *id == me) {
+        app.appin = None;
+    }
+    drop(app);
+    ack_error.map_or(fed.map(drop), Err)
+}
+
 /// A user missing from the guest's /etc/passwd (resolved as pull resolves the image's), or a directory
 /// that is not one, is the command's failure (126), as with docker exec.
 fn exec_conf(mut c: Conf, e: &crate::proto::Exec, passwd: &str, group: &str) -> io::Result<Conf> {
@@ -226,6 +293,9 @@ fn exec_conf(mut c: Conf, e: &crate::proto::Exec, passwd: &str, group: &str) -> 
     }
     if let Some(dir) = &e.workdir {
         c.cwd = dir.clone();
+    }
+    if e.tty {
+        terminal_env(&mut c);
     }
     if !std::fs::metadata(&c.cwd).is_ok_and(|m| m.is_dir()) {
         let why = std::fs::metadata(&c.cwd).map_or_else(|e| e.to_string(), |_| "not a directory".into());
@@ -416,41 +486,70 @@ fn start(settings: &str, statuses: &Statuses) -> io::Result<i32> {
         return Ok(pid);
     }
     let settings = unhex(settings.trim()).ok_or_else(|| io::Error::other("bad app settings encoding"))?;
-    let c = &with_settings(config()?, &String::from_utf8_lossy(&settings))?;
+    let c = &mut with_settings(config()?, &String::from_utf8_lossy(&settings))?;
     if c.argv.is_empty() {
         return Err(io::Error::other("the image has no entrypoint or command: there is no app"));
     }
+    if c.tty {
+        terminal_env(c);
+    }
+    let pty = c.tty.then(|| crate::input::openpty(None)).transpose()?;
     let mut cmd = command(c, &c.argv);
+    if let Some((_, slave)) = &pty {
+        crate::input::controlling_terminal(&mut cmd, slave)?;
+    } else if c.stdin {
+        cmd.stdin(Stdio::piped());
+    }
     if let Some(work) = mem::work_procs() {
         mem::enter(&mut cmd, work, true);
     }
-    restrict(&mut cmd, c);
-    let (pid, _) = launch(&mut app, &mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
+    // A pty's session is its own already.
+    credentials(&mut cmd, c, pty.is_none());
+    let (pid, _) = launch(&mut app, &mut cmd, statuses, pty.map(|(master, _)| master)).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
+    // Without `-i`, a pty's input is not the client's either.
+    if !c.stdin {
+        app.stdin = None;
+    }
     *RUN.lock().unwrap() = Some(c.clone());
-    app.push(format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
+    app.push(FRAME_NOTE, format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
     Ok(pid)
 }
 
 /// Its supervisor (returned) logs output as an exec session's: until its exit and `DRAIN` more, then
 /// discarded, so descendants that hold the pipes never write into the log once it is marked exited.
-fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses) -> io::Result<(i32, thread::JoinHandle<()>)> {
-    let (mut child, exited, token) = spawn_watched(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()), statuses, true)?;
+/// `pty`: its master, the slave the command's stdio already (else its output is piped here, and its stdin is
+/// what the caller made it).
+fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses, pty: Option<File>) -> io::Result<(i32, thread::JoinHandle<()>)> {
+    if pty.is_none() {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
+    let (mut child, exited, token) = spawn_watched(cmd, statuses, true)?;
     let pid = child.id() as i32;
     let Some(exited) = exited else { return Err(unwatched(statuses, pid, token, io::Error::other("cannot open a pidfd to watch it"))) };
+    let mut inputs = |master: &Option<File>| -> io::Result<_> {
+        Ok(match master {
+            Some(m) => (vec![(m.try_clone()?, FRAME_STDOUT)], Some(Stdin::new(m.try_clone()?, Some(m.try_clone()?))?)),
+            None => (crate::outputs(&mut child), child.stdin.take().map(|s| Stdin::new(File::from(std::os::fd::OwnedFd::from(s)), None)).transpose()?),
+        })
+    };
+    let (streams, stdin) = inputs(&pty).map_err(|e| unwatched(statuses, pid, token, e))?;
     let watched = statuses.clone();
     let supervisor = thread::Builder::new()
         .spawn(move || {
-            crate::discard(crate::pump_until(child.stdout.take(), child.stderr.take(), Some(exited), DRAIN, |_, data| {
-                APP.lock().unwrap().push(data);
+            crate::discard(crate::pump_until(streams, Some(exited), DRAIN, |kind, data| {
+                APP.lock().unwrap().push(kind, data);
                 Duration::ZERO
             }));
             let code = wait_exit(&watched, token, None).expect("no deadline");
             let mut app = APP.lock().unwrap();
-            app.state = State::Exited(code);
-            app.push(format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
+            (app.state, app.stdin) = (State::Exited(code), None);
+            if let Some((_, conn)) = app.appin.take() {
+                unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
+            }
+            app.push(FRAME_NOTE, format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
         })
         .map_err(|e| unwatched(statuses, pid, token, e))?;
-    (app.state, app.token) = (State::Running(pid), token);
+    (app.state, app.token, app.tty, app.stdin) = (State::Running(pid), token, pty.is_some(), stdin.map(Arc::new));
     Ok((pid, supervisor))
 }
 
@@ -502,23 +601,25 @@ fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
     loop {
         let (chunk, status, done, moved) = {
             let (app, _) = CHANGED
-                .wait_timeout_while(APP.lock().unwrap(), Duration::from_secs(5), |a| follow && offset >= a.output.end && matches!(a.state, State::Running(_)))
+                // Past the end (`attach` asks for what comes from now on), it is clamped, and told, at once.
+                .wait_timeout_while(APP.lock().unwrap(), Duration::from_secs(5), |a| follow && offset == a.output.end && matches!(a.state, State::Running(_)))
                 .unwrap();
             let clamped = offset.clamp(app.output.start, app.output.end);
             let moved = clamped != offset;
             offset = clamped;
-            let chunk = app
-                .output
-                .read_chunk(offset)
-                .map_or_else(Vec::new, |(_, data)| data[..data.len().min(64 * 1024).min(stop.saturating_sub(offset) as usize)].to_vec());
-            (chunk, app.status(), !follow || !matches!(app.state, State::Running(_)), moved)
+            let (kind, chunk) = app.output.read_chunk(offset).map_or_else(
+                || (FRAME_STDOUT, Vec::new()),
+                |(kind, data)| (kind, data[..data.len().min(64 * 1024).min(stop.saturating_sub(offset) as usize)].to_vec()),
+            );
+            ((kind, chunk), app.status(), !follow || !matches!(app.state, State::Running(_)), moved)
         };
+        let (kind, chunk) = chunk;
         if follow && moved {
             write_frame(&mut out, FRAME_LOST, &offset.to_le_bytes())?;
         }
         offset += chunk.len() as u64;
         // An empty frame doubles as a keepalive that notices a closed connection.
-        write_frame(&mut out, FRAME_STDOUT, &chunk)?;
+        write_frame(&mut out, kind, &chunk)?;
         if done && chunk.is_empty() {
             return msg(out, format!("{status} {offset}"));
         }
@@ -532,7 +633,7 @@ mod tests {
 
     fn exec(argv: &[&str], env: &[&str], workdir: Option<&str>, user: Option<&str>) -> crate::proto::Exec {
         let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
-        crate::proto::Exec { argv: strings(argv), env: strings(env), workdir: workdir.map(String::from), user: user.map(String::from), detach: false }
+        crate::proto::Exec { argv: strings(argv), env: strings(env), workdir: workdir.map(String::from), user: user.map(String::from), ..Default::default() }
     }
 
     #[test]
@@ -679,7 +780,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut out = [Vec::new(), Vec::new()];
-        crate::pump_until(child.stdout.take(), child.stderr.take(), None, Duration::ZERO, |kind, data| {
+        crate::pump_until(crate::outputs(&mut child), None, Duration::ZERO, |kind, data| {
             out[usize::from(kind != FRAME_STDOUT)].extend_from_slice(data);
             Duration::ZERO
         });
@@ -705,7 +806,7 @@ mod tests {
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", "echo early; (sleep 3; echo late) & exit 0"]);
             let begun = Instant::now();
-            let (_, supervisor) = launch(&mut APP.lock().unwrap(), &mut cmd, &statuses).unwrap();
+            let (_, supervisor) = launch(&mut APP.lock().unwrap(), &mut cmd, &statuses, None).unwrap();
             supervisor.join().unwrap();
             assert!(begun.elapsed() < DRAIN + Duration::from_millis(900), "{:?}", begun.elapsed());
             assert!(matches!(APP.lock().unwrap().state, State::Exited(0)));
@@ -765,7 +866,7 @@ mod tests {
     fn followed_logs_catch_up_through_exit() {
         let mut app = APP.lock().unwrap();
         (app.output, app.state) = (Output::default(), State::Running(1));
-        app.push(&vec![b'x'; RING_BYTES + 10]);
+        app.push(FRAME_STDOUT, &vec![b'x'; RING_BYTES + 10]);
         drop(app);
         let reader = thread::spawn(|| {
             let mut frames = Vec::new();
@@ -773,7 +874,7 @@ mod tests {
         });
         let mut app = APP.lock().unwrap();
         app.state = State::Exited(7);
-        app.push(b"crash-tail\n");
+        app.push(FRAME_STDOUT, b"crash-tail\n");
         let end = app.output.end;
         drop(app);
         let frames = reader.join().unwrap().unwrap();
@@ -869,7 +970,7 @@ mod tests {
     #[test]
     fn a_signal_reaches_only_a_running_app() {
         let statuses = Statuses::default();
-        let mut app = App { state: State::Idle, token: 0, output: Output::default() };
+        let mut app = App::default();
         assert!(signal_app(&app, "15", &statuses).unwrap_err().to_string().contains("no app"));
         let mut child = Command::new("/bin/sleep").arg("100").spawn().unwrap();
         let pid = child.id() as i32;
