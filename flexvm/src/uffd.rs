@@ -779,6 +779,13 @@ impl Pager {
         self.discards.load(Ordering::SeqCst)
     }
 
+    /// `discards` once the events read so far are applied: the kernel lets a discard finish as its
+    /// event is read, so one that ended before a pause may not be counted yet.
+    pub fn settled_discards(&self) -> u64 {
+        drop(self.pages().removing());
+        self.discards()
+    }
+
     /// Installs that found a REMOVE queued and waited for it to be read.
     pub fn install_eagain(&self) -> u64 {
         self.pages().install_eagain.load(Ordering::Relaxed)

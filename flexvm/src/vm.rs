@@ -356,7 +356,7 @@ impl Vm {
         let saved = match crate::host::tripped("snapshot_fail") {
             true => Err("injected fault: creating the snapshot failed".into()),
             false => self.fc(|fc| {
-                self.snapshot_discards.store(self.pager.discards(), Ordering::SeqCst);
+                self.snapshot_discards.store(self.pager.settled_discards(), Ordering::SeqCst);
                 fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))
             }),
         };

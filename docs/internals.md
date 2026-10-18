@@ -122,11 +122,16 @@ Memory still goes back to the host. A VM's host RSS went from 19 MiB idle to
 2630 MiB holding 2.5 GiB in /dev/shm, then back to 96 MiB 15 s after the
 file was deleted. What stays resident is the page structs of the touched
 memory (1/64 of it) and small free fragments that free page reporting skips.
-Two details keep untouched plugged memory free:
+Untouched plugged memory stays free:
 
-- Templates wait for free page reporting to finish before the snapshot.
-  Otherwise every VM reports the 4 GiB again after restore, and the walk over
-  its page structs costs ~64 MiB RSS per VM.
+- Templates do not wait for free page reporting before the snapshot, so each
+  VM reports its free memory (~5.6 GB on ubuntu:24.04) over its first ~25 s.
+  The walk over its page structs costs ~7 MiB RSS per VM (44 to 51 MiB); waiting
+  added ~26 s to every pull, since the guest reports a sixteenth of its free list
+  every 2 s. Free page hinting does not help: it leaves the pages unmarked, so
+  VMs still report them. Warm templates still wait: memory warm-up freed holds
+  data, which would stay in the template (a 1 GiB buffer freed left 1180 MiB of
+  memory file, against 159 MiB; hinting, only whole 4 MiB blocks, left 797).
 - The pager copies 16 template pages per fault only when faults are
   sequential. Strided reads, such as reporting touching one page struct per
   4 MiB block, used to pull in 16 times what they touched. Recorded working
@@ -647,7 +652,9 @@ through, so the checkpoint is exactly the memory at the pause.
 - **Discards.** The kernel zaps a page right after the pager reads the
   REMOVE event for it, so a balloon or virtio-mem discard must not be read
   while pages are unsaved. So none is made during the copy:
-  - **Free page reports are held.** Before the resume the VM process sends
+  - **Free page reports are held.** Before the pause (paused vCPUs do not stop
+    Firecracker processing what the guest queued; every checkpoint holds them, a
+    fresh VM reports for ~25 s) the VM process sends
     `PATCH /balloon/reporting/hold` (`firecracker/0003`): Firecracker leaves
     the guest's reports in the queue, neither discarding nor acknowledging
     them, until `.../release` after the copy (also on failure) processes
