@@ -207,6 +207,7 @@ impl Proc {
             self.record_for_suspend()?;
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
+            staging.add_file("PORTS", &serde_json::to_vec(&*self.ports.lock().unwrap())?)?;
             let cmd = match self.cmd.lock().unwrap().clone() {
                 Some(cmd) => Some((cmd, self.cmd_session()?, staging.create(CMD)?)),
                 None => None,
@@ -295,6 +296,8 @@ impl Proc {
         crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         self.set_resources(ck.manifest.resources, &tpl.meta)?;
+        *self.ports.lock().unwrap() = read_ports(&dir)?;
+        self.start_ports(ip)?;
         let claim = {
             let l = self.host.lock()?;
             if !self.host.current(&l, ip, gen)? {
@@ -373,6 +376,7 @@ impl Proc {
             }
         };
         let ip = self.set_addr(claim);
+        self.start_ports(ip)?;
         t.mark("claim_ip");
         self.restore_checkpoint(&name, ck, tpl, ip, false, paused, &mut t).map_err(|(Restore::NotRun(e) | Restore::Ran(e) | Restore::Uncertain(e))| e)
     }
@@ -438,7 +442,7 @@ impl Proc {
             self.publish();
             self.announce();
             self.watch_checkpoint_pull(vm.clone(), dir.clone(), to_load);
-            json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "resume_error": why, "restore_ms": ms(restore), "timings_ms": t.json()})
+            json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "ports": *self.ports.lock().unwrap(), "state": "paused", "resume_error": why, "restore_ms": ms(restore), "timings_ms": t.json()})
         };
         // Test gate: a resume loaded and paused, not yet marked STARTED (the fence's host lock not yet taken).
         if owned {
@@ -542,6 +546,7 @@ impl Proc {
             "ip": ip.to_string(),
             "pid": std::process::id(),
             "state": state,
+            "ports": *self.ports.lock().unwrap(),
             "restore_ms": ms(restore),
             "ready_ms": ready.map(ms),
             "guest_error": guest_error,
@@ -1059,6 +1064,14 @@ pub(crate) fn quarantined<'a>(q: &'a str, boot: &str) -> Option<&'a str> {
     (written == boot).then_some(why)
 }
 
+fn read_ports(dir: &Path) -> Result<Vec<crate::ports::Port>> {
+    match std::fs::read(dir.join("PORTS")) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     if !host.is_suspended(name) {
         return None;
@@ -1070,6 +1083,7 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };
     Some(json!({
         "name": name, "ip": m.ip.to_string(), "template": m.template, "template_id": m.template_id,
+        "ports": read_ports(&dir).ok()?,
         "state": state, "vcpus": m.vcpus, "cpus": m.resources.cpus, "resources": m.resources,
         "guest_mib": m.mem_mib.saturating_add(m.hotplug_mib), "max_mib": m.resources.ceiling(m.mem_mib, m.max_mib),
         "checkpoint_mib": (m.data_pages.saturating_mul(PAGE_SIZE as u64)) >> 20,
@@ -1086,7 +1100,18 @@ pub fn ckhash(paths: &crate::template::Paths, dir: &Path) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::quarantined;
+    use super::{quarantined, read_ports};
+
+    #[test]
+    fn suspended_port_records_roundtrip_and_missing_old_records_are_empty() {
+        let dir = crate::test_util::TempDir::new("suspended-ports");
+        assert!(read_ports(&dir).unwrap().is_empty());
+        let ports = vec!["127.0.0.1:8080:80".parse::<crate::ports::Port>().unwrap(), "5353:53/udp".parse().unwrap()];
+        std::fs::write(dir.join("PORTS"), serde_json::to_vec(&ports).unwrap()).unwrap();
+        assert_eq!(read_ports(&dir).unwrap(), ports);
+        std::fs::write(dir.join("PORTS"), b"broken").unwrap();
+        assert!(read_ports(&dir).is_err(), "a corrupt record must refuse start");
+    }
 
     #[test]
     fn quarantine_holds_only_in_its_boot() {

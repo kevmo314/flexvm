@@ -463,6 +463,8 @@ impl Proc {
 
     /// A failed route is retried in the background: the target owns the VM either way.
     fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>, switch: bool) -> (Option<hold::Stats>, Result<()>) {
+        self.drop_ports();
+        self.publish();
         let ip = self.vm().ip;
         let mut route = Route::new(to, target, conn);
         *self.pending_route.lock().unwrap() = Some((mig, route.clone()));

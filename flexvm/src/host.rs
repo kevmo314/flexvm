@@ -2486,6 +2486,7 @@ impl Drop for NameLock {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Entry {
+    pub ports: Vec<crate::ports::Port>,
     pub name: String,
     #[serde(flatten)]
     pub ident: Ident,
