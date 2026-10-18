@@ -14,7 +14,8 @@ use crate::util::Result;
 
 const CONNECTIONS: usize = 256;
 const BUFFER: usize = 65536;
-const UDP_IDLE: Duration = Duration::from_secs(60);
+/// UDP sessions expire after this; a TCP forward this idle is closed only to admit a client at the cap.
+const IDLE: Duration = Duration::from_secs(60);
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 /// The most datagrams taken from one socket per wakeup: a flood on one cannot starve the others.
 const BURST: usize = 1024;
@@ -118,7 +119,7 @@ impl Forwarder {
         for (fds, protocol, port) in self.bound.drain(..) {
             let (stop, target) = (self.stop.clone(), SocketAddrV4::new(vm, port));
             self.workers.push(thread::Builder::new().name("port-forward".into()).spawn(move || match protocol {
-                Protocol::Tcp => tcp(fds.into_iter().map(TcpListener::from).collect(), target, stop.as_fd()),
+                Protocol::Tcp => tcp(fds.into_iter().map(TcpListener::from).collect(), target, stop.as_fd(), CONNECTIONS, IDLE),
                 Protocol::Udp => udp(fds.into_iter().map(UdpSocket::from).collect(), target, stop.as_fd()),
             })?);
         }
@@ -240,13 +241,17 @@ impl Direction {
         (if !self.eof && self.bytes.len() < BUFFER { libc::POLLIN } else { 0 }) | (if !reverse.bytes.is_empty() { libc::POLLOUT } else { 0 })
     }
 
-    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> io::Result<()> {
-        let mut buf = [0; 16384];
+    /// True if it moved anything.
+    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> io::Result<bool> {
+        let (mut buf, mut moved) = ([0; 16384], false);
         let room = (BUFFER - self.bytes.len()).min(buf.len());
         if !self.eof && room > 0 {
             match from.read(&mut buf[..room]) {
-                Ok(0) => self.eof = true,
-                Ok(n) => self.bytes.extend(&buf[..n]),
+                Ok(0) => (self.eof, moved) = (true, true),
+                Ok(n) => {
+                    self.bytes.extend(&buf[..n]);
+                    moved = true;
+                }
                 Err(e) if transient(&e) => {}
                 Err(e) => return Err(e),
             }
@@ -256,6 +261,7 @@ impl Direction {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => {
                     self.bytes.drain(..n);
+                    moved = true;
                 }
                 Err(e) if transient(&e) => {}
                 Err(e) => return Err(e),
@@ -265,7 +271,7 @@ impl Direction {
             to.shutdown(Shutdown::Write)?;
             self.shut = true;
         }
-        Ok(())
+        Ok(moved)
     }
 }
 
@@ -278,14 +284,30 @@ struct Connection {
     guest: TcpStream,
     connected: bool,
     since: Instant,
+    /// When it last moved data (or connected).
+    active: Instant,
     out: Direction,
     incoming: Direction,
 }
 
-fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd) {
+/// The connected forward idle longest, if for at least `idle`: the one to close for a new client at the cap.
+fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
+    let (i, c) = connections.iter().enumerate().filter(|(_, c)| c.connected).min_by_key(|(_, c)| c.active)?;
+    (c.active.elapsed() >= idle).then_some(i)
+}
+
+/// How many connected forwards have been idle for `idle`: each may make way for one more client.
+fn spare(connections: &[Connection], idle: Duration) -> usize {
+    connections.iter().filter(|c| c.connected && c.active.elapsed() >= idle).count()
+}
+
+/// At most `cap` connected, and as many more connecting as forwards are idle: each replaces one once
+/// connected, or is closed if none is idle by then.
+fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap: usize, idle: Duration) {
     let mut connections: Vec<Connection> = Vec::new();
     loop {
-        let room = if connections.len() < CONNECTIONS { libc::POLLIN } else { 0 };
+        // Idle forwards cannot hold the cap: at it, a waiting client replaces the idlest once it connects.
+        let room = if connections.len() < cap + spare(&connections, idle) { libc::POLLIN } else { 0 };
         let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, room)).collect();
         for c in &connections {
             fds.push(poll(&c.client, if c.connected { c.out.events(&c.incoming) } else { 0 }));
@@ -308,11 +330,27 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd) {
                 if !c.connected {
                     return c.since.elapsed() <= CONNECT_WAIT;
                 }
+                // It moves nothing until it is admitted below.
+                c.active = Instant::now();
+                return true;
             } else if !ready(client) && !ready(guest) {
                 return true;
             }
-            c.out.pump(&c.client, &c.guest).is_ok() && c.incoming.pump(&c.guest, &c.client).is_ok() && !(c.out.shut && c.incoming.shut)
+            let Ok(out) = c.out.pump(&c.client, &c.guest) else { return false };
+            let Ok(incoming) = c.incoming.pump(&c.guest, &c.client) else { return false };
+            if out || incoming {
+                c.active = Instant::now();
+            }
+            !(c.out.shut && c.incoming.shut)
         });
+        // Only now: a replacement whose connect fails closes nothing, and one that finds none idle any
+        // more (the newest connected) is closed itself.
+        while connections.iter().filter(|c| c.connected).count() > cap {
+            let newest = connections.iter().enumerate().filter(|(_, c)| c.connected).max_by_key(|(_, c)| c.since).map(|(i, _)| i);
+            let Some(i) = idlest(&connections, idle).or(newest) else { break };
+            connections.swap_remove(i);
+        }
+        let spare = spare(&connections, idle);
         for (listener, fd) in listeners.iter().zip(&accepting) {
             // Attempts are bounded too: a client whose guest connect fails (EMFILE, say) is dropped,
             // and a flood of them must still let the loop see its stop.
@@ -320,7 +358,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd) {
                 continue;
             }
             for _ in 0..CONNECTIONS {
-                if connections.len() >= CONNECTIONS {
+                if connections.len() >= cap + spare {
                     break;
                 }
                 let client = match listener.accept() {
@@ -335,6 +373,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd) {
                             guest,
                             connected: false,
                             since: Instant::now(),
+                            active: Instant::now(),
                             out: Direction::default(),
                             incoming: Direction::default(),
                         });
@@ -483,7 +522,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
                 }
             }
         }
-        clients.retain(|_, (_, at, _)| at.elapsed() < UDP_IDLE);
+        clients.retain(|_, (_, at, _)| at.elapsed() < IDLE);
     }
 }
 
@@ -536,6 +575,137 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn only_a_connected_forward_idle_for_long_is_closed_for_a_new_client() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ago = |d: Duration| Instant::now().checked_sub(d).unwrap();
+        let connection = |connected, active| {
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            Connection { client, guest, connected, since: active, active, out: Direction::default(), incoming: Direction::default() }
+        };
+        let mut connections = vec![connection(true, ago(IDLE / 2)), connection(false, ago(IDLE * 3))];
+        assert_eq!(idlest(&connections, IDLE), None, "a busy forward and a pending connect stay");
+        connections.push(connection(true, ago(IDLE)));
+        connections.push(connection(true, ago(IDLE * 2)));
+        assert_eq!(idlest(&connections, IDLE), Some(3));
+    }
+
+    /// A TCP worker of `cap` connections to a new guest listener: its address, the guest, and its stop.
+    fn worker(cap: usize, idle: Duration) -> (SocketAddr, TcpListener, Arc<OwnedFd>, JoinHandle<()>) {
+        let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (addr, target) = (listener.local_addr().unwrap(), SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest.local_addr().unwrap().port()));
+        let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
+        let worker = {
+            let stop = stop.clone();
+            thread::spawn(move || tcp(vec![listener], target, stop.as_fd(), cap, idle))
+        };
+        (addr, guest, stop, worker)
+    }
+
+    fn halt(stop: &OwnedFd, worker: JoinHandle<()>) {
+        unsafe { libc::write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
+        worker.join_within().unwrap();
+    }
+
+    fn echo(c: &mut TcpStream, s: &mut TcpStream) {
+        c.write_all(b"x").unwrap();
+        s.read_exact(&mut [0]).unwrap();
+        s.write_all(b"y").unwrap();
+        c.read_exact(&mut [0]).unwrap();
+    }
+
+    /// Fills `guest`'s accept queue: further SYNs are dropped, so connects to it stay in progress.
+    fn fill(guest: &TcpListener) -> Vec<TcpStream> {
+        assert_eq!(unsafe { libc::listen(guest.as_raw_fd(), 0) }, 0);
+        let filler: Vec<_> = (0..4).map_while(|_| TcpStream::connect_timeout(&guest.local_addr().unwrap(), Duration::from_millis(200)).ok()).collect();
+        assert!(filler.len() < 4, "the accept queue never filled");
+        filler
+    }
+
+    #[test]
+    fn a_replacement_that_finds_none_idle_once_connected_is_closed() {
+        const IDLE: Duration = Duration::from_secs(1);
+        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut client, &mut server);
+        let _filler = fill(&guest);
+        thread::sleep(IDLE + Duration::from_millis(200));
+        // Admitted while the forward is idle, it is still connecting when the forward is busy again.
+        let replacement = TcpStream::connect(addr).unwrap();
+        thread::sleep(Duration::from_millis(TICK as u64) * 2);
+        replacement.set_nonblocking(true).unwrap();
+        guest.set_nonblocking(true).unwrap();
+        let (mut accepted, deadline) = (Vec::new(), Instant::now() + Duration::from_secs(20));
+        // Both stay busy: one of them must go.
+        loop {
+            echo(&mut client, &mut server);
+            let _ = (&replacement).write(b"r");
+            accepted.extend(std::iter::from_fn(|| guest.accept().ok()));
+            match (&replacement).read(&mut [0]) {
+                Ok(n) => break assert_eq!(n, 0),
+                Err(e) if transient(&e) => assert!(Instant::now() < deadline, "the replacement went over the cap"),
+                Err(_) => break,
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!accepted.is_empty(), "the replacement never connected");
+        echo(&mut client, &mut server);
+        halt(&stop, worker);
+    }
+
+    #[test]
+    fn a_replacement_still_connecting_closes_nothing() {
+        const IDLE: Duration = Duration::from_millis(500);
+        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut client, &mut server);
+        let _filler = fill(&guest);
+        thread::sleep(IDLE * 2);
+        let _waiting = TcpStream::connect(addr).unwrap();
+        thread::sleep(Duration::from_millis(TICK as u64) * 2);
+        echo(&mut client, &mut server);
+        halt(&stop, worker);
+    }
+
+    #[test]
+    fn at_the_cap_a_waiting_client_replaces_the_idlest_forward_once_it_is_idle() {
+        const IDLE: Duration = Duration::from_secs(2);
+        let (addr, guest, stop, worker) = worker(2, IDLE);
+        let mut forwards = Vec::new();
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            echo(&mut client, &mut server);
+            forwards.push((client, server));
+            thread::sleep(Duration::from_millis(50));
+        }
+        let mut waiting = TcpStream::connect(addr).unwrap();
+        waiting.write_all(b"w").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        guest.set_nonblocking(true).unwrap();
+        assert!(guest.accept().is_err(), "a forward was closed before it was idle");
+        guest.set_nonblocking(false).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        let mut b = [0];
+        server.read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"w");
+        match forwards[0].0.read(&mut b) {
+            Ok(n) => assert_eq!(n, 0, "the idlest forward is closed"),
+            Err(e) => assert!(!transient(&e) && e.kind() != io::ErrorKind::TimedOut, "the idlest forward stayed open: {e}"),
+        }
+        let (client, server) = &mut forwards[1];
+        echo(client, server);
+        halt(&stop, worker);
     }
 
     #[test]

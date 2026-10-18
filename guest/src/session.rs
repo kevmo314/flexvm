@@ -706,6 +706,7 @@ fn take_input(conn: &mut io::Chain<&[u8], File>, output: &Session, input: &Stdin
                 (ring.detached, ring.gone) = (true, Some(awake()));
                 ring.chunks = VecDeque::new();
                 ring.start = ring.end;
+                ring.reservation.release();
             }
             // A bad frame: this attachment ends (its client may come again).
             Err(_) => drop(ring.attached.as_ref().and_then(|a| a.conn.as_ref()).map(|c| unsafe { libc::shutdown(c.as_raw_fd(), libc::SHUT_RDWR) })),
@@ -955,6 +956,23 @@ mod tests {
         drop(ring);
         sessions.lock().unwrap().reclaim_after(&statuses, Duration::ZERO, Duration::from_secs(1000));
         assert!(sessions.lock().unwrap().live.contains_key("s"), "a detached command runs on");
+    }
+
+    #[test]
+    fn detaching_releases_the_ring_reservation() {
+        use crate::proto::IN_DETACH;
+        let mut table = Table::default();
+        let (_r, w) = UnixStream::pair().unwrap();
+        let input = Arc::new(Stdin::new(File::from(OwnedFd::from(w)), None).unwrap());
+        let output = live(&mut table, "s", Output { input: Some(input.clone()), ..Default::default() });
+        let me = attach(&output, 0, None).1;
+        output.0.lock().unwrap().reservation.grow(CAPACITY);
+        assert!(table.pool.load(Ordering::Acquire) < POOL);
+        let (conn, _peer) = UnixStream::pair().unwrap();
+        let detach = frame(IN_DETACH, &[]);
+        take_input(&mut (&detach[..]).chain(File::from(OwnedFd::from(conn))), &output, &input, me);
+        assert!(output.0.lock().unwrap().detached);
+        assert_eq!(table.pool.load(Ordering::Acquire), POOL, "a detached session holds none of the pool");
     }
 
     #[test]
