@@ -3065,18 +3065,25 @@ mod tests {
     fn each_peer_waits_until_done_or_by() {
         let done = Arc::new(Mutex::new(Vec::new()));
         let d = done.clone();
+        // Done before its deadline: not waited for (a minute is far past what two quick peers take, even loaded).
         let t = Instant::now();
-        each_peer(vec!["a".into(), "b".into()], t + Duration::from_secs(10), move |p| d.lock().unwrap().push(p.to_string()));
-        assert!(t.elapsed() < Duration::from_secs(5));
+        each_peer(vec!["a".into(), "b".into()], t + Duration::from_secs(60), move |p| d.lock().unwrap().push(p.to_string()));
+        assert!(t.elapsed() < Duration::from_secs(60), "waited for the deadline: {:?}", t.elapsed());
         assert_eq!(done.lock().unwrap().len(), 2);
+        // The hung peer is let go only once the wait has returned: it returned at its deadline, not for it.
+        let (release, hung) = std::sync::mpsc::channel::<()>();
+        let hung = Mutex::new(hung);
         let t = Instant::now();
-        each_peer(vec!["hung".into(), "fast".into()], t + Duration::from_millis(200), |p| {
+        each_peer(vec!["hung".into(), "fast".into()], t + Duration::from_millis(200), move |p| {
             if p == "hung" {
-                thread::sleep(Duration::from_secs(3));
+                // Bounded, so one that waited for it fails below rather than hangs.
+                let _ = hung.lock().unwrap().recv_timeout(Duration::from_secs(30));
             }
         });
         let took = t.elapsed();
-        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(2), "{took:?}");
+        drop(release);
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(30), "waited for the hung peer: {took:?}");
+        crate::log!("each_peer returned {took:?} into a 200 ms wait");
     }
 
     /// An announcement waits out refused threads and failed lookups, and is delivered (the newest one) once both can be had.
@@ -4007,9 +4014,18 @@ mod tests {
         let (mut stopping, active) = (None, host.run.join("evict.active"));
         let start = Instant::now();
         relieve(&host, Some(0), false, &mut stopping);
+        let by = stopping.as_ref().map(|s: &Stopping| s.by);
+        let second = by.is_some_and(|by| by >= start + Duration::from_secs(1) && by <= Instant::now() + Duration::from_secs(1));
+        // Within the second, however long this tick takes to come round on a loaded machine.
+        if let Some(s) = stopping.as_mut() {
+            s.by = Instant::now() + Duration::from_secs(3600);
+        }
         relieve(&host, Some(0), false, &mut stopping);
         let (took, pressure, held) = (start.elapsed(), crate::standby::pressure(&host).exists(), active.exists());
-        thread::sleep(Duration::from_secs(1));
+        // The second is up.
+        if let Some(s) = stopping.as_mut() {
+            s.by = Instant::now();
+        }
         relieve(&host, Some(0), false, &mut stopping);
         let evicting = active.exists();
         let running = child.try_wait().unwrap().is_none();
@@ -4017,6 +4033,7 @@ mod tests {
         let _ = child.wait();
         std::fs::remove_dir_all(base).unwrap();
         assert!(took < Duration::from_secs(5), "{took:?}");
+        assert!(second, "held off a second: {by:?} from {start:?}");
         assert!(pressure && !held && evicting && running && stopping.is_none());
     }
 
