@@ -8088,6 +8088,8 @@ def fc_died_starting():
             check(f"fc died starting {how}: no standby left", wait_for(lambda: not standby_pids(A, t), 30), standby_pids(A, t))
         print(f"fc died starting {how}: exited {took:.2f} s after its Firecracker", flush=True)
         check(f"fc died starting {how}: ended as a death, exit status 124", code == 124, (code, took))
+        # Not a performance bound: guest calls retried on its refusing socket would take their 5 s (guest::TIMEOUT).
+        check(f"fc died starting {how}: its guest calls cut short, not waited out", took < 5, took)
         failed = vms(A).get(n, {})
         check(f"fc died starting {how}: ps -a shows it failed, saying how", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
         check(f"fc died starting {how}: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))

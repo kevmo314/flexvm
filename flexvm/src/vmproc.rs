@@ -390,16 +390,21 @@ impl Proc {
     /// Its Firecracker's exit, waited on from the moment the VM runs here, not only once its start is
     /// done (`serve`): a death mid-start (`start_guest`'s guest calls) marks the VM dead at once, so those
     /// calls fail without waiting out their retries, and the start ends as a death (`died_starting`, #730).
+    /// One that exited already (no pidfd for it: it is gone) is a death at once.
     fn watch_death(&self) {
-        let Some(p) = self.me.upgrade() else { return };
-        let Some(fc) = self.vm.get().and_then(|vm| vm.pid()).and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten()) else {
+        let (Some(p), Some(vm)) = (self.me.upgrade(), self.vm.get()) else { return };
+        let fc = vm.pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten());
+        if fc.is_none() && !vm.firecracker_exited() {
+            // Not watchable, yet running: the controller's tick notices its exit (`firecracker_alive`).
             return;
-        };
+        }
         if self.watching_death.swap(true, Ordering::SeqCst) {
             return;
         }
         thread::spawn(move || {
-            while !fc.wait(Duration::from_secs(3600)) {}
+            if let Some(fc) = fc {
+                while !fc.wait(Duration::from_secs(3600)) {}
+            }
             p.died();
         });
     }
@@ -1167,7 +1172,14 @@ impl Proc {
         drop(still);
         t.mark("resume");
         self.set_vm(vm);
-        let mut v = self.start_guest(&mut t)?;
+        let started = self.start_guest(&mut t);
+        // It ran, then died: no longer exited, as its failed record will say (#730).
+        if let (Err(_), Some(path)) = (&started, &record) {
+            if self.died_starting() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let mut v = started?;
         v["standby"] = json!(false);
         // Kept until it runs: a rerun that fails before leaves the VM exited, to start again.
         if let Some(path) = record {
@@ -2222,8 +2234,13 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         crate::standby::maintain(p.host.clone());
         Ok(v)
     });
-    // Its Firecracker died under the VM before the start was done (#730): it ends as any death does.
-    let died = res.is_err() && !incoming && p.died_starting();
+    // Its Firecracker died under the VM before the start was done (#730): it ends as any death does, even
+    // a start that went on regardless (a restore's guest steps are never fatal), so it is never answered ok.
+    let died = !incoming && p.died_starting();
+    let res = match res {
+        Ok(_) if died => Err(Box::new(Died("its firecracker exited".into())) as Error),
+        res => res,
+    };
     let mut reply = crate::util::reply(&res);
     if died {
         reply["died"] = json!(true);
