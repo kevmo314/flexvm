@@ -775,8 +775,10 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   name waits a few seconds for those standby VMs, then deletes the generation
   the name linked to before as `image prune` would (`template::prune` of that
   id alone), unless the templates directory is shared: a state whose
-  `templates` is a link marks its target `.shared` (`template::note_shared`),
-  since its suspended VMs hold no lock the owner could see. An incoming migration uses the generation with the source's
+  `templates` is a link marks its target `.shared` when opened
+  (`template::note_shared`, under the templates lock, which the pull's
+  decision holds exclusively), since its suspended VMs hold no lock the
+  owner could see. An incoming migration uses the generation with the source's
   content id if the host has it. `flexvm rmi` removes a name and the
   generation and root filesystem nothing uses any more: see below.
 - **Image removal: users and locks.** What uses a template generation

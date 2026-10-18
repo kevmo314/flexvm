@@ -885,16 +885,14 @@ pub fn up_to_date(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: &
 /// one there holds no lock) may use its generations, so pulls leave those they supersede to `image prune`.
 const SHARED: &str = ".shared";
 
-/// Marks the templates directory `STATE/templates` links to as shared (`Host::open`).
+/// Marks the templates directory `STATE/templates` links to as shared (`Host::open`), under the
+/// templates lock: a pull's `prune` decides under it exclusively.
 pub fn note_shared(paths: &Paths) -> std::io::Result<()> {
-    match paths.templates.is_symlink() && paths.templates.is_dir() && !paths.templates.join(SHARED).exists() {
-        true => crate::util::write_file(&paths.templates, SHARED, b"", true),
-        false => Ok(()),
+    if !paths.templates.is_symlink() || !paths.templates.is_dir() || paths.templates.join(SHARED).exists() {
+        return Ok(());
     }
-}
-
-pub fn shared(paths: &Paths) -> bool {
-    paths.templates.is_symlink() || paths.templates.join(SHARED).exists()
+    let _l = crate::host::Flock::new(template_lock(paths, "templates", "")?, libc::LOCK_SH)?;
+    crate::util::write_file(&paths.templates, SHARED, b"", true)
 }
 
 /// Builds `name` from an image's root filesystem and publishes it as a new generation; returns
@@ -1189,15 +1187,21 @@ pub fn tag(paths: &Paths, src: &str, dst: &str) -> Result<Value> {
     Ok(json!({"tagged": image_of(&dst), "id": id}))
 }
 
-/// `image prune`: each unnamed generation (or only `only`, which a pull moved its name off), as
-/// `rmi ID` would remove it; those still used stay.
+/// `image prune`: each unnamed generation (or only `only`, which a pull moved its name off, unless
+/// other states share the templates directory: `SHARED`), as `rmi ID` would remove it; those still
+/// used stay.
 pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Vec<Value>> {
     if !paths.templates.exists() {
         return Ok(vec![]);
     }
+    let linked = paths.templates.is_symlink();
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
     let _lock = templates_lock(paths, libc::LOCK_EX)?;
+    if let Some(id) = only.filter(|_| linked || paths.templates.join(SHARED).exists()) {
+        crate::log!("flexvm: kept {id}: other states share these templates, and their VMs may use it; image prune removes it");
+        return Ok(vec![]);
+    }
     sweep_locked(paths)?;
     let mut removed = vec![];
     for id in generations(&paths.templates)?.into_iter().filter(|id| only.is_none_or(|o| o == id)) {
@@ -1595,11 +1599,13 @@ mod tests {
         let other = crate::test_util::TempDir::new("template-sharer");
         std::os::unix::fs::symlink(&f.paths.templates, other.join("templates")).unwrap();
         let theirs = Paths { templates: other.join("templates"), ..f.paths.clone() };
-        assert!(!shared(&f.paths) && shared(&theirs));
+        let old = publish_as(&f, "t", &gen("eeee5555")).unwrap();
+        assert!(prune(&theirs, Some(&old), &none).unwrap().is_empty(), "pulled through a link");
         note_shared(&f.paths).unwrap();
-        assert!(!shared(&f.paths), "only a link marks it");
+        assert!(!f.paths.templates.join(SHARED).exists(), "only a link marks it");
         note_shared(&theirs).unwrap();
-        assert!(shared(&f.paths));
+        assert!(prune(&f.paths, Some(&old), &none).unwrap().is_empty() && Template::generation(&f.paths, &old).is_some());
+        assert_eq!(prune(&f.paths, None, &none).unwrap().len(), 1, "image prune still removes it");
     }
 
     #[test]

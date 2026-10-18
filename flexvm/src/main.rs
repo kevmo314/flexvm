@@ -1479,15 +1479,11 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     })();
     net::delete_tap(&tap);
     // The generation the name linked to before, unless a VM here (or another name) still uses it.
-    match res? {
-        Some(old) if template::shared(&paths) => log!("flexvm: kept {old}: other states share {}; image prune removes it", paths.templates.display()),
-        Some(old) => {
-            standby::superseded(&host, &name);
-            for removed in template::prune(&paths, Some(&old), &|| host.template_users())? {
-                output(format_args!("{removed}\n"))?;
-            }
+    if let Some(old) = res? {
+        standby::superseded(&host, &name);
+        for removed in template::prune(&paths, Some(&old), &|| host.template_users())? {
+            output(format_args!("{removed}\n"))?;
         }
-        None => {}
     }
     match standby {
         // Kept per image (`STATE/standby/NAME`): refilled now, and by every listener and VM process.

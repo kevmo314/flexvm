@@ -712,7 +712,10 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 `pull` writes the flexvm-init built into flexvm into the image as PID 1 (`--init PATH`
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
-host's. On first open, each state directory permanently records its canonical run
+host's. A state whose `templates` is a link marks its target shared when opened, and
+pulls through a shared one leave old generations to `image prune` (see Images);
+after upgrading to this release, run a command with each such state (`flexvm --state S
+ps`) before pulling, or a stopped VM there may lose its generation. On first open, each state directory permanently records its canonical run
 path in `run.json`, and the run directory records its state in `state.json`; using
 either with a different partner is refused. Without `--run`, the run directory follows
 from the state's path alone (`/run/flexvm` for `/var/lib/flexvm`, `/run/flexvm-PREFIX` for
