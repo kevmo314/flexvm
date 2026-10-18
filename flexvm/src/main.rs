@@ -81,7 +81,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm cp SRC DST                  copy files or directories between the host and a VM (NAME:PATH, as
                                      docker cp; - for a tar on stdin or stdout); into the VM as root
   flexvm logs [-f] [--tail N] NAME   a VM's output (its log, the one before its last rotation first);
-                                     -f follows it, across rotations and restarts, until the VM is gone
+                                     -f follows it, across rotations and restarts, until the VM exits or is removed
   flexvm inspect NAME...             a JSON array: per VM, what ps --json says and its config
   flexvm wait NAME...                wait until each VM's process ends, and print its exit status
                                      (a stopped one: 143; an exited one: its status; failed or lost: 124)
@@ -177,7 +177,7 @@ fn takes_value(flag: &str, cmd: Option<&str>) -> Option<bool> {
 /// A value that is itself a flag (or `--`) is a forgotten value, as in `--state --run X`; any
 /// other is taken as is, so argv-style ones can start with `--` (`--cmd "--port 8080"`).
 fn is_flag(v: &str) -> bool {
-    v == "--" || v.strip_prefix("--").is_some_and(|f| takes_value(f, None).is_some())
+    v == "--" || v.strip_prefix("--").is_some_and(|f| takes_value(f.split_once('=').map_or(f, |(f, _)| f), None).is_some())
 }
 
 impl Args {
@@ -201,11 +201,16 @@ impl Args {
     /// Up to an error; called again, it goes on after it.
     fn parse_into(&mut self, it: &mut impl Iterator<Item = String>) -> Result<()> {
         let a = self;
-        while let Some(arg) = it.next() {
+        while let Some(mut arg) = it.next() {
             let cmd = a.positional.first().map(String::as_str);
-            // `-it`, `-dit`, as docker's.
-            if matches!(cmd, Some("run" | "exec")) && arg.len() > 2 && arg.starts_with('-') && arg[1..].bytes().all(|b| b"dit".contains(&b)) {
-                for b in arg[1..].bytes() {
+            // `-it`, `-dit` and `-itp 80:80`, as docker's: switches, then perhaps a valued flag.
+            let n = arg.bytes().skip(1).take_while(|b| b"dit".contains(b)).count();
+            if matches!(cmd, Some("run" | "exec"))
+                && arg.starts_with('-')
+                && n > 0
+                && (n > 1 && arg.len() == n + 1 || arg[n + 1..].starts_with(['p', 'e', 'u', 'w']))
+            {
+                for b in arg[1..=n].bytes() {
                     let f = match b {
                         b'd' => "detach",
                         b'i' => "interactive",
@@ -216,7 +221,10 @@ impl Args {
                     }
                     a.flags.push((f.into(), "1".into()));
                 }
-                continue;
+                if arg.len() == n + 1 {
+                    continue;
+                }
+                arg = format!("-{}", &arg[n + 1..]);
             }
             if arg != "-d" && arg != "--detach" {
                 a.child_args.push(arg.clone());
@@ -237,7 +245,14 @@ impl Args {
                 _ => None,
             };
             // Short flags with a value read as their long ones.
-            let valued = match arg.as_str() {
+            let (option, attached) = if arg.starts_with("--") {
+                arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v)))
+            } else if arg.starts_with('-') && arg.len() > 2 && arg.is_char_boundary(2) {
+                (&arg[..2], Some(arg[2..].strip_prefix('=').unwrap_or(&arg[2..])))
+            } else {
+                (arg.as_str(), None)
+            };
+            let valued = match option {
                 "-p" => Some("publish"),
                 "-e" if matches!(cmd, Some("run" | "exec")) => Some("env"),
                 "-w" if cmd == Some("exec") => Some("workdir"),
@@ -245,15 +260,17 @@ impl Args {
                 "-s" if cmd == Some("kill") => Some("signal"),
                 _ => None,
             };
-            match valued.or_else(|| arg.strip_prefix("--")) {
-                Some("") => {
+            match valued.or_else(|| option.strip_prefix("--")) {
+                Some("") if attached.is_none() => {
                     a.rest.extend(it.by_ref());
                     a.child_args.extend(a.rest.iter().cloned());
                 }
                 Some(f) => {
-                    let value = match takes_value(f, cmd) {
-                        Some(false) => "1".into(),
-                        Some(true) => {
+                    let value = match (takes_value(f, cmd), attached) {
+                        (Some(false), Some(_)) => bail!("--{f} does not take a value"),
+                        (Some(false), None) => "1".into(),
+                        (Some(true), Some(v)) => v.into(),
+                        (Some(true), None) => {
                             let value = it.next().filter(|v| if arg == "-p" { !v.starts_with('-') } else { !is_flag(v) }).ok_or_else(|| match f {
                                 "publish" if arg == "-p" => "-p needs a port mapping".to_string(),
                                 "force" => "--force needs a generation; run flexvm reclaim IP to see GEN".to_string(),
@@ -262,7 +279,7 @@ impl Args {
                             a.child_args.push(value.clone());
                             value
                         }
-                        None => bail!("unknown option --{f} (see flexvm --help)"),
+                        (None, _) => bail!("unknown option --{f} (see flexvm --help)"),
                     };
                     a.flags.push((f.into(), value));
                 }
@@ -791,6 +808,10 @@ fn memory_mib(v: &str) -> Result<u64> {
         "t" | "tb" | "tib" => 40,
         _ => return Err(bad().into()),
     };
+    // Digits, and perhaps a fraction: not f64's signs, exponents or bare points.
+    if !number.splitn(2, '.').all(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(bad().into());
+    }
     let n: f64 = number.parse().ok().filter(|n: &f64| n.is_finite() && *n >= 0.0).ok_or_else(bad)?;
     let mib = n * (1u64 << shift) as f64 / (1u64 << 20) as f64;
     if mib >= u64::MAX as f64 {
@@ -1400,6 +1421,11 @@ fn pull_missing(args: &Args, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a pull only adjusts the standby count, leaving its template options intact.
+fn only_standby(args: &Args) -> bool {
+    args.flags.iter().all(|(f, _)| GLOBAL.contains(&f.as_str()) || matches!(f.as_str(), "standby" | "tag"))
+}
+
 /// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date;
 /// then `--standby N`, its count of standby VMs.
 fn pull(args: &Args, src: &str) -> Result<()> {
@@ -1415,8 +1441,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     }
     // Of an image pulled here, `--standby N` alone (and its --tag) only sets the count: the
     // pull's other options would have to be given again, or it would be rebuilt without them.
-    let only_standby = args.flags.iter().all(|(f, _)| matches!(f.as_str(), "standby" | "tag" | "state" | "run"));
-    if let (Some(n), true) = (standby, only_standby) {
+    if let (Some(n), true) = (standby, only_standby(args)) {
         if std::fs::symlink_metadata(paths(args)?.templates.join(&name)).is_ok() {
             return print(standby::set(&open_host(args)?, &name, n)?);
         }
@@ -2158,13 +2183,43 @@ mod exec_tests {
     }
 
     #[test]
+    fn standby_only_pulls_allow_global_flags() {
+        for global in ["-v", "--verbose", "--help", "--version"] {
+            let args = parse(&[global, "--state", "/state", "--run", "/run", "pull", "nginx", "--standby", "3", "--tag", "web"]);
+            assert!(only_standby(&args), "{global}");
+        }
+        for option in ["--mem=512", "--warm", "--ready-port=80", "--vcpus=2"] {
+            assert!(!only_standby(&parse(&["-v", "pull", "nginx", "--standby=3", option])), "{option}");
+        }
+    }
+
+    #[test]
+    fn attached_option_values_preserve_commands_and_child_args() {
+        let args = parse(&["run", "-dit", "--name=web", "--memory=1g", "-p8080:80", "-eA=one=two", "--env=B=", "-ip=1:1", "nginx", "--name=app"]);
+        check_applies(&args).unwrap();
+        assert_eq!((args.get("name"), args.get("memory")), (Some("web"), Some("1g")));
+        assert_eq!((args.all("publish"), args.all("env")), (vec!["8080:80".to_string(), "1:1".into()], vec!["A=one=two".to_string(), "B=".into()]));
+        assert!(args.has("detach") && args.has("interactive") && args.has("tty"));
+        assert_eq!(args.rest, ["--name=app"]);
+        let child = parse(&args.child_args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!((child.has("detach"), child.flags.len()), (false, args.flags.len() - 1));
+        let args = parse(&["exec", "-itu", "app", "-w/srv", "-eA=B", "web", "sh", "-c", "true"]);
+        assert_eq!((args.get("workdir"), args.get("user"), args.get("env")), (Some("/srv"), Some("app"), Some("A=B")));
+        assert_eq!(parse(&["kill", "-sTERM", "web"]).get("signal"), Some("TERM"));
+        for option in ["--detach=true", "-dtrue", "-itx", "-dv", "-é", "--unknown=value"] {
+            assert!(Args::parse(["run", option, "nginx"].map(String::from)).is_err(), "{option}");
+        }
+        assert!(Args::parse(["run", "--name", "--memory=1g", "nginx"].map(String::from)).is_err());
+    }
+
+    #[test]
     fn memory_sizes_are_dockers() {
         for (v, mib) in
             [("512m", 512), ("512M", 512), ("2g", 2048), ("2GB", 2048), ("1.5g", 1536), ("1048576", 1), ("1t", 1 << 20), ("1536k", 1), ("4096mib", 4096)]
         {
             assert_eq!(memory_mib(v).unwrap(), mib, "{v}");
         }
-        for v in ["", "m", "x", "2q", "-1g", "nang", "1e30t"] {
+        for v in ["", "m", "x", "2q", "-1g", "nang", "1e30t", "1e3m", "+2g", ".5g", "1.g", "1.2.3g", "1e-3g", "1e+3m"] {
             assert!(memory_mib(v).is_err(), "{v}");
         }
         assert_eq!(memory_mib("2048").unwrap_err().to_string(), "--memory 2048 is 2048 bytes: give a unit, as 2048m");
@@ -2358,10 +2413,12 @@ mod exec_tests {
 
     #[test]
     fn unknown_options_and_missing_values_are_errors() {
-        for option in ["--typo", "--listen", "-x", "--detach=yes", "--keep-running"] {
+        for option in ["--typo", "--listen", "-x", "--keep-running"] {
             let error = Args::parse(["run", option, "web"].map(String::from)).err().unwrap();
             assert_eq!(error.to_string(), format!("unknown option {option} (see flexvm --help)"));
         }
+        let error = Args::parse(["run", "--detach=yes", "web"].map(String::from)).err().unwrap();
+        assert_eq!(error.to_string(), "--detach does not take a value");
         let error = Args::parse(["run", "--ip"].map(String::from)).err().unwrap();
         assert_eq!(error.to_string(), "--ip needs a value");
     }
