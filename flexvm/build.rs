@@ -14,8 +14,22 @@ const ASSETS: [(&str, &str); 2] = [("firecracker", "FLEXVM_PIN_FIRECRACKER"), ("
 fn main() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest.parent().unwrap().to_path_buf();
+    // Worktrees keep HEAD and branch refs outside their .git file.
+    let reference = git(&root, &["symbolic-ref", "-q", "HEAD"]);
+    for name in [Some("HEAD"), Some("packed-refs"), reference.as_deref()].into_iter().flatten() {
+        if let Some(path) = git(&root, &["rev-parse", "--git-path", name]) {
+            println!("cargo:rerun-if-changed={}", root.join(path).display());
+        }
+    }
+    let commit = git(&root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=FLEXVM_GIT_COMMIT={commit}");
     pins(&root);
     init(&root);
+}
+
+fn git(root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).current_dir(root).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// `NAME=${NAME:-value}` (or `NAME=value`) in a shell file: its default.

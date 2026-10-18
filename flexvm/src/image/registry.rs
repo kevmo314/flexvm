@@ -586,6 +586,26 @@ impl Registry {
         Registry { r, base, basic, auth: Mutex::new(None) }
     }
 
+    pub fn with_state(r: Reference, state: &Path) -> Result<Registry> {
+        let base = r.base_url();
+        let basic = if base.starts_with("https://") { super::auth::credentials(state, &r.registry)?.or_else(|| docker_credentials(&r.registry)) } else { None };
+        Ok(Registry { r, base, basic, auth: Mutex::new(None) })
+    }
+
+    /// Probe the registry API with the supplied credentials, including its token exchange.
+    pub fn verify(registry: &str, basic: &str) -> Result<()> {
+        let mut reg = Self::new(Reference::parse(&format!("{registry}/login"))?);
+        if !reg.base.starts_with("https://") {
+            bail!("login requires HTTPS; credentials never travel over plain HTTP");
+        }
+        reg.r.repository.clear();
+        reg.base = format!("https://{registry}/v2");
+        reg.basic = Some(basic.into());
+        *reg.auth.lock().unwrap() = Some(format!("Basic {basic}").into());
+        reg.get_inner("", "application/json", Instant::now() + Duration::from_secs(30), false)?;
+        Ok(())
+    }
+
     /// Credentials go only over HTTPS to the registry itself or its well-known token service.
     fn trusted(&self, url: &str) -> bool {
         let Some(rest) = url.strip_prefix("https://") else { return false };
@@ -605,6 +625,10 @@ impl Registry {
     /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials, and, as
     /// the token service is, only to public addresses unless the registry is local.
     fn get(&self, path: &str, accept: &str, deadline: Instant) -> Result<ureq::Body> {
+        self.get_inner(path, accept, deadline, true)
+    }
+
+    fn get_inner(&self, path: &str, accept: &str, deadline: Instant, redirects_allowed: bool) -> Result<ureq::Body> {
         let base = format!("{}/{path}", self.base);
         let (mut url, mut redirects, mut authenticated) = (base.clone(), 0, false);
         let peer = Peer::default();
@@ -635,6 +659,9 @@ impl Registry {
             let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
             match resp.status().as_u16() {
                 300..=399 => {
+                    if !redirects_allowed {
+                        bail!("registry login endpoint redirected; credentials were not verified");
+                    }
                     let loc = match resp.headers().get("location") {
                         None => bail!("GET {url}: redirect without a location"),
                         Some(v) => match v.to_str() {
@@ -648,6 +675,12 @@ impl Registry {
                 ..=299 => return Ok(resp.into_body()),
                 401 if !authenticated && redirects == 0 => {
                     let challenge = header("www-authenticate").unwrap_or("").to_string();
+                    if !redirects_allowed {
+                        let (scheme, params) = parse_challenge(&challenge);
+                        if scheme.eq_ignore_ascii_case("bearer") && params.iter().any(|(k, v)| k == "realm" && !self.trusted(v)) {
+                            bail!("registry login names an untrusted token realm; credentials were not verified");
+                        }
+                    }
                     self.authenticate(&challenge, deadline, local)?;
                     authenticated = true;
                 }
@@ -704,7 +737,9 @@ impl Registry {
             if let Some(service) = param("service") {
                 req = req.query("service", &service);
             }
-            req = req.query("scope", param("scope").unwrap_or(format!("repository:{}:pull", self.r.repository)));
+            if let Some(scope) = param("scope").or_else(|| (!self.r.repository.is_empty()).then(|| format!("repository:{}:pull", self.r.repository))) {
+                req = req.query("scope", scope);
+            }
             if let Some(c) = &creds {
                 req = req.header("Authorization", c);
             }

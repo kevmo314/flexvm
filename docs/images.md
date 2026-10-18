@@ -34,7 +34,8 @@ failed cleanup fails the check. Non-root checks need cgroup2 with
 the guest can leave any cgroup); without cgroup2 their session is killed.
 
 - **Pull.** Native registry v2 client (no docker or skopeo): anonymous bearer
-  tokens, or basic credentials from `$DOCKER_CONFIG`, `~/.docker/config.json`
+  tokens, or credentials saved by `flexvm login` in root-owned, mode 0600
+  `STATE/auth.json`, falling back to `$DOCKER_CONFIG`, `~/.docker/config.json`
   or, under sudo, the invoking user's. Indexes resolve to linux/amd64. Blobs
   are streamed to `STATE/images/blobs/sha256/` and checked against their
   digests; gzip, zstd and uncompressed layers are supported. Archives are read

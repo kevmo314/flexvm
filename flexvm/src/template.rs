@@ -1125,6 +1125,59 @@ pub fn generation_by_prefix(paths: &Paths, id: &str) -> Result<String> {
     }
 }
 
+/// Give a pulled generation another name, under the same publication lock as removal.
+pub fn tag(paths: &Paths, src: &str, dst: &str) -> Result<Value> {
+    let dst = name_of(dst)?;
+    let parent = crate::host::Directory::open(&paths.templates)?;
+    let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
+    let _lock = templates_lock(paths, libc::LOCK_EX)?;
+    let source = name_of(src).ok().filter(|n| paths.templates.join(n).is_symlink());
+    let id = match source {
+        Some(name) => {
+            let target = std::fs::read_link(paths.templates.join(name))?;
+            let id = target.file_name().ok_or("image has no generation")?.to_string_lossy().into_owned();
+            if target != Path::new(GENERATIONS).join(&id) {
+                bail!("image has an invalid generation link");
+            }
+            generation_by_prefix(paths, &id)?
+        }
+        None => generation_by_prefix(paths, src)?,
+    };
+    if Meta::read(&paths.templates.join(GENERATIONS).join(&id))?.image.is_none() {
+        bail!("tag needs a pulled image generation");
+    }
+    let live = paths.templates.join(&dst);
+    if live.symlink_metadata().is_ok_and(|m| !m.file_type().is_symlink()) {
+        bail!("image {} is not a symlink", image_of(&dst));
+    }
+    let tmp = paths.templates.join(format!(".{dst}.link-{}", crate::util::random_hex(8)?));
+    std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&id), &tmp)?;
+    if let Err(e) = std::fs::rename(&tmp, &live) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    crate::util::sync_dir(&paths.templates)?;
+    Ok(json!({"tagged": image_of(&dst), "id": id}))
+}
+
+/// `image prune`: each unnamed generation, as `rmi ID` would remove it; those still used stay.
+pub fn prune(paths: &Paths, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Vec<Value>> {
+    if !paths.templates.exists() {
+        return Ok(vec![]);
+    }
+    let parent = crate::host::Directory::open(&paths.templates)?;
+    let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
+    let _lock = templates_lock(paths, libc::LOCK_EX)?;
+    sweep_locked(paths)?;
+    let mut removed = vec![];
+    for id in generations(&paths.templates)? {
+        if let Ok(rootfs) = delete_unused(paths, &id, in_use)? {
+            removed.push(json!({"deleted": id, "rootfs": rootfs}));
+        }
+    }
+    Ok(removed)
+}
+
 /// `rmi`: removes the name `name` (if given), then the generation `id` (the one the name linked to)
 /// unless a name still links to it or a VM here uses it, and the image root filesystems that no
 /// generation left uses. The caller checked that no VM uses the name. `in_use` reads the content ids
@@ -1153,30 +1206,32 @@ pub(crate) fn remove_locked(paths: &Paths, name: Option<&str>, id: &str, in_use:
         std::fs::remove_file(&link)?;
         crate::util::sync_dir(&paths.templates)?;
     }
-    let kept = |reason: String, refusal: String| -> Result<Value> {
-        if name.is_none() {
-            bail!("{refusal}");
-        }
-        Ok(json!({"untagged": name, "kept": id, "reason": reason}))
-    };
-    let names = names(&paths.templates)?;
-    if let Some((other, _)) = names.iter().find(|(_, i)| i == id) {
-        return kept(format!("{} is the same image", image_of(other)), format!("image {id} is {0}; remove that: flexvm rmi {0}", image_of(other)));
+    match delete_unused(paths, id, in_use)? {
+        Ok(rootfs) => Ok(json!({"untagged": name, "deleted": id, "rootfs": rootfs})),
+        Err((reason, _)) if name.is_some() => Ok(json!({"untagged": name, "kept": id, "reason": reason})),
+        Err((_, refusal)) => bail!("{refusal}"),
+    }
+}
+
+/// Deletes generation `id` and the root filesystem only it used, unless a name links to it or a
+/// VM here has it open or uses it: then it is kept, with the reason and the refusal to give.
+fn delete_unused(paths: &Paths, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<std::result::Result<Option<PathBuf>, (String, String)>> {
+    if let Some((other, _)) = names(&paths.templates)?.iter().find(|(_, i)| i == id) {
+        return Ok(Err((format!("{} is the same image", image_of(other)), format!("image {id} is {0}; remove that: flexvm rmi {0}", image_of(other)))));
     }
     let gens = paths.templates.join(GENERATIONS);
     // Kept while a VM process has it open (one starting has no registry entry yet).
     let st = crate::util::fstat(File::open(gens.join(id))?.as_raw_fd())?;
     let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else {
-        return kept("open in a VM process here".into(), format!("image {id} is open in a VM process here"));
+        return Ok(Err(("open in a VM process here".into(), format!("image {id} is open in a VM process here"))));
     };
     if in_use().contains(id) {
-        return kept("used by a VM here".into(), format!("image {id} is used by a VM here"));
+        return Ok(Err(("used by a VM here".into(), format!("image {id} is used by a VM here"))));
     }
     let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
     std::fs::rename(gens.join(id), &tombstone)?;
     crate::util::sync_dir(&gens)?;
-    let removed_rootfs = finish_remove(paths, &tombstone)?;
-    Ok(json!({"untagged": name, "deleted": id, "rootfs": removed_rootfs}))
+    Ok(Ok(finish_remove(paths, &tombstone)?))
 }
 
 /// Under the templates lock. A tombstone's generation is gone, but it stays a rootfs user until
@@ -1512,6 +1567,35 @@ mod tests {
         assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_some());
         f.replace("firecracker", b"another firecracker");
         assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), None);
+    }
+
+    #[test]
+    fn tag_names_generations_and_prune_removes_only_unused_unnamed_ones() {
+        let f = Fixture::new();
+        let gen = |id: &str| Meta { id: id.into(), image: Some(image("sha256:a", "")), ..f.meta.clone() };
+        publish_as(&f, "t", &gen("aaaa1111"));
+        tag(&f.paths, "t", "ghcr.io/org/app:v1").unwrap();
+        let alias = name_of("ghcr.io/org/app:v1").unwrap();
+        assert_eq!(Template::resolve(&f.paths, "t").unwrap(), Template::resolve(&f.paths, &alias).unwrap());
+        assert!(tag(&f.paths, "t", "../bad").is_err());
+        assert!(tag(&f.paths, "missing", "new").is_err());
+        // The name moves on; the alias keeps the old generation, so nothing is unnamed.
+        publish_as(&f, "t", &gen("bbbb2222"));
+        assert!(prune(&f.paths, &BTreeSet::new).unwrap().is_empty());
+        // By ID prefix, an existing name moves too: now aaaa1111 is unnamed.
+        tag(&f.paths, "bbbb", &alias).unwrap();
+        publish_as(&f, "t", &gen("cccc3333"));
+        let users = || BTreeSet::from(["aaaa1111".to_string()]);
+        assert!(prune(&f.paths, &users).unwrap().is_empty(), "a VM record uses it");
+        let handle = File::open(f.paths.templates.join(GENERATIONS).join("aaaa1111")).unwrap();
+        let st = crate::util::fstat(handle.as_raw_fd()).unwrap();
+        let held = crate::host::lock_at(crate::host::host_locks().unwrap(), &crate::host::use_lock(&st), libc::LOCK_SH).unwrap();
+        assert!(prune(&f.paths, &BTreeSet::new).unwrap().is_empty(), "a VM process has it open");
+        drop((held, handle));
+        let removed = prune(&f.paths, &BTreeSet::new).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0]["deleted"], "aaaa1111");
+        assert_eq!(generations(&f.paths.templates).unwrap(), ["bbbb2222", "cccc3333"]);
     }
 
     #[test]

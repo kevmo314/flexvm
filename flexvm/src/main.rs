@@ -16,6 +16,7 @@ mod image;
 mod lifecycle;
 mod limit;
 mod listen;
+mod management;
 mod migrate;
 mod net;
 mod socket;
@@ -68,7 +69,16 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      directory needs --tag; see README); again: rebuilt if it changed;
                                      --standby N keeps N of its VMs restored and paused (run: ~5 ms);
                                      of an image pulled here, alone it only sets that count
-  flexvm images [--json]             list pulled images
+  flexvm images [-q] [--json] [--filter reference=PATTERN|dangling=true|false]
+                                     list pulled images (-q: unique generation IDs)
+  flexvm tag SRC DST                 name a pulled generation again, without rebuilding
+  flexvm image prune [-f]            remove <none> generations no VM here uses (-f: without asking)
+  flexvm system prune [-f]           also failed and lost VM records and the layer blob cache
+  flexvm system df                   disk space by images, templates, blobs, VMs and checkpoints
+  flexvm version                     version, commit and artifact information
+  flexvm login [REGISTRY] [--username USER] [--password-stdin]
+                                     verify and save registry credentials in STATE/auth.json
+  flexvm logout [REGISTRY]           remove saved credentials (default registry: Docker Hub)
   flexvm rmi IMAGE|ID                remove an image no VM here uses
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
   flexvm info                        this host's settings (STATE/host.json, edited by hand) and what is
@@ -86,7 +96,8 @@ the VM dies; exec returns the command's status, or 125 when flexvm fails
 ";
 
 /// Flags that take no value (`-a`, `-f` and `--standby` depend on the command: `takes_value`).
-const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "incoming", "json", "detach", "all", "attach", "help", "version"];
+const SWITCHES: &[&str] =
+    &["warm", "stop", "paused", "incremental", "incoming", "json", "detach", "all", "attach", "help", "version", "quiet", "password-stdin"];
 
 /// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`.
 pub struct Args {
@@ -143,9 +154,10 @@ impl Args {
             let short = match arg.as_str() {
                 "-d" => Some("detach"),
                 "-h" => Some("help"),
+                "-q" => Some("quiet"),
                 "-a" => Some(if cmd == Some("start") { "attach" } else { "all" }),
                 // Not reclaim's `--force GEN`.
-                "-f" if cmd == Some("rm") => Some("force"),
+                "-f" if matches!(cmd, Some("rm" | "image" | "system")) => Some("force"),
                 _ => None,
             };
             match arg.strip_prefix("--") {
@@ -279,7 +291,13 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("listen", 2, &[]),
     ("info", 1, &[]),
     ("pull", 2, &["tag", "vcpus", "mem", "max", "plug", "standby"]),
-    ("images", 1, &["json"]),
+    ("images", 1, &["json", "quiet", "filter"]),
+    ("tag", 3, &[]),
+    ("image", 2, &["force"]),
+    ("system", 2, &["force"]),
+    ("version", 1, &[]),
+    ("login", 2, &["username", "password-stdin"]),
+    ("logout", 2, &[]),
     ("rmi", 2, &[]),
     (
         "bench",
@@ -309,6 +327,14 @@ fn check_applies(args: &Args) -> Result<()> {
             "exec" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "checkpoint" | "migrate" => bail!("{cmd} needs NAME"),
             _ => {}
         }
+    }
+    match cmd.as_str() {
+        "tag" if args.names().len() != 2 => bail!("tag needs SRC DST"),
+        "image" if first.map(String::as_str) != Some("prune") => bail!("image needs prune"),
+        "system" if !matches!(first.map(String::as_str), Some("prune" | "df")) => bail!("system needs prune or df"),
+        "system" if first.map(String::as_str) == Some("df") && args.has("force") => bail!("system df takes no -f"),
+        "images" if args.has("quiet") && args.has("json") => bail!("images takes either -q or --json"),
+        _ => {}
     }
     let image = cmd == "pull";
     if let Some((f, _)) = args.flags.iter().find(|(f, _)| ![GLOBAL, flags, if image { IMAGE_FLAGS } else { &[] }].concat().contains(&f.as_str())) {
@@ -369,7 +395,12 @@ fn real_main(args: &Args) -> Result<()> {
     let call = |req: Value| print(vmproc::call(&open_host(args)?, name, req, None)?);
     match pos.first().copied() {
         Some("pull") => pull(args, name),
-        Some("images") => images(&open_host(args)?, &paths(args)?, args.has("json")),
+        Some("images") => images(&open_host(args)?, &paths(args)?, args),
+        Some("tag") => print(template::tag(&paths(args)?, name, arg2.ok_or("tag needs SRC DST")?)?),
+        Some("image" | "system") => management::system(args, name),
+        Some("version") => management::version(&paths(args)?),
+        Some("login") => image::auth::login(&open_host(args)?.state, name, args.get("username"), args.has("password-stdin")),
+        Some("logout") => image::auth::logout(&open_host(args)?.state, name),
         Some("rmi") => rmi(&open_host(args)?, &paths(args)?, name),
         Some("run") if args.has("standby") => {
             let template = template::name_of(name)?;
@@ -1082,7 +1113,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     let res = (|| {
         let init = args.get("init").map(PathBuf::from);
         // Held until the template is published: `rmi` leaves the root filesystem to this build.
-        let (rootfs, meta, _reserved) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
+        let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
         if let Some(id) = template::up_to_date(&paths, &name, size, &rootfs, &meta) {
             return output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)));
         }
@@ -1098,14 +1129,23 @@ fn pull(args: &Args, src: &str) -> Result<()> {
 }
 
 /// `images`: a row per image (`template::images`), with its standby count.
-fn images(host: &Host, paths: &Paths, as_json: bool) -> Result<()> {
+fn images(host: &Host, paths: &Paths, args: &Args) -> Result<()> {
+    let filters = management::Filters::parse(&args.all("filter"))?;
     let mut images = template::images(paths)?;
+    images.retain(|v| filters.matches(v));
+    if args.has("quiet") {
+        let ids: std::collections::BTreeSet<_> = images.iter().filter_map(|v| v["id"].as_str()).collect();
+        for id in ids {
+            output(format_args!("{id}\n"))?;
+        }
+        return Ok(());
+    }
     for v in &mut images {
         if let Some(name) = v["name"].as_str().map(String::from) {
             v["standby"] = json!(standby::target(host, &name));
         }
     }
-    if as_json {
+    if args.has("json") {
         return print(json!(images));
     }
     let row = |c: [&str; 8]| output(format_args!("{:<32} {:<16} {:<16} {:>4} {:>8} {:>8} {:>7} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]));
@@ -1699,6 +1739,40 @@ mod exec_tests {
             check_applies(&parse(argv)).unwrap();
         }
         assert!(check_applies(&parse(&["stop", "a", ""])).is_err());
+    }
+
+    #[test]
+    fn image_and_system_command_options_apply_narrowly() {
+        for argv in [
+            vec!["images", "-q", "--filter", "reference=app:*", "--filter", "dangling=false"],
+            vec!["tag", "src", "dst"],
+            vec!["image", "prune", "-f"],
+            vec!["system", "prune", "--force"],
+            vec!["system", "df"],
+            vec!["version"],
+            vec!["login", "ghcr.io", "--username", "alice", "--password-stdin"],
+            vec!["logout"],
+        ] {
+            check_applies(&parse(&argv)).unwrap();
+        }
+        for argv in [
+            vec!["tag", "src"],
+            vec!["tag", "src", "dst", "extra"],
+            vec!["image", "df"],
+            vec!["system", "df", "-f"],
+            vec!["system", "df", "-a"],
+            vec!["image", "prune", "-a"],
+            vec!["system"],
+            vec!["images", "-q", "--json"],
+            vec!["version", "--filter", "x=y"],
+            vec!["logout", "--username", "alice"],
+            vec!["logout", "-q"],
+            vec!["images", "--password-stdin"],
+            vec!["ps", "-q"],
+        ] {
+            assert!(check_applies(&parse(&argv)).is_err(), "{argv:?}");
+        }
+        assert_eq!(parse(&["images", "--filter", "reference=a*", "--filter", "reference=b*"]).all("filter").len(), 2);
     }
 
     #[test]

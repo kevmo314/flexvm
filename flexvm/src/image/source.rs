@@ -177,7 +177,7 @@ pub fn resolve(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
         from_files(&tar_index(path, limits)?, limits)?
     } else {
         let r = Reference::parse(src).map_err(|e| format!("{e} (and no such file or directory)"))?;
-        pull(cache, Registry::new(r), limits)?
+        pull(cache, Registry::with_state(r, cache.parent().ok_or("image cache has no state directory")?)?, limits)?
     };
     if sha256_hex(&img.config) != img.config_digest {
         bail!("image config does not match its digest {}", img.config_digest);

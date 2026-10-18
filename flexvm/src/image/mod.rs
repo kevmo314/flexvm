@@ -1,6 +1,7 @@
 //! Templates from container images: read-only ext4 root filesystems cached by digest
 //! (`blobs/sha256/<hex>`, `rootfs/<key>.ext4`), attached in place, so deleting one breaks its templates.
 
+pub mod auth;
 mod reference;
 mod registry;
 mod source;
@@ -146,7 +147,11 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 
 /// `init` is flexvm-init's path, or the one built into flexvm (`artifacts::INIT`) for `None`.
 /// The root filesystem comes reserved (`Cached::reserved`): hold it until the template is published.
-pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBuf, ImageMeta, Flock)> {
+pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBuf, ImageMeta, Flock, crate::host::HeldLock)> {
+    crate::util::create_dir_durably(cache, 0o755)?;
+    let cache_dir = crate::host::Directory::open(cache)?;
+    let key = crate::host::keyed("image-cache", &cache_dir.stat()?, "");
+    let _cache_lock = crate::host::lock_at(crate::host::host_locks()?, &key, libc::LOCK_SH)?;
     let img = source::resolve(cache, &o.image, &o.limits)?;
     let config: Value = serde_json::from_slice(&img.config)?;
     let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("amd64"));
@@ -198,7 +203,7 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
         ready,
         ready_timeout: o.ready_timeout,
     };
-    Ok((cached.path, meta, cached.reserved))
+    Ok((cached.path, meta, cached.reserved, _cache_lock))
 }
 
 pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
@@ -1453,7 +1458,7 @@ mod tests {
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();
-        let (path, meta, _reserved) = prepare(&d, Some(&init), &o).unwrap();
+        let (path, meta, _reserved, _cache_lock) = prepare(&d, Some(&init), &o).unwrap();
         serving.join().unwrap();
         assert_eq!(read(path), "cached image");
         assert_eq!(meta.app_conf, "cached config");
