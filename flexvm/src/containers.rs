@@ -55,27 +55,46 @@ const STOPPED: i32 = 128 + libc::SIGTERM;
 /// say (stopped: 143; failed or lost: 124).
 pub fn wait(host: &Host, name: &str) -> Result<i32> {
     host::check_name(name)?;
+    let before = exit_record(host, name).map(|e| e.ident);
     loop {
-        if host.name_locked(name) == Some(true) {
-            // Empty while a start writes it: read again.
-            let Some(id) = host.name_holder(name)? else {
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
-            };
-            if let Some(fd) = host::PidFd::open(&id)? {
-                while !fd.wait(Duration::from_secs(1)) {}
-            }
-            // Written before it let the name go. Without one, whatever held the name was not a
-            // VM's process (an `rm` deciding) or it died unrecorded: the records decide.
-            if let Some(e) = exit_record(host, name).filter(|e| e.ident == id) {
-                return Ok(e.code);
-            }
-            if host.name_locked(name) == Some(true) && host.name_holder(name)?.is_some_and(|h| h != id) {
-                continue;
-            }
+        if host.name_locked(name) != Some(true) {
+            return ended(host, name);
+        }
+        // Empty while a start writes it: read again.
+        let Some(id) = host.name_holder(name)? else {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        if let Some(fd) = host::PidFd::open(&id)? {
+            while !fd.wait(Duration::from_secs(1)) {}
+        }
+        // Written before it let the name go, under the name it had then (a rename moves it on).
+        if let Some(e) = exit_of(host, name, &id) {
+            return Ok(e.code);
+        }
+        // Without one, what held the name was not a VM's process (an `rm` deciding), or it died
+        // unrecorded. Only the one waited on is waited for: never a later one under the name.
+        let unrecorded = || format!("vm {name}'s process ended without an exit status (killed with SIGKILL, or it crashed)");
+        if host.name_locked(name) == Some(true) && host.name_holder(name)?.is_some_and(|h| h != id) {
+            bail!("{}; another process holds the name now", unrecorded());
+        }
+        if exit_record(host, name).map(|e| e.ident) != before {
+            bail!("{}; another vm has run under the name since", unrecorded());
         }
         return ended(host, name);
     }
+}
+
+/// `id`'s exit record: under `name`, else under whatever name it had last (`rename`).
+fn exit_of(host: &Host, name: &str, id: &Ident) -> Option<Exit> {
+    if let Some(e) = exit_record(host, name).filter(|e| e.ident == *id) {
+        return Some(e);
+    }
+    std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten().find_map(|e| {
+        let file = e.file_name().into_string().ok()?;
+        let n = file.strip_suffix(".exit").filter(|n| !n.starts_with('.'))?;
+        exit_record(host, n).filter(|e| e.ident == *id)
+    })
 }
 
 /// The status of `name` with no process running it.
@@ -191,7 +210,15 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
                     return Ok(());
                 }
             }
+            let was = cur.as_ref().and_then(ino);
             cur = open();
+            // Rotated twice since: the one in between is the previous log now, whole.
+            if let Ok(mut between) = std::fs::File::open(&prev) {
+                let b = ino(&between);
+                if b.is_some() && b != was && b != cur.as_ref().and_then(ino) && !drain(&mut between)? {
+                    return Ok(());
+                }
+            }
             continue;
         }
         // Gone for a while (not a restart's moment between its stop and start).
@@ -273,16 +300,6 @@ pub fn rename(host: &Host, from: &str, to: &str) -> Result<()> {
     crate::output(format_args!("{to}\n"))
 }
 
-/// A failed or lost VM's record keeps its name: refused, as docker refuses a name in use.
-fn refuse_recorded(host: &Host, to: &str) -> Result<()> {
-    for ext in ["failed", "lost"] {
-        if host.vms(to, ext)?.exists() {
-            bail!("vm name {to:?} is taken (a {ext} vm, see flexvm ps -a): flexvm rm {to} first");
-        }
-    }
-    Ok(())
-}
-
 /// A suspended (or quarantined) VM: its checkpoint directory, the claim on its address (which a
 /// sweep reads by the name: `Host::held`), its logs and its exit status move to `to`. Both names
 /// are held throughout, so no start of either runs meanwhile; the directory and the claim move
@@ -302,18 +319,27 @@ fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
     if !host.is_suspended(from) {
         bail!("no vm named {from:?}");
     }
-    refuse_recorded(host, to)?;
-    let _to = host.take_name(to, false)?;
+    let _to = host.take_unrecorded_name(to)?;
     let (dir, dest) = (host.suspended(from)?, host.suspended(to)?);
     let ip = crate::checkpoint::read_manifest(&dir).ok().map(|m| m.ip);
     {
         let l = host.lock()?;
-        std::fs::rename(&dir, &dest).map_err(|e| format!("renaming {} to {}: {e}", dir.display(), dest.display()))?;
-        crate::util::sync_dir(&host.state.join("suspended"))?;
+        // A crash past the move (before the claim follows) leaves the journal: the claim stays
+        // held by the directory at `to`, and the next to take `to` moves it (`Host::finish_rename`).
+        let (journal, parent) = (host.rename_journal(to)?, host.state.join("suspended"));
+        crate::util::write_file(&parent, &journal.file_name().unwrap_or_default().to_string_lossy(), from.as_bytes(), true)?;
+        let moved = std::fs::rename(&dir, &dest).map_err(|e| format!("renaming {} to {}: {e}", dir.display(), dest.display()));
+        if let Err(e) = moved.and_then(|()| crate::util::sync_dir(&parent).map_err(|e| format!("syncing {}: {e}", parent.display()))) {
+            let _ = crate::util::unlink_durably(&journal);
+            return Err(e.into());
+        }
         if let Some(ip) = ip {
             if let Err(e) = host.rename_holder(&l, ip, from, to, None) {
                 // Moved back: the claim still names `from`.
-                let back = std::fs::rename(&dest, &dir).and_then(|()| crate::util::sync_dir(&host.state.join("suspended")));
+                let back = std::fs::rename(&dest, &dir).and_then(|()| crate::util::sync_dir(&parent));
+                if back.is_ok() {
+                    let _ = crate::util::unlink_durably(&journal);
+                }
                 return Err(format!(
                     "vm {from}: moving the claim on {ip} to {to}: {e}{}",
                     back.err().map_or(String::new(), |b| format!("; moving it back: {b}"))
@@ -321,6 +347,7 @@ fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
                 .into());
             }
         }
+        crate::util::unlink_durably(&journal)?;
     }
     move_records(host, from, to)
 }
@@ -377,14 +404,16 @@ impl Proc {
         if *self.suspending.lock().unwrap() != Suspend::Idle {
             bail!("vm {from} is being stopped: not renaming it");
         }
+        if self.consumed.lock().unwrap().is_some() {
+            bail!("vm {from} is still paging in its checkpoint (it was started from it): try again once it is all here");
+        }
         if self.arrived.lock().unwrap().is_some() {
             bail!("vm {from} is still arriving by migration (its memory is still coming): try again once it is all here");
         }
         if self.reconciling.lock().unwrap().is_some() || self.is_leaving() {
             bail!("vm {from} is the source of a migration whose outcome is pending: not renaming it");
         }
-        refuse_recorded(&self.host, to)?;
-        let new = self.host.take_name(to, false)?;
+        let new = self.host.take_unrecorded_name(to)?;
         let (sock, new_sock) = (self.host.sock(&from)?, self.host.sock(to)?);
         std::fs::rename(&sock, &new_sock).map_err(|e| format!("vm {from}: moving its control socket: {e}"))?;
         let moved = (|| -> Result<()> {
@@ -739,6 +768,81 @@ mod tests {
         assert_eq!(waiter.join().unwrap().unwrap(), 5);
         assert!(started.elapsed() >= Duration::from_millis(200), "it waited for the holder's process");
         drop(lock);
+    }
+
+    #[test]
+    fn wait_never_takes_a_later_holder_or_its_status() {
+        let (_d, host) = host("wait-later");
+        let lock = host.take_name("job", false).unwrap();
+        let path = host.vms("job", "lock").unwrap();
+        let spawn = |secs: &str| {
+            let c = std::process::Command::new("sleep").arg(secs).spawn().unwrap();
+            let id = Ident::of(c.id()).unwrap();
+            (c, id)
+        };
+        // Its holder dies unrecorded and another holds the name by then: an error, not a wait on it.
+        let ((mut first, id), (mut later, later_id)) = (spawn("0.3"), spawn("30"));
+        std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
+        let h = host.clone();
+        let waiter = std::thread::spawn(move || wait(&h, "job"));
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(&path, serde_json::to_vec(&later_id).unwrap()).unwrap();
+        first.wait().unwrap();
+        let e = waiter.join().unwrap().unwrap_err().to_string();
+        assert!(e.contains("without an exit status") && e.contains("holds the name now"), "{e}");
+        later.kill().unwrap();
+        later.wait().unwrap();
+        // A later instance's record (it ran and ended meanwhile) is not the one waited on.
+        let (mut again, id) = spawn("0.3");
+        std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
+        let h = host.clone();
+        let waiter = std::thread::spawn(move || wait(&h, "job"));
+        std::thread::sleep(Duration::from_millis(100));
+        record_exit(&host, "job", &later_id, 0);
+        again.wait().unwrap();
+        let e = waiter.join().unwrap().unwrap_err().to_string();
+        assert!(e.contains("another vm has run under the name since"), "{e}");
+        // Renamed while waited on: its record is found under its new name.
+        let (mut renamed, id) = spawn("0.3");
+        std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
+        let h = host.clone();
+        let waiter = std::thread::spawn(move || wait(&h, "job"));
+        std::thread::sleep(Duration::from_millis(100));
+        record_exit(&host, "job-new", &id, 143);
+        renamed.wait().unwrap();
+        assert_eq!(waiter.join().unwrap().unwrap(), 143);
+        drop(lock);
+    }
+
+    #[test]
+    fn a_rename_cut_short_keeps_the_claim_and_is_finished_by_the_next_taker() {
+        let (_d, host) = host("rename-journal");
+        let ip: std::net::Ipv4Addr = "10.0.0.7".parse().unwrap();
+        suspended_vm(&host, "old", "10.0.0.7");
+        // Moved, the claim not yet: as a renamer killed between the two leaves it.
+        std::fs::write(host.rename_journal("new").unwrap(), "old").unwrap();
+        std::fs::rename(host.suspended("old").unwrap(), host.suspended("new").unwrap()).unwrap();
+        let l = host.lock().unwrap();
+        assert_eq!(host.holder(&l, ip).unwrap().as_deref(), Some("old"), "still held: the journal names where it went");
+        drop(l);
+        drop(host.take_name("new", true).unwrap());
+        let l = host.lock().unwrap();
+        assert_eq!(host.holder(&l, ip).unwrap().as_deref(), Some("new"));
+        drop(l);
+        assert!(!host.rename_journal("new").unwrap().exists() && host.is_suspended("new"));
+        // A journal of a rename that never moved anything is only forgotten.
+        std::fs::write(host.rename_journal("other").unwrap(), "new").unwrap();
+        drop(host.take_name("other", false).unwrap());
+        assert!(!host.rename_journal("other").unwrap().exists() && host.is_suspended("new"));
+    }
+
+    #[test]
+    fn a_new_name_with_a_record_is_refused_and_the_record_kept() {
+        let (_d, host) = host("unrecorded");
+        std::fs::write(host.vms("db", "lost").unwrap(), "rebooted").unwrap();
+        assert!(host.take_unrecorded_name("db").err().unwrap().to_string().contains("lost"));
+        assert!(host.vms("db", "lost").unwrap().exists() && !host.alive("db"));
+        drop(host.take_unrecorded_name("free").unwrap());
     }
 
     /// A suspended VM `name` at `ip`, its claim held by a process gone (as a suspend leaves it).

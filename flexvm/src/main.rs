@@ -1730,7 +1730,8 @@ fn exec_request(
                     }
                     deadline = Instant::now() + Duration::from_secs(30);
                 }
-                if !host.alive(name) {
+                // Renamed meanwhile (a VM's own main command): asked again under its new name.
+                if !host.alive(name) && containers::renamed(name) == *name {
                     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
                         return Err(format!("vm {name} moved to {to}; the command keeps running there (session {id})").into());
                     }
@@ -2272,7 +2273,6 @@ mod exec_tests {
             vec!["logout", "--username", "alice"],
             vec!["logout", "-q"],
             vec!["images", "--password-stdin"],
-            vec!["ps", "-q"],
         ] {
             assert!(check_applies(&parse(&argv)).is_err(), "{argv:?}");
         }

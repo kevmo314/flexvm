@@ -755,6 +755,16 @@ impl Host {
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
+        self.take_name_as(name, resuming, false)
+    }
+
+    /// `take_name` of a new name for a VM (`rename`): a `failed` or `lost` record of it is
+    /// refused, decided holding the name, never cleared.
+    pub fn take_unrecorded_name(&self, name: &str) -> Result<NameLock> {
+        self.take_name_as(name, false, true)
+    }
+
+    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool) -> Result<NameLock> {
         let (lock, suspended) = (self.vms(name, "lock")?, self.suspended(name)?);
         if !resuming && self.is_suspended(name) {
             bail!("vm {name:?} exists (stopped); flexvm start or rm it");
@@ -773,6 +783,14 @@ impl Host {
         // proof of death only, and an unreadable lock is an error, never no holder.
         if let Some(old) = lock_holder(&lock)?.filter(|o| *o != Ident::me()) {
             reap(&self.run, &old)?;
+        }
+        self.finish_rename(name)?;
+        if refuse_records {
+            for ext in ["failed", "lost"] {
+                if self.vms(name, ext)?.exists() {
+                    bail!("vm name {name:?} is taken (a {ext} vm, see flexvm ps -a): flexvm rm {name} first");
+                }
+            }
         }
         if suspended.exists() && !self.is_suspended(name) {
             crate::lifecycle::remove_debris(self, name)?;
@@ -997,10 +1015,46 @@ impl Host {
     }
 
     /// A suspended VM `name` with generation `gen` (or one whose generation was
-    /// never recorded: quarantined, it keeps what it held).
+    /// never recorded: quarantined, it keeps what it held). One a `rename` cut short
+    /// moved already (`rename_journal`) is it, under its new name.
     fn suspended_with(&self, name: &str, gen: u64) -> bool {
-        let recorded = || crate::lifecycle::read_gen(&self.suspended(name).ok()?);
-        self.is_suspended(name) && recorded().is_none_or(|g| g == gen)
+        let with = |name: &str| {
+            let recorded = || crate::lifecycle::read_gen(&self.suspended(name).ok()?);
+            self.is_suspended(name) && recorded().is_none_or(|g| g == gen)
+        };
+        with(name) || self.renamed_to(name).is_some_and(|to| with(&to))
+    }
+
+    /// `STATE/suspended/.NEW.renamed-from`, holding OLD: written (durably) before a stopped
+    /// VM's checkpoint directory moves from OLD to NEW, removed once the claim on its address
+    /// moved too. Until then the claim, still OLD's, is held by the directory at NEW
+    /// (`suspended_with`), and the next to take NEW moves it (`finish_rename`).
+    pub fn rename_journal(&self, to: &str) -> Result<PathBuf> {
+        check_name(to)?;
+        Ok(self.state.join("suspended").join(format!(".{to}.renamed-from")))
+    }
+
+    /// The name a stopped VM `from` was being renamed to, if a journal says so.
+    fn renamed_to(&self, from: &str) -> Option<String> {
+        std::fs::read_dir(self.state.join("suspended")).into_iter().flatten().flatten().find_map(|e| {
+            let file = e.file_name().into_string().ok()?;
+            let to = file.strip_prefix('.')?.strip_suffix(".renamed-from")?.to_string();
+            (std::fs::read_to_string(e.path()).ok()? == from).then_some(to)
+        })
+    }
+
+    /// Finishes (or forgets) a rename to `to` cut short: holding `to`'s name.
+    fn finish_rename(&self, to: &str) -> Result<()> {
+        let journal = self.rename_journal(to)?;
+        let Ok(from) = std::fs::read_to_string(&journal) else { return Ok(()) };
+        let l = self.lock()?;
+        if check_name(&from).is_ok() && self.is_suspended(to) {
+            if let Ok(m) = crate::checkpoint::read_manifest(&self.suspended(to)?) {
+                self.rename_holder(&l, m.ip, &from, to, None)?;
+            }
+        }
+        crate::util::unlink_durably(&journal)?;
+        Ok(())
     }
 
     /// From the range as host.json has it now (a standby started before a `vm_ips`
@@ -3412,6 +3466,14 @@ fn collect_owned(run: &Path) {
             for ext in ["json", "sock"] {
                 let _ = std::fs::remove_file(vms.join(format!("{}.{ext}", name.to_string_lossy())));
             }
+            // An exit status (`flexvm wait`) of an earlier instance: this one ended without
+            // one, and with its lock goes the proof that the record is not its own.
+            let exit = vms.join(format!("{}.exit", name.to_string_lossy()));
+            if let (Some(dead), Ok(Some(recorded))) = (&reaped, load::<Ident>(&exit)) {
+                if recorded != *dead {
+                    let _ = std::fs::remove_file(&exit);
+                }
+            }
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -4918,6 +4980,21 @@ pub(crate) mod tests {
         collect_owned(&h.run);
         assert!(fc.done() && !h.vms("k", "lock").unwrap().exists() && h.vms("k", "failed").unwrap().exists());
         assert!(h.vms("e", "lock").unwrap().exists());
+        // An exit status (`flexvm wait`) an earlier instance left goes with a killed holder's lock,
+        // which alone told it apart from the holder's own; the holder's own stays.
+        let exit = |id: &Ident, code: i32| {
+            let mut v = serde_json::to_value(id).unwrap();
+            v["code"] = code.into();
+            v
+        };
+        let (fc, fc2) = (Sleeper::new(), Sleeper::new());
+        let (dead, dead2) = (dead_owner(&h, 999_999_905, &[&fc.1]), dead_owner(&h, 999_999_906, &[&fc2.1]));
+        store(&h.vms("w", "lock").unwrap(), &dead, false).unwrap();
+        store(&h.vms("w", "exit").unwrap(), &exit(&Ident { pid: 1, start: 1, boot: "earlier".into() }, 143), false).unwrap();
+        store(&h.vms("w2", "lock").unwrap(), &dead2, false).unwrap();
+        store(&h.vms("w2", "exit").unwrap(), &exit(&dead2, 3), false).unwrap();
+        collect_owned(&h.run);
+        assert!(!h.vms("w", "exit").unwrap().exists() && h.vms("w2", "exit").unwrap().exists());
     }
 
     #[test]
