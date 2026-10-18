@@ -660,18 +660,18 @@ fn run(args: &Args, image: &str) -> Result<()> {
     let (host, paths) = (open_host(args)?, paths(args)?);
     let template = template::name_of(image)?;
     let resources = resources(args)?;
-    port_specs(args)?;
     let ip = args.get("ip").filter(|&s| s != "auto");
     let ip: Option<std::net::Ipv4Addr> = ip.map(|s| s.parse().map_err(|_| format!("bad --ip {s:?}"))).transpose()?;
     if let Some(name) = args.get("name") {
         host::check_name(name)?;
     }
+    // Parsed once (its `-p` ports included), before a pull: a bad one is refused at once.
+    let spec = run_spec(args, ip)?;
     // Pulled the first time, as docker does (a detached run's VM process finds it there).
     if std::fs::symlink_metadata(paths.templates.join(&template)).is_err() {
         pull_missing(args, &template)?;
     }
     let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
-    let spec = run_spec(args, ip)?;
     // Only settings for the app need the template's (a standby VM's claim is ~5 ms).
     match spec.changes_app() {
         true => spec.check(template::Template::open(&paths, &template)?.meta.image.as_ref())?,
@@ -710,9 +710,9 @@ fn run_as(
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
-    let ports = port_specs(args)?;
     let tty = log.is_none() && stdin_tty();
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "attached": log.is_none(), "ports": ports});
+    // `ports` beside the spec too, for a standby process of an older flexvm.
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "attached": log.is_none(), "ports": spec.ports});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
@@ -745,7 +745,7 @@ fn run_as(
             vmproc::main(
                 host.clone(),
                 paths.clone(),
-                Start::Run { name, template: template.into(), ip, cmd, resources, generated, ports, spec, tty, rerun },
+                Start::Run { name, template: template.into(), ip, cmd, resources, generated, spec, tty, rerun },
                 notify_fd(),
             )
         }
@@ -760,7 +760,7 @@ fn stdin_tty() -> bool {
     unsafe { libc::isatty(0) == 1 }
 }
 
-/// `-e`, `--env-file`, `--entrypoint`, `--keep`, `--rm` (and the `--ip` asked for, for a rerun).
+/// `-e`, `--env-file`, `--entrypoint`, `--keep`, `--rm`, `-p` (and the `--ip` asked for, for a rerun).
 fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec> {
     let lookup = |k: &str| std::env::var(k).ok();
     let mut env = Vec::new();
@@ -776,7 +776,7 @@ fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec>
         }
     }
     let entrypoint = args.get("entrypoint").map(image::parse_argv).transpose()?;
-    Ok(app::RunSpec { env, entrypoint, keep: args.has("keep"), rm: args.has("rm"), ip })
+    Ok(app::RunSpec { env, entrypoint, keep: args.has("keep"), rm: args.has("rm"), ip, ports: port_specs(args)? })
 }
 
 /// `start` of an exited VM (`app::Exited`): a new run under its name, as its record (read under
@@ -787,18 +787,7 @@ fn rerun(host: &Host, name: &str) -> Result<Option<Start>> {
         return Ok(None);
     }
     let (template, resources, spec) = (String::new(), vm::Resources::default(), app::RunSpec::default());
-    Ok(Some(Start::Run {
-        name: name.into(),
-        template,
-        ip: None,
-        cmd: None,
-        resources,
-        generated: false,
-        ports: Vec::new(),
-        spec,
-        tty: stdin_tty(),
-        rerun: true,
-    }))
+    Ok(Some(Start::Run { name: name.into(), template, ip: None, cmd: None, resources, generated: false, spec, tty: stdin_tty(), rerun: true }))
 }
 
 /// `kill -s SIGNAL NAME`: to its app.
@@ -1132,7 +1121,7 @@ fn vms(host: &Host) -> Vec<Value> {
     for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".exited").map(String::from)).filter(|n| !host.alive(n)) {
         let Ok(path) = host.vms(&n, "exited") else { continue };
         match app::Exited::read(&path) {
-            Ok(r) => vms.push(json!({"name": n, "state": "exited", "status": r.status, "template": r.template, "exited_at": r.at})),
+            Ok(r) => vms.push(json!({"name": n, "state": "exited", "status": r.status, "template": r.template, "exited_at": r.at, "ports": r.spec.ports})),
             Err(e) => vms.push(json!({"name": n, "state": "exited", "error": e.to_string()})),
         }
     }
@@ -1714,6 +1703,9 @@ mod exec_tests {
         let command = parse(&["run", "-p", "8080:80", "image", "echo", "-p", "123"]);
         assert_eq!(command.rest, ["echo", "-p", "123"]);
         assert_eq!(port_specs(&command).unwrap().len(), 1);
+        // They are the run's settings, which travel with the VM as a unit.
+        assert_eq!(run_spec(&args, None).unwrap().ports, ports);
+        assert!(run_spec(&parse(&["run", "-p", "80", "image"]), None).is_err());
     }
 
     #[test]

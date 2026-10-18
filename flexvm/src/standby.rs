@@ -614,8 +614,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         }
         // Before it is published: eviction leaves a CMD VM alone.
         *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
-        // The claim's app settings are applied as it starts the app (`start_guest`).
-        *p.spec.lock().unwrap() = serde_json::from_value(req["spec"].clone()).unwrap_or_default();
+        // The claim's app settings are applied as it starts the app (`start_guest`), its ports as it claims.
+        *p.spec.lock().unwrap() = claim_spec(&req);
         p.tty.store(req["tty"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         p.attached.store(req["attached"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         match claim(p, &req) {
@@ -746,7 +746,6 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         p.refund_start();
         (e, retry)
     };
-    *p.ports.lock().unwrap() = serde_json::from_value(req.get("ports").cloned().unwrap_or_else(|| json!([]))).map_err(|e| not_run(e.into(), false))?;
     p.bind_ports().map_err(|e| not_run(e, false))?;
     let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| not_run(e, false))?;
     p.serve_ports(claim.ip).map_err(|e| not_run(e, false))?;
@@ -778,6 +777,15 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     let mut v = p.start_guest(&mut t).map_err(|e| (e, false))?;
     v["standby"] = json!(true);
     Ok(v)
+}
+
+/// The run's settings, its ports in them; an older `run` sent its ports beside them.
+fn claim_spec(req: &Value) -> crate::app::RunSpec {
+    let mut spec: crate::app::RunSpec = serde_json::from_value(req["spec"].clone()).unwrap_or_default();
+    if spec.ports.is_empty() {
+        spec.ports = serde_json::from_value(req.get("ports").cloned().unwrap_or_else(|| json!([]))).unwrap_or_default();
+    }
+    spec
 }
 
 /// A claim's generation: the template's, marked as a claim whose VM follows its app with the run's
@@ -973,6 +981,16 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claims_ports_come_in_its_spec_or_beside_it_from_an_older_run() {
+        let ports: Vec<crate::ports::Port> = vec!["8080:80".parse().unwrap()];
+        let spec = crate::app::RunSpec { keep: true, ports: ports.clone(), ..Default::default() };
+        assert_eq!(claim_spec(&json!({"spec": spec, "ports": ports})), spec);
+        assert_eq!(claim_spec(&json!({"spec": {"keep": true}, "ports": ports})), spec);
+        assert_eq!(claim_spec(&json!({"spec": {"keep": true}})), crate::app::RunSpec { keep: true, ..Default::default() });
+        assert_eq!(claim_spec(&json!({})), crate::app::RunSpec::default());
+    }
 
     #[test]
     fn claims_use_a_private_socket_and_require_the_same_uid() {

@@ -123,7 +123,7 @@ impl Proc {
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
         // Before the pause: dropped, the connection ends the target's arrival.
-        check_app_support(to, &vm.name, &prepared, &self.spec.lock().unwrap(), vm.template.meta.image.as_ref())?;
+        check_app_support(to, &vm.name, &prepared, &self.spec.lock().unwrap().moving(), vm.template.meta.image.as_ref())?;
         let prepare = prep.elapsed();
         // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
         let mut wanted = crate::standby::load_set(&self.host, &vm.template);
@@ -285,8 +285,8 @@ impl Proc {
                 // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
                 "plugged_mib": vm.hotplug_plugged(),
                 "resources": vm.resources(),
-                // What becomes of it once its app exits goes with it.
-                "spec": *self.spec.lock().unwrap(),
+                // What becomes of it once its app exits goes with it; its forwards stay here.
+                "spec": self.spec.lock().unwrap().moving(),
                 "regions": vm.pager.regions(),
                 // The MSRs its vmstate will hold: this host's, which may be more than the template's.
                 "msrs": msrs,
@@ -466,8 +466,9 @@ impl Proc {
     }
 
     /// A failed route is retried in the background: the target owns the VM either way.
+    /// The forwards stay until `finish` (`End::Moved`): meanwhile they reach the VM by the route to
+    /// the target, and an abort after this runs the VM here again with them.
     fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>, switch: bool) -> (Option<hold::Stats>, Result<()>) {
-        self.drop_ports_later();
         let ip = self.vm().ip;
         let mut route = Route::new(to, target, conn);
         *self.pending_route.lock().unwrap() = Some((mig, route.clone()));
@@ -865,7 +866,8 @@ impl Proc {
         // Its caps move with it (the same template: they fit).
         // Refused before the source pauses: a capped VM never runs uncapped here.
         self.keep_resources(serde_json::from_value(req["resources"].clone()).unwrap_or_default())?;
-        *self.spec.lock().unwrap() = serde_json::from_value(req["spec"].clone()).unwrap_or_default();
+        // Its forwards stayed on the source, as host-local proxies.
+        *self.spec.lock().unwrap() = serde_json::from_value::<crate::app::RunSpec>(req["spec"].clone()).unwrap_or_default().moving();
         t.mark("template");
         going()?;
         // Admission, the record and the claim under one wait for the lock, which gives up in time.
@@ -1210,8 +1212,11 @@ mod tests {
             RunSpec { ip: Some("10.0.0.9".parse().unwrap()), ..Default::default() },
         ];
         for target in [json!({}), json!({"follows_app": false}), json!({"follows_app": true})] {
+            // `-p` ports stay on the source: they never need a newer target.
+            let ported = RunSpec { ports: vec!["8080:80".parse().unwrap()], ..Default::default() }.moving();
             for image in [None, Some(&idle)] {
                 assert!(check_app_support("peer", "vm", &target, &plain, image).is_ok());
+                assert!(check_app_support("peer", "vm", &target, &ported, image).is_ok());
             }
             for (spec, image) in [(&plain, Some(&app)), (&plain, Some(&warm))].into_iter().chain(settings.iter().map(|s| (s, Some(&idle)))) {
                 let result = check_app_support("peer", "vm", &target, spec, image);
