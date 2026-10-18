@@ -411,9 +411,11 @@ The store's lock (`checkpoints/.locks/store`, a flock) orders the rest:
 - Shared by a VM process from before its checkpoint stages until it is
   named, so the parent of a delta cannot go while the delta is written
   (the delta checks its chain again before publishing, as before).
-- Shared by a restore from before it opens the checkpoint until it has read
-  it (`Checkpoint::open`, `SPEC`). From then on it reads only through
-  descriptors, which removal leaves readable.
+- Shared by a restore, of the store the checkpoint is in (whichever state's,
+  `store::holding`), from before it opens the checkpoint until it has read it
+  (`Checkpoint::open`, `SPEC`) and opened its template generation (whose use
+  lock then keeps it). From then on it reads only through descriptors, which
+  removal leaves readable.
 - Exclusive for `checkpoint rm` and `prune`. They first delete what an
   interrupted removal left (`.removed-*`), and any `ID` without a manifest
   (a revoked publication's leftover: a checkpoint is published whole). Then,

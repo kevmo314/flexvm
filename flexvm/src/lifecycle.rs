@@ -378,13 +378,12 @@ impl Proc {
         ports: Vec<crate::ports::Port>,
     ) -> Result<Value> {
         let mut t = Phases::new();
-        // Until it is open: a stored one's removal waits.
-        let held = store::lock(&self.host.state, libc::LOCK_SH)?;
+        // Until it and its template are open: a stored one's removal (in whichever state) waits.
+        let held = store::holding(dir)?;
         let ck = Checkpoint::open(dir)?;
         // Its app's settings and what becomes of it; not the address its original asked for, nor
         // its ports (its original may hold them still): only those this `run` gives.
         let spec = read_spec(dir).map_err(|e| format!("its run settings {}: {e}", dir.join(SPEC).display()))?;
-        drop(held);
         *self.spec.lock().unwrap() = crate::app::RunSpec { ip: None, ports, ..spec };
         t.mark("verify_checkpoint");
         let name = name.unwrap_or(&ck.manifest.name).to_string();
@@ -398,6 +397,7 @@ impl Proc {
         }
         self.set_name(self.host.take_name(&name, false)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
+        drop(held);
         self.set_resources(resources.or(ck.manifest.resources), &tpl.meta)?;
         self.bind_ports()?;
         // Decided and claimed under one lock, by one reading of the range: a change

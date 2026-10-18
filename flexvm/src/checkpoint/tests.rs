@@ -798,6 +798,11 @@ fn the_store_names_lists_and_removes_dependants_first() {
     assert_eq!((all[0].name.as_deref(), store::find(&all, "base").unwrap().id.as_str()), (Some("base"), a.as_str()));
     assert_eq!(store::find(&all, &d[..6]).unwrap().id, d);
     assert!(store::find(&all, "nope").is_err() && store::find(&all, &d[..3]).is_err(), "a prefix has 4 digits or more");
+    // A restore of a stored one (by any path to it) holds its store, whichever state's; one elsewhere none.
+    let held = store::holding(&state.join("checkpoints/../checkpoints").join(&a)).unwrap();
+    assert!(held.is_some() && store::lock(&state, libc::LOCK_EX | libc::LOCK_NB).is_err());
+    drop(held);
+    assert!(store::holding(&state).unwrap().is_none());
     let rows = store::rows(&state, &[json!({"name": "busybox:1.36", "id": "id"})]);
     assert_eq!(
         (&rows[0]["template"], &rows[0]["vm"], &rows[1]["parent"], &rows[2]["parent"]),
