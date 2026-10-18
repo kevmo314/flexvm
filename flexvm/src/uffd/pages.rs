@@ -251,6 +251,11 @@ impl Pages {
         }
     }
 
+    /// A bounded run worth reading ahead from the template. Only a hint: states may change after this scan.
+    pub(super) fn base_run(&self, first: usize, n: usize, has_data: impl Fn(usize) -> bool) -> usize {
+        (first..first.saturating_add(n).min(self.len())).take_while(|&p| self.get(p) == BASE && has_data(p)).count()
+    }
+
     pub fn get(&self, page: usize) -> u8 {
         self.states[page].load(Ordering::SeqCst)
     }
@@ -613,6 +618,20 @@ mod tests {
             assert_eq!(std::hint::black_box(pages.discard(&removing, first, first + n)), 0);
         }
         println!("128 MiB REMOVE: {:?} per event", start.elapsed() / 50);
+    }
+
+    #[test]
+    fn template_readahead_is_bounded_and_skips_other_sources() {
+        let mut pages = Pages::new(32);
+        assert_eq!(pages.base_run(0, 16, |_| true), 16);
+        assert_eq!(pages.base_run(30, 16, |_| true), 2);
+        assert_eq!(pages.base_run(0, 16, |p| p < 3), 3);
+        for state in [PRESENT, ZERO, REMOTE, INFLIGHT, DISCARDED] {
+            pages.fill(4, 1, state);
+            assert_eq!(pages.base_run(0, 16, |_| true), 4);
+            assert_eq!(pages.base_run(4, 16, |_| true), 0);
+        }
+        assert_eq!(pages.get(0), BASE, "readahead never claims or installs pages");
     }
 
     #[test]

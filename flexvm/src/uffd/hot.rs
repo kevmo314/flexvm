@@ -16,8 +16,7 @@
 //! next one's.
 
 use super::{Mapping, Pager, PRESENT};
-use crate::bail;
-use crate::util::{Mmap, Result, PAGE_SIZE};
+use crate::util::{Mmap, PAGE_SIZE};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,6 +72,13 @@ impl Held {
     pub fn get(&self, page: usize) -> Option<&[u8]> {
         self.pages.binary_search(&page).ok().map(|i| self.buf.page(i))
     }
+}
+
+/// A failed copy still owns both allocations so the pager can recycle them.
+struct CopyError {
+    error: io::Error,
+    buf: Buf,
+    prev: Option<Arc<Held>>,
 }
 
 /// What `copy` copied: the hot pages, those of them found unchanged since the last checkpoint, and the blocks
@@ -135,7 +141,15 @@ impl Pager {
         let candidate = |p: usize| pages.is_dirty(p) && hot_before(p) && eligible(p);
         let hot = select_hot(pages.hot_pages(&before.bits), prev.as_ref().map_or(&[], |h| h.pages()), candidate, buf.pages());
         let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
-        copy(buf, prev, hot, |p| next_to(self.mappings(), p), read).inspect_err(|e| crate::log!("uffd: hot pages not copied, protecting them: {e}")).ok()
+        match copy(buf, prev, hot, |p| next_to(self.mappings(), p), read) {
+            Ok(hot) => Some(hot),
+            Err(CopyError { error, buf, prev }) => {
+                crate::log!("uffd: hot pages not copied, protecting them: {error}");
+                self.recycle_buf(buf);
+                self.recycle(prev);
+                None
+            }
+        }
     }
 
     /// The VM process's memory controller, every second: `room` gives what host memory is left above its reserve and
@@ -166,6 +180,14 @@ impl Pager {
     pub(super) fn recycle(&self, held: Option<Arc<Held>>) {
         if let Some(Held { buf, .. }) = held.and_then(|h| Arc::try_unwrap(h).ok()) {
             self.recycle_buf(buf);
+        }
+    }
+
+    /// A failed freeze cannot use either snapshot for comparison, but can reuse their memory.
+    pub(super) fn recycle_hot(&self, hot: Option<Hot>) {
+        if let Some(hot) = hot {
+            self.recycle(Some(hot.held));
+            self.recycle(hot.prev);
         }
     }
 
@@ -217,7 +239,7 @@ fn copy(
     hot: Vec<usize>,
     next_to: impl Fn(usize) -> bool,
     read: impl Fn(usize, &mut [u8]) -> io::Result<()> + Sync,
-) -> Result<Hot> {
+) -> std::result::Result<Hot, CopyError> {
     assert!(hot.len() <= buf.pages());
     let mut runs: Vec<(usize, usize)> = Vec::new();
     for i in 0..hot.len() {
@@ -263,7 +285,7 @@ fn copy(
         work();
     });
     if let Some(e) = failed.into_inner().unwrap() {
-        bail!("copying hot pages: {e}");
+        return Err(CopyError { error: e, buf, prev });
     }
     let mut unchanged = unchanged.into_inner().unwrap();
     unchanged.sort_unstable();
@@ -336,7 +358,7 @@ mod tests {
             Ok(())
         };
         // Page 70 starts another region.
-        copy(Buf::new(hot.len()).unwrap(), prev, hot, |p| p != 70, read).unwrap()
+        copy(Buf::new(hot.len()).unwrap(), prev, hot, |p| p != 70, read).unwrap_or_else(|e| panic!("{}", e.error))
     }
 
     #[test]
@@ -387,7 +409,7 @@ mod tests {
             reads.lock().unwrap().push((p, dst.len() / PAGE_SIZE));
             Ok(())
         };
-        copy(Buf::new(4).unwrap(), None, vec![510, 511, 512, 513], |p| next_to(&regions, p), read).unwrap();
+        copy(Buf::new(4).unwrap(), None, vec![510, 511, 512, 513], |p| next_to(&regions, p), read).unwrap_or_else(|e| panic!("{}", e.error));
         let mut runs = reads.into_inner().unwrap();
         runs.sort();
         assert_eq!(runs, [(510, 2), (512, 2)]);
@@ -396,6 +418,12 @@ mod tests {
     #[test]
     fn a_failed_read_copies_nothing() {
         let read = |p: usize, _: &mut [u8]| if p == 9 { Err(io::Error::other("gone")) } else { Ok(()) };
-        assert!(copy(Buf::new(4).unwrap(), None, vec![1, 2, 9, 30], |_| true, read).is_err());
+        let buf = Buf::new(4).unwrap();
+        let ptr = buf.0.ptr();
+        let prev = Arc::new(Held::of(&[(1, 42)]));
+        let Err(failed) = copy(buf, Some(prev.clone()), vec![1, 2, 9, 30], |_| true, read) else { panic!("copy succeeded") };
+        assert_eq!(failed.buf.0.ptr(), ptr, "failed copy returns its populated allocation");
+        assert!(Arc::ptr_eq(failed.prev.as_ref().unwrap(), &prev));
+        assert_eq!(failed.prev.unwrap().get(1).unwrap(), &[42; PAGE_SIZE]);
     }
 }
