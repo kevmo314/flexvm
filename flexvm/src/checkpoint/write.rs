@@ -8,7 +8,7 @@ use crate::{
     crc32c,
     template::Template,
     uffd::{Pager, Runs, REMOTE},
-    util::{Result, PAGE_SIZE},
+    util::{Mmap, Result, PAGE_SIZE},
 };
 use std::{
     fs::File,
@@ -154,35 +154,17 @@ fn pwritev_all(file: &File, mut iov: &mut [libc::iovec], mut off: u64) -> io::Re
 /// all of the rounded-up mapping, which counts against the host's memory room as rescued
 /// copies do (`cow::Room`); without that much room the buffer is ordinary pages, just `UNIT`.
 pub(crate) struct Buf {
-    ptr: *mut u8,
-    map: usize,
+    mem: Mmap,
     len: usize,
 }
-
-// Its mapping is its own alone (unmapped on drop): a writer thread may be handed it.
-unsafe impl Send for Buf {}
 
 #[cfg(test)]
 thread_local! {
     /// Tests: the next `Buf::map` on this thread fails.
     static FAIL_MAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Tests: the next `populate` on this thread finds the kernel cannot (as before 5.14).
-    static FAIL_POPULATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 const HUGE: usize = 2 << 20;
-const MADV_POPULATE_WRITE: libc::c_int = 23;
-
-/// Faults in `len` bytes from `ptr` for writing: at once where the kernel can, else a write to each page.
-fn populate(ptr: *mut u8, len: usize) {
-    #[cfg(test)]
-    let fail = FAIL_POPULATE.with(|f| f.replace(false));
-    #[cfg(not(test))]
-    let fail = false;
-    if fail || unsafe { libc::madvise(ptr.cast(), len, MADV_POPULATE_WRITE) } != 0 {
-        (0..len).step_by(PAGE_SIZE).for_each(|o| unsafe { ptr.add(o).write_volatile(0) });
-    }
-}
 
 impl Buf {
     #[cfg(test)]
@@ -198,12 +180,9 @@ impl Buf {
         let mib = (huge >> 20) as u64;
         let fit = n.min(usize::try_from(room.get() / mib).unwrap_or(usize::MAX));
         let one = || -> io::Result<Buf> {
-            let ptr = Buf::map(huge, len, HUGE)?;
-            // Only a hint: without it the buffer is ordinary pages.
-            unsafe { libc::madvise(ptr.cast(), huge, libc::MADV_HUGEPAGE) };
-            let buf = Buf { ptr, map: huge, len };
-            populate(buf.ptr, buf.map);
-            Ok(buf)
+            let mem = Buf::map(huge, len, HUGE)?;
+            mem.populate();
+            Ok(Buf { mem, len })
         };
         let mut out = match fit {
             0 => Vec::new(),
@@ -218,43 +197,21 @@ impl Buf {
     /// Ordinary page-aligned storage, taking no room.
     pub(crate) fn plain(pages: usize) -> io::Result<Buf> {
         let len = pages * PAGE_SIZE;
-        Buf::map(len, len, 0).map(|ptr| Buf { ptr, map: len, len })
+        Buf::map(len, len, 0).map(|mem| Buf { mem, len })
     }
 
     /// `map` bytes of anonymous memory, at a multiple of `align` (0: anywhere).
-    fn map(map: usize, len: usize, align: usize) -> io::Result<*mut u8> {
-        let full = map + align;
+    fn map(map: usize, len: usize, align: usize) -> io::Result<Mmap> {
         #[cfg(test)]
         if FAIL_MAP.with(|f| f.replace(false)) {
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, "injected: cannot allocate checkpoint buffer"));
         }
-        let raw = unsafe { libc::mmap(std::ptr::null_mut(), full, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
-        if raw == libc::MAP_FAILED {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, format!("cannot allocate checkpoint buffer of {len} bytes")));
-        }
-        let raw = raw as usize;
-        let start = if align == 0 { raw } else { raw.next_multiple_of(align) };
-        // The excess around the aligned start, unmapped again.
-        unsafe {
-            if start > raw {
-                libc::munmap(raw as *mut _, start - raw);
-            }
-            if raw + full > start + map {
-                libc::munmap((start + map) as *mut _, raw + full - start - map);
-            }
-        }
-        Ok(start as *mut u8)
+        Mmap::new(map, align).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, format!("cannot allocate checkpoint buffer of {len} bytes")))
     }
 
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         // Mapped, initialized (zero) and ours alone.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-}
-
-impl Drop for Buf {
-    fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr.cast(), self.map) };
+        unsafe { std::slice::from_raw_parts_mut(self.mem.ptr(), self.len) }
     }
 }
 
@@ -388,6 +345,7 @@ pub(super) fn write_pages(
 #[cfg(test)]
 mod buf_tests {
     use super::*;
+    use crate::util::FAIL_POPULATE;
 
     #[test]
     fn writer_buffers_are_huge_only_with_room_for_the_whole_huge_page() {
@@ -395,24 +353,24 @@ mod buf_tests {
             let room = Room::default();
             room.set(have);
             let b = Buf::new(&room).unwrap();
-            assert_eq!((b.map == HUGE, room.get()), (huge, left), "room {have} MiB");
+            assert_eq!((b.mem.len() == HUGE, room.get()), (huge, left), "room {have} MiB");
             // A huge one is all of an aligned 2 MiB; an ordinary one only what it holds,
             // which no huge page fits in.
             if !huge {
-                assert_eq!(b.map, UNIT * PAGE_SIZE);
+                assert_eq!(b.mem.len(), UNIT * PAGE_SIZE);
             }
-            assert_eq!(b.ptr as usize % if huge { HUGE } else { PAGE_SIZE }, 0);
+            assert_eq!(b.mem.ptr() as usize % if huge { HUGE } else { PAGE_SIZE }, 0);
             let mut b = b;
             let bytes = b.bytes();
             assert_eq!(bytes.len(), UNIT * PAGE_SIZE);
             assert!(bytes.iter().all(|&x| x == 0));
             bytes.fill(7);
             if !huge {
-                assert_eq!(anon_huge_kib(b.ptr as usize), 0, "an ordinary buffer took a huge page");
+                assert_eq!(anon_huge_kib(b.mem.ptr() as usize), 0, "an ordinary buffer took a huge page");
             }
         }
         // No bound: huge.
-        assert_eq!(Buf::new(&Room::default()).unwrap().map, HUGE);
+        assert_eq!(Buf::new(&Room::default()).unwrap().mem.len(), HUGE);
     }
 
     /// A checkpoint's writers take their huge buffers in one take, as many as the room shows space for (#677).
@@ -421,14 +379,14 @@ mod buf_tests {
         let room = Room::default();
         room.set(5);
         let bufs = Buf::many(&room, 4).unwrap();
-        assert_eq!(bufs.iter().map(|b| b.map == HUGE).collect::<Vec<_>>(), [true, true, false, false]);
+        assert_eq!(bufs.iter().map(|b| b.mem.len() == HUGE).collect::<Vec<_>>(), [true, true, false, false]);
         assert_eq!(room.get(), 1);
-        for b in bufs.iter().filter(|b| b.map == HUGE) {
-            let mut resident = vec![0u8; b.map / PAGE_SIZE];
-            assert_eq!(unsafe { libc::mincore(b.ptr.cast(), b.map, resident.as_mut_ptr()) }, 0);
+        for b in bufs.iter().filter(|b| b.mem.len() == HUGE) {
+            let mut resident = vec![0u8; b.mem.len() / PAGE_SIZE];
+            assert_eq!(unsafe { libc::mincore(b.mem.ptr().cast(), b.mem.len(), resident.as_mut_ptr()) }, 0);
             assert!(resident.iter().all(|&v| v & 1 == 1), "the whole huge buffer is populated when the take returns");
         }
-        assert_eq!(Buf::many(&room, 3).unwrap().iter().filter(|b| b.map == HUGE).count(), 0, "no room left");
+        assert_eq!(Buf::many(&room, 3).unwrap().iter().filter(|b| b.mem.len() == HUGE).count(), 0, "no room left");
     }
 
     #[test]
@@ -438,7 +396,7 @@ mod buf_tests {
         FAIL_MAP.with(|f| f.set(true));
         assert!(Buf::new(&room).is_err());
         // And the next one maps (huge) as usual.
-        assert_eq!(Buf::new(&room).unwrap().map, HUGE);
+        assert_eq!(Buf::new(&room).unwrap().mem.len(), HUGE);
     }
 
     /// A writer buffer is populated before its first write, also where the kernel cannot populate it at once (#674):
@@ -448,9 +406,9 @@ mod buf_tests {
         let room = Room::default();
         FAIL_POPULATE.with(|f| f.set(true));
         let b = Buf::new(&room).unwrap();
-        assert!(b.map == HUGE && !FAIL_POPULATE.with(|f| f.get()), "huge, and the populate failed");
-        let mut vec = vec![0u8; b.map / PAGE_SIZE];
-        assert_eq!(unsafe { libc::mincore(b.ptr.cast(), b.map, vec.as_mut_ptr()) }, 0);
+        assert!(b.mem.len() == HUGE && !FAIL_POPULATE.with(|f| f.get()), "huge, and the populate failed");
+        let mut vec = vec![0u8; b.mem.len() / PAGE_SIZE];
+        assert_eq!(unsafe { libc::mincore(b.mem.ptr().cast(), b.mem.len(), vec.as_mut_ptr()) }, 0);
         assert!(vec.iter().all(|&v| v & 1 == 1), "every page in");
     }
 

@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 
 use crate::checkpoint::GuestPages;
 use crate::uffd::{zeroed_atomics, Held, Runs, REMOTE};
-use crate::util::{Result, PAGE_SIZE};
+use crate::util::{Mmap, Result, PAGE_SIZE};
 
 pub const CLEAN: u8 = 0;
 pub const PENDING: u8 = 1;
@@ -604,12 +604,11 @@ pub struct Slots {
 
 #[derive(Default)]
 struct SlotsInner {
-    chunks: Vec<usize>,
+    chunks: Vec<Mmap>,
     free: Vec<Slot>,
 }
 
 const SLOT_CHUNK: usize = 2 << 20;
-const MADV_POPULATE_WRITE: libc::c_int = 23;
 
 /// What host memory rescue memory, hot pages' memory and writer buffers may still take, in MiB. That memory is not
 /// admitted like a guest's (its copy would wait), so it keeps out of the host's reserve instead: once `attach`ed, each
@@ -723,11 +722,13 @@ impl Slots {
     fn take(&self, n: usize, unbounded: bool) -> std::io::Result<Option<Vec<Slot>>> {
         let mut inner = self.inner.lock().unwrap();
         let short = short_mib(n, inner.free.len());
-        // Each chunk populated as it is mapped (`map_chunk`), within the take.
+        // Each chunk populated as it is mapped, within the take.
         let grow = |inner: &mut SlotsInner| -> std::io::Result<()> {
             while inner.free.len() < n {
-                let c = map_chunk()?;
-                inner.chunks.push(c);
+                let chunk = Mmap::new(SLOT_CHUNK, SLOT_CHUNK)?;
+                chunk.populate();
+                let c = chunk.ptr() as usize;
+                inner.chunks.push(chunk);
                 self.mapped.fetch_add(1, Ordering::Relaxed);
                 // Descending: they are taken from the end.
                 inner.free.extend((0..SLOT_CHUNK / PAGE_SIZE).rev().map(|i| Slot(c + i * PAGE_SIZE)));
@@ -763,14 +764,11 @@ impl Slots {
         let inner = self.inner.get_mut().unwrap();
         let cap = if self.room.get() == 0 { 0 } else { (BUDGET_MIB << 20) / SLOT_CHUNK };
         let keep = self.peak.get_mut().div_ceil(SLOT_CHUNK / PAGE_SIZE).min(inner.chunks.len()).min(cap);
-        for &c in &inner.chunks[keep..] {
-            unsafe { libc::munmap(c as *mut _, SLOT_CHUNK) };
-        }
         inner.chunks.truncate(keep);
         *self.mapped.get_mut() = keep;
         inner.free.clear();
         let chunks = &inner.chunks;
-        inner.free.extend(chunks.iter().rev().flat_map(|&c| (0..SLOT_CHUNK / PAGE_SIZE).rev().map(move |i| Slot(c + i * PAGE_SIZE))));
+        inner.free.extend(chunks.iter().rev().flat_map(|c| (0..SLOT_CHUNK / PAGE_SIZE).rev().map(move |i| Slot(c.ptr() as usize + i * PAGE_SIZE))));
         (*self.used.get_mut(), *self.peak.get_mut()) = (0, 0);
     }
 
@@ -778,38 +776,6 @@ impl Slots {
     fn mapped(&self) -> usize {
         self.mapped_bytes() / PAGE_SIZE
     }
-}
-
-impl Drop for Slots {
-    fn drop(&mut self) {
-        for &c in self.inner.get_mut().unwrap().chunks.iter() {
-            unsafe { libc::munmap(c as *mut _, SLOT_CHUNK) };
-        }
-    }
-}
-
-/// `SLOT_CHUNK` of anonymous memory, aligned to it (so it can be a huge page) and populated.
-fn map_chunk() -> std::io::Result<usize> {
-    let len = 2 * SLOT_CHUNK;
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
-    if p == libc::MAP_FAILED {
-        return Err(std::io::Error::last_os_error());
-    }
-    let (start, end) = (p as usize, p as usize + len);
-    let c = start.next_multiple_of(SLOT_CHUNK);
-    unsafe {
-        if c > start {
-            libc::munmap(start as *mut _, c - start);
-        }
-        if end > c + SLOT_CHUNK {
-            libc::munmap((c + SLOT_CHUNK) as *mut _, end - c - SLOT_CHUNK);
-        }
-        libc::madvise(c as *mut _, SLOT_CHUNK, libc::MADV_HUGEPAGE);
-        if libc::madvise(c as *mut _, SLOT_CHUNK, MADV_POPULATE_WRITE) != 0 {
-            (0..SLOT_CHUNK).step_by(PAGE_SIZE).for_each(|o| ((c + o) as *mut u8).write_volatile(0));
-        }
-    }
-    Ok(c)
 }
 
 #[cfg(test)]

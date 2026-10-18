@@ -17,7 +17,7 @@
 
 use super::{Mapping, Pager, PRESENT};
 use crate::bail;
-use crate::util::{Result, PAGE_SIZE};
+use crate::util::{Mmap, Result, PAGE_SIZE};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,48 +36,25 @@ const HOT_RUN: usize = 256;
 /// near there again, against well under a microsecond a page to copy them. Smaller blocks here copied as much, kept
 /// fewer pages unprotected, and faulted three times as often.
 const HOT_BLOCK: usize = 64;
-const MADV_POPULATE_WRITE: libc::c_int = 23;
 
 /// Anonymous memory, populated when allocated, so that filling it during a pause takes no page faults (several
 /// microseconds each here).
-pub struct Buf {
-    ptr: *mut u8,
-    len: usize,
-}
-
-// Plain memory: shared read-only once filled, and filled only through disjoint ranges.
-unsafe impl Send for Buf {}
-unsafe impl Sync for Buf {}
+pub struct Buf(Mmap);
 
 impl Buf {
     fn new(pages: usize) -> io::Result<Buf> {
-        let len = pages.max(1) * PAGE_SIZE;
-        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let buf = Buf { ptr: ptr.cast(), len };
-        unsafe {
-            if libc::madvise(ptr, len, MADV_POPULATE_WRITE) != 0 {
-                (0..len).step_by(PAGE_SIZE).for_each(|o| buf.ptr.add(o).write_volatile(0));
-            }
-        }
-        Ok(buf)
+        let mem = Mmap::new(pages.max(1) * PAGE_SIZE, 0)?;
+        mem.populate();
+        Ok(Buf(mem))
     }
 
     fn pages(&self) -> usize {
-        self.len / PAGE_SIZE
+        self.0.len() / PAGE_SIZE
     }
 
     fn page(&self, i: usize) -> &[u8] {
         assert!(i < self.pages());
-        unsafe { std::slice::from_raw_parts(self.ptr.add(i * PAGE_SIZE), PAGE_SIZE) }
-    }
-}
-
-impl Drop for Buf {
-    fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+        unsafe { std::slice::from_raw_parts(self.0.ptr().add(i * PAGE_SIZE), PAGE_SIZE) }
     }
 }
 
@@ -255,7 +232,7 @@ fn copy(
     let work = || loop {
         let Some(&(a, b)) = runs.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
         // Each run is taken once: its part of `buf` is written by this thread only.
-        let dst = unsafe { std::slice::from_raw_parts_mut(buf.ptr.add(a * PAGE_SIZE), (b - a) * PAGE_SIZE) };
+        let dst = unsafe { std::slice::from_raw_parts_mut(buf.0.ptr().add(a * PAGE_SIZE), (b - a) * PAGE_SIZE) };
         if let Err(e) = read(hot[a], dst) {
             *failed.lock().unwrap() = Some(e);
             return;
@@ -301,7 +278,7 @@ impl Held {
     pub fn of(pages: &[(usize, u8)]) -> Held {
         let buf = Buf::new(pages.len()).unwrap();
         for (i, &(_, b)) in pages.iter().enumerate() {
-            unsafe { std::ptr::write_bytes(buf.ptr.add(i * PAGE_SIZE), b, PAGE_SIZE) };
+            unsafe { std::ptr::write_bytes(buf.0.ptr().add(i * PAGE_SIZE), b, PAGE_SIZE) };
         }
         Held { pages: pages.iter().map(|&(p, _)| p).collect(), buf }
     }

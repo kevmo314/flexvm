@@ -277,6 +277,74 @@ impl Drop for Slot {
 
 pub const PAGE_SIZE: usize = 4096;
 
+/// Anonymous writable memory, unmapped on drop. Nonzero alignment also requests huge pages.
+pub struct Mmap {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// Owned memory, shared read-only once filled; callers write only through disjoint ranges.
+unsafe impl Send for Mmap {}
+unsafe impl Sync for Mmap {}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the next populate on this thread finds the kernel cannot (as before 5.14).
+    pub static FAIL_POPULATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl Mmap {
+    /// `len` bytes at a multiple of `align` (0: anywhere), initially unpopulated.
+    pub fn new(len: usize, align: usize) -> io::Result<Self> {
+        let full = len + align;
+        let raw = unsafe { libc::mmap(std::ptr::null_mut(), full, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let raw = raw as usize;
+        let start = if align == 0 { raw } else { raw.next_multiple_of(align) };
+        unsafe {
+            if start > raw {
+                libc::munmap(raw as *mut _, start - raw);
+            }
+            if raw + full > start + len {
+                libc::munmap((start + len) as *mut _, raw + full - start - len);
+            }
+            if align != 0 {
+                // Only a hint: without it the mapping is ordinary pages.
+                libc::madvise(start as *mut _, len, libc::MADV_HUGEPAGE);
+            }
+        }
+        Ok(Self { ptr: start as *mut u8, len })
+    }
+
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Faults in every page for writing; any madvise failure falls back to per-page writes.
+    pub fn populate(&self) {
+        const MADV_POPULATE_WRITE: libc::c_int = 23;
+        #[cfg(test)]
+        let fail = FAIL_POPULATE.with(|f| f.replace(false));
+        #[cfg(not(test))]
+        let fail = false;
+        if fail || unsafe { libc::madvise(self.ptr.cast(), self.len, MADV_POPULATE_WRITE) } != 0 {
+            (0..self.len).step_by(PAGE_SIZE).for_each(|o| unsafe { self.ptr.add(o).write_volatile(0) });
+        }
+    }
+}
+
+impl Drop for Mmap {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
 pub fn send_json(w: &mut impl Write, v: &impl serde::Serialize) -> io::Result<()> {
     let mut buf = serde_json::to_vec(v)?;
     buf.push(b'\n');
