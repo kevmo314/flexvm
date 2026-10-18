@@ -520,6 +520,27 @@ def run_exec_ps():
     check("exec: stdout", out == "to-stdout\n", repr(out))
     check("exec: stderr", err == "to-stderr\n", repr(err))
     check("exec: exit status", code == 7, code)
+    # Its background child holds the pipes: the exec ends DRAIN after the shell's exit, not with the child.
+    t = time.time()
+    code, _, _ = A.exec(vm, "sleep 3600 & exit 7")
+    check("exec: back promptly past a background child", code == 7 and time.time() - t < 15, (code, time.time() - t))
+    # passwd and group are read for -u alone, never waited on, and followed through a link: a FIFO in passwd's
+    # place stalls no exec, and fails one with -u (not read as empty, which would give a numeric user group 0).
+    nobody = must(A, vm, "id -u nobody")
+    must(A, vm, "mv /etc/passwd /etc/passwd.e2e && mkfifo /etc/passwd")
+    t = time.time()
+    plain = A.exec(vm, "echo ok", timeout=30)
+    users = [A.cli("exec", "-u", u, vm, "true", check=False, timeout=30).returncode for u in ("1000", "nobody")]
+    took = time.time() - t
+    must(A, vm, "rm /etc/passwd && ln -s passwd.e2e /etc/passwd")
+    linked = A.cli("exec", "-u", "nobody", vm, "id", "-u", check=False, timeout=30)
+    must(A, vm, "ln -sfn /nonexistent /etc/passwd")
+    dangling = A.cli("exec", "-u", "1000", vm, "true", check=False, timeout=30).returncode
+    must(A, vm, "rm /etc/passwd && mv /etc/passwd.e2e /etc/passwd")
+    check("exec: a FIFO for /etc/passwd stalls nothing, refused for -u", plain[:2] == (0, "ok\n") and users == [126, 126] and took < 15,
+          (plain, users, took))
+    check("exec -u: /etc/passwd through a link, refused through a dangling one", (linked.returncode, linked.stdout, dangling) == (0, nobody + "\n", 126),
+          (linked.returncode, linked.stdout, linked.stderr, dangling))
     # Multi-MB output streamed whole through exec and checked on the host.
     code, out, err = A.exec(vm, "head -c 3000000 /dev/zero | tr '\\0' x")
     check("exec: 3 MB of pipeline output, all of it", code == 0 and out == "x" * 3000000,
@@ -1482,6 +1503,10 @@ def copy():
     check("cp out: the tree round-trips", tree(os.path.join(back, "copy")) == tree(src), (tree(os.path.join(back, "copy")), tree(src)))
     A.cli("cp", f"{vm}:/tmp/tree/sub/deeper/script", os.path.join(back, "renamed"))
     check("cp out: a file onto a new name", open(os.path.join(back, "renamed")).read() == "#!/bin/sh\necho hi\n")
+    # A device is skipped outside a VM, before anything is replaced: the file it was copied onto is as it was.
+    r = A.cli("cp", f"{vm}:/dev/null", os.path.join(back, "renamed"), check=False)
+    check("cp out: a device over a file leaves it", r.returncode == 0 and "skipping device" in r.stderr
+          and open(os.path.join(back, "renamed")).read() == "#!/bin/sh\necho hi\n", (r.returncode, r.stderr))
     r = subprocess.run([BIN, "--state", A.state_dir, "--run", A.run_dir, "cp", f"{vm}:/tmp/tree/sub", "-"], capture_output=True, env=ENV, timeout=60)
     listing = subprocess.run(["tar", "-tv"], input=r.stdout, capture_output=True).stdout.decode()
     check("cp out to -: a tar", r.returncode == 0 and "sub/deeper/script" in listing and "sub/big" in listing, (r.returncode, listing[:500], r.stderr[-300:]))
