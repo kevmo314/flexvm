@@ -740,9 +740,10 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         p.refund_start();
         (e, retry)
     };
-    let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| not_run(e, false))?;
     *p.ports.lock().unwrap() = serde_json::from_value(req.get("ports").cloned().unwrap_or_else(|| json!([]))).map_err(|e| not_run(e.into(), false))?;
-    p.start_ports(claim.ip).map_err(|e| not_run(e, false))?;
+    p.bind_ports().map_err(|e| not_run(e, false))?;
+    let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| not_run(e, false))?;
+    p.serve_ports(claim.ip).map_err(|e| not_run(e, false))?;
     t.mark("claim_ip");
     // Prepare the paused tap outside the host lock; a withdrawal can still win before fence.
     let tap = p.standby.lock().unwrap().as_ref().ok_or_else(|| not_run("standby vm gone".into(), true))?.firecracker().tap.clone();

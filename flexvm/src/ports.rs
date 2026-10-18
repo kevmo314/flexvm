@@ -65,22 +65,21 @@ enum Bound {
     Udp(UdpSocket),
 }
 
-/// Bind the actual listeners, without SO_REUSEPORT, and retain them for the VM's
-/// lifetime. This atomically rejects overlapping forwards across processes/run directories
-/// and ordinary bound ports; a failed batch releases everything it acquired.
+/// The actual listeners, without SO_REUSEPORT, held for the VM's lifetime. Binding
+/// atomically refuses overlapping forwards across processes and run directories and
+/// ordinary bound ports; a failed batch releases everything it acquired.
 pub struct Forwarder {
     stop: Arc<AtomicBool>,
+    bound: Vec<(Bound, u16)>,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl Forwarder {
-    pub fn start(ports: &[Port], vm: Ipv4Addr) -> Result<Self> {
+    /// Before the VM's address is claimed: a clash refuses the start with nothing to give back.
+    pub fn bind(ports: &[Port]) -> Result<Self> {
         let bound = ports
             .iter()
             .map(|p| -> Result<_> {
-                if p.host_port == 0 || p.vm_port == 0 {
-                    crate::bail!("forwarded ports must be nonzero");
-                }
                 let addr = SocketAddrV4::new(p.ip, p.host_port);
                 let socket = match p.protocol {
                     Protocol::Tcp => {
@@ -94,18 +93,29 @@ impl Forwarder {
                         Bound::Udp(s)
                     }
                 };
-                Ok((socket, SocketAddrV4::new(vm, p.vm_port)))
+                Ok((socket, p.vm_port))
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut forwarder = Self { stop: Arc::new(AtomicBool::new(false)), workers: Vec::new() };
-        for (socket, target) in bound {
-            let stop = forwarder.stop.clone();
-            forwarder.workers.push(thread::Builder::new().name("port-forward".into()).spawn(move || match socket {
+        Ok(Self { stop: Arc::new(AtomicBool::new(false)), bound, workers: Vec::new() })
+    }
+
+    /// Proxies to the VM at `vm`, once its address is known.
+    pub fn serve(&mut self, vm: Ipv4Addr) -> Result<()> {
+        for (socket, port) in self.bound.drain(..) {
+            let (stop, target) = (self.stop.clone(), SocketAddrV4::new(vm, port));
+            self.workers.push(thread::Builder::new().name("port-forward".into()).spawn(move || match socket {
                 Bound::Tcp(s) => tcp(s, target, &stop),
                 Bound::Udp(s) => udp(s, target, &stop),
             })?);
         }
-        Ok(forwarder)
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn start(ports: &[Port], vm: Ipv4Addr) -> Result<Self> {
+        let mut f = Self::bind(ports)?;
+        f.serve(vm)?;
+        Ok(f)
     }
 }
 

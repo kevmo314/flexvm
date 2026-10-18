@@ -291,15 +291,31 @@ impl Proc {
         }))
     }
 
-    pub fn start_ports(&self, ip: Ipv4Addr) -> Result<()> {
-        let forwarder = crate::ports::Forwarder::start(&self.ports.lock().unwrap(), ip)?;
-        *self.forwards.lock().unwrap() = Some(forwarder);
+    /// Before the address is claimed (`Forwarder::bind`); `serve_ports` once it is.
+    pub fn bind_ports(&self) -> Result<()> {
+        *self.forwards.lock().unwrap() = Some(crate::ports::Forwarder::bind(&self.ports.lock().unwrap())?);
         Ok(())
     }
 
+    pub fn serve_ports(&self, ip: Ipv4Addr) -> Result<()> {
+        self.forwards.lock().unwrap().as_mut().map_or(Ok(()), |f| f.serve(ip))
+    }
+
+    /// Released before it returns: a retried claim can bind them again.
     pub fn drop_ports(&self) {
         self.forwards.lock().unwrap().take();
         self.ports.lock().unwrap().clear();
+    }
+
+    /// Off the migration's switchover: joining the forwarder takes up to a poll's wait.
+    pub fn drop_ports_later(&self) {
+        let forwards = self.forwards.lock().unwrap().take();
+        self.ports.lock().unwrap().clear();
+        let Some(p) = self.arc() else { return };
+        thread::spawn(move || {
+            drop(forwards);
+            p.publish();
+        });
     }
 
     pub fn vm(&self) -> &Arc<Vm> {
@@ -989,9 +1005,10 @@ impl Proc {
         t.mark("template");
         // Before the claim: a refused start mints no generation (nor withdraws one).
         self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
+        self.bind_ports()?;
         let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
         let ip = self.set_addr(claim);
-        self.start_ports(ip)?;
+        self.serve_ports(ip)?;
         t.mark("claim_ip");
         crate::host::stall("start_stall");
         let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;

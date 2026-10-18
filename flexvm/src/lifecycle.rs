@@ -297,7 +297,7 @@ impl Proc {
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         self.set_resources(ck.manifest.resources, &tpl.meta)?;
         *self.ports.lock().unwrap() = read_ports(&dir)?;
-        self.start_ports(ip)?;
+        self.bind_ports()?;
         let claim = {
             let l = self.host.lock()?;
             if !self.host.current(&l, ip, gen)? {
@@ -306,6 +306,7 @@ impl Proc {
             self.host.claim_incoming(&l, name, ip, gen, None)?
         };
         self.set_addr(claim);
+        self.serve_ports(ip)?;
         // Before it is published: eviction leaves a CMD VM alone.
         *self.cmd.lock().unwrap() = cmd.as_ref().map(|(c, _)| c.clone());
         match self.restore_checkpoint(name, ck, tpl, ip, true, false, &mut t) {
@@ -360,6 +361,7 @@ impl Proc {
         self.set_name(self.host.take_name(&name, false)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         self.set_resources(resources.or(ck.manifest.resources), &tpl.meta)?;
+        self.bind_ports()?;
         // Decided and claimed under one lock, by one reading of the range: a change
         // between them cannot send a local address to `claim_new` as foreign.
         let l = self.host.lock()?;
@@ -376,7 +378,7 @@ impl Proc {
             }
         };
         let ip = self.set_addr(claim);
-        self.start_ports(ip)?;
+        self.serve_ports(ip)?;
         t.mark("claim_ip");
         self.restore_checkpoint(&name, ck, tpl, ip, false, paused, &mut t).map_err(|(Restore::NotRun(e) | Restore::Ran(e) | Restore::Uncertain(e))| e)
     }
@@ -1083,7 +1085,7 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };
     Some(json!({
         "name": name, "ip": m.ip.to_string(), "template": m.template, "template_id": m.template_id,
-        "ports": read_ports(&dir).ok()?,
+        "ports": read_ports(&dir).unwrap_or_default(),
         "state": state, "vcpus": m.vcpus, "cpus": m.resources.cpus, "resources": m.resources,
         "guest_mib": m.mem_mib.saturating_add(m.hotplug_mib), "max_mib": m.resources.ceiling(m.mem_mib, m.max_mib),
         "checkpoint_mib": (m.data_pages.saturating_mul(PAGE_SIZE as u64)) >> 20,

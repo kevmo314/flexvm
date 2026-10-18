@@ -139,9 +139,9 @@ flexvm run -d --name web -p 8080:80 -p 127.0.0.1:5353:53/udp ubuntu:24.04
 its VM's address. Repeat `-p` for more ports. The default bind address is
 `0.0.0.0` (all host IPv4 interfaces), and the default protocol is TCP.
 Ports must be 1–65535. A port already bound by an application or another
-VM is refused, including overlapping wildcard binds; TCP and UDP can use
-the same number. `ps` shows a PORTS column; `ps --json` and `run -d` return
-`ports` objects with `ip`, `host_port`, `vm_port`, and `protocol`.
+VM is refused at `run`, before anything starts, including overlapping
+wildcard binds; TCP and UDP can use the same number. `ps` shows a PORTS
+column; `ps --json` and `run -d` return `ports` objects with `ip`, `host_port`, `vm_port`, and `protocol`.
 
 These are single-host userspace proxies in the VM process. The guest sees
 the host as the client. Each mapping uses one thread, with up to 256 TCP
