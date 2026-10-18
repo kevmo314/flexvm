@@ -132,6 +132,30 @@ fn out(data: &[u8]) -> Result<bool> {
     }
 }
 
+/// The last `n` lines of `files` one after another, each as long as it was (`usize::MAX`: all of them),
+/// read back from their ends in blocks: no more than those lines (and a block) is read.
+fn tail_files(files: &[(&std::fs::File, u64)], n: usize) -> Result<Vec<u8>> {
+    let (mut blocks, mut breaks, mut last) = (Vec::new(), 0, None);
+    'files: for &(f, len) in files.iter().rev() {
+        let mut end = len;
+        while end > 0 {
+            // Breaks before the last line: a last newline ends it, it does not start one.
+            if breaks - usize::from(last == Some(b'\n')) >= n {
+                break 'files;
+            }
+            let start = end.saturating_sub(64 << 10);
+            let mut b = vec![0; (end - start) as usize];
+            std::os::unix::fs::FileExt::read_exact_at(f, &mut b, start)?;
+            last = last.or(b.last().copied());
+            breaks += b.iter().filter(|&&c| c == b'\n').count();
+            blocks.push(b);
+            end = start;
+        }
+    }
+    blocks.reverse();
+    Ok(tail(&blocks.concat(), n).to_vec())
+}
+
 /// The last `n` lines of `data` (a last line without its newline counts).
 pub fn tail(data: &[u8], n: usize) -> &[u8] {
     if n == 0 {
@@ -149,35 +173,27 @@ const FOLLOW_EVERY: Duration = Duration::from_millis(200);
 
 /// `logs [-f] [--tail N] NAME`: `NAME.log.1` (the log before its last rotation), then `NAME.log`.
 /// Following, it reads on across rotations (it finishes the log rotated away, then starts on the
-/// new one) and restarts (a resumed VM appends to its log); it ends once nothing of the VM is left
-/// (`rm`, `kill`, or a `run -- CMD` that ended), or its reader is gone.
+/// new one) and restarts (a resumed VM appends to its log); it ends once no process runs the VM and
+/// it is not stopped (it exited, or `rm`, `kill`), as docker's does, or its reader is gone.
 pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Result<()> {
     host::check_name(name)?;
     let (path, prev) = (host.vms(name, "log")?, host.vms(name, "log.1")?);
     let open = || std::fs::File::open(&path).ok();
     // The current log first: one rotated meanwhile is then the previous one read below.
     let mut cur = open();
-    let (mut old, old_ino) = match std::fs::File::open(&prev) {
-        Ok(mut f) => {
-            let mut b = Vec::new();
-            f.read_to_end(&mut b)?;
-            (b, f.metadata().ok().map(|m| (m.dev(), m.ino())))
-        }
-        Err(_) => (Vec::new(), None),
-    };
     let ino = |f: &std::fs::File| f.metadata().ok().map(|m| (m.dev(), m.ino()));
-    if cur.as_ref().is_some_and(|f| ino(f) == old_ino) {
-        old.clear();
-    }
-    if cur.is_none() && old.is_empty() && !known(host, name) {
+    let old = std::fs::File::open(&prev).ok().filter(|o| cur.as_ref().is_none_or(|c| ino(c) != ino(o)));
+    let files: Vec<_> = [old.as_ref(), cur.as_ref()].into_iter().flatten().map(|f| (f, f.metadata().map_or(0, |m| m.len()))).collect();
+    if cur.is_none() && files.iter().all(|&(_, len)| len == 0) && !known(host, name) {
         bail!("no vm named {name:?}");
     }
-    let mut first = old;
-    if let Some(f) = cur.as_mut() {
-        f.read_to_end(&mut first)?;
+    let first = tail_files(&files, lines.unwrap_or(usize::MAX))?;
+    // Followed from where that was read to.
+    let end = files.last().map(|&(_, len)| len).filter(|_| cur.is_some());
+    if let (Some(f), Some(end)) = (cur.as_mut(), end) {
+        f.seek(std::io::SeekFrom::Start(end))?;
     }
-    let first = lines.map_or(&first[..], |n| tail(&first, n));
-    if !out(first)? || !follow {
+    if !out(&first)? || !follow {
         return Ok(());
     }
     let mut buf = vec![0; 64 << 10];
@@ -221,8 +237,8 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
             }
             continue;
         }
-        // Gone for a while (not a restart's moment between its stop and start).
-        match (known(host, name), gone_since) {
+        // Ended for a while (not a restart's moment between its stop and start).
+        match (host.alive(name) || host.is_suspended(name), gone_since) {
             (true, _) => gone_since = None,
             (false, None) => gone_since = Some(Instant::now()),
             (false, Some(t)) if t.elapsed() > Duration::from_secs(1) => return Ok(()),
@@ -725,6 +741,43 @@ mod tests {
         assert_eq!(tail(b"a\nb\n", 0), b"");
         assert_eq!(tail(b"", 3), b"");
         assert_eq!(tail(b"one", 1), b"one");
+    }
+
+    #[test]
+    fn tail_files_reads_back_across_blocks_and_files() {
+        let root = TempDir::new("tail-files");
+        let mut data = Vec::new();
+        for i in 0..3000 {
+            data.extend(format!("line {i} {}\n", "x".repeat(i % 97)).as_bytes());
+        }
+        data.extend(vec![b'y'; 100 << 10]);
+        data.extend(b"\nlast");
+        for split in [0, 1, 70_000, data.len() - 3, data.len()] {
+            let (a, b) = (root.join("a"), root.join("b"));
+            std::fs::write(&a, &data[..split]).unwrap();
+            std::fs::write(&b, &data[split..]).unwrap();
+            let (a, b) = (std::fs::File::open(a).unwrap(), std::fs::File::open(b).unwrap());
+            let files = [(&a, split as u64), (&b, (data.len() - split) as u64)];
+            for n in [0, 1, 2, 3, 50, 2999, 3001, 3002, 5000, usize::MAX] {
+                assert_eq!(tail_files(&files, n).unwrap(), tail(&data, n), "split {split}, {n} lines");
+            }
+        }
+        // Each only as long as it was: what was written since is the follower's.
+        std::fs::write(root.join("c"), b"a\nb\nc\n").unwrap();
+        let f = std::fs::File::open(root.join("c")).unwrap();
+        assert_eq!(tail_files(&[(&f, 3)], 5).unwrap(), b"a\nb");
+    }
+
+    #[test]
+    fn logs_follow_ends_for_a_vm_that_exited() {
+        let root = TempDir::new("logs-exited");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::write(host.vms("job", "log").unwrap(), b"done\n").unwrap();
+        let rec = crate::app::Exited::new(3, "t".into(), None, Default::default(), Default::default(), 0);
+        crate::host::write_record(&host.vms("job", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(logs(&host, "job", true, Some(1)).is_ok()));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "logs -f of an exited vm ends");
     }
 
     #[test]

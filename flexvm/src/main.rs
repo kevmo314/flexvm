@@ -854,19 +854,20 @@ fn run_as(
     resources: vm::Resources,
     spec: &app::RunSpec,
 ) -> Result<()> {
+    // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
+    let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
     // A foreground -i or -t runs it in the background, and attaches to it (as `attach`).
-    let attached = (args.has("interactive") || args.has("tty")) && !args.has("detach") && std::env::var_os("FLEXVM_NOTIFY_FD").is_none();
+    let foreground = (args.has("interactive") || args.has("tty")) && !args.has("detach");
+    let attached = foreground && !tried;
     // A claimed standby VM writes where this process would, to opens made here (`own`).
     let log = (args.has("detach") || attached).then(|| log_file(host, &name)).transpose()?;
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
     let tty = log.is_none() && std::io::stdin().is_terminal();
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none()});
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none(), "attacher": attached});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
-    // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
-    let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
     // A foreground claim's signals wait from before it is sent: the VM it makes gets them
     // (`follow`), as a cold start would, never orphaned by this process dying mid-claim.
     let set = (!tried && log.is_none()).then(|| util::block_signals(&FOLLOW_SIGNALS));
@@ -901,7 +902,7 @@ fn run_as(
             vmproc::main(
                 host.clone(),
                 paths.clone(),
-                Start::Run { name, template: template.into(), ip, cmd, resources, generated, spec, tty, rerun },
+                Start::Run { name, template: template.into(), ip, cmd, resources, generated, spec, tty, rerun, attacher: foreground && tried },
                 notify_fd(),
             )
         }
@@ -969,6 +970,7 @@ fn rerun(host: &Host, name: &str) -> Result<Option<Start>> {
         spec,
         tty: std::io::stdin().is_terminal(),
         rerun: true,
+        attacher: false,
     }))
 }
 
