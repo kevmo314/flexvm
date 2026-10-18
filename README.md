@@ -28,12 +28,13 @@ prebuilt: the first command that needs them downloads them into
 `artifacts/` from the release this build pins (`ARTIFACTS_TAG` in
 `scripts/versions.sh`) and checks them against the sha256 pinned in
 `scripts/checksums.sha256`. A file already there is never downloaded or
-replaced. It must match the pin or be recorded as a build of your own
-(`firecracker.custom` beside it holds its sha256, which
-`scripts/build-firecracker.sh` writes). Anything else is refused, never run:
-a corrupted or replaced download, a copy cut short, an older release's.
-Remove such a file to download the pinned one. A Firecracker of your own
-copied to another host takes its `.custom` file along.
+replaced. It must match the pin or be recorded: `NAME.sha256` beside it holds
+the sha256 of a file that flexvm downloaded, or that the scripts below built
+or fetched and verified. A build that pins no release (between a release's
+tag and its pin) can go only by the record. Anything else is refused, never
+run: a corrupted or replaced download, a copy cut short, an older release's.
+Remove such a file to download the pinned one. Copying artifacts to another
+host takes the `.sha256` files along.
 
 To build your own, or for a host without network access, put the files in
 `artifacts/` first (the scripts install with sudo; give them `--state DIR`

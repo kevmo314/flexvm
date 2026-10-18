@@ -40,10 +40,11 @@ inputs() {
     echo "No pinned SHA256 for $CI/$KERNEL in scripts/checksums.sha256" >&2
     return 1
   fi
-  printf 'firecracker %s %s\n' "$FC_VERSION" "$ARCH"
-  printf 'commit %s\n' "$FC_COMMIT"
-  (cd "$root/firecracker" && sha256sum -- *.patch)
-  (cd "$root" && sha256sum .github/workflows/release.yml scripts/release-assets.sh scripts/build-firecracker.sh scripts/fetch.sh)
+  # Each failure returns explicitly: callers test this in conditions, where errexit is off.
+  printf 'firecracker %s %s\n' "$FC_VERSION" "$ARCH" || return 1
+  printf 'commit %s\n' "$FC_COMMIT" || return 1
+  (cd "$root/firecracker" && sha256sum -- *.patch) || return 1
+  (cd "$root" && sha256sum .github/workflows/release.yml scripts/release-assets.sh scripts/build-firecracker.sh scripts/fetch.sh) || return 1
   printf 'vmlinux %s %s\n' "$kernel" "$KERNEL"
 }
 
@@ -72,20 +73,25 @@ in_history() {
 # them); else pending, for how long since ARTIFACTS_TAG came to name it on this branch (its first-parent history:
 # when a pull request merged, not when its commit was written).
 pending() {
-  local tagged status=0 since age tree
+  local tagged status=0 since age tree ours theirs
   tagged=$(tag_commit) || status=$?
   if [ "$status" = 1 ]; then return 1; fi
   if [ "$status" = 0 ]; then
     in_history "$tagged" || return 1
+    ours=$(inputs) || return 1
     tree=$(mktemp -d)
-    git -C "$root" archive "$tagged" .github scripts firecracker | tar -x -C "$tree"
-    if ! "$tree/scripts/pin-artifacts.sh" --inputs | cmp -s - <(inputs); then
-      echo "$ARTIFACTS_TAG is tagged at $tagged, whose inputs differ from this checkout's: bump ARTIFACTS_TAG in scripts/versions.sh (RELEASING in README.md)" >&2
-      "$tree/scripts/pin-artifacts.sh" --inputs | diff - <(inputs) >&2 || true
+    if ! { git -C "$root" archive "$tagged" .github scripts firecracker | tar -x -C "$tree"; } ||
+      ! theirs=$("$tree/scripts/pin-artifacts.sh" --inputs); then
+      echo "cannot tell what $ARTIFACTS_TAG at $tagged is built from" >&2
       rm -rf -- "$tree"
       return 1
     fi
     rm -rf -- "$tree"
+    if [ "$theirs" != "$ours" ]; then
+      echo "$ARTIFACTS_TAG is tagged at $tagged, whose inputs differ from this checkout's: bump ARTIFACTS_TAG in scripts/versions.sh (RELEASING in README.md)" >&2
+      diff <(printf '%s\n' "$theirs") <(printf '%s\n' "$ours") >&2 || true
+      return 1
+    fi
     echo "$ARTIFACTS_TAG is tagged at $tagged, with this checkout's inputs, but not pinned yet: once release.yml has published it, run scripts/pin-artifacts.sh and commit it" >&2
   else
     echo "$ARTIFACTS_TAG is not tagged yet: push its tag at the commit on main that names it, then run scripts/pin-artifacts.sh (RELEASING in README.md)" >&2
@@ -123,7 +129,8 @@ case "${1:-}" in
       exit 1
     fi
     want=$(pinned "$ARTIFACTS_URL/inputs.txt")
-    if [ "$(inputs | sha256sum | cut -d' ' -f1)" != "$want" ]; then
+    ours=$(inputs) || exit 1
+    if [ "$(printf '%s\n' "$ours" | sha256sum | cut -d' ' -f1)" != "$want" ]; then
       echo "The pinned release $ARTIFACTS_TAG was built from other inputs than this checkout's (scripts/pin-artifacts.sh --inputs): bump ARTIFACTS_TAG in scripts/versions.sh in the same change (RELEASING in README.md)" >&2
       exit 1
     fi
