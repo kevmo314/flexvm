@@ -1484,6 +1484,9 @@ def copy():
     start = time.time()
     cp = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "cp", f"{vm}:/", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
     lister = subprocess.Popen(["tar", "-t"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    # A cp that stalls with its stdout open would block the reads below: killed at the deadline.
+    watchdog = threading.Timer(150, cp.kill)
+    watchdog.start()
     listed = {}
     reader = threading.Thread(target=lambda: listed.update(names=lister.stdout.read().decode(errors="replace").splitlines()))
     reader.start()
@@ -1498,6 +1501,7 @@ def copy():
     if cp.poll() is None and (size >= 2 << 30 or time.time() - start >= 120):
         cp.kill()
     cp_err = cp.communicate(timeout=60)[1]
+    watchdog.cancel()
     lister.wait(timeout=60)
     reader.join()
     names = listed.get("names", [])

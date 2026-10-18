@@ -559,7 +559,8 @@ fn name_in_hosts(hosts: &std::path::Path, name: &str) -> io::Result<()> {
     let tmp = hosts.with_file_name(".hosts.flexvm");
     let _ = std::fs::remove_file(&tmp);
     let res = (|| {
-        let mut t = File::options().write(true).create_new(true).open(&tmp)?;
+        // Readable by none but root until it has the original's owner and mode.
+        let mut t = File::options().write(true).create_new(true).mode(0o600).open(&tmp)?;
         t.write_all(new.as_bytes())?;
         std::os::unix::fs::fchown(&t, Some(meta.uid()), Some(meta.gid()))?;
         t.set_permissions(meta.permissions())?;
