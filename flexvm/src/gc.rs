@@ -182,7 +182,11 @@ fn cleanup_locked(host: &Host, lock: Option<Flock>) -> Result<()> {
         }
     }
     load_sets(&host.run.join("standby"));
-    collected.map(|_| ())
+    match collected {
+        // The address stays held, and the next sweep tries its lost record again.
+        Err(e) if crate::host::name_busy(&e) => Ok(()),
+        other => other.map(|_| ()),
+    }
 }
 
 /// `.loadset-ID` (`standby::save_load_set`) neither read nor written for `LOADSET_TTL`:

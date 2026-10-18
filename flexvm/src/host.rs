@@ -3049,7 +3049,11 @@ impl Host {
         let lock = self.vms(name, "lock")?;
         let _held = match lock_path(&lock, libc::LOCK_EX | libc::LOCK_NB) {
             Ok(held) => held,
-            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                // A sweep, or a start before it writes its identity, may hold this briefly.
+                // Only a recorded holder lets the old instance go without a lost record.
+                return if self.holder_gone(name) { Err(std::io::Error::new(e.kind(), format!("{}: {e}", lock.display())).into()) } else { Ok(()) };
+            }
             Err(e) => bail!("{}: {e}", lock.display()),
         };
         let why = format!("lost: its process ended without withdrawing {ip} (generation {gen}), as in a reboot; the address is withdrawn, its log is gone with the run directory; flexvm rm {name} clears this");
@@ -3099,7 +3103,7 @@ impl Host {
             .filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok())
             .filter(|&ip| self.read_addr(ip).ok().and_then(|a| a.holder_id).is_some_and(|id| id.liveness() == Liveness::Gone))
             .collect();
-        let (mut withdrawn, mut unrecorded) = (Vec::new(), None);
+        let (mut withdrawn, mut unrecorded, mut busy) = (Vec::new(), None, None);
         if candidates.is_empty() {
             return Ok(withdrawn);
         }
@@ -3162,6 +3166,10 @@ impl Host {
                 continue;
             }
             if let Err(e) = if lost { self.record_lost(name, ip, gen) } else { Ok(()) } {
+                if name_busy(&e) {
+                    busy.get_or_insert(e);
+                    continue;
+                }
                 crate::log!("withdrawing {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
                 unrecorded.get_or_insert(e);
                 continue;
@@ -3180,8 +3188,9 @@ impl Host {
             crate::net::unroute(ip);
             withdrawn.push((name.to_string(), ip, gen));
         }
-        // Failed writes keep the boot's recovery from completing: they are tried again.
-        match unrecorded {
+        // Failed writes and busy names keep boot recovery incomplete. Write failures first:
+        // contention alone fails no sweep (`gc::cleanup_locked`).
+        match unrecorded.or(busy) {
             Some(e) => Err(e),
             None => Ok(withdrawn),
         }
@@ -4195,6 +4204,11 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
     // Ensure the next write changes the mtime the cache keys on.
     std::thread::sleep(Duration::from_millis(10));
     Ok(())
+}
+
+/// A name lock held for a moment by another process (`record_lost`): tried again on the next sweep.
+pub fn name_busy(e: &crate::util::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
 }
 
 #[cfg(test)]
@@ -6012,6 +6026,40 @@ pub(crate) mod tests {
         assert!(h.has_record("web", "lost"));
         let _held = h.take_name("web", false).unwrap();
         assert!(!h.has_record("web", "lost"));
+    }
+
+    /// #754: a sweep holding a dead name, or a start before recording its identity,
+    /// cannot let boot recovery withdraw the address without its lost record.
+    #[test]
+    fn lost_records_retry_busy_names_without_a_live_holder() {
+        for recorded in [false, true] {
+            let (_dir, h) = host("lost-name-busy");
+            let ip = ip("10.9.0.1");
+            let dead = dead_owner(&h, 999_999_949, &[]);
+            h.put_addr(ip, &Addr { seen: 2, held: 2, holder: Some("web".into()), holder_id: Some(dead.clone()), ..Addr::default() }, true).unwrap();
+            let lock = h.vms("web", "lock").unwrap();
+            let held = lock_path(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+            if recorded {
+                held.write_all_at(&serde_json::to_vec(&dead).unwrap(), 0).unwrap();
+            }
+            assert!(h.holder_gone("web"));
+            let e = h.record_lost("web", ip, 2).unwrap_err();
+            assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+            for _ in 0..2 {
+                assert!(h.withdraw_dead(true).is_err());
+                // Incomplete, but the rest of the recovery still runs; a sweep does not fail.
+                assert_eq!(h.after_boot_with("boot-busy", |_, _| Ok(())).unwrap(), Some(false));
+                crate::gc::sweep_now(&h).unwrap();
+                let a = h.addr(&h.lock().unwrap(), ip).unwrap();
+                assert!(!a.withdrawn && a.holder_id.as_ref() == Some(&dead));
+                assert!(!h.has_record("web", "lost") && !h.boot_marker().exists());
+            }
+            drop(held);
+            assert_eq!(h.after_boot_with("boot-busy", |_, _| Ok(())).unwrap(), Some(true));
+            assert!(h.has_record("web", "lost"));
+            let a = h.addr(&h.lock().unwrap(), ip).unwrap();
+            assert!(a.withdrawn && a.holder_id.is_none());
+        }
     }
 
     /// #556, #563: a write's temporary file goes once its writer is proven gone (by pid, start time and
