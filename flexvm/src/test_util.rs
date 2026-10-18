@@ -29,9 +29,13 @@ impl Drop for ChildGuard {
     }
 }
 
+pub fn sleeper(secs: u64) -> ChildGuard {
+    ChildGuard(std::process::Command::new("sleep").arg(secs.to_string()).spawn().unwrap())
+}
+
 #[test]
 fn helper_process_is_killed_and_reaped_on_unwind() {
-    let child = ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+    let child = sleeper(60);
     let pid = child.id();
     let result = std::panic::catch_unwind(move || {
         let _child = child;
