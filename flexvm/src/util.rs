@@ -327,7 +327,8 @@ impl Mmap {
     }
 
     /// Faults in every page for writing; any madvise failure falls back to per-page writes.
-    pub fn populate(&self) {
+    /// Exclusive: the fallback writes, so it must not race another user.
+    pub fn populate(&mut self) {
         const MADV_POPULATE_WRITE: libc::c_int = 23;
         #[cfg(test)]
         let fail = FAIL_POPULATE.with(|f| f.replace(false));
@@ -2598,18 +2599,11 @@ pub mod output {
             return;
         }
         // Given up, unless a retarget replaced it meanwhile.
-        let log = || {
-            LOG.lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|p| File::options().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(p).ok())
-                .map(Arc::new)
-        };
         let fallback = {
             let mut targets = TARGETS.lock().unwrap();
             if targets[i].as_ref().map(Arc::as_ptr) == target.as_ref().map(Arc::as_ptr) {
-                targets[i] = log();
-                LOGS.lock().unwrap()[i] = targets[i].as_ref().and_then(|f| capped(f));
+                LOGS.lock().unwrap()[i] = LOG.lock().unwrap().clone();
+                targets[i] = None;
             }
             (targets[i].clone(), LOGS.lock().unwrap()[i].clone())
         };
@@ -2620,23 +2614,24 @@ pub mod output {
         }
     }
 
-    /// What was written by `deadline`: in pieces no bigger than a pipe takes
-    /// at once, each only once the target is ready for it.
+    /// What was written by `deadline`: regular files take the whole buffer;
+    /// other targets take pipe-sized pieces, each once the target is ready.
     fn write_within(f: &File, data: &[u8], deadline: Instant) -> usize {
+        use std::os::unix::fs::FileTypeExt;
+        let kind = f.metadata().ok().map(|m| m.file_type());
+        let regular = kind.is_some_and(|k| k.is_file());
+        let socket = kind.is_some_and(|k| k.is_socket());
         let mut sent = 0;
         while sent < data.len() {
             let left = deadline.saturating_duration_since(Instant::now());
             let mut p = libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
-            if left.is_zero() || unsafe { libc::poll(&mut p, 1, left.as_millis().max(1) as i32) } <= 0 || p.revents & libc::POLLOUT == 0 {
+            if left.is_zero() || (!regular && (unsafe { libc::poll(&mut p, 1, left.as_millis().max(1) as i32) } <= 0 || p.revents & libc::POLLOUT == 0)) {
                 break;
             }
-            let piece = &data[sent..(sent + 4096).min(data.len())];
+            let piece = &data[sent..if regular { data.len() } else { (sent + 4096).min(data.len()) }];
             let (fd, buf, len) = (f.as_raw_fd(), piece.as_ptr().cast(), piece.len());
             // Another relay may have filled a shared target since the poll: retried.
-            let n = match unsafe { libc::send(fd, buf, len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } {
-                -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) => unsafe { libc::write(fd, buf, len) },
-                n => n,
-            };
+            let n = if socket { unsafe { libc::send(fd, buf, len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } } else { unsafe { libc::write(fd, buf, len) } };
             match n {
                 n if n > 0 => sent += n as usize,
                 _ if matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) => {}
@@ -2783,6 +2778,48 @@ pub mod output {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    #[test]
+    fn regular_output_writes_the_whole_buffer() {
+        let dir = crate::test_util::TempDir::new("regular-output");
+        let path = dir.join("output");
+        let f = File::create(&path).unwrap();
+        let data = vec![42; 64 << 10];
+        assert_eq!(write_within(&f, &data, Instant::now() + STALL), data.len());
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert_eq!(write_within(&f, b"late", Instant::now()), 0);
+    }
+
+    #[test]
+    fn fallback_log_follows_rotation_by_path() {
+        const CHILD: &str = "FLEXVM_FALLBACK_ROTATION_TEST";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let log = PathBuf::from(path);
+            fall_back_to(log.clone());
+            TARGETS.lock().unwrap()[0] = Some(Arc::new(File::open("/dev/null").unwrap()));
+            relay(0, b"first");
+            assert_eq!(LOGS.lock().unwrap()[0].as_ref(), Some(&log));
+            assert!(TARGETS.lock().unwrap()[0].is_none());
+            let old = log.with_extension("log.1");
+            std::fs::rename(&log, &old).unwrap();
+            relay(0, b"second");
+            assert_eq!(std::fs::read(&old).unwrap(), b"first");
+            assert_eq!(std::fs::read(&log).unwrap(), b"second");
+            std::fs::remove_file(&old).unwrap();
+            relay(0, &vec![42; LOG_CAP as usize]);
+            assert!(!log.exists());
+            relay(0, b"third");
+            assert_eq!(std::fs::read(&log).unwrap(), b"third");
+            return;
+        }
+        let dir = crate::test_util::TempDir::new("fallback-rotation");
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "util::output::fallback_log_follows_rotation_by_path", "--nocapture"])
+            .env(CHILD, dir.join("vm.log"))
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     }
 
     #[test]

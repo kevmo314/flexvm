@@ -168,21 +168,21 @@ fn no_ipv6(ip: IpAddr, e: &io::Error) -> bool {
 /// net.ipv6.bindv6only is 0. TCP reuses addresses, as std's binds do.
 fn listen(addr: SocketAddr, protocol: Protocol) -> io::Result<OwnedFd> {
     let tcp = protocol == Protocol::Tcp;
+    // A wildcard UDP listener learns each datagram's destination, which its replies leave from.
+    let pktinfo = !tcp && addr.ip().is_unspecified();
     let SocketAddr::V6(a) = addr else {
-        return Ok(match protocol {
+        let fd: OwnedFd = match protocol {
             Protocol::Tcp => TcpListener::bind(addr).and_then(|s| s.set_nonblocking(true).map(|()| s.into()))?,
             Protocol::Udp => UdpSocket::bind(addr).and_then(|s| s.set_nonblocking(true).map(|()| s.into()))?,
-        });
+        };
+        return if !pktinfo || on(&fd, libc::IPPROTO_IP, libc::IP_PKTINFO) { Ok(fd) } else { Err(io::Error::last_os_error()) };
     };
     let fd = unsafe { libc::socket(libc::AF_INET6, if tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM } | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let on = |level, name| {
-        let one: libc::c_int = 1;
-        unsafe { libc::setsockopt(fd.as_raw_fd(), level, name, (&one as *const libc::c_int).cast(), std::mem::size_of_val(&one) as _) == 0 }
-    };
+    let on = |level, name| on(&fd, level, name);
     let sa = libc::sockaddr_in6 {
         sin6_family: libc::AF_INET6 as _,
         sin6_port: a.port().to_be(),
@@ -192,12 +192,18 @@ fn listen(addr: SocketAddr, protocol: Protocol) -> io::Result<OwnedFd> {
     };
     let ok = (!tcp || on(libc::SOL_SOCKET, libc::SO_REUSEADDR))
         && on(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)
+        && (!pktinfo || on(libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO))
         && unsafe { libc::bind(fd.as_raw_fd(), (&sa as *const libc::sockaddr_in6).cast(), std::mem::size_of_val(&sa) as _) } == 0
         && (!tcp || unsafe { libc::listen(fd.as_raw_fd(), 128) } == 0);
     if !ok {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)
+}
+
+fn on(fd: &OwnedFd, level: libc::c_int, name: libc::c_int) -> bool {
+    let one: libc::c_int = 1;
+    unsafe { libc::setsockopt(fd.as_raw_fd(), level, name, (&one as *const libc::c_int).cast(), std::mem::size_of_val(&one) as _) == 0 }
 }
 
 /// Nonblocking connect: an unreachable guest cannot stall accepts or cleanup.
@@ -339,15 +345,102 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd) {
     }
 }
 
+/// Where a wildcard listener's datagram was sent, which its replies leave from. The interface is
+/// kept only for a link-local address (which needs it): other replies are routed as before.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Local(IpAddr, u32);
+
+/// A datagram, its sender and, on a wildcard listener, its `Local`.
+fn recv_datagram(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Option<Local>)> {
+    unsafe {
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut control = [0u64; 8];
+        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        (msg.msg_name, msg.msg_namelen) = ((&raw mut addr).cast(), size_of_val(&addr) as _);
+        (msg.msg_iov, msg.msg_iovlen) = (&mut iov, 1);
+        (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), size_of_val(&control));
+        let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let peer = if addr.ss_family as i32 == libc::AF_INET {
+            let a = &*(&raw const addr).cast::<libc::sockaddr_in>();
+            SocketAddr::from((u32::from_be(a.sin_addr.s_addr).to_be_bytes(), u16::from_be(a.sin_port)))
+        } else {
+            let a = &*(&raw const addr).cast::<libc::sockaddr_in6>();
+            std::net::SocketAddrV6::new(a.sin6_addr.s6_addr.into(), u16::from_be(a.sin6_port), a.sin6_flowinfo, a.sin6_scope_id).into()
+        };
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            match ((*c).cmsg_level, (*c).cmsg_type) {
+                // The local address, not the header's: for a broadcast, the interface's.
+                (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
+                    let p = &*libc::CMSG_DATA(c).cast::<libc::in_pktinfo>();
+                    return Ok((n as usize, peer, Some(Local(IpAddr::from(u32::from_be(p.ipi_spec_dst.s_addr).to_be_bytes()), 0))));
+                }
+                (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
+                    let p = &*libc::CMSG_DATA(c).cast::<libc::in6_pktinfo>();
+                    let ip = Ipv6Addr::from(p.ipi6_addr.s6_addr);
+                    // No multicast source: the kernel picks one, as before.
+                    let ip = if ip.is_multicast() { Ipv6Addr::UNSPECIFIED } else { ip };
+                    return Ok((n as usize, peer, Some(Local(ip.into(), if ip.is_unicast_link_local() { p.ipi6_ifindex } else { 0 }))));
+                }
+                _ => c = libc::CMSG_NXTHDR(&msg, c),
+            }
+        }
+        Ok((n as usize, peer, None))
+    }
+}
+
+/// `send_to`, from `local` if known.
+fn send_datagram(socket: &UdpSocket, data: &[u8], peer: SocketAddr, local: Option<Local>) -> io::Result<usize> {
+    let Some(Local(ip, interface)) = local else { return socket.send_to(data, peer) };
+    unsafe {
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut control = [0u64; 8];
+        let mut iov = libc::iovec { iov_base: data.as_ptr().cast_mut().cast(), iov_len: data.len() };
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        (msg.msg_name, msg.msg_iov, msg.msg_iovlen) = ((&raw mut addr).cast(), &mut iov, 1);
+        (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), size_of_val(&control));
+        let c = &mut *libc::CMSG_FIRSTHDR(&msg);
+        let len = match (peer, ip) {
+            (SocketAddr::V4(peer), IpAddr::V4(ip)) => {
+                let a = &mut *(&raw mut addr).cast::<libc::sockaddr_in>();
+                (a.sin_family, a.sin_port, a.sin_addr.s_addr) = (libc::AF_INET as _, peer.port().to_be(), u32::from_ne_bytes(peer.ip().octets()));
+                (msg.msg_namelen, c.cmsg_level, c.cmsg_type) = (size_of_val(a) as _, libc::IPPROTO_IP, libc::IP_PKTINFO);
+                (*libc::CMSG_DATA(c).cast::<libc::in_pktinfo>()).ipi_spec_dst.s_addr = u32::from_ne_bytes(ip.octets());
+                size_of::<libc::in_pktinfo>()
+            }
+            (SocketAddr::V6(peer), IpAddr::V6(ip)) => {
+                let a = &mut *(&raw mut addr).cast::<libc::sockaddr_in6>();
+                (a.sin6_family, a.sin6_port, a.sin6_addr.s6_addr, a.sin6_scope_id) =
+                    (libc::AF_INET6 as _, peer.port().to_be(), peer.ip().octets(), peer.scope_id());
+                (msg.msg_namelen, c.cmsg_level, c.cmsg_type) = (size_of_val(a) as _, libc::IPPROTO_IPV6, libc::IPV6_PKTINFO);
+                let p = &mut *libc::CMSG_DATA(c).cast::<libc::in6_pktinfo>();
+                (p.ipi6_addr.s6_addr, p.ipi6_ifindex) = (ip.octets(), interface);
+                size_of::<libc::in6_pktinfo>()
+            }
+            _ => return socket.send_to(data, peer),
+        };
+        (c.cmsg_len, msg.msg_controllen) = (libc::CMSG_LEN(len as _) as _, libc::CMSG_SPACE(len as _) as _);
+        match libc::sendmsg(socket.as_raw_fd(), &msg, 0) {
+            n if n < 0 => Err(io::Error::last_os_error()),
+            n => Ok(n as usize),
+        }
+    }
+}
+
 fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
     // A connected guest socket per client preserves reply isolation. Idle sessions expire,
     // and both protocols bound the number of sockets and per-stream queued bytes.
     // Replies leave by the listener the client sent to.
-    let mut clients: HashMap<SocketAddr, (UdpSocket, Instant, usize)> = HashMap::new();
+    // Keyed by where the client sent to, on a wildcard listener.
+    let mut clients: HashMap<(SocketAddr, Option<Local>), (UdpSocket, Instant, usize)> = HashMap::new();
     let mut buf = vec![0; BUFFER];
     loop {
         let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, libc::POLLIN)).collect();
-        let peers: Vec<SocketAddr> = clients.keys().copied().collect();
+        let peers: Vec<_> = clients.keys().copied().collect();
         fds.extend(peers.iter().map(|p| poll(&clients[p].0, libc::POLLIN)));
         if !wait(&mut fds, stop) {
             return;
@@ -358,7 +451,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
             for _ in 0..BURST {
                 match s.recv(&mut buf) {
                     Ok(n) => {
-                        let _ = listeners[*i].send_to(&buf[..n], peer);
+                        let _ = send_datagram(&listeners[*i], &buf[..n], peer.0, peer.1);
                         *at = Instant::now();
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -372,8 +465,8 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
                 continue;
             }
             for _ in 0..BURST {
-                let (n, peer) = match listener.recv_from(&mut buf) {
-                    Ok(got) => got,
+                let (n, peer) = match recv_datagram(listener, &mut buf) {
+                    Ok((n, peer, local)) => (n, (peer, local)),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
@@ -398,6 +491,52 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn wildcard_udp_replies_from_each_destination() {
+        retry_ports(|| {
+            let guest = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mapping = Port { ip: None, host_port: 0, vm_port: guest.local_addr().unwrap().port(), protocol: Protocol::Udp };
+            let mut forwarder = Forwarder::bind(&[mapping])?;
+            let port = UdpSocket::from(forwarder.bound[0].0[0].try_clone().unwrap()).local_addr().unwrap().port();
+            let v6_port = forwarder.bound[0].0.get(1).map(|fd| UdpSocket::from(fd.try_clone().unwrap()).local_addr().unwrap().port());
+            forwarder.serve(Ipv4Addr::LOCALHOST)?;
+            // Reuse one client endpoint across destinations: these must be separate sessions.
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0; 32];
+            let mut sessions = Vec::new();
+            for ip in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)] {
+                client.connect((ip, port)).unwrap();
+                client.send(&ip.octets()).unwrap();
+                let (n, session) = guest.recv_from(&mut buf).unwrap();
+                assert_eq!(&buf[..n], &ip.octets());
+                sessions.push((session, ip));
+            }
+            assert_ne!(sessions[0].0, sessions[1].0);
+            for (session, ip) in sessions {
+                client.connect((ip, port)).unwrap();
+                guest.send_to(&ip.octets(), session).unwrap();
+                let (n, source) = client.recv_from(&mut buf).unwrap();
+                assert_eq!(source, SocketAddr::new(ip.into(), port));
+                assert_eq!(&buf[..n], &ip.octets());
+            }
+            if let Some(port) = v6_port {
+                let client = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+                client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                client.connect((Ipv6Addr::LOCALHOST, port)).unwrap();
+                client.send(b"v6").unwrap();
+                let (n, session) = guest.recv_from(&mut buf).unwrap();
+                guest.send_to(&buf[..n], session).unwrap();
+                let (n, source) = client.recv_from(&mut buf).unwrap();
+                assert_eq!(source, SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port));
+                assert_eq!(&buf[..n], b"v6");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn parse_and_record_ports() {

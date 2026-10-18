@@ -43,7 +43,7 @@ pub struct Buf(Mmap);
 
 impl Buf {
     fn new(pages: usize) -> io::Result<Buf> {
-        let mem = Mmap::new(pages.max(1) * PAGE_SIZE, 0)?;
+        let mut mem = Mmap::new(pages.max(1) * PAGE_SIZE, 0)?;
         mem.populate();
         Ok(Buf(mem))
     }

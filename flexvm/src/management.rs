@@ -70,8 +70,14 @@ fn disk_usage(path: &Path, seen: &mut BTreeSet<(u64, u64)>) -> Result<u64> {
     }
     let mut size = meta.blocks() * 512;
     if meta.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            size += disk_usage(&entry?.path(), seen)?;
+        // Removed since (a pull's cleanup, a template sweep): nothing left in it.
+        match std::fs::read_dir(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            entries => {
+                for entry in entries? {
+                    size += disk_usage(&entry?.path(), seen)?;
+                }
+            }
         }
     }
     Ok(size)
