@@ -897,6 +897,8 @@ def port_forward():
     check("migrate: freed on the source", wait_for(lambda: free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM), 60))
     check("migrate: none on the target", not B.ps()[vm].get("ports"), B.ps()[vm])
     B.kill(vm)
+    # The source's process lets the name go once the move is final.
+    check("migrate: the source lets the name go", wait_for(lambda: vm not in A.ps(), 60), A.ps().get(vm))
     A.run_json(vm, extra=fwd)
     A.kill(vm)
     check("kill: frees the ports", free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM))
