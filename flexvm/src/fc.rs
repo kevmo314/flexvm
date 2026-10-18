@@ -800,9 +800,9 @@ mod tests {
 
     #[test]
     fn api_stalled_response_keeps_one_deadline_and_drops_connection() {
-        // Response bytes arrive within the deadline: one restarted by them, not kept for the whole call, would return
-        // no sooner than TIMEOUT after they were sent.
-        const TIMEOUT: Duration = Duration::from_millis(500);
+        // Response bytes arrive halfway to the deadline: one restarted by them, not kept for the whole call, would
+        // return no sooner than TIMEOUT after they were sent, so the call has TIMEOUT / 2 of scheduling slack.
+        const TIMEOUT: Duration = Duration::from_secs(2);
         for response in [&b""[..], &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..], &b"HTTP/1.1 200 OK\r\nContent-Length:"[..]] {
             let (sent_tx, sent_rx) = std::sync::mpsc::channel();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -824,7 +824,7 @@ mod tests {
             let returned = std::time::Instant::now();
             assert!(!not_sent(&e));
             assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
-            assert_eq!(e.to_string(), "firecracker GET /vm (timeout 500ms): deadline passed");
+            assert_eq!(e.to_string(), format!("firecracker GET /vm (timeout {TIMEOUT:?}): deadline passed"));
             let sent = sent_rx.recv().unwrap();
             assert!(returned < sent + TIMEOUT, "deadline restarted by the response bytes: returned {:?} after them", returned - sent);
             assert!(api.connection.borrow().is_none());

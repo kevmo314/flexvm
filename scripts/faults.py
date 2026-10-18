@@ -477,15 +477,16 @@ def third_peer():
         # The lane's, by its host A's listener port: runs at once on this machine never share one (a pid could), and
         # what a run on it that died left is this lane's to remove.
         slot = int(args.a.rsplit(":", 1)[1])
-        ns, dev, base = f"fvp-third-{slot}", f"fvp3-{slot}", ipaddress.IPv4Address("198.19.0.0") + (slot % 16384) * 4
+        # A /31 (point to point) each of 198.18.0.0/15: one per port, so no two lanes share one.
+        ns, dev, base = f"fvp-third-{slot}", f"fvp3-{slot}", ipaddress.IPv4Address("198.18.0.0") + slot * 2
         subprocess.run(["ip", "link", "del", dev], capture_output=True)
         subprocess.run(["ip", "netns", "del", ns], capture_output=True)
         subprocess.run(["ip", "netns", "add", ns], check=True)
-        THIRD.update(ns=ns, dev=dev, addr=str(base + 2))
+        THIRD.update(ns=ns, dev=dev, addr=str(base + 1))
         subprocess.run(["ip", "link", "add", dev, "type", "veth", "peer", "name", "eth0", "netns", ns], check=True)
-        subprocess.run(["ip", "addr", "add", f"{base + 1}/30", "dev", dev], check=True)
+        subprocess.run(["ip", "addr", "add", f"{base}/31", "dev", dev], check=True)
         subprocess.run(["ip", "link", "set", dev, "up"], check=True)
-        subprocess.run(["ip", "-n", ns, "addr", "add", f"{base + 2}/30", "dev", "eth0"], check=True)
+        subprocess.run(["ip", "-n", ns, "addr", "add", f"{base + 1}/31", "dev", "eth0"], check=True)
         for d in ("eth0", "lo"):
             subprocess.run(["ip", "-n", ns, "link", "set", d, "up"], check=True)
     return THIRD["addr"]
@@ -3411,8 +3412,8 @@ def tscs_agree(skews, within=0.05):
 
 
 def guest_clock_error(host, name):
-    """Guest wall clock minus host wall clock, in seconds, of three readings the one whose exec took least: the least
-    it can be, the guest having read its clock anywhere within that exec (0 if within it)."""
+    """Guest wall clock minus host wall clock, in seconds (+- half an exec), of three readings the one whose exec took
+    least; None if none took under half a second (it could be anything within it then)."""
     best = None
     for _ in range(3):
         before = time.time()
@@ -3420,15 +3421,12 @@ def guest_clock_error(host, name):
         after = time.time()
         if code == 0 and (best is None or after - before < best[0]):
             best = (after - before, float(out) - (before + after) / 2)
-    if not best:
-        return None
-    half, err = best[0] / 2, best[1]
-    return max(0.0, abs(err) - half) * (1 if err >= 0 else -1)
+    return best[1] if best and best[0] < 0.5 else None
 
 
 def guest_clock_right(host, name, timeout=30):
     """Whether the guest's clock comes within 0.5 s of the host's, and its last error: polled until it does, not one
-    sample (an exec slow on a loaded host, or a step the guest carries out once it runs)."""
+    sample (a step the guest carries out once it runs; a loaded host's slow execs read nothing)."""
     last = [None]
 
     def right():
@@ -8079,14 +8077,19 @@ def fc_died_busy():
         busy = wait_for(lambda: staged_mib() > 20 and vms(A).get(n, {}).get("checkpoint_copy"), 60)
         check("fc died busy: caught the checkpoint copying", busy, vms(A).get(n))
         v = vms(A)[n]
+        # Held from here: the copy crawls (500 ms a 1 MiB unit, at most 6 writers: 12 MiB/s), so one that waited for it
+        # would take longer than the copy has left (of the 300 MiB written, less what is staged).
+        fault(A, "ckpt_crawl", 120000)
+        left = max(0, 300 - staged_mib())
         os.kill(v["firecracker"], signal.SIGKILL)
         started = time.time()
         code = wait_process(p, 60)
         took = time.time() - started
+        fault(A, "ckpt_crawl", 0)
         t.join(60)
-    # The time a measurement, not a pass/fail: the checkpoint failing unpublished (below) is what shows it was not waited for.
-    print(f"fc died busy: exited {took:.2f} s after its Firecracker", flush=True)
+    print(f"fc died busy: exited {took:.2f} s after its Firecracker, {left} MiB of the copy left", flush=True)
     check("fc died busy: noticed, exit status 124", code == 124, (code, took))
+    check("fc died busy: not waiting for the copy (it had longer left to crawl)", took < left / 12, (took, left))
     check("fc died busy: the checkpoint failed, nothing published", not res.get("r", {}).get("ok") and not os.path.exists(path), res)
     failed = vms(A).get(n, {})
     check("fc died busy: ps -a shows it failed", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)

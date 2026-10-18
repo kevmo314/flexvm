@@ -3011,8 +3011,10 @@ mod tests {
     fn each_peer_waits_until_done_or_by() {
         let done = Arc::new(Mutex::new(Vec::new()));
         let d = done.clone();
-        // Returning at all shows it did not wait for its deadline: it is an hour off.
-        each_peer(vec!["a".into(), "b".into()], Instant::now() + Duration::from_secs(3600), move |p| d.lock().unwrap().push(p.to_string()));
+        // Done before its deadline: not waited for (a minute is far past what two quick peers take, even loaded).
+        let t = Instant::now();
+        each_peer(vec!["a".into(), "b".into()], t + Duration::from_secs(60), move |p| d.lock().unwrap().push(p.to_string()));
+        assert!(t.elapsed() < Duration::from_secs(60), "waited for the deadline: {:?}", t.elapsed());
         assert_eq!(done.lock().unwrap().len(), 2);
         // The hung peer is let go only once the wait has returned: it returned at its deadline, not for it.
         let (release, hung) = std::sync::mpsc::channel::<()>();
@@ -3020,12 +3022,13 @@ mod tests {
         let t = Instant::now();
         each_peer(vec!["hung".into(), "fast".into()], t + Duration::from_millis(200), move |p| {
             if p == "hung" {
-                let _ = hung.lock().unwrap().recv();
+                // Bounded, so one that waited for it fails below rather than hangs.
+                let _ = hung.lock().unwrap().recv_timeout(Duration::from_secs(30));
             }
         });
         let took = t.elapsed();
         drop(release);
-        assert!(took >= Duration::from_millis(200), "{took:?}");
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(30), "waited for the hung peer: {took:?}");
         crate::log!("each_peer returned {took:?} into a 200 ms wait");
     }
 
