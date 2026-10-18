@@ -203,6 +203,15 @@ impl Pager {
                 pages.events_read();
                 self.pulled(resolved);
             }
+            // Start bounded template reads for the whole batch before the first UFFDIO_COPY can wait on disk.
+            // No wp/events/prefetch lock is held here; retries do not issue the hint again, nor do faults in the run
+            // just hinted (about 0.6 µs a call with the page cache warm).
+            let mut hinted = 0..0;
+            for p in pending.iter().filter(|p| !p.tried && p.flags & UFFD_PAGEFAULT_FLAG_WP == 0) {
+                if !self.page_of(p.addr).is_some_and(|(page, _)| hinted.contains(&page)) {
+                    hinted = self.readahead_template(p.addr);
+                }
+            }
             // Before the faults look at page states: an installer that settles a page after that sees it set, and wakes
             // this thread.
             pages.waiting.store(!pending.is_empty(), Ordering::SeqCst);
@@ -286,8 +295,18 @@ impl Pager {
         resolved
     }
 
-    /// Serves a fault, without waiting for the network or disk: a REMOTE page's run goes to a fetcher (`fetch_faults`),
-    /// and the fault waits.
+    /// Best-effort, at most 64 KiB per new BASE fault, stopping at holes, other states and the region end.
+    /// WILLNEED starts page-cache I/O without touching the mapping or changing guest page states. It can overlap
+    /// reads for queued faults and nearby future faults; UFFDIO_COPY still waits if their data is not ready.
+    /// Returns the pages hinted.
+    fn readahead_template(&self, addr: u64) -> std::ops::Range<usize> {
+        let Some((page, m)) = self.page_of(addr) else { return 0..0 };
+        let n = self.pages().base_run(page, FAULT_AROUND.min(m.span().1 - page), |p| self.base.has_data(p));
+        self.base.willneed(page, n);
+        page..page + n
+    }
+
+    /// Serves a fault: REMOTE reads go to fetchers, while BASE copies can wait for template disk I/O.
     fn fault(&self, addr: u64, flags: u64, waiting: bool, first: bool) -> io::Result<Served> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));

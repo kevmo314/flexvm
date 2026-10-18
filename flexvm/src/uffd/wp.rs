@@ -362,6 +362,7 @@ impl Pager {
         let hot_time = start.elapsed();
         let _wp = self.wp.lock().unwrap();
         if (cow || incremental) && !self.tracking() {
+            self.recycle_hot(hot);
             bail!("write tracking is off");
         }
         let pages = self.pages();
@@ -370,7 +371,6 @@ impl Pager {
         let dirty = Arc::new(pages.dirty_bits(cow));
         let ndirty = dirty.count();
         // Hot pages stay unprotected unless their block did not change since the last checkpoint.
-        let prev = hot.as_mut().and_then(|h| h.prev.take());
         let hot_unchanged = hot.as_ref().map_or(0, |h| h.unchanged.len());
         // Ascending.
         let kept: Vec<usize> = hot.iter().flat_map(|h| h.held.pages().iter().copied().filter(|&p| h.keeps(p))).collect();
@@ -386,7 +386,13 @@ impl Pager {
             // (see `WP_CHUNK`), so the guest would refault every page it uses there, clean ones too, after the resume.
             // That costs far more than the calls it spares (#281).
             let dirty_here = dirty.pages(from, to).filter(|&p| pages.get(p) == PRESENT && kept.binary_search(&p).is_err());
-            protected += self.protect(protect_ranges(dirty_here, &kept), Some(&dirty))?;
+            match self.protect(protect_ranges(dirty_here, &kept), Some(&dirty)) {
+                Ok(n) => protected += n,
+                Err(e) => {
+                    self.recycle_hot(hot);
+                    return Err(e);
+                }
+            }
         }
         let protect = start.elapsed();
         let out = match incremental {
@@ -436,6 +442,7 @@ impl Pager {
         }
         *self.cow.lock().unwrap() = cow.clone();
         let taken = if cow.is_some() { dirty } else { Arc::default() };
+        let prev = hot.as_mut().and_then(|h| h.prev.take());
         let (hot, held) = held.map_or((0, None), |(n, h)| (n, Some(h)));
         Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect, held, hot, hot_time, hot_unchanged, prev: Mutex::new(prev) })
     }
@@ -892,8 +899,7 @@ mod tests {
         assert!(cow.wanted_pages().is_empty());
     }
 
-    #[test]
-    fn memory_kept_for_the_next_checkpoint_goes_back_when_the_host_is_short() {
+    fn test_pager(n: usize) -> (crate::test_util::TempDir, Pager) {
         let dir = crate::test_util::TempDir::new("host-memory");
         std::fs::write(
             dir.join("meta.json"),
@@ -907,7 +913,6 @@ mod tests {
         )
         .unwrap();
         std::fs::File::create(dir.join("mem")).unwrap().set_len(PAGE_SIZE as u64).unwrap();
-        let n = 4096;
         let pager = Pager {
             base: crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap(),
             runtime: Runtime {
@@ -922,6 +927,56 @@ mod tests {
             collapse_report: Mutex::new(None),
             collapse_gate: Default::default(),
         };
+        (dir, pager)
+    }
+
+    #[test]
+    fn template_readahead_stays_within_the_mapping() {
+        // The template maps one page: hints past its end are clamped, not a panic or a stray madvise.
+        let (_dir, pager) = test_pager(4096);
+        pager.base.willneed(0, 16);
+        pager.base.willneed(1, 16);
+        pager.base.willneed(usize::MAX / PAGE_SIZE, 16);
+    }
+
+    #[test]
+    fn failed_hot_copy_and_freeze_recycle_memory() {
+        let (_dir, mut pager) = test_pager(4096);
+        // No process at pid 0: a hot candidate's read fails without a VM or a userfaultfd.
+        pager.runtime.pages.get_mut().unwrap().fill(1, 1, PRESENT);
+        pager.pages().mark_dirty(1);
+        *pager.hot_dirty.lock().unwrap() = Arc::new(pager.pages().dirty_bits(false));
+        pager.prepare_hot();
+        *pager.hot_prev.lock().unwrap() = Some(Arc::new(Held::of(&[(1, 42)])));
+        assert!(pager.copy_hot().is_none());
+        assert!(pager.hot_spare.lock().unwrap().is_some(), "failed read recycles its allocation");
+        assert!(pager.hot_prev.lock().unwrap().is_none(), "failed copy invalidates comparisons");
+
+        // No hot candidates now: the hot copy succeeds without a read, but protecting the dirty page fails.
+        *pager.hot_dirty.lock().unwrap() = Arc::default();
+        *pager.hot_spare.lock().unwrap() = None;
+        *pager.hot_prev.lock().unwrap() = Some(Arc::new(Held::of(&[(1, 42)])));
+        pager.prepare_hot();
+        pager.fail_protect.store(true, Ordering::SeqCst);
+        assert!(pager.freeze(&vec![], true, true).is_err());
+        assert!(pager.hot_spare.lock().unwrap().is_some(), "failed freeze recycles its allocation");
+        assert!(pager.hot_prev.lock().unwrap().is_none());
+        assert!(pager.pages().is_dirty(1), "failed freeze restores dirty bits");
+
+        // If the new snapshot is still shared, recycle the previous snapshot instead.
+        pager.tracking.store(true, Ordering::SeqCst);
+        pager.prepare_hot();
+        *pager.hot_prev.lock().unwrap() = Some(Arc::new(Held::of(&[(1, 42)])));
+        let hot = pager.copy_hot().unwrap();
+        let _shared = hot.held.clone();
+        pager.recycle_hot(Some(hot));
+        assert!(pager.hot_spare.lock().unwrap().is_some(), "previous snapshot can become the spare");
+    }
+
+    #[test]
+    fn memory_kept_for_the_next_checkpoint_goes_back_when_the_host_is_short() {
+        let n = 4096;
+        let (_dir, pager) = test_pager(n);
         // A copy that rescued pages leaves their memory for the next one; so does a checkpoint its hot pages'.
         let keep = || {
             let cow = Cow::new(n, &vec![]).keep_slots(pager.slot_spare.clone(), pager.mem_room.clone());
