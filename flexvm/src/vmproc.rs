@@ -2195,6 +2195,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     if let Some(dev) = &host.cfg.announce_dev() {
         let _ = crate::net::proxy_arp(dev);
     }
+    crate::artifacts::check_pinned(&paths.firecracker, &crate::artifacts::FIRECRACKER)?;
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();
     thread::spawn(move || {

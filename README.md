@@ -28,21 +28,25 @@ prebuilt: the first command that needs them downloads them into
 `artifacts/` from the release this build pins (`ARTIFACTS_TAG` in
 `scripts/versions.sh`) and checks them against the sha256 pinned in
 `scripts/checksums.sha256`. A file already there is never downloaded or
-replaced. It must match the pin or be recorded: `NAME.sha256` beside it holds
-the sha256 of a file that flexvm downloaded, or that the scripts below built
-or fetched and verified. A build that pins no release (between a release's
-tag and its pin) can go only by the record. Anything else is refused, never
-run: a corrupted or replaced download, a copy cut short, an older release's.
-Remove such a file to download the pinned one. Copying artifacts to another
-host takes the `.sha256` files along.
+replaced, and a build that pins it accepts only the pinned file, also when a
+VM starts: anything else is refused, never run (a corrupted or replaced
+download, a copy cut short, an older release's after an upgrade, one built
+here). Remove such a file to download the pinned one, and pull the templates
+built with it again. A build that pins no release (between a release's tag and
+its pin) goes by the record instead: `NAME.sha256` beside the file holds the
+sha256 of a file that flexvm downloaded, or that the scripts below built or
+fetched and verified. Copying artifacts to another host takes the `.sha256`
+files along.
 
-To build your own, or for a host without network access, put the files in
-`artifacts/` first (the scripts install with sudo; give them `--state DIR`
-for another state directory, then copy it over):
+For a host without network access, put the files in `artifacts/` first (the
+scripts install with sudo; give them `--state DIR` for another state
+directory, then copy it over). A Firecracker built here runs only with a build
+pinning no release, as after a change to the patches (which bumps
+`ARTIFACTS_TAG`, see [Releasing the artifacts](#releasing-the-artifacts)):
 
 ```sh
 ./scripts/build-firecracker.sh   # patched firecracker (needs musl-tools, libseccomp-dev)
-./scripts/fetch.sh               # guest kernel and the release's firecracker (if none is built), and the tests' base rootfs
+./scripts/fetch.sh               # guest kernel, the pinned release's firecracker (else a recorded build, else the stock one), and the tests' base rootfs
 ```
 
 `FLEXVM_ARTIFACTS_URL` points the download at a mirror of the release (the
@@ -54,7 +58,7 @@ The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 Hosts that migrate or restore each other's VMs need the same CPU model and
 a byte-identical Firecracker: a snapshot records both (the binary by its
 content hash), and any difference refuses it ("Firecracker differs"). Builds
-pinning the same release download the same binary; a Firecracker of your own
+pinning the same release download the same binary; a Firecracker of your own (for a build pinning none)
 is built once and copied to every host (`/var/lib/flexvm/artifacts`) rather than
 built on each. Replacing the binary also invalidates every template
 built with the old one: pull them again. Templates themselves must be identical

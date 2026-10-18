@@ -69,7 +69,7 @@ jobs:
       # warning, but on main (push, nightly) a failure once it has been pending for the release window.
       - name: Pinned artifacts release
         env:
-          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
           status=0
           ./scripts/pin-artifacts.sh --check || status=$?
@@ -77,7 +77,7 @@ jobs:
             0) ;;
             3) echo "::warning::the artifacts release is pending: tag, release and pin it (RELEASING in README.md)" ;;
             4)
-              if [ "$EVENT" = pull_request ]; then
+              if [ "$REF" != refs/heads/main ]; then
                 echo "::warning::the artifacts release has been pending for longer than the release window (RELEASING in README.md)"
               else
                 echo "::error::the artifacts release has been pending for longer than the release window: tag, release and pin it (RELEASING in README.md)"
@@ -157,14 +157,18 @@ jobs:
           cat urls.txt
           echo "env=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
           echo "fc=$(grep '^firecracker ' urls.txt | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          # Until the release is pinned, fetch.sh names the stock Firecracker (a .tgz): the patched one is built here.
+          if grep -q '^firecracker .*\.tgz$' urls.txt; then echo "fc-build=true" >> "$GITHUB_OUTPUT"; fi
           echo "downloads=$(sha256sum urls.txt | cut -c1-16)" >> "$GITHUB_OUTPUT"
           rm urls.txt
 
-      # Patched Firecracker, built from this checkout's patches (not the pinned release's, which
-      # a patch under review cannot be in): rebuilt only when its inputs change. Each artifact is saved
-      # right after it is built, so a failing test run still fills the cache.
+      # Patched Firecracker, built from this checkout's patches while its ARTIFACTS_TAG is unpinned (a change
+      # to them bumps it, so a patch under review is never in the pinned release): rebuilt only when its
+      # inputs change. Each artifact is saved right after it is built, so a failing test run still fills the
+      # cache. Once the release is pinned, flexvm runs only its Firecracker, which fetch.sh downloads instead.
       - name: Restore Firecracker
         id: fc-cache
+        if: steps.keys.outputs.fc-build == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -172,13 +176,13 @@ jobs:
             ${{ env.STATE }}/artifacts/firecracker.sha256
           key: firecracker-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh', 'scripts/versions.sh') }}
       - name: Build Firecracker
-        if: steps.fc-cache.outputs.cache-hit != 'true'
+        if: steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
           ./scripts/build-firecracker.sh
       - name: Save Firecracker
-        if: steps.fc-cache.outputs.cache-hit != 'true'
+        if: steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -186,7 +190,8 @@ jobs:
             ${{ env.STATE }}/artifacts/firecracker.sha256
           key: ${{ steps.fc-cache.outputs.cache-primary-key }}
 
-      # Guest kernel and the test image's base root filesystem (fetch.sh skips the stock Firecracker: the patched one is there).
+      # Guest kernel and the test image's base root filesystem (fetch.sh keeps the patched Firecracker built above, its
+      # record checking, over the stock one; once the release is pinned, it downloads the release's).
       - name: Restore downloads
         id: dl-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

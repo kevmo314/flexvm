@@ -68,7 +68,7 @@ jobs:
         run: |
           out=$RUNNER_TEMP/assets
           {
-            echo "Prebuilt patched Firecracker ($(./scripts/pin-artifacts.sh --inputs | head -1 | cut -d' ' -f2)) and guest kernel for flexvm, built from ${GITHUB_SHA}."
+            echo "Prebuilt patched Firecracker ($(head -1 "$out/inputs.txt" | cut -d' ' -f2)) and guest kernel for flexvm, built from ${GITHUB_SHA}."
             echo
             echo "Pin them with scripts/pin-artifacts.sh at a commit whose scripts/versions.sh names ${TAG}."
             echo

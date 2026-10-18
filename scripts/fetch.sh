@@ -42,11 +42,11 @@ if [ "${1:-}" = --kernel ]; then only_kernel=1; fi
 
 out=$state/artifacts
 sudo mkdir -p "$out"
-work=$(mktemp -d)
-placing=
+work= placing=
 trap 'rm -rf -- "$work"; [ -z "$placing" ] || sudo rm -f -- "$placing"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+work=$(mktemp -d)
 
 # A download into $work, checked against its pinned SHA256.
 download() {
@@ -74,14 +74,15 @@ fetched() {
 # Installed to a temporary file of this run's own beside its final path, then
 # renamed into place: an interrupted install never leaves a short file there,
 # and concurrent fetches never rename each other's.
-# Each is recorded first in NAME.sha256 (this file was checked against a pin): flexvm runs a file there only if it is
-# the pinned release's or recorded, and a build pinning no release goes by the record alone.
+# Recorded after installation in NAME.sha256: a build pinning no release goes by the record alone.
 place() {
-  record "$3" "$(sha256sum < "$2" | cut -d' ' -f1)" "$4"
+  local checksum
   placing=$(sudo mktemp -p "$out" ".$3.XXXXXX")
   sudo install -m "$1" "$2" "$placing"
+  checksum=$(sudo sha256sum "$placing" | cut -d' ' -f1)
   sudo mv -T "$placing" "$out/$3"
   placing=
+  record "$3" "$checksum" "$4"
 }
 
 # NAME.sha256: SHA256, which was checked against URL's pin.
@@ -93,15 +94,31 @@ record() {
   placing=
 }
 
-if [ -z "$only_kernel" ] && ! sudo test -x "$out/firecracker"; then
-  echo "fetching firecracker from $FC_URL"
-  if [[ $FC_URL == *.tgz ]]; then
-    download firecracker.tgz "$FC_URL"
-    tar xzf "$work/firecracker.tgz" -C "$work"
-    place 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker "$FC_URL"
+# A local build is kept only if its record checks; an unrecorded stock binary is fetched and verified again.
+firecracker_fetched() {
+  if [[ $FC_URL != *.tgz ]]; then fetched firecracker "$FC_URL"; return; fi
+  local checksum
+  checksum=$(sudo awk 'NR == 1 {print $1}' "$out/firecracker.sha256" 2> /dev/null) || checksum=
+  if ! [[ $checksum =~ ^[[:xdigit:]]{64}$ ]] || ! printf '%s  %s\n' "$checksum" "$out/firecracker" | sudo sha256sum --check --status; then
+    echo "$out/firecracker is not recorded in firecracker.sha256; fetching it again"
+    return 1
+  fi
+}
+
+if [ -z "$only_kernel" ]; then
+  if sudo test -x "$out/firecracker" && firecracker_fetched; then
+    # A raw release asset was checked just now, even if fetched before records were kept.
+    if [[ $FC_URL != *.tgz ]]; then record firecracker "$(pinned "$FC_URL")" "$FC_URL"; fi
   else
-    download firecracker "$FC_URL"
-    place 755 "$work/firecracker" firecracker "$FC_URL"
+    echo "fetching firecracker from $FC_URL"
+    if [[ $FC_URL == *.tgz ]]; then
+      download firecracker.tgz "$FC_URL"
+      tar xzf "$work/firecracker.tgz" -C "$work"
+      place 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker "$FC_URL"
+    else
+      download firecracker "$FC_URL"
+      place 755 "$work/firecracker" firecracker "$FC_URL"
+    fi
   fi
 fi
 

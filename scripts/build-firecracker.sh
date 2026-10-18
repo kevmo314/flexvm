@@ -56,18 +56,19 @@ target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-build/cargo_target}}
 cargo build --release --target x86_64-unknown-linux-musl --target-dir "$target" -p firecracker
 # Installed to temporary files beside their final paths, then renamed into place: a concurrent start never runs a
 # half-copied binary, and an interrupted install never leaves a short one there. firecracker.sha256 records the build:
-# flexvm refuses a Firecracker there that is neither the pinned release's nor recorded.
+# A build without a release pin accepts the recorded binary.
 built=$target/x86_64-unknown-linux-musl/release/firecracker
 out=$state/artifacts
 sudo mkdir -p "$out"
+placing= recording=
+trap 'sudo rm -f -- "$placing" "$recording"' EXIT
 placing=$(sudo mktemp -p "$out" .firecracker.XXXXXX)
 recording=$(sudo mktemp -p "$out" .firecracker.sha256.XXXXXX)
-trap 'sudo rm -f -- "$placing" "$recording"' EXIT
 sudo install -m 755 "$built" "$placing"
-printf '%s  built by scripts/build-firecracker.sh (%s %s, patches %s)\n' "$(sha256sum < "$built" | cut -d' ' -f1)" "$FC_VERSION" \
+printf '%s  built by scripts/build-firecracker.sh (%s %s, patches %s)\n' "$(sudo sha256sum "$placing" | cut -d' ' -f1)" "$FC_VERSION" \
   "$FC_COMMIT" "$(cd "$root/firecracker" && cat -- *.patch | sha256sum | cut -c1-16)" | sudo tee "$recording" > /dev/null
 sudo chmod 644 "$recording"
-sudo mv -T "$recording" "$out/firecracker.sha256"
 sudo mv -T "$placing" "$out/firecracker"
+sudo mv -T "$recording" "$out/firecracker.sha256"
 trap - EXIT
 "$target"/x86_64-unknown-linux-musl/release/firecracker --version
