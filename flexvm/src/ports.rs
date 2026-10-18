@@ -308,7 +308,15 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd) {
             c.out.pump(&c.client, &c.guest).is_ok() && c.incoming.pump(&c.guest, &c.client).is_ok() && !(c.out.shut && c.incoming.shut)
         });
         for (listener, fd) in listeners.iter().zip(&accepting) {
-            while ready(fd) && connections.len() < CONNECTIONS {
+            // Attempts are bounded too: a client whose guest connect fails (EMFILE, say) is dropped,
+            // and a flood of them must still let the loop see its stop.
+            if !ready(fd) {
+                continue;
+            }
+            for _ in 0..CONNECTIONS {
+                if connections.len() >= CONNECTIONS {
+                    break;
+                }
                 let client = match listener.accept() {
                     Ok((client, _)) => client,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
