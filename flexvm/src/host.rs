@@ -780,8 +780,13 @@ impl Host {
         let f = loop {
             match lock_path(&lock, libc::LOCK_EX | libc::LOCK_NB) {
                 Ok(f) => break f,
-                Err(_) if std::time::Instant::now() < until && self.holder_gone(name) => std::thread::sleep(Duration::from_millis(2)),
-                Err(_) => bail!("vm name {name:?} is taken"),
+                Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                    if std::time::Instant::now() >= until || !self.holder_gone(name) {
+                        bail!("vm name {name:?} is taken");
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => bail!("{}: {e}", lock.display()),
             }
         };
         // Locked, so its holder no longer runs it; its Firecrackers are reaped on
@@ -3041,9 +3046,12 @@ impl Host {
     /// `RUN/vms/NAME.lost`, before its address is withdrawn: one that cannot be written keeps the
     /// address for the next try. Nothing for a name held again since (taking it clears the record).
     fn record_lost(&self, name: &str, ip: Ipv4Addr, gen: u64) -> Result<()> {
-        if self.alive(name) {
-            return Ok(());
-        }
+        let lock = self.vms(name, "lock")?;
+        let _held = match lock_path(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(held) => held,
+            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(()),
+            Err(e) => bail!("{}: {e}", lock.display()),
+        };
         let why = format!("lost: its process ended without withdrawing {ip} (generation {gen}), as in a reboot; the address is withdrawn, its log is gone with the run directory; flexvm rm {name} clears this");
         self.vms(name, "lost")?;
         crate::util::write_file(&self.run.join("vms"), &format!("{name}.lost"), why.as_bytes(), false)
@@ -3061,9 +3069,10 @@ impl Host {
     fn collect_garbage_with(&self, lost: bool) -> Result<Vec<Withdrawn>> {
         collect_dead_taps(&self.run, None);
         collect_owned(&self.run);
-        // What a write killed midway left of the per-boot records: unsynced-claim markers
-        // (`RUN/claims`) and the generation cursor (`RUN/.gens.next`).
-        remove_write_debris(&self.run.join("claims"), |_| true);
+        // What a write killed midway left of the records.
+        for dir in [self.run.join("claims"), self.run.join("vms"), self.state.join("addrs"), self.state.join("standby")] {
+            remove_write_debris(&dir, |_| true);
+        }
         remove_write_debris(&self.run, |n| n.starts_with("..gens.next."));
         let withdrawn = self.withdraw_dead(lost);
         // After the sweep of dead holders, whose claims took their published revisions with them.
@@ -5979,6 +5988,32 @@ pub(crate) mod tests {
         c.keep();
     }
 
+    #[test]
+    fn name_lock_errors_are_not_taken_names() {
+        let (_dir, h) = host("name-lock-error");
+        let lock = h.vms("broken", "lock").unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let expected = lock_path(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap_err();
+        assert_ne!(expected.raw_os_error(), Some(libc::EWOULDBLOCK));
+        let e = h.take_name("broken", false).err().unwrap();
+        assert_eq!(e.to_string(), format!("{}: {expected}", lock.display()));
+        assert!(!name_taken(&e));
+    }
+
+    #[test]
+    fn lost_records_wait_for_the_name() {
+        let (_dir, h) = host("lost-name");
+        let held = h.take_name("web", false).unwrap();
+        let ip = "10.9.0.1".parse().unwrap();
+        h.record_lost("web", ip, 1).unwrap();
+        assert!(!h.has_record("web", "lost"));
+        drop(held);
+        h.record_lost("web", ip, 1).unwrap();
+        assert!(h.has_record("web", "lost"));
+        let _held = h.take_name("web", false).unwrap();
+        assert!(!h.has_record("web", "lost"));
+    }
+
     /// #556, #563: a write's temporary file goes once its writer is proven gone (by pid, start time and
     /// boot), never a live one's nor a published record, in STATE and RUN alike.
     #[test]
@@ -5989,6 +6024,10 @@ pub(crate) mod tests {
         let mine = crate::util::write_tag();
         assert_eq!(mine, format!("{}-{}-{boot}", me.pid, me.start));
         let claims = h.run.join("claims");
+        let dirs = [h.state.join("addrs"), h.run.join("vms"), h.state.join("standby")];
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         let files = [
             (format!(".10.9.0.1.{mine}.tmp"), true),
             (format!(".10.9.0.2.{}-{}-{boot}.tmp", me.pid, me.start + 1), false),
@@ -5999,7 +6038,9 @@ pub(crate) mod tests {
             (".10.9.0.7.x-1-2.tmp".to_string(), true),
         ];
         for (f, _) in &files {
-            std::fs::write(claims.join(f), "").unwrap();
+            for dir in std::iter::once(&claims).chain(&dirs) {
+                std::fs::write(dir.join(f), "").unwrap();
+            }
         }
         // Another boot's, by a pid that runs now: an mtime before this boot.
         let old = claims.join(format!(".10.9.0.8.{}.tmp", me.pid));
@@ -6012,7 +6053,9 @@ pub(crate) mod tests {
         std::fs::write(&other, "").unwrap();
         h.collect_garbage().unwrap();
         for (f, kept) in &files {
-            assert_eq!(claims.join(f).exists(), *kept, "{f}");
+            for dir in std::iter::once(&claims).chain(&dirs) {
+                assert_eq!(dir.join(f).exists(), *kept, "{}: {f}", dir.display());
+            }
         }
         assert!(!old.exists());
         for (f, kept) in &gens {
