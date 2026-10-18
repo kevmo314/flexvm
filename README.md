@@ -175,21 +175,16 @@ flexvm run -d --name web -p 8080:80 -p 127.0.0.1:5353:53/udp ubuntu:24.04
 ```
 
 `run -p [IP:]HOST_PORT:VM_PORT[/tcp|/udp]` forwards a host port to
-its VM's IPv4 address. Repeat `-p` for more ports. Bind addresses can be
-IPv4 or bracketed IPv6, for example `-p '[::1]:8080:80'` (loopback) or
-`-p '[::]:8080:80'` (all IPv6 interfaces). With no address, it binds both
-`0.0.0.0` and `[::]`, as Docker does; if the host has no IPv6 support or
-address, only IPv4 is bound. Explicit IPv6 binds still fail if unavailable.
-IPv6 listeners accept only IPv6. The default protocol is TCP.
+its VM's address. Repeat `-p` for more ports. IP is IPv4 or bracketed IPv6
+(`-p '[::1]:8080:80'`). With none, it binds both `0.0.0.0` and `[::]`, as
+Docker does, or IPv4 alone on a host without IPv6. The default protocol is TCP.
 Ports must be 1–65535. A port already bound by an application or another
 VM is refused at `run`, before anything starts, including overlapping
 wildcard binds; TCP and UDP can use the same number. `ps` shows a PORTS
-column with bracketed IPv6 addresses; default dual bindings appear separately.
-`ps --json` and `run -d` return one `ports` object per bound address with
-`ip` (an unbracketed address), `host_port`, `vm_port`, and `protocol`.
+column; `ps --json` and `run -d` return `ports` objects with `ip`, `host_port`, `vm_port`, and `protocol`, one per bound address.
 
 These are single-host userspace proxies in the VM process. The guest sees
-the host as the client. Each bound address uses one thread, with up to 256 TCP
+the host as the client. Each mapping uses one thread, with up to 256 TCP
 connections or UDP client sessions; UDP sessions expire after 60 idle
 seconds. TCP buffers are bounded and support half-close. Killing or
 removing the VM closes its listeners and connections. Process death closes
