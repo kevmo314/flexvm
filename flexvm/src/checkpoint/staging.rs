@@ -197,7 +197,7 @@ impl Staging {
         let manifest = Manifest {
             format: if parent.is_some() { FORMAT_INCREMENTAL } else { FORMAT },
             created_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-            name: vm.name.clone(),
+            name: vm.name.get(),
             ip: vm.ip,
             template: vm.template.name.clone(),
             template_id: meta.id.clone(),

@@ -1063,6 +1063,11 @@ fn generations(templates: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// `describe` of generation `id`, if there is one here (`inspect`).
+pub fn describe_id(paths: &Paths, id: &str) -> Option<Value> {
+    Template::generation(paths, id).map(|dir| describe(None, id, &dir))
+}
+
 fn describe(name: Option<&str>, id: &str, dir: &Path) -> Value {
     let (repository, tag) = match name.map(Reference::from_template_name) {
         Some(Ok(r)) => (r.familiar_repository(), r.reference.clone()),

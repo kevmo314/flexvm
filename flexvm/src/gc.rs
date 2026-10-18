@@ -242,6 +242,13 @@ fn vm_files(host: &Host) {
             let _ = std::fs::remove_file(&path);
         }
     }
+    // Exit statuses (`flexvm wait`) of a name with nothing else left, its logs gone too.
+    for (file, path) in files() {
+        let Some(name) = file.strip_suffix(".exit").filter(|n| !n.starts_with('.')) else { continue };
+        if crate::containers::stale_exit(host, name, &path, ORPHAN_LOG_TTL) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Writers' locks (`output::log_lock`) in `dir` with neither log there, removed while held:

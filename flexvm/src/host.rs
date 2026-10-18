@@ -817,6 +817,11 @@ impl Host {
         }
     }
 
+    /// Who holds `name` (or held it last, and died holding it): its lock's record.
+    pub fn name_holder(&self, name: &str) -> Result<Option<Ident>> {
+        lock_holder(&self.vms(name, "lock")?)
+    }
+
     /// Reaps only a proven dead holder, even when no stopped VM remains to remove.
     pub fn reap_dead_holder(&self, name: &str) -> Result<()> {
         if let Some(owner) = lock_holder(&self.vms(name, "lock")?)?.filter(|o| o.liveness() == Liveness::Gone) {
@@ -1150,6 +1155,18 @@ impl Host {
             self.unpublish(l, ip, id);
         }
         Ok(())
+    }
+
+    /// `rename`: `from`'s claim on `ip` (with `id`, only that instance's) is `to`'s from now on.
+    /// Durable: a sweep reads the holder's name (`held`). False if `from` held none.
+    pub fn rename_holder(&self, l: &Locked, ip: Ipv4Addr, from: &str, to: &str, id: Option<&Ident>) -> Result<bool> {
+        self.update(l, ip, true, |a| {
+            let ours = a.holder.as_deref() == Some(from) && id.is_none_or(|id| a.holder_id.as_ref() == Some(id));
+            if ours {
+                a.holder = Some(to.into());
+            }
+            ours
+        })
     }
 
     /// True if this made the loan (only then may its maker undo it). The
@@ -2256,6 +2273,11 @@ pub struct AddrClaim {
 }
 
 impl AddrClaim {
+    /// Its VM's new name (`Host::rename_holder` moved the record).
+    pub fn rename(&mut self, to: &str) {
+        self.holder = to.into();
+    }
+
     /// Kept past this process (suspended): its published revision goes with the process.
     pub fn keep(mut self) {
         self.kept = true;
@@ -2505,6 +2527,9 @@ impl Drop for NameLock {
 #[serde(default)]
 pub struct Entry {
     pub ports: Vec<crate::ports::Port>,
+    /// Its run settings (`-e`, `--entrypoint`, `--keep`, `--rm`, `--ip`), for `inspect`.
+    #[serde(skip_serializing_if = "crate::app::RunSpec::is_default")]
+    pub spec: crate::app::RunSpec,
     pub name: String,
     #[serde(flatten)]
     pub ident: Ident,

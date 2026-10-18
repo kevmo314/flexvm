@@ -200,11 +200,11 @@ impl Proc {
             self.settle_arrival(&op, DRAIN_WAIT)?;
             // This one goes where the checkpoint it was resumed from is.
             if let Some(dir) = self.consumed.lock().unwrap().take() {
-                delete_consumed(&vm.name, &dir);
+                delete_consumed(&vm.name.get(), &dir);
             }
             // What an earlier removal of it left (its address is this VM's).
-            let dir = self.host.suspended(&vm.name)?;
-            if dir.exists() && !self.host.is_suspended(&vm.name) {
+            let dir = self.host.suspended(&vm.name.get())?;
+            if dir.exists() && !self.host.is_suspended(&vm.name.get()) {
                 remove_durably(&dir).map_err(|e| format!("removing what is left of {}: {e}", dir.display()))?;
             }
             // Its address record durable first, at its revision: a fresh claim's was written without fsync, and a
@@ -240,7 +240,7 @@ impl Proc {
         // Its Firecracker dying meanwhile cancels it too: then it ends as a death does.
         if saved.is_ok() && vm.cancel_checkpoint.load(Ordering::SeqCst) > 0 {
             let how = if vm.dead() { "died" } else { "killed" };
-            match revoke(&self.host, &vm.name) {
+            match revoke(&self.host, &vm.name.get()) {
                 Ok(freed) if vm.dead() => {
                     if let Err(e) = freed {
                         crate::log!("vm {}: died while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
@@ -264,7 +264,7 @@ impl Proc {
                 let data = (m.data_pages * PAGE_SIZE as u64) >> 20;
                 crate::log!(
                     "{}",
-                    json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name).ok(), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()})
+                    json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name.get()).ok(), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()})
                 );
                 self.finish(&op, End::Suspended, 128 + libc::SIGTERM, None)
             }
@@ -662,7 +662,7 @@ impl Proc {
                 // Under the op lock: a suspend may be about to write here.
                 let _op = p.op();
                 if let Some(dir) = p.consumed.lock().unwrap().take() {
-                    delete_consumed(&vm.name, &dir);
+                    delete_consumed(&vm.name.get(), &dir);
                 }
             }
         });
@@ -1018,7 +1018,7 @@ fn read_cmd(dir: &Path) -> Result<Option<(String, crate::Session)>> {
 }
 
 /// With an older checkpoint's `PORTS`, if its `SPEC` has none.
-fn read_spec(dir: &Path) -> Result<crate::app::RunSpec> {
+pub(crate) fn read_spec(dir: &Path) -> Result<crate::app::RunSpec> {
     let mut spec: crate::app::RunSpec = match std::fs::read(dir.join(SPEC)) {
         Ok(b) => serde_json::from_slice(&b)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::app::RunSpec::default(),

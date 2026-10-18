@@ -52,6 +52,10 @@ pub struct RunSpec {
 const MAX_SETTINGS: usize = 64 << 10;
 
 impl RunSpec {
+    pub fn is_default(&self) -> bool {
+        *self == RunSpec::default()
+    }
+
     /// The app's settings in app.conf's form (`arg`, `env` lines), as the guest's `APP` takes them.
     pub fn app_settings(&self) -> String {
         let mut s = String::new();
