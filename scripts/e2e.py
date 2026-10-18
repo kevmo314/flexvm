@@ -1024,6 +1024,15 @@ def containers():
     check("rename: exec by the new name", must(A, renamed, "echo hi") == "hi")
     check("rename: same guest process", marker_id(A, renamed) == proc)
     check("rename: the old name is gone", A.exec(vm, "true")[0] != 0)
+    check("rename: its hostname follows", must(A, renamed, "hostname") == renamed)
+    # rename while paused: its hostname follows once it is resumed.
+    paused = renamed + "-p"
+    A.vms.add(paused)
+    A.pause(renamed)
+    A.cli("rename", renamed, paused)
+    A.resume(paused)
+    check("rename: paused, its hostname follows on resume", wait_for(lambda: must(A, paused, "hostname") == paused, 15), must(A, paused, "hostname"))
+    A.cli("rename", paused, renamed)
     logdir = os.path.join(A.run_dir, "vms")
     check("rename: its log moved", os.path.exists(os.path.join(logdir, f"{renamed}.log")) and not os.path.exists(os.path.join(logdir, f"{vm}.log")),
           os.listdir(logdir))
@@ -1334,6 +1343,45 @@ def interactive():
             att.wait()
     A.rm(vm, force=True)
 
+    # An attach across pauses (each a new VM process connection for its threads): the app's status, never
+    # "made again" because a stale connection put back the process it had before.
+    vm = "e2e-attach-paused"
+    A.vms.add(vm)
+    r = json.loads(A.cli("run", "--name", vm, "-d", "-i", t, "sh").stdout)
+    A.pids.add((r["pid"], r["start"]))
+    att = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "attach", vm], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=ENV)
+    try:
+        att.stdin.write(b"touch /tmp/before\n")
+        att.stdin.flush()
+        check("attach -i: stdin reaches the app", wait_for(lambda: A.exec(vm, "test -e /tmp/before")[0] == 0, 30))
+        for _ in range(3):
+            A.pause(vm)
+            time.sleep(0.3)
+            A.resume(vm)
+        att.stdin.write(b"exit 6\n")
+        att.stdin.flush()
+        _, err = att.communicate(timeout=60)
+        check("attach across pauses: the app's own status", att.returncode == 6, (att.returncode, err[-500:]))
+    finally:
+        if att.poll() is None:
+            att.kill()
+            att.wait()
+    A.rm(vm, force=True)
+
+    # login's Password: prompt interrupted: the terminal's echo comes back.
+    p = Pty(A, "login", "localhost:1")
+    try:
+        p.expect("Username: ")
+        p.send("me\r")
+        p.expect("Password: ")
+        check("login: no echo at Password:", wait_for(lambda: not termios.tcgetattr(p.slave)[3] & termios.ECHO, 10))
+        p.send(b"\x03")
+        code = p.wait(30)
+        check("login: Ctrl-C at Password: puts echo back", termios.tcgetattr(p.slave)[3] & termios.ECHO and code == -signal.SIGINT, (code, p.out[-300:]))
+    finally:
+        p.close()
+
     # run -d -it, then attach; detach and attach again; on B after a migration.
     vm = "e2e-attach"
     A.vms.add(vm)
@@ -1431,6 +1479,33 @@ def copy():
     A.exec(vm, "mkdir -p /tmp/evil && ln -sfn " + back + " /tmp/evil/out")
     A.cli("cp", f"{vm}:/tmp/evil", os.path.join(back, "evil"))
     check("cp out: a guest's link stays a link", os.readlink(os.path.join(back, "evil", "out")) == back)
+    # The guest's whole filesystem: /proc, /sys and /dev (other filesystems) as empty directories, never
+    # walked (/proc/kcore alone claims an address space's size): bounded in time and size.
+    start = time.time()
+    cp = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "cp", f"{vm}:/", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
+    lister = subprocess.Popen(["tar", "-t"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    listed = {}
+    reader = threading.Thread(target=lambda: listed.update(names=lister.stdout.read().decode(errors="replace").splitlines()))
+    reader.start()
+    size = 0
+    while size < (2 << 30) and time.time() - start < 120:
+        chunk = cp.stdout.read(1 << 20)
+        if not chunk:
+            break
+        size += len(chunk)
+        lister.stdin.write(chunk)
+    lister.stdin.close()
+    if cp.poll() is None and (size >= 2 << 30 or time.time() - start >= 120):
+        cp.kill()
+    cp_err = cp.communicate(timeout=60)[1]
+    lister.wait(timeout=60)
+    reader.join()
+    names = listed.get("names", [])
+    took = time.time() - start
+    check("cp vm:/ -: the whole filesystem, ending in time and size", cp.returncode == 0 and took < 120 and size < 2 << 30 and "./etc/hosts" in names,
+          (cp.returncode, took, size, cp_err[-300:]))
+    check("cp vm:/ -: other filesystems as empty directories", "./proc/" in names and not [n for n in names if re.match(r"\./(proc|sys)/.", n)],
+          [n for n in names if n.startswith(("./proc/", "./sys/"))][:10])
     A.kill(vm)
     shutil.rmtree(os.path.join(WORK, "cp-src"), ignore_errors=True)
     shutil.rmtree(back, ignore_errors=True)
