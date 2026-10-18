@@ -939,7 +939,7 @@ mod tests {
 
     /// An exited VM's record (`app::Exited`), as a background VM whose app exited leaves it.
     fn exited_vm(host: &Host, name: &str, status: i32) {
-        let rec = json!({"status": status, "template": "ci", "cmd": "make", "spec": {"env": ["A=1"], "ports": ["127.0.0.1:8080:80".parse::<crate::ports::Port>().unwrap()]}, "at": 1});
+        let rec = json!({"status": status, "template": "ci", "cmd": "make", "spec": {"env": ["A=1"], "stdin": true, "tty": true, "ports": ["127.0.0.1:8080:80".parse::<crate::ports::Port>().unwrap()]}, "at": 1});
         std::fs::write(host.vms(name, "exited").unwrap(), serde_json::to_vec(&rec).unwrap()).unwrap();
     }
 
@@ -956,6 +956,7 @@ mod tests {
         assert_eq!((v["state"].as_str(), v["exit_code"].as_i64()), (Some("exited"), Some(3)), "{v}");
         let c = &v["config"];
         assert_eq!(c["ports"][0]["host_port"], 8080, "{c}");
+        assert!(c["run"]["stdin"] == true && c["run"]["tty"] == true, "-i and -t: {c}");
         assert_eq!((c["run"]["env"][0].as_str(), c["cmd"].as_str(), c["template"].as_str()), (Some("A=1"), Some("make"), Some("ci")), "{c}");
         // A name an exited vm keeps is refused; renamed, its record, log and status move.
         exited_vm(&host, "other", 0);

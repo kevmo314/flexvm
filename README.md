@@ -138,7 +138,7 @@ and `ip`. `--format` fields are `.Name`, `.IP`, `.Image`, `.State` (or
 object; `\t` and `\n` are a tab and a newline. `inspect` adds `config` to
 what `ps --json` says of each VM: its image, template and the image's app,
 caps, ports (`ports`), run settings (`run`: `-e`, `--entrypoint`, `--keep`,
-`--rm`, `--ip`), its log, and its control socket (running) or checkpoint
+`--rm`, `--ip`, `-p`, `-i` as `stdin`, `-t` as `tty`), its log, and its control socket (running) or checkpoint
 directory (stopped); a stopped or exited one has its `exit_code` too. A name that is not a VM
 fails `inspect` once the others are printed.
 
