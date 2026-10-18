@@ -752,6 +752,62 @@ impl Host {
         ids
     }
 
+    /// Remember destinations before publication while the VM still holds its template use lock.
+    /// Missing destinations are harmless (an interrupted checkpoint); live manifests decide usage.
+    pub fn track_checkpoint(&self, dir: &Path) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::path::absolute(dir)?;
+        let records = self.state.join("checkpoints");
+        crate::util::create_dir_durably(&records, 0o700)?;
+        let key = format!("{:x}", Sha256::digest(dir.as_os_str().as_bytes()));
+        store(&records.join(key), &dir, true)
+    }
+
+    pub fn checkpoint_paths(&self) -> Result<Vec<PathBuf>> {
+        let entries = match std::fs::read_dir(self.state.join("checkpoints")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            r => Some(r?),
+        };
+        let mut out = vec![];
+        for entry in entries.into_iter().flatten() {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            if let Some(path) = load::<PathBuf>(&entry.path())? {
+                match std::fs::symlink_metadata(path.join("manifest.json")) {
+                    Ok(_) => out.push(path),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        // Include older suspended checkpoints that predate destination tracking.
+        for entry in std::fs::read_dir(self.state.join("suspended"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            match std::fs::symlink_metadata(entry.path().join("manifest.json")) {
+                Ok(_) => out.push(entry.path()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn prune_users(&self) -> Result<std::collections::BTreeSet<String>> {
+        let mut users = self.template_users();
+        for dir in self.checkpoint_paths()? {
+            users.insert(crate::checkpoint::read_manifest(&dir)?.template_id);
+        }
+        Ok(users)
+    }
+
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {

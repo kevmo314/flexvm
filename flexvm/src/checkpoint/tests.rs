@@ -771,3 +771,19 @@ fn reserve_allocates_in_units_up_to_what_is_asked() {
     assert!(allocated(&file) >= 1000 * PAGE_SIZE as u64, "{}", allocated(&file));
     assert_eq!(file.file.metadata().unwrap().len(), 1000 * PAGE_SIZE as u64);
 }
+
+#[test]
+fn tracked_checkpoints_protect_generations_until_deleted() {
+    let root = tmp("tracked-checkpoints");
+    let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+    let dest = root.join("external-checkpoint");
+    host.track_checkpoint(&dest).unwrap();
+    assert!(host.prune_users().unwrap().is_empty());
+    link(&dest, None, |m| m.template_id = "aaaa1111".into());
+    assert!(host.prune_users().unwrap().contains("aaaa1111"));
+    // Invalid existing checkpoints refuse pruning instead of silently losing a user.
+    fs::write(dest.join("manifest.json"), b"broken").unwrap();
+    assert!(host.prune_users().is_err());
+    fs::remove_dir_all(dest).unwrap();
+    assert!(host.prune_users().unwrap().is_empty());
+}
