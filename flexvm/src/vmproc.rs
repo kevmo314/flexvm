@@ -114,6 +114,9 @@ pub const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
 const SIGNALS: [i32; 7] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP, libc::SIGUSR1];
 const MAX_CONTROL: usize = 256;
 static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Long sessions leave room for control requests once parsed.
+const MAX_SESSIONS: usize = 256;
+static SESSIONS: AtomicUsize = AtomicUsize::new(0);
 /// Page-server requests (peers', forwarded by the listener) refused or served at once: not on `MAX_CONTROL`, so they
 /// never shut out local control requests (#335). Those served are bounded further by the page server.
 const MAX_PAGES: usize = 64;
@@ -157,6 +160,7 @@ pub enum Start {
     /// The migration connection is fd 3.
     Incoming {
         req: Value,
+        log: Option<PathBuf>,
     },
     Standby {
         template: String,
@@ -880,7 +884,7 @@ impl Proc {
         crate::socket::remove(&work);
         let _ = std::fs::remove_dir_all(&work);
         // Rate-limited straggler counts not reported yet would end with the process.
-        if let Some(h) = self.holder() {
+        if let Some(Some(h)) = self.holder.get() {
             h.report_now();
         }
         crate::util::flush_log(crate::util::LOG_FLUSH);
@@ -1110,7 +1114,9 @@ impl Proc {
         let mut t = Phases::new();
         let mut name = name.to_string();
         let mut record = None;
+        let mut attempts = 0;
         let lock = loop {
+            attempts += 1;
             let taken = match rerun {
                 true => self.host.take_rerun_name(&name).map(|(lock, path)| {
                     record = Some(path);
@@ -1119,7 +1125,12 @@ impl Proc {
                 false => self.host.take_name(&name, false),
             };
             match taken {
-                Err(e) if generated && crate::host::name_taken(&e) => name = crate::host::generated_name(&self.host)?,
+                Err(e) if generated && crate::host::name_taken(&e) => {
+                    if attempts >= 100 {
+                        bail!("could not take a free name: give one with --name");
+                    }
+                    name = crate::host::generated_name(&self.host)?;
+                }
                 r => break r?,
             }
         };
@@ -1396,7 +1407,7 @@ impl Proc {
         })
     }
 
-    /// `slot`: its place among `MAX_CONTROL`, which a page-server request trades for one among `MAX_PAGES`.
+    /// Parsed sessions and page requests trade their control slot for their own budget.
     fn control(self: &Arc<Self>, c: UnixStream, slot: Slot) {
         let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
         let got = crate::util::recv_with_fds(&c, crate::util::MAX_LINE as usize, || Ok(()))
@@ -1406,13 +1417,26 @@ impl Proc {
             Err(e) => return drop(send_json(&mut &c, &json!({"ok": false, "error": format!("bad request: {e}")}))),
         };
         let _ = c.set_read_timeout(None);
-        let reply = match req["op"].as_str().unwrap_or("") {
+        let op = req["op"].as_str().unwrap_or("");
+        if matches!(op, "exec" | "attach" | "stdin") {
+            let session = Slot::take(&SESSIONS, MAX_SESSIONS);
+            drop(slot);
+            let Some(_session) = session else {
+                return drop(send_json(&mut &c, &json!({"ok": false, "error": "busy", "busy": true})));
+            };
+            if self.vm.get().is_none() {
+                return drop(send_json(&mut &c, &control_reply(&Err(Busy(format!("vm {} is starting", self.name())).into()))));
+            }
+            return match op {
+                "exec" => self.exec(&req, c),
+                _ => self.attach(&req, c),
+            };
+        }
+        let reply = match op {
             // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
-            "exec" | "attach" | "stdin" | "checkpoint" | "migrate" | "debug" | "resume" | "signal" | "rename" if self.vm.get().is_none() => {
+            "checkpoint" | "migrate" | "debug" | "resume" | "signal" | "rename" if self.vm.get().is_none() => {
                 Err(Busy(format!("vm {} is starting", self.name())).into())
             }
-            "exec" => return self.exec(&req, c),
-            "attach" | "stdin" => return self.attach(&req, c),
             "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
                 let stop = req["stop"] == true;
@@ -2201,9 +2225,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
             p.attached.store(notify.is_none(), Ordering::SeqCst);
             p.restore(&dir, name.as_deref(), ip.as_deref(), paused, resources, ports)
         }
-        Start::Incoming { req } => {
-            let log = std::env::var_os("FLEXVM_INCOMING_LOG").map(PathBuf::from);
-            std::env::remove_var("FLEXVM_INCOMING_LOG");
+        Start::Incoming { req, log } => {
             // The arrival's lock (`listen::incoming`), held until the log is published or removed;
             // close-on-exec, so no Firecracker holds it on.
             let held =
@@ -3838,6 +3860,39 @@ mod tests {
         let reply = crate::util::recv_json(&mut BufReader::new(client)).unwrap().unwrap();
         assert_eq!(reply, json!({"ok": false, "error": "busy", "busy": true}));
         assert_eq!(COUNT.load(Ordering::SeqCst), MAX_CONTROL);
+    }
+
+    #[test]
+    fn parsed_sessions_release_control_slots_before_waiting_on_clients() {
+        use std::io::Write;
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        let (p, _root) = test_proc("session-slots", None);
+        for op in ["exec", "attach", "stdin"] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            // A full send buffer holds even the starting-VM reply in the session.
+            server.set_nonblocking(true).unwrap();
+            loop {
+                match server.write(&[0; 4096]) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            server.set_nonblocking(false).unwrap();
+            send_json(&mut client, &json!({"op": op})).unwrap();
+            let q = p.clone();
+            let slot = Slot::take(&COUNT, MAX_CONTROL).unwrap();
+            let worker = thread::spawn(move || q.control(server, slot));
+            let until = Instant::now() + Duration::from_secs(5);
+            while COUNT.load(Ordering::SeqCst) != 0 && Instant::now() < until {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let released = COUNT.load(Ordering::SeqCst) == 0;
+            let waiting = !worker.is_finished() && SESSIONS.load(Ordering::SeqCst) > 0;
+            drop(client);
+            worker.join().unwrap();
+            assert!(released && waiting, "{op}: control released {released}, session waiting {waiting}");
+        }
     }
 
     #[test]

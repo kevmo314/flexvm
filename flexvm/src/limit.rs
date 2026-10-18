@@ -189,13 +189,13 @@ impl Limit {
             }
         };
         let mut m = self.mark.lock().unwrap();
-        // Lifted meanwhile (a migration or checkpoint pauses it): nothing to raise, the grant goes back.
-        if m.lifted {
+        // Lifted or clipped meanwhile: return the grant and ask afresh next tick.
+        if m.lifted || more > m.cap.saturating_sub(m.admitted) {
             drop(m);
             host.refund(id);
             return self.clear_throttled(Growth::Idle);
         }
-        m.admitted = (m.admitted + more).min(m.cap.max(m.admitted));
+        m.admitted += more;
         self.write(&m);
         drop(m);
         self.clear_throttled(Growth::Raised)
@@ -426,6 +426,28 @@ mod tests {
             drop(lifted);
         });
         assert_eq!(high(&cg), Some(512 + overhead(512)));
+    }
+
+    #[test]
+    fn a_cap_lowered_during_admission_returns_the_grant() {
+        for cap in [512, 600] {
+            let (_dir, l, cg, host) = cgroup("clipped");
+            l.start(512, 5000);
+            set(&cg, 512 + overhead(512));
+            let growth = l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
+                let id = host.grant(more, None)?;
+                assert!(id.is_some());
+                l.mark.lock().unwrap().cap = cap;
+                Ok(id)
+            });
+            assert_eq!(growth, Growth::Idle);
+            assert_eq!(l.admitted(), 512);
+            let grants: Vec<(u64, u64, u64)> = crate::host::load(&host.grants()).unwrap().unwrap_or_default();
+            assert!(grants.is_empty(), "{grants:?}");
+            let growth = l.grow(&host, &mut GrantBackoff::default());
+            assert_eq!(growth, if cap == 512 { Growth::Full } else { Growth::Raised });
+            assert_eq!(l.admitted(), cap);
+        }
     }
 
     #[test]
