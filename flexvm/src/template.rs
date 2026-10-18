@@ -492,6 +492,15 @@ impl Template {
         assert!(start + n * PAGE_SIZE <= self.len);
         unsafe { std::slice::from_raw_parts(self.map.add(start), n * PAGE_SIZE) }
     }
+
+    /// Starts page-cache reads of up to `n` pages from `page`, clamped to the whole pages mapped; best effort.
+    pub fn willneed(&self, page: usize, n: usize) {
+        let n = n.min((self.len / PAGE_SIZE).saturating_sub(page));
+        if n > 0 {
+            // Page aligned and within the mapping; an advisory failure changes nothing.
+            unsafe { libc::madvise(self.map.add(page * PAGE_SIZE) as *mut libc::c_void, n * PAGE_SIZE, libc::MADV_WILLNEED) };
+        }
+    }
 }
 
 impl Drop for Template {

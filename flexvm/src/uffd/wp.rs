@@ -931,6 +931,15 @@ mod tests {
     }
 
     #[test]
+    fn template_readahead_stays_within_the_mapping() {
+        // The template maps one page: hints past its end are clamped, not a panic or a stray madvise.
+        let (_dir, pager) = test_pager(4096);
+        pager.base.willneed(0, 16);
+        pager.base.willneed(1, 16);
+        pager.base.willneed(usize::MAX / PAGE_SIZE, 16);
+    }
+
+    #[test]
     fn failed_hot_copy_and_freeze_recycle_memory() {
         let (_dir, mut pager) = test_pager(4096);
         // No process at pid 0: a hot candidate's read fails without a VM or a userfaultfd.
