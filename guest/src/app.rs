@@ -1,8 +1,11 @@
 //! The image's entrypoint, supervised by flexvm-init. `/etc/flexvm/app.conf` (written at build) has one
 //! `key value` per line, `\` and newline escaped as `\\` and `\n`: `arg`/`env` (repeated), `cwd`, `uid`,
-//! `gid`, `groups`. Requests: `APP`, `APPSTATUS`, `LOGS <offset> <follow 0|1>`, `PROBE <port>`,
-//! `CHECK <timeout ms> <hex shell command>`, `QUIESCE`. A non-root app runs with no_new_privs and an
-//! empty bounding set, so setuid binaries and file capabilities cannot take it back to root.
+//! `gid`, `groups`. Requests: `APP [<hex settings>]`, `APPSTATUS`, `LOGS <offset> <follow 0|1>`,
+//! `PROBE <port>`, `CHECK <timeout ms> <hex shell command>`, `QUIESCE`, `SIGNAL <signo>`. `APP`'s settings
+//! are a run's (`run -e`, `--entrypoint`), in app.conf's form: `env` lines replace the image's of their
+//! key, `arg` lines (if any) its whole argv. `SIGNAL` goes to the app's process alone, as docker kill's
+//! does. A non-root app runs with no_new_privs and an empty bounding set, so setuid binaries and file
+//! capabilities cannot take it back to root.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -32,7 +35,7 @@ fn config() -> io::Result<&'static Conf> {
     CONFIG.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
-pub const VERBS: [&str; 6] = ["APP", "APPSTATUS", "LOGS", "PROBE", "CHECK", "QUIESCE"];
+pub const VERBS: [&str; 7] = ["APP", "APPSTATUS", "LOGS", "PROBE", "CHECK", "QUIESCE", "SIGNAL"];
 
 #[derive(Clone, Copy)]
 enum State {
@@ -43,10 +46,12 @@ enum State {
 
 struct App {
     state: State,
+    /// The running app's reaper token: a signal reaches it only while it is unreaped (`kill_running`).
+    token: u64,
     output: Output,
 }
 
-static APP: LazyLock<Mutex<App>> = LazyLock::new(|| Mutex::new(App { state: State::Idle, output: Output::default() }));
+static APP: LazyLock<Mutex<App>> = LazyLock::new(|| Mutex::new(App { state: State::Idle, token: 0, output: Output::default() }));
 static CHANGED: Condvar = Condvar::new();
 
 impl App {
@@ -71,9 +76,11 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
         crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Duration::from_secs(5));
     }
     let reply = match verb {
-        "APP" => start(statuses).map(|pid| format!("ok {pid}")),
+        // `applied`: the run's settings were (an older agent ignored them).
+        "APP" => start(arg, statuses).map(|pid| format!("ok {pid}{}", if arg.trim().is_empty() { "" } else { " applied" })),
         "APPSTATUS" => Ok(APP.lock().unwrap().status()),
         "CHECK" => check(arg, statuses),
+        "SIGNAL" => signal(arg, statuses),
         "LOGS" => {
             let mut a = arg.split_whitespace();
             let offset = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -95,6 +102,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
     reply.map_or_else(|e| fail(out, e), |m| msg(out, m))
 }
 
+#[derive(Clone)]
 struct Conf {
     argv: Vec<String>,
     env: Vec<(String, String)>,
@@ -140,6 +148,33 @@ fn parse_conf(text: &str) -> io::Result<Conf> {
     Ok(c)
 }
 
+/// The image's configuration with a run's settings (`APP`'s): `env K=V` replaces the image's `K`,
+/// `arg` lines (any) the whole argv, as `docker run --entrypoint` drops the image's command too.
+fn with_settings(c: &Conf, text: &str) -> io::Result<Conf> {
+    let (mut c, mut argv) = (c.clone(), None);
+    for line in text.split('\n').filter(|l| !l.is_empty()) {
+        let (k, v) = line.split_once(' ').unwrap_or((line, ""));
+        match k {
+            "arg" => argv.get_or_insert_with(Vec::new).push(unescape(v)),
+            "env" => {
+                let kv = unescape(v);
+                let (k, v) = kv.split_once('=').unwrap_or((&kv, ""));
+                c.env.retain(|(e, _)| e != k);
+                c.env.push((k.into(), v.into()));
+            }
+            _ => return Err(io::Error::other(format!("unknown app setting {k:?}"))),
+        }
+    }
+    if let Some(argv) = argv {
+        c.argv = argv;
+    }
+    Ok(c)
+}
+
+fn unhex(hex: &str) -> Option<Vec<u8>> {
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect()
+}
+
 fn command<S: AsRef<std::ffi::OsStr>>(c: &Conf, argv: &[S]) -> Command {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).env_clear().envs(c.env.iter().map(|(k, v)| (k, v))).current_dir(&c.cwd).stdin(Stdio::null());
@@ -152,8 +187,7 @@ fn command<S: AsRef<std::ffi::OsStr>>(c: &Conf, argv: &[S]) -> Command {
 fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let (ms, hex) = arg.trim().split_once(' ').ok_or_else(|| io::Error::other("usage: CHECK <ms> <hex>"))?;
     let ms: u64 = ms.parse().map_err(|_| io::Error::other("bad timeout"))?;
-    let bytes: Option<Vec<u8>> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
-    let bytes = bytes.ok_or_else(|| io::Error::other("bad command encoding"))?;
+    let bytes = unhex(hex).ok_or_else(|| io::Error::other("bad command encoding"))?;
     let c = config()?;
     let mut cg = match CheckGroup::new() {
         Ok(g) => Some(g),
@@ -317,12 +351,13 @@ fn restrict(cmd: &mut Command, c: &Conf) {
     }
 }
 
-fn start(statuses: &Statuses) -> io::Result<i32> {
+fn start(settings: &str, statuses: &Statuses) -> io::Result<i32> {
     let mut app = APP.lock().unwrap();
     if let State::Running(pid) = app.state {
         return Ok(pid);
     }
-    let c = config()?;
+    let settings = unhex(settings.trim()).ok_or_else(|| io::Error::other("bad app settings encoding"))?;
+    let c = &with_settings(config()?, &String::from_utf8_lossy(&settings))?;
     if c.argv.is_empty() {
         return Err(io::Error::other("the image has no entrypoint or command: there is no app"));
     }
@@ -355,8 +390,22 @@ fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses) -> io::Result<(
             app.push(format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
         })
         .map_err(|e| unwatched(statuses, pid, token, e))?;
-    app.state = State::Running(pid);
+    (app.state, app.token) = (State::Running(pid), token);
     Ok((pid, supervisor))
+}
+
+/// `kill -s SIGNAL NAME`: to the app's process (not its group), while it runs.
+fn signal(arg: &str, statuses: &Statuses) -> io::Result<String> {
+    signal_app(&APP.lock().unwrap(), arg, statuses)
+}
+
+fn signal_app(app: &App, arg: &str, statuses: &Statuses) -> io::Result<String> {
+    let sig = arg.trim().parse::<i32>().ok().filter(|s| (1..=64).contains(s)).ok_or_else(|| io::Error::other(format!("bad signal {arg:?}")))?;
+    match app.state {
+        State::Running(pid) if kill_running(statuses, pid, app.token, false, sig) => Ok("ok".into()),
+        State::Idle => Err(io::Error::other("no app was started")),
+        _ => Err(io::Error::other("the app is not running (it exited)")),
+    }
 }
 
 /// Without a pidfd or supervisor thread the app cannot be watched: its session is killed and reaped.
@@ -419,6 +468,7 @@ fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn readiness_token_is_forgotten_even_if_reaped_during_timeout() {
@@ -673,6 +723,42 @@ mod tests {
         assert_eq!(cmd.get_program(), "/bin/app\r");
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["\r", " a\r\nb\\r \t\r"]);
         assert!(cmd.get_envs().any(|(k, v)| k == "FOO" && v == Some(std::ffi::OsStr::new("bar\r"))));
+    }
+
+    #[test]
+    fn run_settings_override_env_by_key_and_replace_argv() {
+        let image = parse_conf("arg nginx\narg -g\nenv PATH=/bin\nenv A=image\ncwd /srv\nuid 7").unwrap();
+        let c = with_settings(&image, "env A=run\nenv NEW=a\\nb\n").unwrap();
+        assert_eq!(c.argv, ["nginx", "-g"], "no arg lines: the image's argv");
+        assert_eq!(c.env, [("PATH".into(), "/bin".into()), ("A".into(), "run".into()), ("NEW".into(), "a\nb".into())]);
+        assert_eq!((c.cwd.as_str(), c.uid), ("/srv", 7));
+        let c = with_settings(&image, "arg /bin/sh\narg -c\narg echo  hi\n").unwrap();
+        assert_eq!(c.argv, ["/bin/sh", "-c", "echo  hi"], "an entrypoint drops the image's command too");
+        assert_eq!(with_settings(&image, "").unwrap().argv, image.argv);
+        assert!(with_settings(&image, "cwd /").is_err(), "only env and arg are a run's");
+        assert_eq!(unhex("656e76"), Some(b"env".to_vec()));
+        assert_eq!(unhex(""), Some(vec![]));
+        assert_eq!(unhex("6"), None);
+        assert_eq!(unhex("zz"), None);
+    }
+
+    #[test]
+    fn a_signal_reaches_only_a_running_app() {
+        let statuses = Statuses::default();
+        let mut app = App { state: State::Idle, token: 0, output: Output::default() };
+        assert!(signal_app(&app, "15", &statuses).unwrap_err().to_string().contains("no app"));
+        let mut child = Command::new("/bin/sleep").arg("100").spawn().unwrap();
+        let pid = child.id() as i32;
+        (app.state, app.token) = (State::Running(pid), 99);
+        assert!(signal_app(&app, "x", &statuses).is_err());
+        assert!(signal_app(&app, "65", &statuses).is_err());
+        // Not this token's unreaped child (as once reaped): never signalled.
+        assert!(signal_app(&app, "15", &statuses).is_err());
+        statuses.0.lock().unwrap().running.insert(pid, 99);
+        assert_eq!(signal_app(&app, "15", &statuses).unwrap(), "ok");
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        app.state = State::Exited(143);
+        assert!(signal_app(&app, "15", &statuses).unwrap_err().to_string().contains("not running"));
     }
 
     #[test]

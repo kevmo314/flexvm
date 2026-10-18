@@ -38,6 +38,8 @@ const GEN: &str = "GEN";
 const QUARANTINE: &str = "QUARANTINE";
 /// A suspended `run -- CMD` VM's command and its session (`{"cmd", "session"}`), reattached on resume.
 const CMD: &str = "CMD";
+/// A suspended VM's `app::RunSpec` (JSON), when it has one other than the default.
+const SPEC: &str = "SPEC";
 
 /// Set while a suspend or `checkpoint --stop` saves the VM, and for good once
 /// it did: the app log follower writes nothing past the offset the checkpoint
@@ -148,6 +150,7 @@ impl Proc {
         let vm = self.vm();
         let mut t = Phases::new();
         let staging = Staging::new(Path::new(dir), vm.dir.join("checkpoint.vmstate"))?;
+        self.save_spec(&staging)?;
         let dest = staging.dest().to_path_buf();
         t.mark("prepare");
         let saved = self.save(vm, staging, !stop, incremental, &mut t, || Ok(()));
@@ -208,6 +211,7 @@ impl Proc {
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             staging.add_file("PORTS", &serde_json::to_vec(&*self.ports.lock().unwrap())?)?;
+            self.save_spec(&staging)?;
             let cmd = match self.cmd.lock().unwrap().clone() {
                 Some(cmd) => Some((cmd, self.cmd_session()?, staging.create(CMD)?)),
                 None => None,
@@ -271,6 +275,15 @@ impl Proc {
         }
     }
 
+    /// What becomes of the VM once its app exits goes with its checkpoint (`SPEC`).
+    fn save_spec(&self, staging: &Staging) -> Result<()> {
+        let spec = self.spec.lock().unwrap().clone();
+        if spec != crate::app::RunSpec::default() {
+            staging.add_file(SPEC, &serde_json::to_vec(&spec)?)?;
+        }
+        Ok(())
+    }
+
     pub fn resume_suspended(&self, name: &str) -> Result<Value> {
         let mut t = Phases::new();
         self.set_name(self.host.take_name(name, true)?);
@@ -290,6 +303,7 @@ impl Proc {
         })?;
         let ck = Checkpoint::open(&dir)?;
         let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
+        *self.spec.lock().unwrap() = read_spec(&dir).map_err(|e| format!("vm {name}: its run settings {}: {e}", dir.join(SPEC).display()))?;
         t.mark("verify_checkpoint");
         let ip = ck.manifest.ip;
         // Checked again, as a restore's is: safe when suspended, it may be a peer's or local now.
@@ -348,6 +362,9 @@ impl Proc {
     pub fn restore(&self, dir: &Path, name: Option<&str>, ip: Option<&str>, paused: bool, resources: crate::vm::Resources) -> Result<Value> {
         let mut t = Phases::new();
         let ck = Checkpoint::open(dir)?;
+        // Its app's settings and what becomes of it; not the address its original asked for.
+        let spec = read_spec(dir).map_err(|e| format!("its run settings {}: {e}", dir.join(SPEC).display()))?;
+        *self.spec.lock().unwrap() = crate::app::RunSpec { ip: None, ..spec };
         t.mark("verify_checkpoint");
         let name = name.unwrap_or(&ck.manifest.name).to_string();
         let want = match ip {
@@ -989,6 +1006,14 @@ fn read_cmd(dir: &Path) -> Result<Option<(String, crate::Session)>> {
     let v: Value = serde_json::from_slice(&bytes)?;
     let cmd = v["cmd"].as_str().ok_or("no command")?.to_string();
     Ok(Some((cmd, serde_json::from_value(v["session"].clone())?)))
+}
+
+fn read_spec(dir: &Path) -> Result<crate::app::RunSpec> {
+    match std::fs::read(dir.join(SPEC)) {
+        Ok(b) => Ok(serde_json::from_slice(&b)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::app::RunSpec::default()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn read_gen(dir: &Path) -> Option<u64> {

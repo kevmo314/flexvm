@@ -286,11 +286,33 @@ pub fn forks(uds: &Path) -> Result<usize> {
     Ok(m.strip_prefix("ok ").ok_or_else(|| refused("FORKS", m.as_bytes()))?.trim().parse()?)
 }
 
-pub fn start_app(uds: &Path) -> Result<u32> {
-    let reply = message(uds, "APP", TIMEOUT)?;
-    match reply.strip_prefix("ok ") {
-        Some(pid) => Ok(pid.trim().parse()?),
-        None => bail!("starting the app: {}", reply.trim_start_matches("error: ")),
+/// `settings`: a run's (`vmproc::RunSpec::app_settings`), in app.conf's form; empty for the image's own.
+pub fn start_app(uds: &Path, settings: &str) -> Result<u32> {
+    let line = match settings {
+        "" => "APP".to_string(),
+        s => format!("APP {}", s.bytes().map(|b| format!("{b:02x}")).collect::<String>()),
+    };
+    let reply = message(uds, &line, TIMEOUT)?;
+    app_started(&reply, !settings.is_empty())
+}
+
+/// `ok <pid>`, and ` applied` if settings were sent: an agent that predates them starts the image's app as is.
+fn app_started(reply: &str, settings: bool) -> Result<u32> {
+    let Some(rest) = reply.strip_prefix("ok ") else { bail!("starting the app: {}", reply.trim_start_matches("error: ")) };
+    let mut words = rest.split_whitespace();
+    let pid = words.next().ok_or("starting the app: no pid")?.parse()?;
+    if settings && words.next() != Some("applied") {
+        bail!("its template's flexvm-init predates -e, --env-file and --entrypoint at run, so its app started without them: pull its image again");
+    }
+    Ok(pid)
+}
+
+/// `kill -s`: `sig` to the app's process.
+pub fn signal_app(uds: &Path, sig: i32) -> Result<()> {
+    match message(uds, &format!("SIGNAL {sig}"), TIMEOUT)?.as_str() {
+        "ok" => Ok(()),
+        m if m.starts_with("unknown request") => bail!("its template's flexvm-init predates kill -s: pull its image again"),
+        m => bail!("{}", m.trim_start_matches("error: ")),
     }
 }
 
@@ -388,6 +410,15 @@ mod tests {
         line.clear();
         stream.read_line(&mut line).unwrap();
         (stream, line)
+    }
+
+    #[test]
+    fn run_settings_must_be_applied_by_the_agent() {
+        assert_eq!(app_started("ok 42", false).unwrap(), 42);
+        assert_eq!(app_started("ok 42 applied", true).unwrap(), 42);
+        assert!(app_started("ok 42", true).unwrap_err().to_string().contains("pull its image again"), "an older agent ignores them");
+        assert!(app_started("error: no app", false).unwrap_err().to_string().contains("no app"));
+        assert!(app_started("ok x", false).is_err());
     }
 
     #[test]

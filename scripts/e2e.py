@@ -119,11 +119,11 @@ os.makedirs(args.log_dir, exist_ok=True)
 # and `flexvm start`, and destroyed with `flexvm kill` (or `rm -f`).
 
 
-def flexvm(*argv, timeout=180, check=True, env=None):
+def flexvm(*argv, timeout=180, check=True, env=None, stdin=None):
     """Runs the flexvm CLI; returns the CompletedProcess."""
     # A run directory belongs to one state directory, so BUILD has its own (a Host's --run follows and wins).
     r = subprocess.run([BIN, "--state", BUILD, "--run", os.path.join(RUN, "build"), *argv], capture_output=True, text=True, timeout=timeout,
-                       env=env)
+                       env=env, stdin=stdin)
     if check and r.returncode != 0:
         raise AssertionError(f"flexvm {' '.join(argv)} exited {r.returncode}: {r.stderr.strip()}")
     return r
@@ -539,6 +539,116 @@ def run_exec_ps():
     check("run without --name: a made-up name", re.fullmatch(r"[a-z]+_[a-z]+", r["name"]) is not None, r)
     check("run without --name: listed under it", A.ps(all=False).get(r["name"], {}).get("ip") == r["ip"], A.ps())
     check("kill: prints the name", A.kill(r["name"]).stdout == r["name"] + "\n")
+
+
+@case
+def app_lifecycle():
+    """A VM follows its app: exits with it (an exited record with -d), --keep, --rm, start reruns, kill -s, -e/--entrypoint."""
+    t = args.template
+    entry = lambda script: ["--entrypoint", json.dumps(["sh", "-c", script])]
+
+    def run_d(vm, *opts):
+        A.vms.add(vm)
+        r = json.loads(A.cli("run", "--name", vm, "-d", *opts, t).stdout)
+        A.pids.add((r["pid"], r["start"]))
+        return r
+    exited = lambda vm: A.ps().get(vm, {}).get("state") == "exited"
+
+    # The test image has no app: its VM idles, and an app's signal has nowhere to go.
+    run_d("e2e-idle")
+    time.sleep(1.5)
+    check("no app: the vm idles", A.ps(all=False).get("e2e-idle", {}).get("state") == "running", A.ps())
+    r = A.cli("kill", "-s", "TERM", "e2e-idle", check=False)
+    check("kill -s: a vm with no app refuses it", r.returncode != 0 and "no app" in r.stderr, r.stderr)
+    check("kill -s: and runs on", A.exec("e2e-idle", "true")[0] == 0)
+    A.kill("e2e-idle")
+
+    # -d: the app's exit is the VM's, which leaves its record and log; -e wins over --env-file.
+    env_file = os.path.join(WORK, "app.env")
+    with open(env_file, "w") as f:
+        f.write("# from the file\nGREETING=file\nEXTRA=from-file\n")
+    vm = "e2e-app-exit"
+    first = run_d(vm, "--env-file", env_file, "-e", "GREETING=hi", *entry("echo app-says-$GREETING-$EXTRA; exit 3"))
+    check("app exit: the vm exits, listed exited", wait_for(lambda: exited(vm), 30), A.ps().get(vm))
+    check("app exit: with its status", A.ps()[vm].get("status") == 3, A.ps()[vm])
+    check("app exit: not in ps without -a", vm not in A.ps(all=False))
+    check("app exit: -e and --env-file reach the app", "app-says-hi-from-file" in A.logs(vm), A.logs(vm)[-2000:])
+    check("app exit: its process is gone", wait_for(lambda: not alive(first["pid"]), 10))
+    r = A.cli("run", "--name", vm, "-d", t, check=False)
+    check("app exit: its name stays taken", r.returncode != 0 and "exited" in r.stderr, r.stderr)
+    r = A.kill(vm, check=False)
+    check("app exit: kill refuses it (not running)", r.returncode != 0 and "rm" in r.stderr, r.stderr)
+    # start runs it again, as it was run.
+    out = json.loads(A.cli("start", vm).stdout)
+    A.pids.add((out["pid"], out["start"]))
+    check("start: an exited vm runs again", wait_for(lambda: A.logs(vm).count("app-says-hi-from-file") == 2, 30), A.logs(vm)[-2000:])
+    check("start: and exits again, with its status", wait_for(lambda: exited(vm) and A.ps()[vm].get("status") == 3, 30), A.ps().get(vm))
+    check("rm: removes the exited record", A.rm(vm).stdout == vm + "\n" and vm not in A.ps())
+
+    # A rerun refused before it runs (its --ip taken meanwhile) leaves the record, to start again.
+    ip = f"{args.net_a}.50"
+    run_d("e2e-app-ip", "--ip", ip, *entry("exit 2"))
+    check("rerun: exited at its --ip", wait_for(lambda: exited("e2e-app-ip"), 30), A.ps().get("e2e-app-ip"))
+    A.run("e2e-ip-holder", ip=ip)
+    r = A.cli("start", "e2e-app-ip", check=False)
+    check("rerun: refused while its address is taken", r.returncode != 0, r.stdout + r.stderr)
+    check("rerun: its record stays", exited("e2e-app-ip") and A.ps()["e2e-app-ip"].get("status") == 2, A.ps().get("e2e-app-ip"))
+    A.kill("e2e-ip-holder")
+    out = json.loads(A.cli("start", "e2e-app-ip").stdout)
+    check("rerun: once free, at its address again", out["ip"] == ip, out)
+    check("rerun: and exits again", wait_for(lambda: exited("e2e-app-ip"), 30), A.ps().get("e2e-app-ip"))
+    A.rm("e2e-app-ip")
+
+    # A checkpoint keeps the run's settings: the restored VM follows its --entrypoint app.
+    run_d("e2e-app-ck", *entry("echo ck-up; sleep 4; exit 9"))
+    check("checkpoint: the app is up", wait_for(lambda: "ck-up" in A.logs("e2e-app-ck"), 30), A.logs("e2e-app-ck")[-2000:])
+    ck = ckpt_dir("app-ck")
+    A.checkpoint("e2e-app-ck", ck, stop=True)
+    A.restore(ck, name="e2e-app-ck2", ip="auto")
+    check("checkpoint: the restored vm exits with the app", wait_for(lambda: exited("e2e-app-ck2"), 30) and A.ps()["e2e-app-ck2"].get("status") == 9,
+          (A.ps().get("e2e-app-ck2"), A.logs("e2e-app-ck2")[-2000:]))
+    A.rm("e2e-app-ck2")
+    shutil.rmtree(ck, ignore_errors=True)
+
+    # --rm: no record once it exits.
+    run_d("e2e-app-rm", "--rm", *entry("exit 0"))
+    check("--rm: gone once its app exits", wait_for(lambda: "e2e-app-rm" not in A.ps(), 30), A.ps().get("e2e-app-rm"))
+
+    # --keep: up once its app exited, to exec into.
+    run_d("e2e-app-keep", "--keep", *entry("echo kept; exit 4"))
+    check("--keep: its app ran", wait_for(lambda: "exited with status 4" in A.logs("e2e-app-keep"), 30), A.logs("e2e-app-keep")[-2000:])
+    check("--keep: the vm stays up", A.ps(all=False).get("e2e-app-keep", {}).get("state") == "running", A.ps())
+    check("--keep: exec works", A.exec("e2e-app-keep", "echo up")[1] == "up\n")
+    A.kill("e2e-app-keep")
+
+    # kill -s: to the app, which the VM follows.
+    vm = "e2e-app-sig"
+    run_d(vm, *entry("trap 'echo got-term; exit 7' TERM; echo trap-set; while :; do sleep 0.1; done"))
+    check("kill -s: the app is up", wait_for(lambda: "trap-set" in A.logs(vm), 30), A.logs(vm)[-2000:])
+    check("kill -s: prints the name", A.cli("kill", "-s", "SIGTERM", vm).stdout == vm + "\n")
+    check("kill -s: the app took it, the vm exits with it", wait_for(lambda: exited(vm), 30) and A.ps()[vm].get("status") == 7,
+          (A.ps().get(vm), A.logs(vm)[-2000:]))
+    check("kill -s: the app's handler ran", "got-term" in A.logs(vm))
+    A.rm(vm)
+
+    # Foreground: run returns the app's status; an app that exits at once without a terminal gets the hint.
+    A.vms.add("e2e-app-fg")
+    r = A.cli("run", "--name", "e2e-app-fg", *entry("exit 5"), t, check=False, stdin=subprocess.DEVNULL)
+    check("foreground: run exits with the app's status", r.returncode == 5, (r.returncode, r.stderr[-2000:]))
+    check("foreground: the hint", "sh exited at once (it needs a terminal?): use flexvm run -it" in r.stderr, r.stderr[-2000:])
+    check("foreground: no exited record", "e2e-app-fg" not in A.ps())
+
+    # A standby VM's claim carries the run's settings.
+    try:
+        flexvm_json = json.loads(A.cli("pull", t, "--standby", "1", timeout=300).stdout)
+        check("standby: one ready", flexvm_json.get("standby") == 1, flexvm_json)
+        r = run_d("e2e-app-sb", "-e", "FROM=standby", *entry("echo sb-$FROM; exit 6"))
+        check("standby: the run claimed it", r.get("standby") is True, r)
+        check("standby: its app got -e and --entrypoint", wait_for(lambda: exited("e2e-app-sb"), 30) and A.ps()["e2e-app-sb"].get("status") == 6
+              and "sb-standby" in A.logs("e2e-app-sb"), (A.ps().get("e2e-app-sb"), A.logs("e2e-app-sb")[-2000:]))
+        A.rm("e2e-app-sb")
+    finally:
+        A.cli("pull", t, "--standby", "0", timeout=300)
 
 
 @case
@@ -1083,7 +1193,7 @@ COST = {"faults/exec_background": 110, "faults/reboot": 40, "faults/mem_refused_
         "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
         "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
-        "faults/resume_suspending": 16, "image_template": 15, "faults/arrival_flood": 14, "faults/page_conns": 14,
+        "faults/resume_suspending": 16, "image_template": 15, "app_lifecycle": 30, "faults/arrival_flood": 14, "faults/page_conns": 14,
         "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
         "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,

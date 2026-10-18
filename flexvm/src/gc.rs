@@ -234,8 +234,9 @@ fn vm_files(host: &Host) {
         }
         // Not a VM's name: never one of its logs.
         let Ok(suspended) = host.suspended(name) else { continue };
-        let orphan =
-            host.holder_gone(name) && !suspended.exists() && !["failed", "moved", "lost"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
+        let orphan = host.holder_gone(name)
+            && !suspended.exists()
+            && !["failed", "moved", "lost", "exited"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
         if orphan {
             // Its writers' lock goes after (`orphan_log_locks`).
             let _ = std::fs::remove_file(&path);

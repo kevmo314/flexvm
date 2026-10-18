@@ -1,7 +1,7 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
 //! `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters) and holds
-//! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, generation}` with
+//! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, spec, tty, generation}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows. An
 //! `attached` claim (a foreground `run`'s, with its cgroup directory fd, which the VM joins) ends the
@@ -598,7 +598,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         };
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20, ready) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
-        if req["generation"] != mine {
+        if !claims_generation(&req["generation"], &mine) {
             continue;
         }
         // Locked until the claim succeeds or rolls back (dropped): relief does not count it stopped.
@@ -614,6 +614,10 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         }
         // Before it is published: eviction leaves a CMD VM alone.
         *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
+        // The claim's app settings are applied as it starts the app (`start_guest`).
+        *p.spec.lock().unwrap() = serde_json::from_value(req["spec"].clone()).unwrap_or_default();
+        p.tty.store(req["tty"] == json!(true), std::sync::atomic::Ordering::SeqCst);
+        p.attached.store(req["attached"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         match claim(p, &req) {
             Ok(v) => {
                 p.forget_stop();
@@ -676,6 +680,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             Err((e, retry)) => {
                 p.drop_ports();
                 *p.cmd.lock().unwrap() = None;
+                *p.spec.lock().unwrap() = crate::app::RunSpec::default();
                 // Nor its caps (`--memory` included): the next claim sets its own.
                 let _ = p.keep_resources(crate::vm::Resources::default());
                 let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": retry}));
@@ -721,6 +726,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     let resources: crate::vm::Resources = serde_json::from_value(req["resources"].clone()).map_err(|e| (format!("bad resources: {e}").into(), false))?;
     let tpl = p.standby.lock().unwrap().as_ref().map(|s| s.template()).ok_or_else(|| ("standby vm gone".into(), true))?;
     p.set_resources(resources, &tpl.meta).map_err(|e| (e, false))?;
+    p.spec.lock().unwrap().check(tpl.meta.image.as_ref()).map_err(|e| (e, false))?;
     // Taken ahead of any claim: every claim sets its cgroup's cap, `max` for none, so one an
     // earlier claim that failed set (after this point) never carries over to this VM.
     {
@@ -774,6 +780,20 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     Ok(v)
 }
 
+/// A claim's generation: the template's, marked as a claim whose VM follows its app with the run's
+/// settings (`app::RunSpec`). A standby process older than that would take it and ignore them: it
+/// finds no generation of its own, and the claim goes to another (or starts cold).
+fn generation(key: &str) -> String {
+    format!("{key}{FOLLOWS_APP}")
+}
+
+const FOLLOWS_APP: &str = "+app";
+
+/// A claim of this generation: marked, or (an older `run`'s) not.
+fn claims_generation(generation: &Value, mine: &str) -> bool {
+    generation.as_str().is_some_and(|g| g.strip_suffix(FOLLOWS_APP).unwrap_or(g) == mine)
+}
+
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
 /// no answer (by `CLAIM_TIMEOUT`) is then an error, never a reason to start it again.
 pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, BufReader<UnixStream>)>> {
@@ -788,7 +808,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         .collect();
     socks.sort();
     let mut req = req.clone();
-    req["generation"] = json!(key);
+    req["generation"] = json!(generation(&key));
     let mut line = serde_json::to_vec(&req)?;
     line.push(b'\n');
     let name = req["name"].as_str().unwrap_or("");
@@ -1276,6 +1296,16 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_with_run_settings_is_marked_for_standbys_that_apply_them() {
+        let marked = generation("a");
+        assert_eq!(marked, "a+app");
+        assert!(claims_generation(&json!("a"), "a") && claims_generation(&json!(marked), "a"));
+        // What an older standby compares: never its own generation, so it leaves the claim be.
+        assert_ne!(json!(marked), json!("a"));
+        assert!(!claims_generation(&json!("b+app"), "a") && !claims_generation(&json!("a+appx"), "a") && !claims_generation(&json!(null), "a"));
+    }
+
+    #[test]
     fn stopped_standbys_share_one_handshake_budget_and_a_live_one_after_them_wins() {
         let (_root, host, paths, d) = pool("standby-budget");
         let stopped = ["0", "00"].map(|n| UnixListener::bind(d.join(format!("{n}.sock"))).unwrap());
@@ -1283,7 +1313,7 @@ mod tests {
         let live = std::thread::spawn(move || {
             let (c, _) = live.accept().unwrap();
             let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
-            assert_eq!(req["generation"], "a");
+            assert_eq!(req["generation"], "a+app");
             send_json(&mut &c, &json!({"claiming": true})).unwrap();
             send_json(&mut &c, &json!({"ok": true, "result": "live"})).unwrap();
         });

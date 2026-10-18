@@ -122,6 +122,10 @@ impl Proc {
         let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
+        // Before the pause: dropped, the connection ends the target's arrival.
+        if prepared["follows_app"] != true && *self.spec.lock().unwrap() != crate::app::RunSpec::default() {
+            bail!("{to} runs an older flexvm, which would drop vm {}'s run settings (-e, --entrypoint, --keep, --rm, --ip): upgrade it first", vm.name);
+        }
         let prepare = prep.elapsed();
         // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
         let mut wanted = crate::standby::load_set(&self.host, &vm.template);
@@ -283,6 +287,8 @@ impl Proc {
                 // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
                 "plugged_mib": vm.hotplug_plugged(),
                 "resources": vm.resources(),
+                // What becomes of it once its app exits goes with it.
+                "spec": *self.spec.lock().unwrap(),
                 "regions": vm.pager.regions(),
                 // The MSRs its vmstate will hold: this host's, which may be more than the template's.
                 "msrs": msrs,
@@ -590,7 +596,8 @@ impl Proc {
                 return Err(e);
             }
         };
-        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true}}))?;
+        // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app.
+        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true}}))?;
         let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
@@ -860,6 +867,7 @@ impl Proc {
         // Its caps move with it (the same template: they fit).
         // Refused before the source pauses: a capped VM never runs uncapped here.
         self.keep_resources(serde_json::from_value(req["resources"].clone()).unwrap_or_default())?;
+        *self.spec.lock().unwrap() = serde_json::from_value(req["spec"].clone()).unwrap_or_default();
         t.mark("template");
         going()?;
         // Admission, the record and the claim under one wait for the lock, which gives up in time.
