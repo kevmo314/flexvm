@@ -356,18 +356,47 @@ memory; `flexvm kill` refuses that copy (kill the VM where it runs), and
 ## Checkpoint and restore
 
 ```sh
-flexvm checkpoint web /data/web-1                   # the VM runs on (paused ~20 ms)
-flexvm checkpoint web /data/web-2 --incremental     # only what changed since the last one
-flexvm checkpoint web /data/web-3 --stop            # and destroy it
-flexvm run --checkpoint /data/web-1                 # same name and address
-flexvm run -d --checkpoint /data/web-1 --name web2 --ip auto   # a fork, with a new address
-flexvm run --checkpoint /data/web-1 --paused        # held until flexvm unpause
+flexvm checkpoint create web base                   # the VM runs on (paused ~20 ms); named base
+flexvm checkpoint create web --incremental          # only what changed since its last one
+flexvm checkpoint create web last --stop            # and destroy it
+flexvm checkpoint ls                                # name, id, VM, template, parent, size, age
+flexvm run --checkpoint base                        # same name and address
+flexvm run -d --checkpoint base --name web2 --ip auto   # a fork, with a new address
+flexvm run --checkpoint 3f2a --paused               # by the start of its id; held until unpause
+flexvm checkpoint rm base                           # refused while another builds on it
+flexvm checkpoint prune --older-than 7d             # asks first on a terminal (-f: not)
 ```
+
+flexvm keeps checkpoints in `STATE/checkpoints`, each under its id (the
+checksum of its manifest), and a name, given at `create`, links to one.
+Names are unique: `create` with a taken one is refused. One being written is
+not listed, restored or built on until it is complete. `--incremental` stores
+a delta on the VM's last checkpoint, taken here since it last started, was
+restored or migrated, that it ran on after; with that one removed, take a
+full one. `checkpoint rm NAME|ID...` (an id's first 4 or more digits will do)
+is refused while a checkpoint not removed with it builds on it; `-f` removes
+those too. `checkpoint prune` removes every checkpoint, or with
+`--older-than AGE` (`90s`, `30m`, `24h`, `7d`) those older, except what a kept one
+builds on; it lists what it removed. Both wait for checkpoints being
+written and for restores still opening one. A VM restored from a checkpoint runs
+on after the checkpoint is removed. `ls -q` prints ids; `--filter name=PART`,
+`vm=NAME` and `template=IMAGE|ID` select (a key again: either value); `--format`
+takes `json` or a template of `.Name`, `.ID`, `.VM`, `.Template`, `.TemplateID`,
+`.Parent`, `.Size` (bytes) and `.Created` (Unix seconds), as `ps --format`
+does. The template column is the image that names the checkpoint's template
+generation now, or `<none>`, with the start of the generation's id. A stored
+checkpoint keeps its generation through pulls, `image prune` and `rmi` (see
+Images); `system df` counts stored checkpoints.
 
 A checkpoint restores on any host with the same template (by content id).
 Restored on another host with its own address, the VM borrows the address
 from its home host, which refuses one in use or lent out; `--ip auto` picks
-a new one.
+a new one. `run --checkpoint PATH` (any argument with a `/`) restores a
+checkpoint directory as it is: one written by flexvm 0.1.0's `flexvm checkpoint
+VM DIR` (which `checkpoint create` replaces, and now refuses), another state's
+stored one (`STATE/checkpoints/ID`), or a stopped VM's. Its template generation
+must be here. Moving stored checkpoints between hosts (`checkpoint save` and
+`load`) is to come (#775).
 
 ## Configuration
 
@@ -640,10 +669,9 @@ old generation and the root filesystem only it used, printing what it removed
 (running, paused, stopped, standby, or migrating in or out) or a checkpoint in
 `STATE/checkpoints` uses it. Those name it by content id, so it stays for
 them, listed as `<none>` by `images`, until `image prune` or `rmi ID` removes
-it once they are gone. Checkpoints written to other directories (`flexvm
-checkpoint VM DIR`) are not tracked, as with `image prune`: once their
-generation is deleted they cannot be restored here (managed checkpoints, #775,
-replace them). Nor can VMs of it elsewhere migrate here. A templates directory
+it once they are gone. Checkpoint directories elsewhere (flexvm 0.1.0's, restored by
+path) are not tracked, as with `image prune`: once their generation is deleted
+they cannot be restored here. Nor can VMs of it elsewhere migrate here. A templates directory
 that other states link to (see Paths and knobs) may hold generations their VMs
 use, so pulls through it leave the old generation to `image prune`.
 
@@ -651,9 +679,10 @@ use, so pulls through it leave the old generation to `image prune`.
 them, its generation and its root filesystem (`images/rootfs/`); `rmi ID` (or
 a unique prefix of it) removes a `<none>` generation. Both are refused while a
 VM here (running, paused or stopped) uses the image; `rmi IMAGE` sets its
-standby count to 0 and waits for its standby VMs to go first. Checkpoints in
-other directories than `STATE/checkpoints` that pin a removed generation cannot
-be restored here any more. Layer blobs (`images/blobs/`)
+standby count to 0 and waits for its standby VMs to go first. A generation a
+stored checkpoint uses stays: `rmi IMAGE` removes only the name, and `rmi ID`
+is refused until `checkpoint rm`. Checkpoints in other directories than
+`STATE/checkpoints` that pin a removed generation cannot be restored here any more. Layer blobs (`images/blobs/`)
 are a download cache and stay until `system prune`.
 
 `image prune` removes each `<none>` generation as `rmi ID` would: those a
@@ -663,8 +692,8 @@ pin a pruned generation cannot be restored here any more. `system prune` also re
 blob cache (left alone while a pull runs). Both list what they remove and the
 bytes reclaimed, and ask first on a terminal; without one they need `-f`.
 `system df` reports allocated bytes for image root filesystems, templates,
-blobs, VM records and logs, and stopped VMs' checkpoints, counting hard links
-once.
+blobs, VM records and logs, and checkpoints (stored ones and stopped VMs'),
+counting hard links once.
 
 **Registry credentials.** `flexvm login [REGISTRY]` defaults to Docker Hub.
 It verifies the supplied credentials over HTTPS before saving them in
@@ -732,7 +761,7 @@ For flexvm's development:
 ```sh
 flexvm bench --template small                                     # standby and cold run latency
 flexvm bench --to 127.0.0.1:7131 --to-state S --to-run R --dirty-mib 500   # run + migrate to another host on this machine
-flexvm bench --lifecycle /data/ckpt --to-state S --to-run R      # pause, checkpoint, restore, suspend
+flexvm bench --lifecycle --to-state S --to-run R                 # pause, checkpoint, restore, suspend
 ```
 
 The other host's state (S) holds the same artifacts and templates (symlinks

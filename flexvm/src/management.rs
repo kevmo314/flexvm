@@ -60,7 +60,7 @@ fn glob(pattern: &str, value: &str) -> bool {
 }
 
 /// Allocated bytes, counting each inode once and never following symlinks.
-fn disk_usage(path: &Path, seen: &mut BTreeSet<(u64, u64)>) -> Result<u64> {
+pub(crate) fn disk_usage(path: &Path, seen: &mut BTreeSet<(u64, u64)>) -> Result<u64> {
     let meta = match path.symlink_metadata() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         m => m?,
@@ -111,14 +111,16 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
     if operation == "df" {
         let mut seen = BTreeSet::new();
         output(format_args!("{:<16} {:>16}\n", "TYPE", "ALLOCATED BYTES"))?;
-        for (kind, path) in [
-            ("Images", paths.images.join("rootfs")),
-            ("Templates", paths.templates.clone()),
-            ("Blobs", paths.images.join("blobs")),
-            ("VMs", host.run.join("vms")),
-            ("Checkpoints", host.state.join("suspended")),
+        // Checkpoints: stored ones (`checkpoint::store`) and stopped VMs'.
+        for (kind, dirs) in [
+            ("Images", vec![paths.images.join("rootfs")]),
+            ("Templates", vec![paths.templates.clone()]),
+            ("Blobs", vec![paths.images.join("blobs")]),
+            ("VMs", vec![host.run.join("vms")]),
+            ("Checkpoints", vec![crate::checkpoint::store::dir(&host.state), host.state.join("suspended")]),
         ] {
-            output(format_args!("{kind:<16} {:>16}\n", disk_usage(&path, &mut seen)?))?;
+            let bytes = dirs.iter().map(|d| disk_usage(d, &mut seen)).sum::<Result<u64>>()?;
+            output(format_args!("{kind:<16} {bytes:>16}\n"))?;
         }
         return Ok(());
     }
@@ -144,6 +146,77 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
         prune_blobs(&paths)?;
     }
     output(format_args!("Total reclaimed space: {} bytes\n", before.saturating_sub(total()?)))
+}
+
+/// Their `--format` fields.
+const CHECKPOINT_FIELDS: crate::containers::Fields = &[
+    ("Name", "name"),
+    ("ID", "id"),
+    ("VM", "vm"),
+    ("Template", "template"),
+    ("TemplateID", "template_id"),
+    ("Parent", "parent"),
+    ("Size", "size"),
+    ("Created", "created"),
+];
+
+/// `checkpoint ls|rm|prune` (`checkpoint create` is the VM's).
+pub fn checkpoints(args: &Args, operation: &str) -> Result<()> {
+    use crate::checkpoint::store;
+    let host = crate::open_host(args)?;
+    let removed = match operation {
+        "ls" => return list_checkpoints(&host, args),
+        "rm" => store::remove(&host.state, &args.names()[1..], args.has("force"))?,
+        _ => {
+            let before = args.get("older-than").map(|d| -> Result<u64> {
+                let age = crate::util::parse_age(d).ok_or_else(|| format!("bad --older-than {d:?}: give a number and s, m, h or d (24h)"))?;
+                let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+                Ok(since.saturating_sub(age).as_millis() as u64)
+            });
+            let before = before.transpose()?;
+            let older = args.get("older-than").map_or(String::new(), |d| format!(" older than {d}"));
+            confirm(args.has("force"), &format!("every stored checkpoint{older} that no other kept builds on"))?;
+            store::prune(&host.state, before)?
+        }
+    };
+    removed.into_iter().try_for_each(crate::print)
+}
+
+fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {
+    let format = args.get("format").filter(|f| f.trim() != "table").map(|f| crate::containers::Format::parse_with(f, CHECKPOINT_FIELDS)).transpose()?;
+    let mut filters = vec![];
+    for f in args.all("filter") {
+        match f.split_once('=') {
+            Some((k @ ("name" | "vm" | "template"), v)) if !v.is_empty() => filters.push((k.to_string(), v.to_string())),
+            _ => bail!("bad checkpoint filter {f:?}: use name=PART, vm=NAME or template=IMAGE|ID"),
+        }
+    }
+    let s = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let matches = |v: &Value, k: &str, want: &str| match k {
+        "name" => s(v, "name").contains(want),
+        "vm" => s(v, "vm") == want,
+        _ => crate::template::name_of(want).is_ok_and(|n| n == s(v, "template")) || (want.len() >= 4 && s(v, "template_id").starts_with(want)),
+    };
+    let templates = crate::template::images(&Paths::new(&host.state)).unwrap_or_default();
+    let mut rows = crate::checkpoint::store::rows(&host.state, &templates);
+    // A key again: either value.
+    rows.retain(|v| filters.iter().all(|(k, _)| filters.iter().any(|(k2, want)| k2 == k && matches(v, k, want))));
+    if args.has("quiet") {
+        return rows.iter().try_for_each(|v| output(format_args!("{}\n", s(v, "id"))));
+    }
+    if let Some(f) = format {
+        return output(format_args!("{}", f.render(&rows)?));
+    }
+    let row = |c: [&str; 7]| output(format_args!("{:<24} {:<16} {:<24} {:<40} {:<24} {:>8} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6]));
+    row(["NAME", "ID", "VM", "TEMPLATE", "PARENT", "SIZE MiB", "CREATED"])?;
+    for v in &rows {
+        let image = v["template"].as_str().map_or("<none>".into(), crate::template::image_of);
+        let template = format!("{image} ({})", &s(v, "template_id")[..s(v, "template_id").len().min(8)]);
+        let size = (v["size"].as_u64().unwrap_or(0) >> 20).to_string();
+        let name = v["name"].as_str().unwrap_or("<none>");
+        row([name, &s(v, "id"), &s(v, "vm"), &template, &s(v, "parent"), &size, &crate::ago(v["created"].as_u64())])?;
+    }
+    Ok(())
 }
 
 fn prune_vm_record(host: &crate::host::Host, name: &str) -> Result<bool> {

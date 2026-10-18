@@ -244,7 +244,22 @@ def migrate(src, name, dst, timeout=120):
 
 
 def checkpoint(host, name, path, stop=False, incremental=False, timeout=300):
-    return cli_json(host, "checkpoint", name, path, *(["--stop"] if stop else []), *(["--incremental"] if incremental else []), timeout=timeout)
+    """`checkpoint create` into `host`'s store (#775); `path` then links to it there (`rm_ckpt` removes both)."""
+    r = cli_json(host, "checkpoint", "create", name, *(["--stop"] if stop else []), *(["--incremental"] if incremental else []), timeout=timeout)
+    if r["ok"]:
+        os.symlink(r["result"]["dir"], path)
+    return r
+
+
+def store(host):
+    """`host`'s checkpoint store: where checkpoints are staged and published."""
+    return os.path.join(host.state, "checkpoints")
+
+
+def staging(host=None):
+    """The staging directories in `host`'s (A's) store."""
+    d = store(host or A)
+    return [os.path.join(d, f) for f in (os.listdir(d) if os.path.isdir(d) else []) if f.startswith(".flexvm-staging-")]
 
 
 def restore(host, path, name=None, ip=None, paused=False):
@@ -3344,11 +3359,14 @@ def ckpt_path(label):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     path = os.path.join(args.ckpt_dir, label)
     scenario_checkpoints.add(path)
-    subprocess.run(["rm", "-rf", path])
+    rm_ckpt(path)
     return path
 
 
 def rm_ckpt(path):
+    """Removes `path`, and the stored checkpoint it links to (`checkpoint`)."""
+    if os.path.islink(path):
+        subprocess.run(["rm", "-rf", os.path.realpath(path)])
     subprocess.run(["rm", "-rf", path])
 
 
@@ -3504,7 +3522,7 @@ def checkpoint_restore():
     check("checkpoint: TCP echo before", echo(conn, b"before\n"))
     r = ok(checkpoint(A, n, path, stop=True))
     print(f"checkpoint: {r['checkpoint_ms']} ms ({r['data_mib']} MiB data), paused {r['paused_ms']} ms")
-    leftovers = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    leftovers = staging()
     check("checkpoint: published, no partial left", os.path.exists(os.path.join(path, "manifest.json")) and not leftovers, leftovers)
     check("checkpoint --stop: gone from A", wait_for(lambda: n not in vms(A), 10), vms(A).get(n))
     r = ok(restore(B, path))
@@ -3535,9 +3553,6 @@ def checkpoint_fork():
     m = setup(n)
     r = ok(checkpoint(A, n, path))
     check("fork: still running on A", r["state"] == "running" and where(n) == {A: "running"}, where(n))
-    again = checkpoint(A, n, path)
-    check("fork: a checkpoint is never overwritten", not again["ok"] and "already exists" in again["error"], again)
-    check("fork: refused before pausing", where(n) == {A: "running"}, where(n))
     code, _ = sh(A, n, "echo changed >> /tmp/f")
     check("fork: A keeps working", code == 0 and md5(A, n) != m)
     taken = restore(A, path, name="ft-fork2")
@@ -3560,7 +3575,7 @@ def checkpoint_corrupt():
     setup(n)
     ok(checkpoint(A, n, path, stop=True))
     pristine = path + ".orig"
-    subprocess.run(["cp", "-a", path, pristine], check=True)
+    subprocess.run(["cp", "-aL", path, pristine], check=True)
 
     def poke(file, offset):
         with open(f"{path}/{file}", "r+b") as f:
@@ -3615,17 +3630,16 @@ def checkpoint_corrupt():
 
 
 def staged_mib():
-    """Roughly how many MiB of page data checkpoints staged in --ckpt-dir
+    """Roughly how many MiB of page data checkpoints staged in A's store
     have written."""
     n = 0
-    for s in os.listdir(args.ckpt_dir):
-        if s.startswith(".flexvm-staging-"):
-            try:
-                fd = os.open(os.path.join(args.ckpt_dir, s, "ck", "pages"), os.O_RDONLY)
-            except OSError:
-                continue
-            n += sum(any(os.pread(fd, 4096, o)) for o in range(0, os.fstat(fd).st_size, 1 << 20))
-            os.close(fd)
+    for s in staging():
+        try:
+            fd = os.open(os.path.join(s, "ck", "pages"), os.O_RDONLY)
+        except OSError:
+            continue
+        n += sum(any(os.pread(fd, 4096, o)) for o in range(0, os.fstat(fd).st_size, 1 << 20))
+        os.close(fd)
     return n
 
 
@@ -3651,14 +3665,14 @@ def checkpoint_crash():
     check("crash: no checkpoint published", not os.path.exists(path))
     r = restore(B, path, ip="auto")
     check("crash: nothing to restore", not r["ok"], r)
-    partial = [os.path.join(args.ckpt_dir, f, "ck") for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    partial = [os.path.join(f, "ck") for f in staging()]
     check("crash: staging left behind (root-only)", len(partial) == 1, partial)
     for f in partial:
         r = restore(B, f, ip="auto")
         check("crash: the partial directory does not restore", not r["ok"], r)
     m = setup(n, mib=50)
     ok(checkpoint(A, n, path, stop=True))
-    left = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    left = staging()
     check("crash: next checkpoint cleared the debris", not left, left)
     ok(restore(B, path, ip="auto"))
     check("crash: next checkpoint restores", md5(B, n) == m)
@@ -3959,20 +3973,20 @@ def checkpoint_hotplug():
 
 
 def checkpoint_untrusted_dir():
-    """Checkpoints into a user's directory: the files are theirs, nothing is
-    left behind, and a restore never follows a symlink planted in one."""
+    """A checkpoint copied into a user's directory (as v0.1.0 wrote them)
+    restores by its path, but never through a symlink planted in it."""
     n = "ft-user"
     user = int(os.environ.get("SUDO_UID", "65534"))
     d = ckpt_path("user")
     os.makedirs(d)
-    os.chown(d, user, user)
     path = os.path.join(d, "ck")
     setup(n, mib=20)
-    ok(checkpoint(A, n, path, stop=True))
-    st = os.stat(path)
-    check("untrusted dir: checkpoint belongs to the directory's owner", st.st_uid == user, st.st_uid)
-    left = [f for f in os.listdir(d) if f.startswith(".flexvm-staging")]
-    check("untrusted dir: no staging left behind", not left, left)
+    stored = ckpt_path("user-stored")
+    ok(checkpoint(A, n, stored, stop=True))
+    subprocess.run(["cp", "-aL", stored, path], check=True)
+    for root, dirs, files in os.walk(d):
+        for f in [root, *(os.path.join(root, x) for x in files)]:
+            os.chown(f, user, user)
     os.rename(f"{path}/vmstate", f"{path}/vmstate.real")
     os.symlink(f"{path}/vmstate.real", f"{path}/vmstate")
     r = restore(B, path, ip="auto")
@@ -3983,6 +3997,7 @@ def checkpoint_untrusted_dir():
     check("untrusted dir: restores once it is a plain file again", r["ok"], r)
     cleanup(n)
     rm_ckpt(d)
+    rm_ckpt(stored)
 
 
 def resume_failures():
@@ -5122,7 +5137,7 @@ def cow_crash():
     check("cow crash: no checkpoint published", not os.path.exists(path))
     r = restore(B, path, ip="auto")
     check("cow crash: nothing to restore", not r["ok"], r)
-    partial = [os.path.join(args.ckpt_dir, f, "ck") for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    partial = [os.path.join(f, "ck") for f in staging()]
     for f in partial:
         r = restore(B, f, ip="auto")
         check("cow crash: the partial directory does not restore", not r["ok"], r)
@@ -5140,7 +5155,7 @@ def cow_crash():
     ok(run(A, n))
     start_writer(A, n, mib=16)
     ok(checkpoint(A, n, path))
-    left = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    left = staging()
     check("cow crash: next checkpoint cleared the debris", not left, left)
     ok(restore(B, path, name=n + "2", ip="auto"))
     errors, _, out = writer_check(B, n + "2")
@@ -5215,8 +5230,10 @@ def ckpt_incremental():
             time.sleep(1)
     check("incremental: deltas store only what changed", all(r["data_mib"] < res[0]["data_mib"] / 4 for r in res[1:]),
           [r["data_mib"] for r in res])
-    check("incremental: deltas name their parent", [r["parent"] for r in res] == [None, "../ft-inc0", "../ft-inc1"],
+    check("incremental: deltas name their parent", [r["parent"] for r in res] == [None] + ["../" + r["id"] for r in res[:-1]],
           [r["parent"] for r in res])
+    # As stored: the links here are only to restore them by.
+    real = [os.path.realpath(p) for p in paths]
     for i, p in enumerate(paths):
         h = ckhash(A, p)
         check(f"incremental: link {i} == memory at its pause", h["hash"] == res[i]["pause_memhash"] and len(h["chain"]) == i, h)
@@ -5243,20 +5260,20 @@ def ckpt_incremental():
             f.seek(off)
             f.write(b)
     # No delta onto a chain whose older ancestor has gone.
-    os.rename(paths[0], paths[0] + ".moved")
+    os.rename(real[0], real[0] + ".moved")
     r = checkpoint(A, n, paths[2] + "x", incremental=True)
     check("incremental: no delta onto a broken chain", not r["ok"] and "full one" in r["error"] and not os.path.exists(paths[2] + "x"), r)
     check("incremental: VM runs on after the refusal", where(n) == {A: "running"}, where(n))
-    os.rename(paths[0] + ".moved", paths[0])
+    os.rename(real[0] + ".moved", real[0])
     # A replaced parent (same path, other contents) and a missing one.
-    os.rename(paths[1], paths[1] + ".moved")
+    os.rename(real[1], real[1] + ".moved")
     r = restore(B, paths[2], name="ft-inc4", ip="auto")
     check("incremental: missing parent refused", not r["ok"] and "parent" in r["error"], r)
-    subprocess.run(["sudo", "cp", "-a", paths[0], paths[1]], check=True)
+    subprocess.run(["sudo", "cp", "-a", real[0], real[1]], check=True)
     r = restore(B, paths[2], name="ft-inc4", ip="auto")
     check("incremental: replaced parent refused", not r["ok"] and "changed" in r["error"], r)
-    rm_ckpt(paths[1])
-    os.rename(paths[1] + ".moved", paths[1])
+    rm_ckpt(real[1])
+    os.rename(real[1] + ".moved", real[1])
     cleanup(n)
     cleanup("ft-inc4")
     for p in paths:
@@ -5505,33 +5522,6 @@ def ckpt_rearm():
     cleanup(n + "2")
     for x in "abcd":
         rm_ckpt(f"{path}-{x}")
-
-
-
-def ckpt_dir_moved():
-    """The destination's directory is renamed while a checkpoint is written:
-    nothing is published (in either place), and a delta checks its parent in
-    the directory it is written into, not by a path that moved."""
-    n = "ft-moved"
-    top = os.path.join(args.ckpt_dir, "moved")
-    for d in (top, top + "2"):
-        rm_ckpt(d)
-    os.makedirs(top)
-    ok(run(A, n))
-    start_writer(A, n, mib=32)
-    ok(checkpoint(A, n, os.path.join(top, "base")))
-    with armed_fault(A, "ckpt_slow", 120000):
-        res, t = background(lambda: checkpoint(A, n, os.path.join(top, "d1"), incremental=True))
-        wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30)
-        os.rename(top, top + "2")
-        t.join()
-    r = res.get("r", {})
-    check("moved dir: checkpoint refused", not r.get("ok") and "was moved or replaced" in r.get("error", ""), r)
-    check("moved dir: nothing published anywhere", not os.path.exists(os.path.join(top, "d1")) and not os.path.exists(os.path.join(top + "2", "d1")))
-    check("moved dir: VM runs on", where(n) == {A: "running"}, where(n))
-    cleanup(n)
-    for d in (top, top + "2"):
-        rm_ckpt(d)
 
 
 
@@ -8821,7 +8811,7 @@ def revoked_publication():
         path = ckpt_path("revoked")
         r = checkpoint(A, n, path)
         check("revoked checkpoint: refused, nothing left", not r["ok"] and "revoked it" in r["error"] and not os.path.exists(path), r)
-        leftovers = [f for f in os.listdir(os.path.dirname(path)) if f.startswith(".flexvm-staging-")]
+        leftovers = staging()
         check("revoked checkpoint: no staging left", not leftovers, leftovers)
         with armed_fault(A, "revoke_cleanup", 120000):
             seen = len(log(A, n))
@@ -8831,11 +8821,13 @@ def revoked_publication():
             check("revoked, not removed: no manifest left, not listed",
                   os.path.isdir(d) and not os.path.exists(os.path.join(d, "manifest.json")) and n not in [k for k, v in vms(A).items() if not v.get("pid")],
                   os.listdir(d) if os.path.exists(d) else None)
-            left = ckpt_path("revoked-left")
-            r = checkpoint(A, n, left)
+            r = checkpoint(A, n, ckpt_path("revoked-left"))
             check("revoked checkpoint, not removed: reported", not r["ok"] and "removing its directory failed" in r["error"], r)
-            r = restore(A, left, name=n + "-left", ip="auto")
+            left = [os.path.join(store(A), f) for f in os.listdir(store(A)) if len(f) == 16 and not os.path.exists(os.path.join(store(A), f, "manifest.json"))]
+            r = restore(A, left[0], name=n + "-left", ip="auto") if len(left) == 1 else {"ok": True, "left": left}
             check("revoked checkpoint, not removed: does not restore", not r["ok"], r)
+    ok(cli_json(A, "checkpoint", "prune", "--older-than", "3650d", "-f"))
+    check("revoked checkpoint, not removed: the store's next removal clears it", not any(os.path.exists(p) for p in left), left)
     ok(checkpoint(A, n, path))
     suspend(A, n)
     check("revoked: suspends once it can, over what was left", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
@@ -9210,24 +9202,24 @@ def gc_debris():
         if os.path.exists(p):
             os.unlink(p)
     cleanup(n)
-    # A VM process killed during a checkpoint leaves its root-only staging in the checkpoint's directory: gc leaves it
-    # (#329), and the next checkpoint into that directory clears it.
+    # A VM process killed during a checkpoint leaves its root-only staging in the store: gc leaves it
+    # (#329), and the next checkpoint clears it.
     n, d = "ft-gc-ck", ckpt_path("ft-gc-ckdir")
     os.makedirs(d)
     ok(run(A, n))
     with armed_fault(A, "ckpt_slow", 120000):
         t = start_thread(target=lambda: checkpoint(A, n, os.path.join(d, "ck"), timeout=60))
-        staged = lambda: [e for e in os.listdir(d) if e.startswith(".flexvm-staging-")]
-        copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and staged(), 30)
-        check("gc: a checkpoint is staging", copying, (vms(A).get(n), os.listdir(d)))
+        copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and staging(), 30)
+        check("gc: a checkpoint is staging", copying, (vms(A).get(n), staging()))
         signal_vm(A, n, signal.SIGKILL)
         t.join()
     ok(cli_json(A, "debug", "gc"))
-    check("gc: the killed checkpoint's staging stays through a sweep", staged(), os.listdir(d))
+    check("gc: the killed checkpoint's staging stays through a sweep", staging())
     n2 = "ft-gc-ck2"
     ok(run(A, n2))
     ok(checkpoint(A, n2, os.path.join(d, "ck2")))
-    check("gc: the next checkpoint into the directory clears the dead one's staging", not staged() and not os.path.exists(os.path.join(d, "ck")), os.listdir(d))
+    check("gc: the next checkpoint clears the dead one's staging", not staging() and not os.path.exists(os.path.join(d, "ck")), staging())
+    rm_ckpt(os.path.join(d, "ck2"))
     cleanup(n2)
     cleanup(n)
     rm_ckpt(d)
@@ -10050,7 +10042,7 @@ SCENARIOS = dict(
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
     resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=cow_collapsed, unplug_collapsed=no_evict(unplug_collapsed), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
-    ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
+    ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
     leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
     fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,

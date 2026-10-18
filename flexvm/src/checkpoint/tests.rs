@@ -766,3 +766,62 @@ fn reserve_allocates_in_units_up_to_what_is_asked() {
     assert!(allocated(&file) >= 1000 * PAGE_SIZE as u64, "{}", allocated(&file));
     assert_eq!(file.file.metadata().unwrap().len(), 1000 * PAGE_SIZE as u64);
 }
+
+/// A stored checkpoint (`store::dir(state)/ID`), a delta on `parent`'s if given, made at `ms`.
+fn stored(state: &Path, parent: Option<&str>, ms: u64) -> String {
+    let new = store::dir(state).join(".new");
+    let id = link(&new, parent.map(|p| Parent { path: format!("../{p}").into(), id: p.into() }), |m| m.created_unix_ms = ms);
+    fs::rename(&new, store::dir(state).join(&id)).unwrap();
+    id
+}
+
+#[test]
+fn the_store_names_lists_and_removes_dependants_first() {
+    let state = tmp("store");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let ids = || store::list(&state).into_iter().map(|e| e.id).collect::<Vec<_>>();
+    let gone = |id: &str| json!({"deleted": id, "name": null});
+    let (a, d) = (stored(&state, None, 1), stored(&state, None, 4));
+    let b = stored(&state, Some(&a), 2);
+    let c = stored(&state, Some(&b), 3);
+    store::link(&state, "base", &a).unwrap();
+    assert!(store::link(&state, "base", &d).is_err(), "a name is one checkpoint's");
+    assert!(["", ".x", "a/b", &"x".repeat(65)].iter().all(|n| store::check_free(&state, n).is_err()));
+    // Neither staging nor what a removal left is listed (nor anything not named by an id).
+    fs::create_dir_all(store::dir(&state).join(".flexvm-staging-1/ck")).unwrap();
+    link(&store::dir(&state).join(".removed-0123456789abcdef"), None, |_| {});
+    let revoked = store::dir(&state).join("fedcba9876543210");
+    fs::create_dir_all(&revoked).unwrap();
+    fs::write(revoked.join("vmstate"), b"s").unwrap();
+    assert_eq!(ids(), [&a, &b, &c, &d].map(String::clone), "oldest first");
+    let all = store::list(&state);
+    assert_eq!((all[0].name.as_deref(), store::find(&all, "base").unwrap().id.as_str()), (Some("base"), a.as_str()));
+    assert_eq!(store::find(&all, &d[..6]).unwrap().id, d);
+    assert!(store::find(&all, "nope").is_err() && store::find(&all, &d[..3]).is_err(), "a prefix has 4 digits or more");
+    let rows = store::rows(&state, &[json!({"name": "busybox:1.36", "id": "id"})]);
+    assert_eq!(
+        (&rows[0]["template"], &rows[0]["vm"], &rows[1]["parent"], &rows[2]["parent"]),
+        (&json!("busybox:1.36"), &json!("x"), &json!("base"), &json!(b))
+    );
+    // Refused while one not removed with it builds on it; together, dependants go first.
+    let err = store::remove(&state, &["base".into()], false).unwrap_err().to_string();
+    assert!(err.contains("checkpoint base has checkpoints built on it") && err.contains(&b), "{err}");
+    assert_eq!(ids().len(), 4);
+    assert_eq!(store::remove(&state, &[b.clone(), c.clone()], false).unwrap(), [gone(&c), gone(&b)]);
+    assert!(!store::dir(&state).join(".removed-0123456789abcdef").exists() && !revoked.exists(), "a removal clears what an earlier one or a revocation left");
+    // -f: with all that builds on it, transitively; its name goes with it.
+    let b = stored(&state, Some(&a), 5);
+    let c = stored(&state, Some(&b), 6);
+    let removed = store::remove(&state, &["base".into()], true).unwrap();
+    assert_eq!(removed, [gone(&c), gone(&b), json!({"deleted": a, "name": "base"})]);
+    assert_eq!(ids(), [d.clone()]);
+    assert!(fs::read_dir(store::dir(&state).join("names")).unwrap().next().is_none());
+    store::link(&state, "base", &d).unwrap();
+    // prune: what is older, unless a kept one builds on it.
+    let x = stored(&state, None, 10);
+    let y = stored(&state, Some(&x), 20);
+    let z = stored(&state, None, 15);
+    assert_eq!(store::prune(&state, Some(18)).unwrap(), [json!({"deleted": d, "name": "base"}), gone(&z)]);
+    assert_eq!(store::prune(&state, None).unwrap(), [gone(&y), gone(&x)]);
+    assert!(ids().is_empty());
+}

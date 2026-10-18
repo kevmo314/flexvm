@@ -16,6 +16,7 @@ macro_rules! ensure {
 mod chain;
 mod format;
 mod staging;
+pub mod store;
 mod write;
 
 pub use chain::{chain_ids, chain_meta_budget, parent_path, read_manifest, Checkpoint, PageFile, MAX_CHAIN};

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::checkpoint::{read_manifest, Checkpoint, CommitError, Manifest, Staging};
+use crate::checkpoint::{read_manifest, store, Checkpoint, CommitError, Manifest, Staging};
 use crate::host::{fault, Host};
 use crate::template::Template;
 use crate::uffd::{Frozen, Origin};
@@ -146,17 +146,26 @@ impl Proc {
         Ok(())
     }
 
-    /// With `stop` the VM stays paused for the caller to destroy.
-    pub fn checkpoint(&self, _op: &Op, dir: &str, stop: bool, incremental: bool) -> Result<Value> {
+    /// Into flexvm's store (`checkpoint::store`), as `name` if given. With `stop` the VM stays
+    /// paused for the caller to destroy.
+    pub fn checkpoint(&self, _op: &Op, name: Option<&str>, stop: bool, incremental: bool) -> Result<Value> {
         let vm = self.vm();
         let mut t = Phases::new();
-        let staging = Staging::new(Path::new(dir), vm.dir.join("checkpoint.vmstate"))?;
+        let state = &self.host.state;
+        // Shared until it is named: a removal waits, so the parent of a delta stays.
+        let _store = store::lock(state, libc::LOCK_SH)?;
+        name.map(|n| store::check_free(state, n)).transpose()?;
+        let staging = Staging::in_store(&store::dir(state), vm.dir.join("checkpoint.vmstate"))?;
         self.save_spec(&staging)?;
-        let dest = staging.dest().to_path_buf();
         t.mark("prepare");
         let saved = self.save(vm, staging, !stop, incremental, &mut t, || Ok(()));
         self.publish();
         let (m, mut v) = saved?;
+        let id = v["id"].as_str().unwrap_or_default().to_string();
+        let dest = store::dir(state).join(&id);
+        // Taken by another meanwhile: kept unnamed, as the VM may be gone.
+        let name =
+            name.filter(|n| store::link(state, n, &id).inspect_err(|e| crate::log!("vm {}: checkpoint {id} is kept without a name: {e}", vm.name)).is_ok());
         let state = match vm.state() {
             _ if stop => "stopped",
             State::Running => {
@@ -167,6 +176,7 @@ impl Proc {
         };
         let extra = json!({
             "name": vm.name,
+            "checkpoint": name,
             "dir": dest,
             "state": state,
             "checkpoint_ms": ms(t.total()),
@@ -368,10 +378,13 @@ impl Proc {
         ports: Vec<crate::ports::Port>,
     ) -> Result<Value> {
         let mut t = Phases::new();
+        // Until it is open: a stored one's removal waits.
+        let held = store::lock(&self.host.state, libc::LOCK_SH)?;
         let ck = Checkpoint::open(dir)?;
         // Its app's settings and what becomes of it; not the address its original asked for, nor
         // its ports (its original may hold them still): only those this `run` gives.
         let spec = read_spec(dir).map_err(|e| format!("its run settings {}: {e}", dir.join(SPEC).display()))?;
+        drop(held);
         *self.spec.lock().unwrap() = crate::app::RunSpec { ip: None, ports, ..spec };
         t.mark("verify_checkpoint");
         let name = name.unwrap_or(&ck.manifest.name).to_string();
@@ -691,7 +704,7 @@ impl Proc {
             false => None,
             true => {
                 let Some((dir, id)) = vm.last_checkpoint.lock().unwrap().clone().filter(|_| vm.pager.tracking()) else {
-                    bail!("vm {} has no checkpoint to build on: take a full one with flexvm checkpoint NAME DIR first (without --stop) (an incremental checkpoint builds on the last one taken of the vm on this host, since it was last restored or migrated, that the vm ran on after)", vm.name)
+                    bail!("vm {} has no checkpoint to build on: take a full one with flexvm checkpoint create NAME first (without --stop) (an incremental checkpoint builds on the last one taken of the vm on this host, since it was last restored or migrated, that the vm ran on after)", vm.name)
                 };
                 let ck = Checkpoint::open(&dir).map_err(|e| last(&e))?;
                 if ck.id != id {
@@ -853,7 +866,7 @@ impl Proc {
             None => vm.pager.as_ref(),
         };
         let snapshot_discards = vm.snapshot_discards.load(Ordering::SeqCst);
-        let dest = staging.dest().to_path_buf();
+        let (dest, by_id) = (staging.dest().to_path_buf(), staging.by_id());
         let (parent, links) = parent.unzip();
         let pinned = staging.pinned_dir();
         let parent_ref = parent.clone();
@@ -911,6 +924,7 @@ impl Proc {
         let paused = pause.unwrap_or_else(|| paused.elapsed());
         match committed {
             Ok((manifest, id)) => {
+                let dest = if by_id { dest.with_file_name(&id) } else { dest };
                 *vm.last_checkpoint.lock().unwrap() = cow.then(|| (dest, id.clone()));
                 Ok((
                     manifest,

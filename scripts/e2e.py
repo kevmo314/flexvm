@@ -69,7 +69,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "sigkill_restart listen_trickle suspend_cmd suspend_slow_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
-          "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash ckpt_dir_moved "
+          "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash "
           "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log warm_ready forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked restore_route_fence "
           "resume_outcome exec_recovery_instance pause_resume collapse_abort")
 # The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
@@ -298,15 +298,18 @@ class Host:
         """`flexvm rm`: removes a stopped VM; with force (-f) one in any state."""
         return self.cli("rm", *(["-f"] if force else []), vm, check=check)
 
-    def checkpoint(self, vm, path, stop=False, incremental=False):
+    def checkpoint(self, vm, path=None, stop=False, incremental=False, name=None):
+        """`flexvm checkpoint create VM [NAME]`: into this host's store; `path`, if given, links to it there."""
         extra = (["--stop"] if stop else []) + (["--incremental"] if incremental else [])
-        r = json.loads(self.cli("checkpoint", vm, path, *extra).stdout)
+        r = json.loads(self.cli("checkpoint", "create", vm, *([name] if name else []), *extra).stdout)
+        if path:
+            os.symlink(r["dir"], path)
         if stop:
             assert wait_for(lambda: vm not in self.ps(), 30), f"{vm} still listed after checkpoint --stop"
         return r
 
     def restore(self, path, name=None, ip=None):
-        """`flexvm run --checkpoint PATH -d`: a VM from a checkpoint (its name and address unless given)."""
+        """`flexvm run --checkpoint PATH|NAME|ID -d`: a VM from a checkpoint (its name and address unless given)."""
         extra = (["--name", name] if name else []) + (["--ip", ip] if ip else [])
         r = json.loads(self.cli("run", "--checkpoint", path, *extra, "-d").stdout)
         self.vms.add(r["name"])
@@ -793,6 +796,55 @@ def checkpoint_restore():
 
 
 @case
+def checkpoint_store():
+    """checkpoint create/ls/rm/prune (#775): named and incremental checkpoints in STATE/checkpoints, restored by name or id."""
+    vm, forks = "e2e-store", []
+    A.run(vm)
+    m = fill(A, vm)
+    ls = lambda *f: [json.loads(line) for line in A.cli("checkpoint", "ls", "--format", "json", *f).stdout.splitlines()]
+    has = lambda n, f: A.exec(n, f"test -e {f} && echo yes || echo no")[1].strip() == "yes"
+    try:
+        base = A.checkpoint(vm, name="base")
+        check("create: named, published in the store under its id", base["checkpoint"] == "base" and base["dir"] == os.path.join(A.state_dir, "checkpoints", base["id"]), base)
+        r = A.cli("checkpoint", "create", vm, "base", check=False)
+        check("create: a taken name is refused", r.returncode != 0 and "is taken" in r.stderr, r.stderr)
+        r = A.cli("checkpoint", vm, ckpt_dir(vm), check=False)
+        check("checkpoint VM DIR: refused, pointing at create", r.returncode != 0 and "checkpoint create VM" in r.stderr, r.stderr)
+        must(A, vm, "echo 1 > /tmp/one")
+        one = A.checkpoint(vm, name="one", incremental=True)
+        must(A, vm, "echo 2 > /tmp/two")
+        two = A.checkpoint(vm, incremental=True)
+        rows = ls()
+        check("ls: oldest first, with names, parents, VM and template", [(c["name"], c["parent"], c["vm"]) for c in rows] == [("base", None, vm), ("one", "base", vm), (None, "one", vm)]
+              and all(c["template_id"] == A.ps()[vm]["template_id"] and c["size"] > 0 for c in rows), rows)
+        check("ls: -q and --filter", A.cli("checkpoint", "ls", "-q", "--filter", "name=on").stdout.split() == [one["id"]] and not ls("--filter", "vm=nope"))
+        table = A.cli("checkpoint", "ls").stdout
+        check("ls: a table", table.startswith("NAME") and "<none>" in table and two["id"] in table, table)
+        # Restored by name and by an id's start, as forks; each has what its checkpoint had.
+        for i, (what, files) in enumerate([("one", (True, False)), (two["id"][:8], (True, True))]):
+            fork = f"{vm}-{i}"
+            A.restore(what, name=fork, ip="auto")
+            forks.append(fork)
+            check(f"restore {what}: its memory and files", md5(A, fork) == m and (has(fork, "/tmp/one"), has(fork, "/tmp/two")) == files)
+        for what in ("base", "one"):
+            r = A.cli("checkpoint", "rm", what, check=False)
+            check(f"rm {what}: refused while one builds on it", r.returncode != 0 and "built on it" in r.stderr and len(ls()) == 3, r.stderr)
+        A.kill(forks.pop(0))
+        r = A.cli("checkpoint", "rm", "-f", "one")
+        check("rm -f: with what builds on it", [c["name"] for c in ls()] == ["base"] and one["id"] in r.stdout and two["id"] in r.stdout, (r.stdout, ls()))
+        check("rm -f: a VM restored from it runs on", md5(A, forks[0]) == m and has(forks[0], "/tmp/two"))
+        r = A.cli("checkpoint", "prune", check=False)
+        check("prune: asks first, without a terminal refused", r.returncode != 0 and "-f" in r.stderr and len(ls()) == 1, r.stderr)
+        A.cli("checkpoint", "prune", "--older-than", "1h", "-f")
+        check("prune --older-than: newer ones stay", len(ls()) == 1, ls())
+        A.cli("checkpoint", "prune", "-f")
+        check("prune: all of them", not ls(), ls())
+    finally:
+        for n in [vm, *forks]:
+            A.kill(n, check=False)
+
+
+@case
 def suspend_resume():
     """stop (suspend) frees the VM's Firecracker; start brings back process and RAM; rm removes a stopped VM."""
     vm = "e2e-suspend"
@@ -1090,9 +1142,7 @@ def containers():
     e = subprocess.Popen(cli + [renamed, "sh", "-c", "sleep 4; echo exec-done"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
     time.sleep(1)
     A.cli("rename", renamed, moved)
-    path = ckpt_dir(moved)
-    A.cli("checkpoint", moved, path)
-    shutil.rmtree(path, ignore_errors=True)
+    A.cli("checkpoint", "create", moved)
     out, err = e.communicate(timeout=120)
     check("rename: a separate exec client reattaches under the new name", e.returncode == 0 and out == "exec-done\n", (e.returncode, out, err[-500:]))
     sleeping = lambda n: A.exec(n, "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline; echo; done | grep -cx 'sleep 4321 '")[1].strip() == "1"
@@ -1110,8 +1160,7 @@ def containers():
     # Refused while a checkpoint holds the vm.
     fill(A, renamed, 32)
     A.cli("debug", "fault", "ckpt_crawl", "120000")
-    path = ckpt_dir(renamed)
-    ck = threading.Thread(target=lambda: A.cli("checkpoint", renamed, path, check=False, timeout=300))
+    ck = threading.Thread(target=lambda: A.cli("checkpoint", "create", renamed, check=False, timeout=300))
     ck.start()
     try:
         time.sleep(1.5)
@@ -1120,7 +1169,6 @@ def containers():
     finally:
         A.cli("debug", "fault", "ckpt_crawl", "0")
         ck.join()
-    shutil.rmtree(path, ignore_errors=True)
     # rename while stopped: started again under the new name, with its address and processes.
     A.suspend(renamed)
     final = vm + "-final"
@@ -1144,9 +1192,7 @@ def containers():
     A.vms.update({cmd_vm, cmd_new})
     A.cli("run", "--name", cmd_vm, "-d", args.template, "--", "sleep 4; echo cmd-done; exit 4")
     A.cli("rename", cmd_vm, cmd_new)
-    path = ckpt_dir(cmd_new)
-    A.cli("checkpoint", cmd_new, path)
-    shutil.rmtree(path, ignore_errors=True)
+    A.cli("checkpoint", "create", cmd_new)
     check("rename: a command's vm ends with its command, under the new name", A.cli("wait", cmd_new, timeout=120).stdout == "4\n")
     check("rename: its command's output in the new log", "cmd-done\n" in A.cli("logs", cmd_new).stdout)
     # rm (of a running vm, and of a failed one) leaves no status to wait for.
@@ -1760,15 +1806,20 @@ def pull_gc():
         h.rm(vm)
         out = prune()
         check("prune: collected once free", second in out and second not in images(), (second, out))
-        # A checkpoint in STATE/checkpoints (flexvm's own, #775) keeps its generation too.
+        # A stored checkpoint (flexvm's own, #775) keeps its generation too, through prune and rmi.
         third = current()
         h.run(vm, template=name)
-        managed = os.path.join(h.state_dir, "checkpoints")
-        os.makedirs(managed)
-        h.checkpoint(vm, os.path.join(managed, "gc"), stop=True)
+        ck = h.checkpoint(vm, stop=True)
         deleted = pull(4)
-        check("rebuild: a checkpoint's generation stays", deleted == [] and images().get(third, "missing") is None, (third, deleted, images()))
-        shutil.rmtree(managed)
+        check("rebuild: a stored checkpoint's generation stays", deleted == [] and images().get(third, "missing") is None, (third, deleted, images()))
+        out = prune()
+        check("prune: a stored checkpoint's generation stays", third not in out and images().get(third, "missing") is None, (third, out))
+        listed = json.loads(h.cli("checkpoint", "ls", "--format", "json").stdout.splitlines()[0])
+        check("checkpoint ls: its generation is <none> now", listed["template"] is None and listed["template_id"] == third, listed)
+        h.restore(ck["id"], name=vm)
+        check("restore: from a stored checkpoint of a superseded generation", h.ps().get(vm, {}).get("state") == "running", h.ps())
+        h.rm(vm, force=True)
+        h.cli("checkpoint", "rm", ck["id"])
         out = prune()
         check("prune: collected once its checkpoint is gone", third in out and third not in images(), (third, out))
         h.cli("rmi", name)
@@ -1917,7 +1968,7 @@ COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "f
         "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
         "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
-        "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
+        "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "checkpoint_store": 12, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
         "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
         "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,
@@ -1931,7 +1982,7 @@ COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "f
         "faults/pause_cmd_start": 6, "faults/reconcile_announce": 6, "faults/resume_unpause_fail": 6,
         "faults/same_host_hold_route_fail": 6, "faults/standby_lock_timeout": 6, "faults/standby_refill_race": 6,
         "faults/checkpoint_fork": 5, "faults/checkpoint_restore": 5, "faults/ckpt_backlog": 5,
-        "faults/ckpt_dir_moved": 5, "faults/ckpt_rearm": 5, "faults/resume_failures": 5, "faults/resume_kill": 5,
+        "faults/ckpt_rearm": 5, "faults/resume_failures": 5, "faults/resume_kill": 5,
         "faults/source_unpublished": 5, "pause_resume": 5, "faults/bad_preload": 4, "faults/basic": 4,
         "faults/cow_abort": 4, "faults/cow_crash": 4, "faults/ctrl_z_long_op": 4, "faults/handoff_superseded": 4,
         "faults/lost_ack": 4, "faults/meminfo_unreadable": 4, "faults/prepare_fail": 4, "faults/prepared_retry": 4,
