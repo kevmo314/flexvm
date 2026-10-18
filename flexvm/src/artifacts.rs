@@ -1,7 +1,7 @@
 //! The prebuilt patched Firecracker and guest kernel: on first use, a missing `STATE/artifacts/firecracker` or
 //! `vmlinux` is downloaded from the release scripts/versions.sh names (`ARTIFACTS_TAG`), checked against the sha256
-//! scripts/checksums.sha256 pins for it (build.rs), and renamed into place. A file already there is used as it is:
-//! one built with the scripts, or copied in for an offline host. It must match the pin, or be recorded: `NAME.sha256`
+//! scripts/checksums.sha256 pins for it (build.rs), and renamed into place. A file already there must match the pin.
+//! Only a build without a pin accepts a recorded file, built with the scripts or copied in for an offline host: `NAME.sha256`
 //! beside it holds the sha256 of a file the scripts built or verified (scripts/build-firecracker.sh and fetch.sh
 //! write it), which is all a build pinning no release can go by. Anything else (a corrupted or replaced download, a
 //! copy cut short, an older release's) is refused, never run. Every host that
@@ -88,7 +88,7 @@ fn record_path(path: &Path) -> std::path::PathBuf {
     record.into()
 }
 
-/// The file already at `path` must be the pinned one (if this build pins one), or one `record_path` records.
+/// The file already at `path` must match the pin; only without a pin does `record_path` count.
 fn check_existing(path: &Path, asset: &Asset, sha256: Option<&str>) -> Result<()> {
     let got = (|| -> Result<String> {
         let mut f = crate::image::Hashed::new(File::open(path)?);
@@ -96,22 +96,23 @@ fn check_existing(path: &Path, asset: &Asset, sha256: Option<&str>) -> Result<()
         Ok(f.digest().trim_start_matches("sha256:").to_string())
     })()
     .map_err(|e| format!("{}: cannot check its sha256: {e}", path.display()))?;
-    if sha256 == Some(got.as_str()) {
-        return Ok(());
+    if let Some(pin) = sha256 {
+        if got == pin {
+            return Ok(());
+        }
+        bail!("{}: not the pinned {} (sha256 {got}, pinned {pin}), so it is not run. Remove it to download the pinned one.", path.display(), asset.name);
     }
     let record = record_path(path);
     let recorded = std::fs::read_to_string(&record).unwrap_or_default();
     if recorded.lines().any(|l| l.split_whitespace().next() == Some(got.as_str())) {
         return Ok(());
     }
-    let (what, fix) = match sha256 {
-        Some(pin) => (format!("not the pinned {} (sha256 {got}, pinned {pin})", asset.name), "Remove it to download the pinned one; or, if it"),
-        None => (format!("sha256 {got}, and this flexvm build pins no {} release to check it against", asset.name), "If it"),
-    };
     bail!(
-        "{}: {what}, and {} does not record it, so it is not run. {fix} is a file of your own, record it ({} does): \
+        "{}: sha256 {got}, and this flexvm build pins no {} release to check it against, and {} does not record it, \
+         so it is not run. If it is a file of your own, record it ({} does): \
          sha256sum {} > {}",
         path.display(),
+        asset.name,
         record.display(),
         asset.by_hand,
         path.display(),
@@ -143,12 +144,12 @@ fn fetch(url: &str, sha256: &str, path: &Path, mode: u32) -> Result<()> {
         }
         f.flush()?;
         f.sync_all()?;
-        // Recorded first: a build pinning no release (or another release) still runs what this one checked.
+        // A build pinning no release can also run what this one checked.
         let mut r = File::options().write(true).create_new(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(&record_part)?;
         writeln!(r, "{sha256}  downloaded by flexvm from {url}")?;
         r.sync_all()?;
-        std::fs::rename(&record_part, record_path(path))?;
         std::fs::rename(&part, path)?;
+        std::fs::rename(&record_part, record_path(path))?;
         Ok(sync_dir(dir)?)
     })();
     let _ = std::fs::remove_file(&part);
@@ -238,7 +239,33 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_file_must_match_its_pin_or_its_record() {
+    fn a_recorded_download_is_refused_after_the_pin_changes() {
+        let dir = crate::test_util::TempDir::new("artifacts-upgrade");
+        let path = dir.join("firecracker");
+        let old = hex(b"old release");
+        std::fs::write(&path, b"old release").unwrap();
+        std::fs::write(record_path(&path), format!("{old}  downloaded by flexvm from an older release\n")).unwrap();
+        ensure_one(&path, &FIRECRACKER, Some(&old), "http://127.0.0.1:1").unwrap();
+        let pin = hex(b"new release");
+        let error = ensure_one(&path, &FIRECRACKER, Some(&pin), "http://127.0.0.1:1").unwrap_err().to_string();
+        assert!(error.contains(&format!("sha256 {old}, pinned {pin}")), "{error}");
+        assert!(!error.contains("record it"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old release");
+        ensure_one(&path, &FIRECRACKER, None, "http://127.0.0.1:1").unwrap();
+    }
+
+    #[test]
+    fn a_matching_pin_needs_no_matching_record() {
+        let dir = crate::test_util::TempDir::new("artifacts-pinned");
+        let path = dir.join("firecracker");
+        std::fs::write(&path, b"pinned release").unwrap();
+        std::fs::write(record_path(&path), format!("{}  old release\n", hex(b"old release"))).unwrap();
+        check_existing(&path, &FIRECRACKER, Some(&hex(b"pinned release"))).unwrap();
+        assert!(check_existing(&path, &FIRECRACKER, None).is_err());
+    }
+
+    #[test]
+    fn an_existing_file_must_match_its_pin_or_without_one_its_record() {
         let dir = crate::test_util::TempDir::new("artifacts-existing");
         let path = dir.join("firecracker");
         let record = dir.join("firecracker.sha256");
@@ -253,13 +280,14 @@ mod tests {
         std::fs::write(&path, b"patched").unwrap();
         let error = check(Some(&pin)).unwrap_err().to_string();
         assert!(error.contains("not the pinned firecracker") && error.contains(&hex(b"patched")), "{error}");
-        assert!(error.contains("firecracker.sha256") && error.contains("scripts/build-firecracker.sh"), "{error}");
+        assert!(error.contains("Remove it to download the pinned one"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), b"patched");
-        // A record of another file does not let it through; one of this file does, pinned or not.
+        // A record counts only without a pin, and must match the file.
         std::fs::write(&record, format!("{}  firecracker\n", hex(b"other"))).unwrap();
         assert!(check(Some(&pin)).is_err());
+        assert!(check(None).is_err());
         std::fs::write(&record, format!("{}  firecracker\n", hex(b"patched"))).unwrap();
-        check(Some(&pin)).unwrap();
+        assert!(check(Some(&pin)).is_err());
         check(None).unwrap();
         // Unreadable: refused, not trusted.
         std::fs::remove_file(&path).unwrap();

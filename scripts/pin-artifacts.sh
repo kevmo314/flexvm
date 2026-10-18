@@ -25,9 +25,9 @@ ASSETS=(firecracker vmlinux inputs.txt)
 # How long main may name an unpinned ARTIFACTS_TAG: tag, release and pin take well under an hour.
 RELEASE_WINDOW_HOURS=24
 
-# The pinned SHA256 of a URL, if any.
+# The pinned SHA256 of a URL, if any (a URL without a digest is malformed too).
 pinned() {
-  awk -v url="$1" '$2 == url {print $1}' "$checksums"
+  awk -v url="$1" '$2 == url || (NF == 1 && $1 == url) {print $1}' "$checksums"
 }
 
 # What a release is built from, by content: Firecracker's version, the commit its tag names and the patches; the
@@ -73,12 +73,11 @@ in_history() {
 # them); else pending, for how long since ARTIFACTS_TAG came to name it on this branch (its first-parent history:
 # when a pull request merged, not when its commit was written).
 pending() {
-  local tagged status=0 since age tree ours theirs
+  local ours=$1 tagged status=0 since age tree theirs
   tagged=$(tag_commit) || status=$?
   if [ "$status" = 1 ]; then return 1; fi
   if [ "$status" = 0 ]; then
     in_history "$tagged" || return 1
-    ours=$(inputs) || return 1
     tree=$(mktemp -d)
     if ! { git -C "$root" archive "$tagged" .github scripts firecracker | tar -x -C "$tree"; } ||
       ! theirs=$("$tree/scripts/pin-artifacts.sh" --inputs); then
@@ -114,14 +113,20 @@ case "${1:-}" in
     ;;
   --check)
     # This checkout's inputs must be well-formed whatever the release's state.
-    inputs > /dev/null || exit 1
+    ours=$(inputs) || exit 1
     pins=0
     for asset in "${ASSETS[@]}"; do
-      if [[ $(pinned "$ARTIFACTS_URL/$asset") =~ ^[[:xdigit:]]{64}$ ]]; then pins=$((pins + 1)); fi
+      checksum=$(pinned "$ARTIFACTS_URL/$asset")
+      if [[ $checksum =~ ^[[:xdigit:]]{64}$ ]]; then
+        pins=$((pins + 1))
+      elif [ -n "$checksum" ]; then
+        echo "Malformed SHA256 for $ARTIFACTS_URL/$asset in scripts/checksums.sha256" >&2
+        exit 1
+      fi
     done
     if [ "$pins" = 0 ]; then
       status=0
-      pending || status=$?
+      pending "$ours" || status=$?
       exit "$status"
     fi
     if [ "$pins" != "${#ASSETS[@]}" ]; then
@@ -129,7 +134,6 @@ case "${1:-}" in
       exit 1
     fi
     want=$(pinned "$ARTIFACTS_URL/inputs.txt")
-    ours=$(inputs) || exit 1
     if [ "$(printf '%s\n' "$ours" | sha256sum | cut -d' ' -f1)" != "$want" ]; then
       echo "The pinned release $ARTIFACTS_TAG was built from other inputs than this checkout's (scripts/pin-artifacts.sh --inputs): bump ARTIFACTS_TAG in scripts/versions.sh in the same change (RELEASING in README.md)" >&2
       exit 1
@@ -145,15 +149,19 @@ case "${1:-}" in
 esac
 
 command -v gh > /dev/null || { echo "pinning needs gh (GitHub CLI) to verify the assets' build provenance" >&2; exit 1; }
-work=$(mktemp -d)
+work=
 trap 'rm -rf -- "$work"' EXIT
+work=$(mktemp -d)
 for asset in "${ASSETS[@]}"; do
   echo "downloading $ARTIFACTS_URL/$asset"
   # Never executable: nothing downloaded here is run.
   curl -fsSL -o "$work/$asset" "$ARTIFACTS_URL/$asset"
   chmod 644 "$work/$asset"
 done
-tagged=$(tag_commit) || { echo "no tag $ARTIFACTS_TAG in $REPO" >&2; exit 1; }
+status=0
+tagged=$(tag_commit) || status=$?
+if [ "$status" = 2 ]; then echo "no tag $ARTIFACTS_TAG in $REPO" >&2; fi
+if [ "$status" != 0 ]; then exit 1; fi
 in_history "$tagged"
 # Each asset must have been built by this repository's release workflow, from this tag at that commit, on a
 # GitHub-hosted runner.
