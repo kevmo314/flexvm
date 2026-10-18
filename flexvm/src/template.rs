@@ -1714,6 +1714,10 @@ mod tests {
         mem.write_all_at(&[9u8; PAGE_SIZE], 40 * PAGE_SIZE as u64).unwrap();
         f.meta.identify(&f.paths, &f.dir).unwrap();
         f.write_meta(&f.meta, &f.dir);
+        // Recorded, as scripts/build-firecracker.sh records its build: `artifacts::ensure` runs no other unpinned one.
+        use sha2::Digest;
+        let sum = format!("{:x}  firecracker\n", sha2::Sha256::digest(std::fs::read(&f.paths.firecracker).unwrap()));
+        std::fs::write(f.dir.join("firecracker.sha256"), sum).unwrap();
         let tpl = f.open().unwrap();
         let mut buf = vec![];
         assert_eq!(send(&tpl, &mut buf).unwrap(), 2 * PAGE_SIZE as u64 + std::fs::metadata(&f.meta.rootfs).unwrap().len() + rootfs_named.len() as u64 + 15);
@@ -1795,6 +1799,8 @@ mod tests {
         let (_other, mut paths) = elsewhere(&f);
         paths.firecracker = paths.templates.join("firecracker");
         std::fs::write(&paths.firecracker, "another build").unwrap();
+        use sha2::Digest;
+        std::fs::write(paths.templates.join("firecracker.sha256"), format!("{:x}  firecracker\n", sha2::Sha256::digest("another build"))).unwrap();
         let e = receive(&paths, &mut &buf[..], id).err().unwrap().to_string();
         assert!(e.contains("another Firecracker"), "{e}");
     }
