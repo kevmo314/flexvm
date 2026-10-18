@@ -414,33 +414,35 @@ impl Root {
         if depth > 40 {
             bail!("too many levels of symbolic links creating {rel:?}");
         }
-        let mut cur = rel.to_path_buf();
-        let mut tail = Vec::new();
-        let mut fd = loop {
-            match self.resolve(&cur) {
-                Ok(fd) => break fd,
-                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
-                Err(e) => bail!("resolve {cur:?}: {e}"),
-            }
-            tail.push(cur.file_name().ok_or("missing image root")?.to_os_string());
-            cur.pop();
-        };
-        for c in tail.iter().rev() {
-            let name = cpath(Path::new(c))?;
+        match self.resolve(rel) {
+            Ok(fd) => return Ok(fd),
+            Err(e) if e.raw_os_error() != Some(libc::ENOENT) => bail!("resolve {rel:?}: {e}"),
+            Err(_) => {}
+        }
+        let mut cur = PathBuf::new();
+        let mut fd = self.resolve(&cur)?;
+        for c in rel.components() {
+            let name = cpath(c.as_ref())?;
             cur.push(c);
-            self.check_entry_limit()?;
-            if unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
-                self.entries += 1;
-            } else {
-                // A dangling symlink (say var/run -> /run): create its target, as container runtimes do.
-                let mut buf = vec![0u8; 4096];
-                let n = unsafe { libc::readlinkat(fd.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-                check(n as i32, "mkdir", &cur)?;
-                // Relative to where the link really is, which a symlinked parent may have moved.
-                let target = self.real(&fd)?.join(OsStr::from_bytes(&buf[..n as usize]));
-                self.mkdir_p(&lexical(&target), depth + 1)?;
-            }
-            fd = self.resolve(&cur)?;
+            fd = match self.resolve(&cur) {
+                Ok(next) => next,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    self.check_entry_limit()?;
+                    if unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
+                        self.entries += 1;
+                    } else {
+                        // A dangling symlink (say var/run -> /run): create its target, as container runtimes do.
+                        let mut buf = vec![0u8; 4096];
+                        let n = unsafe { libc::readlinkat(fd.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+                        check(n as i32, "mkdir", &cur)?;
+                        // Relative to where the link really is, which a symlinked parent may have moved.
+                        let target = self.real(&fd)?.join(OsStr::from_bytes(&buf[..n as usize]));
+                        self.mkdir_p(&lexical(&target), depth + 1)?;
+                    }
+                    self.resolve(&cur)?
+                }
+                Err(e) => bail!("resolve {cur:?}: {e}"),
+            };
         }
         Ok(fd)
     }
@@ -894,6 +896,15 @@ pub(super) mod tests {
         s.open().apply_layer(&tar[..]).unwrap();
         assert_eq!(s.read("x/run/pid").as_deref(), Some("1"));
         assert!(!s.root.join("run").exists());
+    }
+
+    #[test]
+    fn a_dangling_target_may_create_what_comes_next() {
+        let s = Sandbox::new("dangling-creates-next");
+        // `n/a` is really `n/n/n` (`e/..` is the root) but is created as spelled, `n/n/n/n`: then `n/a/n` exists.
+        let tar = layer(&[("e/", 'd', ""), ("n/y", 'l', "/e"), ("n/a", 'l', "y/../n/n/n"), ("n/a/n/f", 'f', "1")]);
+        s.open().apply_layer(&tar[..]).unwrap();
+        assert_eq!(s.read("n/n/n/n/f").as_deref(), Some("1"));
     }
 
     #[test]
