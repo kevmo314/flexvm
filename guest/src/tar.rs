@@ -278,6 +278,8 @@ fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>) -> io::Resu
     match node.kind() {
         libc::S_IFDIR => {
             let (d, st) = node.read().map_err(|e| with(path.display(), e))?;
+            // One descriptor per level of the walk: the directory's, which its entries are opened from.
+            drop(node);
             let entries = names(&d).map_err(|e| with(path.display(), e))?;
             let h = header(&st, name);
             let mut dir = h.clone();

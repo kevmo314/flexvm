@@ -1313,11 +1313,24 @@ def interactive():
         time.sleep(1)
         check("attach: ends once its vm is replaced", att.returncode != 0, (att.returncode, err[-500:]))
         check("attach: the new vm under the name gets none of its stdin", A.exec(vm, "test -e /tmp/leaked")[0] != 0)
+        # Replaced by one that has exited already: its status is not this attach's.
+        att = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "attach", vm], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=ENV)
+        att.stdin.write(b"touch /tmp/second\n")
+        att.stdin.flush()
+        check("attach -i: stdin reaches the second app", wait_for(lambda: A.exec(vm, "test -e /tmp/second")[0] == 0, 30))
+        os.kill(att.pid, signal.SIGSTOP)
+        A.kill(vm)
+        A.cli("run", "--name", vm, "-d", t, "true")
+        check("the replacement exited", wait_for(lambda: A.ps().get(vm, {}).get("state") == "exited", 30), A.ps().get(vm))
+        os.kill(att.pid, signal.SIGCONT)
+        _, err = att.communicate(timeout=60)
+        check("attach: not the replacement's status", att.returncode != 0 and b"made again" in err, (att.returncode, err[-500:]))
     finally:
         if att.poll() is None:
             att.kill()
             att.wait()
-    A.kill(vm)
+    A.rm(vm, force=True)
 
     # run -d -it, then attach; detach and attach again; on B after a migration.
     vm = "e2e-attach"

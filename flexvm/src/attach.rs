@@ -336,12 +336,12 @@ pub fn detach_later() {
 struct Pinned {
     host: Host,
     name: String,
-    vm: Arc<Mutex<Option<crate::Instance>>>,
+    pin: Arc<Mutex<crate::Pin>>,
 }
 
 impl Pinned {
     fn name(&self) -> String {
-        crate::current_name(&self.host, &self.name, *self.vm.lock().unwrap())
+        self.pin.lock().unwrap().name(&self.host, &self.name)
     }
 
     fn alive(&self) -> bool {
@@ -349,9 +349,10 @@ impl Pinned {
     }
 
     fn connect(&self, req: &Value) -> Result<UnixStream> {
-        let mut vm = *self.vm.lock().unwrap();
-        let c = crate::connect_same(&self.host, &self.name(), req, Instant::now() + Duration::from_secs(5), &mut vm);
-        *self.vm.lock().unwrap() = vm;
+        let name = self.name();
+        let mut pin = self.pin.lock().unwrap().clone();
+        let c = crate::connect_same(&self.host, &name, req, Instant::now() + Duration::from_secs(5), &mut pin);
+        *self.pin.lock().unwrap() = pin;
         c
     }
 }
@@ -372,11 +373,19 @@ fn open(vm: &Pinned, req: &Value) -> Result<BufReader<UnixStream>> {
 /// Why attaching to the VM can go on no more, its VM process gone: its app's status if it exited.
 fn gone(vm: &Pinned) -> Result<i32> {
     let (host, name) = (&vm.host, &vm.name());
+    // The process last reached: only its own end is told (one made again under the name since may have ended too).
+    let process = vm.pin.lock().unwrap().process.clone();
+    let last = crate::containers::exit_record(host, name).map(|e| e.ident);
+    if process.is_some() && last.is_some() && last != process {
+        bail!("vm {name} was killed and made again since this attached; the vm it attached to is gone");
+    }
     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
         bail!("vm {name} moved to {to}; attach to it there");
     }
     if let Ok(rec) = crate::app::Exited::read(&host.vms(name, "exited")?) {
-        return Ok(rec.status);
+        if process.is_none() || last == process {
+            return Ok(rec.status);
+        }
     }
     if host.is_suspended(name) {
         bail!("vm {name} was stopped; flexvm start {name}, then attach again");
@@ -399,7 +408,7 @@ fn ended(vm: &Pinned) -> bool {
 /// `attach NAME`, and a foreground `run -i`/`-t` (from 0): the app's output from `from` (None: from now on),
 /// and stdin to it if it was run with `-i`, until it exits (its status) or the client detaches.
 pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
-    let vm = Pinned { host: host.clone(), name: name.to_string(), vm: Arc::default() };
+    let vm = Pinned { host: host.clone(), name: name.to_string(), pin: Arc::default() };
     let stream = u64::from_str_radix(&util::random_hex(8)?, 16)?;
     let stdin_req = json!({"op": "stdin", "stream": stream});
     let handshake = open(&vm, &stdin_req).and_then(|mut first| match guest::read_frame(&mut first)? {
@@ -699,6 +708,23 @@ mod tests {
         // Nothing at all: an error still; and `attach NAME` to a VM that ended before, as docker's.
         assert!(attach(&host, "never", Some(0)).is_err());
         assert!(attach(&host, "fast", None).is_err());
+    }
+
+    #[test]
+    fn an_attach_never_takes_a_replacements_status_for_its_vms() {
+        let root = crate::test_util::TempDir::new("attach-replaced");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let ours = crate::host::Ident { pid: 999_999_901, start: 1, boot: crate::host::boot_id().into() };
+        let vm = Pinned { host: host.clone(), name: "web".into(), pin: Arc::default() };
+        vm.pin.lock().unwrap().process = Some(ours.clone());
+        let rec = crate::app::Exited::new(0, "t".into(), None, Default::default(), Default::default(), 0);
+        crate::host::write_record(&host.vms("web", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
+        // Killed, then another VM made under the name exited: its records are not this attach's VM's.
+        crate::containers::record_exit(&host, "web", &crate::host::Ident { pid: 999_999_902, ..ours.clone() }, 0);
+        assert!(gone(&vm).unwrap_err().to_string().contains("made again"));
+        // Its own end: its status.
+        crate::containers::record_exit(&host, "web", &ours, 0);
+        assert_eq!(gone(&vm).unwrap(), 0);
     }
 
     #[test]
