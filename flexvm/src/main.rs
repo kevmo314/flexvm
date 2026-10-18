@@ -382,6 +382,9 @@ fn check_applies(args: &Args) -> Result<()> {
     if !args.rest.is_empty() && cmd != "run" && cmd != "exec" {
         bail!("{cmd} takes no -- CMD");
     }
+    if cmd == "run" && args.has("keep") && !args.rest.is_empty() {
+        bail!("--keep applies to the image's app: with CMD, the vm ends with CMD");
+    }
     if cmd == "start" && args.has("attach") && args.names().len() > 1 {
         bail!("start -a takes one NAME");
     }
@@ -2004,15 +2007,13 @@ mod exec_tests {
 
     #[test]
     fn run_takes_app_settings_and_kill_a_signal() {
-        let a = parse(&["run", "-e", "A=1", "--env", "B=2", "--env-file", "f", "--entrypoint", "[\"sh\", \"-c\"]", "--keep", "--rm", "-d", "img", "-e", "x"]);
+        let a = parse(&["run", "-e", "A=1", "--env", "B=2", "--env-file", "f", "--entrypoint", "[\"sh\", \"-c\"]", "--rm", "-d", "img", "-e", "x"]);
         check_applies(&a).unwrap();
-        assert_eq!((a.all("env"), a.get("env-file"), a.has("keep"), a.has("rm")), (vec!["A=1".to_string(), "B=2".into()], Some("f"), true, true));
+        assert_eq!((a.all("env"), a.get("env-file"), a.has("rm")), (vec!["A=1".to_string(), "B=2".into()], Some("f"), true));
+        assert!(parse(&["run", "--keep", "img"]).has("keep") && check_applies(&parse(&["run", "--keep", "img"])).is_ok());
         assert_eq!(a.rest, ["-e", "x"], "after IMAGE, the command's");
         // A detached run's VM process parses its words again.
-        assert_eq!(
-            a.child_args,
-            ["run", "-e", "A=1", "--env", "B=2", "--env-file", "f", "--entrypoint", "[\"sh\", \"-c\"]", "--keep", "--rm", "img", "-e", "x"]
-        );
+        assert_eq!(a.child_args, ["run", "-e", "A=1", "--env", "B=2", "--env-file", "f", "--entrypoint", "[\"sh\", \"-c\"]", "--rm", "img", "-e", "x"]);
         let spec = run_spec(&parse(&["run", "-e", "A=1", "-e", "FLEXVM_TEST_UNSET_VAR", "--entrypoint", "sleep 1", "img"]), None).unwrap();
         assert_eq!(spec, app::RunSpec { env: vec!["A=1".into()], entrypoint: Some(vec!["sleep".into(), "1".into()]), ..Default::default() });
         let dir = test_util::TempDir::new("env-file-flag");
@@ -2034,6 +2035,7 @@ mod exec_tests {
         assert!(err(&["run", "--checkpoint", "/d", "-e", "A=1"]).unwrap().contains("--checkpoint"));
         assert!(err(&["run", "--checkpoint", "/d", "--keep"]).unwrap().contains("--checkpoint"));
         assert!(err(&["pull", "img", "--keep"]).is_some());
+        assert!(err(&["run", "--keep", "img", "make"]).unwrap().contains("CMD"));
     }
 
     #[test]

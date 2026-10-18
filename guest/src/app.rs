@@ -76,7 +76,8 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
         crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Duration::from_secs(5));
     }
     let reply = match verb {
-        "APP" => start(arg, statuses).map(|pid| format!("ok {pid}")),
+        // `applied`: the run's settings were (an older agent ignored them).
+        "APP" => start(arg, statuses).map(|pid| format!("ok {pid}{}", if arg.trim().is_empty() { "" } else { " applied" })),
         "APPSTATUS" => Ok(APP.lock().unwrap().status()),
         "CHECK" => check(arg, statuses),
         "SIGNAL" => signal(arg, statuses),
