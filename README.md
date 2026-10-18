@@ -149,9 +149,11 @@ flexvm exec -d -e MODE=worker -w /srv -u app:staff web ./worker
 arguments. Options go before NAME: `-d` / `--detach` starts the command and returns
 0 without output; `-e` / `--env K=V` is repeatable; `-w` / `--workdir DIR` and
 `-u` / `--user USER[:GROUP]` override the image defaults for this command.
-Users and groups are resolved inside the guest, including supplementary groups
-when no explicit group is given. Exec inherits the image's environment and
-working directory. Use `sh -c '...'` for pipelines, redirects and shell syntax.
+Users and groups are resolved inside the guest as `pull` resolves the image's
+`User` (a numeric uid or gid need no entry; supplementary groups only without an
+explicit group), and `-u` sets `HOME` to that user's. Exec otherwise runs as the
+image's user, with its environment and working directory. Use `sh -c '...'` for
+pipelines, redirects and shell syntax.
 
 As with ssh, the words of `run IMAGE CMD` are joined with spaces for the guest's
 shell, so quote a command that has its own quoting:
@@ -251,7 +253,8 @@ could not start the VM (or gave it up; also for `run -d` and `start`), 124
 when the VM died under it (`flexvm ps -a` then shows it `failed`, and `ps -a
 --json` why, until `flexvm rm`). For a VM with neither they are the same, so a script
 can tell a VM that never ran (125) from one that did. `flexvm exec` returns
-the command's status, or 125 for flexvm's own failures. Other commands exit
+the command's status, 127 when it is not found, 126 when it cannot be run (or
+its `-u` user or `-w` directory is missing), or 125 for flexvm's own failures. Other commands exit
 1 when they fail.
 
 `flexvm reclaim IP` explains the loan and prints `flexvm reclaim IP --force GEN`

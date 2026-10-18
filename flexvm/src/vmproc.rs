@@ -1395,10 +1395,10 @@ impl Proc {
     fn exec(&self, req: &Value, c: UnixStream) {
         let mut w = &c;
         let vm = self.vm();
-        let cmd = guest::command_body(&req["cmd"]);
         let action = req["action"].as_str().unwrap_or("start");
         let action = if action == "start" && req["cmd"].is_object() { "argv" } else { action };
         let started = vm.exec(|s| {
+            let cmd = if matches!(action, "start" | "argv") { guest::command_body(&req["cmd"])? } else { String::new() };
             let id = req["session"].as_str().ok_or("missing session id")?;
             guest::session(s, action, id, req["offset"].as_u64().unwrap_or(0), &cmd, guest::TIMEOUT)
         });

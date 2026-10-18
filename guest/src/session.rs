@@ -489,15 +489,9 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
 
 type Attached = (Session, u64);
 
-#[derive(serde::Deserialize)]
-struct Exec {
-    argv: Vec<String>,
-    #[serde(default)]
-    env: Vec<String>,
-    workdir: Option<String>,
-    user: Option<String>,
-    #[serde(default)]
-    detach: bool,
+/// The refusal of a command that cannot be run, carrying the status its client exits with.
+pub(crate) fn cannot_run(code: i32, e: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("{e}{}{code}", crate::proto::EXIT_STATUS))
 }
 
 fn argv_command(argv: &[String]) -> io::Result<Command> {
@@ -565,7 +559,7 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             }
             table.admit(statuses)?;
             let command = std::str::from_utf8(command).map_err(io::Error::other)?;
-            let spec = argv.then(|| serde_json::from_str::<Exec>(command).map_err(io::Error::other)).transpose()?;
+            let spec = argv.then(|| crate::proto::Exec::decode(command).map_err(io::Error::other)).transpose()?;
             let mut cmd = match &spec {
                 Some(spec) => argv_command(&spec.argv)?,
                 None => shell_command(command)?,
@@ -603,8 +597,16 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             }
             // argv commands also work in images without a shell.
             let (child, exited, token) = spawn_watched(&mut cmd, statuses, true).map_err(|e| {
-                let program = cmd.get_program().to_string_lossy();
-                io::Error::new(e.kind(), format!("cannot run {program}: {e}"))
+                let program = cmd.get_program().to_string_lossy().into_owned();
+                match (&spec, e.kind()) {
+                    // The directory was checked: not found is the program (or its interpreter).
+                    (Some(_), io::ErrorKind::NotFound) => cannot_run(127, format!("cannot run {program}: {e}")),
+                    (Some(_), _) => cannot_run(126, format!("cannot run {program}: {e}")),
+                    (None, kind) => {
+                        let hint = if kind == io::ErrorKind::NotFound { " (does the image have a shell?)" } else { "" };
+                        io::Error::new(kind, format!("cannot run /bin/sh: {e}{hint}"))
+                    }
+                }
             })?;
             table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
             // Attached before any output, so none is overwritten before it is sent.

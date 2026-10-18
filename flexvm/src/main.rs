@@ -1395,7 +1395,13 @@ fn exec_command(args: &Args) -> Result<Value> {
             bail!("exec -e needs K=V: {kv:?}");
         }
     }
-    Ok(json!({"argv": args.rest, "env": env, "workdir": args.get("workdir"), "user": args.get("user"), "detach": args.has("detach")}))
+    // As with docker exec; a relative one would be resolved against a directory the user cannot see.
+    if args.get("workdir").is_some_and(|w| !w.starts_with('/')) {
+        bail!("exec -w needs an absolute path");
+    }
+    let cmd = json!({"argv": args.rest, "env": env, "workdir": args.get("workdir"), "user": args.get("user"), "detach": args.has("detach")});
+    guest::command_body(&cmd)?;
+    Ok(cmd)
 }
 
 /// Reattaches when the connection drops (a checkpoint's pause resets vsock).
@@ -1467,7 +1473,7 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
 
 fn exec_request(host: &Host, name: &str, cmd: &Value, session: &Mutex<Session>, patient: bool) -> Result<i32> {
     // Check the actual wire body before trying the VM.
-    guest::fits(&guest::command_body(cmd))?;
+    guest::fits(&guest::command_body(cmd)?)?;
     let detached = cmd["detach"] == true;
     let id = session.lock().unwrap().id.clone();
     let mut error = String::new();
@@ -1497,7 +1503,7 @@ fn exec_request(host: &Host, name: &str, cmd: &Value, session: &Mutex<Session>, 
                     Ok(Some((guest::FRAME_MSG, m))) if guest::transient(&String::from_utf8_lossy(&m)) => {
                         Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&m).into_owned()))
                     }
-                    Ok(Some((guest::FRAME_MSG, m))) => Err(String::from_utf8_lossy(&m).into_owned().into()),
+                    Ok(Some((guest::FRAME_MSG, m))) => cannot_run(&m, &mut std::io::stderr()),
                     _ => Ok(StreamEnd::Disconnected("lost detached start acknowledgement".into())),
                 };
             }
@@ -1605,6 +1611,19 @@ fn exec_stream<S: util::Timed>(c: S, at: Instant) -> Result<BufReader<S>> {
     Ok(r.s)
 }
 
+/// A refusal before the command started: one that could not be run (`EXIT_STATUS`) is told on
+/// `stderr` and ends with its status, as with docker exec; any other is flexvm's failure.
+fn cannot_run(m: &[u8], stderr: &mut impl Write) -> Result<StreamEnd> {
+    let m = guest::refusal(m);
+    match guest::refusal_status(&m) {
+        Some((code, why)) => {
+            writeln!(stderr, "flexvm: {}", why.strip_prefix("error: ").unwrap_or(why))?;
+            Ok(StreamEnd::Exit(code))
+        }
+        None => Err(m.into()),
+    }
+}
+
 enum StreamEnd {
     Exit(i32),
     Disconnected(String),
@@ -1652,7 +1671,13 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
             guest::FRAME_MSG if !s.started && guest::transient(&String::from_utf8_lossy(&data)) => {
                 return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned()))
             }
-            guest::FRAME_MSG if !s.started => return Err(guest::refusal(&data).into()),
+            guest::FRAME_MSG if !s.started => {
+                let end = cannot_run(&data, stderr);
+                if let Ok(StreamEnd::Exit(code)) = end {
+                    s.exit = Some(code);
+                }
+                return end;
+            }
             guest::FRAME_MSG => return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned())),
             _ => return Err(format!("unknown session frame {kind}").into()),
         }
@@ -2430,6 +2455,26 @@ mod exec_tests {
         assert!(!session.lock().unwrap().started);
         let input = frames(&[(guest::FRAME_MSG, b"error: too many sessions: 64 commands are running or awaiting their client")]);
         assert!(exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).is_err());
+    }
+
+    #[test]
+    fn a_command_that_cannot_run_exits_with_its_status() {
+        for code in [126, 127] {
+            let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
+            let refusal = format!("error: cannot run nope: No such file or directory (os error 2){}{code}", guest::EXIT_STATUS);
+            let input = frames(&[(guest::FRAME_MSG, refusal.as_bytes())]);
+            let mut stderr = Vec::new();
+            let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut stderr, &mut Instant::now()).unwrap();
+            assert!(matches!(end, StreamEnd::Exit(c) if c == code));
+            assert_eq!(session.lock().unwrap().exit, Some(code));
+            assert_eq!(String::from_utf8(stderr).unwrap(), "flexvm: cannot run nope: No such file or directory (os error 2)\n");
+        }
+    }
+
+    #[test]
+    fn exec_needs_an_absolute_workdir() {
+        let e = exec_command(&parse(&["exec", "-w", "srv", "vm", "true"])).unwrap_err();
+        assert!(e.to_string().contains("absolute"), "{e}");
     }
 
     #[test]

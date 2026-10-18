@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::proto::FRAME_LOST;
-use crate::session::{Output, DRAIN};
+use crate::session::{cannot_run, Output, DRAIN};
 use crate::user::resolve_user;
 use crate::{fail, kill_running, mem, msg, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
 
@@ -183,16 +183,28 @@ fn command<S: AsRef<std::ffi::OsStr>>(c: &Conf, argv: &[S]) -> Command {
 }
 
 /// Exec inherits the image's environment, directory and credentials; overrides affect only this child.
+/// A user missing from the guest's /etc/passwd (as pull resolves the image's), or a directory that is
+/// not one, is the command's failure (126), as with docker exec.
 pub(crate) fn configure_exec(cmd: &mut Command, env: &[String], cwd: Option<&str>, user: Option<&str>) -> io::Result<()> {
-    let mut c = config()?.clone();
-    if let Some(user) = user {
-        let (uid, gid, _, groups) =
-            resolve_user(user, &std::fs::read_to_string("/etc/passwd").unwrap_or_default(), &std::fs::read_to_string("/etc/group").unwrap_or_default())?;
-        c.uid = uid;
-        c.gid = gid;
-        c.groups = groups;
-    }
+    let read = |p| std::fs::read_to_string(p).unwrap_or_default();
+    let c = exec_conf(config()?.clone(), cwd, user, &read("/etc/passwd"), &read("/etc/group"))?;
     configure_exec_with(cmd, &c, env, cwd)
+}
+
+fn exec_conf(mut c: Conf, cwd: Option<&str>, user: Option<&str>, passwd: &str, group: &str) -> io::Result<Conf> {
+    if let Some(user) = user {
+        let (uid, gid, home, groups) = resolve_user(user, passwd, group).map_err(|e| cannot_run(126, e))?;
+        (c.uid, c.gid, c.groups) = (uid, gid, groups);
+        // Pull set HOME for the image's user; this one's is the passwd entry's, unless -e names one.
+        c.env.retain(|(k, _)| k != "HOME");
+        c.env.push(("HOME".into(), home));
+    }
+    let dir = cwd.unwrap_or(&c.cwd);
+    if !std::fs::metadata(dir).is_ok_and(|m| m.is_dir()) {
+        let why = std::fs::metadata(dir).map_or_else(|e| e.to_string(), |_| "not a directory".into());
+        return Err(cannot_run(126, format!("cannot change to directory {dir}: {why}")));
+    }
+    Ok(c)
 }
 
 fn configure_exec_with(cmd: &mut Command, c: &Conf, env: &[String], cwd: Option<&str>) -> io::Result<()> {
@@ -513,6 +525,21 @@ mod tests {
         assert_eq!(inherited.get_current_dir().unwrap(), std::path::Path::new("/srv"));
         assert_eq!(c.env[0], ("K".into(), "image".into()));
         assert!(configure_exec_with(&mut Command::new("true"), &c, &["BAD".into()], None).is_err());
+    }
+
+    #[test]
+    fn exec_as_another_user_gets_its_home_and_bad_users_or_directories_cannot_run() {
+        let c = parse_conf("arg /app\nenv HOME=/root\nenv K=v\ncwd /\n").unwrap();
+        let passwd = "nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n";
+        let n = exec_conf(c.clone(), Some("/tmp"), Some("nobody"), passwd, "").unwrap();
+        assert_eq!((n.uid, n.gid, n.groups.clone()), (65534, 65534, vec![65534]));
+        assert_eq!(n.env, [("K".into(), "v".into()), ("HOME".into(), "/nonexistent".into())]);
+        assert_eq!(exec_conf(c.clone(), None, None, passwd, "").unwrap().env, c.env);
+        let status = format!("{}126", crate::proto::EXIT_STATUS);
+        for (cwd, user) in [(Some("/nonexistent-flexvm-dir"), None), (Some("/etc/passwd"), None), (None, Some("missing"))] {
+            let e = exec_conf(c.clone(), cwd, user, passwd, "").err().unwrap();
+            assert!(e.to_string().ends_with(&status), "{e}");
+        }
     }
 
     #[test]

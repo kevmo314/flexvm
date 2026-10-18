@@ -113,9 +113,23 @@ pub fn untimed(r: &BufReader<UnixStream>) -> Result<()> {
     Ok(r.get_ref().set_write_timeout(None)?)
 }
 
-/// Shell strings remain available to internal run/readiness callers.
-pub fn command_body(cmd: &serde_json::Value) -> String {
-    cmd.as_str().map_or_else(|| cmd.to_string(), str::to_owned)
+/// A session's body: a string is a shell command (a VM's main command), an object `exec`'s argv
+/// and options (`Exec`'s fields).
+pub fn command_body(cmd: &serde_json::Value) -> Result<String> {
+    if let Some(s) = cmd.as_str() {
+        return Ok(s.to_owned());
+    }
+    let strings = |k: &str| -> Result<Vec<String>> {
+        cmd[k].as_array().map_or(Ok(vec![]), |a| a.iter().map(|v| v.as_str().map(String::from).ok_or_else(|| format!("bad exec {k}").into())).collect())
+    };
+    let e = Exec {
+        argv: strings("argv")?,
+        env: strings("env")?,
+        workdir: cmd["workdir"].as_str().map(String::from),
+        user: cmd["user"].as_str().map(String::from),
+        detach: cmd["detach"] == true,
+    };
+    Ok(e.encode()?)
 }
 
 pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
@@ -430,7 +444,7 @@ mod tests {
     #[test]
     fn argv_wire_preserves_words_and_checks_serialized_size() {
         let cmd = serde_json::json!({"argv": ["printf", "%s", "a b", "", "$HOME"], "env": ["K=v"], "detach": true});
-        let body = command_body(&cmd);
+        let body = command_body(&cmd).unwrap();
         let stream = std::io::Cursor::new(Vec::new());
         let sent = session_on("argv", "id", 0, &body, |line| {
             assert_eq!(line, format!("ARGV id {}", body.len()));
@@ -439,8 +453,20 @@ mod tests {
         .unwrap()
         .into_inner()
         .into_inner();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&sent).unwrap(), cmd);
-        let too_large = command_body(&serde_json::json!({"argv": ["x".repeat(MAX_BODY)]}));
+        let e = Exec::decode(std::str::from_utf8(&sent).unwrap()).unwrap();
+        assert_eq!(
+            e,
+            Exec { argv: ["printf", "%s", "a b", "", "$HOME"].map(String::from).into(), env: vec!["K=v".into()], detach: true, ..Default::default() }
+        );
+        let e = Exec { argv: vec!["x".into()], workdir: Some("/w".into()), user: Some("1:2".into()), ..Default::default() };
+        assert_eq!(Exec::decode(&e.encode().unwrap()).unwrap(), e);
+        assert!(Exec { argv: vec!["a\0b".into()], ..Default::default() }.encode().is_err());
+        for bad in ["", "a", "\0", "x\0", "dx\0"] {
+            assert!(Exec::decode(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(refusal_status(&format!("error: cannot run x{EXIT_STATUS}127")), Some((127, "error: cannot run x")));
+        assert_eq!(refusal_status("error: busy"), None);
+        let too_large = command_body(&serde_json::json!({"argv": ["x".repeat(MAX_BODY)]})).unwrap();
         assert!(session_on("argv", "id", 0, &too_large, |_| -> Result<BufReader<std::io::Cursor<Vec<u8>>>> { panic!("must not connect") }).is_err());
     }
 
