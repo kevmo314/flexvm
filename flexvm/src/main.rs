@@ -340,7 +340,7 @@ fn main() {
             // A VM process's output may still be in its relays (`output::guard`).
             util::output::drain();
         }
-        std::process::exit(if vm { vmproc::FAILED } else { 1 });
+        std::process::exit(if vm { vmproc::exit_code(&e) } else { 1 });
     }
     util::exit(0)
 }
@@ -1028,7 +1028,7 @@ fn spawn_detached(host: &Host, name: &str, child: &[String], log: &std::fs::File
     drop(w);
     let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", log_path.display()))?;
     if reply["ok"] != json!(true) {
-        return Err(reply["error"].as_str().unwrap_or("failed").to_string().into());
+        return Err(vmproc::start_error(&reply, "failed"));
     }
     Ok(reply["result"].clone())
 }

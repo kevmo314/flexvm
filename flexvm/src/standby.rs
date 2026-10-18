@@ -679,6 +679,12 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 return Ok(Value::Null);
             }
             Err((e, retry)) => {
+                // Its VM ran, then its Firecracker died (#730): it ends as a death, its claimer told so.
+                if p.died_starting() {
+                    let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": false, "died": true}));
+                    crate::log!("standby {template}: claimed as {}: {e}", req["name"].as_str().unwrap_or(""));
+                    p.end_died(op);
+                }
                 p.drop_ports();
                 *p.cmd.lock().unwrap() = None;
                 *p.spec.lock().unwrap() = crate::app::RunSpec::default();
@@ -880,7 +886,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             return Ok(Some((reply["result"].clone(), r.s)));
         }
         if reply["retry"] != json!(true) {
-            bail!("{}", reply["error"].as_str().unwrap_or("claim failed"));
+            return Err(crate::vmproc::start_error(&reply, "claim failed"));
         }
         crate::log!("flexvm: {}; trying another", reply["error"].as_str().unwrap_or(""));
     }

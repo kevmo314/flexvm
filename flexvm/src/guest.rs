@@ -450,6 +450,27 @@ mod tests {
         (stream, line)
     }
 
+    /// #730: a guest call that finds its Firecracker gone (its vsock socket refusing) retries until the VM is
+    /// marked dead (`abandon`), then fails at once saying so, rather than waiting out its deadline.
+    #[test]
+    fn a_retried_call_ends_once_its_firecracker_is_marked_dead() {
+        let (_dir, path, listener) = agent("dead-fc");
+        // Bound and closed: a dead Firecracker's socket, refusing every connect.
+        drop(listener);
+        let retried = || retries().get("START").copied().unwrap_or(0);
+        let before = retried();
+        let uds = path.clone();
+        let call = std::thread::spawn(move || start(&uds, std::net::Ipv4Addr::new(10, 0, 0, 2), None));
+        // Retrying (the counter is shared with other tests, so only growth past `before` is ours or theirs).
+        let deadline = Instant::now() + TIMEOUT;
+        while retried() == before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        abandon(&path);
+        let e = call.join().unwrap().unwrap_err();
+        assert_eq!(e.to_string(), "its firecracker exited", "ended by the death, not its deadline");
+    }
+
     #[test]
     fn run_settings_must_be_applied_by_the_agent() {
         assert_eq!(app_started("ok 42", false).unwrap(), 42);
