@@ -1,5 +1,5 @@
 //! `flexvm bench`: runs (and optionally migrates) fresh VMs and writes per-phase latency
-//! percentiles to `bench/`; `--lifecycle DIR` times pause, checkpoint, restore and suspend.
+//! percentiles to `bench/`; `--lifecycle` times pause, checkpoint, restore and suspend.
 //! VMs are driven as a user would; migrations go to another host on this machine.
 
 use std::io::{Read, Write};
@@ -95,19 +95,9 @@ pub fn run(args: &Args) -> Result<()> {
     let template = &crate::template::name_of(args.get("template").unwrap_or("ubuntu:24.04"))?;
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
     let id = format!("{}-{}", std::process::id(), crate::migrate::migration_id());
-    let (report, suffix) = match args.get("lifecycle") {
-        Some(dir) => {
-            let parent = std::path::absolute(dir)?;
-            std::fs::create_dir_all(&parent)?;
-            let scratch = parent.join(format!("bench-{id}"));
-            std::fs::create_dir(&scratch)?;
-            let report = lifecycle(&hosts, args, template, &scratch, &date, &id);
-            if let Err(e) = std::fs::remove_dir_all(&scratch) {
-                crate::log!("bench: cleanup {}: {e}", scratch.display());
-            }
-            (report, "-lifecycle")
-        }
-        None => (runs(&hosts, args, template, &date, &id), ""),
+    let (report, suffix) = match args.has("lifecycle") {
+        true => (lifecycle(&hosts, args, template, &date, &id), "-lifecycle"),
+        false => (runs(&hosts, args, template, &date, &id), ""),
     };
     let mut report = report?;
     report["date_utc"] = json!(date);
@@ -220,7 +210,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
     Ok(sample)
 }
 
-fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &std::path::Path, date: &str, id: &str) -> Result<Value> {
+fn lifecycle(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<Value> {
     let iterations = args.parse_or::<u64>("iterations", 5)?.max(1);
     let sizes: Vec<u64> = args
         .get("dirty-mib")
@@ -234,9 +224,7 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &std::path::Path, date
         let mut samples = Vec::new();
         for i in 0..iterations {
             let name = format!("lcbench-{id}-{mib}-{i}");
-            let ck = dir.join(&name);
-            let res = trial(h, &name, template, mib, &ck);
-            let _ = std::fs::remove_dir_all(&ck);
+            let res = trial(h, &name, template, mib);
             samples.push(res.map_err(|e| format!("{mib} MiB, trial {}: {e}", i + 1))?);
             crate::log!("bench: {mib} MiB {}/{iterations}", i + 1);
         }
@@ -254,8 +242,8 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &std::path::Path, date
     }))
 }
 
-/// Ten pause/resume cycles, checkpoint --stop, restore on `b`, then suspend and resume.
-fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) -> Result<Value> {
+/// Ten pause/resume cycles, checkpoint --stop, restore on `b` (by its path in `a`'s store), then suspend and resume.
+fn trial(h: &Hosts, name: &str, template: &str, mib: u64) -> Result<Value> {
     h.cli(&h.a, &["run", "--name", name, "-d", template])?;
     let mut owned = OwnedVm { h, name, hosts: vec![&h.a] };
     if mib > 0 && crate::exec(&h.a, name, &json!({"argv": ["sh", "-c", format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null")]}))? != 0 {
@@ -281,7 +269,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     // Signal dispatch, entry/lock reads and the 1 ms state polling interval are included.
     let pause_client = json!({"pause_client": med(&mut p), "resume_client": med(&mut r)});
 
-    let c = crate::vmproc::call(&h.a, name, json!({"op": "checkpoint", "dir": ck, "stop": true}), None)?;
+    let c = crate::vmproc::call(&h.a, name, json!({"op": "checkpoint", "stop": true}), None)?;
     let mut checkpoint = c["timings_ms"].clone();
     checkpoint["paused"] = c["paused_ms"].clone();
     checkpoint["data_mib"] = c["data_mib"].clone();
@@ -294,13 +282,16 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
         t["pull"] = h.pulled(&h.b, name)?;
         Ok(t)
     };
-    let ck = ck.to_string_lossy();
+    let ck = c["dir"].as_str().unwrap_or_default().to_string();
     let mut argv = vec!["run", "--checkpoint", &ck, "--name", name, "-d"];
     if h.to.is_some() || h.a.state != h.b.state || h.a.run != h.b.run {
         // Another host gives it an address of its own (its own is the first host's to give).
         argv.extend(["--ip", "auto"]);
     }
-    let reply = h.cli(&h.b, &argv)?;
+    let reply = h.cli(&h.b, &argv);
+    // Open once restored: its files stay readable.
+    let _ = crate::checkpoint::store::remove(&h.a.state, &[c["id"].as_str().unwrap_or_default().into()], true);
+    let reply = reply?;
     owned.hosts.push(&h.b);
     let restore = restored(reply)?;
 

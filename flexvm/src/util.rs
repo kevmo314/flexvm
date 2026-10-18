@@ -996,6 +996,18 @@ impl Phases {
 }
 
 /// A `Key: value kB` field from a /proc style file, in bytes.
+/// A count of seconds, minutes, hours or days: `90s`, `30m`, `24h`, `7d`.
+pub fn parse_age(s: &str) -> Option<std::time::Duration> {
+    let unit = match s.chars().last()? {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        _ => return None,
+    };
+    s[..s.len() - 1].parse::<u64>().ok()?.checked_mul(unit).map(std::time::Duration::from_secs)
+}
+
 pub fn proc_kb(path: &str, key: &str) -> Option<u64> {
     let s = std::fs::read_to_string(path).ok()?;
     s.lines()

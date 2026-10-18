@@ -310,17 +310,17 @@ VM that is busy, paused or suspended.
 
 - **pause / unpause** stop and restart the vCPUs; memory and devices stay.
   Both take under a millisecond (2 vCPU) to 1.5 ms (24 vCPU).
-- **checkpoint NAME DIR** first waits for any VM still pulling memory (from a
+- **checkpoint create NAME [CKPT]** first waits for any VM still pulling memory (from a
   migration source or its checkpoint), and for virtio-mem to settle (see
   below). It then pauses the VM, quiesces its devices and pager like a
   migration source does, saves the vCPU/device state and writes every page
-  that differs from the template into DIR. Without `--stop` (the
+  that differs from the template into the store (below). Without `--stop` (the
   default) the VM resumes as soon as its memory is write-protected and the
   pages are written copy-on-write while it runs (pause 17–30 ms at any
   size, see below); with `--stop` it stays paused for the write (2–3 GB/s
   here) and is killed. `--incremental` writes only what changed since its
   last checkpoint, as a delta against it.
-- **run --checkpoint DIR** (a restore) works on any host whose template has the same content id.
+- **run --checkpoint CKPT|PATH** (a restore) works on any host whose template has the same content id.
   It loads the verified state (copied to the VM's own run directory) into a
   fresh Firecracker, paused. That Firecracker's pager takes pages from the
   checkpoint's page file: on fault, and in the background (the template's
@@ -397,11 +397,50 @@ VM that is busy, paused or suspended.
   target, which pulls all its pages from the source. Resuming it there
   waits (up to 30 s) for that pull, so it never runs split across hosts.
 
+#### The checkpoint store (#775)
+
+`checkpoint create` writes into `STATE/checkpoints`, flexvm's own
+(`checkpoint::store`), root's and 0700. Each checkpoint is the directory
+`ID`, its manifest's checksum: `Staging::in_store` stages it there as below
+and, once the manifest is written, publishes it under that id
+(`RENAME_NOREPLACE`). A name is a link `names/NAME` to `../ID`, made with
+`symlink` (atomic, never over another) after publication: a name taken
+meanwhile leaves the checkpoint unnamed (logged), as a `--stop` VM is gone
+by then. A delta's parent is `../ID`. Everything listed or referenced is a
+complete `ID` with a manifest: staging (`.flexvm-staging-*`) and removed
+ones (`.removed-ID`) are not ids. Its generation is kept while it is stored
+(`checkpoint::managed`, read by `Host::template_users`).
+
+The store's lock (`checkpoints/.locks/store`, a flock) orders the rest:
+
+- Shared by a VM process from before its checkpoint stages until it is
+  named, so the parent of a delta cannot go while the delta is written
+  (the delta checks its chain again before publishing, as before).
+- Shared by a restore, of the store the checkpoint is in (whichever state's,
+  `store::holding`), from before it opens the checkpoint until it has read it
+  (`Checkpoint::open`, `SPEC`) and opened its template generation (whose use
+  lock then keeps it). From then on it reads only through descriptors, which
+  removal leaves readable.
+- Exclusive for `checkpoint rm` and `prune`. They first delete what an
+  interrupted removal left (`.removed-*`), and any `ID` without a manifest
+  (a revoked publication's leftover: a checkpoint is published whole). Then,
+  per checkpoint, dependants before what they build on: unlink its name
+  durably, rename it `.removed-ID`, fsync the store, delete it. A crash
+  leaves whole chains, perhaps one checkpoint unnamed.
+
+`rm` refuses a checkpoint that one not removed with it builds on
+(`manifest.parent.id`), unless `-f` adds those too, transitively. `prune`
+takes those created before the cutoff (all without one), minus what a kept
+one builds on. `run --checkpoint` takes a name, else an id or a unique start
+of one (4+ digits); an argument with a `/` is a directory, restored as is
+(flexvm 0.1.0 wrote them with `checkpoint VM DIR`, which is refused now).
+
 #### Checkpoint format (versions 2 and 3)
 
-A checkpoint is a directory that is written in full or not at all. The
-destination's directory may belong to an unprivileged user while flexvm
-runs as root, so nothing follows a path that user can change:
+A checkpoint is a directory that is written in full or not at all. Its
+directory is the store's, or for a suspend `STATE/suspended`. The staging
+code still treats it as if it may belong to an unprivileged user (0.1.0 wrote
+checkpoints anywhere), so nothing follows a path that user can change:
 
 - **Staging.** The destination's directory is opened and pinned by fd. Files
   are created with `O_EXCL|O_NOFOLLOW` inside a root-only (0700)
@@ -422,7 +461,8 @@ runs as root, so nothing follows a path that user can change:
 - **Restore.** Every file is opened with `O_NOFOLLOW` and must be a regular
   file.
 - **Leftovers.** A later checkpoint into the same directory clears staging
-  that a dead VM process left behind.
+  that a dead VM process left behind. A revocation's leftover (no manifest),
+  the store's next removal does.
 
 | file | contents |
 |---|---|
@@ -463,14 +503,14 @@ trimmed to what was written. Each writer uses a 1 MiB buffer backed by a
 without enough room, the writer uses an ordinary 1 MiB page-aligned buffer.
 
 An incremental checkpoint (format 3) adds `parent` to the manifest: the
-parent's path (`../NAME` when they share a directory, else absolute) and id
+parent's path (`../NAME` when they share a directory, as in the store, else absolute) and id
 (its manifest's checksum line). Its page map lists only pages that changed
 since the parent's pause, with a third kind, TEMPLATE (the template's page,
 a run only). A restore follows the chain (at most 64 deep), checks each
 link and that it names the template and size its child does, refuses a
 parent that is missing or whose id changed, and flattens the maps: each page
 is read from the newest checkpoint that has it. Deleting or rewriting a
-parent breaks its children.
+parent breaks its children: in the store, `checkpoint rm` refuses it.
 
 #### Copy-on-write and incremental checkpoints
 
@@ -813,12 +853,14 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     name survives, including on timeout or a failed removal.
   - An incoming migration: the target's process, from opening the source's
     content id (`open_id`) until it is a running VM.
-  - A checkpoint restore: the restoring process, from `open_id`. A checkpoint
-    at rest (`checkpoint`, `checkpoint --stop`) does not keep its generation
-    unless it is in `STATE/checkpoints` (flexvm's own, #775: any manifest
-    there, `checkpoint::managed`, read with the VM records): elsewhere, like
-    an exported image, it names it by content id, and restoring it after `rmi`,
-    `image prune` or a rebuilding pull fails.
+  - A checkpoint restore: the restoring process, from `open_id`.
+  - A stored checkpoint (`checkpoint create`): its manifest in
+    `STATE/checkpoints` (any there, removed ones' too, `checkpoint::managed`,
+    read with the VM records). Its VM process (which holds the generation
+    open) publishes it before it lets go. A checkpoint directory elsewhere
+    (0.1.0's, restored by path) does not keep its generation: like an exported
+    image it names it by content id, and restoring it after `rmi`, `image
+    prune` or a rebuilding pull fails.
   - A suspended VM: no process, only its record, the published checkpoint in
     `STATE/suspended/NAME` (a manifest, neither STARTED nor DISCARDED) whose
     manifest names the content id. A suspend publishes it before its process

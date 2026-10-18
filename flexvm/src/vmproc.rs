@@ -1445,7 +1445,7 @@ impl Proc {
                 if stop {
                     self.settle_arrival(&op, crate::lifecycle::DRAIN_WAIT)?;
                 }
-                let v = self.checkpoint(&op, req["dir"].as_str().unwrap_or(""), stop, req["incremental"] == true)?;
+                let v = self.checkpoint(&op, req["name"].as_str(), stop, req["incremental"] == true)?;
                 if stop {
                     self.finish(&op, End::Gone, 0, Some((&mut &c, json!({"ok": true, "result": v}))));
                 }
