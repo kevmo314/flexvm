@@ -296,12 +296,18 @@ fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
     (c.active.elapsed() >= idle).then_some(i)
 }
 
-/// At most `cap` connections.
+/// How many connected forwards have been idle for `idle`: each may make way for one more client.
+fn spare(connections: &[Connection], idle: Duration) -> usize {
+    connections.iter().filter(|c| c.connected && c.active.elapsed() >= idle).count()
+}
+
+/// At most `cap` connected, and as many more connecting as forwards are idle (each replaces one once
+/// connected, as they stay idle; else it stays above the cap until one is).
 fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap: usize, idle: Duration) {
     let mut connections: Vec<Connection> = Vec::new();
     loop {
-        // Idle forwards cannot hold the cap: at it, a waiting client replaces the idlest.
-        let room = if connections.len() < cap || idlest(&connections, idle).is_some() { libc::POLLIN } else { 0 };
+        // Idle forwards cannot hold the cap: at it, a waiting client replaces the idlest once it connects.
+        let room = if connections.len() < cap + spare(&connections, idle) { libc::POLLIN } else { 0 };
         let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, room)).collect();
         for c in &connections {
             fds.push(poll(&c.client, if c.connected { c.out.events(&c.incoming) } else { 0 }));
@@ -335,6 +341,12 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
             }
             !(c.out.shut && c.incoming.shut)
         });
+        // Only now: a replacement whose connect fails closes nothing.
+        while connections.iter().filter(|c| c.connected).count() > cap {
+            let Some(i) = idlest(&connections, idle) else { break };
+            connections.swap_remove(i);
+        }
+        let spare = spare(&connections, idle);
         for (listener, fd) in listeners.iter().zip(&accepting) {
             // Attempts are bounded too: a client whose guest connect fails (EMFILE, say) is dropped,
             // and a flood of them must still let the loop see its stop.
@@ -342,7 +354,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 continue;
             }
             for _ in 0..CONNECTIONS {
-                if connections.len() >= cap && idlest(&connections, idle).is_none() {
+                if connections.len() >= cap + spare {
                     break;
                 }
                 let client = match listener.accept() {
@@ -352,9 +364,6 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 };
                 if let Ok(guest) = connect(target) {
                     if client.set_nonblocking(true).is_ok() {
-                        if let Some(i) = idlest(&connections, idle).filter(|_| connections.len() >= cap) {
-                            connections.swap_remove(i);
-                        }
                         connections.push(Connection {
                             client,
                             guest,
@@ -578,6 +587,40 @@ mod tests {
         connections.push(connection(true, ago(IDLE)));
         connections.push(connection(true, ago(IDLE * 2)));
         assert_eq!(idlest(&connections, IDLE), Some(3));
+    }
+
+    #[test]
+    fn a_replacement_still_connecting_closes_nothing() {
+        const IDLE: Duration = Duration::from_millis(500);
+        let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (addr, target) = (listener.local_addr().unwrap(), SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest.local_addr().unwrap().port()));
+        let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
+        let worker = {
+            let stop = stop.clone();
+            thread::spawn(move || tcp(vec![listener], target, stop.as_fd(), 1, IDLE))
+        };
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        let echo = |c: &mut TcpStream, s: &mut TcpStream| {
+            c.write_all(b"x").unwrap();
+            s.read_exact(&mut [0]).unwrap();
+            s.write_all(b"y").unwrap();
+            c.read_exact(&mut [0]).unwrap();
+        };
+        echo(&mut client, &mut server);
+        // A full accept queue drops further SYNs: the guest connect stays in progress.
+        assert_eq!(unsafe { libc::listen(guest.as_raw_fd(), 0) }, 0);
+        let filler: Vec<_> = (0..4).map_while(|_| TcpStream::connect_timeout(&guest.local_addr().unwrap(), Duration::from_millis(200)).ok()).collect();
+        assert!(filler.len() < 4, "the accept queue never filled");
+        thread::sleep(IDLE * 2);
+        let _waiting = TcpStream::connect(addr).unwrap();
+        thread::sleep(Duration::from_millis(TICK as u64) * 2);
+        echo(&mut client, &mut server);
+        unsafe { libc::write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
+        worker.join_within().unwrap();
     }
 
     #[test]
