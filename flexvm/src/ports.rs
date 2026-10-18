@@ -879,8 +879,13 @@ mod tests {
             active.set_read_timeout(Some(WAIT)).unwrap();
             let (_guest_connection, _) = crate::test_util::accept_tcp(&guest);
             let workers = std::mem::take(&mut f.workers);
+            let at = Instant::now();
             drop(f);
-            wait_until("active forwarding workers to stop", || workers.iter().all(|w| w.is_finished()));
+            while !workers.iter().all(|w| w.is_finished()) {
+                assert!(at.elapsed() < Duration::from_secs(1), "active forwarding workers stayed open");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(at.elapsed() < Duration::from_secs(1));
             for worker in workers {
                 worker.join_within().unwrap();
             }

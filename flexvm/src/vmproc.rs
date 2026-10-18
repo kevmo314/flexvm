@@ -3495,11 +3495,12 @@ mod tests {
                 if armed2.swap(false, Ordering::SeqCst) {
                     // The peer is configured and told after this list is read, before it is used.
                     let (c, a) = (c.clone(), m.get().unwrap().upgrade().unwrap());
+                    let added = c.clone();
                     thread::spawn(move || {
                         c.lock().unwrap().push("b".into());
                         a.tell(vec!["b".into()], json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
                     });
-                    thread::sleep(Duration::from_millis(100));
+                    wait_until("b to be configured before pruning the old list", || added.lock().unwrap().contains(&"b".to_string()));
                 }
                 old
             }),
