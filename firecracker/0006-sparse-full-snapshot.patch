@@ -1,5 +1,5 @@
 diff --git a/src/vmm/src/vstate/memory.rs b/src/vmm/src/vstate/memory.rs
-index 888e8c5..700c117 100644
+index 888e8c5..b88928f 100644
 --- a/src/vmm/src/vstate/memory.rs
 +++ b/src/vmm/src/vstate/memory.rs
 @@ -87,6 +87,8 @@ pub enum MemoryError {
@@ -11,7 +11,7 @@ index 888e8c5..700c117 100644
  }
  
  impl From<vm_memory::VolatileMemoryError> for MemoryError {
-@@ -95,6 +97,43 @@ impl From<vm_memory::VolatileMemoryError> for MemoryError {
+@@ -95,6 +97,46 @@ impl From<vm_memory::VolatileMemoryError> for MemoryError {
      }
  }
  
@@ -19,7 +19,11 @@ index 888e8c5..700c117 100644
 +/// data, in RAM or swapped out. Unlike `mincore(2)`, it tells a swapped-out page from one that was
 +/// never touched or was discarded (`MADV_DONTNEED`/`MADV_REMOVE`).
 +#[derive(Debug)]
-+pub struct PageMap(File);
++pub struct PageMap {
++    file: File,
++    /// One read's entries, 8 bytes per page: reused by every read.
++    entries: Vec<u8>,
++}
 +
 +impl PageMap {
 +    /// Pages per read: 32 MiB of guest memory with 4 KiB pages.
@@ -31,31 +35,30 @@ index 888e8c5..700c117 100644
 +
 +    /// Opens this process's pagemap. Fails where `/proc` is not mounted (e.g. in a jail).
 +    pub fn open() -> io::Result<Self> {
-+        File::open("/proc/self/pagemap").map(Self)
++        Ok(Self {
++            file: File::open("/proc/self/pagemap")?,
++            entries: vec![0; Self::CHUNK * 8],
++        })
 +    }
 +
-+    /// Whether each of the `count` host pages from `addr` holds data, into `out`.
-+    fn backed(&mut self, addr: usize, count: usize, out: &mut Vec<bool>) -> io::Result<()> {
++    /// Whether each of the `count` (at most [`Self::CHUNK`]) host pages from `addr` holds data.
++    fn backed(&mut self, addr: usize, count: usize) -> io::Result<impl Iterator<Item = bool> + '_> {
 +        use std::io::{Read, Seek};
-+        let page_size = host_page_size();
-+        let mut entries = vec![0u8; count * 8];
++        let entries = &mut self.entries[..count * 8];
 +        // pread64 is not in the VMM thread's seccomp filter; lseek and read are.
-+        self.0
-+            .seek(SeekFrom::Start((addr / page_size * 8) as u64))?;
-+        self.0.read_exact(&mut entries)?;
-+        out.clear();
-+        out.extend(entries.chunks_exact(8).map(|e| {
-+            let entry = u64::from_ne_bytes(e.try_into().unwrap());
-+            entry & (Self::PRESENT | Self::SWAPPED) != 0
-+        }));
-+        Ok(())
++        self.file
++            .seek(SeekFrom::Start((addr / host_page_size() * 8) as u64))?;
++        self.file.read_exact(entries)?;
++        Ok(entries.chunks_exact(8).map(|e| {
++            u64::from_ne_bytes(e.try_into().unwrap()) & (Self::PRESENT | Self::SWAPPED) != 0
++        }))
 +    }
 +}
 +
  /// Type of the guest region
  #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
  pub enum GuestRegionType {
-@@ -517,6 +556,53 @@ impl<'a> GuestMemorySlot<'a> {
+@@ -517,6 +559,52 @@ impl<'a> GuestMemorySlot<'a> {
          Ok(())
      }
  
@@ -85,16 +88,15 @@ index 888e8c5..700c117 100644
 +                    .map_err(MemoryError::SeekError)
 +            }
 +        };
-+        let mut pages = Vec::with_capacity(PageMap::CHUNK);
 +        // The current run of pages that all hold data (or all do not), from `start`.
 +        let (mut start, mut backed) = (0, true);
 +        let mut off = 0;
 +        while off < len {
 +            let count = (len - off).div_ceil(page_size).min(PageMap::CHUNK);
-+            pagemap
-+                .backed(addr + off, count, &mut pages)
++            let pages = pagemap
++                .backed(addr + off, count)
 +                .map_err(MemoryError::PageMap)?;
-+            for (i, &page) in pages.iter().enumerate() {
++            for (i, page) in pages.enumerate() {
 +                if page != backed {
 +                    let at = off + i * page_size;
 +                    flush(start, at, backed)?;
@@ -109,7 +111,7 @@ index 888e8c5..700c117 100644
      /// Makes the slot host memory PROT_NONE (true) or PROT_READ|PROT_WRITE (false)
      pub(crate) fn protect(&self, protected: bool) -> Result<(), MemoryError> {
          let prot = if protected {
-@@ -1003,6 +1089,19 @@ where
+@@ -1003,6 +1091,19 @@ where
      /// Dumps all contents of GuestMemoryMmap to a writer.
      fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
  
@@ -129,7 +131,7 @@ index 888e8c5..700c117 100644
      /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
      fn dump_dirty<T: WriteVolatile + std::io::Seek>(
          &self,
-@@ -1105,6 +1204,37 @@ impl GuestMemoryExtension for GuestMemoryMmap {
+@@ -1105,6 +1206,37 @@ impl GuestMemoryExtension for GuestMemoryMmap {
              .map_err(MemoryError::WriteMemory)
      }
  
@@ -167,7 +169,7 @@ index 888e8c5..700c117 100644
      /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
      fn dump_dirty<T: WriteVolatile + std::io::Seek>(
          &self,
-@@ -1581,6 +1711,92 @@ mod tests {
+@@ -1581,6 +1713,92 @@ mod tests {
          assert_eq!(second_region, restored_region);
      }
  

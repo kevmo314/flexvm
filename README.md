@@ -28,7 +28,13 @@ prebuilt: the first command that needs them downloads them into
 `artifacts/` from the release this build pins (`ARTIFACTS_TAG` in
 `scripts/versions.sh`) and checks them against the sha256 pinned in
 `scripts/checksums.sha256`. A file already there is never downloaded or
-replaced.
+replaced. It must match the pin or be recorded: `NAME.sha256` beside it holds
+the sha256 of a file that flexvm downloaded, or that the scripts below built
+or fetched and verified. A build that pins no release (between a release's
+tag and its pin) can go only by the record. Anything else is refused, never
+run: a corrupted or replaced download, a copy cut short, an older release's.
+Remove such a file to download the pinned one. Copying artifacts to another
+host takes the `.sha256` files along.
 
 To build your own, or for a host without network access, put the files in
 `artifacts/` first (the scripts install with sudo; give them `--state DIR`
@@ -40,10 +46,8 @@ for another state directory, then copy it over):
 ```
 
 `FLEXVM_ARTIFACTS_URL` points the download at a mirror of the release (the
-same pins apply). A new release of the artifacts is cut by pushing the tag
-`scripts/versions.sh` names (`.github/workflows/release.yml` builds and
-publishes it), then pinning it with `scripts/pin-artifacts.sh` in a
-follow-up commit.
+same pins apply). How a release is cut: [Releasing the
+artifacts](#releasing-the-artifacts).
 
 The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 
@@ -61,6 +65,40 @@ pulled again.
 
 flexvm runs as root (KVM, userfaultfd, routes, cgroups); commands below
 assume that.
+
+### Releasing the artifacts
+
+A release (`ARTIFACTS_TAG` in `scripts/versions.sh`) is built from what
+`scripts/pin-artifacts.sh --inputs` lists: Firecracker's version, the commit
+its tag names (`FC_COMMIT`; the build refuses any other), the patches, the
+recipe (`.github/workflows/release.yml` and the scripts it runs:
+`scripts/release-assets.sh`, `scripts/build-firecracker.sh`,
+`scripts/fetch.sh`) and the kernel. That list is
+the release's `inputs.txt`, and its assets never change. So a change to any
+of those inputs bumps `ARTIFACTS_TAG` in the same pull request; CI fails it
+otherwise. Then:
+
+1. Merge it. Main now names a pending tag: flexvm builds from it download
+   nothing until step 3 (build.rs warns), and CI warns.
+2. Push the tag at that commit on main:
+   `git tag artifacts-N <commit> && git push origin artifacts-N`.
+   `.github/workflows/release.yml` checks that `versions.sh` there names it,
+   builds the assets with `scripts/release-assets.sh`, attests their build
+   provenance and publishes them.
+3. Run `scripts/pin-artifacts.sh` on main once the release exists. It checks
+   that the tag's commit is in your history, verifies the attestations
+   (release.yml at that tag and commit, on a GitHub-hosted runner), and checks
+   that `inputs.txt` matches the checkout. It then writes the three pins to
+   `scripts/checksums.sha256`. Merge that commit.
+
+CI's "Pinned artifacts release" check fails any change whose inputs differ
+from the pinned release's, or from those at the commit a pending tag names if it is
+tagged already. It also fails if the tag can't be looked up. A pending tag is a
+warning on pull requests. On main (pushes and the nightly run) it is an error
+once more than 24 hours (`RELEASE_WINDOW_HOURS`) have passed since the tag
+was named on main (first-parent history: when the pull request merged). The
+release flow never fails CI: the bump merges with a warning, the tag push
+runs only release.yml, and the pin commit matches.
 
 ## Run a VM
 

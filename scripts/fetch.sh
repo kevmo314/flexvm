@@ -74,10 +74,22 @@ fetched() {
 # Installed to a temporary file of this run's own beside its final path, then
 # renamed into place: an interrupted install never leaves a short file there,
 # and concurrent fetches never rename each other's.
+# Each is recorded first in NAME.sha256 (this file was checked against a pin): flexvm runs a file there only if it is
+# the pinned release's or recorded, and a build pinning no release goes by the record alone.
 place() {
+  record "$3" "$(sha256sum < "$2" | cut -d' ' -f1)" "$4"
   placing=$(sudo mktemp -p "$out" ".$3.XXXXXX")
   sudo install -m "$1" "$2" "$placing"
   sudo mv -T "$placing" "$out/$3"
+  placing=
+}
+
+# NAME.sha256: SHA256, which was checked against URL's pin.
+record() {
+  placing=$(sudo mktemp -p "$out" ".$1.sha256.XXXXXX")
+  printf '%s  fetched by scripts/fetch.sh, checked against the pin of %s\n' "$2" "$3" | sudo tee "$placing" > /dev/null
+  sudo chmod 644 "$placing"
+  sudo mv -T "$placing" "$out/$1.sha256"
   placing=
 }
 
@@ -86,23 +98,26 @@ if [ -z "$only_kernel" ] && ! sudo test -x "$out/firecracker"; then
   if [[ $FC_URL == *.tgz ]]; then
     download firecracker.tgz "$FC_URL"
     tar xzf "$work/firecracker.tgz" -C "$work"
-    place 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
+    place 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker "$FC_URL"
   else
     download firecracker "$FC_URL"
-    place 755 "$work/firecracker" firecracker
+    place 755 "$work/firecracker" firecracker "$FC_URL"
   fi
 fi
 
 if ! fetched vmlinux "$KERNEL_URL"; then
   echo "fetching $KERNEL from $KERNEL_URL"
   download vmlinux "$KERNEL_URL"
-  place 644 "$work/vmlinux" vmlinux
+  place 644 "$work/vmlinux" vmlinux "$KERNEL_URL"
+else
+  # Checked just now (and perhaps fetched before records were kept).
+  record vmlinux "$(pinned "$KERNEL_URL")" "$KERNEL_URL"
 fi
 
 if [ -z "$only_kernel" ] && ! fetched base.squashfs "$CI/ubuntu-24.04.squashfs"; then
   echo "fetching ubuntu-24.04 rootfs"
   download base.squashfs "$CI/ubuntu-24.04.squashfs"
-  place 644 "$work/base.squashfs" base.squashfs
+  place 644 "$work/base.squashfs" base.squashfs "$CI/ubuntu-24.04.squashfs"
 fi
 
 sudo ls -lh "$out"

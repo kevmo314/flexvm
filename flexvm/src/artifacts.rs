@@ -1,8 +1,11 @@
 //! The prebuilt patched Firecracker and guest kernel: on first use, a missing `STATE/artifacts/firecracker` or
 //! `vmlinux` is downloaded from the release scripts/versions.sh names (`ARTIFACTS_TAG`), checked against the sha256
 //! scripts/checksums.sha256 pins for it (build.rs), and renamed into place. A file already there is used as it is:
-//! one built with the scripts, or copied in for an offline host. Every host that migrates VMs to another needs
-//! byte-identical Firecracker; hosts built from the same pins get it.
+//! one built with the scripts, or copied in for an offline host. It must match the pin, or be recorded: `NAME.sha256`
+//! beside it holds the sha256 of a file the scripts built or verified (scripts/build-firecracker.sh and fetch.sh
+//! write it), which is all a build pinning no release can go by. Anything else (a corrupted or replaced download, a
+//! copy cut short, an older release's) is refused, never run. Every host that
+//! migrates VMs to another needs byte-identical Firecracker; hosts built from the same pins get it.
 
 use std::fs::File;
 use std::io::Write;
@@ -54,7 +57,7 @@ pub fn ensure(want: &[(&Path, &Asset)]) -> Result<()> {
 
 fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> Result<()> {
     if path.exists() {
-        return Ok(());
+        return check_existing(path, asset, sha256);
     }
     let Some(sha256) = sha256 else {
         bail!(
@@ -78,6 +81,44 @@ fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> R
     Ok(())
 }
 
+/// Where the sha256 (hex) of a file the scripts built or verified at `path` is recorded: the first word of a line.
+fn record_path(path: &Path) -> std::path::PathBuf {
+    let mut record = path.as_os_str().to_owned();
+    record.push(".sha256");
+    record.into()
+}
+
+/// The file already at `path` must be the pinned one (if this build pins one), or one `record_path` records.
+fn check_existing(path: &Path, asset: &Asset, sha256: Option<&str>) -> Result<()> {
+    let got = (|| -> Result<String> {
+        let mut f = crate::image::Hashed::new(File::open(path)?);
+        std::io::copy(&mut f, &mut std::io::sink())?;
+        Ok(f.digest().trim_start_matches("sha256:").to_string())
+    })()
+    .map_err(|e| format!("{}: cannot check its sha256: {e}", path.display()))?;
+    if sha256 == Some(got.as_str()) {
+        return Ok(());
+    }
+    let record = record_path(path);
+    let recorded = std::fs::read_to_string(&record).unwrap_or_default();
+    if recorded.lines().any(|l| l.split_whitespace().next() == Some(got.as_str())) {
+        return Ok(());
+    }
+    let (what, fix) = match sha256 {
+        Some(pin) => (format!("not the pinned {} (sha256 {got}, pinned {pin})", asset.name), "Remove it to download the pinned one; or, if it"),
+        None => (format!("sha256 {got}, and this flexvm build pins no {} release to check it against", asset.name), "If it"),
+    };
+    bail!(
+        "{}: {what}, and {} does not record it, so it is not run. {fix} is a file of your own, record it ({} does): \
+         sha256sum {} > {}",
+        path.display(),
+        record.display(),
+        asset.by_hand,
+        path.display(),
+        record.display()
+    )
+}
+
 /// `url` into `path`, written to a part of its own beside it and renamed over it once its sha256 checks: a
 /// concurrent download renames identical bytes, and a killed one leaves only its part (removed by a later one).
 fn fetch(url: &str, sha256: &str, path: &Path, mode: u32) -> Result<()> {
@@ -85,7 +126,10 @@ fn fetch(url: &str, sha256: &str, path: &Path, mode: u32) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().ok_or("no file name")?.to_string_lossy().into_owned();
     sweep_parts(dir, &name);
-    let part = dir.join(format!(".{name}.part{}", crate::util::random_hex(8)?));
+    sweep_parts(dir, &format!("{name}.sha256"));
+    let nonce = crate::util::random_hex(8)?;
+    let part = dir.join(format!(".{name}.part{nonce}"));
+    let record_part = dir.join(format!(".{name}.sha256.part{nonce}"));
     let res = (|| {
         let mut f = File::options().write(true).create_new(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(&part)?;
         let mut body = crate::image::Hashed::new(std::io::Read::take(crate::image::download(url, MAX_SIZE)?.into_reader(), MAX_SIZE + 1));
@@ -99,10 +143,16 @@ fn fetch(url: &str, sha256: &str, path: &Path, mode: u32) -> Result<()> {
         }
         f.flush()?;
         f.sync_all()?;
+        // Recorded first: a build pinning no release (or another release) still runs what this one checked.
+        let mut r = File::options().write(true).create_new(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(&record_part)?;
+        writeln!(r, "{sha256}  downloaded by flexvm from {url}")?;
+        r.sync_all()?;
+        std::fs::rename(&record_part, record_path(path))?;
         std::fs::rename(&part, path)?;
         Ok(sync_dir(dir)?)
     })();
     let _ = std::fs::remove_file(&part);
+    let _ = std::fs::remove_file(&record_part);
     res
 }
 
@@ -165,11 +215,13 @@ mod tests {
         ensure_one(&path, &FIRECRACKER, Some(&hex(b"patched firecracker")), &format!("{base}/moved")).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"patched firecracker");
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
-        // There now: never fetched again (the server is gone), whatever its content.
-        std::fs::write(&path, b"built by hand").unwrap();
-        ensure_one(&path, &FIRECRACKER, Some(&hex(b"other")), "http://127.0.0.1:1").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"built by hand");
-        assert_eq!(std::fs::read_dir(dir.join("artifacts")).unwrap().count(), 1);
+        // Recorded beside it, so a build pinning nothing runs it too.
+        let record = std::fs::read_to_string(dir.join("artifacts/firecracker.sha256")).unwrap();
+        assert!(record.starts_with(&format!("{}  downloaded by flexvm from ", hex(b"patched firecracker"))), "{record}");
+        // There now: never fetched again (the server is gone).
+        ensure_one(&path, &FIRECRACKER, Some(&hex(b"patched firecracker")), "http://127.0.0.1:1").unwrap();
+        ensure_one(&path, &FIRECRACKER, None, "http://127.0.0.1:1").unwrap();
+        assert_eq!(std::fs::read_dir(dir.join("artifacts")).unwrap().count(), 2);
     }
 
     #[test]
@@ -183,6 +235,37 @@ mod tests {
         assert!(!path.exists());
         // Nothing left beside it either.
         assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_existing_file_must_match_its_pin_or_its_record() {
+        let dir = crate::test_util::TempDir::new("artifacts-existing");
+        let path = dir.join("firecracker");
+        let record = dir.join("firecracker.sha256");
+        let pin = hex(b"patched firecracker");
+        let check = |pin: Option<&str>| ensure_one(&path, &FIRECRACKER, pin, "http://127.0.0.1:1");
+        std::fs::write(&path, b"patched firecracker").unwrap();
+        check(Some(&pin)).unwrap();
+        // A build pinning nothing can only go by the record.
+        let error = check(None).unwrap_err().to_string();
+        assert!(error.contains("pins no firecracker release") && error.contains("firecracker.sha256"), "{error}");
+        // Cut short, replaced, or built by hand and not recorded: refused, never downloaded over.
+        std::fs::write(&path, b"patched").unwrap();
+        let error = check(Some(&pin)).unwrap_err().to_string();
+        assert!(error.contains("not the pinned firecracker") && error.contains(&hex(b"patched")), "{error}");
+        assert!(error.contains("firecracker.sha256") && error.contains("scripts/build-firecracker.sh"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"patched");
+        // A record of another file does not let it through; one of this file does, pinned or not.
+        std::fs::write(&record, format!("{}  firecracker\n", hex(b"other"))).unwrap();
+        assert!(check(Some(&pin)).is_err());
+        std::fs::write(&record, format!("{}  firecracker\n", hex(b"patched"))).unwrap();
+        check(Some(&pin)).unwrap();
+        check(None).unwrap();
+        // Unreadable: refused, not trusted.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = check(None).unwrap_err().to_string();
+        assert!(error.contains("cannot check its sha256"), "{error}");
     }
 
     #[test]
