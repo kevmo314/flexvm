@@ -71,7 +71,9 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
           "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash ckpt_dir_moved "
           "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log warm_ready forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked restore_route_fence "
-          "resume_outcome exec_recovery_instance pause_resume collapse_abort")
+          "resume_outcome exec_recovery_instance pause_resume collapse_abort "
+          "app_abort arrival_bind_fail back_to_back evict_peer_busy kill_prepare resume_bind_fail resume_migrating rmi_suspend "
+          "standby_claim_cgroupns standby_claim_orphan standby_claim_orphan_migrating standby_refill_mark standby_relief_no_vm")
 # The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
 # never gets its pages, gated deterministically).
@@ -84,6 +86,8 @@ RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd
 # (collapse_ckpt_fail) and a stalled shrink: scheduled, one at a time (--jobs 1).
 HEAVY_FAULTS = ("pages_dead source_killed_basic pull_died kill_source kill_refused_checkpoint quiet_source checkpoint_crash suspend_disk_freed "
                 "cow_reports_held collapse_ckpt_fail shrink_stall evict_no_pingpong evict_grower")
+# SCENARIOS keys in no shard, each with why: the ones another scenario runs as part of itself.
+UNSHARDED = {"source_killed": "heavy's source_killed_basic runs it, then basic"}
 SHARDS = {"pr": FAULTS + " " + RECOVERY_FAULTS, "main": FAULTS, "recovery": RECOVERY_FAULTS, "heavy": HEAVY_FAULTS}
 p.add_argument("--shard", choices=SHARDS, default="main",
                help="pr, main: the cases and those scenarios; recovery, heavy: only the faults case, with those scenarios")
@@ -622,7 +626,8 @@ def app_lifecycle():
 
     # A checkpoint keeps the run's settings: the restored VM follows its --entrypoint app.
     run_d("e2e-app-ck", *entry("echo ck-up; sleep 4; exit 9"))
-    check("checkpoint: the app is up", wait_for(lambda: "ck-up" in A.logs("e2e-app-ck"), 30), A.logs("e2e-app-ck")[-2000:])
+    # A whole line: flexvm-init's "started" line quotes the command, ck-up and all.
+    check("checkpoint: the app is up", wait_for(lambda: "ck-up" in A.logs("e2e-app-ck").splitlines(), 30), A.logs("e2e-app-ck")[-2000:])
     ck = ckpt_dir("app-ck")
     A.checkpoint("e2e-app-ck", ck, stop=True)
     A.restore(ck, name="e2e-app-ck2", ip="auto")
@@ -1044,16 +1049,31 @@ def containers():
     A.suspend(other)
     check("wait: a stopped vm's status", waiter.communicate(timeout=60)[0] == "143\n")
     check("wait: of a stopped vm, at once", A.cli("wait", other, timeout=10).stdout == "143\n")
-    # restart: stop then start, same address, same guest processes; logs -f follows it through.
+    # restart: stop then start, same address, same guest processes.
     proc = marker(A, vm)
-    follower = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "logs", "-f", "--tail", "0", vm], stdout=subprocess.PIPE, text=True)
+    r = A.cli("restart", vm, timeout=240)
+    # logs -f follows a restarted vm through: what its command prints after the restart (its count
+    # goes on: the same guest process) reaches the follower.
+    ticker = "e2e-ctr-tick"
+    A.vms.add(ticker)
+    A.cli("run", "--name", ticker, "-d", args.template, "--", "i=0; while :; do echo tick-$i; i=$((i + 1)); sleep 0.2; done")
+    ticks = lambda text: [int(x) for x in re.findall(r"^tick-(\d+)$", text, re.M)]
+    follower = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "logs", "-f", "--tail", "0", ticker], stdout=subprocess.PIPE, text=True)
+    followed = []
+    reader = threading.Thread(target=lambda: followed.extend(follower.stdout), daemon=True)
+    reader.start()
     try:
-        r = A.cli("restart", vm, timeout=240)
-        time.sleep(2)
-        check("logs -f: follows a restart", follower.poll() is None, follower.poll() is not None and follower.communicate())
+        check("logs -f: follows", wait_for(lambda: ticks("".join(followed)), 30), A.logs(ticker)[-500:])
+        A.cli("restart", ticker, timeout=240)
+        # Printed after the restart returned: past what its log has now.
+        after = max(ticks(A.logs(ticker)))
+        check("logs -f: follows a restart", wait_for(lambda: max(ticks("".join(followed))) > after, 30),
+              (after, "".join(followed)[-300:], follower.poll()))
     finally:
         follower.kill()
         follower.wait()
+        reader.join(10)
+    A.rm(ticker, force=True)
     check("restart: running again", A.ps().get(vm, {}).get("state") == "running" and A.ps()[vm]["ip"] == ip, (r.stdout, A.ps().get(vm)))
     check("restart: same guest process", marker_id(A, vm) == proc)
     A.cli("restart", other, timeout=240)
@@ -1095,14 +1115,15 @@ def containers():
     shutil.rmtree(path, ignore_errors=True)
     out, err = e.communicate(timeout=120)
     check("rename: a separate exec client reattaches under the new name", e.returncode == 0 and out == "exec-done\n", (e.returncode, out, err[-500:]))
-    sleeping = lambda n: A.exec(n, "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline; echo; done | grep -cx 'sleep 4321 '")[1].strip() == "1"
+    # How many run (`must`: an exec that fails raises, never reads as none).
+    sleeping = lambda n: int(must(A, n, "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline; echo; done | grep -cx 'sleep 4321 ' || :"))
     e = subprocess.Popen(cli + [moved, "sleep", "4321"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
     try:
-        check("exec: its command runs", wait_for(lambda: sleeping(moved), 30))
+        check("exec: its command runs", wait_for(lambda: sleeping(moved) == 1, 30))
         A.cli("rename", moved, renamed)
         e.send_signal(signal.SIGINT)
         _, err = e.communicate(timeout=30)
-        check("rename: an interrupted exec client stops its command under the new name", wait_for(lambda: not sleeping(renamed), 15), err[-500:])
+        check("rename: an interrupted exec client stops its command under the new name", wait_for(lambda: sleeping(renamed) == 0, 15), err[-500:])
     finally:
         if e.poll() is None:
             e.kill()
@@ -1114,7 +1135,11 @@ def containers():
     ck = threading.Thread(target=lambda: A.cli("checkpoint", renamed, path, check=False, timeout=300))
     ck.start()
     try:
-        time.sleep(1.5)
+        # Under way once its copy runs (or it is paused for it), not after a guessed delay.
+        # (`debug VM status`: its process's own account; ps has no copy in it.)
+        status = lambda: json.loads(A.cli("debug", renamed, "status").stdout)
+        busy = lambda: (lambda st: st["describe"]["checkpoint_copy"] or st["describe"].get("state") == "checkpointing")(status())
+        check("rename: the checkpoint got under way", wait_for(busy, 60), status()["describe"])
         r = A.cli("rename", renamed, vm, check=False)
         check("rename: refused while a checkpoint is under way", r.returncode != 0 and "busy" in r.stderr and renamed in A.ps(), r.stderr)
     finally:
@@ -1369,7 +1394,9 @@ def interactive():
         _, err = att.communicate(timeout=60)
         time.sleep(1)
         check("attach: ends once its vm is replaced", att.returncode != 0, (att.returncode, err[-500:]))
-        check("attach: the new vm under the name gets none of its stdin", A.exec(vm, "test -e /tmp/leaked")[0] != 0)
+        # Said by the guest: an exec that fails is no answer.
+        leaked = must(A, vm, "if test -e /tmp/leaked; then echo leaked; else echo none; fi")
+        check("attach: the new vm under the name gets none of its stdin", leaked == "none", leaked)
         # Replaced by one that has exited already: its status is not this attach's.
         att = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "attach", vm], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, env=ENV)
@@ -1775,13 +1802,13 @@ TEST_IMAGE = os.path.abspath(args.test_image) if args.test_image else os.path.jo
 shared_state(BUILD)
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
-# The app_log and bad_app_log scenarios' template, built once with the others (lanes that each built
+# The app_log, bad_app_log and app_abort scenarios' template, built once with the others (lanes that each built
 # it on first use would replace it under one another's VMs). Its app as scripts/faults.py's app_template.
 APP = args.template + "-applog"
 # The template's ceiling: the heavy shard's guests write 1.5 GiB, shrink_stall needs 4 GiB at the start and
 # 4 GiB more to grow into, evict_grower's grow past 3 GiB (with the default 4 GiB plugged, free until touched).
 TEMPLATE_MAX = "10240" if args.shard == "heavy" else "2048"
-APP_FAULTS = ("app_log", "bad_app_log")
+APP_FAULTS = ("app_log", "bad_app_log", "app_abort")
 APP_OPTS = ["--vcpus", "2", "--max", "2048", "--cmd", json.dumps(
     ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"])]
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
@@ -1884,9 +1911,27 @@ COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "f
         "faults/route": 4, "faults/same_host_backlog": 4, "faults/same_host_bulk_tcp": 4, "faults/same_host_flood": 4,
         "faults/same_host_slow_route": 4, "faults/slow_preload": 4, "faults/suspend_killed": 4,
         "faults/suspend_slow_cmd": 4, "faults/unlend_retry": 4, "faults/ckpt_ancestor_corrupt": 3,
-        "faults/ckpt_packet_hold": 3, "faults/same_host_order": 3, "faults/suspend_died": 3}
+        "faults/ckpt_packet_hold": 3, "faults/same_host_order": 3, "faults/suspend_died": 3,
+        # From local runs (about half a CI runner's time), doubled.
+        "faults/rmi_suspend": 22, "faults/standby_refill_mark": 18, "faults/standby_relief_no_vm": 17, "faults/back_to_back": 14,
+        "faults/resume_migrating": 11, "faults/standby_claim_orphan_migrating": 9, "faults/standby_claim_orphan": 7,
+        "faults/app_abort": 5, "faults/evict_peer_busy": 4, "faults/arrival_bind_fail": 3, "faults/kill_prepare": 3,
+        "faults/standby_claim_cgroupns": 3, "faults/resume_bind_fail": 3}
 BATCH_S = 20
 SELFTEST_SKIP_NAME = "wildcard_listen"
+
+
+def shard_coverage():
+    """(scenarios in faults.py's SCENARIOS that no shard runs, nor UNSHARDED or BENCHMARKS names; shard
+    names that are no scenario). Read from faults.py's source: it cannot be imported without its hosts."""
+    import ast
+    tree = ast.parse(open(os.path.join(ROOT, "scripts", "faults.py")).read())
+    dicts = {t.id: {k.arg for k in n.value.keywords} for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+             and getattr(n.value.func, "id", None) == "dict" for t in n.targets if isinstance(t, ast.Name)}
+    scenarios = dicts.get("SCENARIOS", set()) - dicts.get("BENCHMARKS", set())
+    assert len(scenarios) > 100, f"faults.py's SCENARIOS not found ({len(scenarios)} keys)"
+    sharded = {x for v in SHARDS.values() for x in v.split()}
+    return sorted(scenarios - sharded - set(UNSHARDED)), sorted((sharded | set(UNSHARDED)) - scenarios)
 
 
 def lanes():
@@ -2116,8 +2161,11 @@ def main():
         print(f"selftest: failed {bad}, expected {want}; skipped {sorted(r[0] for r in skipped)}, expected {want_skip}")
         mixed = [b for b in spawned if len({s in LISTENER_FAULTS for s in b[1]}) > 1]
         print(f"selftest: batches mixing listener-owning scenarios with others: {mixed}")
+        # CI runs only the shards: a scenario in none of them never runs.
+        unsharded, unknown = shard_coverage()
+        print(f"selftest: faults.py scenarios in no shard: {unsharded}; shards' names that are no scenario: {unknown}")
         return 0 if (bad == want and len(summary) == len(scheduled) + len(builders) and not mixed
-                     and sorted(r[0] for r in skipped) == want_skip) else 1
+                     and sorted(r[0] for r in skipped) == want_skip and not unsharded and not unknown) else 1
     return 1 if failed else 0
 
 

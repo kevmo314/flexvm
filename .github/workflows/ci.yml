@@ -55,11 +55,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: unit tests
         run: cargo test --workspace
-      # Tap, routing and tc operations only (no VM): built as the runner's user, run as root.
-      - name: Root networking unit tests
+      # The #[ignore]d tests that need root (taps, routing and tc; root-owned files; the guest's bind
+      # mounts), no VM: built as the runner's user, run as root.
+      - name: Root unit tests
         run: |
           sudo modprobe tun
-          cargo test -p flexvm --config 'target.x86_64-unknown-linux-gnu.runner="sudo -E"' -- --ignored
+          cargo test -p flexvm -p flexvm-init --config 'target.x86_64-unknown-linux-gnu.runner="sudo -E"' -- --ignored
       # The pinned artifacts release (what `cargo build` users download) must be pinned, and built from
       # this checkout's Firecracker patches and kernel; a change to them needs a new one (scripts/versions.sh).
       - name: Pinned artifacts release

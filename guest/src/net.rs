@@ -267,17 +267,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // root: a bind mount needs CAP_SYS_ADMIN (CI's root step runs it)
     fn resolv_conf_rewrites_a_bind_mounted_file_in_place() {
+        crate::test_util::assert_root();
         use std::os::unix::ffi::OsStrExt;
         let dir = crate::test_util::TempDir::new("resolv-bind");
         let (path, source) = (dir.join("resolv.conf"), dir.join("source"));
         std::fs::write(&path, "").unwrap();
         std::fs::write(&source, "nameserver 8.8.8.8\n").unwrap();
         let c = |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
-        // Needs CAP_SYS_ADMIN, as under `unshare -rm`.
-        if unsafe { libc::mount(c(&source).as_ptr(), c(&path).as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } != 0 {
-            return;
-        }
+        let mounted = unsafe { libc::mount(c(&source).as_ptr(), c(&path).as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) };
+        assert_eq!(mounted, 0, "bind mount: {}", std::io::Error::last_os_error());
         let result = resolv_conf(&dir, "1.1.1.1");
         unsafe { libc::umount2(c(&path).as_ptr(), libc::MNT_DETACH) };
         result.unwrap();
