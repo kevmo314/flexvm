@@ -24,6 +24,24 @@ pub fn check(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Bound at `private` (in a 0700 directory, so nobody else can connect while its mode is the
+/// umask's), made 0600 there, then moved to `sock`: never reachable by others at any mode.
+pub fn bind_private(private: &Path, sock: &Path) -> io::Result<std::os::unix::net::UnixListener> {
+    check(private)?;
+    let _ = fs::remove_file(private);
+    let listener = std::os::unix::net::UnixListener::bind(private)?;
+    let placed = fs::set_permissions(private, fs::Permissions::from_mode(0o600)).and_then(|()| fs::rename(private, sock));
+    if placed.is_err() {
+        let _ = fs::remove_file(private);
+    }
+    placed.map(|()| listener)
+}
+
+/// Whether `c`'s peer is root or this process's user: one a 0600 socket would admit.
+pub fn trusted_peer(c: &std::os::unix::net::UnixStream) -> bool {
+    crate::util::peer_cred(c).is_ok_and(|cred| cred.uid == 0 || cred.uid == unsafe { libc::geteuid() })
+}
+
 fn denied(path: &Path, what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, format!("socket directory {}: {what}", path.display()))
 }
