@@ -20,6 +20,7 @@ pub fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 }
 
 /// Keep a broken helper from hanging its test in `join`.
+#[allow(dead_code)] // the guest shares this file
 pub trait JoinWithin<T> {
     fn join_within(self) -> std::thread::Result<T>;
 }
@@ -32,33 +33,33 @@ impl<T> JoinWithin<T> for std::thread::JoinHandle<T> {
     }
 }
 
+/// Accepts on a blocking listener, failing after `WAIT` rather than hanging.
 #[track_caller]
-fn accept<T>(mut connection: impl FnMut() -> std::io::Result<T>) -> T {
-    let mut accepted = None;
-    wait_until("helper connection", || match connection() {
-        Ok(c) => {
-            accepted = Some(c);
-            true
+fn accept<T>(listener: &impl std::os::fd::AsRawFd, accept: impl FnOnce() -> std::io::Result<T>) -> T {
+    let mut fd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let n = loop {
+        let n = unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) };
+        if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            break n;
         }
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => false,
-        Err(e) => panic!("accept: {e}"),
-    });
-    accepted.unwrap()
+    };
+    assert!(n > 0, "no helper connection: {}", if n < 0 { std::io::Error::last_os_error().to_string() } else { "timed out".into() });
+    accept().unwrap()
 }
 
 #[allow(dead_code)] // the guest shares this file
+#[track_caller]
 pub fn accept_tcp(listener: &std::net::TcpListener) -> (std::net::TcpStream, std::net::SocketAddr) {
-    listener.set_nonblocking(true).unwrap();
-    let (stream, addr) = accept(|| listener.accept());
+    let (stream, addr) = accept(listener, || listener.accept());
     stream.set_read_timeout(Some(WAIT)).unwrap();
     stream.set_write_timeout(Some(WAIT)).unwrap();
     (stream, addr)
 }
 
 #[allow(dead_code)] // the guest shares this file
+#[track_caller]
 pub fn accept_unix(listener: &std::os::unix::net::UnixListener) -> (std::os::unix::net::UnixStream, std::os::unix::net::SocketAddr) {
-    listener.set_nonblocking(true).unwrap();
-    let (stream, addr) = accept(|| listener.accept());
+    let (stream, addr) = accept(listener, || listener.accept());
     stream.set_read_timeout(Some(WAIT)).unwrap();
     stream.set_write_timeout(Some(WAIT)).unwrap();
     (stream, addr)
@@ -87,42 +88,19 @@ impl DerefMut for ChildGuard {
     }
 }
 
-impl ChildGuard {
-    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let end = Instant::now() + WAIT;
-        loop {
-            if let Some(status) = self.0.try_wait()? {
-                return Ok(status);
-            }
-            if Instant::now() >= end {
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "helper process did not exit"));
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-}
-
+/// A helper process's exit status, failing after `WAIT` rather than hanging.
 #[allow(dead_code)] // the guest shares this file
 pub fn status(command: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
-    ChildGuard(command.spawn()?).wait()
-}
-
-#[allow(dead_code)] // the guest shares this file
-pub fn output(command: &mut std::process::Command) -> std::process::Output {
-    use std::io::Read;
-    use std::process::Stdio;
-    let mut child = ChildGuard(command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
-    let read = |mut stream: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut data = Vec::new();
-            stream.read_to_end(&mut data).unwrap();
-            data
-        })
-    };
-    let stdout = read(Box::new(child.stdout.take().unwrap()));
-    let stderr = read(Box::new(child.stderr.take().unwrap()));
-    let status = child.wait().unwrap();
-    std::process::Output { status, stdout: stdout.join_within().unwrap(), stderr: stderr.join_within().unwrap() }
+    let (mut child, end) = (ChildGuard(command.spawn()?), Instant::now() + WAIT);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= end {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "helper process did not exit"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 impl Drop for ChildGuard {

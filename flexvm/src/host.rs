@@ -4234,9 +4234,11 @@ pub(crate) mod tests {
     }
 
     fn all_leave(ths: Vec<std::thread::JoinHandle<()>>) {
-        wait_until("parked threads to leave", || ths.iter().all(|t| t.is_finished()));
-        for th in ths {
-            th.join_within().unwrap();
+        // Well short of the parks' 60 s cap, so one left parked fails here.
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while !ths.iter().all(|t| t.is_finished()) {
+            assert!(std::time::Instant::now() < end, "a parked thread was left parked");
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -4289,6 +4291,7 @@ pub(crate) mod tests {
             assert!(std::time::Instant::now() < end);
             std::thread::sleep(Duration::from_millis(5));
         }
+        std::thread::sleep(Duration::from_millis(100));
         assert!(!th.is_finished(), "a new arming did not park");
         std::fs::remove_file(&marker).unwrap();
         all_leave(vec![th]);
@@ -7243,7 +7246,7 @@ pub(crate) mod tests {
         let start = std::time::Instant::now();
         let err = h.lock_by(Some(start + Duration::from_millis(50))).err().unwrap();
         assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
-        assert!(start.elapsed() < WAIT);
+        assert!(start.elapsed() < Duration::from_secs(5));
         release.0.send(()).unwrap();
         t.join_within().unwrap();
         // Had once let go of; not within 1 s, as other tests' host locks take the same
@@ -7766,6 +7769,7 @@ pub(crate) mod tests {
         drop(worker);
         assert!(above(1).is_ok());
         // `listen` raises the reserve while this process runs: admission sees it.
+        std::thread::sleep(Duration::from_millis(20));
         h.configure(|c| {
             c.reserve_mib = Some(AVAIL - 1000);
             Ok(())
@@ -7881,8 +7885,10 @@ pub(crate) mod tests {
         let waiting = path.clone();
         let waiter = std::thread::spawn(move || flock_by(&waiting, std::time::Instant::now() + WAIT));
         wait_until("flock helper to start", || FLOCK_HELPERS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&path)));
+        let at = std::time::Instant::now();
         drop(held);
         let got = waiter.join_within().unwrap().unwrap();
+        assert!(at.elapsed() < Duration::from_secs(5), "had once let go of, not at the deadline: {:?}", at.elapsed());
         assert!(probe(&open(), libc::LOCK_EX).is_err(), "the lock returned is held");
         // Held past the deadline: refused then, and what the helper gets later with no one waiting it lets go of.
         let start = std::time::Instant::now();
@@ -7917,8 +7923,12 @@ pub(crate) mod tests {
         // A later wait takes over that helper's lock as soon as the holder lets go.
         let waiting = path.clone();
         let waiter = std::thread::spawn(move || flock_by(&waiting, std::time::Instant::now() + WAIT));
+        let waiters = || FLOCK_WAITS.lock().unwrap().as_ref().and_then(|m| m.get(&path)).map_or(0, |w| w.waiters);
+        wait_until("the later wait to join the helper", || waiters() > 0);
+        let at = std::time::Instant::now();
         drop(held);
         let got = waiter.join_within().unwrap().unwrap();
+        assert!(at.elapsed() < Duration::from_secs(5), "had once let go of: {:?}", at.elapsed());
         assert_eq!(helpers(), 1, "the waiting helper's lock was handed over, no new one started");
         assert!(probe(&open(), libc::LOCK_EX).is_err(), "the lock handed over is held");
         flock(&got, libc::LOCK_UN).unwrap();

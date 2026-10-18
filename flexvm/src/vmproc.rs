@@ -3465,11 +3465,14 @@ mod tests {
         a.tell(peers, json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
         until(&|| calls("gone") > 0);
         configured.lock().unwrap().retain(|p| p != "gone");
+        // At most the one call under way, or due by a list read before this, follows.
+        let removed = calls("gone");
         until(&|| a.pending.lock().unwrap().is_empty());
         let gone = calls("gone");
+        assert!(gone <= removed + 1, "pruned once no longer configured: {removed} then {gone}");
         assert_eq!(calls("down"), 41, "tried until delivered, then no more");
-        assert!(a.pending.lock().unwrap().is_empty(), "delivered or pruned peers are no longer pending");
-        assert_eq!((calls("gone"), calls("down")), (gone, 41));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!((calls("gone"), calls("down")), (gone, 41), "and never called again");
     }
 
     /// A peer configured and told while the announcer reads the peers is not pruned by the list it read.
@@ -3491,12 +3494,11 @@ mod tests {
                 if armed2.swap(false, Ordering::SeqCst) {
                     // The peer is configured and told after this list is read, before it is used.
                     let (c, a) = (c.clone(), m.get().unwrap().upgrade().unwrap());
-                    let added = c.clone();
                     thread::spawn(move || {
-                        added.lock().unwrap().push("b".into());
+                        c.lock().unwrap().push("b".into());
                         a.tell(vec!["b".into()], json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
                     });
-                    wait_until("peer b to be configured", || c.lock().unwrap().contains(&"b".to_string()));
+                    thread::sleep(Duration::from_millis(100));
                 }
                 old
             }),
@@ -3505,7 +3507,11 @@ mod tests {
         .unwrap();
         me.set(Arc::downgrade(&a)).unwrap();
         armed.store(true, Ordering::SeqCst);
-        a.tell(Vec::new(), json!({}));
+        // Woken, not told: a tell landing after b's would prune b by its own (empty) list.
+        wait_until("the announcer to read the peers", || {
+            a.wake.notify_all();
+            !armed.load(Ordering::SeqCst)
+        });
         let end = Instant::now() + WAIT;
         while !CALLS.lock().unwrap().contains(&"b".to_string()) {
             assert!(Instant::now() < end, "b was told");
@@ -4016,7 +4022,7 @@ mod tests {
         let held = p.op();
         let q = p.clone();
         let pause = thread::spawn(move || q.op_unless_destroyed().map(drop).map_err(|e| e.to_string()));
-        // The operation lock keeps the pause out until destroy is visible.
+        thread::sleep(Duration::from_millis(50));
         // As `destroy` does before it waits for `op`; the pause gets it first.
         p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
         drop(held);
@@ -4036,6 +4042,7 @@ mod tests {
         let taking = p.taking.lock().unwrap();
         let q = p.clone();
         let asked = thread::spawn(move || q.ask_resume());
+        thread::sleep(Duration::from_millis(50));
         assert!(!asked.is_finished(), "waits for the signal thread");
         *p.suspending.lock().unwrap() = Suspend::Suspending;
         drop(taking);
@@ -4717,7 +4724,7 @@ mod session_relay_tests {
         });
         let t = Instant::now();
         relay_session(&mut guest, &mut &relay, CLIENT_STALL, false).unwrap();
-        assert!(t.elapsed() < WAIT, "the relay waited {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(4), "the relay waited {:?}", t.elapsed());
         drop(release);
         assert!(guest.get_ref().output.is_empty());
         silent.join_within().unwrap();

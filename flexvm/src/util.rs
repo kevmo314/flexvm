@@ -2204,8 +2204,9 @@ mod tests {
         tx.send(LogMsg::Line("first".into())).unwrap();
         let start = Instant::now();
         assert!(!send_log_by(&tx, LogMsg::Line("full".into()), start + Duration::from_millis(20)));
-        assert!(start.elapsed() < WAIT);
+        assert!(start.elapsed() < Duration::from_secs(5));
         let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
             assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line == "first"));
             assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
         });
@@ -2243,24 +2244,21 @@ mod tests {
                 written.lock().unwrap().insert(line.to_string());
             })
         });
-        let callers: Vec<_> = (0..8)
-            .map(|t| {
-                let (tx, lines) = (tx.clone(), lines.clone());
-                std::thread::spawn(move || {
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let (tx, lines) = (&tx, &lines);
+                scope.spawn(move || {
                     for i in 0..25 {
                         let marker = format!("{t}.{i}");
-                        assert!(send_log_by(&tx, LogMsg::Line(marker.clone()), Instant::now() + WAIT));
-                        flush_log_to(&tx, Instant::now() + WAIT);
+                        tx.send(LogMsg::Line(marker.clone())).unwrap();
+                        flush_log_to(tx, Instant::now() + Duration::from_secs(30));
                         assert!(lines.lock().unwrap().contains(&marker), "flush missed {marker}");
                     }
-                })
-            })
-            .collect();
-        for caller in callers {
-            caller.join_within().unwrap();
-        }
+                });
+            }
+        });
         drop(tx);
-        writer.join_within().unwrap();
+        writer.join().unwrap();
     }
 
     /// Past the cap a log moves to `.1` whole and its writers go on in a new
@@ -2289,22 +2287,41 @@ mod tests {
         // made unlocked, and nothing rotated meanwhile.
         let held = open();
         crate::host::flock(&held, libc::LOCK_SH).unwrap();
+        let timed = |l: std::path::PathBuf| {
+            let t = Instant::now();
+            (output::append_capped(&l, b"six six\n", 10), t.elapsed())
+        };
         let (l1, l2) = (log.clone(), log.clone());
-        let w = std::thread::spawn(move || output::append_capped(&l1, b"six six\n", 10));
-        assert!(output::append_capped(&l2, b"six six\n", 10) && w.join_within().unwrap());
+        let w = std::thread::spawn(move || timed(l1));
+        // Each call waits out its own `STALL` (1 s); in turn, the second would take 2 s.
+        for (written, took) in [timed(l2), w.join_within().unwrap()] {
+            assert!(written && took < Duration::from_millis(1900), "{took:?}");
+        }
         assert_eq!(read("vm.log"), "five\nsix six\nsix six\n");
         crate::host::flock(&held, libc::LOCK_UN).unwrap();
         assert!(output::append_capped(&log, b"seven\n", 10) && read("vm.log.1") == "five\nsix six\nsix six\nseven\n");
-        // A holder rotates and stalls before letting go: a writer goes on
-        // in the new log, never into `.1`. Rotate before starting the writer
-        // so descheduling this thread cannot let its STALL expire first.
-        assert!(output::append_capped(&log, b"eight\n", 10));
+        // A holder that rotates and stalls before letting go: a writer waiting
+        // meanwhile goes on in the new log, never into `.1`. Only a rename within
+        // the writer's `STALL` shows that; a round slowed past it is tried again.
         let held = open();
         crate::host::flock(&held, libc::LOCK_EX).unwrap();
-        std::fs::rename(&log, d.join("vm.log.1")).unwrap();
-        let l = log.clone();
-        let w = std::thread::spawn(move || output::append_capped(&l, b"nine\n", 10));
-        assert!(w.join_within().unwrap());
+        for round in 1.. {
+            std::fs::write(&log, "eight\n").unwrap();
+            let (l, (started, start)) = (log.clone(), std::sync::mpsc::channel());
+            let w = std::thread::spawn(move || {
+                started.send(Instant::now()).unwrap();
+                output::append_capped(&l, b"nine\n", 10)
+            });
+            let start = start.recv_timeout(WAIT).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::rename(&log, d.join("vm.log.1")).unwrap();
+            let waiting = start.elapsed() < Duration::from_secs(1);
+            assert!(w.join_within().unwrap());
+            if waiting {
+                break;
+            }
+            assert!(round < 10, "never renamed within the writer's stall");
+        }
         assert_eq!((read("vm.log.1"), read("vm.log")), ("eight\n".into(), "nine\n".into()));
     }
 
@@ -2810,7 +2827,7 @@ pub mod output {
                 }
                 _ => {}
             }
-            let output = crate::test_util::output(&mut cmd);
+            let output = cmd.output().unwrap();
             assert!(output.status.success(), "{mode}: {output:?}");
             let stdout = String::from_utf8(output.stdout).unwrap();
             let stderr = String::from_utf8(output.stderr).unwrap();
@@ -2841,7 +2858,7 @@ pub mod output {
         while (&t).write(&[0; 4096]).is_ok() {}
         let start = Instant::now();
         assert_eq!(write_within(&t, &[0; 100], start + Duration::from_millis(200)), 0);
-        assert!(start.elapsed() < crate::test_util::WAIT);
+        assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(unsafe { libc::fcntl(w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK, 0);
     }
 

@@ -589,18 +589,26 @@ mod tests {
     fn drops_wake_the_workers_at_once() {
         retry_ports(|| {
             let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let mut took = Duration::ZERO;
             for _ in 0..10 {
                 let tcp = mapping(free_tcp(), guest.local_addr().unwrap().port(), Protocol::Tcp);
                 let udp = Port { protocol: Protocol::Udp, ..tcp.clone() };
                 let mut f = Forwarder::start(&[tcp, udp], Ipv4Addr::LOCALHOST)?;
+                // Asleep in poll, with nothing to do.
+                thread::sleep(Duration::from_millis(20));
                 // Keep the handles so a missed wake fails by a deadline instead of hanging Drop.
                 let workers = std::mem::take(&mut f.workers);
+                let at = Instant::now();
                 drop(f);
                 wait_until("forwarding workers to stop", || workers.iter().all(|w| w.is_finished()));
+                took += at.elapsed();
                 for worker in workers {
                     worker.join_within().unwrap();
                 }
             }
+            // A worker that only noticed on its poll tick took most of a tick each time.
+            let tick = Duration::from_millis(TICK as u64);
+            assert!(took < tick * 5, "10 drops took {took:?}");
             Ok(())
         })
         .unwrap();
