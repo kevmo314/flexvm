@@ -1962,7 +1962,11 @@ impl Host {
         let owed: Vec<(u64, PathBuf, Owed)> =
             self.owed_ids()?.into_iter().filter_map(|(id, path)| Some((id, path.clone(), load::<Owed>(&path).ok()??))).filter(|(_, _, o)| o.ip == ip).collect();
         // Withdrawn first: a crash before the records go leaves them to settle as aborted (a withdrawal again).
-        let current = self.observe(&l, ip, gen, 0, None)?;
+        // A local withdrawal (this host lent `gen`): not bounded as a peer's is (#701).
+        let current = self.observe_and(&l, ip, gen, 0, None, |_| ())?;
+        if !current && self.current(&l, ip, gen)? {
+            bail!("{ip}: withdrawal of generation {gen} was not recorded; it is still current");
+        }
         self.unlend(&l, ip, gen)?;
         // A dead source's `leaving` claim goes too: withdrawn, nothing is owed for it (#570).
         if let (Some(_), Some(name), Some(by)) = (&a.leaving, &a.holder, &a.holder_id) {
@@ -6488,6 +6492,22 @@ pub(crate) mod tests {
         assert!(!h.owed_path(4).exists() && h.owed_path(5).exists(), "only that address's");
         let _w = h.take_name("w", false).unwrap();
         assert!(h.claim_new(&h.lock().unwrap(), "w", Some(x)).unwrap().gen > gen);
+    }
+
+    #[test]
+    fn reclaim_withdraws_a_loan_above_the_peer_bound() {
+        let (_h_dir, h) = host("reclaim-above-bound");
+        let x = ip("10.9.0.2");
+        let gen = {
+            let l = h.lock().unwrap();
+            assert!(h.observe(&l, x, RECV_MAX, 0, Some(ip("10.1.0.2"))).unwrap());
+            assert!(h.observe(&l, x, RECV_MAX, 0, None).unwrap(), "the peer withdraws it");
+            h.lend_new(&l, x).unwrap()
+        };
+        assert!(gen > RECV_MAX);
+        assert_eq!(h.reclaim(x, gen).unwrap(), (gen, vec![]));
+        let a = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(a.withdrawn && a.lent.is_none() && a.seen == gen);
     }
 
     #[test]
