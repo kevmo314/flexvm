@@ -72,8 +72,45 @@ impl State {
 /// How long setting a VM's first memory mark waits for the host lock to admit more.
 const ADMIT_WAIT: Duration = Duration::from_millis(500);
 
+/// A VM's name, which `flexvm rename` changes while it runs: read it afresh (`get`) wherever it
+/// names a file or a record.
+#[derive(Default)]
+pub struct VmName(std::sync::RwLock<String>);
+
+impl VmName {
+    pub fn new(name: &str) -> VmName {
+        VmName(std::sync::RwLock::new(name.into()))
+    }
+
+    pub fn get(&self) -> String {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, name: &str) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = name.into();
+    }
+}
+
+impl std::fmt::Display for VmName {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.get())
+    }
+}
+
+impl std::fmt::Debug for VmName {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self.get())
+    }
+}
+
+impl serde::Serialize for VmName {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.get())
+    }
+}
+
 pub struct Vm {
-    pub name: String,
+    pub name: VmName,
     pub template: Arc<Template>,
     /// Effective rate Firecracker loaded (host default when it skipped scaling).
     pub tsc_khz: u32,
@@ -717,7 +754,7 @@ impl Vm {
     fn running_here(&self) -> Result<()> {
         match self.state() {
             State::Running => {}
-            State::Paused => bail!("vm {} is paused{}", self.name, paused(&self.name)),
+            State::Paused => bail!("vm {} is paused{}", self.name, paused(&self.name.get())),
             State::Checkpointing => bail!("vm {}{CHECKPOINTING}", self.name),
             _ => bail!("vm {} is not running here", self.name),
         }
@@ -1092,7 +1129,7 @@ impl Prepared {
     pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
         let idle = self.fc.take().unwrap();
         Arc::new(Vm {
-            name: name.into(),
+            name: VmName::new(name),
             template: self.template.clone(),
             tsc_khz: self.tsc_khz,
             dir: idle.dir.clone(),

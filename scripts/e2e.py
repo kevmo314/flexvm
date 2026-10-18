@@ -925,6 +925,154 @@ def port_forward():
     A.rm(app)
 
 
+@case
+def containers():
+    """ps -q, --filter and --format; inspect; logs (-f, --tail); wait; restart; rename running, stopped and exited."""
+    vm, other, job = "e2e-ctr", "e2e-ctr-other", "e2e-ctr-job"
+    hp = A.port + 20100
+    ip, ip2 = A.run(vm), A.run_json(other, extra=["-e", "E2E_CTR=1", "-p", f"127.0.0.1:{hp}:80"])["ip"]
+    names = lambda *argv: sorted(A.cli("ps", "-q", *argv).stdout.split())
+    check("ps -q: names only", names() == sorted([vm, other]), names())
+    check("ps --filter: name and ip both", names("--filter", f"name={vm}", "--filter", f"ip={ip}") == [vm])
+    check("ps --filter: either value of a key", names("--filter", f"ip={ip}", "--filter", f"ip={ip2}") == sorted([vm, other]))
+    check("ps --filter: a part of the name", names("--filter", "name=ctr-oth") == [other])
+    image = A.cli("ps", "--filter", f"ip={ip}", "--format", "{{.Image}}").stdout.strip()
+    check("ps --filter image", image and names("--filter", f"image={image}") == sorted([vm, other]), image)
+    out = A.cli("ps", "--filter", f"ip={ip}", "--format", "{{.Name}}\\t{{.IP}}").stdout
+    check("ps --format: a template", out == f"{vm}\t{ip}\n", repr(out))
+    lines = [json.loads(l) for l in A.cli("ps", "--format", "json").stdout.splitlines()]
+    check("ps --format json: an object per line", sorted(l["name"] for l in lines) == sorted([vm, other]), lines)
+    bad = A.cli("ps", "--filter", "color=red", check=False)
+    check("ps --filter: an unknown key is refused", bad.returncode != 0 and "color" in bad.stderr, bad.stderr)
+    # inspect: an array, as docker's; a missing name fails after printing the others.
+    got = json.loads(A.cli("inspect", vm, other).stdout)
+    check("inspect: one object each, in order", [g["name"] for g in got] == [vm, other] and got[0]["ip"] == ip, got)
+    cfg = got[0].get("config", {})
+    check("inspect: its config", cfg.get("template") == args.template and cfg.get("log", "").endswith(f"/{vm}.log")
+          and cfg.get("socket", "").endswith(f"/{vm}.sock"), cfg)
+    cfg = got[1].get("config", {})
+    check("inspect: its ports and run settings", [p.get("host_port") for p in cfg.get("ports", [])] == [hp]
+          and cfg.get("run", {}).get("env") == ["E2E_CTR=1"], cfg)
+    r = A.cli("inspect", vm, "e2e-ctr-none", check=False)
+    check("inspect: a missing name fails", r.returncode != 0 and [g["name"] for g in json.loads(r.stdout)] == [vm], (r.stdout, r.stderr))
+    # A command's VM: wait prints its status; it is then exited (listed, inspected, its log kept) until
+    # rm or start; restart runs it again; renamed, its record goes with it, and logs -f (which followed it
+    # across the rerun) ends with the name.
+    A.vms.add(job)
+    A.cli("run", "--name", job, "-d", args.template, "--", "for i in 1 2 3; do echo line$i; done; sleep 3; echo late; exit 3")
+    follower = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "logs", "-f", job], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    waiter = None
+    try:
+        waiter = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "wait", job], stdout=subprocess.PIPE, text=True)
+        time.sleep(1)
+        check("wait: blocks while the vm runs", waiter.poll() is None, waiter.poll() is not None and waiter.communicate())
+        out, _ = waiter.communicate(timeout=120)
+        check("wait: the command's status", out == "3\n", repr(out))
+        check("ps --filter status=exited: the exited vm alone", names("--filter", "status=exited") == [job], A.ps().get(job))
+        got = json.loads(A.cli("inspect", job).stdout)[0]
+        check("inspect: an exited vm, its status and what it ran", got.get("state") == "exited" and got.get("exit_code") == 3
+              and "exit 3" in (got.get("config", {}).get("cmd") or ""), got)
+        log = A.cli("logs", job).stdout
+        check("logs: an exited vm's whole log", "line1\nline2\nline3\n" in log and "late\n" in log, repr(log))
+        tail = A.cli("logs", "--tail", "2", job).stdout
+        check("logs --tail 2: its last two lines", tail == "\n".join(log.splitlines()[-2:]) + "\n" and len(tail.splitlines()) == 2, (tail, log))
+        check("wait: again, its last status", A.cli("wait", job).stdout == "3\n")
+        check("logs -f: still following an exited vm", follower.poll() is None)
+        A.cli("restart", job, timeout=240)
+        check("restart: an exited vm runs again", A.ps().get(job, {}).get("state") in ("running", "exited"), A.ps().get(job))
+        check("wait: the rerun's status", A.cli("wait", job, timeout=120).stdout == "3\n")
+        renamed_job = job + "-renamed"
+        A.vms.add(renamed_job)
+        check("rename: an exited vm", A.cli("rename", job, renamed_job).stdout == renamed_job + "\n")
+        vms = A.ps()
+        check("rename: exited, listed under its new name", job not in vms and vms.get(renamed_job, {}).get("state") == "exited", vms)
+        check("rename: an exited vm's status goes with it", A.cli("wait", renamed_job).stdout == "3\n")
+        out, err = follower.communicate(timeout=30)
+        check("logs -f: followed both runs, until the name went", out.count("line1\n") == 2 and out.count("late\n") == 2, (out, err))
+        check("logs: under the new name", A.cli("logs", renamed_job).stdout.count("late\n") == 2)
+        A.rm(renamed_job)
+    finally:
+        for p in (follower, waiter):
+            if p and p.poll() is None:
+                p.kill()
+                p.wait()
+    # wait on a stop: 143, as SIGTERM's; a stopped vm's at once.
+    waiter = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "wait", other], stdout=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    A.suspend(other)
+    check("wait: a stopped vm's status", waiter.communicate(timeout=60)[0] == "143\n")
+    check("wait: of a stopped vm, at once", A.cli("wait", other, timeout=10).stdout == "143\n")
+    # restart: stop then start, same address, same guest processes.
+    proc = marker(A, vm)
+    r = A.cli("restart", vm, timeout=240)
+    check("restart: running again", A.ps().get(vm, {}).get("state") == "running" and A.ps()[vm]["ip"] == ip, (r.stdout, A.ps().get(vm)))
+    check("restart: same guest process", marker_id(A, vm) == proc)
+    A.cli("restart", other, timeout=240)
+    check("restart: a stopped vm is started", A.ps().get(other, {}).get("state") == "running", A.ps().get(other))
+    # rename while running: its process, address, logs and control socket go with it.
+    renamed = vm + "-new"
+    pid = A.pid(vm)
+    taken = A.cli("rename", vm, other, check=False)
+    check("rename: to a name in use is refused", taken.returncode != 0 and vm in A.ps(), taken.stderr)
+    check("rename: prints the new name", A.cli("rename", vm, renamed).stdout == renamed + "\n")
+    A.vms.add(renamed)
+    vms = A.ps()
+    check("rename: listed under its new name only", vm not in vms and vms.get(renamed, {}).get("ip") == ip and vms[renamed]["pid"] == pid, vms)
+    check("rename: exec by the new name", must(A, renamed, "echo hi") == "hi")
+    check("rename: same guest process", marker_id(A, renamed) == proc)
+    check("rename: the old name is gone", A.exec(vm, "true")[0] != 0)
+    logdir = os.path.join(A.run_dir, "vms")
+    check("rename: its log moved", os.path.exists(os.path.join(logdir, f"{renamed}.log")) and not os.path.exists(os.path.join(logdir, f"{vm}.log")),
+          os.listdir(logdir))
+    # Refused while a checkpoint holds the vm.
+    fill(A, renamed, 32)
+    A.cli("debug", "fault", "ckpt_crawl", "120000")
+    path = ckpt_dir(renamed)
+    ck = threading.Thread(target=lambda: A.cli("checkpoint", renamed, path, check=False, timeout=300))
+    ck.start()
+    try:
+        time.sleep(1.5)
+        r = A.cli("rename", renamed, vm, check=False)
+        check("rename: refused while a checkpoint is under way", r.returncode != 0 and "busy" in r.stderr and renamed in A.ps(), r.stderr)
+    finally:
+        A.cli("debug", "fault", "ckpt_crawl", "0")
+        ck.join()
+    shutil.rmtree(path, ignore_errors=True)
+    # rename while stopped: started again under the new name, with its address and processes.
+    A.suspend(renamed)
+    final = vm + "-final"
+    check("rename: a stopped vm", A.cli("rename", renamed, final).stdout == final + "\n")
+    A.vms.add(final)
+    vms = A.ps()
+    check("rename: stopped, listed under its new name", renamed not in vms and vms.get(final, {}).get("state") == "suspended", vms)
+    A.cli("start", final)
+    check("rename: started under the new name, its address kept", A.ps().get(final, {}).get("ip") == ip, A.ps().get(final))
+    check("rename: same guest process after the stop", marker_id(A, final) == proc)
+    # A vm whose Firecracker dies: wait prints 124.
+    fc = A.ps()[other]["firecracker"]
+    check("its Firecracker is this host's", fc in A.firecrackers(), (fc, A.firecrackers()))
+    waiter = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "wait", other], stdout=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    os.kill(fc, signal.SIGKILL)
+    check("wait: a failed vm's status", waiter.communicate(timeout=60)[0] == "124\n")
+    # A command's VM renamed while it runs: a checkpoint's pause resets vsock, and its command
+    # reattaches under the new name, and ends the VM with its status.
+    cmd_vm, cmd_new = "e2e-ctr-cmd", "e2e-ctr-cmd2"
+    A.vms.update({cmd_vm, cmd_new})
+    A.cli("run", "--name", cmd_vm, "-d", args.template, "--", "sleep 4; echo cmd-done; exit 4")
+    A.cli("rename", cmd_vm, cmd_new)
+    path = ckpt_dir(cmd_new)
+    A.cli("checkpoint", cmd_new, path)
+    shutil.rmtree(path, ignore_errors=True)
+    check("rename: a command's vm ends with its command, under the new name", A.cli("wait", cmd_new, timeout=120).stdout == "4\n")
+    check("rename: its command's output in the new log", "cmd-done\n" in A.cli("logs", cmd_new).stdout)
+    # rm (of a running vm, and of a failed one) leaves no status to wait for.
+    for n in (final, other):
+        A.rm(n, force=True)
+        check(f"rm: no status of {n} left to wait for", A.cli("wait", n, check=False).returncode != 0)
+
+
 # --- the image case's registry pull and its cache --------------------------------
 # With --image-cache, the pulled blobs are kept there as an OCI layout of the image
 # (oci/REF/), which later runs build from without the registry.
@@ -1495,7 +1643,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"faults/exec_background": 110, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,

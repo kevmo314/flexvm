@@ -123,7 +123,7 @@ impl Proc {
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
         // Before the pause: dropped, the connection ends the target's arrival.
-        check_app_support(to, &vm.name, &prepared, &self.spec.lock().unwrap().moving(), vm.template.meta.image.as_ref())?;
+        check_app_support(to, &vm.name.get(), &prepared, &self.spec.lock().unwrap().moving(), vm.template.meta.image.as_ref())?;
         let prepare = prep.elapsed();
         // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
         let mut wanted = crate::standby::load_set(&self.host, &vm.template);
@@ -454,7 +454,7 @@ impl Proc {
             let op = p.op();
             // Decided here durably first: once the target forgets its record, the
             // migration would read as aborted there.
-            match p.host.lock().and_then(|l| p.host.release(&l, p.vm().ip, &p.vm().name, Some(&crate::host::Ident::me()))) {
+            match p.host.lock().and_then(|l| p.host.release(&l, p.vm().ip, &p.vm().name.get(), Some(&crate::host::Ident::me()))) {
                 Ok(()) => drop(peer_call(&to, json!({"op": "migration", "mig": mig, "done": true}))),
                 Err(e) => crate::log!(
                     "vm {}: recording that {to} has it: {e}; {to} is not told it is done, so it keeps its record for this host to ask about",

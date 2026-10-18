@@ -122,7 +122,25 @@ with the VM through `stop`/`start`, checkpoints and migrations; `run
 flexvm ps                       # running VMs; -a: stopped ones too; --json: all of it
 NAME                     IP              IMAGE            STATE             PID  CPUS  RSS MiB  MAX MiB STARVED
 web                      10.200.0.1      nginx:1.27       running         41522     2       27     8192
+flexvm ps -q                    # names only
+flexvm ps --filter name=web --filter status=paused   # both; a key again: either value
+flexvm ps --format '{{.Name}}\t{{.IP}}'               # a Go-template subset; 'table ...': a header, aligned
+flexvm ps --format json         # an object per line, as docker's
+flexvm inspect web db           # a JSON array: per VM, what ps --json says and its config
 ```
+
+`--filter` keys are `name` (a part of it, as docker's), `status` (a state
+below, as `exited`, or `stopped` for any no process runs; a status filter
+lists stopped and exited VMs without `-a`), `image` (as `pull` took it, or its template name)
+and `ip`. `--format` fields are `.Name`, `.IP`, `.Image`, `.State` (or
+`.Status`), `.PID`, `.CPUs`, `.VCPUs`, `.RSS`, `.MaxMiB`, `.Starved`,
+`.Template`, `.TemplateID` and `.Error`, any case; `{{json .}}` is the whole
+object; `\t` and `\n` are a tab and a newline. `inspect` adds `config` to
+what `ps --json` says of each VM: its image, template and the image's app,
+caps, ports (`ports`), run settings (`run`: `-e`, `--entrypoint`, `--keep`,
+`--rm`, `--ip`, `-p`, `-i` as `stdin`, `-t` as `tty`), its log, and its control socket (running) or checkpoint
+directory (stopped); a stopped or exited one has its `exit_code` too. A name that is not a VM
+fails `inspect` once the others are printed.
 
 | state | meaning |
 |---|---|
@@ -189,6 +207,19 @@ the host (no VM, stopped VM, `exited`, `failed` or moved record) are removed onc
 unwritten for an hour, by sweeps that run when a VM starts and about every
 30 s while a listener or any VM process runs. Logs do not survive a reboot.
 
+```sh
+flexvm logs web                 # its log: NAME.log.1 (before the last rotation), then NAME.log
+flexvm logs --tail 20 web       # the last 20 lines
+flexvm logs -f web              # and follow it, until nothing of the VM is left
+```
+
+`logs -f` reads on across rotations (it finishes the rotated log, then
+starts on the new one) and restarts (a VM started again appends to its log);
+it ends once the name has no VM left (`kill`, `rm`, a `--rm` VM's command
+or app that ended; an exited VM's log stays, to read, until `rm`) or its
+reader is gone. A foreground VM's output is its terminal's, so
+its log holds only what came after a closed terminal.
+
 ## Forward host ports
 
 ```sh
@@ -234,7 +265,29 @@ flexvm kill web                 # destroy a running VM (as SIGINT; Ctrl-C or Ctr
 flexvm kill -s HUP web          # send a signal (name or number) to its app instead
 flexvm rm web                   # remove a stopped VM (suspended, quarantined, exited, failed, lost)
 flexvm rm -f web                # destroy it, running or not
+flexvm restart web              # stop, then start (a stopped VM is started, an exited one run again)
+flexvm wait web                 # block until its process ends; print its exit status
+flexvm rename web web2          # a running or stopped VM
 ```
+
+`wait` takes several names and prints each one's status in turn: its
+process's (as `run`'s, below: 143 for a stop, 130 for a kill, 124 when it
+died, CMD's or the app's when it exits), and at once for one with no process
+(a stopped VM: 143; an exited one: its status; `failed` or `lost`: 124). It needs no daemon: it waits on
+a pidfd of the process holding the name, then reads `RUN/vms/NAME.exit`,
+which the VM's process writes as it ends; a process that ended without one
+(SIGKILLed) is an error. `rm` removes the record.
+
+`rename` keeps everything but the name: a running VM's own process takes the
+new name (its registry entry, control socket, the claim on its address and
+its log move, and its command and execs go on under it); a stopped VM's
+checkpoint, address claim and logs move; an exited VM's record (what `start`
+runs again) and logs move. It refuses a name in use (a VM,
+stopped or not, or an `exited`, `failed` or `lost` record: `rm` that first), and a VM
+that is checkpointing, migrating (either way, or still pulling its memory
+after an arrival), being stopped, or `failed` or `lost`. An `exec` started
+before keeps its stream, but cannot reattach (after a checkpoint or a stop)
+under the old name.
 
 As in Docker, `kill` is for a running VM and `rm` for a stopped one: `kill`
 of a stopped VM and `rm` of a running one are refused, saying so, and `rm -f`
@@ -635,7 +688,7 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 | flag | default | what |
 |---|---|---|
 | `--state DIR` | `/var/lib/flexvm` | everything on disk: `host.json` (see Configuration), `artifacts/` (`firecracker`, `vmlinux`; `base.squashfs`, the tests' base rootfs), `templates/` (a link per image name to its current generation in `templates/.gen/`), `images/` (layer blobs and image root filesystems), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), addresses, stopped VMs |
-| `--run DIR` | `/run/flexvm` (another `--state`'s: `/run/flexvm-PREFIX`) | registry, sockets, logs (tmpfs) |
+| `--run DIR` | `/run/flexvm` (another `--state`'s: `/run/flexvm-PREFIX`) | registry, sockets, logs, exit statuses (tmpfs) |
 
 `pull` writes the flexvm-init built into flexvm into the image as PID 1 (`--init PATH`
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and

@@ -6,6 +6,7 @@ mod attach;
 mod bench;
 mod checkpoint;
 mod compat;
+mod containers;
 mod cow;
 mod crc32c;
 mod fc;
@@ -68,17 +69,29 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --rm                           leave no exited record once a background VM exits
       --checkpoint DIR               start it from a checkpoint instead of IMAGE (its name and address
                                      unless --name and --ip IP|auto); --paused holds it until unpause
-  flexvm ps [-a] [--json]            list running VMs (-a: stopped ones too)
+  flexvm ps [-a] [-q] [--json] [--filter KEY=VALUE]... [--format FORMAT]
+                                     list running VMs (-a: stopped ones too; -q: names only);
+                                     --filter name=PART|status=STATE|image=IMAGE|ip=IP (a key again:
+                                     either value; a status filter lists stopped VMs too);
+                                     --format json (an object per line) or a template, as
+                                     '{{.Name}}\t{{.IP}}' ('table ' first: with a header, aligned)
   flexvm exec [OPTIONS] NAME CMD...  run argv in a VM (-d, -e K=V, -w DIR, -u USER[:GROUP]; -i: stdin
                                      too; -t: on a pty, this terminal raw, Ctrl-P Ctrl-Q detaches)
   flexvm attach NAME                 a running VM's app: its output from now on, and stdin if run -i
   flexvm cp SRC DST                  copy files or directories between the host and a VM (NAME:PATH, as
                                      docker cp; - for a tar on stdin or stdout); into the VM as root
+  flexvm logs [-f] [--tail N] NAME   a VM's output (its log, the one before its last rotation first);
+                                     -f follows it, across rotations and restarts, until the VM is gone
+  flexvm inspect NAME...             a JSON array: per VM, what ps --json says and its config
+  flexvm wait NAME...                wait until each VM's process ends, and print its exit status
+                                     (a stopped one: 143; an exited one: its status; failed or lost: 124)
   flexvm stop NAME...                suspend a VM to disk, freeing its memory (as SIGTERM to its process)
   flexvm start [-a] NAME...          resume a stopped VM in the background (-a: in the foreground); an
                                      exited one runs again from its image (its writes were in its memory)
   flexvm pause NAME...               pause a VM's vCPUs, keeping its memory (as SIGTSTP; Ctrl-Z works too)
   flexvm unpause NAME...             resume a paused VM
+  flexvm restart NAME...             stop, then start a VM (a stopped one is started, an exited one rerun)
+  flexvm rename OLD NEW              rename a running, stopped or exited VM (not while it checkpoints or migrates)
   flexvm kill NAME...                destroy a running VM (Ctrl-C or Ctrl-\\ in the foreground)
   flexvm kill -s SIGNAL NAME...      send SIGNAL (TERM, HUP, 9, ...) to the VM's app instead
   flexvm rm [-f] NAME...             remove a stopped VM (suspended, exited, failed or lost); -f: a running
@@ -137,6 +150,7 @@ const SWITCHES: &[&str] = &[
     "version",
     "quiet",
     "password-stdin",
+    "follow",
 ];
 
 /// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`.
@@ -216,6 +230,7 @@ impl Args {
                 "-t" if matches!(cmd, Some("run" | "exec")) => Some("tty"),
                 // Not reclaim's `--force GEN`.
                 "-f" if matches!(cmd, Some("rm" | "image" | "system")) => Some("force"),
+                "-f" if cmd == Some("logs") => Some("follow"),
                 _ => None,
             };
             // Short flags with a value read as their long ones.
@@ -372,10 +387,15 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
             "publish",
         ],
     ),
-    ("ps", 1, &["all", "json"]),
+    ("ps", 1, &["all", "json", "quiet", "filter", "format"]),
     ("exec", 2, &["detach", "interactive", "tty", "env", "workdir", "user"]),
     ("attach", 2, &[]),
     ("cp", 3, &[]),
+    ("logs", 2, &["follow", "tail"]),
+    ("inspect", NAMES, &[]),
+    ("wait", NAMES, &[]),
+    ("restart", NAMES, &[]),
+    ("rename", 3, &[]),
     ("stop", NAMES, &[]),
     ("start", NAMES, &["attach"]),
     ("pause", NAMES, &[]),
@@ -424,7 +444,10 @@ fn check_applies(args: &Args) -> Result<()> {
     } else if !internal && first.is_none() {
         match cmd.as_str() {
             "run" | "pull" | "rmi" => bail!("{cmd} needs IMAGE"),
-            "exec" | "attach" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "checkpoint" | "migrate" => bail!("{cmd} needs NAME"),
+            "exec" | "attach" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "checkpoint" | "migrate" | "logs" | "inspect" | "wait" | "restart" => {
+                bail!("{cmd} needs NAME")
+            }
+            "rename" => bail!("rename needs OLD NEW"),
             "cp" => bail!("cp needs SRC DST"),
             _ => {}
         }
@@ -460,6 +483,12 @@ fn check_applies(args: &Args) -> Result<()> {
     }
     if cmd == "start" && args.has("attach") && args.names().len() > 1 {
         bail!("start -a takes one NAME");
+    }
+    if cmd == "rename" && args.positional.len() < 3 {
+        bail!("rename needs OLD NEW");
+    }
+    if cmd == "ps" && args.has("json") && args.has("format") {
+        bail!("ps takes --json or --format, not both");
     }
     Ok(())
 }
@@ -540,7 +569,7 @@ fn real_main(args: &Args) -> Result<()> {
                 false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?)?),
             })
         }
-        Some("ps") => ps(&open_host(args)?, args.has("all"), args.has("json")),
+        Some("ps") => ps(&open_host(args)?, args),
         Some("exec") => {
             let cmd = exec_command(args)?;
             util::exit(exec(&open_host(args)?, name, &cmd)?)
@@ -553,9 +582,36 @@ fn real_main(args: &Args) -> Result<()> {
             let host = open_host(args)?;
             util::exit(attach::cp(&host, name, arg2.unwrap_or_default())?)
         }
+        Some("logs") => {
+            let tail = args
+                .get("tail")
+                .filter(|&t| t != "all")
+                .map(|t| t.parse().map_err(|_| format!("bad --tail {t:?}: give a count of lines, or all")))
+                .transpose()?;
+            containers::logs(&open_host(args)?, name, args.has("follow"), tail)
+        }
+        Some("inspect") => containers::inspect(&open_host(args)?, &paths(args)?, args.names()),
+        Some("wait") => {
+            let host = open_host(args)?;
+            each(args.names(), |n| output(format_args!("{}\n", containers::wait(&host, n)?)))
+        }
+        Some("rename") => containers::rename(&open_host(args)?, name, arg2.unwrap_or_default()),
         Some("stop") => {
             let host = open_host(args)?;
-            each(args.names(), |n| stop(&host, n))
+            each(args.names(), |n| stop(&host, n).and_then(|()| output(format_args!("{n}\n"))))
+        }
+        Some("restart") => {
+            let host = open_host(args)?;
+            each(args.names(), |n| {
+                // An exited VM has nothing to stop: `start` runs it again.
+                if host.alive(n) || !host.vms(n, "exited")?.exists() {
+                    stop(&host, n)?;
+                }
+                match resume(&host, n)? {
+                    true => output(format_args!("{n}\n")),
+                    false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?)?),
+                }
+            })
         }
         Some("pause") => {
             let host = open_host(args)?;
@@ -579,7 +635,7 @@ fn real_main(args: &Args) -> Result<()> {
         }
         Some("rm") => {
             let host = open_host(args)?;
-            each(args.names(), |n| remove(&host, n, args.has("force"), true))
+            each(args.names(), |n| remove(&host, n, args.has("force"), true).inspect(|()| containers::forget_exit(&host, n)))
         }
         Some("reclaim") => {
             let gen = args.get("force").map(|v| v.parse().map_err(|_| format!("bad --force generation {v:?}"))).transpose()?;
@@ -1056,7 +1112,7 @@ fn stop(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
     let vm = match host.signal(name, libc::SIGTERM) {
         Ok(vm) => vm,
-        Err(_) if !host.alive(name) && host.suspended(name)?.exists() => return output(format_args!("{name}\n")),
+        Err(_) if !host.alive(name) && host.suspended(name)?.exists() => return Ok(()),
         Err(_) => return Err(not_running(host, name)),
     };
     let (start, mut seen) = (Instant::now(), false);
@@ -1070,7 +1126,7 @@ fn stop(host: &Host, name: &str) -> Result<()> {
         }
     }
     if host.suspended(name)?.exists() {
-        return output(format_args!("{name}\n"));
+        return Ok(());
     }
     match std::fs::read_to_string(host.vms(name, "moved")?) {
         Ok(to) => Err(format!("vm {name} moved to {to} before it was stopped; stop it there").into()),
@@ -1250,10 +1306,20 @@ fn stopped(v: &Value) -> bool {
     matches!(v["state"].as_str(), Some("suspended" | "quarantined" | "exited" | "failed" | "lost"))
 }
 
-fn ps(host: &Host, all: bool, as_json: bool) -> Result<()> {
-    let vms: Vec<Value> = vms(host).into_iter().filter(|v| all || !stopped(v)).collect();
-    if as_json {
+/// `ps`: `-a`, `-q`, `--json`, `--filter`s and `--format` (`containers`).
+fn ps(host: &Host, args: &Args) -> Result<()> {
+    let filters = containers::Filters::parse(&args.all("filter"))?;
+    let format = args.get("format").map(containers::Format::parse).transpose()?;
+    let all = args.has("all") || filters.has_status();
+    let vms: Vec<Value> = vms(host).into_iter().filter(|v| (all || !stopped(v)) && filters.matches(v)).collect();
+    if args.has("quiet") {
+        return vms.iter().try_for_each(|v| output(format_args!("{}\n", containers::field(v, "Name"))));
+    }
+    if args.has("json") {
         return print(json!(vms));
+    }
+    if let Some(f) = format.filter(|f| *f != containers::Format::Table) {
+        return output(format_args!("{}", f.render(&vms)?));
     }
     let row = |c: [&str; 10]| {
         output(format_args!("{:<24} {:<15} {:<16} {:<12} {:>8} {:>5} {:>8} {:>8} {} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9]))
@@ -1610,6 +1676,8 @@ fn exec_request(
     // The VM the first request reached: only it is attached to, or asked to start the command again.
     let mut vm = None;
     while Instant::now() < deadline {
+        // A VM's own main command follows its renames.
+        let name = &containers::renamed(name);
         let (started, offset) = {
             let s = session.lock().unwrap();
             if let Some(code) = s.exit {
@@ -1665,7 +1733,8 @@ fn exec_request(
                     }
                     deadline = Instant::now() + Duration::from_secs(30);
                 }
-                if !host.alive(name) {
+                // Renamed meanwhile (a VM's own main command): asked again under its new name.
+                if !host.alive(name) && containers::renamed(name) == *name {
                     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
                         return Err(format!("vm {name} moved to {to}; the command keeps running there (session {id})").into());
                     }
@@ -2207,7 +2276,6 @@ mod exec_tests {
             vec!["logout", "--username", "alice"],
             vec!["logout", "-q"],
             vec!["images", "--password-stdin"],
-            vec!["ps", "-q"],
         ] {
             assert!(check_applies(&parse(&argv)).is_err(), "{argv:?}");
         }
@@ -2314,6 +2382,37 @@ mod exec_tests {
         assert!(err(&["run", "--checkpoint", "/d", "--keep"]).unwrap().contains("--checkpoint"));
         assert!(err(&["pull", "img", "--keep"]).is_some());
         assert!(err(&["run", "--keep", "img", "make"]).unwrap().contains("CMD"));
+    }
+
+    #[test]
+    fn container_commands_take_their_flags_and_words() {
+        let err = |a: &[&str]| check_applies(&parse(a)).err().map(|e| e.to_string());
+        for ok in [
+            &["logs", "-f", "--tail", "20", "web"][..],
+            &["logs", "--follow", "web"],
+            &["inspect", "a", "b"],
+            &["wait", "a", "b"],
+            &["restart", "a", "b"],
+            &["rename", "a", "b"],
+            &["ps", "-q", "-a", "--filter", "name=web", "--filter", "status=running", "--format", "{{.Name}}"],
+        ] {
+            assert_eq!(err(ok), None, "{ok:?}");
+        }
+        let logs = parse(&["logs", "-f", "web"]);
+        assert!(logs.has("follow") && !logs.has("force"), "-f is logs' follow");
+        assert!(parse(&["rm", "-f", "web"]).has("force"), "and rm's force");
+        assert_eq!(parse(&["ps", "--filter", "a=1", "--filter", "b=2"]).all("filter"), ["a=1", "b=2"]);
+        assert_eq!(err(&["rename", "a"]).unwrap(), "rename needs OLD NEW");
+        assert!(err(&["rename", "a", "b", "c"]).is_some());
+        assert_eq!(err(&["logs"]).unwrap(), "logs needs NAME");
+        assert!(err(&["logs", "a", "b"]).is_some(), "one NAME");
+        assert_eq!(err(&["wait"]).unwrap(), "wait needs NAME");
+        assert_eq!(err(&["inspect"]).unwrap(), "inspect needs NAME");
+        assert_eq!(err(&["restart"]).unwrap(), "restart needs NAME");
+        assert!(err(&["stop", "-q", "a"]).unwrap().contains("--quiet does not apply"));
+        assert!(err(&["ps", "--tail", "3"]).is_some());
+        assert!(err(&["ps", "--json", "--format", "json"]).unwrap().contains("not both"));
+        assert!(Args::parse(["kill", "-f", "a"].map(String::from)).is_err(), "-f is only rm's and logs'");
     }
 
     #[test]

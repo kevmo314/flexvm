@@ -2427,6 +2427,9 @@ pub mod output {
     static LOGS: Mutex<[Option<PathBuf>; 2]> = Mutex::new([None, None]);
     static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
     static RELAYS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+    /// Held by each relay's write (shared), and by `moved` (exclusive): no write goes to a log
+    /// path that is being renamed.
+    static MOVING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
     pub fn guard() -> std::io::Result<()> {
         for (i, fd) in [1, 2].into_iter().enumerate() {
@@ -2450,6 +2453,7 @@ pub mod output {
     }
 
     fn relay(i: usize, data: &[u8]) {
+        let _moving = MOVING.read().unwrap_or_else(|e| e.into_inner());
         // A capped log's output is appended there or dropped, never written twice.
         let log = LOGS.lock().unwrap()[i].clone();
         if let Some(log) = log {
@@ -2537,6 +2541,24 @@ pub mod output {
                 targets[i] = Some(Arc::new(own(f)));
             }
         }
+    }
+
+    /// `rename`: the logs at `from` move to `to` (`mv` renames them), with no write of this
+    /// process's in between; its output goes on there.
+    pub fn moved(from: &Path, to: &Path, mv: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        let _moving = MOVING.write().unwrap_or_else(|e| e.into_inner());
+        // As a target's path reads (`capped`): through any symlink in the run directory's.
+        let real = from.parent().and_then(|d| Some(std::fs::canonicalize(d).ok()?.join(from.file_name()?)));
+        let was = |p: &Option<PathBuf>| p.as_deref().is_some_and(|p| p == from || Some(p) == real.as_deref());
+        mv()?;
+        for l in LOGS.lock().unwrap().iter_mut().filter(|l| was(l)) {
+            *l = Some(to.into());
+        }
+        let mut log = LOG.lock().unwrap();
+        if was(&log) {
+            *log = Some(to.into());
+        }
+        Ok(())
     }
 
     /// An arrival's log was published as `log` (renamed): capped there from now on.

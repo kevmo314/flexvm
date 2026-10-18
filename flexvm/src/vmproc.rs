@@ -151,9 +151,9 @@ pub struct Proc {
     pub host: Host,
     pub paths: Paths,
     pub spawner: Spawner,
-    ident: Ident,
-    name: Mutex<Option<NameLock>>,
-    addr: Mutex<Option<AddrClaim>>,
+    pub(crate) ident: Ident,
+    pub(crate) name: Mutex<Option<NameLock>>,
+    pub(crate) addr: Mutex<Option<AddrClaim>>,
     runtime: Runtime,
     me: std::sync::Weak<Proc>,
     announcer: Arc<Announcer>,
@@ -202,7 +202,7 @@ pub struct Runtime {
     pub suspending: Mutex<Suspend>,
     /// The migration away (and its target) whose outcome this source has yet
     /// to learn (its target never said, nor can be asked): a kill meanwhile ends it.
-    reconciling: Mutex<Option<(u64, String)>>,
+    pub(crate) reconciling: Mutex<Option<(u64, String)>>,
     /// While an operation waits in `settle_arrival` for the arrival's last pages (`debug status` shows it).
     settling: AtomicBool,
     early: Mutex<Vec<i32>>,
@@ -387,6 +387,11 @@ impl Proc {
         let vm = self.vm();
         let sizes = self.sizes.lock().unwrap().take().unwrap_or_else(|| vm.mem_sizes());
         vm.start_limit(self.granted.load(Ordering::SeqCst), sizes, &self.host);
+    }
+
+    /// Set while a migration away may commit.
+    pub fn is_leaving(&self) -> bool {
+        self.leaving.load(Ordering::SeqCst)
     }
 
     pub fn name(&self) -> String {
@@ -760,6 +765,7 @@ impl Proc {
             growth_mib_s: self.growth.load(Ordering::SeqCst),
             cmd: self.cmd.lock().unwrap().is_some(),
             ports: self.bound_ports(),
+            spec: self.spec.lock().unwrap().clone(),
         };
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
             crate::log!("vm {n}: registry: {e}");
@@ -793,6 +799,10 @@ impl Proc {
         }
         if exited {
             self.record_exit(code);
+        }
+        // Before the name goes: `flexvm wait` reads it as this instance's.
+        if let Some(n) = self.name.lock().unwrap().as_ref() {
+            crate::containers::record_exit(&self.host, &n.name, &self.ident, code);
         }
         drop(self.name.lock().unwrap().take());
         for f in self.files.lock().unwrap().drain(..) {
@@ -1332,7 +1342,7 @@ impl Proc {
         let _ = c.set_read_timeout(None);
         let reply = match req["op"].as_str().unwrap_or("") {
             // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
-            "exec" | "attach" | "stdin" | "checkpoint" | "migrate" | "debug" | "resume" | "signal" if self.vm.get().is_none() => {
+            "exec" | "attach" | "stdin" | "checkpoint" | "migrate" | "debug" | "resume" | "signal" | "rename" if self.vm.get().is_none() => {
                 Err(Busy(format!("vm {} is starting", self.name())).into())
             }
             "exec" => return self.exec(&req, c),
@@ -1353,6 +1363,7 @@ impl Proc {
             "debug" => self.debug(&req),
             "resume" => self.resume_request(),
             "signal" => self.signal_app(&req),
+            "rename" => self.rename(req["to"].as_str().unwrap_or("")),
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
         };
@@ -1551,7 +1562,7 @@ impl Proc {
         let vm = self.vm();
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         crate::log!("vm {}: died: {why}", vm.name);
-        if let Ok(failed) = self.host.vms(&vm.name, "failed") {
+        if let Ok(failed) = self.host.vms(&vm.name.get(), "failed") {
             let _ = crate::host::write_record(&failed, why.as_bytes());
         }
         self.finish(op, End::Died, DIED, None)
