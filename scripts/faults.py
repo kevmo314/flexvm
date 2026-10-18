@@ -4511,6 +4511,10 @@ def resume_mark_fails():
     # quarantine no longer keeps a sweep from withdrawing the generation (#556). `debug gc` waits
     # for a sweep under way (another process's periodic one), then runs its own.
     rewrite(os.path.join(d, "QUARANTINE"), lambda q: "another-boot " + q.split(" ", 1)[1])
+    # A sweep withdraws only for a holder proven dead, and the quarantined resume's process answers
+    # before it ends (#700): its gc waits for that.
+    holder = addr(A, ip).get("holder_id") or {}
+    check("marker kept: the quarantined resume's process ended", wait_for(lambda: not alive(holder.get("pid")), 30), holder)
     ok(cli_json(A, "debug", "gc"))
     check("marker kept, after a reboot: its generation withdrawn", addr(A, ip).get("withdrawn") is True and addr(A, ip).get("holder") is None, addr(A, ip))
     r = resume_suspended(A, n)
