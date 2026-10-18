@@ -1195,6 +1195,10 @@ impl Host {
     /// The record's revision may trail the one its holder here runs at (published, `live`): the
     /// newer of the two decides.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
+        // All generations supplied by peers, including withdrawals, are bounded.
+        if gen > RECV_MAX {
+            return Ok(false);
+        }
         self.observe_and(l, ip, gen, rev, via, |_| ())
     }
 
@@ -1202,8 +1206,16 @@ impl Host {
     fn observe_and(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>, also: impl FnOnce(&mut Addr)) -> Result<bool> {
         let live = via.and_then(|_| self.live_of(ip, &self.addr(l, ip).ok()?)).unwrap_or(0);
         self.update(l, ip, true, |a| {
-            also(a);
-            if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev.max(live))) {
+            // Only a local withdrawal of the recorded generation may exceed the peer bound.
+            if gen == 0
+                || (gen > RECV_MAX && (via.is_some() || gen != a.seen))
+                || gen < a.seen
+                || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev.max(live)))
+            {
+                // A stale claim can be released; a refused current one must remain retryable.
+                if !a.current(gen) {
+                    also(a);
+                }
                 return false;
             }
             if via.is_some() || gen > a.seen {
@@ -1213,6 +1225,7 @@ impl Host {
             if via.is_none() && a.lent.is_some_and(|lent| lent <= gen) {
                 a.lent = None;
             }
+            also(a);
             true
         })
     }
@@ -1949,7 +1962,11 @@ impl Host {
         let owed: Vec<(u64, PathBuf, Owed)> =
             self.owed_ids()?.into_iter().filter_map(|(id, path)| Some((id, path.clone(), load::<Owed>(&path).ok()??))).filter(|(_, _, o)| o.ip == ip).collect();
         // Withdrawn first: a crash before the records go leaves them to settle as aborted (a withdrawal again).
-        let current = self.observe(&l, ip, gen, 0, None)?;
+        // A local withdrawal (this host lent `gen`): not bounded as a peer's is (#701).
+        let current = self.observe_and(&l, ip, gen, 0, None, |_| ())?;
+        if !current && self.current(&l, ip, gen)? {
+            bail!("{ip}: withdrawal of generation {gen} was not recorded; it is still current");
+        }
         self.unlend(&l, ip, gen)?;
         // A dead source's `leaving` claim goes too: withdrawn, nothing is owed for it (#570).
         if let (Some(_), Some(name), Some(by)) = (&a.leaving, &a.holder, &a.holder_id) {
@@ -3055,6 +3072,7 @@ impl Host {
     /// peers (`deliver_withdrawals`) whatever dies or is down meanwhile.
     /// A notice of an older generation is replaced; a newer one is kept.
     /// A notice of the same generation and an older revision is replaced too.
+    /// An unobserved withdrawal is an error if the generation is still current.
     pub fn withdraw_noted(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
         self.withdraw_noted_and(l, ip, gen, |_| ())
     }
@@ -3068,7 +3086,11 @@ impl Host {
             let peers = peers.into_iter().map(|peer| Unheard { peer, tries: 0, next_ms: 0 }).collect();
             store(&path, &Notice { gen, rev, peers }, true)?;
         }
-        self.observe_and(l, ip, gen, 0, None, also)
+        let observed = self.observe_and(l, ip, gen, 0, None, also)?;
+        if !observed && self.current(l, ip, gen)? {
+            bail!("{ip}: withdrawal of generation {gen} was not recorded; it is still current");
+        }
+        Ok(observed)
     }
 
     /// The latest revision of generation `gen` of `ip` here: the record's, or what the VM that
@@ -6473,6 +6495,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reclaim_withdraws_a_loan_above_the_peer_bound() {
+        let (_h_dir, h) = host("reclaim-above-bound");
+        let x = ip("10.9.0.2");
+        let gen = {
+            let l = h.lock().unwrap();
+            assert!(h.observe(&l, x, RECV_MAX, 0, Some(ip("10.1.0.2"))).unwrap());
+            assert!(h.observe(&l, x, RECV_MAX, 0, None).unwrap(), "the peer withdraws it");
+            h.lend_new(&l, x).unwrap()
+        };
+        assert!(gen > RECV_MAX);
+        assert_eq!(h.reclaim(x, gen).unwrap(), (gen, vec![]));
+        let a = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(a.withdrawn && a.lent.is_none() && a.seen == gen);
+    }
+
+    #[test]
     fn reclaim_refuses_a_generation_lent_again_since_confirmation() {
         let (_h_dir, h) = host("reclaim-generation");
         let x = ip("10.9.0.2");
@@ -7047,10 +7085,54 @@ pub(crate) mod tests {
         let addr = ip("10.9.0.1");
         for gen in [0, RECV_MAX + 1, GEN_MAX - 1025, GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX, GEN_MAX + 1, u64::MAX] {
             assert!(h.claim_incoming(&l, "incoming", addr, gen, None).is_err());
+            assert!(h.claim_arrival(&l, "arrival", addr, gen, 1, 1).is_err());
             assert!(!h.observe(&l, addr, gen, 0, Some(ip("10.1.0.2"))).unwrap());
             assert!(!h.observe(&l, addr, gen, 0, None).unwrap());
             assert_eq!(h.addr(&l, addr).unwrap(), Addr::default());
         }
+    }
+
+    #[test]
+    fn local_withdrawals_above_the_peer_bound_succeed() {
+        let (_dir, h) = host("local-gen-bound");
+        let l = h.lock().unwrap();
+        let peer_addr = ip("10.9.0.1");
+        assert!(h.observe(&l, peer_addr, RECV_MAX, 0, Some(ip("10.1.0.2"))).unwrap());
+        let first = h.claim_new(&l, "first", Some(peer_addr)).unwrap();
+        let second = h.claim_new(&l, "second", Some(ip("10.9.0.2"))).unwrap();
+        for claim in [first, second] {
+            assert!(claim.gen > RECV_MAX);
+            // Even the exact recorded generation cannot be withdrawn by a peer above the bound.
+            assert!(!h.observe(&l, claim.ip, claim.gen, 0, None).unwrap());
+            assert!(h.current(&l, claim.ip, claim.gen).unwrap());
+            assert!(h.withdraw_noted(&l, claim.ip, claim.gen).unwrap());
+            assert!(!h.current(&l, claim.ip, claim.gen).unwrap());
+            claim.release(&l).unwrap();
+        }
+    }
+
+    #[test]
+    fn unobserved_current_withdrawal_is_an_error_and_keeps_the_claim() {
+        let (_dir, h) = host("withdraw-not-observed");
+        let l = h.lock().unwrap();
+        let x = ip("10.9.0.1");
+        let claim = h.claim_new(&l, "vm", Some(x)).unwrap();
+        let before = h.addr(&l, x).unwrap();
+        // A generation not recorded locally cannot use the local exemption.
+        let gen = RECV_MAX + 1;
+        assert!(before.current(gen));
+        let err = h.withdraw_noted_and(&l, x, gen, |a| drop(let_go(a, "vm", None))).unwrap_err();
+        assert!(err.to_string().contains("still current"), "{err}");
+        assert_eq!(h.addr(&l, x).unwrap(), before);
+        // A stale withdrawal may still finish releasing its old claim.
+        assert!(!h.withdraw_noted(&l, x, claim.gen - 1).unwrap());
+        claim.release(&l).unwrap();
+
+        let before = Addr { seen: 0, held: 0, holder: Some("vm".into()), ..Addr::default() };
+        h.put_addr(x, &before, true).unwrap();
+        assert!(h.current(&l, x, 0).unwrap());
+        assert!(h.withdraw_noted_and(&l, x, 0, |a| drop(let_go(a, "vm", None))).is_err());
+        assert_eq!(h.addr(&l, x).unwrap(), before);
     }
 
     #[test]
