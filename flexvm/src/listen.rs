@@ -799,8 +799,10 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let mut asked = false;
     let got = PUSHES.take(conn.peer_addr()?.ip()).ok_or(BUSY.into()).and_then(|_slot| {
         let _turn = crate::template::turn(&paths, id, at)?;
-        if let Some(dir) = crate::template::Template::generation(&paths, id) {
-            return crate::template::Template::open_dir(id, dir).inspect(|_| drop(answer(&Ok(json!({"have": true})))));
+        let held = HELD.lock().unwrap().get(id).map(|h| h.0.clone());
+        if let Some(tpl) = held.map(Ok).or_else(|| crate::template::Template::generation(&paths, id).map(|dir| crate::template::Template::open_dir(id, dir))) {
+            // A received one's digests, for the source to compare: its content id is no proof of its files.
+            return tpl.inspect(|t| drop(answer(&Ok(json!({"have": true, "digests": t.meta.received})))));
         }
         answer(&Ok(json!({"have": false})))?;
         asked = true;
@@ -811,10 +813,7 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
             if asked {
                 answer(&Ok(json!({"received": true})))?;
             }
-            std::thread::spawn(move || {
-                std::thread::sleep(PUSH_HOLD);
-                drop(tpl);
-            });
+            hold(tpl);
         }
         Err(e) => {
             answer(&Err(e))?;
@@ -824,6 +823,26 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Generations held for arrivals, by content id, until when: one hold (and thread) each, however often asked.
+static HELD: Mutex<std::collections::BTreeMap<String, (Arc<crate::template::Template>, Instant)>> = Mutex::new(std::collections::BTreeMap::new());
+
+fn hold(tpl: Arc<crate::template::Template>) {
+    let id = tpl.meta.id.clone();
+    if HELD.lock().unwrap().insert(id.clone(), (tpl, Instant::now() + PUSH_HOLD)).is_some() {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        let mut held = HELD.lock().unwrap();
+        let left = held[&id].1.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            held.remove(&id);
+            return;
+        }
+        drop(held);
+        std::thread::sleep(left);
+    });
 }
 
 /// The host lock, waited for `LOCK_WAIT` at most: then refused as busy.

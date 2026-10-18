@@ -58,6 +58,10 @@ pub struct Meta {
     /// `recipe()` of the build: a pull of the same image skips the build only if it matches.
     #[serde(default)]
     pub recipe: String,
+    /// A received generation's SHA-256 digests (`digests`): its content id is no check against a peer that
+    /// made files to match it, so a source finding it here compares its own. None for one built here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received: Option<BTreeMap<String, String>>,
 }
 
 pub const FORMAT_VERSION: u64 = 2;
@@ -139,10 +143,32 @@ fn zero(page: &[u8]) -> bool {
 
 /// Length plus non-zero pages, so sparse and dense copies of the same bytes match.
 fn content_hash(file: &File) -> Result<String> {
+    let mut hash = Hash::new();
+    hash.word(file.metadata()?.len());
+    nonzero_pages(file, |n, p| {
+        hash.word(n);
+        hash.update(p);
+    })?;
+    Ok(hash.finish())
+}
+
+/// `content_hash`'s page walk, but cryptographic: what a received generation is compared by.
+fn digest(path: &Path) -> Result<String> {
+    use sha2::Digest;
+    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut h = sha2::Sha256::new();
+    h.update(file.metadata()?.len().to_le_bytes());
+    nonzero_pages(&file, |n, p| {
+        h.update(n.to_le_bytes());
+        h.update(p);
+    })?;
+    Ok(format!("{:x}", h.finalize()))
+}
+
+/// Calls `f` with each page of `file` that is not all zero, by index, in order.
+fn nonzero_pages(file: &File, mut f: impl FnMut(u64, &[u8])) -> Result<()> {
     let len = file.metadata()?.len();
     let page = PAGE_SIZE as u64;
-    let mut hash = Hash::new();
-    hash.word(len);
     let mut buf = vec![0u8; 1 << 20];
     let mut next = 0;
     for (start, end) in data_extents(file, len)? {
@@ -155,14 +181,32 @@ fn content_hash(file: &File) -> Result<String> {
             buf[have..n].fill(0);
             for (i, p) in buf[..n].chunks(PAGE_SIZE).enumerate() {
                 if !zero(p) {
-                    hash.word(off / page + i as u64);
-                    hash.update(p);
+                    f(off / page + i as u64, p);
                 }
             }
             off += n as u64;
         }
     }
-    Ok(hash.finish())
+    Ok(())
+}
+
+/// The SHA-256 digests of a generation's files and of what its metadata says beyond its content id
+/// (its host's CPU and Firecracker, sizes, image, recipe), which `received` records.
+fn digests(meta: &Meta, vmstate: &Path, mem: &Path, rootfs: &Path) -> Result<BTreeMap<String, String>> {
+    use sha2::Digest;
+    let said =
+        serde_json::to_vec(&(&meta.id, &meta.compatibility, [meta.vcpus as u64, meta.mem_mib, meta.max_mib, meta.plugged_mib], &meta.image, &meta.recipe))?;
+    let mut out = BTreeMap::from([("meta".to_string(), format!("{:x}", sha2::Sha256::digest(said)))]);
+    for (name, path) in [("vmstate", vmstate), ("mem", mem), ("rootfs", rootfs)] {
+        out.insert(name.into(), digest(path)?);
+    }
+    Ok(out)
+}
+
+/// Whether `vmstate` names `rootfs` by its path, as generations built by v0.1.0 do (not `ROOTFS`).
+fn names_by_path(vmstate: &[u8], rootfs: &Path) -> bool {
+    let path = rootfs.as_os_str().as_encoded_bytes();
+    vmstate.windows(path.len()).any(|w| w == path)
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<Component> {
@@ -483,6 +527,16 @@ impl Template {
             crate::util::write_file(&self.fixed, "meta.json", &serde_json::to_vec_pretty(&meta)?, true).inspect_err(|_| cache.clear())?;
         }
         Ok(())
+    }
+
+    /// `digests` of this generation, as a source compares them with a target's received copy.
+    pub fn digests(&self) -> Result<BTreeMap<String, String>> {
+        digests(&self.meta, &self.vmstate(), &self.fixed.join("mem"), &self.meta.rootfs)
+    }
+
+    /// Whether its snapshot names its root filesystem by its path (built by v0.1.0), which v0.1.0 needs.
+    pub fn names_rootfs_by_path(&self) -> Result<bool> {
+        Ok(names_by_path(&std::fs::read(self.vmstate())?, &self.meta.rootfs))
     }
 
     pub fn check_id(&self, id: &str) -> Result<()> {
@@ -1060,14 +1114,11 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
     }
     let staging = Staging::new(paths, id)?;
     let gen = std::fs::canonicalize(&staging.parent.path)?.join(GENERATIONS).join(id);
-    let mut budget = MAX_DATA;
-    let file = |r: &mut _, name: &str, max, budget: &mut _| {
-        receive_file(r, &staging.dir.join(name), max, budget).map_err(|e| format!("template {id}: its {name}: {e}"))
-    };
-    file(r, "vmstate", MAX_VMSTATE, &mut budget)?;
+    let mut room = Room(0);
+    let mut file = |r: &mut _, name: &str, max| receive_file(r, &staging.dir.join(name), max, &mut room).map_err(|e| format!("template {id}: its {name}: {e}"));
+    file(r, "vmstate", MAX_VMSTATE)?;
     // Older generations name the root filesystem by its path (not `ROOTFS`), which must hold it here too.
-    let src = meta.rootfs.as_os_str().as_encoded_bytes();
-    let local = match std::fs::read(staging.dir.join("vmstate"))?.windows(src.len()).any(|w| w == src) {
+    let local = match names_by_path(&std::fs::read(staging.dir.join("vmstate"))?, &meta.rootfs) {
         false => None,
         true => Some(
             Some(&meta.rootfs)
@@ -1077,18 +1128,21 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
                 .ok_or_else(|| format!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display()))?,
         ),
     };
-    file(r, "rootfs", MAX_FILE, &mut budget)?;
+    file(r, "rootfs", MAX_FILE)?;
     // Test gate: half received, for a test to kill the receiver.
     crate::host::hold("receive_hold");
-    file(r, "mem", MAX_FILE, &mut budget)?;
+    file(r, "mem", MAX_FILE)?;
+    let staged = |n: &str| staging.dir.join(n);
+    let rootfs = local.as_ref().map_or(staged("rootfs"), |_| meta.rootfs.clone());
+    meta.received = Some(digests(&meta, &staged("vmstate"), &staged("mem"), &rootfs)?);
     let rootfs = match local {
         Some(have) => {
-            std::fs::remove_file(staging.dir.join("rootfs"))?;
+            std::fs::remove_file(staged("rootfs"))?;
             have
         }
         None => {
             meta.rootfs = gen.join("rootfs");
-            hash_file(&staging.dir.join("rootfs"))?
+            hash_file(&staged("rootfs"))?
         }
     };
     let got = [
@@ -1121,24 +1175,40 @@ fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
     Ok(out)
 }
 
+/// Blocks receives here are yet to fill, which each one's room check counts as taken.
+static RESERVED: Mutex<u64> = Mutex::new(0);
+
+/// What one receive reserved, given back when it ends (written by then, or removed).
+struct Room(u64);
+
+impl Drop for Room {
+    fn drop(&mut self) {
+        *RESERVED.lock().unwrap() -= self.0;
+    }
+}
+
 /// One of `send`'s files, written to a new `path` with the same length and holes, within `max` and
-/// what is left of `budget` and of its filesystem's room.
-fn receive_file(r: &mut impl Read, path: &Path, max: u64, budget: &mut u64) -> Result<()> {
+/// what is left of the generation's budget (`MAX_DATA`) and of its filesystem's room, by blocks.
+fn receive_file(r: &mut impl Read, path: &Path, max: u64, room: &mut Room) -> Result<()> {
     let [len, n] = read_words(r)?;
     if len > max || n > MAX_EXTENTS {
         bail!("{len} bytes in {n} extents is past the limits");
     }
     let extents: Vec<(u64, u64)> = (0..n).map(|_| read_words(r).map(|[s, e]| (s, e))).collect::<Result<_>>()?;
-    let data: u64 = extents.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-    if !valid_extents(&extents, len) || data > *budget {
-        bail!("bad extents, or {data} bytes of data past the limit");
+    if !valid_extents(&extents, len) {
+        bail!("bad extents");
     }
-    *budget -= data;
     let file = File::options().write(true).create_new(true).open(path)?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) } == 0 && st.f_bavail.saturating_mul(st.f_frsize) < data + KEEP_FREE {
-        bail!("{data} bytes of data would leave less than {} MiB free", KEEP_FREE >> 20);
+    crate::util::check(unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) })?;
+    let block = st.f_frsize.max(PAGE_SIZE as u64);
+    let blocks: u64 = extents.iter().map(|(s, e)| (e.div_ceil(block) - s / block) * block).sum();
+    let mut reserved = RESERVED.lock().unwrap();
+    if room.0 + blocks > MAX_DATA || st.f_bavail.saturating_mul(st.f_frsize) < *reserved + blocks + KEEP_FREE {
+        bail!("{blocks} bytes of blocks are past the limit, or would leave less than {} MiB free", KEEP_FREE >> 20);
     }
+    (*reserved, room.0) = (*reserved + blocks, room.0 + blocks);
+    drop(reserved);
     file.set_len(len)?;
     let mut buf = vec![0u8; 1 << 20];
     for (mut off, end) in extents {
@@ -1237,6 +1307,7 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
         components: BTreeMap::new(),
         image: Some(image),
         recipe: recipe(),
+        received: None,
     };
     meta.identify(paths, dir)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
@@ -1600,6 +1671,7 @@ mod tests {
                 components: BTreeMap::new(),
                 image: None,
                 recipe: String::new(),
+                received: None,
             };
             for (name, path) in meta.files(&paths, &dir) {
                 std::fs::write(path, name.as_bytes()).unwrap();
@@ -1680,6 +1752,19 @@ mod tests {
         assert!(names(&paths.templates).unwrap().is_empty());
         assert_eq!(images(&paths).unwrap()[0]["name"], Value::Null);
         assert!(Template::open_id(&paths, "t", &tpl.meta.id).is_ok());
+        // What a source compares: a copy made to match the content id, or with other metadata, differs.
+        assert_eq!(got.meta.received.as_ref(), Some(&tpl.digests().unwrap()));
+        let (_other, elsewhere_paths) = elsewhere(&f);
+        let mut meta = tpl.meta.clone();
+        meta.compatibility.cpu = "another".into();
+        let forged = [
+            &(serde_json::to_vec(&meta).unwrap().len() as u64).to_le_bytes()[..],
+            &serde_json::to_vec(&meta).unwrap(),
+            &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..],
+        ]
+        .concat();
+        let poisoned = receive(&elsewhere_paths, &mut &forged[..], &tpl.meta.id).unwrap();
+        assert_ne!(poisoned.meta.received.as_ref(), Some(&tpl.digests().unwrap()));
         // An identical one arriving again keeps the first.
         drop(got);
         receive(&paths, &mut &buf[..], &tpl.meta.id).unwrap();
@@ -1705,7 +1790,7 @@ mod tests {
         for words in [[8u64, 1, 0, 16], [MAX_DATA + 1, 1, 0, MAX_DATA + 1]] {
             let head: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             path.set_extension("y");
-            assert!(receive_file(&mut &head[..], &path, u64::MAX, &mut MAX_DATA.clone()).is_err());
+            assert!(receive_file(&mut &head[..], &path, u64::MAX, &mut Room(0)).is_err());
         }
         let (_other, mut paths) = elsewhere(&f);
         paths.firecracker = paths.templates.join("firecracker");

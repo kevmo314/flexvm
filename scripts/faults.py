@@ -6493,7 +6493,8 @@ def evict_peer_busy():
             configure(A, peers=[B.addr])
     with open(os.path.join(A.run, "evict.backoff")) as f:
         backoff = json.load(f)
-    check("evict peer busy: the stub was asked", "migrate_in" in stub.asked, stub.asked)
+    # Its template first (`template`): refused there, the eviction moves on as for any refusal.
+    check("evict peer busy: the stub was asked", stub.asked and set(stub.asked) <= {"template", "migrate_in"}, stub.asked)
     check("evict peer busy: moved to the next peer", moved, (where(n), log(A, n)[-1500:]))
     check("evict peer busy: the stub is backed off", f"{v['pid']}-{v['start']} {stub.addr}" in backoff, backoff)
     check("evict peer busy: md5 intact", md5(B, n) == m)

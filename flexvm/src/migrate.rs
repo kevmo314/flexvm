@@ -119,6 +119,9 @@ impl Proc {
         vm.can_leave()?;
         vm.template.verify(&self.paths)?;
         let pushed = push_template(to, &vm.template)?;
+        if pushed.is_none() && !vm.template.names_rootfs_by_path()? {
+            bail!("{to} runs flexvm v0.1.0, which cannot load template {} (built since): upgrade it first", vm.template.meta.id);
+        }
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
@@ -1024,6 +1027,9 @@ fn push_template(to: &str, tpl: &Template) -> Result<Option<Value>> {
         r => r.map_err(fail)?,
     };
     let sent = match have["have"] == json!(true) {
+        true if !have["digests"].is_null() && have["digests"] != json!(tpl.digests()?) => {
+            bail!("{to} has a received copy of template {} whose files differ from this host's: remove it there (flexvm rmi {0})", tpl.meta.id)
+        }
         true => 0,
         false => {
             let sent = crate::template::send(tpl, &mut std::io::BufWriter::with_capacity(1 << 20, By { s: &conn, at }));

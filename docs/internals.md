@@ -277,14 +277,19 @@ target's reply to them.
    and `images` lists it as `<none>`. The root filesystem goes in the
    generation's own directory, which takes it along when it is removed. Two
    arrivals of one template take turns (`template::turn`), so the second sends
-   nothing. A push that fails or is killed leaves its staging directory, which
+   nothing. The content id's hash is no cryptographic check, so a received
+   generation records SHA-256 digests of its files and of its metadata
+   (`received`); a target answering that it has a received copy sends them,
+   and the source refuses one that differs from its own. A push that fails or is killed leaves its staging directory, which
    the next build or push sweeps, never a generation. The listener holds the
    generation open for 17 s, until the arrival has opened it itself, so no
    `rmi` or prune removes it in between; from then on the VM holds it as any
    VM does. Caps: 4 pushes at once (2 from one peer), 64 GiB of data, 1 GiB
    left free on the disk, and 10 minutes for the whole push. A v0.1.0 target
    answers `unknown op`: the migration goes on and needs the generation there,
-   as before. All of this happens while the VM runs: none of it is downtime.
+   as before, and one built since (whose snapshot names `rootfs`, which v0.1.0
+   does not link) is refused at once. Disk room is reserved by blocks, across
+   pushes at once. All of this happens while the VM runs: none of it is downtime.
 1. Before the pause, over one connection (`migrate_in`): the target checks the
    template, reserves the name and address, spawns a Firecracker and
    starts its pager (the listener started a VM process for it). With `firecracker/0002-*.patch` it also has Firecracker
