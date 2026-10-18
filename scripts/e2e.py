@@ -534,10 +534,13 @@ def run_exec_ps():
     took = time.time() - t
     must(A, vm, "rm /etc/passwd && ln -s passwd.e2e /etc/passwd")
     linked = A.cli("exec", "-u", "nobody", vm, "id", "-u", check=False, timeout=30)
+    must(A, vm, "ln -sfn /nonexistent /etc/passwd")
+    dangling = A.cli("exec", "-u", "1000", vm, "true", check=False, timeout=30).returncode
     must(A, vm, "rm /etc/passwd && mv /etc/passwd.e2e /etc/passwd")
     check("exec: a FIFO for /etc/passwd stalls nothing, refused for -u", plain[:2] == (0, "ok\n") and users == [126, 126] and took < 15,
           (plain, users, took))
-    check("exec -u: /etc/passwd through a link", (linked.returncode, linked.stdout) == (0, nobody + "\n"), (linked.returncode, linked.stdout, linked.stderr))
+    check("exec -u: /etc/passwd through a link, refused through a dangling one", (linked.returncode, linked.stdout, dangling) == (0, nobody + "\n", 126),
+          (linked.returncode, linked.stdout, linked.stderr, dangling))
     # Multi-MB output streamed whole through exec and checked on the host.
     code, out, err = A.exec(vm, "head -c 3000000 /dev/zero | tr '\\0' x")
     check("exec: 3 MB of pipeline output, all of it", code == 0 and out == "x" * 3000000,

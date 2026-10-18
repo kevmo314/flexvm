@@ -404,7 +404,8 @@ impl Output {
         while self.chunks.front().is_some_and(|c| c.offset + c.data.len() as u64 <= keep) {
             self.chunks.pop_front();
         }
-        self.start = self.chunks.front().map_or(self.end, |c| c.offset.max(keep));
+        // Never back: a grown capacity must not bring back what was dropped (still in the oldest chunk).
+        self.start = self.chunks.front().map_or(self.end, |c| c.offset.max(keep).max(self.start));
     }
 
     pub(crate) fn read_chunk(&self, offset: u64) -> Option<(u8, &[u8])> {
@@ -1536,6 +1537,8 @@ mod tests {
         full.push(FRAME_STDOUT, &[b'z'; BLOCK], 4 * BLOCK);
         assert_eq!((full.start, full.chunks.len()), (BLOCK as u64 + 1, 5));
         assert_eq!(full.read_chunk(BLOCK as u64 + 1), Some((FRAME_STDOUT, &[b'x'; BLOCK - 1][..])));
+        full.push(FRAME_STDOUT, b"z", 8 * BLOCK);
+        assert_eq!(full.start, BLOCK as u64 + 1, "a larger capacity brought dropped output back");
     }
 
     fn read_to_exit(peer: &mut UnixStream) {
