@@ -881,3 +881,90 @@ fn store_prune_keeps_every_ancestor_of_a_kept_leaf() {
     let removed = store::prune(&state, None).unwrap();
     assert_eq!(removed, ids.into_iter().rev().map(|id| json!({"deleted": id, "name": null})).collect::<Vec<_>>());
 }
+
+/// `remove` and `prune` as they were before the dependency index (#804), for comparison.
+mod scan {
+    use super::super::store::{find, Entry};
+    use crate::{bail, util::Result};
+    use std::collections::BTreeSet;
+
+    fn builds_on(e: &Entry, id: &str) -> bool {
+        e.manifest.parent.as_ref().is_some_and(|p| p.id == id)
+    }
+
+    fn label(e: &Entry) -> &str {
+        e.name.as_deref().unwrap_or(&e.id)
+    }
+
+    pub fn remove(all: &[Entry], whats: &[String], force: bool) -> Result<Vec<String>> {
+        let mut doomed: BTreeSet<&str> = whats.iter().map(|w| Ok(find(all, w)?.id.as_str())).collect::<Result<_>>()?;
+        loop {
+            let more: Vec<&Entry> = all.iter().filter(|e| !doomed.contains(e.id.as_str()) && doomed.iter().any(|d| builds_on(e, d))).collect();
+            let Some(first) = more.first() else { break };
+            if !force {
+                let parent = all.iter().find(|p| builds_on(first, &p.id)).map_or("", label);
+                let children: Vec<&str> = more.iter().map(|e| label(e)).collect();
+                bail!("checkpoint {parent} has checkpoints built on it ({}): remove them first, or -f removes them too", children.join(", "));
+            }
+            doomed.extend(more.iter().map(|e| e.id.as_str()));
+        }
+        Ok(delete(all, doomed))
+    }
+
+    pub fn prune(all: &[Entry], before: Option<u64>) -> Vec<String> {
+        let mut doomed: BTreeSet<&str> = all.iter().filter(|e| before.is_none_or(|b| e.manifest.created_unix_ms < b)).map(|e| e.id.as_str()).collect();
+        while let Some(kept) = all.iter().find(|p| doomed.contains(p.id.as_str()) && all.iter().any(|e| !doomed.contains(e.id.as_str()) && builds_on(e, &p.id)))
+        {
+            doomed.remove(kept.id.as_str());
+        }
+        delete(all, doomed)
+    }
+
+    fn delete(all: &[Entry], mut doomed: BTreeSet<&str>) -> Vec<String> {
+        let mut out = vec![];
+        while let Some(e) = all.iter().find(|e| doomed.contains(e.id.as_str()) && !all.iter().any(|c| doomed.contains(c.id.as_str()) && builds_on(c, &e.id))) {
+            doomed.remove(e.id.as_str());
+            out.push(e.id.clone());
+        }
+        out
+    }
+}
+
+#[test]
+fn store_dependency_index_matches_the_scan_on_every_small_graph() {
+    // Each checkpoint's parent: none, one not in the store, itself, or any other (so cycles and
+    // children listed before their parents too): every graph of up to 4, every 7th of 5.
+    let mut graphs = 0;
+    for n in 1..=5usize {
+        let choices = n + 2;
+        for code in (0..choices.pow(n as u32)).step_by(if n < 5 { 1 } else { 7 }) {
+            let id = |i: usize| format!("{i:016x}");
+            let all: Vec<store::Entry> = (0..n)
+                .map(|i| {
+                    let parent = match code / choices.pow(i as u32) % choices {
+                        0 => None,
+                        1 => Some("ffffffffffffffff".to_string()),
+                        c => Some(id(c - 2)),
+                    };
+                    let mut m = manifest(1, parent.map(|p| Parent { path: format!("../{p}").into(), id: p }), json!({}));
+                    m.created_unix_ms = i as u64 * 10;
+                    store::Entry { id: id(i), name: (i % 2 == 1).then(|| format!("n{i}")), dir: format!("/nonexistent/{i}").into(), manifest: m }
+                })
+                .collect();
+            let ids = |order: Vec<usize>| order.into_iter().map(|i| all[i].id.clone()).collect::<Vec<_>>();
+            for subset in 0..1usize << n {
+                let whats: Vec<String> = (0..n).filter(|i| subset >> i & 1 == 1).map(|i| if i % 2 == 1 { format!("n{i}") } else { id(i) }).collect();
+                for force in [false, true] {
+                    let new = store::removal(&all, &whats, force).map(ids).map_err(|e| e.to_string());
+                    let old = scan::remove(&all, &whats, force).map_err(|e| e.to_string());
+                    assert_eq!(new, old, "remove {whats:?} force={force} from {code} of {n}");
+                }
+            }
+            for before in std::iter::once(None).chain((0..=n as u64).map(|i| Some(i * 10))) {
+                assert_eq!(ids(store::pruning(&all, before)), scan::prune(&all, before), "prune {before:?} from {code} of {n}");
+            }
+            graphs += 1;
+        }
+    }
+    assert_eq!(graphs, 3 + 16 + 125 + 1296 + 2401);
+}
