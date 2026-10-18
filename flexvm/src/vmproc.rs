@@ -3495,12 +3495,16 @@ mod tests {
                 if armed2.swap(false, Ordering::SeqCst) {
                     // The peer is configured and told after this list is read, before it is used.
                     let (c, a) = (c.clone(), m.get().unwrap().upgrade().unwrap());
-                    let added = c.clone();
-                    thread::spawn(move || {
+                    let (configured, tid) = std::sync::mpsc::channel();
+                    let telling = thread::spawn(move || {
+                        let req = json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0});
                         c.lock().unwrap().push("b".into());
-                        a.tell(vec!["b".into()], json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
+                        configured.send(unsafe { libc::gettid() }).unwrap();
+                        a.tell(vec!["b".into()], req);
                     });
-                    wait_until("b to be configured before pruning the old list", || added.lock().unwrap().contains(&"b".to_string()));
+                    // Told (a tell not held off by this read), or asleep in tell waiting on `pending`.
+                    let tid = tid.recv_timeout(WAIT).unwrap();
+                    wait_until("b to be told before the old list is used", || telling.is_finished() || crate::test_util::asleep(tid));
                 }
                 old
             }),

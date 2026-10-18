@@ -2221,10 +2221,16 @@ mod tests {
             let delay = Duration::from_millis(20);
             assert!(!send_log_by(&tx, LogMsg::Line("full".into()), start + delay));
             assert!(start.elapsed() >= delay && start.elapsed() < Duration::from_secs(5));
-            full.send(()).unwrap();
-            assert!(send_log_by(&tx, LogMsg::Line("x".repeat(LOG_LINE_MAX + 1)), Instant::now() + WAIT));
+            let long = LogMsg::Line("x".repeat(LOG_LINE_MAX + 1));
+            full.send(unsafe { libc::gettid() }).unwrap();
+            assert!(send_log_by(&tx, long, Instant::now() + WAIT));
         });
-        waited.recv_timeout(WAIT).unwrap();
+        let tid = waited.recv_timeout(WAIT).unwrap();
+        // Asleep with "first" still queued: only send_log_by's wait for space sleeps there.
+        crate::test_util::wait_until("the second send to wait for queue space", || {
+            assert!(!sender.is_finished(), "the second send returned with the queue full");
+            crate::test_util::asleep(tid)
+        });
         assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line == "first"));
         assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
         sender.join_within().unwrap();
@@ -2920,8 +2926,9 @@ pub mod output {
         struct Restore(Option<Arc<File>>, Option<PathBuf>);
         impl Drop for Restore {
             fn drop(&mut self) {
-                TARGETS.lock().unwrap()[0] = self.0.take();
-                LOGS.lock().unwrap()[0] = self.1.take();
+                // Also after a panic, which may have poisoned either lock.
+                TARGETS.lock().unwrap_or_else(|e| e.into_inner())[0] = self.0.take();
+                LOGS.lock().unwrap_or_else(|e| e.into_inner())[0] = self.1.take();
             }
         }
         let _restore = Restore(TARGETS.lock().unwrap()[0].clone(), LOGS.lock().unwrap()[0].clone());
