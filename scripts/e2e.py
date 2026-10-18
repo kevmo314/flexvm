@@ -524,15 +524,20 @@ def run_exec_ps():
     t = time.time()
     code, _, _ = A.exec(vm, "sleep 3600 & exit 7")
     check("exec: back promptly past a background child", code == 7 and time.time() - t < 15, (code, time.time() - t))
-    # passwd and group are read for -u alone, and never waited on: a FIFO in passwd's place stalls no exec.
+    # passwd and group are read for -u alone, never waited on, and followed through a link: a FIFO in passwd's
+    # place stalls no exec, and fails one with -u (not read as empty, which would give a numeric user group 0).
+    nobody = must(A, vm, "id -u nobody")
     must(A, vm, "mv /etc/passwd /etc/passwd.e2e && mkfifo /etc/passwd")
     t = time.time()
-    plain, numeric = A.exec(vm, "echo ok", timeout=30), A.cli("exec", "-u", "1000", vm, "id", "-u", check=False, timeout=30)
-    named = A.cli("exec", "-u", "nobody", vm, "true", check=False, timeout=30)
+    plain = A.exec(vm, "echo ok", timeout=30)
+    users = [A.cli("exec", "-u", u, vm, "true", check=False, timeout=30).returncode for u in ("1000", "nobody")]
     took = time.time() - t
+    must(A, vm, "rm /etc/passwd && ln -s passwd.e2e /etc/passwd")
+    linked = A.cli("exec", "-u", "nobody", vm, "id", "-u", check=False, timeout=30)
     must(A, vm, "rm /etc/passwd && mv /etc/passwd.e2e /etc/passwd")
-    check("exec: a FIFO for /etc/passwd stalls nothing", plain[:2] == (0, "ok\n") and (numeric.returncode, numeric.stdout) == (0, "1000\n")
-          and named.returncode == 126 and took < 15, (plain, numeric.returncode, numeric.stdout, named.returncode, named.stderr, took))
+    check("exec: a FIFO for /etc/passwd stalls nothing, refused for -u", plain[:2] == (0, "ok\n") and users == [126, 126] and took < 15,
+          (plain, users, took))
+    check("exec -u: /etc/passwd through a link", (linked.returncode, linked.stdout) == (0, nobody + "\n"), (linked.returncode, linked.stdout, linked.stderr))
     # Multi-MB output streamed whole through exec and checked on the host.
     code, out, err = A.exec(vm, "head -c 3000000 /dev/zero | tr '\\0' x")
     check("exec: 3 MB of pipeline output, all of it", code == 0 and out == "x" * 3000000,

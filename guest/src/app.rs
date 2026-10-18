@@ -227,9 +227,13 @@ pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)
         Some(c) => c,
         None => config()?.clone(),
     };
-    // Only `-u` needs them: the image's user was resolved at pull.
-    let read = |p: &str| e.user.as_ref().and_then(|_| crate::read_etc(p.as_ref()).ok()).map(|(text, _)| text).unwrap_or_default();
-    let c = exec_conf(base, e, &read("/etc/passwd"), &read("/etc/group"))?;
+    // Only `-u` needs them (the image's user was resolved at pull), through links as pull reads them. One
+    // there but unreadable fails the exec: read as empty, a numeric user's group would become 0.
+    let read = |p: &str| match e.user.as_ref().map(|_| crate::read_etc(p.as_ref(), 0)) {
+        Some(Err(err)) if err.kind() != io::ErrorKind::NotFound => Err(cannot_run(126, format!("cannot read {p}: {err}"))),
+        got => Ok(got.and_then(Result::ok).map(|(text, _)| text).unwrap_or_default()),
+    };
+    let c = exec_conf(base, e, &read("/etc/passwd")?, &read("/etc/group")?)?;
     Ok((command(&c, &e.argv), c))
 }
 
