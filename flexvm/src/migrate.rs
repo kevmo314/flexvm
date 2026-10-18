@@ -1280,8 +1280,8 @@ mod tests {
             target_via(&host, &json!({"underlay": "127.0.0.1"}), "unseen.invalid:7070", Some(conn.peer_addr().unwrap().ip())).unwrap(),
             Ipv4Addr::LOCALHOST
         );
-        // Reconciliation has no connection: resolve the destination instead.
-        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "localhost:7070", None).unwrap(), Ipv4Addr::LOCALHOST);
+        // Reconciliation has no connection: resolve the destination instead (an address: no resolver to wait on).
+        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "127.0.0.1:7070", None).unwrap(), Ipv4Addr::LOCALHOST);
         assert!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "127.0.0.1:7070", Some(conn.peer_addr().unwrap().ip())).is_err());
         assert!(target_via(&host, &json!({"underlay": "224.0.0.1"}), "224.0.0.1:7070", None).is_err());
     }

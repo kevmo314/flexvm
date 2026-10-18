@@ -577,16 +577,34 @@ mod tests {
     #[test]
     fn layer_download_failures_and_conflicting_sizes_are_reported() {
         // The largest goes first; once it fails, only the three already in flight run.
+        type Latch = Arc<(Mutex<bool>, std::sync::Condvar)>;
+        /// Opens the latch as its thread ends: the failed download's worker has stopped the rest from starting then.
+        struct Ended(Latch);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+        thread_local! {
+            static ENDED: std::cell::RefCell<Option<Ended>> = const { std::cell::RefCell::new(None) };
+        }
         let descs: Vec<_> = (0..10).map(|i| (format!("l{i}"), i, ())).collect();
         let started = AtomicUsize::new(0);
         let barrier = Barrier::new(4);
+        let ended: Latch = Arc::default();
         let err = download_layers(&descs, |d, _, _| {
             started.fetch_add(1, Ordering::SeqCst);
             barrier.wait();
             if d == "l9" {
+                ENDED.with(|e| *e.borrow_mut() = Some(Ended(ended.clone())));
                 bail!("failed download");
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // In flight until the failure has stopped the rest.
+            let done = ended.0.lock().unwrap();
+            let (done, timeout) = ended.1.wait_timeout_while(done, std::time::Duration::from_secs(30), |d| !*d).unwrap();
+            drop(done);
+            assert!(!timeout.timed_out(), "the failed download's worker never ended");
             Ok(())
         })
         .unwrap_err();

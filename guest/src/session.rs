@@ -989,6 +989,12 @@ mod tests {
         let (output, group) = start(&sessions, &statuses, "slow", b"head -c 65536 /dev/zero; sleep 0.5; echo more; exit 3");
         let status = reap(&statuses, group);
         assert_eq!(libc::WEXITSTATUS(status), 3);
+        // The first half comes in; the pump waits for the client there, well within GRACE.
+        let ring = output.0.lock().unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, Duration::from_secs(20), |r| r.end < 65536 && r.exit.is_none()).unwrap();
+        assert!(!timeout.timed_out(), "the first half never came: {} bytes", ring.end);
+        drop(ring);
+        // Then it takes no more (one that did not wait would take the rest at once).
         thread::sleep(Duration::from_millis(100));
         let ring = output.0.lock().unwrap();
         assert!(ring.exit.is_none() && ring.end == 65536, "the pump did not wait: {} bytes", ring.end);
@@ -1228,13 +1234,27 @@ mod tests {
     #[test]
     fn closing_after_the_shell_exited_signals_nothing() {
         let (sessions, statuses) = (Sessions::default(), statuses());
-        let (output, group) = start(&sessions, &statuses, "late", b"sleep 100 & exit 0");
+        let dir = crate::test_util::TempDir::new("close-late");
+        let (marker, ready) = (dir.join("term"), dir.join("ready"));
+        // The job notes a SIGTERM; a SIGKILL from CLOSE (sent before it answers) would be fatal first.
+        let command = format!("(trap 'echo term > {}; exit' TERM; : > {}; while :; do sleep 0.05; done) & exit 0", marker.display(), ready.display());
+        let (_output, group) = start(&sessions, &statuses, "late", command.as_bytes());
         reap(&statuses, group);
-        // Still draining (the sleep holds the pipes), but the group may be anyone's by now.
-        assert!(output.0.lock().unwrap().exit.is_none());
+        // Its trap is set (a SIGTERM before would end it without a note).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "the job never started");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Likely still draining (the job holds the pipes), but the group may be anyone's by now: draining or not, the
+        // shell's token is reaped.
         assert!(request(&sessions, &statuses, "CLOSE late", b"").ends_with(b"closed"));
-        thread::sleep(Duration::from_millis(100));
-        assert_eq!(unsafe { libc::kill(-group, 0) }, 0, "an exited shell's group was signalled");
+        assert_eq!(unsafe { libc::kill(-group, libc::SIGTERM) }, 0, "an exited shell's group was signalled");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "an exited shell's group was signalled");
+            thread::sleep(Duration::from_millis(10));
+        }
         unsafe { libc::kill(-group, libc::SIGKILL) };
     }
 
@@ -1255,11 +1275,10 @@ mod tests {
         sessions.lock().unwrap().live.get_mut("old").unwrap().group = pid;
         assert_eq!(statuses.0.lock().unwrap().running[&pid], token);
         assert!(request(&sessions, &statuses, "CLOSE old", b"").ends_with(b"closed"));
-        thread::sleep(Duration::from_millis(100));
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, 0, "the new process was killed");
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-        reap(&statuses, pid);
+        // A SIGKILL from CLOSE (sent before it answers) would be fatal before this one.
+        unsafe { libc::kill(-pid, libc::SIGTERM) };
+        let status = reap(&statuses, pid);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM, "the new process was killed");
     }
 
     #[test]
@@ -1268,13 +1287,18 @@ mod tests {
         let _dir = crate::test_util::TempDir::new("discard");
         let marker = _dir.join("fixture");
         let _ = std::fs::remove_file(&marker);
-        let command = format!("(sleep 3; echo late; echo late >&2; echo survived > {}) & exit 0", marker.display());
+        let go = _dir.join("go");
+        let _ = std::fs::remove_file(&go);
+        // It writes only once told to, after the drain is over.
+        let command =
+            format!("(while [ ! -e {} ]; do sleep 0.01; done; echo late; echo late >&2; echo survived > {}) & exit 0", go.display(), marker.display());
         let (output, group) = start(&sessions, &statuses, "drop", command.as_bytes());
         reap(&statuses, group);
         let ring = output.0.lock().unwrap();
-        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN + Duration::from_secs(30), |r| r.exit.is_none()).unwrap();
         assert!(!timeout.timed_out() && ring.end == 0, "exit {:?}, {} bytes", ring.exit, ring.end);
         drop(ring);
+        std::fs::write(&go, b"").unwrap();
         // A closed pipe would have killed it with SIGPIPE at its first echo.
         let deadline = Instant::now() + Duration::from_secs(10);
         while !marker.exists() {
@@ -1437,8 +1461,11 @@ mod tests {
         let (handler, mut peer) = attach_to_exit(&sessions, &statuses, "slow");
         // The client writes its output out for seconds before it acknowledges: the handler gave up on it
         // and let go of its connection.
-        thread::sleep(ACK_WAIT + Duration::from_secs(2));
-        assert!(handler.is_finished());
+        let deadline = Instant::now() + ACK_WAIT + Duration::from_secs(30);
+        while !handler.is_finished() {
+            assert!(Instant::now() < deadline, "the handler never gave up on the acknowledgement");
+            thread::sleep(Duration::from_millis(10));
+        }
         handler.join().unwrap().unwrap();
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
         let _ = peer.write_all(&[SESSION_DONE]);

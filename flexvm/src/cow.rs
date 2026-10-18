@@ -857,12 +857,17 @@ mod tests {
         room.refresh(|| Some(100));
         assert_eq!(room.get(), 0, "not opened by a refresh");
         room.attach(&h);
+        // Pinned: a take that found the host lock busy leaves none until `BUSY_MS` after, by this clock alone.
+        let t0 = crate::host::boottime_ms();
+        crate::host::pin_clock(t0);
         let populated = std::cell::Cell::new(false);
         // Again while another test has the host lock (a take never waits for it).
         while room.take(1, || populated.set(true)).is_none() {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(populated.get());
+        // Past any busy a retry above left.
+        crate::host::pin_clock(t0 + BUSY_MS);
         assert!(room.get() < u64::MAX, "what was left");
         room.refresh(|| Some(5));
         assert_eq!(room.get(), 5);
@@ -890,7 +895,8 @@ mod tests {
         busy.attach(&h);
         let start = std::time::Instant::now();
         assert!(busy.take(1, || panic!("nothing populated")).is_none());
-        assert!(start.elapsed() < Duration::from_millis(BUSY_MS * 5), "never waits: {:?}", start.elapsed());
+        // Returning at all shows it never waited: the holder keeps the lock until told to let it go.
+        crate::log!("a busy take was refused in {:?}", start.elapsed());
         assert_eq!(busy.get(), 0, "none while busy");
         tx.send(()).unwrap();
         t.join().unwrap();

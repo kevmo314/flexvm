@@ -30,6 +30,35 @@ const RELEASE_GAP_MS: u64 = 1000;
 /// 6 us (and a wakeup): well under 1 ms of CPU a second per VM process.
 const POLL: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
+thread_local! {
+    /// `RELEASE_WAIT` and `POLL` on this test's thread, once set (`pin_release`): a loaded machine can take longer
+    /// than the real ones to schedule a serving thread.
+    static PINNED: std::cell::Cell<(Option<Duration>, Option<Duration>)> = const { std::cell::Cell::new((None, None)) };
+}
+
+/// Sets, on this test's thread, how long a release request waits (`RELEASE_WAIT`) and how often `serve` looks (`POLL`).
+#[cfg(test)]
+pub(crate) fn pin_release(wait: Option<Duration>, poll: Option<Duration>) {
+    PINNED.with(|p| p.set((wait, poll)));
+}
+
+fn release_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(w) = PINNED.with(|p| p.get().0) {
+        return w;
+    }
+    RELEASE_WAIT
+}
+
+fn poll() -> Duration {
+    #[cfg(test)]
+    if let Some(p) = PINNED.with(|p| p.get().1) {
+        return p;
+    }
+    POLL
+}
+
 /// The last request: its number and when it was made (boottime ms).
 fn request(run: &Path) -> PathBuf {
     locks(run).join(format!("release-{}", crate::host::boot_id()))
@@ -60,7 +89,7 @@ pub fn serve(run: &Path, release: impl Fn()) {
             crate::log!("hostmem: {e}: requests do not wait for this process");
         }
         loop {
-            std::thread::sleep(POLL);
+            std::thread::sleep(poll());
             // Unreadable: as no new request (the next one replaces it).
             if let Some((n, _)) = last(run).filter(|r| r.0 != answered) {
                 release();
@@ -75,7 +104,7 @@ pub fn serve(run: &Path, release: impl Fn()) {
 /// runs has, up to `RELEASE_WAIT` (or `deadline`, if sooner). Reuses a request made within `RELEASE_GAP_MS`.
 /// Callers read MemAvailable again after it whatever it found: some may have answered.
 pub fn release_kept(host: &Host, deadline: Option<Instant>) {
-    let by = Instant::now() + RELEASE_WAIT;
+    let by = Instant::now() + release_wait();
     let by = deadline.map_or(by, |d| d.min(by));
     if let Some(n) = ask(host, by) {
         wait(&host.run, n, by);
