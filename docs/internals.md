@@ -280,7 +280,10 @@ target's reply to them.
    nothing. The content id's hash is no cryptographic check, so a received
    generation records SHA-256 digests of its files and of its metadata
    (`received`); a target answering that it has a received copy sends them,
-   and the source refuses one that differs from its own. A push that fails or is killed leaves its staging directory, which
+   and the source refuses one that differs from its own; it then sends its
+   digests in `migrate_in`, and an arrival opens a received generation only
+   for a source whose digests match (so a v0.1.0 source, which sends none,
+   is refused one). A push that fails or is killed leaves its staging directory, which
    the next build or push sweeps, never a generation. The listener holds the
    generation open for 17 s, until the arrival has opened it itself, so no
    `rmi` or prune removes it in between; from then on the VM holds it as any
@@ -289,7 +292,8 @@ target's reply to them.
    answers `unknown op`: the migration goes on and needs the generation there,
    as before, and one built since (whose snapshot names `rootfs`, which v0.1.0
    does not link) is refused at once. Disk room is reserved by blocks, across
-   pushes at once. All of this happens while the VM runs: none of it is downtime.
+   pushes at once; a received memory file must be its guest's size (at most
+   2 TiB), and the listener holds at most 16 generations for arrivals. All of this happens while the VM runs: none of it is downtime.
 1. Before the pause, over one connection (`migrate_in`): the target checks the
    template, reserves the name and address, spawns a Firecracker and
    starts its pager (the listener started a VM process for it). With `firecracker/0002-*.patch` it also has Firecracker

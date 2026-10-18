@@ -811,7 +811,7 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     match got {
         Ok(tpl) => {
             if asked {
-                answer(&Ok(json!({"received": true})))?;
+                answer(&Ok(json!({"received": true, "digests": tpl.meta.received})))?;
             }
             hold(tpl);
         }
@@ -828,11 +828,15 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
 /// Generations held for arrivals, by content id, until when: one hold (and thread) each, however often asked.
 static HELD: Mutex<std::collections::BTreeMap<String, (Arc<crate::template::Template>, Instant)>> = Mutex::new(std::collections::BTreeMap::new());
 
+/// Generations held at once at most: past it, an arrival's own `open_id` must come before any `rmi` does.
+const MAX_HELD: usize = 16;
+
 fn hold(tpl: Arc<crate::template::Template>) {
-    let id = tpl.meta.id.clone();
-    if HELD.lock().unwrap().insert(id.clone(), (tpl, Instant::now() + PUSH_HOLD)).is_some() {
+    let (id, mut held) = (tpl.meta.id.clone(), HELD.lock().unwrap());
+    if held.len() >= MAX_HELD && !held.contains_key(&id) || held.insert(id.clone(), (tpl, Instant::now() + PUSH_HOLD)).is_some() {
         return;
     }
+    drop(held);
     std::thread::spawn(move || loop {
         let mut held = HELD.lock().unwrap();
         let left = held[&id].1.saturating_duration_since(Instant::now());

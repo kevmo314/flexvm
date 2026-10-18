@@ -126,7 +126,8 @@ impl Proc {
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
-        let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict).map_err(|e| match &pushed {
+        let vouched = pushed.as_ref().map_or(Value::Null, |p| p.1.clone());
+        let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict, vouched).map_err(|e| match &pushed {
             None => format!("{e} ({to} is too old to be sent template {}: it migrates in only VMs of templates it has)", vm.template.meta.id).into(),
             Some(_) => e,
         })?;
@@ -250,7 +251,7 @@ impl Proc {
             "name": vm.name,
             "to": to,
             "mig": mig,
-            "template_push": pushed,
+            "template_push": pushed.map(|p| p.0),
             "settle_hotplug_ms": ms(settle),
             "prepare_ms": ms(prepare),
             "unthrottle_ms": ms(unthrottle),
@@ -269,7 +270,8 @@ impl Proc {
         }))
     }
 
-    fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool) -> Result<(TcpStream, Value)> {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool, vouched: Value) -> Result<(TcpStream, Value)> {
         let pid = vm.pid().ok_or("firecracker is gone")?;
         let msrs = crate::compat::local(pid)?.msrs;
         let tsc_khz = vm.tsc_khz;
@@ -283,6 +285,8 @@ impl Proc {
                 "mig": mig,
                 "template": vm.template.name,
                 "id": vm.template.meta.id,
+                // For a copy the target received from a peer: what this host's files digest to (`push_template`).
+                "template_digests": vouched,
                 "ip": vm.ip.to_string(),
                 "gen": gen,
                 "rev": self.rev(),
@@ -868,6 +872,13 @@ impl Proc {
         self.serve_control()?;
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
+        // One received from a peer only for a source with the same files: its content id proves none.
+        if tpl.meta.received.is_some() && req["template_digests"] != json!(tpl.meta.received) {
+            bail!(
+                "template {} here was received from a peer, and this source does not vouch for its files (one older than this host's flexvm cannot)",
+                tpl.meta.id
+            );
+        }
         // Its caps move with it (the same template: they fit).
         // Refused before the source pauses: a capped VM never runs uncapped here.
         self.keep_resources(serde_json::from_value(req["resources"].clone()).unwrap_or_default())?;
@@ -1018,27 +1029,31 @@ impl Proc {
 }
 
 /// Has `to` take generation `tpl`, by content id, before anything else of a migration (so before the
-/// pause): sent unless it has it. None if `to` is too old to be sent one (then it must have it).
-fn push_template(to: &str, tpl: &Template) -> Result<Option<Value>> {
+/// pause): sent unless it has it. Returns its timings and, for a copy `to` received from a peer, the
+/// digests this host vouches for it with (`template::digests`), which the arrival checks. None if `to`
+/// is too old to be sent one (then it must have it).
+fn push_template(to: &str, tpl: &Template) -> Result<Option<(Value, Value)>> {
     let (start, at) = (Instant::now(), Instant::now() + crate::listen::PUSH_WAIT);
     let fail = |e: Error| -> Error { format!("cannot send template {} to {to}: {e}", tpl.meta.id).into() };
-    let (conn, have) = match crate::util::rpc(to, Duration::from_secs(2), at, &json!({"op": "template", "id": tpl.meta.id})) {
+    let (conn, mut reply) = match crate::util::rpc(to, Duration::from_secs(2), at, &json!({"op": "template", "id": tpl.meta.id})) {
         Err(e) if e.to_string().contains("unknown op \"template\"") => return Ok(None),
         r => r.map_err(fail)?,
     };
-    let sent = match have["have"] == json!(true) {
-        true if !have["digests"].is_null() && have["digests"] != json!(tpl.digests()?) => {
-            bail!("{to} has a received copy of template {} whose files differ from this host's: remove it there (flexvm rmi {0})", tpl.meta.id)
-        }
-        true => 0,
-        false => {
-            let sent = crate::template::send(tpl, &mut std::io::BufWriter::with_capacity(1 << 20, By { s: &conn, at }));
-            // Its answer says more than a failed write: it may have refused the template part way.
-            let reply = crate::util::recv_json(&mut BufReader::new(By { s: &conn, at })).and_then(|r| crate::util::answer(r, to, "refused"));
-            reply.and(sent).map_err(fail)?
-        }
+    let mut sent = 0;
+    if reply["have"] != json!(true) {
+        let n = crate::template::send(tpl, &mut std::io::BufWriter::with_capacity(1 << 20, By { s: &conn, at }));
+        // Its answer says more than a failed write: it may have refused the template part way.
+        reply = crate::util::recv_json(&mut BufReader::new(By { s: &conn, at })).and_then(|r| crate::util::answer(r, to, "refused")).map_err(fail)?;
+        sent = n.map_err(fail)?;
+    }
+    let digests = match reply["digests"].is_null() {
+        true => Value::Null,
+        false => json!(tpl.digests()?),
     };
-    Ok(Some(json!({"sent_mib": sent >> 20, "ms": ms(start.elapsed())})))
+    if digests != reply["digests"] {
+        bail!("{to} has a copy of template {} received from a peer whose files differ from this host's: remove it there (flexvm rmi {0})", tpl.meta.id);
+    }
+    Ok(Some((json!({"sent_mib": sent >> 20, "ms": ms(start.elapsed())}), digests)))
 }
 
 /// Header, state, preload and commit reply share one cap: partial writes cannot extend the pause.

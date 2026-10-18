@@ -206,7 +206,7 @@ fn digests(meta: &Meta, vmstate: &Path, mem: &Path, rootfs: &Path) -> Result<BTr
 /// Whether `vmstate` names `rootfs` by its path, as generations built by v0.1.0 do (not `ROOTFS`).
 fn names_by_path(vmstate: &[u8], rootfs: &Path) -> bool {
     let path = rootfs.as_os_str().as_encoded_bytes();
-    vmstate.windows(path.len()).any(|w| w == path)
+    !path.is_empty() && vmstate.windows(path.len()).any(|w| w == path)
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<Component> {
@@ -1041,6 +1041,8 @@ const MAX_META: u64 = 1 << 20;
 const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_FILE: u64 = 1 << 44;
 const MAX_EXTENTS: u64 = 1 << 20;
+/// A received template's guest memory at most (its bitmap, 64 MiB, is allocated at open).
+const MAX_MEM_MIB: u64 = 2 << 20;
 /// The data bytes of one generation's files together.
 pub const MAX_DATA: u64 = 64 << 30;
 /// Room a received generation leaves on its filesystem.
@@ -1103,8 +1105,8 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
     let mut bytes = vec![0u8; len as usize];
     r.read_exact(&mut bytes)?;
     let mut meta: Meta = serde_json::from_slice(&bytes).map_err(|e| format!("template {id}: its metadata: {e}"))?;
-    if meta.id != id || !meta.identified() {
-        bail!("template {id}: the metadata sent is not that template's");
+    if meta.id != id || !meta.identified() || !meta.rootfs.is_absolute() || meta.max_mib > MAX_MEM_MIB {
+        bail!("template {id}: the metadata sent is not that template's, or past the limits");
     }
     // The kernel is in guest memory; restores never read it (`Meta::verify`).
     crate::artifacts::ensure(&[(&paths.firecracker, &crate::artifacts::FIRECRACKER)])?;
@@ -1114,9 +1116,10 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
     }
     let staging = Staging::new(paths, id)?;
     let gen = std::fs::canonicalize(&staging.parent.path)?.join(GENERATIONS).join(id);
-    let mut room = Room(0);
-    let mut file = |r: &mut _, name: &str, max| receive_file(r, &staging.dir.join(name), max, &mut room).map_err(|e| format!("template {id}: its {name}: {e}"));
-    file(r, "vmstate", MAX_VMSTATE)?;
+    let mut budget = MAX_DATA;
+    let mut file =
+        |r: &mut _, name: &str, len| receive_file(r, &staging.dir.join(name), len, &mut budget).map_err(|e| format!("template {id}: its {name}: {e}"));
+    file(r, "vmstate", 0..=MAX_VMSTATE)?;
     // Older generations name the root filesystem by its path (not `ROOTFS`), which must hold it here too.
     let local = match names_by_path(&std::fs::read(staging.dir.join("vmstate"))?, &meta.rootfs) {
         false => None,
@@ -1128,10 +1131,11 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
                 .ok_or_else(|| format!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display()))?,
         ),
     };
-    file(r, "rootfs", MAX_FILE)?;
+    file(r, "rootfs", 0..=MAX_FILE)?;
     // Test gate: half received, for a test to kill the receiver.
     crate::host::hold("receive_hold");
-    file(r, "mem", MAX_FILE)?;
+    // As long as its guest memory, which opening it maps a bitmap of.
+    file(r, "mem", meta.max_mib << 20..=meta.max_mib << 20)?;
     let staged = |n: &str| staging.dir.join(n);
     let rootfs = local.as_ref().map_or(staged("rootfs"), |_| meta.rootfs.clone());
     meta.received = Some(digests(&meta, &staged("vmstate"), &staged("mem"), &rootfs)?);
@@ -1175,23 +1179,24 @@ fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
     Ok(out)
 }
 
-/// Blocks receives here are yet to fill, which each one's room check counts as taken.
+/// Blocks receives here are yet to write, which each one's room check counts as taken (those written
+/// are out of the filesystem's room already).
 static RESERVED: Mutex<u64> = Mutex::new(0);
 
-/// What one receive reserved, given back when it ends (written by then, or removed).
-struct Room(u64);
+/// Blocks of one file's, given back once it is written (or not).
+struct Reserved(u64);
 
-impl Drop for Room {
+impl Drop for Reserved {
     fn drop(&mut self) {
         *RESERVED.lock().unwrap() -= self.0;
     }
 }
 
-/// One of `send`'s files, written to a new `path` with the same length and holes, within `max` and
-/// what is left of the generation's budget (`MAX_DATA`) and of its filesystem's room, by blocks.
-fn receive_file(r: &mut impl Read, path: &Path, max: u64, room: &mut Room) -> Result<()> {
+/// One of `send`'s files, written to a new `path` with the same length (one of `lens`) and holes, within
+/// what is left of the generation's `budget` (`MAX_DATA`) and of its filesystem's room, by blocks.
+fn receive_file(r: &mut impl Read, path: &Path, lens: std::ops::RangeInclusive<u64>, budget: &mut u64) -> Result<()> {
     let [len, n] = read_words(r)?;
-    if len > max || n > MAX_EXTENTS {
+    if !lens.contains(&len) || n > MAX_EXTENTS {
         bail!("{len} bytes in {n} extents is past the limits");
     }
     let extents: Vec<(u64, u64)> = (0..n).map(|_| read_words(r).map(|[s, e]| (s, e))).collect::<Result<_>>()?;
@@ -1204,11 +1209,12 @@ fn receive_file(r: &mut impl Read, path: &Path, max: u64, room: &mut Room) -> Re
     let block = st.f_frsize.max(PAGE_SIZE as u64);
     let blocks: u64 = extents.iter().map(|(s, e)| (e.div_ceil(block) - s / block) * block).sum();
     let mut reserved = RESERVED.lock().unwrap();
-    if room.0 + blocks > MAX_DATA || st.f_bavail.saturating_mul(st.f_frsize) < *reserved + blocks + KEEP_FREE {
+    if blocks > *budget || st.f_bavail.saturating_mul(st.f_frsize) < *reserved + blocks + KEEP_FREE {
         bail!("{blocks} bytes of blocks are past the limit, or would leave less than {} MiB free", KEEP_FREE >> 20);
     }
-    (*reserved, room.0) = (*reserved + blocks, room.0 + blocks);
+    (*reserved, *budget) = (*reserved + blocks, *budget - blocks);
     drop(reserved);
+    let _reserved = Reserved(blocks);
     file.set_len(len)?;
     let mut buf = vec![0u8; 1 << 20];
     for (mut off, end) in extents {
@@ -1709,7 +1715,7 @@ mod tests {
     fn sent(f: &mut Fixture, rootfs_named: &str) -> (Arc<Template>, Vec<u8>) {
         std::fs::write(f.dir.join("vmstate"), format!("state, pmem at {rootfs_named}")).unwrap();
         let mem = File::create(f.dir.join("mem")).unwrap();
-        mem.set_len(64 * PAGE_SIZE as u64).unwrap();
+        mem.set_len(f.meta.max_mib << 20).unwrap();
         mem.write_all_at(&[7u8; PAGE_SIZE], 3 * PAGE_SIZE as u64).unwrap();
         mem.write_all_at(&[9u8; PAGE_SIZE], 40 * PAGE_SIZE as u64).unwrap();
         f.meta.identify(&f.paths, &f.dir).unwrap();
@@ -1749,8 +1755,8 @@ mod tests {
         assert_eq!(std::fs::read(gen.join("rootfs")).unwrap(), std::fs::read(&f.meta.rootfs).unwrap());
         assert_eq!(got.meta.kernel, paths.kernel);
         let mem = File::open(gen.join("mem")).unwrap();
-        assert_eq!(mem.metadata().unwrap().len(), 64 * PAGE_SIZE as u64);
-        assert_eq!(data_extents(&mem, 64 * PAGE_SIZE as u64).unwrap().iter().map(|(s, e)| e - s).sum::<u64>(), 2 * PAGE_SIZE as u64, "holes stay holes");
+        assert_eq!(mem.metadata().unwrap().len(), f.meta.max_mib << 20);
+        assert_eq!(data_extents(&mem, f.meta.max_mib << 20).unwrap().iter().map(|(s, e)| e - s).sum::<u64>(), 2 * PAGE_SIZE as u64, "holes stay holes");
         assert!(got.has_data(40) && !got.has_data(4) && got.pages(3, 1) == [7u8; PAGE_SIZE]);
         // No name: listed as <none>, and the name the source has is not taken here.
         assert!(names(&paths.templates).unwrap().is_empty());
@@ -1786,6 +1792,13 @@ mod tests {
         let e = receive(&paths, &mut &corrupt[..], id).err().unwrap().to_string();
         assert!(e.contains("its mem does not hash"), "{e}");
         assert!(receive(&paths, &mut &buf[..buf.len() - 10], id).is_err());
+        // A root filesystem path that is empty or relative, or memory past the cap, is refused before anything is read.
+        assert!(!names_by_path(b"anything", Path::new("")));
+        for (rootfs, max_mib) in [("", tpl.meta.max_mib), ("rootfs", tpl.meta.max_mib), ("/r", MAX_MEM_MIB + 1)] {
+            let meta = serde_json::to_vec(&Meta { rootfs: rootfs.into(), max_mib, ..tpl.meta.clone() }).unwrap();
+            let forged = [&(meta.len() as u64).to_le_bytes()[..], &meta, &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..]].concat();
+            assert!(receive(&paths, &mut &forged[..], id).err().unwrap().to_string().contains("past the limits"));
+        }
         let e = receive(&paths, &mut &buf[..], "abcd").err().unwrap().to_string();
         assert!(e.contains("not that template's"), "{e}");
         assert!(nothing_in(&paths));
@@ -1794,7 +1807,7 @@ mod tests {
         for words in [[8u64, 1, 0, 16], [MAX_DATA + 1, 1, 0, MAX_DATA + 1]] {
             let head: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             path.set_extension("y");
-            assert!(receive_file(&mut &head[..], &path, u64::MAX, &mut Room(0)).is_err());
+            assert!(receive_file(&mut &head[..], &path, 0..=u64::MAX, &mut MAX_DATA.clone()).is_err());
         }
         let (_other, mut paths) = elsewhere(&f);
         paths.firecracker = paths.templates.join("firecracker");
