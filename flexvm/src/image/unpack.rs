@@ -414,35 +414,33 @@ impl Root {
         if depth > 40 {
             bail!("too many levels of symbolic links creating {rel:?}");
         }
-        match self.resolve(rel) {
-            Ok(fd) => return Ok(fd),
-            Err(e) if e.raw_os_error() != Some(libc::ENOENT) => bail!("resolve {rel:?}: {e}"),
-            Err(_) => {}
-        }
-        let mut cur = PathBuf::new();
-        let mut fd = self.resolve(&cur)?;
-        for c in rel.components() {
-            let name = cpath(c.as_ref())?;
-            cur.push(c);
-            fd = match self.resolve(&cur) {
-                Ok(next) => next,
-                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                    self.check_entry_limit()?;
-                    if unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
-                        self.entries += 1;
-                    } else {
-                        // A dangling symlink (say var/run -> /run): create its target, as container runtimes do.
-                        let mut buf = vec![0u8; 4096];
-                        let n = unsafe { libc::readlinkat(fd.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-                        check(n as i32, "mkdir", &cur)?;
-                        // Relative to where the link really is, which a symlinked parent may have moved.
-                        let target = self.real(&fd)?.join(OsStr::from_bytes(&buf[..n as usize]));
-                        self.mkdir_p(&lexical(&target), depth + 1)?;
-                    }
-                    self.resolve(&cur)?
-                }
+        let mut cur = rel.to_path_buf();
+        let mut tail = Vec::new();
+        let mut fd = loop {
+            match self.resolve(&cur) {
+                Ok(fd) => break fd,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(e) => bail!("resolve {cur:?}: {e}"),
-            };
+            }
+            tail.push(cur.file_name().ok_or("missing image root")?.to_os_string());
+            cur.pop();
+        };
+        for c in tail.iter().rev() {
+            let name = cpath(Path::new(c))?;
+            cur.push(c);
+            self.check_entry_limit()?;
+            if unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
+                self.entries += 1;
+            } else {
+                // A dangling symlink (say var/run -> /run): create its target, as container runtimes do.
+                let mut buf = vec![0u8; 4096];
+                let n = unsafe { libc::readlinkat(fd.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+                check(n as i32, "mkdir", &cur)?;
+                // Relative to where the link really is, which a symlinked parent may have moved.
+                let target = self.real(&fd)?.join(OsStr::from_bytes(&buf[..n as usize]));
+                self.mkdir_p(&lexical(&target), depth + 1)?;
+            }
+            fd = self.resolve(&cur)?;
         }
         Ok(fd)
     }
@@ -453,9 +451,10 @@ impl Root {
         Ok(dir.strip_prefix(&root).map_err(|_| format!("{dir:?} is outside the image root {root:?}"))?.to_path_buf())
     }
 
-    fn at(&mut self, path: &Path) -> Result<At> {
+    fn at(&mut self, path: &Path, create_parents: bool) -> Result<At> {
         let (parent, name) = split(path)?.ok_or("empty path")?;
-        Ok(At { dir: self.mkdir_p(&parent, 0)?, name })
+        let dir = if create_parents { self.mkdir_p(&parent, 0)? } else { self.resolve(&parent)? };
+        Ok(At { dir, name })
     }
 
     /// Applies one decompressed layer, read to its end; returns its digest (the config's diff_id).
@@ -488,11 +487,14 @@ impl Root {
             if rest.is_empty() || rest == b"." || rest == b".." {
                 bail!("bad whiteout target {:?}", String::from_utf8_lossy(rest));
             }
-            if let Ok(dir) = self.resolve(&parent) {
-                match opq {
-                    true => opaque(dir.as_raw_fd(), mine, 0)?,
-                    false => hide(dir.as_raw_fd(), &CString::new(rest).unwrap(), mine, 0)?,
-                }
+            let dir = match self.resolve(&parent) {
+                Ok(dir) => dir,
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)) => return Ok(()),
+                Err(e) => bail!("resolve whiteout parent {parent:?}: {e}"),
+            };
+            match opq {
+                true => opaque(dir.as_raw_fd(), mine, 0)?,
+                false => hide(dir.as_raw_fd(), &CString::new(rest).unwrap(), mine, 0)?,
             }
             return Ok(());
         }
@@ -513,9 +515,14 @@ impl Root {
         use tar::EntryType as T;
         let h = e.header().clone();
         let kind = h.entry_type();
-        let at = self.at(rel)?;
+        let at = self.at(rel, true)?;
+        let src = (kind == T::Link).then(|| self.at(m.link.as_ref().ok_or("hard link without target")?, true)).transpose()?;
+        let ino = |a: &At| stat_at(a.dir.as_raw_fd(), &a.name).map(|st| (st.st_dev, st.st_ino));
+        if src.as_ref().is_some_and(|src| ino(src).is_some_and(|i| Some(i) == ino(&at))) {
+            return Ok(at);
+        }
         // Anything else replaces what is there (a hard link, unless it is that already).
-        if !matches!(kind, T::Directory | T::Link) {
+        if kind != T::Directory {
             forget(at.dir.as_raw_fd(), &at.name, mine, 0)?;
         }
         let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
@@ -549,13 +556,8 @@ impl Root {
                 self.entries += 1;
             }
             T::Link => {
-                let src = self.at(m.link.as_ref().ok_or("hard link without target")?)?;
-                let ino = |a: &At| stat_at(a.dir.as_raw_fd(), &a.name).map(|st| (st.st_dev, st.st_ino));
-                if ino(&src).is_some_and(|i| Some(i) == ino(&at)) {
-                    return Ok(at);
-                }
+                let src = src.unwrap();
                 self.check_entry_limit()?;
-                forget(dfd, &at.name, mine, 0)?;
                 at.remove()?;
                 check(unsafe { libc::linkat(src.dir.as_raw_fd(), src.name.as_ptr(), dfd, name, 0) }, "link", rel)?;
                 // A hard link shares its target's inode and metadata.
@@ -593,7 +595,7 @@ impl Root {
     }
 
     pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
-        let at = self.at(Path::new(rel))?;
+        let at = self.at(Path::new(rel), true)?;
         if stat_at(at.dir.as_raw_fd(), &at.name).is_none() {
             self.check_entry_limit()?;
             let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
@@ -607,7 +609,7 @@ impl Root {
     /// An injected config directory must not retain an image user's ownership or write access.
     pub fn secure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
         self.ensure_dir(rel, mode)?;
-        let at = self.at(Path::new(rel))?;
+        let at = self.at(Path::new(rel), true)?;
         let dir = open_dir_at(at.dir.as_raw_fd(), &at.name)?;
         own(&dir, Path::new(rel))?;
         check(unsafe { libc::fchmod(dir.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
@@ -615,7 +617,7 @@ impl Root {
     }
 
     pub fn write_file(&mut self, rel: &str, data: &[u8], mode: u32) -> Result<()> {
-        let at = self.at(Path::new(rel))?;
+        let at = self.at(Path::new(rel), true)?;
         self.check_entry_limit()?;
         let mut f = at.create()?;
         self.entries += 1;
@@ -626,8 +628,7 @@ impl Root {
     }
 
     pub fn is_file(&mut self, rel: &str) -> bool {
-        let Ok(Some((parent, name))) = split(Path::new(rel)) else { return false };
-        self.resolve(&parent).is_ok_and(|dir| is_type(dir.as_raw_fd(), &name, libc::S_IFREG))
+        self.at(Path::new(rel), false).is_ok_and(|at| is_type(at.dir.as_raw_fd(), &at.name, libc::S_IFREG))
     }
 
     /// At most 1 MiB of a regular file; anything else (a FIFO, a device) is never opened.
@@ -960,6 +961,18 @@ pub(super) mod tests {
         assert_eq!(h.ino(), n.ino());
         assert_eq!(n.mode() & 0o7777, 0o4755);
         assert_eq!(root.read("abs/through"), Some(b"t".to_vec()));
+    }
+
+    #[test]
+    fn whiteouts_fail_on_parent_resolution_errors() {
+        let s = Sandbox::new("whiteout-resolve-error");
+        // A valid tar path can resolve through a symlink to an overlong component.
+        std::os::unix::fs::symlink("x".repeat(libc::NAME_MAX as usize + 1), s.root.join("parent")).unwrap();
+        assert_eq!(s.open().resolve(Path::new("parent")).unwrap_err().raw_os_error(), Some(libc::ENAMETOOLONG));
+        for name in ["parent/.wh.credential", "parent/.wh..wh..opq"] {
+            let error = s.open().apply_layer(layer(&[(name, 'f', "")]).as_slice()).unwrap_err().to_string();
+            assert!(error.contains("resolve whiteout parent") && error.contains(&io::Error::from_raw_os_error(libc::ENAMETOOLONG).to_string()), "{error}");
+        }
     }
 
     #[test]

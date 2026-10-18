@@ -3844,7 +3844,7 @@ mod tests {
     fn eviction_skips_a_replaced_candidate() {
         let root = crate::test_util::TempDir::new("fv-evict-replaced");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let mut original = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("30").spawn().unwrap());
+        let mut original = crate::test_util::sleeper(30);
         let vm = Entry { name: "ev".into(), ident: Ident::of(original.id()).unwrap(), state: "running".into(), ..Entry::default() };
         original.kill().unwrap();
         original.wait().unwrap();

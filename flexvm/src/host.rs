@@ -1276,8 +1276,7 @@ impl Host {
                             continue;
                         }
                     },
-                    (Ok(_), Ok(Some(_))) => false,
-                    (Ok(_), Ok(None)) => false,
+                    (Ok(_), Ok(_)) => false,
                     _ => true,
                 },
             };
@@ -2988,7 +2987,8 @@ impl Host {
                             left.to
                         ),
                         Err(e) => {
-                            crate::log!("vm {name} died as the source of migration {}: letting go of its claim: {e}; retried on the next sweep", left.mig)
+                            crate::log!("vm {name} died as the source of migration {}: letting go of its claim: {e}; retried on the next sweep", left.mig);
+                            unrecorded.get_or_insert(e);
                         }
                     }
                 } else if a.current(gen) && self.dead_and_reaped(&a, true) {
@@ -3003,7 +3003,10 @@ impl Host {
                             left.to,
                             left.to
                         ),
-                        Err(e) => crate::log!("vm {name} died as the source of migration {}: recording it as owed: {e}; retried on the next sweep", left.mig),
+                        Err(e) => {
+                            crate::log!("vm {name} died as the source of migration {}: recording it as owed: {e}; retried on the next sweep", left.mig);
+                            unrecorded.get_or_insert(e);
+                        }
                     }
                 }
                 continue;
@@ -3018,6 +3021,7 @@ impl Host {
             }
             if let Err(e) = self.withdraw_noted(&l, ip, gen) {
                 crate::log!("withdrawing {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
+                unrecorded.get_or_insert(e);
                 continue;
             }
             crate::log!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
@@ -3025,7 +3029,7 @@ impl Host {
             crate::net::unroute(ip);
             withdrawn.push((name.to_string(), ip, gen));
         }
-        // A lost VM not recorded keeps the boot's recovery from completing: it is tried again.
+        // Failed writes keep the boot's recovery from completing: they are tried again.
         match unrecorded {
             Some(e) => Err(e),
             None => Ok(withdrawn),
@@ -4718,15 +4722,13 @@ pub(crate) mod tests {
 
     impl Sleeper {
         fn new() -> Sleeper {
-            let c = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+            let c = crate::test_util::sleeper(60);
             let id = Ident::of(c.id()).unwrap();
             Sleeper(c, id)
         }
-        fn done(mut self) -> bool {
-            let killed = !self.1.alive();
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-            killed
+        fn done(self) -> bool {
+            let _child = self.0;
+            !self.1.alive()
         }
     }
 
@@ -5264,6 +5266,48 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!dead.exists() && live.exists());
+    }
+
+    #[test]
+    fn gc_reports_failed_dead_holder_writes_and_sweeps_other_addresses() {
+        for case in ["withdrawal", "release-stale", "owe", "release-owed"] {
+            let (_dir, mut h) = host(case);
+            h.cfg.peers = vec!["peer".into()];
+            let (x, y) = (ip("10.9.1.1"), ip("10.9.1.2"));
+            let gone = dead_owner(&h, 999_999_951, &[]);
+            let a = Addr {
+                seen: if case == "release-stale" { 5 } else { 4 },
+                held: 4,
+                holder: Some("failed".into()),
+                holder_id: Some(gone.clone()),
+                leaving: (case != "withdrawal").then(|| Leaving { mig: 10, to: "peer".into() }),
+                ..Addr::default()
+            };
+            h.put_addr(x, &a, false).unwrap();
+            h.put_addr(y, &Addr { seen: 4, held: 4, holder: Some("healthy".into()), holder_id: Some(gone), ..Addr::default() }, false).unwrap();
+            // Block only this write, without relying on permissions (also works as root).
+            let path = match case {
+                "withdrawal" => h.notice_path(x),
+                "owe" => h.owed_path(10),
+                _ => h.addr_path(x),
+            };
+            let blocked = path.with_file_name(format!(".{}.{}.tmp", path.file_name().unwrap().to_str().unwrap(), crate::util::write_tag()));
+            std::fs::create_dir(&blocked).unwrap();
+            let error = h.collect_garbage_with(false).unwrap_err().to_string();
+            assert!(error.contains(path.to_str().unwrap()), "{case}: {error}");
+            let l = h.lock().unwrap();
+            assert_eq!(h.addr(&l, x).unwrap(), a, "{case}: failed write keeps its claim");
+            assert!(h.addr(&l, y).unwrap().withdrawn, "{case}: sweep continues after errors");
+            drop(l);
+            std::fs::remove_dir(&blocked).unwrap();
+            if case == "release-owed" {
+                while h.owed_path(10).exists() {
+                    h.settle_owed_with(5, |_, _| Ok("released".into()), |_, _| (), |_, _| ());
+                }
+            }
+            h.collect_garbage_with(false).unwrap();
+            assert!(h.addr(&h.lock().unwrap(), x).unwrap().holder.is_none(), "{case}: retried");
+        }
     }
 
     #[test]

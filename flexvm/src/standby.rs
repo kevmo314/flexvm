@@ -1090,8 +1090,7 @@ mod tests {
         std::fs::remove_file(&record).unwrap();
         assert!(live(&host, "default").is_empty());
         let early = rx.recv_timeout(Duration::from_millis(100));
-        child.kill().unwrap();
-        child.wait().unwrap();
+        drop(child);
         worker.join().unwrap().unwrap();
         assert!(early.is_err(), "removal returned while the process still held its template");
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1115,7 +1114,7 @@ mod tests {
 
     #[test]
     fn a_claimed_standby_is_not_waited_for() {
-        let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("30").spawn().unwrap());
+        let child = crate::test_util::sleeper(30);
         let id = Ident::of(child.id()).unwrap();
         let fd = || vec![(id.clone(), PidFd::open(&id).unwrap().unwrap())];
         let start = Instant::now();
@@ -1125,8 +1124,7 @@ mod tests {
         assert!(wait_gone(fd(), Instant::now() + Duration::from_secs(10), || vec![id.clone()]));
         assert!(start.elapsed() < Duration::from_secs(1));
         let exited = fd();
-        child.kill().unwrap();
-        child.wait().unwrap();
+        drop(child);
         assert!(wait_gone(exited, Instant::now(), Vec::new));
     }
 
@@ -1217,7 +1215,7 @@ mod tests {
             let stop = Flock::new(stop_lock(&host).unwrap(), libc::LOCK_SH).unwrap();
             let (r, mut w) = UnixStream::pair().unwrap();
             std::io::Write::write_all(&mut w, reply.as_bytes()).unwrap();
-            let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+            let mut child = crate::test_util::sleeper(60);
             let pid = child.id();
             let relief_host = host.clone();
             let relief = std::thread::spawn(move || {
@@ -1262,15 +1260,14 @@ mod tests {
         send_json(&mut w, &json!({"locked": true})).unwrap();
         // A partial readiness reply must not extend its deadline either.
         std::io::Write::write_all(&mut w, b"{\"ok\":").unwrap();
-        let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+        let mut child = crate::test_util::sleeper(60);
         let mut r = BufReader::new(r);
         wait_locked(&mut r, &mut child, Instant::now() + Duration::from_secs(1)).unwrap();
         assert!(child.try_wait().unwrap().is_none());
         let start = Instant::now();
         let mut r = crate::util::By { s: r, at: start + Duration::from_millis(100) };
         assert!(crate::util::recv_json(&mut r).is_err());
-        child.kill().unwrap();
-        child.wait().unwrap();
+        drop(child);
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
@@ -1319,10 +1316,9 @@ mod tests {
         let (r, mut w) = UnixStream::pair().unwrap();
         std::io::Write::write_all(&mut w, b"{\"locked\":true}\n{\"ok\":true}\n").unwrap();
         let mut r = BufReader::new(r);
-        let mut child = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+        let mut child = crate::test_util::sleeper(60);
         let locked = wait_locked(&mut r, &mut child, Instant::now() + Duration::from_secs(1));
-        child.kill().unwrap();
-        child.wait().unwrap();
+        drop(child);
         locked.unwrap();
         assert!(!r.buffer().is_empty());
         wait_ready(r, Duration::from_millis(100)).unwrap();
@@ -1407,7 +1403,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = crate::test_util::TempDir::new("standby-planted");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let (d, mut victim) = (dir(&host, "default"), crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("100").spawn().unwrap()));
+        let (d, mut victim) = (dir(&host, "default"), crate::test_util::sleeper(100));
         let locks = crate::host::locks(&d);
         crate::host::private_dir(&locks).unwrap();
         let id = Ident::of(victim.id()).unwrap();
@@ -1428,8 +1424,7 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
         assert!(live(&host, "default").is_empty(), "never through a link");
         assert!(victim.try_wait().unwrap().is_none());
-        victim.kill().unwrap();
-        victim.wait().unwrap();
+        drop(victim);
     }
 
     #[test]
