@@ -155,7 +155,7 @@ fn prune_vm_record(host: &crate::host::Host, name: &str) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    if host.is_suspended(name) || host.vms(name, "moved")?.exists() {
+    if host.is_suspended(name) || host.has_record(name, "moved") {
         return Ok(false);
     }
     for ext in ["failed", "lost"] {

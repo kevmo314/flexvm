@@ -722,6 +722,11 @@ impl Host {
         Ok(if ext == "lock" { locks(&vms) } else { vms }.join(format!("{name}.{ext}")))
     }
 
+    /// Whether a VM record exists; invalid names have no records.
+    pub fn has_record(&self, name: &str, ext: &str) -> bool {
+        self.vms(name, ext).is_ok_and(|p| p.exists())
+    }
+
     pub fn suspended(&self, name: &str) -> Result<PathBuf> {
         check_name(name)?;
         Ok(self.state.join("suspended").join(name))
@@ -787,7 +792,7 @@ impl Host {
         self.finish_rename(name)?;
         if refuse_records {
             for ext in ["failed", "lost"] {
-                if self.vms(name, ext)?.exists() {
+                if self.has_record(name, ext) {
                     bail!("vm name {name:?} is taken (a {ext} vm, see flexvm ps -a): flexvm rm {name} first");
                 }
             }
@@ -799,7 +804,7 @@ impl Host {
             bail!("vm {name:?} exists (stopped); flexvm start or rm it");
         }
         // Its record stays until `rm` or `start` (`take_rerun_name`) takes it.
-        if !resuming && self.vms(name, "exited")?.exists() {
+        if !resuming && self.has_record(name, "exited") {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
         for ext in ["json", "sock", "moved", "failed", "lost"] {
@@ -3589,9 +3594,7 @@ pub fn generated_name(host: &Host) -> Result<String> {
     for _ in 0..100 {
         let r = u64::from_str_radix(&crate::util::random_hex(8)?, 16).unwrap_or(0);
         let name = format!("{}_{}", ADJECTIVES[(r % ADJECTIVES.len() as u64) as usize], NAMES[((r >> 32) % NAMES.len() as u64) as usize]);
-        let taken = host.alive(&name)
-            || host.suspended(&name)?.exists()
-            || ["failed", "lost", "moved", "exited"].iter().any(|ext| host.vms(&name, ext).is_ok_and(|p| p.exists()));
+        let taken = host.alive(&name) || host.suspended(&name)?.exists() || ["failed", "lost", "moved", "exited"].iter().any(|ext| host.has_record(&name, ext));
         if !taken {
             return Ok(name);
         }

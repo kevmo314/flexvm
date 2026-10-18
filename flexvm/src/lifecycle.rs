@@ -40,8 +40,6 @@ const QUARANTINE: &str = "QUARANTINE";
 const CMD: &str = "CMD";
 /// A suspended VM's `app::RunSpec` (JSON), its `-p` ports included, when it has one other than the default.
 const SPEC: &str = "SPEC";
-/// An older suspended VM's `-p` ports, kept apart from its `SPEC`: read into it (`read_spec`), never written.
-const PORTS: &str = "PORTS";
 
 /// Set while a suspend or `checkpoint --stop` saves the VM, and for good once
 /// it did: the app log follower writes nothing past the offset the checkpoint
@@ -1022,21 +1020,13 @@ fn read_cmd(dir: &Path) -> Result<Option<(String, crate::Session)>> {
     Ok(Some((cmd, serde_json::from_value(v["session"].clone())?)))
 }
 
-/// With an older checkpoint's `PORTS`, if its `SPEC` has none.
+/// A v0.1.0 checkpoint has no `SPEC` and uses the default run settings.
 pub(crate) fn read_spec(dir: &Path) -> Result<crate::app::RunSpec> {
-    let mut spec: crate::app::RunSpec = match std::fs::read(dir.join(SPEC)) {
-        Ok(b) => serde_json::from_slice(&b)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::app::RunSpec::default(),
-        Err(e) => return Err(e.into()),
-    };
-    if spec.ports.is_empty() {
-        match std::fs::read(dir.join(PORTS)) {
-            Ok(b) => spec.ports = serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", dir.join(PORTS).display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+    match std::fs::read(dir.join(SPEC)) {
+        Ok(b) => Ok(serde_json::from_slice(&b)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::app::RunSpec::default()),
+        Err(e) => Err(e.into()),
     }
-    Ok(spec)
 }
 
 pub fn read_gen(dir: &Path) -> Option<u64> {
@@ -1142,25 +1132,17 @@ pub fn ckhash(paths: &crate::template::Paths, dir: &Path) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quarantined, read_spec, PORTS, SPEC};
+    use super::{quarantined, read_spec, SPEC};
     use crate::app::RunSpec;
 
     #[test]
-    fn suspended_ports_go_in_the_spec_and_an_older_records_ports_file_is_read_into_it() {
+    fn suspended_specs_round_trip_and_v010_checkpoints_default() {
         let dir = crate::test_util::TempDir::new("suspended-ports");
         assert_eq!(read_spec(&dir).unwrap(), RunSpec::default());
         let ports = vec!["127.0.0.1:8080:80".parse::<crate::ports::Port>().unwrap(), "5353:53/udp".parse().unwrap()];
         let spec = RunSpec { keep: true, ports: ports.clone(), ..Default::default() };
         std::fs::write(dir.join(SPEC), serde_json::to_vec(&spec).unwrap()).unwrap();
         assert_eq!(read_spec(&dir).unwrap(), spec);
-        // An older suspend wrote them apart, with or without a spec.
-        std::fs::write(dir.join(PORTS), serde_json::to_vec(&ports).unwrap()).unwrap();
-        std::fs::write(dir.join(SPEC), serde_json::to_vec(&RunSpec { keep: true, ..Default::default() }).unwrap()).unwrap();
-        assert_eq!(read_spec(&dir).unwrap(), spec);
-        std::fs::remove_file(dir.join(SPEC)).unwrap();
-        assert_eq!(read_spec(&dir).unwrap(), RunSpec { ports: ports.clone(), ..Default::default() });
-        std::fs::write(dir.join(PORTS), b"broken").unwrap();
-        assert!(read_spec(&dir).is_err(), "a corrupt record must refuse start");
         std::fs::write(dir.join(SPEC), b"broken").unwrap();
         assert!(read_spec(&dir).is_err(), "a corrupt record must refuse start");
     }

@@ -31,7 +31,7 @@ mod util;
 mod vm;
 mod vmproc;
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -223,7 +223,6 @@ impl Args {
             }
             let short = match arg.as_str() {
                 "-d" => Some("detach"),
-                "-p" => Some("publish"),
                 "-h" => Some("help"),
                 "-q" => Some("quiet"),
                 "-v" => Some("verbose"),
@@ -237,6 +236,7 @@ impl Args {
             };
             // Short flags with a value read as their long ones.
             let valued = match arg.as_str() {
+                "-p" => Some("publish"),
                 "-e" if matches!(cmd, Some("run" | "exec")) => Some("env"),
                 "-w" if cmd == Some("exec") => Some("workdir"),
                 "-u" if cmd == Some("exec") => Some("user"),
@@ -252,7 +252,8 @@ impl Args {
                     let value = match takes_value(f, cmd) {
                         Some(false) => "1".into(),
                         Some(true) => {
-                            let value = it.next().filter(|v| !is_flag(v)).ok_or_else(|| match f {
+                            let value = it.next().filter(|v| if arg == "-p" { !v.starts_with('-') } else { !is_flag(v) }).ok_or_else(|| match f {
+                                "publish" if arg == "-p" => "-p needs a port mapping".to_string(),
                                 "force" => "--force needs a generation; run flexvm reclaim IP to see GEN".to_string(),
                                 _ => format!("--{f} needs a value"),
                             })?;
@@ -262,11 +263,6 @@ impl Args {
                         None => bail!("unknown option --{f} (see flexvm --help)"),
                     };
                     a.flags.push((f.into(), value));
-                }
-                None if short == Some("publish") => {
-                    let value = it.next().filter(|v| !v.starts_with('-')).ok_or("-p needs a port mapping")?;
-                    a.child_args.push(value.clone());
-                    a.flags.push(("publish".into(), value));
                 }
                 None if short.is_some() => a.flags.push((short.unwrap_or_default().into(), "1".into())),
                 // `-` alone is a word: cp's stdin or stdout.
@@ -820,7 +816,7 @@ fn run(args: &Args, image: &str) -> Result<()> {
     let interactive = args.has("interactive") || args.has("tty");
     // With -i or -t, CMD is the app (`run_spec`), which they are for.
     let cmd = (!args.rest.is_empty() && !interactive).then(|| args.rest.join(" "));
-    if args.has("interactive") && args.has("tty") && !args.has("detach") && !attach::is_tty(0) && std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
+    if args.has("interactive") && args.has("tty") && !args.has("detach") && !std::io::stdin().is_terminal() && std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
         bail!("the input device is not a TTY");
     }
     // Only settings for the app need the template's (a standby VM's claim is ~5 ms).
@@ -863,9 +859,8 @@ fn run_as(
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
-    let tty = log.is_none() && stdin_tty();
-    // `ports` beside the spec too, for a standby process of an older flexvm.
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none(), "ports": spec.ports});
+    let tty = log.is_none() && std::io::stdin().is_terminal();
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none()});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
@@ -929,10 +924,6 @@ fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
     args.all("publish").iter().map(|s| s.parse()).collect()
 }
 
-fn stdin_tty() -> bool {
-    unsafe { libc::isatty(0) == 1 }
-}
-
 /// `-e`, `--env-file`, `--entrypoint`, `--keep`, `--rm`, `-p` (and the `--ip` asked for, for a rerun).
 fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec> {
     let lookup = |k: &str| std::env::var(k).ok();
@@ -962,11 +953,21 @@ fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec>
 /// the name, `Proc::run`) says it was run.
 fn rerun(host: &Host, name: &str) -> Result<Option<Start>> {
     host::check_name(name)?;
-    if host.suspended(name)?.exists() || !host.vms(name, "exited")?.exists() {
+    if host.suspended(name)?.exists() || !host.has_record(name, "exited") {
         return Ok(None);
     }
     let (template, resources, spec) = (String::new(), vm::Resources::default(), app::RunSpec::default());
-    Ok(Some(Start::Run { name: name.into(), template, ip: None, cmd: None, resources, generated: false, spec, tty: stdin_tty(), rerun: true }))
+    Ok(Some(Start::Run {
+        name: name.into(),
+        template,
+        ip: None,
+        cmd: None,
+        resources,
+        generated: false,
+        spec,
+        tty: std::io::stdin().is_terminal(),
+        rerun: true,
+    }))
 }
 
 /// `kill -s SIGNAL NAME`: to its app.
@@ -1112,7 +1113,7 @@ fn stopped_to_attach(host: &Host, name: &str) -> Result<()> {
 fn not_running(host: &Host, name: &str) -> util::Error {
     match host.suspended(name).map(|d| d.exists()) {
         Ok(true) => format!("vm {name} is stopped: flexvm start {name}").into(),
-        _ if host.vms(name, "exited").is_ok_and(|p| p.exists()) => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
+        _ if host.has_record(name, "exited") => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
         _ => format!("no running vm named {name:?}").into(),
     }
 }
@@ -1172,10 +1173,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     }
     // Its tap and route go now, not at a sweep; best effort, as taking the name reaps again where it must.
     let _ = host.reap_dead_holder(name);
-    let records = || -> Result<bool> {
-        Ok(host.suspended(name)?.exists()
-            || ["failed", "lost", "exited"].into_iter().map(|ext| host.vms(name, ext)).collect::<Result<Vec<_>>>()?.iter().any(|p| p.exists()))
-    };
+    let records = || -> Result<bool> { Ok(host.suspended(name)?.exists() || ["failed", "lost", "exited"].iter().any(|ext| host.has_record(name, ext))) };
     if !alive && !stopped && records()? {
         bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
     }
@@ -1198,7 +1196,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         // A suspend that finished first is undone: the kill wins.
         if !host.suspended(name)?.exists() {
             // `rm -f`: so is the record of an app's exit that won the race, under the name (none took it since).
-            if stopped && host.vms(name, "exited")?.exists() {
+            if stopped && host.has_record(name, "exited") {
                 let _lock = host.take_name(name, true)?;
                 let _ = std::fs::remove_file(host.vms(name, "exited")?);
             }
@@ -1322,7 +1320,7 @@ fn stopped(v: &Value) -> bool {
 /// `ps`: `-a`, `-q`, `--json`, `--filter`s and `--format` (`containers`).
 fn ps(host: &Host, args: &Args) -> Result<()> {
     let filters = containers::Filters::parse(&args.all("filter"))?;
-    let format = args.get("format").map(containers::Format::parse).transpose()?;
+    let format = args.get("format").filter(|f| f.trim() != "table").map(containers::Format::parse).transpose()?;
     let all = args.has("all") || filters.has_status();
     let vms: Vec<Value> = vms(host).into_iter().filter(|v| (all || !stopped(v)) && filters.matches(v)).collect();
     if args.has("quiet") {
@@ -1331,7 +1329,7 @@ fn ps(host: &Host, args: &Args) -> Result<()> {
     if args.has("json") {
         return print(json!(vms));
     }
-    if let Some(f) = format.filter(|f| *f != containers::Format::Table) {
+    if let Some(f) = format {
         return output(format_args!("{}", f.render(&vms)?));
     }
     let row = |c: [&str; 10]| {
@@ -1340,18 +1338,14 @@ fn ps(host: &Host, args: &Args) -> Result<()> {
     // STARVED: refused memory here and throttled (moved to a peer if there is one).
     row(["NAME", "IP", "IMAGE", "STATE", "PID", "CPUS", "RSS MiB", "MAX MiB", "STARVED", "PORTS"])?;
     for v in &vms {
-        let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
-        let [a, b, mut d, e, g, h] = ["name", "ip", "state", "pid", "rss_mib", "max_mib"].map(s);
+        let [a, b, image, mut d, e, g, h, starved] = ["Name", "IP", "Image", "State", "PID", "RSS", "MaxMiB", "Starved"].map(|k| containers::field(v, k));
         if let Some(status) = v["status"].as_i64().filter(|_| d == "exited") {
             d = format!("exited ({status})");
         }
-        let image = v["template"].as_str().map(template::image_of).unwrap_or_default();
-        // The --cpus cap, else its vCPUs.
-        let cpus = v["cpus"].as_f64().map_or_else(|| s("vcpus"), |c| c.to_string());
-        let starved = if v["starved"].as_bool() == Some(true) { "yes" } else { "" };
+        let cpus = v["cpus"].as_f64().map_or_else(|| containers::field(v, "VCPUs"), |c| c.to_string());
         let ports: Vec<ports::Port> = serde_json::from_value(v["ports"].clone()).unwrap_or_default();
         let ports = ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
-        row([&a, &b, &image, &d, &e, &cpus, &g, &h, starved, &ports])?;
+        row([&a, &b, &image, &d, &e, &cpus, &g, &h, &starved, &ports])?;
     }
     Ok(())
 }
@@ -1580,7 +1574,7 @@ fn exec_command(args: &Args) -> Result<Value> {
     }
     let (stdin, tty) = (args.has("interactive"), args.has("tty"));
     // As docker's: a terminal's keys, or none.
-    if stdin && tty && !attach::is_tty(0) {
+    if stdin && tty && !std::io::stdin().is_terminal() {
         bail!("the input device is not a TTY");
     }
     let size = tty.then(attach::size).flatten().map(|(rows, cols)| [rows, cols]);
@@ -1593,7 +1587,7 @@ fn exec_command(args: &Args) -> Result<Value> {
 /// `-i`: stdin goes to the command; `-t`: on a pty, this terminal raw and its size followed.
 pub fn exec(host: &Host, name: &str, cmd: &Value) -> Result<i32> {
     let (stdin, tty) = (cmd["stdin"] == true, cmd["tty"] == true);
-    let keys = stdin && tty && attach::is_tty(0);
+    let keys = stdin && tty && std::io::stdin().is_terminal();
     let feed = match cmd["detach"] != true && (stdin || tty) {
         true => Some(attach::Feed::start(stdin.then(|| Box::new(std::io::stdin()) as Box<dyn Read + Send>), tty, keys, attach::detach_later)?),
         false => None,

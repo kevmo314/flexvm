@@ -780,31 +780,23 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     Ok(v)
 }
 
-/// The run's settings, its ports in them; an older `run` sent its ports beside them.
+/// The run's settings, including its ports; absent in a v0.1.0 claim.
 fn claim_spec(req: &Value) -> crate::app::RunSpec {
-    let mut spec: crate::app::RunSpec = serde_json::from_value(req["spec"].clone()).unwrap_or_default();
-    if spec.ports.is_empty() {
-        spec.ports = serde_json::from_value(req.get("ports").cloned().unwrap_or_else(|| json!([]))).unwrap_or_default();
-    }
-    spec
+    serde_json::from_value(req["spec"].clone()).unwrap_or_default()
 }
 
 /// A claim's generation: the template's, marked as a claim whose VM follows its app with the run's
-/// settings (`app::RunSpec`) and accepts optional port IPs. Older standbys find no generation
+/// settings (`app::RunSpec`). v0.1.0 standbys find no generation
 /// of their own, so the claim goes to another (or starts cold) before they deserialize it.
 fn generation(key: &str) -> String {
-    format!("{key}{FOLLOWS_APP}{OPTIONAL_PORT_IP}")
+    format!("{key}{FOLLOWS_APP}")
 }
 
 const FOLLOWS_APP: &str = "+app";
-const OPTIONAL_PORT_IP: &str = "+port-ip";
 
 /// A claim of this generation: marked, or (an older `run`'s) not.
 fn claims_generation(generation: &Value, mine: &str) -> bool {
-    generation.as_str().is_some_and(|g| {
-        let g = g.strip_suffix(OPTIONAL_PORT_IP).unwrap_or(g);
-        g.strip_suffix(FOLLOWS_APP).unwrap_or(g) == mine
-    })
+    generation.as_str().is_some_and(|g| g.strip_suffix(FOLLOWS_APP).unwrap_or(g) == mine)
 }
 
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
@@ -988,11 +980,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_claims_ports_come_in_its_spec_or_beside_it_from_an_older_run() {
+    fn a_claims_ports_come_in_its_spec() {
         let ports: Vec<crate::ports::Port> = vec!["8080:80".parse().unwrap()];
         let spec = crate::app::RunSpec { keep: true, ports: ports.clone(), ..Default::default() };
-        assert_eq!(claim_spec(&json!({"spec": spec, "ports": ports})), spec);
-        assert_eq!(claim_spec(&json!({"spec": {"keep": true}, "ports": ports})), spec);
+        assert_eq!(claim_spec(&json!({"spec": spec})), spec);
         assert_eq!(claim_spec(&json!({"spec": {"keep": true}})), crate::app::RunSpec { keep: true, ..Default::default() });
         assert_eq!(claim_spec(&json!({})), crate::app::RunSpec::default());
     }
@@ -1321,12 +1312,11 @@ mod tests {
     #[test]
     fn a_claim_with_run_settings_is_marked_for_standbys_that_apply_them() {
         let marked = generation("a");
-        assert_eq!(marked, "a+app+port-ip");
+        assert_eq!(marked, "a+app");
         assert!(claims_generation(&json!("a"), "a") && claims_generation(&json!(marked), "a"));
         assert!(claims_generation(&json!("a+app"), "a"));
         // What an older standby compares: never its own generation, so it leaves the claim be.
         assert_ne!(json!(marked), json!("a"));
-        assert_ne!(marked.strip_suffix(FOLLOWS_APP).unwrap_or(&marked), "a");
         assert!(!claims_generation(&json!("b+app"), "a") && !claims_generation(&json!("a+appx"), "a") && !claims_generation(&json!(null), "a"));
     }
 
@@ -1338,9 +1328,9 @@ mod tests {
             let (c, _) = listener.accept().unwrap();
             let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
             assert!(req["spec"]["ports"][0]["ip"].is_null());
-            // The pre-#727 standby's generation check, before `claiming` or deserialization.
+            // v0.1.0 compares the generation exactly, before claiming or deserialization.
             let g = req["generation"].as_str().unwrap();
-            assert_ne!(g.strip_suffix("+app").unwrap_or(g), "a");
+            assert_ne!(g, "a");
         });
         let spec = crate::app::RunSpec { ports: vec!["8080:80".parse().unwrap()], ..Default::default() };
         assert!(take(&host, &paths, "default", &json!({"name": "test", "spec": spec}), &[]).unwrap().is_none());
@@ -1355,7 +1345,7 @@ mod tests {
         let live = std::thread::spawn(move || {
             let (c, _) = live.accept().unwrap();
             let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
-            assert_eq!(req["generation"], "a+app+port-ip");
+            assert_eq!(req["generation"], "a+app");
             send_json(&mut &c, &json!({"claiming": true})).unwrap();
             send_json(&mut &c, &json!({"ok": true, "result": "live"})).unwrap();
         });

@@ -99,7 +99,7 @@ fn exit_of(host: &Host, name: &str, id: &Ident) -> Option<Exit> {
 
 /// The status of `name` with no process running it.
 fn ended(host: &Host, name: &str) -> Result<i32> {
-    let has = |ext: &str| host.vms(name, ext).is_ok_and(|p| p.exists());
+    let has = |ext: &str| host.has_record(name, ext);
     let record = exit_record(host, name);
     // A holder that died without unlocking left its identity: unless the record is its own, it
     // ended unrecorded (SIGKILL, a crash), and the record is an earlier instance's.
@@ -119,7 +119,7 @@ fn ended(host: &Host, name: &str) -> Result<i32> {
 
 /// Whether anything is left of `name` here: a process, a stopped VM, or a record of its end.
 fn known(host: &Host, name: &str) -> bool {
-    host.alive(name) || host.is_suspended(name) || ["failed", "lost", "exited"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()))
+    host.alive(name) || host.is_suspended(name) || ["failed", "lost", "exited"].iter().any(|ext| host.has_record(name, ext))
 }
 
 /// Writes to stdout: false once its reader is gone.
@@ -323,20 +323,16 @@ pub fn rename(host: &Host, from: &str, to: &str) -> Result<()> {
 /// are held throughout, so no start of either runs meanwhile; the directory and the claim move
 /// together under the host lock, so no sweep or claim sees one moved without the other.
 fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
-    let exited = |n: &str| host.vms(n, "exited").is_ok_and(|p| p.exists());
-    if !host.is_suspended(from) && exited(from) {
+    if !host.is_suspended(from) && host.has_record(from, "exited") {
         return rename_exited(host, from, to);
     }
     if !host.is_suspended(from) {
-        return Err(match ["failed", "lost"].iter().find(|ext| host.vms(from, ext).is_ok_and(|p| p.exists())) {
+        return Err(match ["failed", "lost"].iter().find(|ext| host.has_record(from, ext)) {
             Some(ext) => format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed").into(),
             None => format!("no vm named {from:?}").into(),
         });
     }
-    let _from = host.take_name(from, true).map_err(|e| match host.alive(from) {
-        true => format!("vm {from} started meanwhile: try again").into(),
-        false => e,
-    })?;
+    let _from = take_rename_name(host, from)?;
     // Taking the name removed what an interrupted suspend, resume or discard left.
     if !host.is_suspended(from) {
         bail!("no vm named {from:?}");
@@ -377,16 +373,21 @@ fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
 /// An exited VM (`app::Exited`): no checkpoint or address claim, only its record (what `start`
 /// runs again), logs and exit status move, both names held.
 fn rename_exited(host: &Host, from: &str, to: &str) -> Result<()> {
-    let _from = host.take_name(from, true).map_err(|e| match host.alive(from) {
-        true => format!("vm {from} started meanwhile: try again").into(),
-        false => e,
-    })?;
-    if !host.vms(from, "exited")?.exists() || host.is_suspended(from) {
+    let _from = take_rename_name(host, from)?;
+    if !host.has_record(from, "exited") || host.is_suspended(from) {
         bail!("vm {from} changed meanwhile: try again");
     }
     // Refuses a `failed`, `lost` or `exited` record of `to`, and a stopped vm of it.
     let _to = host.take_unrecorded_name(to)?;
     move_records(host, from, to)
+}
+
+/// Hold the old name, reporting a concurrent start consistently for stopped and exited VMs.
+fn take_rename_name(host: &Host, from: &str) -> Result<host::NameLock> {
+    host.take_name(from, true).map_err(|e| match host.alive(from) {
+        true => format!("vm {from} started meanwhile: try again").into(),
+        false => e,
+    })
 }
 
 /// Its logs (and the writers' locks with them) and exit status, under the logs lock shared, as a
@@ -558,7 +559,6 @@ impl Filters {
 #[derive(Debug, PartialEq)]
 pub enum Format {
     Json,
-    Table,
     Template { table: bool, parts: Vec<Part> },
 }
 
@@ -589,10 +589,8 @@ const FIELDS: [(&str, &str); 14] = [
 
 impl Format {
     pub fn parse(f: &str) -> Result<Format> {
-        match f.trim() {
-            "json" => return Ok(Format::Json),
-            "table" => return Ok(Format::Table),
-            _ => {}
+        if f.trim() == "json" {
+            return Ok(Format::Json);
         }
         let (table, body) = match f.strip_prefix("table ") {
             Some(rest) => (true, rest),
@@ -624,10 +622,9 @@ impl Format {
         Ok(Format::Template { table, parts })
     }
 
-    /// One line per VM (none for `Table`, which the caller prints).
+    /// One line per VM.
     pub fn render(&self, vms: &[Value]) -> Result<String> {
         match self {
-            Format::Table => Ok(String::new()),
             Format::Json => Ok(vms.iter().map(|v| Ok(serde_json::to_string(v)? + "\n")).collect::<Result<String>>()?),
             Format::Template { table, parts } => {
                 let line = |v: Option<&Value>| -> Result<String> {
@@ -706,8 +703,8 @@ fn align(text: &str) -> String {
 /// What gc keeps: an exit record of a name with nothing else left, once it is `ttl` old, goes.
 pub fn stale_exit(host: &Host, name: &str, path: &Path, ttl: Duration) -> bool {
     let old = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > ttl);
-    let logs = ["log", "log.1"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
-    let exited = host.vms(name, "exited").is_ok_and(|p| p.exists());
+    let logs = ["log", "log.1"].iter().any(|ext| host.has_record(name, ext));
+    let exited = host.has_record(name, "exited");
     old && host.holder_gone(name) && !host.suspended(name).is_ok_and(|d| d.exists()) && !logs && !exited
 }
 
@@ -771,7 +768,6 @@ mod tests {
         assert_eq!(table, "NAME   STATE\nweb    running\ndb     failed\n");
         assert_eq!(Format::parse("json").unwrap().render(&vms[1..]).unwrap(), "{\"error\":\"died\",\"name\":\"db\",\"state\":\"failed\"}\n");
         assert_eq!(Format::parse("{{json .}}").unwrap().render(&vms[1..]).unwrap(), "{\"error\":\"died\",\"name\":\"db\",\"state\":\"failed\"}\n");
-        assert_eq!(Format::parse("table").unwrap(), Format::Table);
         assert!(Format::parse("{{.Nope}}").is_err());
         assert!(Format::parse("{{.Name").is_err());
     }
@@ -955,7 +951,10 @@ mod tests {
 
     /// An exited VM's record (`app::Exited`), as a background VM whose app exited leaves it.
     fn exited_vm(host: &Host, name: &str, status: i32) {
-        let rec = json!({"status": status, "template": "ci", "cmd": "make", "spec": {"env": ["A=1"], "stdin": true, "tty": true, "ports": ["127.0.0.1:8080:80".parse::<crate::ports::Port>().unwrap()]}, "at": 1});
+        let spec =
+            serde_json::from_value(json!({"env": ["A=1"], "stdin": true, "tty": true, "ports": ["127.0.0.1:8080:80".parse::<crate::ports::Port>().unwrap()]}))
+                .unwrap();
+        let rec = crate::app::Exited::new(status, "ci".into(), Some("make".into()), Default::default(), spec, 1);
         std::fs::write(host.vms(name, "exited").unwrap(), serde_json::to_vec(&rec).unwrap()).unwrap();
     }
 

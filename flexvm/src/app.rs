@@ -141,37 +141,23 @@ pub struct Exited {
     /// Its command's or app's exit status (128+signal for a signal).
     pub status: i32,
     pub template: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
-    #[serde(default)]
     pub resources: crate::vm::Resources,
     /// Its `-p` ports included: forwarded again when it runs again.
-    #[serde(default)]
     pub spec: RunSpec,
-    /// An older record's `-p` ports, kept apart from `spec`: read into it (`read`), never written.
-    #[serde(default, skip_serializing)]
-    ports: Vec<crate::ports::Port>,
     /// When it exited (seconds since the epoch).
-    #[serde(default)]
     pub at: u64,
 }
 
 impl Exited {
     pub fn new(status: i32, template: String, cmd: Option<String>, resources: crate::vm::Resources, spec: RunSpec, at: u64) -> Exited {
-        Exited { status, template, cmd, resources, spec, ports: Vec::new(), at }
+        Exited { status, template, cmd, resources, spec, at }
     }
 
     pub fn read(path: &std::path::Path) -> Result<Exited> {
         let bytes = std::fs::read(path)?;
-        Self::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()).into())
-    }
-
-    fn parse(bytes: &[u8]) -> serde_json::Result<Exited> {
-        let mut e: Exited = serde_json::from_slice(bytes)?;
-        if e.spec.ports.is_empty() {
-            e.spec.ports = std::mem::take(&mut e.ports);
-        }
-        Ok(e)
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()).into())
     }
 }
 
@@ -324,13 +310,6 @@ mod tests {
         std::fs::write(dir.join("x.exited"), serde_json::to_vec(&e).unwrap()).unwrap();
         assert_eq!(Exited::read(&dir.join("x.exited")).unwrap(), e);
         assert!(serde_json::to_value(&e).unwrap().get("ports").is_none(), "the ports are written once, in the spec");
-        // An older record kept them beside its spec.
-        let mut old = serde_json::to_value(Exited::new(3, "t".into(), None, Default::default(), RunSpec { ports: Vec::new(), ..s.clone() }, 5)).unwrap();
-        old["ports"] = serde_json::to_value(&ports).unwrap();
-        std::fs::write(dir.join("old.exited"), serde_json::to_vec(&old).unwrap()).unwrap();
-        assert_eq!(Exited::read(&dir.join("old.exited")).unwrap(), e);
-        std::fs::write(dir.join("y.exited"), "{\"status\": 0, \"template\": \"t\"}").unwrap();
-        assert_eq!(Exited::read(&dir.join("y.exited")).unwrap().spec, RunSpec::default());
         std::fs::write(dir.join("z.exited"), "garbage").unwrap();
         assert!(Exited::read(&dir.join("z.exited")).is_err());
     }
