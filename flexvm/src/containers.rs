@@ -579,8 +579,11 @@ impl Filters {
 #[derive(Debug, PartialEq)]
 pub enum Format {
     Json,
-    Template { table: bool, parts: Vec<Part> },
+    Template { table: bool, parts: Vec<Part>, fields: Fields },
 }
+
+/// A template's field names, and the keys of the JSON objects they name.
+pub type Fields = &'static [(&'static str, &'static str)];
 
 #[derive(Debug, PartialEq)]
 pub enum Part {
@@ -609,6 +612,10 @@ const FIELDS: [(&str, &str); 14] = [
 
 impl Format {
     pub fn parse(f: &str) -> Result<Format> {
+        Format::parse_with(f, &FIELDS)
+    }
+
+    pub fn parse_with(f: &str, fields: Fields) -> Result<Format> {
         if f.trim() == "json" {
             return Ok(Format::Json);
         }
@@ -626,11 +633,11 @@ impl Format {
             let action = rest[at + 2..end].trim();
             parts.push(match action {
                 "json ." => Part::Whole,
-                a => match a.strip_prefix('.').and_then(|field| FIELDS.iter().find(|(n, _)| n.eq_ignore_ascii_case(field))) {
+                a => match a.strip_prefix('.').and_then(|field| fields.iter().find(|(n, _)| n.eq_ignore_ascii_case(field))) {
                     Some((name, _)) => Part::Field(name),
                     None => bail!(
                         "bad --format {f:?}: {{{{{a}}}}} is not a field (fields: {}, or {{{{json .}}}})",
-                        FIELDS.iter().map(|(n, _)| format!(".{n}")).collect::<Vec<_>>().join(" ")
+                        fields.iter().map(|(n, _)| format!(".{n}")).collect::<Vec<_>>().join(" ")
                     ),
                 },
             });
@@ -639,21 +646,21 @@ impl Format {
         if !rest.is_empty() {
             parts.push(Part::Text(unescape(rest)));
         }
-        Ok(Format::Template { table, parts })
+        Ok(Format::Template { table, parts, fields })
     }
 
     /// One line per VM.
     pub fn render(&self, vms: &[Value]) -> Result<String> {
         match self {
             Format::Json => Ok(vms.iter().map(|v| Ok(serde_json::to_string(v)? + "\n")).collect::<Result<String>>()?),
-            Format::Template { table, parts } => {
+            Format::Template { table, parts, fields } => {
                 let line = |v: Option<&Value>| -> Result<String> {
                     let mut s = String::new();
                     for p in parts {
                         match (p, v) {
                             (Part::Text(t), _) => s.push_str(t),
                             (Part::Field(name), None) => s.push_str(&name.to_ascii_uppercase()),
-                            (Part::Field(name), Some(v)) => s.push_str(&field(v, name)),
+                            (Part::Field(name), Some(v)) => s.push_str(&field_in(v, name, fields)),
                             (Part::Whole, None) => s.push_str("JSON"),
                             (Part::Whole, Some(v)) => s.push_str(&serde_json::to_string(v)?),
                         }
@@ -675,7 +682,11 @@ impl Format {
 
 /// A row's field as `ps` shows it.
 pub fn field(v: &Value, name: &str) -> String {
-    let key = FIELDS.iter().find(|(n, _)| *n == name).map_or(name, |(_, k)| k);
+    field_in(v, name, &FIELDS)
+}
+
+fn field_in(v: &Value, name: &str, fields: Fields) -> String {
+    let key = fields.iter().find(|(n, _)| *n == name).map_or(name, |(_, k)| k);
     match key {
         "image" => v["template"].as_str().map(template::image_of).unwrap_or_default(),
         // The --cpus cap, else its vCPUs.

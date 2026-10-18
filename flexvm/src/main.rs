@@ -67,8 +67,9 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --keep                         stay up once the app exits (without: the VM exits with it, with its
                                      status; a background one is then listed exited until rm or start)
       --rm                           leave no exited record once a background VM exits
-      --checkpoint DIR               start it from a checkpoint instead of IMAGE (its name and address
-                                     unless --name and --ip IP|auto); --paused holds it until unpause
+      --checkpoint NAME|ID           start it from a stored checkpoint instead of IMAGE (its name and
+                                     address unless --name and --ip IP|auto), or from a checkpoint
+                                     directory (a path, with a '/'); --paused holds it until unpause
   flexvm ps [-a] [-q] [--json] [--filter KEY=VALUE]... [--format FORMAT]
                                      list running VMs (-a: stopped ones too; -q: names only);
                                      --filter name=PART|status=STATE|image=IMAGE|ip=IP (a key again:
@@ -96,8 +97,16 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm kill -s SIGNAL NAME...      send SIGNAL (TERM, HUP, 9, ...) to the VM's app instead
   flexvm rm [-f] NAME...             remove a stopped VM (suspended, exited, failed or lost); -f: a running
                                      one too
-  flexvm checkpoint NAME DIR [--stop] [--incremental]
-                                     write the VM's state to DIR (a new directory); run --checkpoint DIR
+  flexvm checkpoint create VM [NAME] [--stop] [--incremental]
+                                     store the VM's state in STATE/checkpoints, named NAME if given;
+                                     --incremental: as a delta on its last stored checkpoint
+  flexvm checkpoint ls [-q] [--format FORMAT] [--filter name=PART|vm=NAME|template=IMAGE|ID]...
+                                     list stored checkpoints (-q: ids only; FORMAT as for ps)
+  flexvm checkpoint rm [-f] NAME|ID...
+                                     remove stored checkpoints (-f: and those built on them)
+  flexvm checkpoint prune [--older-than AGE] [-f]
+                                     remove stored checkpoints (older than AGE: 30m, 24h, 7d) no kept
+                                     one builds on (-f: without asking)
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
               [--standby N] ...      pull an image and build its template (an archive or OCI layout
@@ -152,6 +161,7 @@ const SWITCHES: &[&str] = &[
     "password-stdin",
     "follow",
     "verbose",
+    "lifecycle",
 ];
 
 /// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`.
@@ -240,7 +250,7 @@ impl Args {
                 "-i" if matches!(cmd, Some("run" | "exec")) => Some("interactive"),
                 "-t" if matches!(cmd, Some("run" | "exec")) => Some("tty"),
                 // Not reclaim's `--force GEN`.
-                "-f" if matches!(cmd, Some("rm" | "image" | "system")) => Some("force"),
+                "-f" if matches!(cmd, Some("rm" | "image" | "system" | "checkpoint")) => Some("force"),
                 "-f" if cmd == Some("logs") => Some("follow"),
                 _ => None,
             };
@@ -426,7 +436,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("unpause", NAMES, &[]),
     ("kill", NAMES, &["signal"]),
     ("rm", NAMES, &["force"]),
-    ("checkpoint", 3, &["stop", "incremental"]),
+    ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -468,7 +478,7 @@ fn check_applies(args: &Args) -> Result<()> {
     } else if !internal && first.is_none() {
         match cmd.as_str() {
             "run" | "pull" | "rmi" => bail!("{cmd} needs IMAGE"),
-            "exec" | "attach" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "checkpoint" | "migrate" | "logs" | "inspect" | "wait" | "restart" => {
+            "exec" | "attach" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "migrate" | "logs" | "inspect" | "wait" | "restart" => {
                 bail!("{cmd} needs NAME")
             }
             "rename" => bail!("rename needs OLD NEW"),
@@ -483,6 +493,27 @@ fn check_applies(args: &Args) -> Result<()> {
         "system" if !matches!(first.map(String::as_str), Some("prune" | "df")) => bail!("system needs prune or df"),
         "system" if first.map(String::as_str) == Some("df") && args.has("force") => bail!("system df takes no -f"),
         "images" if args.has("quiet") && args.has("json") => bail!("images takes either -q or --json"),
+        "checkpoint" => {
+            let (op, most, flags): (_, _, &[&str]) = match first.map(String::as_str) {
+                Some(op @ "create") => (op, 4, &["stop", "incremental"]),
+                Some(op @ "ls") => (op, 2, &["quiet", "format", "filter"]),
+                Some(op @ "rm") => (op, NAMES, &["force"]),
+                Some(op @ "prune") => (op, 2, &["older-than", "force"]),
+                // `checkpoint VM DIR`, before #775.
+                _ => bail!("checkpoint needs create, ls, rm or prune: flexvm checkpoint create VM [NAME] keeps a VM's checkpoint in STATE/checkpoints (it took a DIR before), and run --checkpoint NAME restores it"),
+            };
+            if let Some((f, _)) = args.flags.iter().find(|(f, _)| !GLOBAL.contains(&f.as_str()) && !flags.contains(&f.as_str())) {
+                bail!("--{f} does not apply to checkpoint {op} (see flexvm --help)");
+            }
+            if let Some(extra) = args.positional.get(most) {
+                bail!("checkpoint {op} does not take {extra:?} (see flexvm --help)");
+            }
+            match op {
+                "create" if args.positional.len() < 3 => bail!("checkpoint create needs VM"),
+                "rm" if args.positional.len() < 3 => bail!("checkpoint rm needs NAME|ID"),
+                _ => {}
+            }
+        }
         _ => {}
     }
     let image = cmd == "pull";
@@ -668,10 +699,11 @@ fn real_main(args: &Args) -> Result<()> {
             let gen = args.get("force").map(|v| v.parse().map_err(|_| format!("bad --force generation {v:?}"))).transpose()?;
             reclaim(&open_host(args)?, name, gen)
         }
-        Some("checkpoint") => {
-            let dir = std::path::absolute(arg2.ok_or("checkpoint needs NAME DIR")?)?;
-            call(json!({"op": "checkpoint", "dir": dir, "stop": args.has("stop"), "incremental": args.has("incremental")}))
+        Some("checkpoint") if name == "create" => {
+            let req = json!({"op": "checkpoint", "name": pos.get(3), "stop": args.has("stop"), "incremental": args.has("incremental")});
+            print(vmproc::call(&open_host(args)?, arg2.unwrap_or_default(), req, None)?)
         }
+        Some("checkpoint") => management::checkpoints(args, name),
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
         Some("listen") => {
             // Before any thread that would take these signals is started.
@@ -1012,7 +1044,16 @@ fn signal_app(host: &Host, name: &str, sig: i32) -> Result<()> {
 
 /// `run --checkpoint DIR`: the checkpoint's name and address unless `--name`, `--ip`.
 fn run_checkpoint(args: &Args) -> Result<()> {
-    let dir = std::path::absolute(args.get("checkpoint").unwrap_or_default())?;
+    let what = args.get("checkpoint").unwrap_or_default();
+    // A path (v0.1.0's checkpoints, a stopped VM's) as it is; else a stored one.
+    let dir = match what.contains('/') {
+        true => std::path::absolute(what)?,
+        false => match checkpoint::store::find(&checkpoint::store::list(&state(args)?), what) {
+            Ok(e) => e.dir.clone(),
+            Err(e) if std::path::Path::new(what).is_dir() => bail!("{e}; a checkpoint directory is given by its path: ./{what}"),
+            Err(e) => Err(e)?,
+        },
+    };
     let resources = resources(args)?;
     let s = Start::Restore {
         dir: dir.clone(),
@@ -1516,18 +1557,23 @@ fn images(host: &Host, paths: &Paths, args: &Args) -> Result<()> {
     row(["REPOSITORY", "TAG", "ID", "VCPU", "MAX MiB", "SIZE MiB", "STANDBY", "CREATED"])?;
     for v in &images {
         let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
-        let created = v["created"].as_u64().map(|t| std::time::UNIX_EPOCH + Duration::from_secs(t)).and_then(|t| t.elapsed().ok());
-        let ago = created.map_or(String::new(), |d| match d.as_secs() {
-            s if s < 120 => format!("{s} seconds ago"),
-            s if s < 7200 => format!("{} minutes ago", s / 60),
-            s if s < 172800 => format!("{} hours ago", s / 3600),
-            s => format!("{} days ago", s / 86400),
-        });
+        let ago = ago(v["created"].as_u64());
         let tag = s("tag");
         let tag = if tag.starts_with("sha256:") { tag[..19].to_string() } else { tag };
         row([&s("repository"), &tag, &s("id"), &s("vcpus"), &s("max_mib"), &s("size_mib"), &s("standby"), &ago])?;
     }
     Ok(())
+}
+
+/// How long ago Unix time `secs` was, as `images` says it.
+fn ago(secs: Option<u64>) -> String {
+    let created = secs.map(|t| std::time::UNIX_EPOCH + Duration::from_secs(t)).and_then(|t| t.elapsed().ok());
+    created.map_or(String::new(), |d| match d.as_secs() {
+        s if s < 120 => format!("{s} seconds ago"),
+        s if s < 7200 => format!("{} minutes ago", s / 60),
+        s if s < 172800 => format!("{} hours ago", s / 3600),
+        s => format!("{} days ago", s / 86400),
+    })
 }
 
 /// `rmi IMAGE|ID`: refused while a VM here (running, paused or suspended) uses it. Its standby
@@ -2368,7 +2414,7 @@ mod exec_tests {
 
     #[test]
     fn missing_or_empty_names_name_the_command() {
-        for cmd in ["run", "exec", "stop", "start", "pause", "unpause", "kill", "rm", "checkpoint", "migrate", "pull", "rmi"] {
+        for cmd in ["run", "exec", "stop", "start", "pause", "unpause", "kill", "rm", "migrate", "pull", "rmi"] {
             let what = if matches!(cmd, "run" | "pull" | "rmi") { "IMAGE" } else { "NAME" };
             for argv in [vec![cmd], vec![cmd, ""]] {
                 assert_eq!(real_main(&parse(&argv)).unwrap_err().to_string(), format!("{cmd} needs {what}"));
@@ -2378,6 +2424,30 @@ mod exec_tests {
             check_applies(&parse(argv)).unwrap();
         }
         assert!(check_applies(&parse(&["stop", "a", ""])).is_err());
+    }
+
+    #[test]
+    fn checkpoint_subcommands_take_their_own_words_and_flags() {
+        for argv in [
+            &["checkpoint", "create", "web"][..],
+            &["checkpoint", "create", "web", "base", "--stop", "--incremental"],
+            &["checkpoint", "ls", "-q", "--filter", "vm=web", "--format", "{{.ID}}"],
+            &["checkpoint", "rm", "-f", "a", "b"],
+            &["checkpoint", "prune", "--older-than", "24h", "-f"],
+        ] {
+            check_applies(&parse(argv)).unwrap();
+        }
+        let err = |argv: &[&str]| check_applies(&parse(argv)).unwrap_err().to_string();
+        assert!(err(&["checkpoint", "web", "/tmp/ck"]).contains("flexvm checkpoint create VM [NAME]"), "the form before #775");
+        assert!(err(&["checkpoint"]).contains("needs create, ls, rm or prune"));
+        assert_eq!(err(&["checkpoint", "create"]), "checkpoint create needs VM");
+        assert_eq!(err(&["checkpoint", "rm"]), "checkpoint rm needs NAME|ID");
+        assert!(err(&["checkpoint", "ls", "--stop"]).contains("--stop does not apply to checkpoint ls"));
+        assert!(err(&["checkpoint", "create", "web", "a", "b"]).contains("does not take \"b\""));
+        assert!(err(&["checkpoint", "prune", "x"]).contains("does not take"));
+        let age = |s| util::parse_age(s).map(|d| d.as_secs());
+        assert_eq!(["90s", "30m", "24h", "7d", "0d"].map(age), [Some(90), Some(1800), Some(86400), Some(604800), Some(0)]);
+        assert!(["", "h", "1", "1w", "-1h", "1.5h"].into_iter().all(|s| age(s).is_none()));
     }
 
     #[test]

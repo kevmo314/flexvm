@@ -63,6 +63,8 @@ pub struct Staging {
     vmstate: PathBuf,
     pages: Option<PagesFile>,
     published: bool,
+    /// Published as its manifest's id (`in_store`), not `dest`'s name.
+    by_id: bool,
     pub meta_left: u64,
     /// `Manifest::app_log`.
     pub app_log: u64,
@@ -107,11 +109,36 @@ impl Staging {
         })()
         .inspect_err(|_| remove_staging(pfd.as_raw_fd(), &outer_name, outer.as_raw_fd(), None))?;
         let _ = std::fs::remove_file(&vmstate);
-        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: chain_meta_budget(), app_log: 0 })
+        Ok(Staging {
+            dest,
+            parent: pfd,
+            base,
+            outer,
+            outer_name,
+            ck,
+            vmstate,
+            pages: None,
+            published: false,
+            by_id: false,
+            meta_left: chain_meta_budget(),
+            app_log: 0,
+        })
     }
 
+    /// Into flexvm's own store (`store::dir`), named by the id only the manifest decides.
+    pub fn in_store(store: &Path, vmstate: PathBuf) -> Result<Staging> {
+        let mut s = Staging::new(&store.join("new"), vmstate)?;
+        s.by_id = true;
+        Ok(s)
+    }
+
+    /// Where it is published: `dest`, or for `in_store` the store's entry `id`.
     pub fn dest(&self) -> &Path {
         &self.dest
+    }
+
+    pub fn by_id(&self) -> bool {
+        self.by_id
     }
 
     /// A path to the destination's directory as pinned; valid while this lives.
@@ -228,6 +255,9 @@ impl Staging {
         }
         self.add_file("manifest.json", &text)?;
         check(unsafe { libc::fsync(self.ck.as_raw_fd()) })?;
+        if self.by_id {
+            (self.base, self.dest) = (cname(&id), self.dest.with_file_name(&id));
+        }
         still_valid()?;
         // The pinned directory must still be the one `dest` names.
         use std::os::unix::fs::MetadataExt;
