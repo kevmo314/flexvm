@@ -65,7 +65,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --checkpoint DIR               start it from a checkpoint instead of IMAGE (its name and address
                                      unless --name and --ip IP|auto); --paused holds it until unpause
   flexvm ps [-a] [--json]            list running VMs (-a: stopped ones too)
-  flexvm exec NAME CMD...            run a shell command in a VM
+  flexvm exec [OPTIONS] NAME CMD...  run argv in a VM (-d, -e K=V, -w DIR, -u USER[:GROUP])
   flexvm stop NAME...                suspend a VM to disk, freeing its memory (as SIGTERM to its process)
   flexvm start [-a] NAME...          resume a stopped VM in the background (-a: in the foreground); an
                                      exited one runs again from its image (its writes were in its memory)
@@ -106,7 +106,8 @@ options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs, host.j
 Each state directory is bound to its first run directory; a different --run is refused (and so is
 none, if it is bound to another than its default); /run/flexvm is /var/lib/flexvm's alone.
 run and start -a exit with the VM's command's (or else its app's) status, 128+signal, 125 when
-flexvm fails, 124 when the VM dies; exec returns the command's status, or 125 when flexvm fails
+flexvm fails, 124 when the VM dies; exec returns the command's status, 127 when it is not found,
+126 when it cannot run, or 125 when flexvm fails
 ";
 
 /// Flags that take no value (`-a`, `-f` and `--standby` depend on the command: `takes_value`).
@@ -177,7 +178,9 @@ impl Args {
             };
             // Short flags with a value read as their long ones.
             let valued = match arg.as_str() {
-                "-e" if cmd == Some("run") => Some("env"),
+                "-e" if matches!(cmd, Some("run" | "exec")) => Some("env"),
+                "-w" if cmd == Some("exec") => Some("workdir"),
+                "-u" if cmd == Some("exec") => Some("user"),
                 "-s" if cmd == Some("kill") => Some("signal"),
                 _ => None,
             };
@@ -308,7 +311,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
         &["name", "detach", "ip", "cpus", "memory", "env", "env-file", "entrypoint", "keep", "rm", "checkpoint", "paused", "standby", "incoming", "publish"],
     ),
     ("ps", 1, &["all", "json"]),
-    ("exec", 2, &[]),
+    ("exec", 2, &["detach", "env", "workdir", "user"]),
     ("stop", NAMES, &[]),
     ("start", NAMES, &["attach"]),
     ("pause", NAMES, &[]),
@@ -468,7 +471,10 @@ fn real_main(args: &Args) -> Result<()> {
             })
         }
         Some("ps") => ps(&open_host(args)?, args.has("all"), args.has("json")),
-        Some("exec") => util::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
+        Some("exec") => {
+            let cmd = exec_command(args)?;
+            util::exit(exec(&open_host(args)?, name, &cmd)?)
+        }
         Some("stop") => {
             let host = open_host(args)?;
             each(args.names(), |n| stop(&host, n))
@@ -1379,9 +1385,32 @@ impl Session {
     }
 }
 
+/// CLI exec has no implicit shell; options are serialized with the argv.
+fn exec_command(args: &Args) -> Result<Value> {
+    if args.rest.first().is_none_or(|s| s.is_empty()) {
+        bail!("exec needs CMD");
+    }
+    let env = args.all("env");
+    for kv in &env {
+        if kv.split_once('=').is_none_or(|(k, _)| k.is_empty()) || kv.contains('\0') {
+            bail!("exec -e needs K=V: {kv:?}");
+        }
+    }
+    // As with docker exec; a relative one would be resolved against a directory the user cannot see.
+    if args.get("workdir").is_some_and(|w| !w.starts_with('/')) {
+        bail!("exec -w needs an absolute path");
+    }
+    let cmd = json!({"argv": args.rest, "env": env, "workdir": args.get("workdir"), "user": args.get("user"), "detach": args.has("detach")});
+    guest::command_body(&cmd)?;
+    Ok(cmd)
+}
+
 /// Reattaches when the connection drops (a checkpoint's pause resets vsock).
-pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
+pub fn exec(host: &Host, name: &str, cmd: &Value) -> Result<i32> {
     let session: &'static Mutex<Session> = Box::leak(Box::new(Mutex::new(Session::new()?)));
+    if cmd["detach"] == true {
+        return exec_request(host, name, cmd, session, false);
+    }
     let id = session.lock().unwrap().id.clone();
     let close = {
         let (host, name, id) = (host.clone(), name.to_string(), id.clone());
@@ -1421,7 +1450,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
         }
         util::raise_signal(sig);
     });
-    let result = exec_session(host, name, cmd, session, false);
+    let result = exec_request(host, name, cmd, session, false);
     // Completed sessions are acknowledged on their attachment. Errors (including a closed
     // stdout, as with `| head`) still need CLOSE to stop a command that may be running.
     if result.is_err() {
@@ -1440,8 +1469,13 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
 /// suspend, and its VM goes with it anyway. `patient` (a VM's main command):
 /// a paused or checkpointing VM is waited for even before the command started.
 pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>, patient: bool) -> Result<i32> {
-    // Otherwise the VM's refusal would be retried until the deadline.
-    guest::fits(cmd)?;
+    exec_request(host, name, &json!(cmd), session, patient)
+}
+
+fn exec_request(host: &Host, name: &str, cmd: &Value, session: &Mutex<Session>, patient: bool) -> Result<i32> {
+    // Check the actual wire body before trying the VM.
+    guest::fits(&guest::command_body(cmd)?)?;
+    let detached = cmd["detach"] == true;
     let id = session.lock().unwrap().id.clone();
     let mut error = String::new();
     let mut deadline = Instant::now() + Duration::from_secs(30);
@@ -1463,6 +1497,16 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
             // Test fault `exec_lose_echo`: the connection is lost before the session id comes back (the guest has the command).
             if !started && crate::host::tripped("exec_lose_echo") {
                 return Ok(StreamEnd::Disconnected("injected fault: lost before the session id".into()));
+            }
+            if detached {
+                return match guest::read_frame(&mut r) {
+                    Ok(Some((guest::FRAME_MSG, m))) if m == id.as_bytes() => Ok(StreamEnd::Exit(0)),
+                    Ok(Some((guest::FRAME_MSG, m))) if guest::transient(&String::from_utf8_lossy(&m)) => {
+                        Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&m).into_owned()))
+                    }
+                    Ok(Some((guest::FRAME_MSG, m))) => cannot_run(&m, &mut std::io::stderr()),
+                    _ => Ok(StreamEnd::Disconnected("lost detached start acknowledgement".into())),
+                };
             }
             let result = exec_frames(&mut r, session, &mut std::io::stdout(), &mut std::io::stderr(), &mut deadline);
             if !patient && matches!(result, Ok(StreamEnd::Exit(_))) {
@@ -1568,6 +1612,19 @@ fn exec_stream<S: util::Timed>(c: S, at: Instant) -> Result<BufReader<S>> {
     Ok(r.s)
 }
 
+/// A refusal before the command started: one that could not be run (`EXIT_STATUS`) is told on
+/// `stderr` and ends with its status, as with docker exec; any other is flexvm's failure.
+fn cannot_run(m: &[u8], stderr: &mut impl Write) -> Result<StreamEnd> {
+    let m = guest::refusal(m);
+    match guest::refusal_status(&m) {
+        Some((code, why)) => {
+            writeln!(stderr, "flexvm: {}", why.strip_prefix("error: ").unwrap_or(why))?;
+            Ok(StreamEnd::Exit(code))
+        }
+        None => Err(m.into()),
+    }
+}
+
 enum StreamEnd {
     Exit(i32),
     Disconnected(String),
@@ -1615,7 +1672,13 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
             guest::FRAME_MSG if !s.started && guest::transient(&String::from_utf8_lossy(&data)) => {
                 return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned()))
             }
-            guest::FRAME_MSG if !s.started => return Err(guest::refusal(&data).into()),
+            guest::FRAME_MSG if !s.started => {
+                let end = cannot_run(&data, stderr);
+                if let Ok(StreamEnd::Exit(code)) = end {
+                    s.exit = Some(code);
+                }
+                return end;
+            }
             guest::FRAME_MSG => return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned())),
             _ => return Err(format!("unknown session frame {kind}").into()),
         }
@@ -1878,6 +1941,43 @@ mod exec_tests {
         // A `--` after IMAGE is dropped, as after exec NAME.
         assert_eq!(parse(&["run", "ubuntu", "--", "ls", "--", "-d"]).rest, ["ls", "--", "-d"]);
         assert_eq!(child_args(&parse(&["--state", "/s", "start", "x"]), &["start", "--attach", "x"]), ["--state", "/s", "start", "--attach", "x"]);
+    }
+
+    #[test]
+    fn exec_options_preserve_argv_and_repeated_env() {
+        let args = parse(&[
+            "exec",
+            "-d",
+            "-e",
+            "K=first",
+            "--env",
+            "K=last=two",
+            "-w",
+            "/srv",
+            "-u",
+            "app:staff",
+            "vm",
+            "printf",
+            "%s",
+            "",
+            "a b",
+            "$HOME",
+            ";",
+            "-d",
+        ]);
+        check_applies(&args).unwrap();
+        let cmd = exec_command(&args).unwrap();
+        assert_eq!(cmd["argv"], json!(["printf", "%s", "", "a b", "$HOME", ";", "-d"]));
+        assert_eq!(cmd["env"], json!(["K=first", "K=last=two"]));
+        assert_eq!(cmd["workdir"], "/srv");
+        assert_eq!(cmd["user"], "app:staff");
+        assert_eq!(cmd["detach"], true);
+        for words in [&["exec", "vm"][..], &["exec", "vm", ""], &["exec", "-e", "BAD", "vm", "true"], &["exec", "-e", "=bad", "vm", "true"]] {
+            assert!(exec_command(&parse(words)).is_err());
+        }
+        for flag in ["-e", "-w", "-u"] {
+            assert!(Args::parse(["exec", flag].map(String::from)).is_err());
+        }
     }
 
     #[test]
@@ -2318,6 +2418,33 @@ mod exec_tests {
     }
 
     #[test]
+    fn detached_exec_retries_busy_then_returns_on_start_without_an_exit_frame() {
+        use std::os::unix::net::UnixListener;
+        let root = crate::test_util::TempDir::new("exec-detached");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let _name = host.take_name("own", false).unwrap();
+        let listener = UnixListener::bind(host.sock("own").unwrap()).unwrap();
+        let cmd = json!({"argv": ["sleep", "100"], "detach": true});
+        let expected = cmd.clone();
+        let server = std::thread::spawn(move || {
+            for busy in [true, false] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let req = recv_json(&mut BufReader::new(&stream)).unwrap().unwrap();
+                assert_eq!(req["cmd"], expected);
+                assert_eq!(req["action"], "start");
+                util::send_json(&mut stream, &json!({"ok": true})).unwrap();
+                let msg = if busy { format!("error: busy{}", guest::TRY_AGAIN) } else { req["session"].as_str().unwrap().to_owned() };
+                guest::write_frame(&mut stream, guest::FRAME_MSG, msg.as_bytes()).unwrap();
+            }
+        });
+        let session = Mutex::new(Session::new().unwrap());
+        assert_eq!(exec_request(&host, "own", &cmd, &session, false).unwrap(), 0);
+        server.join().unwrap();
+        assert!(!session.lock().unwrap().started);
+    }
+
+    #[test]
     fn a_busy_agent_is_asked_again_and_other_refusals_are_final() {
         let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
         // As flexvm-init words it when all its body readers are taken.
@@ -2329,6 +2456,26 @@ mod exec_tests {
         assert!(!session.lock().unwrap().started);
         let input = frames(&[(guest::FRAME_MSG, b"error: too many sessions: 64 commands are running or awaiting their client")]);
         assert!(exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).is_err());
+    }
+
+    #[test]
+    fn a_command_that_cannot_run_exits_with_its_status() {
+        for code in [126, 127] {
+            let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
+            let refusal = format!("error: cannot run nope: No such file or directory (os error 2){}{code}", guest::EXIT_STATUS);
+            let input = frames(&[(guest::FRAME_MSG, refusal.as_bytes())]);
+            let mut stderr = Vec::new();
+            let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut stderr, &mut Instant::now()).unwrap();
+            assert!(matches!(end, StreamEnd::Exit(c) if c == code));
+            assert_eq!(session.lock().unwrap().exit, Some(code));
+            assert_eq!(String::from_utf8(stderr).unwrap(), "flexvm: cannot run nope: No such file or directory (os error 2)\n");
+        }
+    }
+
+    #[test]
+    fn exec_needs_an_absolute_workdir() {
+        let e = exec_command(&parse(&["exec", "-w", "srv", "vm", "true"])).unwrap_err();
+        assert!(e.to_string().contains("absolute"), "{e}");
     }
 
     #[test]

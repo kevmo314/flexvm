@@ -147,8 +147,8 @@ pass
 current=1
 addr=$(cli fvA "$host_A" run --name "$name" -d "${TEMPLATE:-small}" | run_ip)
 listed fvA "$host_A" "$addr" || fail 'ps did not report the new VM and address.'
-[[ $(cli fvA "$host_A" exec "$name" 'printf flexvm-exec-ok') == flexvm-exec-ok ]] || fail 'Guest exec output mismatch.'
-if cli fvA "$host_A" exec "$name" 'exit 7'; then
+[[ $(cli fvA "$host_A" exec "$name" sh -c 'printf flexvm-exec-ok') == flexvm-exec-ok ]] || fail 'Guest exec output mismatch.'
+if cli fvA "$host_A" exec "$name" sh -c 'exit 7'; then
     fail 'exec did not propagate a guest failure.'
 else
     code=$?
@@ -162,15 +162,15 @@ reclaimed=$(cli fvA "$host_A" run --name "$name" --ip "$addr" -d "${TEMPLATE:-sm
 pass
 
 current=2
-cli fvA "$host_A" exec "$name" 'set -e; dd if=/dev/urandom of=/tmp/fv-data bs=1M count=200 status=none; sleep 1000 </dev/null >/tmp/fv-sleep.log 2>&1 & echo $! > /tmp/fv-sleep.pid'
-checksum=$(cli fvA "$host_A" exec "$name" 'md5sum /tmp/fv-data')
-process=$(cli fvA "$host_A" exec "$name" 'p=$(cat /tmp/fv-sleep.pid); kill -0 "$p"; cat /proc/"$p"/stat')
+cli fvA "$host_A" exec "$name" sh -c 'set -e; dd if=/dev/urandom of=/tmp/fv-data bs=1M count=200 status=none; sleep 1000 </dev/null >/tmp/fv-sleep.log 2>&1 & echo $! > /tmp/fv-sleep.pid'
+checksum=$(cli fvA "$host_A" exec "$name" sh -c 'md5sum /tmp/fv-data')
+process=$(cli fvA "$host_A" exec "$name" sh -c 'p=$(cat /tmp/fv-sleep.pid); kill -0 "$p"; cat /proc/"$p"/stat')
 # PID plus /proc start time distinguish the original process from PID reuse.
 identity=$(awk '{print $1, $22}' <<< "$process")
 verify_guest() {
     local actual
-    [[ $(cli "$1" "$2" exec "$name" 'md5sum /tmp/fv-data') == "$checksum" ]] || fail 'Guest RAM file checksum changed.'
-    actual=$(cli "$1" "$2" exec "$name" 'set -e; p=$(cat /tmp/fv-sleep.pid); kill -0 "$p"; test "$(cat /proc/"$p"/comm)" = sleep; cat /proc/"$p"/stat')
+    [[ $(cli "$1" "$2" exec "$name" sh -c 'md5sum /tmp/fv-data') == "$checksum" ]] || fail 'Guest RAM file checksum changed.'
+    actual=$(cli "$1" "$2" exec "$name" sh -c 'set -e; p=$(cat /tmp/fv-sleep.pid); kill -0 "$p"; test "$(cat /proc/"$p"/comm)" = sleep; cat /proc/"$p"/stat')
     [[ $(awk '{print $1, $22}' <<< "$actual") == "$identity" ]] || fail 'Background process identity changed.'
     [[ $(awk '{print $3}' <<< "$actual") != Z ]] || fail 'Background process became a zombie.'
 }
@@ -208,11 +208,11 @@ with socket.socket() as listener:
                 break
             conn.sendall(data)
 PY
-cli fvA "$host_A" exec "$name" "cat > /tmp/fv-server.py <<'PY'
+cli fvA "$host_A" exec "$name" sh -c "cat > /tmp/fv-server.py <<'PY'
 $(cat "$work/server.py")
 PY
 python3 /tmp/fv-server.py </dev/null >/tmp/fv-server.log 2>&1 &"
-wait_for cli fvA "$host_A" exec "$name" 'test -f /tmp/fv-server-ready'
+wait_for cli fvA "$host_A" exec "$name" sh -c 'test -f /tmp/fv-server-ready'
 cat > "$work/client.py" <<'PY'
 import pathlib
 import socket

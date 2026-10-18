@@ -1,4 +1,4 @@
-//! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ATTACH <id> <offset>`,
+//! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ARGV <id> <len>` (JSON argv and options), `ATTACH <id> <offset>`,
 //! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
 //! After an exit, the client may send SESSION_DONE on the attachment, within `ACK_WAIT`, to release the
 //! session; without that acknowledgement the exit stays available for reattachment.
@@ -200,7 +200,7 @@ impl Table {
             .filter_map(|(id, entry)| {
                 let o = entry.output.0.lock().unwrap();
                 let after = if o.exit.is_some() { ABANDONED } else { running_after };
-                (o.attached.is_none() && o.gone.is_some_and(|t| now.saturating_sub(t) >= after)).then(|| id.clone())
+                ((!o.detached || o.exit.is_some()) && o.attached.is_none() && o.gone.is_some_and(|t| now.saturating_sub(t) >= after)).then(|| id.clone())
             })
             .collect();
         for id in abandoned {
@@ -248,6 +248,10 @@ impl Table {
                 None => return output.0.lock().unwrap().delivered = None,
             }
         }
+        self.trim_unacknowledged();
+    }
+
+    fn trim_unacknowledged(&mut self) {
         let unacknowledged = self.unacknowledged();
         for (_, id) in &unacknowledged[..unacknowledged.len().saturating_sub(MAX_UNACKNOWLEDGED)] {
             self.close(id, None);
@@ -255,6 +259,8 @@ impl Table {
     }
 
     fn admit(&mut self, statuses: &Statuses) -> io::Result<()> {
+        // Detached exits also retain their start acknowledgement for a retry, within the same bound.
+        self.trim_unacknowledged();
         if self.running() >= MAX_LIVE {
             self.reclaim(statuses);
             if self.running() >= MAX_LIVE {
@@ -350,6 +356,7 @@ pub(crate) struct Output {
     /// The current attachment was sent the exit, unacknowledged (in `DELIVERIES`' order).
     delivered: Option<u64>,
     reservation: Reservation,
+    detached: bool,
 }
 
 impl Output {
@@ -408,7 +415,7 @@ impl Output {
 }
 
 pub enum Request<'a> {
-    Start { id: &'a str, len: usize },
+    Start { id: &'a str, len: usize, argv: bool },
     Attach { id: &'a str, offset: u64 },
     Close { id: &'a str },
 }
@@ -420,8 +427,8 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
         return Err(io::Error::other("bad session id"));
     }
     match parts.as_slice() {
-        ["SESSION", _, len] => match len.parse::<usize>() {
-            Ok(len) if len <= MAX_BODY => Ok(Request::Start { id, len }),
+        [verb @ ("SESSION" | "ARGV"), _, len] => match len.parse::<usize>() {
+            Ok(len) if len <= MAX_BODY => Ok(Request::Start { id, len, argv: *verb == "ARGV" }),
             _ => Err(io::Error::other("bad command length")),
         },
         ["ATTACH", _, offset] => Ok(Request::Attach { id, offset: offset.parse().map_err(|_| io::Error::other("bad offset"))? }),
@@ -450,6 +457,9 @@ pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
 pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, sessions: &Sessions, statuses: &Statuses) -> io::Result<()> {
     match open(body, conn, line, sessions, statuses) {
         Ok(Some((id, offset, (output, me)))) => {
+            if output.0.lock().unwrap().detached {
+                return msg(&mut w, id);
+            }
             let result = msg(&mut w, id).and_then(|_| drain(&mut w, &output, offset, me));
             if matches!(result, Ok(true)) {
                 sessions.lock().unwrap().delivered(&output, me);
@@ -478,6 +488,11 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
 }
 
 type Attached = (Session, u64);
+
+/// The refusal of a command that cannot be run, carrying the status its client exits with.
+pub(crate) fn cannot_run(code: i32, e: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("{e}{}{code}", crate::proto::EXIT_STATUS))
+}
 
 /// The fd the shell sources the command from; dash takes only single-digit fds in redirections.
 const SCRIPT_FD: i32 = 9;
@@ -518,7 +533,7 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
     let gone = || io::Error::other("session closed");
     let unknown = || io::Error::other("unknown session");
     Ok(Some(match parse(line)? {
-        Request::Start { id, len } => {
+        Request::Start { id, len, argv } => {
             let command = body.get(..len).ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
             let fingerprint = fingerprint(command);
             // Lookup and spawn under one lock: a retried creation cannot spawn twice.
@@ -534,7 +549,13 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             }
             table.admit(statuses)?;
             let command = std::str::from_utf8(command).map_err(io::Error::other)?;
-            let output = session(table.new_output());
+            let spec = argv.then(|| crate::proto::Exec::decode(command).map_err(io::Error::other)).transpose()?;
+            let (mut cmd, exec) = match &spec {
+                Some(spec) => crate::app::exec_command(spec).map(|(cmd, c)| (cmd, Some(c)))?,
+                None => (shell_command(command)?, None),
+            };
+            let detached = spec.as_ref().is_some_and(|s| s.detach);
+            let output = session(Output { detached, gone: detached.then(awake), ..table.new_output() });
             // Start the pump first: if no thread can be had, nothing has run yet.
             let (tx, rx) = mpsc::sync_channel::<(Child, Option<OwnedFd>, u64)>(1);
             let (pumped, statuses_) = (output.clone(), statuses.clone());
@@ -545,20 +566,38 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                         // Closed, they would kill a background process's next write with SIGPIPE.
                         crate::discard(rest);
                         // By token: the pid may be another child's by now, however long the client took.
-                        pumped.0.lock().unwrap().exit = wait_exit(&statuses_, token, None);
+                        let exit = wait_exit(&statuses_, token, None);
+                        let mut ring = pumped.0.lock().unwrap();
+                        ring.exit = exit;
+                        if ring.detached {
+                            ring.delivered = Some(DELIVERIES.fetch_add(1, Ordering::Relaxed));
+                            ring.gone = Some(awake());
+                        }
+                        drop(ring);
                         pumped.1.notify_all();
                     }
                 })
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
-            let mut cmd = shell_command(command)?;
             cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
             if let Some(work) = crate::mem::work_procs() {
                 crate::mem::enter(&mut cmd, work, false);
             }
-            // Minimal images (distroless, scratch) have no shell.
+            // After entering the cgroup, which needs root.
+            if let Some(c) = &exec {
+                crate::app::exec_credentials(&mut cmd, c);
+            }
+            // argv commands also work in images without a shell.
             let (child, exited, token) = spawn_watched(&mut cmd, statuses, true).map_err(|e| {
-                let hint = if e.kind() == io::ErrorKind::NotFound { " (does the image have a shell?)" } else { "" };
-                io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}{hint}"))
+                let program = cmd.get_program().to_string_lossy().into_owned();
+                match (&spec, e.kind()) {
+                    // The directory was checked: not found is the program (or its interpreter).
+                    (Some(_), io::ErrorKind::NotFound) => cannot_run(127, format!("cannot run {program}: {e}")),
+                    (Some(_), _) => cannot_run(126, format!("cannot run {program}: {e}")),
+                    (None, kind) => {
+                        let hint = if kind == io::ErrorKind::NotFound { " (does the image have a shell?)" } else { "" };
+                        io::Error::new(kind, format!("cannot run /bin/sh: {e}{hint}"))
+                    }
+                }
             })?;
             table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
             // Attached before any output, so none is overwritten before it is sent.
@@ -589,6 +628,9 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
 /// Makes `conn` the only attachment, streaming from `offset`; shuts down the one it replaces.
 fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
     let mut ring = output.0.lock().unwrap();
+    if ring.detached {
+        return (output.clone(), 0);
+    }
     ring.attachments += 1;
     let id = ring.attachments;
     let previous = ring.attached.replace(Attachment { id, conn });
@@ -607,7 +649,7 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
 /// Returns how long it waited for the client.
 fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
     let mut ring = output.0.lock().unwrap();
-    if ring.closed {
+    if ring.closed || ring.detached {
         return Duration::ZERO;
     }
     let need = (ring.end - ring.start) as usize + data.len();
@@ -770,6 +812,47 @@ mod tests {
         output.0.lock().unwrap().attached = None;
         output.1.notify_all();
         t.join().unwrap();
+    }
+
+    #[test]
+    fn argv_requests_are_parsed() {
+        assert!(matches!(parse("ARGV abc 10").unwrap(), Request::Start { argv: true, len: 10, .. }));
+        assert!(parse("ARGV abc 1048577").is_err());
+    }
+
+    #[test]
+    fn detached_start_retries_acknowledge_without_attaching_or_respawning() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let body = br#"{"argv":["sleep","100"],"detach":true}"#;
+        let output = live(&mut sessions.lock().unwrap(), "detached", Output { detached: true, ..Default::default() });
+        sessions.lock().unwrap().live.get_mut("detached").unwrap().command = fingerprint(body);
+        let line = format!("ARGV detached {}", body.len());
+        for _ in 0..2 {
+            let reply = request(&sessions, &statuses, &line, body);
+            assert_eq!(reply, frame(FRAME_MSG, &[b"detached"]));
+            assert!(output.0.lock().unwrap().attached.is_none());
+        }
+        output.0.lock().unwrap().exit = Some(0);
+        assert_eq!(request(&sessions, &statuses, &line, body), frame(FRAME_MSG, &[b"detached"]));
+        assert_eq!(sessions.lock().unwrap().live.len(), 1);
+    }
+
+    #[test]
+    fn detached_output_never_blocks_and_running_jobs_are_not_abandoned() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let output = live(&mut sessions.lock().unwrap(), "detached", Output::default());
+        {
+            let mut ring = output.0.lock().unwrap();
+            ring.detached = true;
+            ring.gone = Some(Duration::ZERO);
+        }
+        assert_eq!(deliver(&output, FRAME_STDOUT, &vec![0; CAPACITY]), Duration::ZERO);
+        assert_eq!(output.0.lock().unwrap().end, 0);
+        sessions.lock().unwrap().reclaim_after(&statuses, Duration::from_secs(1), Duration::from_secs(1000));
+        assert!(sessions.lock().unwrap().live.contains_key("detached"));
+        output.0.lock().unwrap().exit = Some(0);
+        sessions.lock().unwrap().reclaim_after(&statuses, Duration::from_secs(1), Duration::from_secs(1000));
+        assert!(!sessions.lock().unwrap().live.contains_key("detached"));
     }
 
     #[test]
@@ -1504,7 +1587,7 @@ mod tests {
 
     #[test]
     fn requests() {
-        assert!(matches!(parse("SESSION abc 3\n").unwrap(), Request::Start { id: "abc", len: 3 }));
+        assert!(matches!(parse("SESSION abc 3\n").unwrap(), Request::Start { id: "abc", len: 3, argv: false }));
         assert!(matches!(parse("ATTACH abc 42").unwrap(), Request::Attach { offset: 42, .. }));
         assert!(matches!(parse("CLOSE abc").unwrap(), Request::Close { .. }));
         for bad in ["SESSION 3", "SESSION abc -1", "SESSION abc 1048577", "ATTACH abc -1", "ATTACH abc 1 extra", "CLOSE", "CLOSE a/b", "EXEC 3"] {

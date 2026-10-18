@@ -6,6 +6,8 @@ mod reference;
 mod registry;
 mod source;
 mod unpack;
+#[path = "../../../guest/src/user.rs"]
+mod user;
 
 use std::fs::File;
 use std::io::Write;
@@ -704,38 +706,9 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
 
 /// Resolves an image `User` against the image's own /etc/passwd and /etc/group.
 fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)> {
-    let rows = |p| -> Vec<Vec<String>> {
-        let text = String::from_utf8_lossy(&root.read(p).unwrap_or_default()).into_owned();
-        text.lines().filter(|l| !l.starts_with('#')).map(|l| l.split(':').map(String::from).collect::<Vec<_>>()).filter(|f| f.len() >= 3).collect()
-    };
-    let (passwd, group) = (rows("etc/passwd"), rows("etc/group"));
-    // As in Docker, `user:` names no group.
-    let (u, g) = user.split_once(':').map_or((user, None), |(u, g)| (u, Some(g).filter(|g| !g.is_empty())));
-    let u = if u.is_empty() { "0" } else { u };
-    let entry = passwd.iter().find(|f| f[0] == u || (u.parse::<u32>().is_ok() && f[2] == u));
-    let uid: u32 = match (u.parse(), entry) {
-        (Ok(n), _) => n,
-        (Err(_), Some(f)) => f[2].parse().map_err(|_| format!("bad uid for {u} in /etc/passwd"))?,
-        (Err(_), None) => bail!("user {u:?} is not in the image's /etc/passwd"),
-    };
-    let home = entry.and_then(|f| f.get(5)).filter(|h| !h.is_empty()).cloned().unwrap_or("/".into());
-    let gid: u32 = match g {
-        Some(g) => match g.parse() {
-            Ok(n) => n,
-            Err(_) => group.iter().find(|f| f[0] == g).and_then(|f| f[2].parse().ok()).ok_or(format!("group {g:?} is not in the image's /etc/group"))?,
-        },
-        None => entry.and_then(|f| f.get(3)?.parse().ok()).unwrap_or(0),
-    };
-    let mut groups = vec![gid];
-    if g.is_none() {
-        let member = |f: &&Vec<String>| entry.is_some_and(|e| f.get(3).is_some_and(|m| m.split(',').any(|m| *m == e[0])));
-        for n in group.iter().filter(member).filter_map(|f| f[2].parse().ok()) {
-            if !groups.contains(&n) {
-                groups.push(n);
-            }
-        }
-    }
-    Ok((uid, gid, home, groups))
+    let passwd = root.read("etc/passwd").unwrap_or_default();
+    let group = root.read("etc/group").unwrap_or_default();
+    Ok(self::user::resolve_user(user, &String::from_utf8_lossy(&passwd), &String::from_utf8_lossy(&group))?)
 }
 
 /// ext4 needs blocks for directory entries and symlinks too long for their inode (60 bytes).

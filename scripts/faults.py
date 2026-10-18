@@ -254,7 +254,7 @@ def restore(host, path, name=None, ip=None, paused=False):
 
 
 def sh(host, name, cmd):
-    code, out, err = cli(host, "exec", name, cmd)
+    code, out, err = cli(host, "exec", name, "sh", "-c", cmd)
     return code, (out + err).strip()
 
 
@@ -860,7 +860,7 @@ def quiet_source():
         flood_udp(ip, stop)
 
     threading.Thread(target=flood, daemon=True).start()
-    session = spawn_cli(A, "exec", n, "while :; do echo tick; sleep 0.05; done", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    session = spawn_cli(A, "exec", n, "sh", "-c", "while :; do echo tick; sleep 0.05; done", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     sysfs = f"/sys/class/net/{tap}"
     tx = lambda: int(open(f"{sysfs}/statistics/tx_packets").read())
     # While paused, try to point the address back at the source's tap (as a
@@ -1072,12 +1072,12 @@ def exec_burst():
     wait for one and run. A command over the guest's 1 MiB limit fails at once."""
     n = "ft-exec-burst"
     ok(run(A, n))
-    # Each argument under the kernel's 128 KiB per-argument limit (the guest's sh -c gets the command as one).
+    # Padding travels as argv, each word under the kernel's 128 KiB per-argument limit.
     pad = lambda k: [f": {'x' * 100000};" for _ in range(k)]
     results = [None] * 32
 
     def one(i):
-        results[i] = cli(A, "exec", n, "--", f": {'x' * 120000};", f"echo {i}")
+        results[i] = cli(A, "exec", n, "--", "sh", "-c", f"echo {i}", "sh", "x" * 120000)
 
     threads = [threading.Thread(target=one, args=(i,)) for i in range(len(results))]
     for t in threads:
@@ -1110,7 +1110,7 @@ def exec_burst():
     bad = [(i, r[0], r[1][-80:], r[2][-200:]) if r else (i, None) for i, r in enumerate(results) if not r or r[:2] != (0, str(i))]
     check("exec burst: execs while every body reader is taken wait for one and run", not bad, bad[:3])
     t = time.time()
-    code, out, err = cli(A, "exec", n, "--", *pad(11), "echo ran")
+    code, out, err = cli(A, "exec", n, "--", "sh", "-c", "echo ran", "sh", *pad(11))
     took = time.time() - t
     check("exec burst: a command over 1 MiB fails at once", code != 0 and "at most" in err and "ran" not in out and took < 5, (code, err[-200:], took))
     check("exec burst: execs still run after it", sh(A, n, "echo hi") == (0, "hi"))
@@ -1135,7 +1135,7 @@ def exec_background():
         s = socket.socket(socket.AF_UNIX)
         s.settimeout(30)
         s.connect(sock)
-        s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": cmd}) + "\n").encode())
+        s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": {"argv": ["sh", "-c", cmd]}}) + "\n").encode())
         return s
 
     # #505. A client that stops reading is dropped after 60 s without progress, freeing its relay and
@@ -1169,7 +1169,7 @@ def exec_background():
     check("exec bg: execs still start after them", sh(A, n, "echo hi") == (0, "hi"))
     interrupted = []
     for _ in range(70):
-        p = spawn_cli(A, "exec", n, "echo ready; sleep 1001; echo after", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p = spawn_cli(A, "exec", n, "sh", "-c", "echo ready; sleep 1001; echo after", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         line = p.stdout.readline().strip()
         p.send_signal(signal.SIGINT)
         _, err = communicate_process(p, 15)
@@ -1184,7 +1184,7 @@ def exec_background():
     # close the session, or `yes` runs on holding a slot and 64 of these use them all up.
     piped = []
     for _ in range(70):
-        p = spawn_cli(A, "exec", n, "yes", stdout=subprocess.PIPE)
+        p = spawn_cli(A, "exec", n, "sh", "-c", "yes", stdout=subprocess.PIPE)
         head = subprocess.Popen(["head", "-n1"], stdin=p.stdout, stdout=subprocess.PIPE, text=True)
         p.stdout.close()
         out = head.communicate(timeout=30)[0].strip()
@@ -1226,7 +1226,7 @@ def exec_background():
     drained = []
 
     def slow_reader(size, wait):
-        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" "head -c {size} /dev/zero" | (sleep {wait}; cat) | wc -c'
+        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" sh -c "head -c {size} /dev/zero" | (sleep {wait}; cat) | wc -c'
         r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n], capture_output=True, text=True, timeout=180, env=ENV)
         drained.append((size, (r.returncode, r.stdout.strip(), r.stderr.strip()[-200:])))
 
@@ -1285,7 +1285,7 @@ def exec_background():
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(30)
         s.connect(os.path.join(A.run, "vms", f"{n}.sock"))
-        s.sendall((json.dumps({"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": "echo ready; sleep 1002"}) + "\n").encode())
+        s.sendall((json.dumps({"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": {"argv": ["sh", "-c", "echo ready; sleep 1002"]}}) + "\n").encode())
         buf = receive_until(s, lambda buf: b"ready" not in buf)
     check("exec bg: a resumable exec started", b"ready" in buf, buf[-200:])
     stopped = wait_for(lambda: count("sleep 1002") == (0, "0"), 90)
@@ -1298,7 +1298,7 @@ def exec_background():
     # As `timeout -s KILL 2 flexvm exec ...`, whose own exit status differs between coreutils versions.
     def killer():
         for _ in range(7):
-            p = spawn_cli(A, "exec", n, "sleep infinity", stderr=subprocess.PIPE, text=True)
+            p = spawn_cli(A, "exec", n, "sh", "-c", "sleep infinity", stderr=subprocess.PIPE, text=True)
             try:
                 p.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -1331,7 +1331,7 @@ def exec_background():
             buf = receive_until(s, lambda buf: until not in buf)
             return buf
 
-    started = session({"action": "start", "cmd": "echo ready; sleep 8; echo done"}, b"ready")
+    started = session({"action": "start", "cmd": {"argv": ["sh", "-c", "echo ready; sleep 8; echo done"]}}, b"ready")
     check("exec bg: a session started, then its client left", b"ready" in started, started[-200:])
     # Heartbeats find the client gone within about 2 s.
     time.sleep(4)
@@ -1389,7 +1389,7 @@ def exec_pause_grace():
                 gaps.append(("lost", struct.unpack("<Q", p)[0]))
         return at, b"".join(data), code, gaps
 
-    first = attach({"action": "start", "cmd": f"echo ready; sleep 5; seq 1 {lines}"}, until_ready=True)
+    first = attach({"action": "start", "cmd": {"argv": ["sh", "-c", f"echo ready; sleep 5; seq 1 {lines}"]}}, until_ready=True)
     offset, head, _, _ = output(first)
     check("exec grace: a session started, then its client left", head == b"ready\n" and offset == 6, first[-3:])
     # The guest finds the client gone within about 2 s; then seq fills half the ring and waits.
@@ -1432,7 +1432,7 @@ def guest_hang():
     def one_raw():
         t = time.time()
         try:
-            r = control(A, n, {"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": "echo hi"})
+            r = control(A, n, {"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": {"argv": ["sh", "-c", "echo hi"]}})
             raw.append((round(time.time() - t, 1), r["ok"]))
         except OSError as e:
             raw.append((None, str(e)))
@@ -1929,7 +1929,7 @@ def commit_fail_routed():
         assert wait_for(lambda: up("a") and up("b"), 10), "listeners did not come up"
         r = nsjson("a", "run", "--name", n, "-d", args.template)
         ip = r["ip"]
-        code, out, err = nscli("a", "exec", n, "dd if=/dev/urandom of=/tmp/f bs=1M count=20 iflag=fullblock 2>/dev/null && md5sum /tmp/f")
+        code, out, err = nscli("a", "exec", n, "sh", "-c", "dd if=/dev/urandom of=/tmp/f bs=1M count=20 iflag=fullblock 2>/dev/null && md5sum /tmp/f")
         assert code == 0, err or out
         m = out.split()[0]
         v = ls("a")[n]
@@ -1950,7 +1950,7 @@ def commit_fail_routed():
         check("commit fail routed: held by the source's generation, the target holds nothing",
               a.get("holder") == n and a.get("held") == gen and not a.get("leaving") and not a.get("lent") and not b.get("holder"), (a, b))
         check("commit fail routed: running on the source only", ls("a")[n]["state"] == "running" and n not in ls("b"), (ls("a").get(n), ls("b").get(n)))
-        code, out, err = nscli("a", "exec", n, "md5sum /tmp/f")
+        code, out, err = nscli("a", "exec", n, "sh", "-c", "md5sum /tmp/f")
         check("commit fail routed: md5 intact", code == 0 and out.split()[0] == m, out or err)
         check("commit fail routed: the source routes it to its tap still", " dev " in route("a", ip) and "via" not in route("a", ip), route("a", ip))
         # Unfaulted, the same commit routes the address to the target's tap.
@@ -1959,7 +1959,7 @@ def commit_fail_routed():
         check("commit fail routed: a later migration goes", code == 0 and wait_for(moved, 30), (code, err))
         check("commit fail routed: and routes it to the target's tap", wait_for(lambda: "via" not in route("b", ip) and " dev " in route("b", ip), 10), route("b", ip))
         seen.add((ls("b")[n]["pid"], ls("b")[n]["start"]))
-        code, out, err = nscli("b", "exec", n, "md5sum /tmp/f")
+        code, out, err = nscli("b", "exec", n, "sh", "-c", "md5sum /tmp/f")
         check("commit fail routed: md5 intact on the target", code == 0 and out.split()[0] == m, out or err)
         code, out, err = nscli("b", "kill", n)
         assert code == 0, err or out
@@ -3646,7 +3646,7 @@ def pause_resume():
     m = setup(n)
     sh(A, n, "date -s @$(date +%s)")  # fresh VMs keep the template's clock; start from a right one
     check("pause: SIGTSTP pauses (the process keeps running)", pause(A, n) and alive(vm_pid(A, n)), vms(A)[n])
-    r = control(A, n, {"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": "echo hi"})
+    r = control(A, n, {"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": {"argv": ["sh", "-c", "echo hi"]}})
     check("pause: exec refused while paused", not r["ok"] and "is paused" in r["error"], r)
     time.sleep(0.2)
     controller_quiet = vms(A)[n]["state"] == "paused"
@@ -5320,7 +5320,7 @@ def fetch_enomem_stuck():
     t0 = time.time()
     # Its own process, reaped here: once started, an exec waits 30 s for a VM
     # that went away, longer than the hosts' teardown waits for leftovers.
-    reader = spawn_cli(B, "exec", n, "md5sum /tmp/f")
+    reader = spawn_cli(B, "exec", n, "sh", "-c", "md5sum /tmp/f")
     try:
         st = {}
 
@@ -8622,7 +8622,7 @@ def exec_recovery_instance():
         clear_gate(A, "exec_retry")
         with armed_fault(A, "exec_lose_echo", 60000):
             fault(A, "exec_retry", 60000)
-            p = spawn_cli(A, "exec", n, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            p = spawn_cli(A, "exec", n, "sh", "-c", cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             held = wait_for(lambda: p.pid in reached(A, "exec_retry"), 30)
         check("exec instance: the connection was lost before the session id", p.pid in reached(A, "exec_lose_echo"), reached(A, "exec_lose_echo"))
         check("exec instance: its retry is held", held, reached(A, "exec_retry"))
@@ -8830,7 +8830,7 @@ def warm_ready():
                              "--warm", "--ready-cmd", ready, "--ready-timeout", "10", timeout=600)
         check("warm ready: template passes the credential check", code == 0, err or out)
     ok(run(A, n, template=tpl))
-    code, out, err = cli(A, "exec", n, "test -f /tmp/app-ready")
+    code, out, err = cli(A, "exec", n, "sh", "-c", "test -f /tmp/app-ready")
     check("warm ready: restored app passed its credential check", code == 0, err or out)
 
 
@@ -9420,7 +9420,7 @@ def ckpt_ancestor_corrupt():
     if r["ok"]:
         # Read all of the guest's memory there is: /tmp/f, and whatever else the page cache holds.
         try:
-            exec_code = subprocess.run([BIN, "--state", B.state, "--run", B.run, "exec", n, "md5sum /tmp/f; cat /proc/meminfo >/dev/null"],
+            exec_code = subprocess.run([BIN, "--state", B.state, "--run", B.run, "exec", n, "sh", "-c", "md5sum /tmp/f; cat /proc/meminfo >/dev/null"],
                                        capture_output=True, timeout=60, env=ENV).returncode
         except subprocess.TimeoutExpired:
             exec_code = "hung"

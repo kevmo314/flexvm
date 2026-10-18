@@ -113,6 +113,25 @@ pub fn untimed(r: &BufReader<UnixStream>) -> Result<()> {
     Ok(r.get_ref().set_write_timeout(None)?)
 }
 
+/// A session's body: a string is a shell command (a VM's main command), an object `exec`'s argv
+/// and options (`Exec`'s fields).
+pub fn command_body(cmd: &serde_json::Value) -> Result<String> {
+    if let Some(s) = cmd.as_str() {
+        return Ok(s.to_owned());
+    }
+    let strings = |k: &str| -> Result<Vec<String>> {
+        cmd[k].as_array().map_or(Ok(vec![]), |a| a.iter().map(|v| v.as_str().map(String::from).ok_or_else(|| format!("bad exec {k}").into())).collect())
+    };
+    let e = Exec {
+        argv: strings("argv")?,
+        env: strings("env")?,
+        workdir: cmd["workdir"].as_str().map(String::from),
+        user: cmd["user"].as_str().map(String::from),
+        detach: cmd["detach"] == true,
+    };
+    Ok(e.encode()?)
+}
+
 pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
     session_on(action, id, offset, cmd, |line| request_on(s, line, timeout))
 }
@@ -135,16 +154,17 @@ fn session_on<S: Read + Write>(action: &str, id: &str, offset: u64, cmd: &str, o
         bail!("bad session id");
     }
     let line = match action {
-        "start" => {
+        "start" | "argv" => {
             fits(cmd)?;
-            format!("SESSION {id} {}", cmd.len())
+            let verb = if action == "argv" { "ARGV" } else { "SESSION" };
+            format!("{verb} {id} {}", cmd.len())
         }
         "attach" => format!("ATTACH {id} {offset}"),
         "close" => format!("CLOSE {id}"),
         _ => bail!("bad session action"),
     };
     let mut r = open(&line)?;
-    if action == "start" {
+    if matches!(action, "start" | "argv") {
         r.get_mut().write_all(cmd.as_bytes())?;
     }
     Ok(r)
@@ -419,6 +439,35 @@ mod tests {
         assert!(app_started("ok 42", true).unwrap_err().to_string().contains("pull its image again"), "an older agent ignores them");
         assert!(app_started("error: no app", false).unwrap_err().to_string().contains("no app"));
         assert!(app_started("ok x", false).is_err());
+    }
+
+    #[test]
+    fn argv_wire_preserves_words_and_checks_serialized_size() {
+        let cmd = serde_json::json!({"argv": ["printf", "%s", "a b", "", "$HOME"], "env": ["K=v"], "detach": true});
+        let body = command_body(&cmd).unwrap();
+        let stream = std::io::Cursor::new(Vec::new());
+        let sent = session_on("argv", "id", 0, &body, |line| {
+            assert_eq!(line, format!("ARGV id {}", body.len()));
+            Ok(BufReader::new(stream))
+        })
+        .unwrap()
+        .into_inner()
+        .into_inner();
+        let e = Exec::decode(std::str::from_utf8(&sent).unwrap()).unwrap();
+        assert_eq!(
+            e,
+            Exec { argv: ["printf", "%s", "a b", "", "$HOME"].map(String::from).into(), env: vec!["K=v".into()], detach: true, ..Default::default() }
+        );
+        let e = Exec { argv: vec!["x".into()], workdir: Some("/w".into()), user: Some("1:2".into()), ..Default::default() };
+        assert_eq!(Exec::decode(&e.encode().unwrap()).unwrap(), e);
+        assert!(Exec { argv: vec!["a\0b".into()], ..Default::default() }.encode().is_err());
+        for bad in ["", "a", "\0", "x\0", "dx\0"] {
+            assert!(Exec::decode(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(refusal_status(&format!("error: cannot run x{EXIT_STATUS}127")), Some((127, "error: cannot run x")));
+        assert_eq!(refusal_status("error: busy"), None);
+        let too_large = command_body(&serde_json::json!({"argv": ["x".repeat(MAX_BODY)]})).unwrap();
+        assert!(session_on("argv", "id", 0, &too_large, |_| -> Result<BufReader<std::io::Cursor<Vec<u8>>>> { panic!("must not connect") }).is_err());
     }
 
     #[test]

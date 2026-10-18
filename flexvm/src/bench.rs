@@ -181,7 +181,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
         if dirty_mib > 0 {
             // /tmp is a tmpfs, so this lands in guest memory.
             let cmd = format!("dd if=/dev/urandom of=/tmp/dirty bs=1M count={dirty_mib} 2>/dev/null");
-            if crate::exec(&h.a, name, &cmd)? != 0 {
+            if crate::exec(&h.a, name, &json!({"argv": ["sh", "-c", cmd]}))? != 0 {
                 bail!("dirtying guest memory failed");
             }
         }
@@ -189,7 +189,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
         // (pages still being pulled): the difference is the post-copy stall.
         let read = |host: &Host| -> Result<Option<f64>> {
             let t = Instant::now();
-            if dirty_mib > 0 && crate::exec(host, name, "cat /tmp/dirty > /dev/null")? != 0 {
+            if dirty_mib > 0 && crate::exec(host, name, &json!({"argv": ["sh", "-c", "cat /tmp/dirty > /dev/null"]}))? != 0 {
                 bail!("reading guest memory back failed");
             }
             Ok((dirty_mib > 0).then(|| ms(t.elapsed())))
@@ -258,7 +258,7 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &std::path::Path, date
 fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) -> Result<Value> {
     h.cli(&h.a, &["run", "--name", name, "-d", template])?;
     let mut owned = OwnedVm { h, name, hosts: vec![&h.a] };
-    if mib > 0 && crate::exec(&h.a, name, &format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null"))? != 0 {
+    if mib > 0 && crate::exec(&h.a, name, &json!({"argv": ["sh", "-c", format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null")]}))? != 0 {
         bail!("dirtying guest memory failed");
     }
     let (mut p, mut r) = (Vec::new(), Vec::new());
