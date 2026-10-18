@@ -2,8 +2,8 @@
 //! even SIGKILL releases them, so gc has no kernel rules or port files to sweep.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -26,7 +26,8 @@ pub enum Protocol {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Port {
-    pub ip: Ipv4Addr,
+    /// None binds both 0.0.0.0 and [::], as Docker does.
+    pub ip: Option<IpAddr>,
     pub host_port: u16,
     pub vm_port: u16,
     pub protocol: Protocol,
@@ -41,28 +42,30 @@ impl std::str::FromStr for Port {
             Some((s, "udp")) => (s, Protocol::Udp),
             _ => crate::bail!("bad port {s:?}: expected [IP:]HOST_PORT:VM_PORT[/tcp|/udp]"),
         };
-        let parts: Vec<_> = addr.split(':').collect();
-        let (ip, host, vm) = match parts.as_slice() {
-            [host, vm] => (Ipv4Addr::UNSPECIFIED, *host, *vm),
-            [ip, host, vm] => (ip.parse::<Ipv4Addr>().map_err(|_| format!("bad port address {ip:?}"))?, *host, *vm),
-            _ => crate::bail!("bad port {s:?}: expected [IP:]HOST_PORT:VM_PORT[/tcp|/udp]"),
-        };
         let port = |v: &str| -> Result<u16> {
             v.parse::<u16>().ok().filter(|&p| p > 0 && v.bytes().all(|b| b.is_ascii_digit())).ok_or_else(|| format!("bad port number {v:?}").into())
         };
-        Ok(Self { ip, host_port: port(host)?, vm_port: port(vm)?, protocol })
+        let Some((bind, vm)) = addr.rsplit_once(':') else { crate::bail!("bad port {s:?}: expected [IP:]HOST_PORT:VM_PORT[/tcp|/udp]") };
+        let (ip, host_port) = match bind.rsplit_once(':') {
+            None => (None, port(bind)?),
+            // IP:PORT or [IPv6]:PORT, without a scope the record could not keep.
+            Some((_, host)) => match bind.parse::<SocketAddr>() {
+                Ok(a) if !matches!(a, SocketAddr::V6(v) if v.scope_id() != 0) => (Some(a.ip()), port(host)?),
+                _ => crate::bail!("bad port address in {s:?}: expected IPv4 or [IPv6]"),
+            },
+        };
+        Ok(Self { ip, host_port, vm_port: port(vm)?, protocol })
     }
 }
 
 impl std::fmt::Display for Port {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}:{}/{}", self.ip, self.host_port, self.vm_port, if self.protocol == Protocol::Tcp { "tcp" } else { "udp" })
+        let protocol = if self.protocol == Protocol::Tcp { "tcp" } else { "udp" };
+        match self.ip {
+            Some(ip) => write!(f, "{}:{}/{protocol}", SocketAddr::new(ip, self.host_port), self.vm_port),
+            None => write!(f, "{}:{}/{protocol}", self.host_port, self.vm_port),
+        }
     }
-}
-
-enum Bound {
-    Tcp(TcpListener),
-    Udp(UdpSocket),
 }
 
 /// The actual listeners, without SO_REUSEPORT, held for the VM's lifetime. Binding
@@ -70,42 +73,42 @@ enum Bound {
 /// ordinary bound ports; a failed batch releases everything it acquired.
 pub struct Forwarder {
     stop: Arc<AtomicBool>,
-    bound: Vec<(Bound, u16)>,
+    /// A worker's: one -p's sockets, of each address it binds.
+    bound: Vec<(Vec<OwnedFd>, Protocol, u16)>,
     workers: Vec<JoinHandle<()>>,
+    /// What is bound, an entry per address: for `ps` and `run`'s reply.
+    pub ports: Vec<Port>,
 }
 
 impl Forwarder {
     /// Before the VM's address is claimed: a clash refuses the start with nothing to give back.
     pub fn bind(ports: &[Port]) -> Result<Self> {
-        let bound = ports
-            .iter()
-            .map(|p| -> Result<_> {
-                let addr = SocketAddrV4::new(p.ip, p.host_port);
-                let socket = match p.protocol {
-                    Protocol::Tcp => {
-                        let s = TcpListener::bind(addr).map_err(|e| format!("forward {p}: bind: {e}"))?;
-                        s.set_nonblocking(true)?;
-                        Bound::Tcp(s)
+        let (mut bound, mut bound_ports) = (Vec::new(), Vec::new());
+        for p in ports {
+            let mut fds = Vec::new();
+            for ip in p.ip.map_or_else(|| vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()], |ip| vec![ip]) {
+                let at = Port { ip: Some(ip), ..p.clone() };
+                match listen(SocketAddr::new(ip, p.host_port), p.protocol) {
+                    Ok(fd) => {
+                        fds.push(fd);
+                        bound_ports.push(at);
                     }
-                    Protocol::Udp => {
-                        let s = UdpSocket::bind(addr).map_err(|e| format!("forward {p}: bind: {e}"))?;
-                        s.set_nonblocking(true)?;
-                        Bound::Udp(s)
-                    }
-                };
-                Ok((socket, p.vm_port))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { stop: Arc::new(AtomicBool::new(false)), bound, workers: Vec::new() })
+                    Err(e) if p.ip.is_none() && no_ipv6(ip, &e) => {}
+                    Err(e) => crate::bail!("forward {at}: bind: {e}"),
+                }
+            }
+            bound.push((fds, p.protocol, p.vm_port));
+        }
+        Ok(Self { stop: Arc::new(AtomicBool::new(false)), bound, workers: Vec::new(), ports: bound_ports })
     }
 
     /// Proxies to the VM at `vm`, once its address is known.
     pub fn serve(&mut self, vm: Ipv4Addr) -> Result<()> {
-        for (socket, port) in self.bound.drain(..) {
+        for (fds, protocol, port) in self.bound.drain(..) {
             let (stop, target) = (self.stop.clone(), SocketAddrV4::new(vm, port));
-            self.workers.push(thread::Builder::new().name("port-forward".into()).spawn(move || match socket {
-                Bound::Tcp(s) => tcp(s, target, &stop),
-                Bound::Udp(s) => udp(s, target, &stop),
+            self.workers.push(thread::Builder::new().name("port-forward".into()).spawn(move || match protocol {
+                Protocol::Tcp => tcp(fds.into_iter().map(TcpListener::from).collect(), target, &stop),
+                Protocol::Udp => udp(fds.into_iter().map(UdpSocket::from).collect(), target, &stop),
             })?);
         }
         Ok(())
@@ -135,6 +138,47 @@ fn wait(fds: &mut [libc::pollfd]) {
 
 fn poll(fd: &impl AsRawFd, events: i16) -> libc::pollfd {
     libc::pollfd { fd: if events == 0 { -1 } else { fd.as_raw_fd() }, events, revents: 0 }
+}
+
+/// Only where a default bind may go without: a host with no IPv6 support or address.
+fn no_ipv6(ip: IpAddr, e: &io::Error) -> bool {
+    ip.is_ipv6() && matches!(e.raw_os_error(), Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL))
+}
+
+/// std cannot set IPV6_V6ONLY before binding: [::] would also take IPv4 where
+/// net.ipv6.bindv6only is 0. TCP reuses addresses, as std's binds do.
+fn listen(addr: SocketAddr, protocol: Protocol) -> io::Result<OwnedFd> {
+    let tcp = protocol == Protocol::Tcp;
+    let SocketAddr::V6(a) = addr else {
+        return Ok(match protocol {
+            Protocol::Tcp => TcpListener::bind(addr).and_then(|s| s.set_nonblocking(true).map(|()| s.into()))?,
+            Protocol::Udp => UdpSocket::bind(addr).and_then(|s| s.set_nonblocking(true).map(|()| s.into()))?,
+        });
+    };
+    let fd = unsafe { libc::socket(libc::AF_INET6, if tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM } | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let on = |level, name| {
+        let one: libc::c_int = 1;
+        unsafe { libc::setsockopt(fd.as_raw_fd(), level, name, (&one as *const libc::c_int).cast(), std::mem::size_of_val(&one) as _) == 0 }
+    };
+    let sa = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as _,
+        sin6_port: a.port().to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+        sin6_scope_id: 0,
+    };
+    let ok = (!tcp || on(libc::SOL_SOCKET, libc::SO_REUSEADDR))
+        && on(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)
+        && unsafe { libc::bind(fd.as_raw_fd(), (&sa as *const libc::sockaddr_in6).cast(), std::mem::size_of_val(&sa) as _) } == 0
+        && (!tcp || unsafe { libc::listen(fd.as_raw_fd(), 128) } == 0);
+    if !ok {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 /// Nonblocking connect: an unreachable guest cannot stall accepts or cleanup.
@@ -213,10 +257,11 @@ struct Connection {
     incoming: Direction,
 }
 
-fn tcp(listener: TcpListener, target: SocketAddrV4, stop: &AtomicBool) {
+fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: &AtomicBool) {
     let mut connections: Vec<Connection> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
-        let mut fds = vec![poll(&listener, if connections.len() < CONNECTIONS { libc::POLLIN } else { 0 })];
+        let room = if connections.len() < CONNECTIONS { libc::POLLIN } else { 0 };
+        let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, room)).collect();
         for c in &connections {
             fds.push(poll(&c.client, if c.connected { c.out.events(&c.incoming) } else { 0 }));
             fds.push(poll(&c.guest, if c.connected { c.incoming.events(&c.out) } else { libc::POLLOUT }));
@@ -234,7 +279,10 @@ fn tcp(listener: TcpListener, target: SocketAddrV4, stop: &AtomicBool) {
             }
             c.out.pump(&c.client, &c.guest).is_ok() && c.incoming.pump(&c.guest, &c.client).is_ok() && !(c.out.shut && c.incoming.shut)
         });
-        if connections.len() < CONNECTIONS {
+        for listener in &listeners {
+            if connections.len() >= CONNECTIONS {
+                break;
+            }
             if let Ok((client, _)) = listener.accept() {
                 if let Ok(guest) = connect(target) {
                     if client.set_nonblocking(true).is_ok() {
@@ -253,31 +301,33 @@ fn tcp(listener: TcpListener, target: SocketAddrV4, stop: &AtomicBool) {
     }
 }
 
-fn udp(listener: UdpSocket, target: SocketAddrV4, stop: &AtomicBool) {
+fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: &AtomicBool) {
     // A connected guest socket per client preserves reply isolation. Idle sessions expire,
     // and both protocols bound the number of sockets and per-stream queued bytes.
-    let mut clients: HashMap<SocketAddr, (UdpSocket, Instant)> = HashMap::new();
+    // Replies leave by the listener the client sent to.
+    let mut clients: HashMap<SocketAddr, (UdpSocket, Instant, usize)> = HashMap::new();
     let mut buf = vec![0; BUFFER];
     while !stop.load(Ordering::SeqCst) {
-        let mut fds = vec![poll(&listener, libc::POLLIN)];
-        fds.extend(clients.values().map(|(s, _)| poll(s, libc::POLLIN)));
+        let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, libc::POLLIN)).collect();
+        fds.extend(clients.values().map(|(s, _, _)| poll(s, libc::POLLIN)));
         wait(&mut fds);
-        if let Ok((n, peer)) = listener.recv_from(&mut buf) {
+        for (i, listener) in listeners.iter().enumerate() {
+            let Ok((n, peer)) = listener.recv_from(&mut buf) else { continue };
             if !clients.contains_key(&peer) && clients.len() < CONNECTIONS {
                 if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
                     if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
-                        clients.insert(peer, (s, Instant::now()));
+                        clients.insert(peer, (s, Instant::now(), i));
                     }
                 }
             }
-            if let Some((s, at)) = clients.get_mut(&peer) {
+            if let Some((s, at, _)) = clients.get_mut(&peer) {
                 let _ = s.send(&buf[..n]);
                 *at = Instant::now();
             }
         }
-        clients.retain(|peer, (s, at)| {
+        clients.retain(|peer, (s, at, i)| {
             if let Ok(n) = s.recv(&mut buf) {
-                let _ = listener.send_to(&buf[..n], peer);
+                let _ = listeners[*i].send_to(&buf[..n], peer);
                 *at = Instant::now();
             }
             at.elapsed() < UDP_IDLE
@@ -292,25 +342,91 @@ mod tests {
     #[test]
     fn parse_and_record_ports() {
         let tcp: Port = "8080:80".parse().unwrap();
-        assert_eq!(tcp, Port { ip: Ipv4Addr::UNSPECIFIED, host_port: 8080, vm_port: 80, protocol: Protocol::Tcp });
+        assert_eq!(tcp, Port { ip: None, host_port: 8080, vm_port: 80, protocol: Protocol::Tcp });
         let udp: Port = "127.0.0.1:5353:53/udp".parse().unwrap();
         assert_eq!(udp.protocol, Protocol::Udp);
-        assert_eq!(udp.ip, Ipv4Addr::LOCALHOST);
-        for p in [tcp, udp, "65535:1/tcp".parse().unwrap()] {
+        assert_eq!(udp.ip, Some(Ipv4Addr::LOCALHOST.into()));
+        let v6: Port = "[::1]:8080:80".parse().unwrap();
+        assert_eq!((v6.ip, v6.to_string()), (Some(Ipv6Addr::LOCALHOST.into()), "[::1]:8080:80/tcp".into()));
+        assert_eq!(serde_json::to_value(&v6).unwrap()["ip"], "::1");
+        for p in [tcp, udp, v6, "[::]:1:2/udp".parse().unwrap(), "65535:1/tcp".parse().unwrap()] {
             assert_eq!(p.to_string().parse::<Port>().unwrap(), p);
             assert_eq!(serde_json::from_slice::<Port>(&serde_json::to_vec(&p).unwrap()).unwrap(), p);
         }
-        for bad in
-            ["", "80", "1:2:3:4", ":80:80", "localhost:80:80", "::1:80:80", "0:80", "80:0", "65536:80", "1:-1", "+1:2", "1:2/sctp", "1:2/tcp/udp", "1:2/"]
-        {
+        for bad in [
+            "",
+            "80",
+            "1:2:3:4",
+            ":80:80",
+            "localhost:80:80",
+            "::1:80:80",
+            "0:80",
+            "80:0",
+            "65536:80",
+            "1:-1",
+            "+1:2",
+            "1:2/sctp",
+            "1:2/tcp/udp",
+            "1:2/",
+            "[::1:80:80",
+            "[127.0.0.1]:80:80",
+            "[::1]:0:80",
+            "[::1]:+1:80",
+            "[fe80::1%2]:80:80",
+        ] {
             assert!(bad.parse::<Port>().is_err(), "{bad}");
         }
         let old: crate::host::Entry = serde_json::from_str(r#"{"pid":1,"start":1,"boot":"old"}"#).unwrap();
         assert!(old.ports.is_empty(), "old VM records remain readable");
     }
 
+    #[test]
+    fn a_default_bind_takes_both_families_on_one_thread_and_a_clash_on_either_refuses_it() {
+        // An explicit IPv6 address must bind, even where a default [::] may go without.
+        let absent = Port { ip: Some("2001:db8::1".parse().unwrap()), ..mapping(free_tcp(), 80, Protocol::Tcp) };
+        assert!(Forwarder::bind(&[absent]).is_err());
+        let Ok(v6) = listen((Ipv6Addr::UNSPECIFIED, 0).into(), Protocol::Tcp) else { return crate::log!("no IPv6: skipped") };
+        assert!(crate::listen::v6only(&TcpListener::from(v6)));
+        let (guest, udp_guest) = (TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(), UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+        udp_guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let port = free_tcp();
+        let tcp = Port { ip: None, ..mapping(port, guest.local_addr().unwrap().port(), Protocol::Tcp) };
+        let udp = Port { protocol: Protocol::Udp, vm_port: udp_guest.local_addr().unwrap().port(), ..tcp.clone() };
+        let f = Forwarder::start(&[tcp.clone(), udp.clone()], Ipv4Addr::LOCALHOST).unwrap();
+        assert_eq!(f.workers.len(), 2);
+        assert_eq!(f.ports.len(), 4);
+        assert_eq!(f.ports[1].to_string(), format!("[::]:{port}:{}/tcp", tcp.vm_port));
+        let mut buf = [0; 8];
+        for ip in [IpAddr::from(Ipv4Addr::LOCALHOST), Ipv6Addr::LOCALHOST.into()] {
+            let mut client = TcpStream::connect((ip, port)).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            client.write_all(b"t").unwrap();
+            let (mut server, _) = guest.accept().unwrap();
+            server.read_exact(&mut buf[..1]).unwrap();
+            server.write_all(b"T").unwrap();
+            client.read_exact(&mut buf[..1]).unwrap();
+            assert_eq!(&buf[..1], b"T");
+            let client = UdpSocket::bind((ip, 0)).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            client.send_to(b"u", (ip, port)).unwrap();
+            let (n, peer) = udp_guest.recv_from(&mut buf).unwrap();
+            udp_guest.send_to(&buf[..n], peer).unwrap();
+            assert_eq!(client.recv_from(&mut buf).unwrap(), (1, (ip, port).into()));
+        }
+        drop(f);
+        // V6ONLY keeps the families apart, and the refused bind releases the family it got.
+        let (any4, any6) = (IpAddr::from(Ipv4Addr::UNSPECIFIED), IpAddr::from(Ipv6Addr::UNSPECIFIED));
+        for (taken, other) in [(any4, any6), (any6, any4)] {
+            for p in [&tcp, &udp] {
+                let _held = Forwarder::bind(&[Port { ip: Some(taken), ..p.clone() }]).unwrap();
+                assert!(Forwarder::bind(std::slice::from_ref(p)).is_err());
+                let _other = Forwarder::bind(&[Port { ip: Some(other), ..p.clone() }]).unwrap();
+            }
+        }
+    }
+
     fn mapping(host: u16, guest: u16, protocol: Protocol) -> Port {
-        Port { ip: Ipv4Addr::LOCALHOST, host_port: host, vm_port: guest, protocol }
+        Port { ip: Some(Ipv4Addr::LOCALHOST.into()), host_port: host, vm_port: guest, protocol }
     }
 
     fn free_tcp() -> u16 {
@@ -329,7 +445,7 @@ mod tests {
         assert!(Forwarder::start(&[p.clone(), p.clone()], Ipv4Addr::LOCALHOST).is_err());
         let f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST).unwrap();
         assert!(Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST).is_err());
-        let wildcard = Port { ip: Ipv4Addr::UNSPECIFIED, ..p.clone() };
+        let wildcard = Port { ip: Some(Ipv4Addr::UNSPECIFIED.into()), ..p.clone() };
         assert!(Forwarder::start(&[wildcard], Ipv4Addr::LOCALHOST).is_err());
         drop(f);
         let _again = Forwarder::start(&[p], Ipv4Addr::LOCALHOST).unwrap();
@@ -348,7 +464,7 @@ mod tests {
         let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let p = mapping(free_tcp(), guest.local_addr().unwrap().port(), Protocol::Tcp);
         let f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST).unwrap();
-        let mut client = TcpStream::connect((p.ip, p.host_port)).unwrap();
+        let mut client = TcpStream::connect((p.ip.unwrap(), p.host_port)).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let server = thread::spawn(move || {
             let (mut s, _) = guest.accept().unwrap();
@@ -365,7 +481,7 @@ mod tests {
         client.read_to_end(&mut reply).unwrap();
         assert_eq!(reply, b"after EOF");
         let guest = server.join().unwrap();
-        let mut active = TcpStream::connect((p.ip, p.host_port)).unwrap();
+        let mut active = TcpStream::connect((p.ip.unwrap(), p.host_port)).unwrap();
         active.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let (_guest_connection, _) = guest.accept().unwrap();
         let at = Instant::now();
@@ -427,8 +543,8 @@ mod tests {
         for client in [&a, &b] {
             client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         }
-        a.send_to(b"a", (p.ip, p.host_port)).unwrap();
-        b.send_to(b"b", (p.ip, p.host_port)).unwrap();
+        a.send_to(b"a", (p.ip.unwrap(), p.host_port)).unwrap();
+        b.send_to(b"b", (p.ip.unwrap(), p.host_port)).unwrap();
         let mut buf = [0; 64];
         let (n1, peer1) = guest.recv_from(&mut buf).unwrap();
         let msg1 = buf[..n1].to_vec();
@@ -440,7 +556,7 @@ mod tests {
         assert_eq!(buf[0], b'a');
         assert_eq!(b.recv(&mut buf).unwrap(), 1);
         assert_eq!(buf[0], b'b');
-        a.send_to(b"", (p.ip, p.host_port)).unwrap();
+        a.send_to(b"", (p.ip.unwrap(), p.host_port)).unwrap();
         let (n, peer) = guest.recv_from(&mut buf).unwrap();
         assert_eq!(n, 0);
         guest.send_to(b"", peer).unwrap();

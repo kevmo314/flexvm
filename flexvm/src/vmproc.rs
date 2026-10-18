@@ -312,6 +312,11 @@ impl Proc {
         Ok(())
     }
 
+    /// What is bound, an entry per address; `ports` stays as asked, for its records.
+    pub fn bound_ports(&self) -> Vec<crate::ports::Port> {
+        self.forwards.lock().unwrap().as_ref().map_or_else(Vec::new, |f| f.ports.clone())
+    }
+
     pub fn serve_ports(&self, ip: Ipv4Addr) -> Result<()> {
         self.forwards.lock().unwrap().as_mut().map_or(Ok(()), |f| f.serve(ip))
     }
@@ -748,7 +753,7 @@ impl Proc {
             starved: vm.starving(),
             growth_mib_s: self.growth.load(Ordering::SeqCst),
             cmd: self.cmd.lock().unwrap().is_some(),
-            ports: self.ports.lock().unwrap().clone(),
+            ports: self.bound_ports(),
         };
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
             crate::log!("vm {n}: registry: {e}");
@@ -1125,7 +1130,7 @@ impl Proc {
             "ip": vm.ip.to_string(),
             "pid": self.ident.pid,
             "start": self.ident.start,
-            "ports": *self.ports.lock().unwrap(),
+            "ports": self.bound_ports(),
             "running_ms": ms(running),
             "ready_ms": ms(t.total()),
             "timings_ms": t.json(),

@@ -461,7 +461,7 @@ impl Proc {
             self.publish();
             self.announce();
             self.watch_checkpoint_pull(vm.clone(), dir.clone(), to_load);
-            json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "ports": *self.ports.lock().unwrap(), "state": "paused", "resume_error": why, "restore_ms": ms(restore), "timings_ms": t.json()})
+            json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "ports": self.bound_ports(), "state": "paused", "resume_error": why, "restore_ms": ms(restore), "timings_ms": t.json()})
         };
         // Test gate: a resume loaded and paused, not yet marked STARTED (the fence's host lock not yet taken).
         if owned {
@@ -565,7 +565,7 @@ impl Proc {
             "ip": ip.to_string(),
             "pid": std::process::id(),
             "state": state,
-            "ports": *self.ports.lock().unwrap(),
+            "ports": self.bound_ports(),
             "restore_ms": ms(restore),
             "ready_ms": ready.map(ms),
             "guest_error": guest_error,
