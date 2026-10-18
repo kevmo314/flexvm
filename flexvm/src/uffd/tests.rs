@@ -437,7 +437,7 @@ fn eagain_waits_for_events_read() {
             discard(&p, 1);
             p.events_read();
         });
-        let (resolved, res) = p.install(0, 2, REMOTE, Some(&stop), |_, n| {
+        let (resolved, res) = p.install(0, 2, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |_, n| {
             calls += 1;
             match p.read_gen.load(Ordering::SeqCst) {
                 0 => Err(os(libc::EAGAIN)),
@@ -773,7 +773,7 @@ fn eagain_retries_only_with_a_stop_flag() {
     let stop = AtomicBool::new(false);
     p.claim(0, 2, BASE, |_| true);
     let mut script = vec![Err(os(libc::EAGAIN)), Ok(2)].into_iter();
-    let (resolved, res) = p.install(0, 2, BASE, Some(&stop), |_, _| script.next().unwrap());
+    let (resolved, res) = p.install(0, 2, BASE, Some(&|| stop.load(Ordering::SeqCst)), |_, _| script.next().unwrap());
     assert!(res.is_ok());
     assert_eq!((states(&p), resolved), (vec![PRESENT, PRESENT], 0));
 }
@@ -1012,7 +1012,7 @@ fn eagain_with_a_stop_flag_keeps_the_run_and_its_failure_history_clear() {
     let stop = AtomicBool::new(false);
     p.claim(0, 4, REMOTE, |_| true);
     let mut script = vec![Err(os(libc::EAGAIN)), Ok(2), Err(os(libc::EAGAIN)), Ok(2)].into_iter();
-    let (resolved, res) = p.install(0, 4, REMOTE, Some(&stop), |_, _| script.next().unwrap());
+    let (resolved, res) = p.install(0, 4, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |_, _| script.next().unwrap());
     assert!(res.is_ok());
     assert_eq!((resolved, states(&p)), (4, vec![PRESENT; 4]));
     assert_eq!(p.failing_since(0, 4), None);
@@ -1020,10 +1020,18 @@ fn eagain_with_a_stop_flag_keeps_the_run_and_its_failure_history_clear() {
 
     let p = pages(&[BASE; 4]);
     p.claim(0, 4, BASE, |_| true);
-    let (_, res) = p.install(0, 4, BASE, Some(&stop), |_, _| {
+    let (_, res) = p.install(0, 4, BASE, Some(&|| stop.load(Ordering::SeqCst)), |_, _| {
         stop.store(true, Ordering::SeqCst);
         Err(os(libc::EAGAIN))
     });
     assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
     assert_eq!(states(&p), [BASE; 4], "given back once stopped");
+
+    // Preload's: a REMOVE that is never drained ends the retry at its deadline.
+    let deadline = Instant::now() + Duration::from_millis(30);
+    p.claim(0, 4, BASE, |_| true);
+    let (_, res) = p.install(0, 4, BASE, Some(&|| Instant::now() >= deadline), |_, _| Err(os(libc::EAGAIN)));
+    assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+    assert!(Instant::now() >= deadline);
+    assert_eq!(states(&p), [BASE; 4]);
 }

@@ -75,6 +75,10 @@ impl Pager {
             Err(e) => return self.fail(format!("allocating background pull buffer: {e}")),
         };
         let buf = storage.bytes();
+        // Connects ahead (nothing to read), so each run's request goes out as it is queued; a failure shows again later.
+        if file.is_none() {
+            let _ = fetch(0, &mut [], &self.stop, &mut |_| true);
+        }
         let mut ok = true;
         for (i, end) in first.chain(all) {
             if !ok || !self.pulling() {

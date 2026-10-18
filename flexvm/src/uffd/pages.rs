@@ -421,14 +421,14 @@ impl Pages {
 
     /// Installs claimed pages `[first, first + n)` with `populate(page, count)`, which returns how many pages from
     /// `page` it populated (UFFDIO_COPY may stop part way) and wakes their waiters. Pages discarded before their copy
-    /// are skipped; EEXIST counts as populated. EAGAIN is retried until `stop` is set, or without `stop` ends the
+    /// are skipped; EEXIST counts as populated. EAGAIN is retried until `stop` says to, or without `stop` ends the
     /// install. Unfinished pages are given back. Returns the REMOTE pages resolved and the error, if any.
     pub fn install(
         &self,
         first: usize,
         n: usize,
         from: u8,
-        stop: Option<&AtomicBool>,
+        stop: Option<&dyn Fn() -> bool>,
         mut populate: impl FnMut(usize, usize) -> io::Result<usize>,
     ) -> (usize, io::Result<()>) {
         let (end, mut resolved, mut i) = (first + n, 0, first);
@@ -454,7 +454,7 @@ impl Pages {
                     resolved += self.settle(i, true, from) as usize;
                     i += 1;
                 }
-                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s.load(Ordering::SeqCst)) => {
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s()) => {
                     drop(installing);
                     self.install_eagain.fetch_add(1, Ordering::Relaxed);
                     self.wait_events_read(gen)

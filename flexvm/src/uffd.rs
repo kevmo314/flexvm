@@ -483,7 +483,7 @@ impl Pager {
                 let n = pages.claim(i, end - i, BASE, |p| self.base.has_data(p) == data);
                 if n > 0 {
                     let src = |p: usize, c: usize| data.then(|| self.base.pages(p, c));
-                    let _ = pages.install(i, n, BASE, Some(&self.quiesce), |p, c| self.populate(p, c, src(p, c)));
+                    let _ = pages.install(i, n, BASE, Some(&|| self.quiesce.load(Ordering::SeqCst)), |p, c| self.populate(p, c, src(p, c)));
                 }
                 i += n.max(1);
             }
@@ -535,7 +535,10 @@ impl Pager {
                         let n = pages.claim(page, end - index, REMOTE, |_| true);
                         if n > 0 {
                             let src = |p: usize, c: usize| &data[(index + p - page) * PAGE_SIZE..(index + p - page + c) * PAGE_SIZE];
-                            let (resolved, res) = pages.install(page, n, REMOTE, Some(&self.stop), |p, c| self.populate(p, c, Some(src(p, c))));
+                            let (resolved, res) =
+                                pages.install(page, n, REMOTE, Some(&|| self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline), |p, c| {
+                                    self.populate(p, c, Some(src(p, c)))
+                                });
                             self.pulled(resolved);
                             installed += resolved;
                             res?;

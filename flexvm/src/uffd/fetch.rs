@@ -49,7 +49,7 @@ impl Pages {
         // Installs pages `from..to` (counted from `first`) out of `data`, which holds them from page `base` on.
         let mut install = |from: usize, to: usize, data: &[u8], base: usize| {
             let src = |p: usize, c: usize| &data[(p - first - base) * PAGE_SIZE..(p - first - base + c) * PAGE_SIZE];
-            self.install(first + from, to - from, REMOTE, Some(stop), |p, c| populate(p, c, src(p, c)))
+            self.install(first + from, to - from, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |p, c| populate(p, c, src(p, c)))
         };
         // Pages from `first` installed (or given back by a failed install).
         let (mut done, mut resolved) = (0, 0);
