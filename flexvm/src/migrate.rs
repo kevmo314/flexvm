@@ -123,9 +123,7 @@ impl Proc {
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
         // Before the pause: dropped, the connection ends the target's arrival.
-        if prepared["follows_app"] != true && *self.spec.lock().unwrap() != crate::app::RunSpec::default() {
-            bail!("{to} runs an older flexvm, which would drop vm {}'s run settings (-e, --entrypoint, --keep, --rm, --ip): upgrade it first", vm.name);
-        }
+        check_app_support(to, &vm.name, &prepared, &self.spec.lock().unwrap(), vm.template.meta.image.as_ref())?;
         let prepare = prep.elapsed();
         // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
         let mut wanted = crate::standby::load_set(&self.host, &vm.template);
@@ -1179,9 +1177,53 @@ fn unplug(vm: &Vm) -> u64 {
     drops
 }
 
+/// Older targets neither preserve run settings nor end the VM when its app exits.
+fn check_app_support(to: &str, name: &str, prepared: &Value, spec: &crate::app::RunSpec, image: Option<&crate::image::ImageMeta>) -> Result<()> {
+    if prepared["follows_app"] != true && (*spec != crate::app::RunSpec::default() || spec.has_app(image)) {
+        bail!("{to} runs an older flexvm, which would drop vm {name}'s run settings (-e, --entrypoint, --keep, --rm, --ip) or fail to exit with its app: upgrade it first");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_targets_must_support_the_app_and_run_settings() {
+        use crate::app::RunSpec;
+        let plain = RunSpec::default();
+        let image = |argv: &[&str], warm| {
+            serde_json::from_value::<crate::image::ImageMeta>(json!({
+                "source": "x", "digest": "d", "config_digest": "c", "app_conf": "", "argv": argv, "warm": warm,
+            }))
+            .unwrap()
+        };
+        let idle = image(&[], false);
+        let app = image(&["/bin/sleep", "10"], false);
+        let warm = image(&["/bin/server"], true);
+        let settings = [
+            RunSpec { env: vec!["A=1".into()], ..Default::default() },
+            RunSpec { entrypoint: Some(vec!["/bin/server".into()]), ..Default::default() },
+            RunSpec { keep: true, ..Default::default() },
+            RunSpec { rm: true, ..Default::default() },
+            RunSpec { ip: Some("10.0.0.9".parse().unwrap()), ..Default::default() },
+        ];
+        for target in [json!({}), json!({"follows_app": false}), json!({"follows_app": true})] {
+            for image in [None, Some(&idle)] {
+                assert!(check_app_support("peer", "vm", &target, &plain, image).is_ok());
+            }
+            for (spec, image) in [(&plain, Some(&app)), (&plain, Some(&warm))].into_iter().chain(settings.iter().map(|s| (s, Some(&idle)))) {
+                let result = check_app_support("peer", "vm", &target, spec, image);
+                if target["follows_app"] == true {
+                    assert!(result.is_ok());
+                } else {
+                    let e = result.unwrap_err().to_string();
+                    assert!(e.contains("older flexvm") && e.contains("exit with its app") && e.contains("upgrade it first"), "{e}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn target_underlay_must_be_a_known_peer() {
