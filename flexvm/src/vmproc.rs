@@ -308,7 +308,11 @@ impl Proc {
 
     /// Before the address is claimed (`Forwarder::bind`); `serve_ports` once it is.
     pub fn bind_ports(&self) -> Result<()> {
-        *self.forwards.lock().unwrap() = Some(crate::ports::Forwarder::bind(&self.ports.lock().unwrap())?);
+        let mut forwards = self.forwards.lock().unwrap();
+        let mut ports = self.ports.lock().unwrap();
+        let forwarder = crate::ports::Forwarder::bind(&ports)?;
+        *ports = forwarder.ports();
+        *forwards = Some(forwarder);
         Ok(())
     }
 
