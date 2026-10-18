@@ -19,7 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -479,24 +479,33 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
 
 type Attached = (Session, u64);
 
-/// Source the command without putting it in argv or consuming the command's stdin.
+/// The fd the shell sources the command from; dash takes only single-digit fds in redirections.
+const SCRIPT_FD: i32 = 9;
+
+/// Sources the command from a memfd: argv caps one argument at 128 KiB (MAX_ARG_STRLEN), the
+/// request body at 1 MiB. `.` opens the file afresh (dash and busybox ash keep that fd cloexec,
+/// bash reads it whole and closes it), so the script's first act closes the inherited fd and
+/// nothing the command starts holds it. The prefix shares the first line, keeping line numbers.
 fn shell_command(command: &str) -> io::Result<Command> {
     if command.contains('\0') {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "command contains a nul byte"));
     }
+    // Cloexec from creation, so no other thread's child inherits it while it is open here.
     let fd = unsafe { libc::memfd_create(c"flexvm-session".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let mut script = unsafe { File::from_raw_fd(fd) };
+    script.write_all(format!("exec {SCRIPT_FD}<&-; ").as_bytes())?;
     script.write_all(command.as_bytes())?;
-    script.rewind()?;
     let mut cmd = Command::new("/bin/sh");
-    cmd.args(["-c", &format!(". /proc/self/fd/{fd}")]);
-    // Keep the file alive through spawn; only this child inherits it across exec.
+    cmd.args(["-c", &format!(". /proc/self/fd/{SCRIPT_FD}")]);
+    // Runs after std has set up stdio, so fd 9 can be taken; dup2 leaves the copy inheritable.
     unsafe {
         cmd.pre_exec(move || {
-            if libc::fcntl(script.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+            let fd = script.as_raw_fd();
+            let ok = if fd == SCRIPT_FD { libc::fcntl(fd, libc::F_SETFD, 0) } else { libc::dup2(fd, SCRIPT_FD) };
+            if ok < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -1086,6 +1095,21 @@ mod tests {
         assert!(!timeout.timed_out(), "exit never recorded");
         assert_eq!(ring.exit, Some(7));
         assert_eq!(ring.read_chunk(0), Some((FRAME_STDOUT, &b"/bin/sh done"[..])));
+    }
+
+    /// Neither the shell's fd 9 nor any process the command starts keeps the script's memfd.
+    #[test]
+    fn the_script_fd_is_not_inherited() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let command = b"[ -e /proc/$$/fd/9 ] && exit 3; /bin/sh -c 'for f in /proc/self/fd/*; do case $(readlink $f) in *flexvm-session*) exit 4;; esac; done'; printf line=$LINENO";
+        let (output, group) = start(&sessions, &statuses, "fds", command);
+        let status = reap(&statuses, group);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        let ring = output.0.lock().unwrap();
+        let (ring, _) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        // dash leaves LINENO unset in a sourced file; bash and ash give 1, the prefix sharing the line.
+        assert!(matches!(ring.read_chunk(0), Some((FRAME_STDOUT, b"line=" | b"line=1"))), "{:?}", ring.read_chunk(0));
     }
 
     #[test]
