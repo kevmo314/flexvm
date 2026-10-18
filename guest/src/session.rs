@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -479,6 +479,41 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
 
 type Attached = (Session, u64);
 
+/// The fd the shell sources the command from; dash takes only single-digit fds in redirections.
+const SCRIPT_FD: i32 = 9;
+
+/// Sources the command from a memfd: argv caps one argument at 128 KiB (MAX_ARG_STRLEN), the
+/// request body at 1 MiB. `.` opens the file afresh (dash and busybox ash keep that fd cloexec,
+/// bash reads it whole and closes it), so the script's first act closes the inherited fd and
+/// nothing the command starts holds it. The prefix shares the first line, keeping line numbers.
+fn shell_command(command: &str) -> io::Result<Command> {
+    if command.contains('\0') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "command contains a nul byte"));
+    }
+    // Cloexec from creation, so no other thread's child inherits it while it is open here.
+    let fd = unsafe { libc::memfd_create(c"flexvm-session".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut script = unsafe { File::from_raw_fd(fd) };
+    script.write_all(format!("exec {SCRIPT_FD}<&-; ").as_bytes())?;
+    script.write_all(command.as_bytes())?;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", &format!(". /proc/self/fd/{SCRIPT_FD}")]);
+    // Runs after std has set up stdio, so fd 9 can be taken; dup2 leaves the copy inheritable.
+    unsafe {
+        cmd.pre_exec(move || {
+            let fd = script.as_raw_fd();
+            let ok = if fd == SCRIPT_FD { libc::fcntl(fd, libc::F_SETFD, 0) } else { libc::dup2(fd, SCRIPT_FD) };
+            if ok < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(cmd)
+}
+
 fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions, statuses: &Statuses) -> io::Result<Option<(&'a str, u64, Attached)>> {
     let gone = || io::Error::other("session closed");
     let unknown = || io::Error::other("unknown session");
@@ -515,14 +550,16 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                     }
                 })
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
-            let mut cmd = Command::new("/bin/sh");
-            cmd.args(["-c", command]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+            let mut cmd = shell_command(command)?;
+            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
             if let Some(work) = crate::mem::work_procs() {
                 crate::mem::enter(&mut cmd, work, false);
             }
             // Minimal images (distroless, scratch) have no shell.
-            let (child, exited, token) = spawn_watched(&mut cmd, statuses, true)
-                .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
+            let (child, exited, token) = spawn_watched(&mut cmd, statuses, true).map_err(|e| {
+                let hint = if e.kind() == io::ErrorKind::NotFound { " (does the image have a shell?)" } else { "" };
+                io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}{hint}"))
+            })?;
             table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
             // Attached before any output, so none is overwritten before it is sent.
             let attached = attach(&output, 0, conn);
@@ -1039,6 +1076,40 @@ mod tests {
         let _ = handle(disconnected, command, None, &format!("SESSION {id} {}", command.len()), sessions, statuses);
         let table = sessions.lock().unwrap();
         (table.live[id].output.clone(), table.live[id].group)
+    }
+
+    #[test]
+    fn a_512_kib_command_preserves_stdin_and_exit_status() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let mut command = String::from("if read -r line; then exit 99; fi; printf '%s' \"$0\"\n#");
+        let tail = "\nprintf ' done'; exit 7";
+        command.extend(std::iter::repeat_n('x', 512 * 1024 - command.len() - tail.len()));
+        command.push_str(tail);
+        assert_eq!(command.len(), 512 * 1024);
+        let (output, group) = start(&sessions, &statuses, "large", command.as_bytes());
+        let status = reap(&statuses, group);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 7);
+        let ring = output.0.lock().unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        assert!(!timeout.timed_out(), "exit never recorded");
+        assert_eq!(ring.exit, Some(7));
+        assert_eq!(ring.read_chunk(0), Some((FRAME_STDOUT, &b"/bin/sh done"[..])));
+    }
+
+    /// Neither the shell's fd 9 nor any process the command starts keeps the script's memfd.
+    #[test]
+    fn the_script_fd_is_not_inherited() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let command = b"[ -e /proc/$$/fd/9 ] && exit 3; /bin/sh -c 'for f in /proc/self/fd/*; do case $(readlink $f) in *flexvm-session*) exit 4;; esac; done'; printf line=$LINENO";
+        let (output, group) = start(&sessions, &statuses, "fds", command);
+        let status = reap(&statuses, group);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        let ring = output.0.lock().unwrap();
+        let (ring, _) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        // dash leaves LINENO unset in a sourced file; bash and ash give 1, the prefix sharing the line.
+        assert!(matches!(ring.read_chunk(0), Some((FRAME_STDOUT, b"line=" | b"line=1"))), "{:?}", ring.read_chunk(0));
     }
 
     #[test]
