@@ -19,12 +19,12 @@ use serde_json::{json, Value};
 #[path = "../../guest/src/tar.rs"]
 mod tar;
 
+use crate::bail;
 use crate::guest::{
     self, frame, FRAME_ACK, FRAME_LOST, FRAME_MSG, FRAME_NOTE, FRAME_STDERR, FRAME_STDOUT, IN_DATA, IN_DETACH, IN_EOF, IN_RESIZE, MAX_INPUT, SESSION_DONE,
 };
 use crate::host::Host;
 use crate::util::{self, Result};
-use crate::{bail, vmproc};
 
 /// Stdin read ahead of what the guest took, at most: past it stdin waits.
 const MAX_UNACKED: usize = 1 << 20;
@@ -102,6 +102,8 @@ struct St {
     /// SESSION_DONE goes out on this connection, then `done_sent`.
     done: Option<u64>,
     done_sent: bool,
+    /// No more is read from the source, which is dropped (`cancel`).
+    cancelled: bool,
 }
 
 impl Feed {
@@ -124,6 +126,9 @@ impl Feed {
     fn read(&self, mut src: Box<dyn Read + Send>, keys: bool, on_detach: fn()) {
         let (mut buf, mut held) = (vec![0; 16 * 1024], false);
         loop {
+            if self.st.lock().unwrap().cancelled {
+                return;
+            }
             let n = match src.read(&mut buf) {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Ok(n) => n,
@@ -149,7 +154,10 @@ impl Feed {
             if n == 0 && held {
                 out.push(DETACH_KEYS[0]);
             }
-            let mut st = self.cv.wait_while(self.st.lock().unwrap(), |s| s.buf.len() >= MAX_UNACKED).unwrap();
+            let mut st = self.cv.wait_while(self.st.lock().unwrap(), |s| s.buf.len() >= MAX_UNACKED && !s.cancelled).unwrap();
+            if st.cancelled {
+                return;
+            }
             st.buf.extend(out);
             (st.eof, st.detached) = (n == 0, detach);
             drop(st);
@@ -170,6 +178,13 @@ impl Feed {
         st.buf.drain(..n as usize);
         st.acked += n;
         drop(st);
+        self.cv.notify_all();
+    }
+
+    /// Nothing more is wanted (the guest is done with stdin, as when it failed): the source is dropped, so
+    /// that what writes to it (a pipe) is not left blocked once the guest stopped taking any.
+    pub fn cancel(&self) {
+        self.st.lock().unwrap().cancelled = true;
         self.cv.notify_all();
     }
 
@@ -315,17 +330,48 @@ pub fn detach_later() {
     let _ = std::io::stderr().write_all(b"\r\nread escape sequence\r\n");
 }
 
-/// A request to `name`'s VM process: its reply read, then its relay.
-fn open(host: &Host, name: &str, req: &Value) -> Result<BufReader<UnixStream>> {
-    let c = vmproc::connect(host, name, req, &[], Instant::now() + Duration::from_secs(5), None)?;
+/// The VM an `attach` follows: the one its first connection reached (an exec's `Instance`), under the name it
+/// has now. One made again under the name since (after a kill) is never sent a request, nor stdin.
+#[derive(Clone)]
+struct Pinned {
+    host: Host,
+    name: String,
+    vm: Arc<Mutex<Option<crate::Instance>>>,
+}
+
+impl Pinned {
+    fn name(&self) -> String {
+        crate::current_name(&self.host, &self.name, *self.vm.lock().unwrap())
+    }
+
+    fn alive(&self) -> bool {
+        self.host.alive(&self.name())
+    }
+
+    fn connect(&self, req: &Value) -> Result<UnixStream> {
+        let mut vm = *self.vm.lock().unwrap();
+        let c = crate::connect_same(&self.host, &self.name(), req, Instant::now() + Duration::from_secs(5), &mut vm);
+        *self.vm.lock().unwrap() = vm;
+        c
+    }
+}
+
+fn replaced(e: &util::Error) -> bool {
+    e.is::<crate::Replaced>()
+}
+
+/// A request to the pinned VM's process: its reply read, then its relay.
+fn open(vm: &Pinned, req: &Value) -> Result<BufReader<UnixStream>> {
+    let c = vm.connect(req)?;
     c.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut r = BufReader::new(c);
     util::answer(util::recv_json(&mut r)?, "vm", "attach failed")?;
     Ok(r)
 }
 
-/// Why attaching to `name` can go on no more, its VM process gone: its app's status if it exited.
-fn gone(host: &Host, name: &str) -> Result<i32> {
+/// Why attaching to the VM can go on no more, its VM process gone: its app's status if it exited.
+fn gone(vm: &Pinned) -> Result<i32> {
+    let (host, name) = (&vm.host, &vm.name());
     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
         bail!("vm {name} moved to {to}; attach to it there");
     }
@@ -338,15 +384,35 @@ fn gone(host: &Host, name: &str) -> Result<i32> {
     bail!("vm {name} ended")
 }
 
+/// Whether the VM ended (its process gone), waiting a moment for one that is ending.
+fn ended(vm: &Pinned) -> bool {
+    let until = Instant::now() + Duration::from_secs(2);
+    while vm.alive() {
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
 /// `attach NAME`, and a foreground `run -i`/`-t` (from 0): the app's output from `from` (None: from now on),
 /// and stdin to it if it was run with `-i`, until it exits (its status) or the client detaches.
 pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
+    let vm = Pinned { host: host.clone(), name: name.to_string(), vm: Arc::default() };
     let stream = u64::from_str_radix(&util::random_hex(8)?, 16)?;
     let stdin_req = json!({"op": "stdin", "stream": stream});
-    let mut first = open(host, name, &stdin_req)?;
-    let hello = match guest::read_frame(&mut first)? {
-        Some((FRAME_MSG, m)) => String::from_utf8_lossy(&m).into_owned(),
+    let handshake = open(&vm, &stdin_req).and_then(|mut first| match guest::read_frame(&mut first)? {
+        Some((FRAME_MSG, m)) => Ok((first, String::from_utf8_lossy(&m).into_owned())),
         other => bail!("vm {name}: unexpected stdin reply {other:?}"),
+    });
+    let (first, hello) = match handshake {
+        Ok(h) => h,
+        Err(e) if replaced(&e) => return Err(e),
+        // A foreground run's fast app (`run -i ... true`) and its VM may be gone before the first connection: its status is
+        // its exited record's. (`attach` to a VM that ended before is refused, as docker's is.)
+        Err(_) if from == Some(0) && ended(&vm) => return gone(&vm),
+        Err(e) => return Err(e),
     };
     let words: Vec<&str> = hello.split_whitespace().collect();
     let (open_stdin, tty) = match words.as_slice() {
@@ -363,12 +429,12 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
         // Not from the terminal (it is raw), or the pty makes them: they end only this client.
         true => util::on_signal(&signals, |sig| exit(128 + sig)),
         // As docker's --sig-proxy: to the app.
-        false => proxy_signals(host.clone(), name.to_string(), signals),
+        false => proxy_signals(vm.clone(), signals),
     }
     let raw = (open_stdin && tty).then(raw).transpose()?;
     if open_stdin {
         let feed = Feed::start(Some(Box::new(std::io::stdin())), tty, tty && is_tty(0), detach_now)?;
-        let (host, name) = (host.clone(), name.to_string());
+        let vm = vm.clone();
         std::thread::Builder::new().spawn(move || {
             let mut conn = Some(first);
             loop {
@@ -383,32 +449,40 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
                     drop(writer);
                 }
                 std::thread::sleep(Duration::from_millis(200));
-                if !host.alive(&name) {
+                if !vm.alive() {
                     return;
                 }
-                conn = open(&host, &name, &stdin_req).ok().and_then(|mut r| match guest::read_frame(&mut r) {
-                    Ok(Some((FRAME_MSG, m))) if m.starts_with(b"ok ") => Some(r),
-                    _ => None,
-                });
+                conn = match open(&vm, &stdin_req) {
+                    // Another VM under the name: what this one did not take is never sent to it.
+                    Err(e) if replaced(&e) => return,
+                    r => r.ok().and_then(|mut r| match guest::read_frame(&mut r) {
+                        Ok(Some((FRAME_MSG, m))) if m.starts_with(b"ok ") => Some(r),
+                        _ => None,
+                    }),
+                };
             }
         })?;
     } else {
         drop(first);
     }
-    let code = follow_output(host, name, from);
+    let code = follow_output(&vm, from);
     drop(raw);
     code
 }
 
-/// `kill -s` for each of `signals` this process gets, to the app.
-fn proxy_signals(host: Host, name: String, signals: [i32; 3]) {
+/// `kill -s` for each of `signals` this process gets, to the app (of the pinned VM only).
+fn proxy_signals(vm: Pinned, signals: [i32; 3]) {
     let set = util::block_signals(&signals);
     std::thread::spawn(move || loop {
         match util::wait_signal(&set) {
             libc::SIGHUP => exit(128 + libc::SIGHUP),
             sig => {
-                if let Err(e) = vmproc::call(&host, &name, json!({"op": "signal", "signal": sig}), None) {
-                    crate::log!("flexvm: {name}: {e}");
+                let sent = vm.connect(&json!({"op": "signal", "signal": sig})).and_then(|c| {
+                    c.set_read_timeout(Some(Duration::from_secs(10)))?;
+                    util::answer(util::recv_json(&mut BufReader::new(c))?, "vm", "refused")
+                });
+                if let Err(e) = sent {
+                    crate::log!("flexvm: {}: {e}", vm.name());
                 }
             }
         }
@@ -416,11 +490,12 @@ fn proxy_signals(host: Host, name: String, signals: [i32; 3]) {
 }
 
 /// The app's output (FRAME_NOTE, flexvm-init's own lines, is left out) until it exits.
-fn follow_output(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
+fn follow_output(vm: &Pinned, from: Option<u64>) -> Result<i32> {
     let mut offset = from.unwrap_or(u64::MAX);
     let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
     loop {
-        match open(host, name, &json!({"op": "attach", "offset": offset})) {
+        let name = &vm.name();
+        match open(vm, &json!({"op": "attach", "offset": offset})) {
             Ok(mut r) => {
                 r.get_ref().set_read_timeout(Some(Duration::from_secs(20)))?;
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut r) {
@@ -445,7 +520,8 @@ fn follow_output(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
                     }
                 }
             }
-            Err(_) if !host.alive(name) => return gone(host, name),
+            Err(e) if replaced(&e) => return Err(e),
+            Err(_) if !vm.alive() => return gone(vm),
             // Paused, or busy: tried again until it runs.
             Err(_) => {}
         }
@@ -475,12 +551,7 @@ pub fn cp(host: &Host, src: &str, dst: &str) -> Result<i32> {
                 }
             };
             let mode = if src_arg == "-" { "into" } else { "cp" };
-            let feed = Feed::start(Some(src), false, false, || {})?;
-            let code = crate::exec_with(host, &name, &cmd(tool(&["--flexvm-cp-in", mode, &path]), true), &mut std::io::stdout(), Some(feed))?;
-            match made.map(|t| t.join().map_err(|_| "cp: archiving panicked")) {
-                Some(Ok(Err(e))) => Err(format!("cp: {e}").into()),
-                _ => Ok(code),
-            }
+            send(src, made, |feed| crate::exec_with(host, &name, &cmd(tool(&["--flexvm-cp-in", mode, &path]), true), &mut std::io::stdout(), Some(feed)))
         }
         (Some((name, path)), None) => {
             if dst == "-" {
@@ -503,6 +574,22 @@ pub fn cp(host: &Host, src: &str, dst: &str) -> Result<i32> {
                 code => Ok(code),
             }
         }
+    }
+}
+
+/// `cp` into a VM: `src` (an archive `made` writes, or stdin's) fed to `unpack`, an exec of the guest's tar tool, its status.
+/// Once it ended, however it ended, the feed stops: the guest failing (and taking no more) never leaves `made` blocked on a full pipe.
+fn send(src: Box<dyn Read + Send>, made: Option<std::thread::JoinHandle<std::io::Result<()>>>, unpack: impl FnOnce(Arc<Feed>) -> Result<i32>) -> Result<i32> {
+    let feed = Feed::start(Some(src), false, false, || {})?;
+    let code = unpack(feed.clone());
+    feed.cancel();
+    let archived = made.map(|t| t.join());
+    let code = code?;
+    match archived {
+        Some(Err(_)) => bail!("cp: archiving panicked"),
+        // A pipe closed by the cancel is the guest's failure, which it told already; any other is the archive's.
+        Some(Ok(Err(e))) if code == 0 || e.kind() != std::io::ErrorKind::BrokenPipe => Err(format!("cp: {e}").into()),
+        _ => Ok(code),
     }
 }
 
@@ -574,6 +661,44 @@ mod tests {
         assert_eq!(data(&got[0]), (0, b"a\x10b\x10".to_vec()));
         assert_eq!(got[1], (IN_DETACH, vec![]));
         assert!(DETACHED.load(Ordering::SeqCst) && feed.detached());
+    }
+
+    #[test]
+    fn cp_into_a_vm_that_fails_does_not_hang() {
+        let root = crate::test_util::TempDir::new("cp-fail");
+        let big = root.join("big");
+        std::fs::write(&big, vec![7u8; 8 * MAX_UNACKED]).unwrap();
+        let (r, mut w) = std::io::pipe().unwrap();
+        let src = big.to_str().unwrap().to_string();
+        let made = std::thread::spawn(move || tar::create(&src, &mut w));
+        // The guest's extraction fails at once: it takes nothing, and acknowledges nothing.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(send(Box::new(r), Some(made), |_feed| Ok(1)).map_err(|e| e.to_string())));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(20)).expect("cp hung after the guest failed"), Ok(1));
+    }
+
+    #[test]
+    fn an_archive_that_fails_is_cp_s_error() {
+        let (r, w) = std::io::pipe().unwrap();
+        drop(w);
+        let made = std::thread::spawn(|| Err(std::io::Error::other("unreadable")));
+        assert!(send(Box::new(r), Some(made), |_| Ok(1)).unwrap_err().to_string().contains("unreadable"));
+    }
+
+    #[test]
+    fn attach_to_an_app_that_ended_before_the_handshake_takes_its_status() {
+        let root = crate::test_util::TempDir::new("attach-fast");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        // `run -i ... true`: its VM gone before the first connection, its exited record left.
+        let rec = crate::app::Exited::new(0, "t".into(), None, Default::default(), Default::default(), 0);
+        crate::host::write_record(&host.vms("fast", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
+        assert_eq!(attach(&host, "fast", Some(0)).unwrap(), 0);
+        let rec = crate::app::Exited::new(3, "t".into(), None, Default::default(), Default::default(), 0);
+        crate::host::write_record(&host.vms("fast", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
+        assert_eq!(attach(&host, "fast", Some(0)).unwrap(), 3);
+        // Nothing at all: an error still; and `attach NAME` to a VM that ended before, as docker's.
+        assert!(attach(&host, "never", Some(0)).is_err());
+        assert!(attach(&host, "fast", None).is_err());
     }
 
     #[test]

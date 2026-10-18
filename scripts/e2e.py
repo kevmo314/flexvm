@@ -1025,6 +1025,31 @@ def containers():
     logdir = os.path.join(A.run_dir, "vms")
     check("rename: its log moved", os.path.exists(os.path.join(logdir, f"{renamed}.log")) and not os.path.exists(os.path.join(logdir, f"{vm}.log")),
           os.listdir(logdir))
+    # A separate exec client, its vm renamed under it: it reattaches under the new name after a checkpoint
+    # resets vsock, and interrupted, it stops its command there.
+    moved = renamed + "-x"
+    A.vms.add(moved)
+    cli = [BIN, "--state", A.state_dir, "--run", A.run_dir, "exec"]
+    e = subprocess.Popen(cli + [renamed, "sh", "-c", "sleep 4; echo exec-done"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+    time.sleep(1)
+    A.cli("rename", renamed, moved)
+    path = ckpt_dir(moved)
+    A.cli("checkpoint", moved, path)
+    shutil.rmtree(path, ignore_errors=True)
+    out, err = e.communicate(timeout=120)
+    check("rename: a separate exec client reattaches under the new name", e.returncode == 0 and out == "exec-done\n", (e.returncode, out, err[-500:]))
+    sleeping = lambda n: A.exec(n, "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline; echo; done | grep -cx 'sleep 4321 '")[1].strip() == "1"
+    e = subprocess.Popen(cli + [moved, "sleep", "4321"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+    try:
+        check("exec: its command runs", wait_for(lambda: sleeping(moved), 30))
+        A.cli("rename", moved, renamed)
+        e.send_signal(signal.SIGINT)
+        _, err = e.communicate(timeout=30)
+        check("rename: an interrupted exec client stops its command under the new name", wait_for(lambda: not sleeping(renamed), 15), err[-500:])
+    finally:
+        if e.poll() is None:
+            e.kill()
+            e.wait()
     # Refused while a checkpoint holds the vm.
     fill(A, renamed, 32)
     A.cli("debug", "fault", "ckpt_crawl", "120000")
@@ -1258,6 +1283,42 @@ def interactive():
     finally:
         p.close()
 
+    # run -i of an app that ends at once: its status, however soon its VM is gone (even before the first connection).
+    for i, (cmd, want) in enumerate([("true", 0), ("exit 3", 3)] * 3):
+        n = f"e2e-run-i-{i}"
+        A.vms.add(n)
+        r = A.cli("run", "-i", "--name", n, t, "sh", "-c", cmd, check=False, stdin=subprocess.DEVNULL, timeout=120)
+        check(f"run -i {cmd!r}: its app's status", r.returncode == want, (r.returncode, r.stderr[-500:]))
+
+    # An attach whose vm is killed and made again under the name: it never reaches the new one, nor sends it
+    # stdin. Stopped meanwhile, so that it reconnects only once the new one runs.
+    vm = "e2e-attach-again"
+    A.vms.add(vm)
+    r = json.loads(A.cli("run", "--name", vm, "-d", "-i", t, "sh").stdout)
+    A.pids.add((r["pid"], r["start"]))
+    att = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "attach", vm], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=ENV)
+    try:
+        att.stdin.write(b"touch /tmp/first\n")
+        att.stdin.flush()
+        check("attach -i: stdin reaches the app", wait_for(lambda: A.exec(vm, "test -e /tmp/first")[0] == 0, 30))
+        os.kill(att.pid, signal.SIGSTOP)
+        A.kill(vm)
+        r = json.loads(A.cli("run", "--name", vm, "-d", "-i", t, "sh").stdout)
+        A.pids.add((r["pid"], r["start"]))
+        att.stdin.write(b"touch /tmp/leaked\n")
+        att.stdin.flush()
+        os.kill(att.pid, signal.SIGCONT)
+        _, err = att.communicate(timeout=60)
+        time.sleep(1)
+        check("attach: ends once its vm is replaced", att.returncode != 0, (att.returncode, err[-500:]))
+        check("attach: the new vm under the name gets none of its stdin", A.exec(vm, "test -e /tmp/leaked")[0] != 0)
+    finally:
+        if att.poll() is None:
+            att.kill()
+            att.wait()
+    A.kill(vm)
+
     # run -d -it, then attach; detach and attach again; on B after a migration.
     vm = "e2e-attach"
     A.vms.add(vm)
@@ -1342,6 +1403,13 @@ def copy():
     code, out, _ = A.exec(vm, "sha256sum < /tmp/from-stdin/tree/sub/big")
     check("cp in from -: a tar unpacked into the directory",
           r.returncode == 0 and out.split()[0] == hashlib.sha256(open(os.path.join(src, "sub", "big"), "rb").read()).hexdigest(), (r.stderr, out))
+    # Far more than the guest takes before it fails, into a destination it cannot unpack at: cp fails, never hangs.
+    huge = os.path.join(WORK, "cp-src", "huge")
+    with open(huge, "wb") as f:
+        f.write(os.urandom(16 << 20))
+    start = time.time()
+    r = A.cli("cp", huge, f"{vm}:/no/such/dir/huge", check=False, timeout=60)
+    check("cp in: a failed extraction ends cp", r.returncode != 0 and time.time() - start < 30, (r.returncode, time.time() - start, r.stderr[-300:]))
     r = A.cli("cp", f"{vm}:/tmp/no-such-file", back, check=False)
     check("cp: a missing source fails", r.returncode != 0 and "no-such-file" in r.stderr, r.stderr)
     # The guest's own symlink pointing out, copied out: it stays a link, nothing is written through it.

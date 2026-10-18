@@ -1213,6 +1213,14 @@ impl Host {
 
     /// `rename`: `from`'s claim on `ip` (with `id`, only that instance's) is `to`'s from now on.
     /// Durable: a sweep reads the holder's name (`held`). False if `from` held none.
+    /// The name the VM of `ip`'s generation `gen` has here now, if its claim is recorded: a rename moves
+    /// the claim with the VM (`rename_holder`), so a client that knew it by another name finds it again.
+    /// A record replaced whole needs no lock to be read; the VM found is checked by whoever connects.
+    pub fn holder_of(&self, ip: Ipv4Addr, gen: u64) -> Option<String> {
+        let a = self.read_addr(ip).ok()?;
+        a.holder.filter(|h| a.held == gen && !a.withdrawn && check_name(h).is_ok())
+    }
+
     pub fn rename_holder(&self, l: &Locked, ip: Ipv4Addr, from: &str, to: &str, id: Option<&Ident>) -> Result<bool> {
         self.update(l, ip, true, |a| {
             let ours = a.holder.as_deref() == Some(from) && id.is_none_or(|id| a.holder_id.as_ref() == Some(id));
@@ -5097,6 +5105,21 @@ pub(crate) mod tests {
         std::fs::write(h.addr_path(ip("10.9.0.2")), "").unwrap();
         std::fs::remove_file(h.gens_path()).unwrap();
         assert!(h.addr(&l, ip("10.9.0.2")).is_err());
+    }
+
+    #[test]
+    fn a_renamed_vm_is_found_by_its_address_and_generation() {
+        let (_h_dir, h) = host("holder-of");
+        let l = h.lock().unwrap();
+        let c = h.claim_new(&l, "old", None).unwrap();
+        let (x, gen) = (c.ip, c.gen);
+        assert_eq!(h.holder_of(x, gen).as_deref(), Some("old"));
+        assert!(h.rename_holder(&l, x, "old", "new", None).unwrap());
+        assert_eq!(h.holder_of(x, gen).as_deref(), Some("new"));
+        // Another generation of the address is another VM: not this one under another name.
+        assert_eq!(h.holder_of(x, gen + 1), None);
+        assert_eq!(h.holder_of(ip("10.9.9.9"), gen), None);
+        c.keep();
     }
 
     #[test]

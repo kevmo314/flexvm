@@ -7,8 +7,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 const BLOCK: usize = 512;
@@ -127,6 +126,9 @@ fn write_header(out: &mut dyn Write, h: &Header) -> io::Result<()> {
 
 /// Writes a tar of `src` (resolved in this process's filesystem) to `out`, docker cp's way: the top entry is named
 /// `basename(src)`, or `.` (its contents) when `src` ends in `/.`. A symlink is archived as a link, unless `src` ends in `/`.
+/// Below `src` nothing is followed or opened by name twice: each entry is opened once from its directory's fd,
+/// without following a link (`O_PATH | O_NOFOLLOW`), typed by `fstat` of that fd, and read from that very inode.
+/// One swapped for a link meanwhile is archived as what it was when opened, or as the link, never as its target.
 pub fn create(src: &str, out: &mut dyn Write) -> io::Result<()> {
     let (path, name, follow) = match src.strip_suffix("/.").or((src == ".").then_some("")) {
         Some(dir) => (
@@ -151,59 +153,189 @@ pub fn create(src: &str, out: &mut dyn Write) -> io::Result<()> {
             (path, base, src.ends_with('/'))
         }
     };
-    let meta = if follow || name == "." { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) }.map_err(|e| with(src, e))?;
-    if name == "." && !meta.is_dir() {
+    // The path the user gave is resolved as given; only its last component is not followed, unless asked.
+    let nofollow = if follow || name == "." { 0 } else { libc::O_NOFOLLOW };
+    let node = Node::open(libc::AT_FDCWD, &cstr(path.as_bytes())?, nofollow).map_err(|e| with(src, e))?;
+    if name == "." && node.kind() != libc::S_IFDIR {
         return Err(with(src, io::Error::from_raw_os_error(libc::ENOTDIR)));
     }
-    walk(out, Path::new(path), name.into_bytes(), &meta)?;
+    walk(out, node, Path::new(path), name.into_bytes())?;
     out.write_all(&[0; BLOCK * 2])?;
     out.flush()
 }
 
-fn walk(out: &mut dyn Write, path: &Path, name: Vec<u8>, meta: &std::fs::Metadata) -> io::Result<()> {
-    let ft = meta.file_type();
-    let mut h = Header { path: name, mode: meta.mode(), uid: meta.uid().into(), gid: meta.gid().into(), mtime: meta.mtime(), ..Default::default() };
-    if ft.is_dir() {
-        let mut entries = std::fs::read_dir(path).and_then(|d| d.collect::<io::Result<Vec<_>>>()).map_err(|e| with(path.display(), e))?;
-        entries.sort_by_key(|e| e.file_name());
-        let mut dir = h.clone();
-        (dir.kind, dir.path) = (b'5', [&h.path[..], b"/"].concat());
-        write_header(out, &dir)?;
-        for e in entries {
-            let p = e.path();
-            let m = std::fs::symlink_metadata(&p).map_err(|e| with(p.display(), e))?;
-            walk(out, &p, [&h.path[..], b"/", e.file_name().as_bytes()].concat(), &m)?;
+/// Where `walk` is, for a test to change the tree under it (`tests::race`).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// An entry's name was read from its directory; it is not opened yet.
+    Listed,
+    /// It is opened (`O_PATH`) and typed; its contents are not read yet.
+    Typed,
+}
+
+#[cfg(test)]
+type Hook = Box<dyn FnMut(Step, &Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static HOOK: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
+}
+
+fn hook(_step: Step, _path: &Path) {
+    #[cfg(test)]
+    HOOK.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f(_step, _path)
         }
-        return Ok(());
+    });
+}
+
+fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    os(unsafe { libc::fstat(fd, &mut st) })?;
+    Ok(st)
+}
+
+/// An entry opened `O_PATH` (no link followed but where asked), and what it was when opened.
+struct Node {
+    fd: OwnedFd,
+    st: libc::stat,
+}
+
+impl Node {
+    fn open(dir: RawFd, name: &CString, nofollow: libc::c_int) -> io::Result<Node> {
+        let fd = os(unsafe { libc::openat(dir, name.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | nofollow) })?;
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let st = fstat(fd.as_raw_fd())?;
+        Ok(Node { fd, st })
     }
-    if ft.is_file() {
-        let mut f = File::open(path).map_err(|e| with(path.display(), e))?;
-        (h.kind, h.size) = (b'0', meta.len());
-        write_header(out, &h)?;
-        let n = io::copy(&mut (&mut f).take(h.size), out).map_err(|e| with(path.display(), e))?;
-        // A file that shrank meanwhile is padded to the size its header says.
-        return zeros(out, padded(h.size) - n);
+
+    fn kind(&self) -> libc::mode_t {
+        self.st.st_mode & libc::S_IFMT
     }
-    h.kind = match () {
-        _ if ft.is_symlink() => {
-            h.link = std::fs::read_link(path)?.into_os_string().into_vec();
-            b'2'
-        }
-        _ if ft.is_fifo() => b'6',
-        _ if ft.is_char_device() || ft.is_block_device() => {
-            h.dev = (libc::major(meta.rdev()), libc::minor(meta.rdev()));
-            if ft.is_char_device() {
-                b'3'
-            } else {
-                b'4'
+
+    /// The node itself opened for reading (`O_PATH` cannot read). A directory through itself; a file through its
+    /// /proc magic link, which is the inode this fd holds, whatever its name is now (no other node of that name is
+    /// opened: a device put there is never opened). Either way its metadata is the opened fd's.
+    fn read(&self) -> io::Result<(OwnedFd, libc::stat)> {
+        let fd = match self.kind() {
+            libc::S_IFDIR => os(unsafe { libc::openat(self.fd.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })?,
+            _ => {
+                let proc = cstr(format!("/proc/self/fd/{}", self.fd.as_raw_fd()).as_bytes())?;
+                os(unsafe { libc::open(proc.as_ptr(), libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC) })?
             }
+        };
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let st = fstat(fd.as_raw_fd())?;
+        if st.st_mode & libc::S_IFMT != self.kind() || (st.st_dev, st.st_ino) != (self.st.st_dev, self.st.st_ino) {
+            return Err(io::Error::other("changed while it was archived"));
         }
-        _ => {
-            warn!("flexvm: cp: skipping {} (a socket)", path.display());
-            return Ok(());
+        Ok((fd, st))
+    }
+}
+
+/// The names in the directory open at `d`, sorted, without `.` and `..`.
+fn names(d: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
+    // Its own descriptor (closedir closes it), reading from the start.
+    let dup = os(unsafe { libc::openat(d.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })?;
+    let dir = unsafe { libc::fdopendir(dup) };
+    if dir.is_null() {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(dup) };
+        return Err(e);
+    }
+    let mut v = Vec::new();
+    let res = loop {
+        // Only errno tells the end from an error.
+        unsafe { *libc::__errno_location() = 0 };
+        let ent = unsafe { libc::readdir(dir) };
+        if ent.is_null() {
+            let e = io::Error::last_os_error();
+            break if e.raw_os_error() == Some(0) { Ok(()) } else { Err(e) };
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            v.push(name.to_vec());
         }
     };
-    write_header(out, &h)
+    unsafe { libc::closedir(dir) };
+    res?;
+    v.sort();
+    Ok(v)
+}
+
+fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>) -> io::Result<()> {
+    let header = |st: &libc::stat, path: Vec<u8>| Header {
+        path,
+        mode: st.st_mode,
+        uid: st.st_uid.into(),
+        gid: st.st_gid.into(),
+        mtime: st.st_mtime,
+        ..Default::default()
+    };
+    hook(Step::Typed, path);
+    match node.kind() {
+        libc::S_IFDIR => {
+            let (d, st) = node.read().map_err(|e| with(path.display(), e))?;
+            let entries = names(&d).map_err(|e| with(path.display(), e))?;
+            let h = header(&st, name);
+            let mut dir = h.clone();
+            (dir.kind, dir.path) = (b'5', [&h.path[..], b"/"].concat());
+            write_header(out, &dir)?;
+            for e in entries {
+                let p = path.join(std::ffi::OsStr::from_bytes(&e));
+                hook(Step::Listed, &p);
+                let child = match Node::open(d.as_raw_fd(), &cstr(&e)?, libc::O_NOFOLLOW) {
+                    // Gone since it was listed: as if it had never been there.
+                    Err(err) if err.raw_os_error() == Some(libc::ENOENT) => continue,
+                    r => r.map_err(|err| with(p.display(), err))?,
+                };
+                walk(out, child, &p, [&h.path[..], b"/", &e].concat())?;
+            }
+            Ok(())
+        }
+        libc::S_IFREG => {
+            let (fd, st) = node.read().map_err(|e| with(path.display(), e))?;
+            let mut f = File::from(fd);
+            let mut h = header(&st, name);
+            (h.kind, h.size) = (b'0', st.st_size as u64);
+            write_header(out, &h)?;
+            let n = io::copy(&mut (&mut f).take(h.size), out).map_err(|e| with(path.display(), e))?;
+            // A file that shrank meanwhile is padded to the size its header says.
+            zeros(out, padded(h.size) - n)
+        }
+        kind => {
+            let mut h = header(&node.st, name);
+            h.kind = match kind {
+                libc::S_IFLNK => {
+                    // The link this fd holds (an empty name: the fd's own node).
+                    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+                    let n = unsafe { libc::readlinkat(node.fd.as_raw_fd(), c"".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+                    if n < 0 {
+                        return Err(with(path.display(), io::Error::last_os_error()));
+                    }
+                    buf.truncate(n as usize);
+                    h.link = buf;
+                    b'2'
+                }
+                libc::S_IFIFO => b'6',
+                libc::S_IFCHR | libc::S_IFBLK => {
+                    h.dev = (libc::major(node.st.st_rdev), libc::minor(node.st.st_rdev));
+                    if kind == libc::S_IFCHR {
+                        b'3'
+                    } else {
+                        b'4'
+                    }
+                }
+                _ => {
+                    warn!("flexvm: cp: skipping {} (a socket)", path.display());
+                    return Ok(());
+                }
+            };
+            write_header(out, &h)
+        }
+    }
 }
 
 struct Reader<'a> {
@@ -623,7 +755,8 @@ pub fn tool_main(args: &[String]) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
     struct Tmp(PathBuf);
@@ -758,6 +891,72 @@ mod tests {
         assert!(std::fs::symlink_metadata(t.0.join("dst/tolink")).unwrap().file_type().is_symlink());
         unpack_to(&tar_of(&format!("{}/", t.s("tolink"))), Dest::Cp(&t.s("followed"))).unwrap();
         assert_eq!(std::fs::read(t.0.join("followed/a/b/c.txt")).unwrap(), b"hello\n");
+    }
+
+    /// Archives `src` with `swap` run once, at `step` of the entry at `at`; returns the archive's entries' names and data.
+    fn race(src: &str, at: &Path, step: Step, swap: impl FnOnce() + 'static) -> Vec<(Vec<u8>, u8, Vec<u8>)> {
+        let (at, mut swap) = (at.to_path_buf(), Some(swap));
+        HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |s, p| {
+                if s == step && p == at {
+                    if let Some(f) = swap.take() {
+                        f();
+                    }
+                }
+            }))
+        });
+        let tar = tar_of(src);
+        HOOK.with(|h| h.borrow_mut().take());
+        let (mut r, mut got) = (&tar[..], Vec::new());
+        let mut rd = Reader { r: &mut r, left: 0 };
+        while let Some(h) = rd.next().unwrap() {
+            let mut data = Vec::new();
+            rd.data(h.size, &mut data).unwrap();
+            got.push((h.path, h.kind, if h.kind == b'2' { h.link } else { data }));
+        }
+        got
+    }
+
+    #[test]
+    fn a_link_swapped_in_while_archiving_is_never_followed() {
+        let t = Tmp::new("race");
+        let (src, secret) = (t.s("src"), t.s("secret"));
+        std::fs::create_dir_all(format!("{src}/d")).unwrap();
+        std::fs::write(&secret, "the secret").unwrap();
+        std::fs::create_dir(t.s("elsewhere")).unwrap();
+        std::fs::write(t.0.join("elsewhere/hidden"), "the secret too").unwrap();
+        let leaked = |got: &[(Vec<u8>, u8, Vec<u8>)]| got.iter().any(|(_, _, d)| d.windows(10).any(|w| w == b"the secret"));
+        let (f, d) = (t.0.join("src/f"), t.0.join("src/d"));
+        let swap = |victim: &Path, to: &str| {
+            let (victim, to) = (victim.to_path_buf(), to.to_string());
+            move || {
+                if victim.is_dir() {
+                    std::fs::remove_dir_all(&victim).unwrap();
+                } else {
+                    std::fs::remove_file(&victim).unwrap();
+                }
+                symlink(&to, &victim).unwrap();
+            }
+        };
+
+        // Opened and typed as a file, then swapped for a link to the secret: its own contents still.
+        std::fs::write(&f, "mine").unwrap();
+        let got = race(&src, &f, Step::Typed, swap(&f, &secret));
+        assert!(!leaked(&got), "{got:?}");
+        assert!(got.iter().any(|(p, k, d)| p == b"src/f" && *k == b'0' && d == b"mine"), "{got:?}");
+
+        // Swapped after it was listed, before it was opened: the link is archived, as a link.
+        std::fs::remove_file(&f).unwrap();
+        std::fs::write(&f, "mine").unwrap();
+        let got = race(&src, &f, Step::Listed, swap(&f, &secret));
+        assert!(!leaked(&got), "{got:?}");
+        assert!(got.iter().any(|(p, k, l)| p == b"src/f" && *k == b'2' && l == secret.as_bytes()), "{got:?}");
+
+        // A directory typed, then swapped for a link to another: the one it was is listed, nothing of the other.
+        std::fs::write(d.join("inner"), "inner").unwrap();
+        let got = race(&src, &d, Step::Typed, swap(&d, &t.s("elsewhere")));
+        assert!(!leaked(&got), "{got:?}");
+        assert!(!got.iter().any(|(p, ..)| p.ends_with(b"hidden")), "{got:?}");
     }
 
     #[test]
