@@ -104,7 +104,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
 }
 
 #[derive(Clone)]
-struct Conf {
+pub(crate) struct Conf {
     argv: Vec<String>,
     env: Vec<(String, String)>,
     cwd: String,
@@ -157,12 +157,7 @@ fn with_settings(c: &Conf, text: &str) -> io::Result<Conf> {
         let (k, v) = line.split_once(' ').unwrap_or((line, ""));
         match k {
             "arg" => argv.get_or_insert_with(Vec::new).push(unescape(v)),
-            "env" => {
-                let kv = unescape(v);
-                let (k, v) = kv.split_once('=').unwrap_or((&kv, ""));
-                c.env.retain(|(e, _)| e != k);
-                c.env.push((k.into(), v.into()));
-            }
+            "env" => set_env(&mut c, &unescape(v)),
             _ => return Err(io::Error::other(format!("unknown app setting {k:?}"))),
         }
     }
@@ -170,6 +165,13 @@ fn with_settings(c: &Conf, text: &str) -> io::Result<Conf> {
         c.argv = argv;
     }
     Ok(c)
+}
+
+/// `K=V` (or a bare `K`, empty) in place of `c`'s `K`: a run's `-e`, and an exec's on top of it.
+fn set_env(c: &mut Conf, kv: &str) {
+    let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+    c.env.retain(|(e, _)| e != k);
+    c.env.push((k.into(), v.into()));
 }
 
 fn unhex(hex: &str) -> Option<Vec<u8>> {
@@ -182,39 +184,54 @@ fn command<S: AsRef<std::ffi::OsStr>>(c: &Conf, argv: &[S]) -> Command {
     cmd
 }
 
-/// Exec inherits the image's environment, directory and credentials; overrides affect only this child.
-/// A user missing from the guest's /etc/passwd (as pull resolves the image's), or a directory that is
-/// not one, is the command's failure (126), as with docker exec.
-pub(crate) fn configure_exec(cmd: &mut Command, env: &[String], cwd: Option<&str>, user: Option<&str>) -> io::Result<()> {
+/// The configuration the app was last started with (the image's and the run's settings): what an exec
+/// inherits, as docker exec does a container's. The image's until an app is started.
+static RUN: Mutex<Option<Conf>> = Mutex::new(None);
+
+/// An exec's command: argv with no shell, run as the app is (its environment, directory and
+/// credentials, without its own session), with `-u`, `-w` and `-e` overriding those for it alone. Its
+/// credentials are `exec_credentials`', applied once the caller has done what needs root (its cgroup).
+pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)> {
+    let base = RUN.lock().unwrap().clone();
+    let base = match base {
+        Some(c) => c,
+        None => config()?.clone(),
+    };
     let read = |p| std::fs::read_to_string(p).unwrap_or_default();
-    let c = exec_conf(config()?.clone(), cwd, user, &read("/etc/passwd"), &read("/etc/group"))?;
-    configure_exec_with(cmd, &c, env, cwd)
+    let c = exec_conf(base, e, &read("/etc/passwd"), &read("/etc/group"))?;
+    Ok((command(&c, &e.argv), c))
 }
 
-fn exec_conf(mut c: Conf, cwd: Option<&str>, user: Option<&str>, passwd: &str, group: &str) -> io::Result<Conf> {
-    if let Some(user) = user {
+pub(crate) fn exec_credentials(cmd: &mut Command, c: &Conf) {
+    credentials(cmd, c, false);
+}
+
+/// A user missing from the guest's /etc/passwd (resolved as pull resolves the image's), or a directory
+/// that is not one, is the command's failure (126), as with docker exec.
+fn exec_conf(mut c: Conf, e: &crate::proto::Exec, passwd: &str, group: &str) -> io::Result<Conf> {
+    if e.argv.first().is_none_or(|p| p.is_empty()) {
+        return Err(io::Error::other("exec needs CMD"));
+    }
+    if let Some(user) = &e.user {
         let (uid, gid, home, groups) = resolve_user(user, passwd, group).map_err(|e| cannot_run(126, e))?;
         (c.uid, c.gid, c.groups) = (uid, gid, groups);
         // Pull set HOME for the image's user; this one's is the passwd entry's, unless -e names one.
-        c.env.retain(|(k, _)| k != "HOME");
-        c.env.push(("HOME".into(), home));
+        set_env(&mut c, &format!("HOME={home}"));
     }
-    let dir = cwd.unwrap_or(&c.cwd);
-    if !std::fs::metadata(dir).is_ok_and(|m| m.is_dir()) {
-        let why = std::fs::metadata(dir).map_or_else(|e| e.to_string(), |_| "not a directory".into());
-        return Err(cannot_run(126, format!("cannot change to directory {dir}: {why}")));
+    for kv in &e.env {
+        if kv.split_once('=').is_none_or(|(k, _)| k.is_empty()) {
+            return Err(io::Error::other(format!("exec env needs K=V: {kv:?}")));
+        }
+        set_env(&mut c, kv);
+    }
+    if let Some(dir) = &e.workdir {
+        c.cwd = dir.clone();
+    }
+    if !std::fs::metadata(&c.cwd).is_ok_and(|m| m.is_dir()) {
+        let why = std::fs::metadata(&c.cwd).map_or_else(|e| e.to_string(), |_| "not a directory".into());
+        return Err(cannot_run(126, format!("cannot change to directory {}: {why}", c.cwd)));
     }
     Ok(c)
-}
-
-fn configure_exec_with(cmd: &mut Command, c: &Conf, env: &[String], cwd: Option<&str>) -> io::Result<()> {
-    cmd.env_clear().envs(c.env.iter().map(|(k, v)| (k, v))).current_dir(cwd.unwrap_or(&c.cwd));
-    for kv in env {
-        let (k, v) = kv.split_once('=').filter(|(k, _)| !k.is_empty()).ok_or_else(|| io::Error::other("exec env needs K=V"))?;
-        cmd.env(k, v);
-    }
-    credentials(cmd, c, false);
-    Ok(())
 }
 
 /// Runs a readiness command as the app would (`ok`, `exit <code>` or `timeout`) in its own cgroup, killed,
@@ -409,6 +426,7 @@ fn start(settings: &str, statuses: &Statuses) -> io::Result<i32> {
     }
     restrict(&mut cmd, c);
     let (pid, _) = launch(&mut app, &mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
+    *RUN.lock().unwrap() = Some(c.clone());
     app.push(format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
     Ok(pid)
 }
@@ -512,32 +530,51 @@ mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
 
+    fn exec(argv: &[&str], env: &[&str], workdir: Option<&str>, user: Option<&str>) -> crate::proto::Exec {
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        crate::proto::Exec { argv: strings(argv), env: strings(env), workdir: workdir.map(String::from), user: user.map(String::from), detach: false }
+    }
+
     #[test]
-    fn exec_inherits_image_defaults_and_applies_env_and_directory_overrides() {
-        let c = parse_conf("arg /app\nenv K=image\nenv KEEP=yes\ncwd /srv\nuid 1000\ngid 2000\ngroups 2000 42\n").unwrap();
-        let mut cmd = Command::new("true");
-        configure_exec_with(&mut cmd, &c, &["K=first".into(), "K=last=two".into(), "EMPTY=".into()], Some("/tmp")).unwrap();
-        assert_eq!(cmd.get_current_dir().unwrap(), std::path::Path::new("/tmp"));
+    fn exec_inherits_the_runs_settings_and_overrides_env_and_directory() {
+        let image = parse_conf("arg /app\nenv K=image\nenv KEEP=yes\ncwd /\nuid 1000\ngid 2000\ngroups 2000 42\n").unwrap();
+        // As docker exec sees a container's `run -e`.
+        let run = with_settings(&image, "env KEEP=run\n").unwrap();
+        let c = exec_conf(run.clone(), &exec(&["true"], &["K=first", "K=last=two", "EMPTY="], Some("/tmp"), None), "", "").unwrap();
+        assert_eq!(c.cwd, "/tmp");
+        assert_eq!(c.env, [("KEEP".into(), "run".into()), ("K".into(), "last=two".into()), ("EMPTY".into(), "".into())]);
+        assert_eq!((c.uid, c.gid, c.groups.clone()), (1000, 2000, vec![2000, 42]));
+        let cmd = command(&c, &["true"]);
         let env: std::collections::BTreeMap<_, _> = cmd.get_envs().map(|(k, v)| (k.to_str().unwrap(), v.unwrap().to_str().unwrap())).collect();
-        assert_eq!(env, [("EMPTY", ""), ("K", "last=two"), ("KEEP", "yes")].into());
-        let mut inherited = Command::new("true");
-        configure_exec_with(&mut inherited, &c, &[], None).unwrap();
-        assert_eq!(inherited.get_current_dir().unwrap(), std::path::Path::new("/srv"));
-        assert_eq!(c.env[0], ("K".into(), "image".into()));
-        assert!(configure_exec_with(&mut Command::new("true"), &c, &["BAD".into()], None).is_err());
+        assert_eq!(env, [("EMPTY", ""), ("K", "last=two"), ("KEEP", "run")].into());
+        assert_eq!(exec_conf(run.clone(), &exec(&["true"], &[], None, None), "", "").unwrap().cwd, "/");
+        for bad in [exec(&["true"], &["BAD"], None, None), exec(&["true"], &["=x"], None, None), exec(&[], &[], None, None), exec(&[""], &[], None, None)] {
+            assert!(exec_conf(run.clone(), &bad, "", "").is_err());
+        }
+    }
+
+    #[test]
+    fn exec_runs_argv_without_a_shell() {
+        let words = ["/usr/bin/printf", "%s\n", "a b", "", "$HOME", "x; echo wrong", "'quoted'"];
+        let c = parse_conf("cwd /\n").unwrap();
+        let output = command(&c, &words).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"a b\n\n$HOME\nx; echo wrong\n'quoted'\n");
     }
 
     #[test]
     fn exec_as_another_user_gets_its_home_and_bad_users_or_directories_cannot_run() {
         let c = parse_conf("arg /app\nenv HOME=/root\nenv K=v\ncwd /\n").unwrap();
         let passwd = "nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n";
-        let n = exec_conf(c.clone(), Some("/tmp"), Some("nobody"), passwd, "").unwrap();
+        let n = exec_conf(c.clone(), &exec(&["id"], &[], Some("/tmp"), Some("nobody")), passwd, "").unwrap();
         assert_eq!((n.uid, n.gid, n.groups.clone()), (65534, 65534, vec![65534]));
         assert_eq!(n.env, [("K".into(), "v".into()), ("HOME".into(), "/nonexistent".into())]);
-        assert_eq!(exec_conf(c.clone(), None, None, passwd, "").unwrap().env, c.env);
+        let h = exec_conf(c.clone(), &exec(&["id"], &["HOME=/h"], None, Some("nobody")), passwd, "").unwrap();
+        assert_eq!(h.env.last().unwrap(), &("HOME".into(), "/h".into()), "-e HOME wins");
+        assert_eq!(exec_conf(c.clone(), &exec(&["id"], &[], None, None), passwd, "").unwrap().env, c.env);
         let status = format!("{}126", crate::proto::EXIT_STATUS);
         for (cwd, user) in [(Some("/nonexistent-flexvm-dir"), None), (Some("/etc/passwd"), None), (None, Some("missing"))] {
-            let e = exec_conf(c.clone(), cwd, user, passwd, "").err().unwrap();
+            let e = exec_conf(c.clone(), &exec(&["id"], &[], cwd, user), passwd, "").err().unwrap();
             assert!(e.to_string().ends_with(&status), "{e}");
         }
     }

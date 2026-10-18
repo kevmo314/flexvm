@@ -494,16 +494,6 @@ pub(crate) fn cannot_run(code: i32, e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("{e}{}{code}", crate::proto::EXIT_STATUS))
 }
 
-fn argv_command(argv: &[String]) -> io::Result<Command> {
-    let program = argv.first().filter(|s| !s.is_empty()).ok_or_else(|| io::Error::other("exec needs CMD"))?;
-    if argv.iter().any(|s| s.contains('\0')) {
-        return Err(io::Error::other("command contains a nul byte"));
-    }
-    let mut cmd = Command::new(program);
-    cmd.args(&argv[1..]);
-    Ok(cmd)
-}
-
 /// The fd the shell sources the command from; dash takes only single-digit fds in redirections.
 const SCRIPT_FD: i32 = 9;
 
@@ -560,9 +550,9 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             table.admit(statuses)?;
             let command = std::str::from_utf8(command).map_err(io::Error::other)?;
             let spec = argv.then(|| crate::proto::Exec::decode(command).map_err(io::Error::other)).transpose()?;
-            let mut cmd = match &spec {
-                Some(spec) => argv_command(&spec.argv)?,
-                None => shell_command(command)?,
+            let (mut cmd, exec) = match &spec {
+                Some(spec) => crate::app::exec_command(spec).map(|(cmd, c)| (cmd, Some(c)))?,
+                None => (shell_command(command)?, None),
             };
             let detached = spec.as_ref().is_some_and(|s| s.detach);
             let output = session(Output { detached, gone: detached.then(awake), ..table.new_output() });
@@ -592,8 +582,9 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             if let Some(work) = crate::mem::work_procs() {
                 crate::mem::enter(&mut cmd, work, false);
             }
-            if let Some(spec) = &spec {
-                crate::app::configure_exec(&mut cmd, &spec.env, spec.workdir.as_deref(), spec.user.as_deref())?;
+            // After entering the cgroup, which needs root.
+            if let Some(c) = &exec {
+                crate::app::exec_credentials(&mut cmd, c);
             }
             // argv commands also work in images without a shell.
             let (child, exited, token) = spawn_watched(&mut cmd, statuses, true).map_err(|e| {
@@ -824,14 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn argv_runs_without_a_shell_and_preserves_literal_arguments() {
-        let words = ["/usr/bin/printf", "%s\n", "a b", "", "$HOME", "x; echo wrong", "'quoted'"].map(String::from);
-        let output = argv_command(&words).unwrap().output().unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"a b\n\n$HOME\nx; echo wrong\n'quoted'\n");
-        assert!(argv_command(&[]).is_err());
-        assert!(argv_command(&["".into()]).is_err());
-        assert!(argv_command(&["true".into(), "\0".into()]).is_err());
+    fn argv_requests_are_parsed() {
         assert!(matches!(parse("ARGV abc 10").unwrap(), Request::Start { argv: true, len: 10, .. }));
         assert!(parse("ARGV abc 1048577").is_err());
     }
