@@ -122,12 +122,16 @@ pub fn command_body(cmd: &serde_json::Value) -> Result<String> {
     let strings = |k: &str| -> Result<Vec<String>> {
         cmd[k].as_array().map_or(Ok(vec![]), |a| a.iter().map(|v| v.as_str().map(String::from).ok_or_else(|| format!("bad exec {k}").into())).collect())
     };
+    let size = cmd["size"].as_array().and_then(|s| Some((u16::try_from(s.first()?.as_u64()?).ok()?, u16::try_from(s.get(1)?.as_u64()?).ok()?)));
     let e = Exec {
         argv: strings("argv")?,
         env: strings("env")?,
         workdir: cmd["workdir"].as_str().map(String::from),
         user: cmd["user"].as_str().map(String::from),
         detach: cmd["detach"] == true,
+        stdin: cmd["stdin"] == true,
+        tty: cmd["tty"] == true,
+        size,
     };
     Ok(e.encode()?)
 }
@@ -402,6 +406,11 @@ pub fn quiesce(uds: &Path) -> Result<()> {
 }
 
 /// Frames end with a message `<status> <next offset>`.
+/// `APPIN`: client `stream`'s input for the app's stdin.
+pub fn start_appin(s: UnixStream, stream: u64, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    request_on(s, &format!("APPIN {stream}"), timeout)
+}
+
 pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -> Result<BufReader<UnixStream>> {
     request_on(s, &format!("LOGS {offset} {}", follow as u8), timeout)
 }

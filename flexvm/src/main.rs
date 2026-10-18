@@ -2,6 +2,7 @@
 
 mod app;
 mod artifacts;
+mod attach;
 mod bench;
 mod checkpoint;
 mod compat;
@@ -49,6 +50,9 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      start a VM of IMAGE (pulled first if missing); the process is the VM
       --name NAME                    its name (without: one is made up, as docker does)
       -d, --detach                   in the background: prints {\"name\", \"ip\", \"pid\", ...} once it runs
+      -i, --interactive              keep the app's stdin open, and attach this one to it (with CMD, CMD
+                                     is the app: its argv, as docker's); -t, --tty: on a pty, this terminal
+                                     raw (Ctrl-P Ctrl-Q detaches); with -d, to attach to later
       -p [IP:]HOST_PORT:VM_PORT[/tcp|/udp]
                                      forward a host port here (repeatable; default IP 0.0.0.0, TCP)
       --ip IP                        its address (without: the next free one)
@@ -65,7 +69,11 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --checkpoint DIR               start it from a checkpoint instead of IMAGE (its name and address
                                      unless --name and --ip IP|auto); --paused holds it until unpause
   flexvm ps [-a] [--json]            list running VMs (-a: stopped ones too)
-  flexvm exec [OPTIONS] NAME CMD...  run argv in a VM (-d, -e K=V, -w DIR, -u USER[:GROUP])
+  flexvm exec [OPTIONS] NAME CMD...  run argv in a VM (-d, -e K=V, -w DIR, -u USER[:GROUP]; -i: stdin
+                                     too; -t: on a pty, this terminal raw, Ctrl-P Ctrl-Q detaches)
+  flexvm attach NAME                 a running VM's app: its output from now on, and stdin if run -i
+  flexvm cp SRC DST                  copy files or directories between the host and a VM (NAME:PATH, as
+                                     docker cp; - for a tar on stdin or stdout); into the VM as root
   flexvm stop NAME...                suspend a VM to disk, freeing its memory (as SIGTERM to its process)
   flexvm start [-a] NAME...          resume a stopped VM in the background (-a: in the foreground); an
                                      exited one runs again from its image (its writes were in its memory)
@@ -111,8 +119,25 @@ flexvm fails, 124 when the VM dies; exec returns the command's status, 127 when 
 ";
 
 /// Flags that take no value (`-a`, `-f` and `--standby` depend on the command: `takes_value`).
-const SWITCHES: &[&str] =
-    &["warm", "stop", "paused", "incremental", "incoming", "json", "detach", "all", "attach", "keep", "rm", "help", "version", "quiet", "password-stdin"];
+const SWITCHES: &[&str] = &[
+    "warm",
+    "stop",
+    "paused",
+    "incremental",
+    "incoming",
+    "json",
+    "detach",
+    "interactive",
+    "tty",
+    "all",
+    "attach",
+    "keep",
+    "rm",
+    "help",
+    "version",
+    "quiet",
+    "password-stdin",
+];
 
 /// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`.
 pub struct Args {
@@ -162,16 +187,33 @@ impl Args {
     fn parse_into(&mut self, it: &mut impl Iterator<Item = String>) -> Result<()> {
         let a = self;
         while let Some(arg) = it.next() {
+            let cmd = a.positional.first().map(String::as_str);
+            // `-it`, `-dit`, as docker's.
+            if matches!(cmd, Some("run" | "exec")) && arg.len() > 2 && arg.starts_with('-') && arg[1..].bytes().all(|b| b"dit".contains(&b)) {
+                for b in arg[1..].bytes() {
+                    let f = match b {
+                        b'd' => "detach",
+                        b'i' => "interactive",
+                        _ => "tty",
+                    };
+                    if b != b'd' {
+                        a.child_args.push(format!("-{}", b as char));
+                    }
+                    a.flags.push((f.into(), "1".into()));
+                }
+                continue;
+            }
             if arg != "-d" && arg != "--detach" {
                 a.child_args.push(arg.clone());
             }
-            let cmd = a.positional.first().map(String::as_str);
             let short = match arg.as_str() {
                 "-d" => Some("detach"),
                 "-p" => Some("publish"),
                 "-h" => Some("help"),
                 "-q" => Some("quiet"),
                 "-a" => Some(if cmd == Some("start") { "attach" } else { "all" }),
+                "-i" if matches!(cmd, Some("run" | "exec")) => Some("interactive"),
+                "-t" if matches!(cmd, Some("run" | "exec")) => Some("tty"),
                 // Not reclaim's `--force GEN`.
                 "-f" if matches!(cmd, Some("rm" | "image" | "system")) => Some("force"),
                 _ => None,
@@ -210,7 +252,8 @@ impl Args {
                     a.flags.push(("publish".into(), value));
                 }
                 None if short.is_some() => a.flags.push((short.unwrap_or_default().into(), "1".into())),
-                None if arg.starts_with('-') => bail!("unknown option {arg} (see flexvm --help)"),
+                // `-` alone is a word: cp's stdin or stdout.
+                None if arg.starts_with('-') && arg != "-" => bail!("unknown option {arg} (see flexvm --help)"),
                 None => {
                     a.positional.push(arg);
                     // `exec NAME CMD` and `run IMAGE CMD`: the rest is the command's (a `--` first is dropped).
@@ -253,6 +296,7 @@ fn main() {
     // A panic's message is queued after the lines before it, and written
     // (bounded: a stalled stderr does not keep the process from aborting).
     std::panic::set_hook(Box::new(|p| {
+        attach::restore_terminal();
         let bt = std::backtrace::Backtrace::capture();
         let bt = if bt.status() == std::backtrace::BacktraceStatus::Captured { format!("\nstack backtrace:\n{bt}") } else { String::new() };
         util::log_final(format!("thread '{}' {p}{bt}\n", std::thread::current().name().unwrap_or("<unnamed>")), false);
@@ -308,10 +352,30 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     (
         "run",
         2,
-        &["name", "detach", "ip", "cpus", "memory", "env", "env-file", "entrypoint", "keep", "rm", "checkpoint", "paused", "standby", "incoming", "publish"],
+        &[
+            "name",
+            "detach",
+            "interactive",
+            "tty",
+            "ip",
+            "cpus",
+            "memory",
+            "env",
+            "env-file",
+            "entrypoint",
+            "keep",
+            "rm",
+            "checkpoint",
+            "paused",
+            "standby",
+            "incoming",
+            "publish",
+        ],
     ),
     ("ps", 1, &["all", "json"]),
-    ("exec", 2, &["detach", "env", "workdir", "user"]),
+    ("exec", 2, &["detach", "interactive", "tty", "env", "workdir", "user"]),
+    ("attach", 2, &[]),
+    ("cp", 3, &[]),
     ("stop", NAMES, &[]),
     ("start", NAMES, &["attach"]),
     ("pause", NAMES, &[]),
@@ -352,7 +416,7 @@ fn check_applies(args: &Args) -> Result<()> {
         if let Some(image) = first {
             bail!("run --checkpoint takes no IMAGE ({image:?}): the checkpoint has its own");
         }
-        if let Some(f) = ["env", "env-file", "entrypoint", "keep", "rm"].into_iter().find(|f| args.has(f)) {
+        if let Some(f) = ["env", "env-file", "entrypoint", "keep", "rm", "interactive", "tty"].into_iter().find(|f| args.has(f)) {
             bail!("--{f} does not apply to run --checkpoint: the checkpoint's app runs already");
         }
     } else if cmd == "run" && args.has("paused") {
@@ -360,12 +424,14 @@ fn check_applies(args: &Args) -> Result<()> {
     } else if !internal && first.is_none() {
         match cmd.as_str() {
             "run" | "pull" | "rmi" => bail!("{cmd} needs IMAGE"),
-            "exec" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "checkpoint" | "migrate" => bail!("{cmd} needs NAME"),
+            "exec" | "attach" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "checkpoint" | "migrate" => bail!("{cmd} needs NAME"),
+            "cp" => bail!("cp needs SRC DST"),
             _ => {}
         }
     }
     match cmd.as_str() {
         "tag" if args.names().len() != 2 => bail!("tag needs SRC DST"),
+        "cp" if args.names().len() != 2 => bail!("cp needs SRC DST"),
         "image" if first.map(String::as_str) != Some("prune") => bail!("image needs prune"),
         "system" if !matches!(first.map(String::as_str), Some("prune" | "df")) => bail!("system needs prune or df"),
         "system" if first.map(String::as_str) == Some("df") && args.has("force") => bail!("system df takes no -f"),
@@ -385,8 +451,12 @@ fn check_applies(args: &Args) -> Result<()> {
     if !args.rest.is_empty() && cmd != "run" && cmd != "exec" {
         bail!("{cmd} takes no -- CMD");
     }
-    if cmd == "run" && args.has("keep") && !args.rest.is_empty() {
+    let interactive = args.has("interactive") || args.has("tty");
+    if cmd == "run" && args.has("keep") && !args.rest.is_empty() && !interactive {
         bail!("--keep applies to the image's app: with CMD, the vm ends with CMD");
+    }
+    if cmd == "run" && interactive && args.has("entrypoint") && !args.rest.is_empty() {
+        bail!("-i and -t make CMD the app: give --entrypoint or CMD");
     }
     if cmd == "start" && args.has("attach") && args.names().len() > 1 {
         bail!("start -a takes one NAME");
@@ -467,13 +537,21 @@ fn real_main(args: &Args) -> Result<()> {
             let host = open_host(args)?;
             each(args.names(), |n| match resume(&host, n)? {
                 true => output(format_args!("{n}\n")),
-                false => spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?),
+                false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?)?),
             })
         }
         Some("ps") => ps(&open_host(args)?, args.has("all"), args.has("json")),
         Some("exec") => {
             let cmd = exec_command(args)?;
             util::exit(exec(&open_host(args)?, name, &cmd)?)
+        }
+        Some("attach") => {
+            let host = open_host(args)?;
+            util::exit(attach::attach(&host, name, None)?)
+        }
+        Some("cp") => {
+            let host = open_host(args)?;
+            util::exit(attach::cp(&host, name, arg2.unwrap_or_default())?)
         }
         Some("stop") => {
             let host = open_host(args)?;
@@ -671,7 +749,12 @@ fn run(args: &Args, image: &str) -> Result<()> {
     if std::fs::symlink_metadata(paths.templates.join(&template)).is_err() {
         pull_missing(args, &template)?;
     }
-    let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
+    let interactive = args.has("interactive") || args.has("tty");
+    // With -i or -t, CMD is the app (`run_spec`), which they are for.
+    let cmd = (!args.rest.is_empty() && !interactive).then(|| args.rest.join(" "));
+    if args.has("interactive") && args.has("tty") && !args.has("detach") && !attach::is_tty(0) && std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
+        bail!("the input device is not a TTY");
+    }
     // Only settings for the app need the template's (a standby VM's claim is ~5 ms).
     match spec.changes_app() {
         true => spec.check(template::Template::open(&paths, &template)?.meta.image.as_ref())?,
@@ -705,8 +788,10 @@ fn run_as(
     resources: vm::Resources,
     spec: &app::RunSpec,
 ) -> Result<()> {
+    // A foreground -i or -t runs it in the background, and attaches to it (as `attach`).
+    let attached = (args.has("interactive") || args.has("tty")) && !args.has("detach") && std::env::var_os("FLEXVM_NOTIFY_FD").is_none();
     // A claimed standby VM writes where this process would, to opens made here (`own`).
-    let log = args.has("detach").then(|| log_file(host, &name)).transpose()?;
+    let log = (args.has("detach") || attached).then(|| log_file(host, &name)).transpose()?;
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
@@ -728,6 +813,7 @@ fn run_as(
         unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
     }
     match (taken, log) {
+        (Some(_), Some(_)) if attached => run_attached(host, &name, args.has("keep")),
         (Some((v, _)), Some(_)) => print(v),
         (Some((v, conn)), None) => {
             crate::log!("{v}");
@@ -737,7 +823,11 @@ fn run_as(
         (None, Some(log)) => {
             // The child takes the name made up here.
             let child = [&["--name".to_string(), name.clone()][..], &args.child_args].concat();
-            spawn_detached(host, &name, &child, &log)
+            let v = spawn_detached(host, &name, &child, &log)?;
+            match attached {
+                true => run_attached(host, &name, args.has("keep")),
+                false => print(v),
+            }
         }
         (None, None) => {
             let generated = args.get("name").is_none();
@@ -750,6 +840,20 @@ fn run_as(
             )
         }
     }
+}
+
+/// A foreground `run -i`/`-t`: attached to its app from its first byte, it exits with it. As a foreground run's,
+/// its VM leaves no exited record (unless detached from, when it is a background VM's like any other).
+fn run_attached(host: &Host, name: &str, keep: bool) -> Result<()> {
+    let code = attach::attach(host, name, Some(0))?;
+    let until = Instant::now() + Duration::from_secs(10);
+    while !keep && host.alive(name) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !keep && !host.alive(name) && host.vms(name, "exited")?.exists() {
+        let _ = remove_stopped(host, name, true);
+    }
+    util::exit(code)
 }
 
 fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
@@ -775,8 +879,14 @@ fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec>
             false => env.extend(lookup(&kv).map(|v| format!("{kv}={v}"))),
         }
     }
-    let entrypoint = args.get("entrypoint").map(image::parse_argv).transpose()?;
-    Ok(app::RunSpec { env, entrypoint, keep: args.has("keep"), rm: args.has("rm"), ip, ports: port_specs(args)? })
+    let (stdin, tty) = (args.has("interactive"), args.has("tty"));
+    let entrypoint = match args.get("entrypoint") {
+        Some(e) => Some(image::parse_argv(e)?),
+        // docker's CMD, whole: images' entrypoints are not kept apart from their commands.
+        None if (stdin || tty) && !args.rest.is_empty() => Some(args.rest.clone()),
+        None => None,
+    };
+    Ok(app::RunSpec { env, entrypoint, keep: args.has("keep"), rm: args.has("rm"), ip, ports: port_specs(args)?, stdin, tty })
 }
 
 /// `start` of an exited VM (`app::Exited`): a new run under its name, as its record (read under
@@ -819,7 +929,7 @@ fn run_checkpoint(args: &Args) -> Result<()> {
             Some(name) => name.to_string(),
             None => checkpoint::read_manifest(&dir)?.name,
         };
-        return spawn_detached(&host, &name, &args.child_args, &log_file(&host, &name)?);
+        return print(spawn_detached(&host, &name, &args.child_args, &log_file(&host, &name)?)?);
     }
     vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }
@@ -839,7 +949,7 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
 }
 
 /// Starts `child` (this binary's arguments) in the background, and prints its VM's answer.
-fn spawn_detached(host: &Host, name: &str, child: &[String], log: &std::fs::File) -> Result<()> {
+fn spawn_detached(host: &Host, name: &str, child: &[String], log: &std::fs::File) -> Result<Value> {
     let log_path = host.vms(name, "log")?;
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
     util::spawn_self(child, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
@@ -848,7 +958,7 @@ fn spawn_detached(host: &Host, name: &str, child: &[String], log: &std::fs::File
     if reply["ok"] != json!(true) {
         return Err(reply["error"].as_str().unwrap_or("failed").to_string().into());
     }
-    print(reply["result"].clone())
+    Ok(reply["result"].clone())
 }
 
 fn notify_fd() -> Option<std::fs::File> {
@@ -1389,16 +1499,36 @@ fn exec_command(args: &Args) -> Result<Value> {
     if args.get("workdir").is_some_and(|w| !w.starts_with('/')) {
         bail!("exec -w needs an absolute path");
     }
-    let cmd = json!({"argv": args.rest, "env": env, "workdir": args.get("workdir"), "user": args.get("user"), "detach": args.has("detach")});
+    let (stdin, tty) = (args.has("interactive"), args.has("tty"));
+    // As docker's: a terminal's keys, or none.
+    if stdin && tty && !attach::is_tty(0) {
+        bail!("the input device is not a TTY");
+    }
+    let size = tty.then(attach::size).flatten().map(|(rows, cols)| [rows, cols]);
+    let cmd = json!({"argv": args.rest, "env": env, "workdir": args.get("workdir"), "user": args.get("user"), "detach": args.has("detach"),
+        "stdin": stdin, "tty": tty, "size": size});
     guest::command_body(&cmd)?;
     Ok(cmd)
 }
 
-/// Reattaches when the connection drops (a checkpoint's pause resets vsock).
+/// `-i`: stdin goes to the command; `-t`: on a pty, this terminal raw and its size followed.
 pub fn exec(host: &Host, name: &str, cmd: &Value) -> Result<i32> {
+    let (stdin, tty) = (cmd["stdin"] == true, cmd["tty"] == true);
+    let keys = stdin && tty && attach::is_tty(0);
+    let feed = match cmd["detach"] != true && (stdin || tty) {
+        true => Some(attach::Feed::start(stdin.then(|| Box::new(std::io::stdin()) as Box<dyn Read + Send>), tty, keys, attach::detach_later)?),
+        false => None,
+    };
+    let _raw = keys.then(attach::raw).transpose()?;
+    exec_with(host, name, cmd, &mut std::io::stdout(), feed)
+}
+
+/// Reattaches when the connection drops (a checkpoint's pause resets vsock); `feed`, the command's stdin
+/// (and pty size), is sent again from what the guest took.
+pub fn exec_with(host: &Host, name: &str, cmd: &Value, out: &mut dyn Write, feed: Option<std::sync::Arc<attach::Feed>>) -> Result<i32> {
     let session: &'static Mutex<Session> = Box::leak(Box::new(Mutex::new(Session::new()?)));
     if cmd["detach"] == true {
-        return exec_request(host, name, cmd, session, false);
+        return exec_request(host, name, cmd, session, false, out, None);
     }
     let id = session.lock().unwrap().id.clone();
     let close = {
@@ -1423,6 +1553,7 @@ pub fn exec(host: &Host, name: &str, cmd: &Value) -> Result<i32> {
     // Interrupted, the command is stopped: left running, it would hold one of the guest's session slots.
     let (stop, vm) = (close.clone(), name.to_string());
     util::on_signal(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], move |sig| {
+        attach::restore_terminal();
         // Held until exit, so the stopped command's status is not reported; not waited for long, as
         // a write to a stalled stdout holds it.
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1439,7 +1570,7 @@ pub fn exec(host: &Host, name: &str, cmd: &Value) -> Result<i32> {
         }
         util::raise_signal(sig);
     });
-    let result = exec_request(host, name, cmd, session, false);
+    let result = exec_request(host, name, cmd, session, false, out, feed.as_ref());
     // Completed sessions are acknowledged on their attachment. Errors (including a closed
     // stdout, as with `| head`) still need CLOSE to stop a command that may be running.
     if result.is_err() {
@@ -1458,10 +1589,18 @@ pub fn exec(host: &Host, name: &str, cmd: &Value) -> Result<i32> {
 /// suspend, and its VM goes with it anyway. `patient` (a VM's main command):
 /// a paused or checkpointing VM is waited for even before the command started.
 pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>, patient: bool) -> Result<i32> {
-    exec_request(host, name, &json!(cmd), session, patient)
+    exec_request(host, name, &json!(cmd), session, patient, &mut std::io::stdout(), None)
 }
 
-fn exec_request(host: &Host, name: &str, cmd: &Value, session: &Mutex<Session>, patient: bool) -> Result<i32> {
+fn exec_request(
+    host: &Host,
+    name: &str,
+    cmd: &Value,
+    session: &Mutex<Session>,
+    patient: bool,
+    stdout: &mut dyn Write,
+    feed: Option<&std::sync::Arc<attach::Feed>>,
+) -> Result<i32> {
     // Check the actual wire body before trying the VM.
     guest::fits(&guest::command_body(cmd)?)?;
     let detached = cmd["detach"] == true;
@@ -1478,7 +1617,8 @@ fn exec_request(host: &Host, name: &str, cmd: &Value, session: &Mutex<Session>, 
             }
             (s.started, s.offset)
         };
-        let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
+        let action = if started { "attach" } else { "start" };
+        let req = json!({"op": "exec", "session": id, "action": action, "offset": offset, "cmd": cmd, "interactive": feed.is_some()});
         let at = Instant::now() + Duration::from_secs(5);
         let stream = connect_same(host, name, &req, at, &mut vm).and_then(|c| exec_stream(c, at));
         // Locked per write, never across a read: a checkpoint takes stdout's lock too.
@@ -1497,14 +1637,21 @@ fn exec_request(host: &Host, name: &str, cmd: &Value, session: &Mutex<Session>, 
                     _ => Ok(StreamEnd::Disconnected("lost detached start acknowledgement".into())),
                 };
             }
-            let result = exec_frames(&mut r, session, &mut std::io::stdout(), &mut std::io::stderr(), &mut deadline);
+            // Stopped (and the connection shut down) when dropped, at the end of this attachment.
+            let writer = feed.map(|f| r.get_ref().try_clone().map_err(util::Error::from).and_then(|c| f.serve(c))).transpose()?;
+            let result = exec_frames(&mut r, session, &mut *stdout, &mut std::io::stderr(), &mut deadline, feed);
             if !patient && matches!(result, Ok(StreamEnd::Exit(_))) {
-                let _ = r.get_mut().write_all(&[guest::SESSION_DONE]);
+                match (feed, &writer) {
+                    (Some(f), Some(w)) => f.done(w),
+                    _ => drop(r.get_mut().write_all(&[guest::SESSION_DONE])),
+                }
             }
             result
         }) {
             Ok(Err(e)) => return Err(e),
             Ok(Ok(StreamEnd::Exit(code))) => return Ok(code),
+            // The guest took its IN_DETACH (sent again on each attachment until then): the command runs on.
+            Ok(Ok(StreamEnd::Detached)) => return Ok(0),
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
             Err(e) if e.is::<Replaced>() => return Err(format!("{e} (session {id})").into()),
             Err(e) => {
@@ -1616,11 +1763,19 @@ fn cannot_run(m: &[u8], stderr: &mut impl Write) -> Result<StreamEnd> {
 
 enum StreamEnd {
     Exit(i32),
+    Detached,
     Disconnected(String),
 }
 
 /// Tracks the session's offset so a reattach resumes without duplicates.
-fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant) -> Result<StreamEnd> {
+fn exec_frames(
+    r: &mut impl Read,
+    session: &Mutex<Session>,
+    stdout: &mut dyn Write,
+    stderr: &mut impl Write,
+    deadline: &mut Instant,
+    feed: Option<&std::sync::Arc<attach::Feed>>,
+) -> Result<StreamEnd> {
     let id = session.lock().unwrap().id.clone();
     let mut echoed = false;
     loop {
@@ -1639,6 +1794,10 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
                 s.offset += bytes.len() as u64;
             }
             guest::FRAME_STDOUT | guest::FRAME_STDERR => return Err("session output before session id".into()),
+            guest::FRAME_ACK if s.started => {
+                let taken = u64::from_le_bytes(data.as_slice().try_into().map_err(|_| "bad stdin acknowledgement")?);
+                feed.ok_or("stdin acknowledged, but none was sent")?.ack(taken);
+            }
             guest::FRAME_EXIT => {
                 let code = guest::session_exit(&data, s.offset)?;
                 s.exit = Some(code);
@@ -1656,6 +1815,7 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
                 )
             }
             guest::FRAME_MSG if data == b"waiting" && s.started => {}
+            guest::FRAME_MSG if data == b"detached" && s.started && feed.is_some_and(|f| f.detached()) => return Ok(StreamEnd::Detached),
             // Before the id echo the request itself failed: not retried, unless the guest was only busy
             // (it never took the command, so it is started again).
             guest::FRAME_MSG if !s.started && guest::transient(&String::from_utf8_lossy(&data)) => {
@@ -1681,6 +1841,28 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn interactive_flags_combine_as_dockers() {
+        let args = parse(&["run", "-dit", "--name", "x", "image", "sh", "-it"]);
+        assert!(args.has("detach") && args.has("interactive") && args.has("tty"));
+        assert_eq!(args.rest, ["sh", "-it"], "CMD's own words are its own");
+        assert_eq!(args.child_args, ["run", "-i", "-t", "--name", "x", "image", "sh", "-it"], "a detached run's VM process is not detached again");
+        check_applies(&args).unwrap();
+        let spec = run_spec(&args, None).unwrap();
+        assert!(spec.stdin && spec.tty);
+        assert_eq!(spec.entrypoint.as_deref(), Some(&["sh".to_string(), "-it".to_string()][..]), "with -i or -t, CMD is the app");
+        assert!(run_spec(&parse(&["run", "image", "sh"]), None).unwrap().entrypoint.is_none(), "without, CMD is the vm's command");
+        let exec = parse(&["exec", "-ti", "vm", "bash"]);
+        assert!(exec.has("interactive") && exec.has("tty") && exec.rest == ["bash"]);
+        assert!(check_applies(&parse(&["run", "-it", "--keep", "image", "sh"])).is_ok(), "CMD is the app, which --keep is for");
+        assert!(check_applies(&parse(&["run", "-it", "--entrypoint", "sh", "image", "x"])).is_err());
+        assert!(check_applies(&parse(&["run", "--checkpoint", "/c", "-i"])).is_err());
+        assert!(Args::parse(["ps", "-it"].map(String::from)).is_err());
+        assert!(check_applies(&parse(&["attach"])).unwrap_err().to_string().contains("needs NAME"));
+        check_applies(&parse(&["cp", "-", "vm:/tmp"])).unwrap();
+        assert!(check_applies(&parse(&["cp", "vm:/x"])).unwrap_err().to_string().contains("SRC DST"));
     }
 
     #[test]
@@ -2321,7 +2503,7 @@ mod exec_tests {
         assert_eq!(r.get_ref().timeouts.borrow().as_slice().len(), 2);
         assert_eq!(r.get_ref().timeouts.borrow().last(), Some(&Duration::from_secs(3)));
         let mut stdout = Vec::new();
-        let result = exec_frames(&mut r, &session, &mut stdout, &mut Vec::new(), &mut Instant::now()).unwrap();
+        let result = exec_frames(&mut r, &session, &mut stdout, &mut Vec::new(), &mut Instant::now(), None).unwrap();
         assert!(matches!(result, StreamEnd::Exit(7)));
         assert_eq!(stdout, b"hello");
         assert_eq!(r.get_ref().reads, 1, "reply and frames need just one underlying read");
@@ -2385,7 +2567,7 @@ mod exec_tests {
         first.extend_from_slice(&at(3, b"d"));
         let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
         let (mut stdout, mut stderr, mut deadline) = (Vec::new(), Vec::new(), Instant::now());
-        let mut run = |input: Vec<u8>| exec_frames(&mut input.as_slice(), &session, &mut stdout, &mut stderr, &mut deadline).unwrap();
+        let mut run = |input: Vec<u8>| exec_frames(&mut input.as_slice(), &session, &mut stdout, &mut stderr, &mut deadline, None).unwrap();
         assert!(matches!(run(first), StreamEnd::Disconnected(_)));
         let resumed = frames(&[
             (guest::FRAME_MSG, b"test-id"),
@@ -2402,10 +2584,10 @@ mod exec_tests {
         let session = Mutex::new(Session { id: "test-id".into(), started: true, offset: 5, exit: None });
         // Within one attachment, a closed session is only a lost connection, retried.
         let input = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_MSG, b"error: session closed")]);
-        let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).unwrap();
+        let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now(), None).unwrap();
         assert!(matches!(end, StreamEnd::Disconnected(_)));
         let input = frames(&[(guest::FRAME_MSG, b"error: session closed")]);
-        let e = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).err().unwrap();
+        let e = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now(), None).err().unwrap();
         assert!(e.to_string().contains("after byte 5 of output"), "{e}");
     }
 
@@ -2431,7 +2613,7 @@ mod exec_tests {
             }
         });
         let session = Mutex::new(Session::new().unwrap());
-        assert_eq!(exec_request(&host, "own", &cmd, &session, false).unwrap(), 0);
+        assert_eq!(exec_request(&host, "own", &cmd, &session, false, &mut std::io::stdout(), None).unwrap(), 0);
         server.join().unwrap();
         assert!(!session.lock().unwrap().started);
     }
@@ -2442,12 +2624,12 @@ mod exec_tests {
         // As flexvm-init words it when all its body readers are taken.
         let busy = format!("error: too many commands arriving at once{}", guest::TRY_AGAIN);
         let input = frames(&[(guest::FRAME_MSG, busy.as_bytes())]);
-        let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).unwrap();
+        let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now(), None).unwrap();
         assert!(matches!(end, StreamEnd::Disconnected(ref why) if *why == busy));
         // Never taken by the guest, so the retry starts it again.
         assert!(!session.lock().unwrap().started);
         let input = frames(&[(guest::FRAME_MSG, b"error: too many sessions: 64 commands are running or awaiting their client")]);
-        assert!(exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).is_err());
+        assert!(exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now(), None).is_err());
     }
 
     #[test]
@@ -2457,7 +2639,7 @@ mod exec_tests {
             let refusal = format!("error: cannot run nope: No such file or directory (os error 2){}{code}", guest::EXIT_STATUS);
             let input = frames(&[(guest::FRAME_MSG, refusal.as_bytes())]);
             let mut stderr = Vec::new();
-            let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut stderr, &mut Instant::now()).unwrap();
+            let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut stderr, &mut Instant::now(), None).unwrap();
             assert!(matches!(end, StreamEnd::Exit(c) if c == code));
             assert_eq!(session.lock().unwrap().exit, Some(code));
             assert_eq!(String::from_utf8(stderr).unwrap(), "flexvm: cannot run nope: No such file or directory (os error 2)\n");
@@ -2485,7 +2667,7 @@ mod exec_tests {
     fn an_agent_without_sessions_says_to_rebuild() {
         let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
         let input = frames(&[(guest::FRAME_MSG, b"unknown request \"SESSION\"")]);
-        let e = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).err().unwrap();
+        let e = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now(), None).err().unwrap();
         assert_eq!(e.to_string(), "unknown request \"SESSION\"; rebuild the rootfs and its templates");
     }
 }

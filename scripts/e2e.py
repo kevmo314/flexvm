@@ -31,7 +31,7 @@ Shards (CI runs pr in four splits side by side, heavy on a schedule):
 A scenario that finds this host lacks what it tests ends SKIP, not PASS; with
 --no-skips (CI) a SKIP fails the run.
 """
-import argparse, glob, hashlib, ipaddress, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, traceback
+import argparse, fcntl, glob, hashlib, ipaddress, json, os, re, select, shutil, signal, socket, struct, subprocess, sys, tempfile, termios, threading, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -928,6 +928,280 @@ def port_forward():
 # CI keeps the directory in actions/cache; a cold cache pulls from the registry.
 
 
+class Pty:
+    """A flexvm command on a terminal of its own (a pty it has as its controlling terminal), as a user at
+    one runs it: what it writes is read back, keys are sent, the window resized."""
+
+    def __init__(self, host, *argv, rows=24, cols=80):
+        self.master, self.slave = os.openpty()
+        self.resize(rows, cols)
+        self.proc = subprocess.Popen([BIN, "--state", host.state_dir, "--run", host.run_dir, *argv], stdin=self.slave, stdout=self.slave,
+                                     stderr=self.slave, env=ENV, start_new_session=True, preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+        self.out = b""
+
+    def send(self, data):
+        os.write(self.master, data.encode() if isinstance(data, str) else data)
+
+    def read(self, timeout):
+        if select.select([self.master], [], [], timeout)[0]:
+            try:
+                self.out += os.read(self.master, 65536)
+            except OSError:
+                time.sleep(timeout)
+
+    def expect(self, pattern, timeout=30, since=0):
+        """Waits for `pattern` (a regex on the output from `since`); returns the match's end."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            m = re.search(pattern.encode(), self.out[since:])
+            if m:
+                return since + m.end()
+            self.read(0.2)
+        raise AssertionError(f"no {pattern!r} in {self.out[since:][-2000:]!r}")
+
+    def resize(self, rows, cols):
+        # The kernel sends SIGWINCH to the terminal's foreground process group: the CLI.
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def wait_raw(self, timeout=60):
+        """Waits for the CLI to make its terminal raw: keys sent before would be echoed here, a line at a time."""
+        deadline = time.time() + timeout
+        while not self.raw():
+            assert time.time() < deadline and self.proc.poll() is None, f"the terminal never went raw: {self.out[-2000:]!r}"
+            self.read(0.05)
+        return self
+
+    def raw(self):
+        """Whether the terminal is in raw mode (no echo, no line editing)."""
+        lflag = termios.tcgetattr(self.slave)[3]
+        return not lflag & (termios.ECHO | termios.ICANON)
+
+    def wait(self, timeout=60):
+        deadline = time.time() + timeout
+        while self.proc.poll() is None and time.time() < deadline:
+            self.read(0.1)
+        self.read(0)
+        if self.proc.poll() is None:
+            self.proc.kill()
+            raise AssertionError(f"still running after {timeout} s: {self.out[-2000:]!r}")
+        return self.proc.returncode
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        os.close(self.master)
+        os.close(self.slave)
+
+
+def typed(p, line, want, timeout=30):
+    """Types `line` and waits for `want` (a regex) after it: checked once the keys echo back, so a
+    command's output is never mistaken for the echo of its own keys."""
+    since = len(p.out)
+    p.send(line + "\r")
+    return p.expect(want, timeout, p.expect(re.escape(line[-12:]), timeout, since))
+
+
+@case
+def interactive():
+    """exec -i streams stdin, exec -it a shell on a pty (echo, stty size following resizes, Ctrl-C to its
+    sleep, its exit status, the terminal restored, detach keys) through a pause and a checkpoint; run -it,
+    run -d -it then attach, detach and attach again, and on after a migration."""
+    vm = "e2e-tty"
+    A.run(vm)
+    data = os.urandom(3 << 20)
+    r = subprocess.run([BIN, "--state", A.state_dir, "--run", A.run_dir, "exec", "-i", vm, "sha256sum"], input=data, capture_output=True, env=ENV, timeout=120)
+    check("exec -i: all of stdin, then its EOF", r.returncode == 0 and r.stdout.split()[0].decode() == hashlib.sha256(data).hexdigest(),
+          (r.returncode, r.stdout[:100], r.stderr[-500:]))
+    # Streamed through a checkpoint and a pause (each resets the connection): reattached, not a byte lost or repeated.
+    data = os.urandom(24 << 20)
+    proc = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "exec", "-i", vm, "sha256sum"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
+
+    def slowly():
+        for i in range(0, len(data), 1 << 16):
+            proc.stdin.write(data[i:i + (1 << 16)])
+            time.sleep(0.008)
+        proc.stdin.close()
+    writer = threading.Thread(target=slowly)
+    writer.start()
+    time.sleep(0.5)
+    ck = ckpt_dir("tty-stdin")
+    A.checkpoint(vm, ck)
+    A.pause(vm)
+    time.sleep(0.5)
+    A.resume(vm)
+    writer.join()
+    out, err = proc.communicate(timeout=120)
+    check("exec -i: through a checkpoint and a pause, stdin intact", proc.returncode == 0 and out.split()[0].decode() == hashlib.sha256(data).hexdigest(),
+          (proc.returncode, out[:100], err[-500:]))
+    shutil.rmtree(ck, ignore_errors=True)
+    r = A.cli("exec", "-it", vm, "true", check=False, stdin=subprocess.DEVNULL)
+    check("exec -it: refused without a terminal", r.returncode != 0 and "the input device is not a TTY" in r.stderr, (r.returncode, r.stderr))
+
+    p = Pty(A, "exec", "-it", vm, "sh").wait_raw()
+    try:
+        typed(p, "echo $((6 * 7))", r"42\r\n")
+        check("exec -it: keys echo and run", True)
+        check("exec -it: the terminal is raw", p.raw())
+        typed(p, "stty size", r"24 80\r\n")
+        p.resize(40, 120)
+        time.sleep(0.5)
+        typed(p, "stty size", r"40 120\r\n")
+        check("exec -it: stty size follows a resize", True)
+        typed(p, "tty", r"/dev/pts/\d+\r\n")
+        p.send("sleep 100\r")
+        time.sleep(1)
+        p.send("\x03")
+        typed(p, "echo after-int $?", r"after-int 130\r\n", timeout=10)
+        check("exec -it: Ctrl-C reaches the guest's sleep, not flexvm", p.proc.poll() is None)
+        # Typed while the VM is paused: it arrives once, after.
+        A.pause(vm)
+        since = len(p.out)
+        p.send("echo during-$((1 + 1))-pause\r")
+        time.sleep(1)
+        A.resume(vm)
+        p.expect(r"during-2-pause\r\n", 30, since)
+        time.sleep(1)
+        check("exec -it: keys typed while paused arrive once", p.out[since:].count(b"during-2-pause") == 1, p.out[since:][-500:])
+        ck = ckpt_dir("tty")
+        A.checkpoint(vm, ck)
+        since = len(p.out)
+        typed(p, "echo after-$((2 + 2))-checkpoint", r"after-4-checkpoint\r\n")
+        check("exec -it: on after a checkpoint, nothing typed twice", p.out[since:].count(b"after-4-checkpoint") == 1)
+        shutil.rmtree(ck, ignore_errors=True)
+        p.send("exit 3\r")
+        check("exec -it: the shell's exit status", p.wait() == 3, p.out[-500:])
+        check("exec -it: the terminal restored", not p.raw())
+    finally:
+        p.close()
+
+    # Detaching leaves the command running.
+    p = Pty(A, "exec", "-it", vm, "sh").wait_raw()
+    try:
+        typed(p, "echo $$ > /tmp/tty.pid; echo saved", r"saved\r\n")
+        p.send(b"\x10\x11")
+        check("exec -it: detach keys end the client, status 0", p.wait() == 0, p.out[-500:])
+        check("exec -it: and say so", b"read escape sequence" in p.out)
+        check("exec -it: the terminal restored after detaching", not p.raw())
+        code, out, _ = A.exec(vm, "kill -0 $(cat /tmp/tty.pid) && echo running")
+        check("exec -it: the detached shell runs on", out == "running\n", (code, out))
+        A.exec(vm, "kill -9 $(cat /tmp/tty.pid)")
+    finally:
+        p.close()
+    A.kill(vm)
+
+    t = args.template
+    # run -it: the app is CMD, on a pty; the VM exits with it, and leaves no record.
+    A.vms.add("e2e-run-it")
+    p = Pty(A, "run", "-it", "--name", "e2e-run-it", t, "sh").wait_raw()
+    try:
+        typed(p, "echo $((2 + 3))-from-run", r"5-from-run\r\n", timeout=60)
+        typed(p, "stty size", r"24 80\r\n")
+        p.send("exit 4\r")
+        check("run -it: exits with its app", p.wait() == 4, p.out[-500:])
+        check("run -it: no exited record", wait_for(lambda: "e2e-run-it" not in A.ps(), 10), A.ps().get("e2e-run-it"))
+        check("run -it: the terminal restored", not p.raw())
+    finally:
+        p.close()
+
+    # run -d -it, then attach; detach and attach again; on B after a migration.
+    vm = "e2e-attach"
+    A.vms.add(vm)
+    r = json.loads(A.cli("run", "--name", vm, "-d", "-it", t, "sh").stdout)
+    A.pids.add((r["pid"], r["start"]))
+    p = Pty(A, "attach", vm).wait_raw()
+    try:
+        typed(p, "x=kept-$((3 * 3))", r"\r\n")
+        typed(p, "echo $x", r"kept-9\r\n")
+        p.send(b"\x10\x11")
+        check("attach: detach keys, status 0", p.wait() == 0, p.out[-500:])
+    finally:
+        p.close()
+    check("attach: the app runs on", A.ps(all=False).get(vm, {}).get("state") == "running", A.ps().get(vm))
+    p = Pty(A, "attach", vm).wait_raw()
+    try:
+        typed(p, "echo again-$x", r"again-kept-9\r\n")
+        A.migrate(vm, B)
+        check("attach: a migration ends it, saying where", p.wait(60) != 0 and b"moved to" in p.out, p.out[-500:])
+    finally:
+        p.close()
+    check("migrate: on B", wait_for(lambda: where(vm) == {B.label: "running"}, 60), where(vm))
+    p = Pty(B, "attach", vm).wait_raw()
+    try:
+        typed(p, "echo on-b-$x", r"on-b-kept-9\r\n")
+        check("attach on B: the shell kept its state", True)
+        p.send("exit 5\r")
+        check("attach: the app's exit status", p.wait() == 5, p.out[-500:])
+    finally:
+        p.close()
+    check("attach: its -d vm exits with the app, listed exited", wait_for(lambda: B.ps().get(vm, {}).get("status") == 5, 30), B.ps().get(vm))
+    B.rm(vm)
+
+
+def tree(root):
+    """Each path under `root`: its type, mode, link target or content hash (owners left out)."""
+    out = {}
+    for d, dirs, files in os.walk(root):
+        for n in dirs + files:
+            p = os.path.join(d, n)
+            st = os.lstat(p)
+            what = os.readlink(p) if os.path.islink(p) else ("dir" if os.path.isdir(p) else hashlib.sha256(open(p, "rb").read()).hexdigest())
+            kind = "l" if os.path.islink(p) else "d" if os.path.isdir(p) else "f"
+            out[os.path.relpath(p, root)] = (kind, st.st_mode & 0o7777, what)
+    return out
+
+
+@case
+def copy():
+    """cp: a directory tree into a VM (modes, links as links, owned by root) and back intact, a file onto
+    a new name, - for a tar either way, and nothing written outside a destination by a guest's archive."""
+    vm = "e2e-cp"
+    A.run(vm)
+    src = os.path.join(WORK, "cp-src", "tree")
+    os.makedirs(os.path.join(src, "sub", "deeper"))
+    open(os.path.join(src, "empty"), "w").close()
+    with open(os.path.join(src, "sub", "big"), "wb") as f:
+        f.write(os.urandom(5 << 20))
+    with open(os.path.join(src, "sub", "deeper", "script"), "w") as f:
+        f.write("#!/bin/sh\necho hi\n")
+    os.chmod(os.path.join(src, "sub", "deeper", "script"), 0o750)
+    os.chmod(os.path.join(src, "sub"), 0o711)
+    os.symlink("sub/deeper/script", os.path.join(src, "link"))
+    os.symlink("/nowhere", os.path.join(src, "dangling"))
+    os.chown(os.path.join(src, "empty"), 1234, 1234)
+    A.cli("cp", src, f"{vm}:/tmp")
+    code, out, err = A.exec(vm, "stat -c '%U %a %F' /tmp/tree/empty /tmp/tree/sub /tmp/tree/sub/deeper/script; readlink /tmp/tree/link")
+    check("cp in: modes kept, owned by root, links as links",
+          out.split("\n")[:4] == ["root 644 regular empty file", "root 711 directory", "root 750 regular file", "sub/deeper/script"], (code, out, err))
+    back = os.path.join(WORK, "cp-back")
+    os.makedirs(back)
+    A.cli("cp", f"{vm}:/tmp/tree", os.path.join(back, "copy"))
+    check("cp out: the tree round-trips", tree(os.path.join(back, "copy")) == tree(src), (tree(os.path.join(back, "copy")), tree(src)))
+    A.cli("cp", f"{vm}:/tmp/tree/sub/deeper/script", os.path.join(back, "renamed"))
+    check("cp out: a file onto a new name", open(os.path.join(back, "renamed")).read() == "#!/bin/sh\necho hi\n")
+    r = subprocess.run([BIN, "--state", A.state_dir, "--run", A.run_dir, "cp", f"{vm}:/tmp/tree/sub", "-"], capture_output=True, env=ENV, timeout=60)
+    listing = subprocess.run(["tar", "-tv"], input=r.stdout, capture_output=True).stdout.decode()
+    check("cp out to -: a tar", r.returncode == 0 and "sub/deeper/script" in listing and "sub/big" in listing, (r.returncode, listing[:500], r.stderr[-300:]))
+    archive = subprocess.run(["tar", "-c", "-C", os.path.join(WORK, "cp-src"), "tree"], capture_output=True).stdout
+    A.exec(vm, "mkdir -p /tmp/from-stdin")
+    r = subprocess.run([BIN, "--state", A.state_dir, "--run", A.run_dir, "cp", "-", f"{vm}:/tmp/from-stdin"], input=archive, capture_output=True, env=ENV, timeout=60)
+    code, out, _ = A.exec(vm, "sha256sum < /tmp/from-stdin/tree/sub/big")
+    check("cp in from -: a tar unpacked into the directory",
+          r.returncode == 0 and out.split()[0] == hashlib.sha256(open(os.path.join(src, "sub", "big"), "rb").read()).hexdigest(), (r.stderr, out))
+    r = A.cli("cp", f"{vm}:/tmp/no-such-file", back, check=False)
+    check("cp: a missing source fails", r.returncode != 0 and "no-such-file" in r.stderr, r.stderr)
+    # The guest's own symlink pointing out, copied out: it stays a link, nothing is written through it.
+    A.exec(vm, "mkdir -p /tmp/evil && ln -sfn " + back + " /tmp/evil/out")
+    A.cli("cp", f"{vm}:/tmp/evil", os.path.join(back, "evil"))
+    check("cp out: a guest's link stays a link", os.readlink(os.path.join(back, "evil", "out")) == back)
+    A.kill(vm)
+    shutil.rmtree(os.path.join(WORK, "cp-src"), ignore_errors=True)
+    shutil.rmtree(back, ignore_errors=True)
+
+
+
+
 def image_ref():
     """(registry host, repository, tag) of --image, with Docker's defaults."""
     name, _, tag = args.image.rpartition(":") if ":" in args.image.rsplit("/", 1)[-1] else (args.image, "", "latest")
@@ -1223,7 +1497,7 @@ COST = {"faults/exec_background": 110, "faults/reboot": 40, "faults/mem_refused_
         "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
         "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
-        "faults/resume_suspending": 16, "image_template": 15, "app_lifecycle": 30, "faults/arrival_flood": 14, "faults/page_conns": 14,
+        "faults/resume_suspending": 16, "image_template": 15, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
         "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
         "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,

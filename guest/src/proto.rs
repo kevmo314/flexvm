@@ -10,6 +10,23 @@ pub const FRAME_STDERR: u8 = 2;
 pub const FRAME_EXIT: u8 = 3;
 pub const FRAME_MSG: u8 = 4;
 pub const FRAME_LOST: u8 = 5;
+/// An interactive session's or the app's stdin bytes taken so far (u64 LE): the client drops them, and
+/// after a reattach resends from there.
+pub const FRAME_ACK: u8 = 6;
+/// flexvm-init's own lines in the app's log (`started`, `exited`), not the app's output.
+pub const FRAME_NOTE: u8 = 7;
+
+/// Input frames, host to guest, on an interactive session's connection (after the request) or `APPIN`'s,
+/// framed as replies are. `IN_DATA`: offset (u64 LE) and bytes; the guest takes each byte once, in order,
+/// skipping what it took before (a resend). `IN_EOF`: offset, where stdin ends. `IN_RESIZE`: rows and
+/// columns (u16 LE each). `IN_DETACH`: the client leaves; an exec runs on, detached. A session's client
+/// may still send SESSION_DONE after the exit.
+pub const IN_DATA: u8 = 1;
+pub const IN_EOF: u8 = 2;
+pub const IN_RESIZE: u8 = 3;
+pub const IN_DETACH: u8 = 4;
+/// The most data one input frame carries.
+pub const MAX_INPUT: usize = 32 * 1024;
 
 /// Optional client acknowledgement after receiving FRAME_EXIT: release the finished session.
 pub const SESSION_DONE: u8 = b'd';
@@ -56,7 +73,7 @@ pub fn refusal_status(m: &str) -> Option<(i32, &str)> {
 
 /// An `ARGV` session's command, with no shell: its body is NUL-terminated fields, each a tag byte
 /// and its value. `a` an argument (in order), `e` K=V, `w` the working directory, `u` USER[:GROUP],
-/// `d` (no value) detach.
+/// `d` (no value) detach, `i` stdin from the client, `t` a pty, `s` its first size (`ROWS COLS`).
 #[derive(Debug, Default, PartialEq)]
 pub struct Exec {
     pub argv: Vec<String>,
@@ -64,6 +81,9 @@ pub struct Exec {
     pub workdir: Option<String>,
     pub user: Option<String>,
     pub detach: bool,
+    pub stdin: bool,
+    pub tty: bool,
+    pub size: Option<(u16, u16)>,
 }
 
 impl Exec {
@@ -79,8 +99,13 @@ impl Exec {
             body.push_str(value);
             body.push('\0');
         }
-        if self.detach {
-            body.push_str("d\0");
+        for (on, tag) in [(self.detach, "d\0"), (self.stdin, "i\0"), (self.tty, "t\0")] {
+            if on {
+                body.push_str(tag);
+            }
+        }
+        if let Some((rows, cols)) = self.size {
+            body.push_str(&format!("s{rows} {cols}\0"));
         }
         Ok(body)
     }
@@ -97,9 +122,18 @@ impl Exec {
                 Some(b'w') => e.workdir = Some(value),
                 Some(b'u') => e.user = Some(value),
                 Some(b'd') if value.is_empty() => e.detach = true,
+                Some(b'i') if value.is_empty() => e.stdin = true,
+                Some(b't') if value.is_empty() => e.tty = true,
+                Some(b's') => e.size = Some(parse_size(&value).ok_or_else(|| format!("bad size {value:?}"))?),
                 _ => return Err(format!("bad exec field {field:?}")),
             }
         }
         Ok(e)
     }
+}
+
+/// `ROWS COLS`.
+pub fn parse_size(s: &str) -> Option<(u16, u16)> {
+    let (rows, cols) = s.split_once(' ')?;
+    Some((rows.parse().ok()?, cols.parse().ok()?))
 }

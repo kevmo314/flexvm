@@ -595,8 +595,9 @@ impl Proc {
                 return Err(e);
             }
         };
-        // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app.
-        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true}}))?;
+        // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app; `attaches`: -i and -t too.
+        let result = json!({"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true, "attaches": true});
+        send_json(&mut w, &json!({"ok": true, "result": result}))?;
         let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
@@ -1184,6 +1185,9 @@ fn check_app_support(to: &str, name: &str, prepared: &Value, spec: &crate::app::
     if prepared["follows_app"] != true && (*spec != crate::app::RunSpec::default() || spec.has_app(image)) {
         bail!("{to} runs an older flexvm, which would drop vm {name}'s run settings (-e, --entrypoint, --keep, --rm, --ip) or fail to exit with its app: upgrade it first");
     }
+    if prepared["attaches"] != true && (spec.stdin || spec.tty) {
+        bail!("{to} runs an older flexvm, which cannot attach to vm {name}'s app (run -i, -t): upgrade it first");
+    }
     Ok(())
 }
 
@@ -1211,6 +1215,10 @@ mod tests {
             RunSpec { rm: true, ..Default::default() },
             RunSpec { ip: Some("10.0.0.9".parse().unwrap()), ..Default::default() },
         ];
+        let it = RunSpec { stdin: true, tty: true, ..Default::default() };
+        let e = check_app_support("peer", "vm", &json!({"follows_app": true}), &it, Some(&app)).unwrap_err().to_string();
+        assert!(e.contains("cannot attach"), "{e}");
+        check_app_support("peer", "vm", &json!({"follows_app": true, "attaches": true}), &it, Some(&app)).unwrap();
         for target in [json!({}), json!({"follows_app": false}), json!({"follows_app": true})] {
             // `-p` ports stay on the source: they never need a newer target.
             let ported = RunSpec { ports: vec!["8080:80".parse().unwrap()], ..Default::default() }.moving();

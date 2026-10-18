@@ -33,7 +33,8 @@ const APP_LOG_SILENCE: Duration = Duration::from_secs(15);
 
 /// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
 /// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session.
-fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl crate::util::Timed + Write), stall: Duration) -> Result<()> {
+/// `both`: the client's input goes to the guest as well (`relay_input`), which ends the stream itself.
+fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl crate::util::Timed + Write), stall: Duration, both: bool) -> Result<()> {
     client.write_timeout(stall)?;
     while let Some((kind, data)) = guest::read_frame(guest)? {
         match client.write_all(&guest::frame(kind, &[&data])) {
@@ -42,7 +43,7 @@ fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl cr
             }
             res => res?,
         }
-        if kind == guest::FRAME_EXIT {
+        if kind == guest::FRAME_EXIT && !both {
             let mut ack = [0];
             if (crate::util::By { s: client, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
                 guest.get_mut().write_all(&ack)?;
@@ -51,6 +52,21 @@ fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl cr
         }
     }
     Ok(())
+}
+
+/// Copies the client's input frames (and a session's SESSION_DONE) to the guest while `relay` relays its
+/// frames back; both connections are shut down at the end.
+fn relay_input(guest: UnixStream, client: &UnixStream, relay: impl FnOnce() -> Result<()>) -> Result<()> {
+    let (mut from, mut to) = (client.try_clone()?, guest.try_clone()?);
+    // Its client gone, the guest's side is shut down too, which ends `relay` (an idle `APPIN` says nothing).
+    let copier = thread::Builder::new().spawn(move || {
+        let _ = std::io::copy(&mut from, &mut to);
+        let _ = to.shutdown(std::net::Shutdown::Both);
+    })?;
+    let res = relay();
+    let _ = (client.shutdown(std::net::Shutdown::Both), guest.shutdown(std::net::Shutdown::Both));
+    let _ = copier.join();
+    res
 }
 
 /// A VM process's own exit statuses (`run -- CMD` passes CMD's through):
@@ -1316,10 +1332,11 @@ impl Proc {
         let _ = c.set_read_timeout(None);
         let reply = match req["op"].as_str().unwrap_or("") {
             // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
-            "exec" | "checkpoint" | "migrate" | "debug" | "resume" | "signal" if self.vm.get().is_none() => {
+            "exec" | "attach" | "stdin" | "checkpoint" | "migrate" | "debug" | "resume" | "signal" if self.vm.get().is_none() => {
                 Err(Busy(format!("vm {} is starting", self.name())).into())
             }
             "exec" => return self.exec(&req, c),
+            "attach" | "stdin" => return self.attach(&req, c),
             "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
                 let stop = req["stop"] == true;
@@ -1417,8 +1434,41 @@ impl Proc {
             // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             send_json(&mut w, &json!({"ok": true}))?;
-            relay_session(&mut g, &mut w, CLIENT_STALL)?;
-            Ok(())
+            match req["interactive"] == true {
+                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, CLIENT_STALL, true)),
+                false => relay_session(&mut g, &mut w, CLIENT_STALL, false),
+            }
+        })();
+        vm.untrack_exec(id);
+    }
+
+    /// `attach`: the app's output from `offset` on (`LOGS`, followed), until it exits; `stdin`: client
+    /// `stream`'s input for it (`APPIN`). Each ends when the VM pauses or leaves; the client comes again.
+    fn attach(&self, req: &Value, c: UnixStream) {
+        let mut w = &c;
+        let vm = self.vm();
+        let input = req["op"] == "stdin";
+        if !self.spec.lock().unwrap().has_app(vm.template.meta.image.as_ref()) {
+            let e = format!("vm {} has no app to attach to (its image has no entrypoint or command); flexvm exec -it {} sh", vm.name, vm.name);
+            return drop(send_json(&mut w, &json!({"ok": false, "error": e})));
+        }
+        let (offset, stream) = (req["offset"].as_u64().unwrap_or(0), req["stream"].as_u64().unwrap_or(0));
+        let started = vm.exec(|s| match input {
+            true => guest::start_appin(s, stream, guest::TIMEOUT),
+            false => guest::start_logs(s, offset, true, guest::TIMEOUT),
+        });
+        let (mut g, id) = match started {
+            Ok(g) => g,
+            Err(e) => return drop(send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))),
+        };
+        let _ = (|| -> Result<()> {
+            // The app's log keeps alive every 5 s; its input says nothing until it takes some.
+            g.get_ref().set_read_timeout((!input).then_some(Duration::from_secs(15)))?;
+            send_json(&mut w, &json!({"ok": true}))?;
+            match input {
+                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, CLIENT_STALL, true)),
+                false => relay_session(&mut g, &mut w, CLIENT_STALL, true),
+            }
         })();
         vm.untrack_exec(id);
     }
@@ -1727,7 +1777,11 @@ impl Proc {
             return;
         }
         let quick = self.app_started.lock().unwrap().is_some_and(|t| t.elapsed() < crate::app::AT_ONCE);
-        if quick && !self.tty.load(Ordering::SeqCst) {
+        let interactive = {
+            let spec = self.spec.lock().unwrap();
+            spec.stdin || spec.tty
+        };
+        if quick && !self.tty.load(Ordering::SeqCst) && !interactive {
             let vm = self.vm();
             let image = vm.template.meta.image.as_ref();
             crate::log!("{}", crate::app::hint(&self.spec.lock().unwrap().program(image), &crate::template::image_of(&vm.template.name)));
@@ -4390,7 +4444,7 @@ mod session_relay_tests {
             // The exit ends the relay, with the stream still open (vsock passes no half-close on).
             let mut guest = BufReader::new(Duplex { input: Cursor::new([&exit[..], b"never read"].concat()), output: Vec::new() });
             let mut client = Duplex { input: Cursor::new(ack.clone()), output: Vec::new() };
-            relay_session(&mut guest, &mut client, CLIENT_STALL).unwrap();
+            relay_session(&mut guest, &mut client, CLIENT_STALL, false).unwrap();
             assert_eq!(client.output, exit);
             assert_eq!(guest.get_ref().output, if ack == [guest::SESSION_DONE] { ack } else { vec![] });
         }
@@ -4408,7 +4462,7 @@ mod session_relay_tests {
             thread::sleep(Duration::from_secs(6));
         });
         let t = Instant::now();
-        relay_session(&mut guest, &mut &relay, CLIENT_STALL).unwrap();
+        relay_session(&mut guest, &mut &relay, CLIENT_STALL, false).unwrap();
         assert!(t.elapsed() < Duration::from_secs(4), "the relay waited {:?}", t.elapsed());
         assert!(guest.get_ref().output.is_empty());
         silent.join().unwrap();
@@ -4428,7 +4482,7 @@ mod session_relay_tests {
         let mut guest = BufReader::new(relay_end);
         let (relay, _client) = UnixStream::pair().unwrap();
         let t = Instant::now();
-        let err = relay_session(&mut guest, &mut &relay, Duration::from_secs(1)).unwrap_err();
+        let err = relay_session(&mut guest, &mut &relay, Duration::from_secs(1), false).unwrap_err();
         assert!(err.to_string().contains("took no output for 1 s"), "{err}");
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         // Dropped, the guest's connection ends unacknowledged: the session stays for a reattach.

@@ -155,6 +155,27 @@ explicit group), and `-u` sets `HOME` to that user's. Exec otherwise runs as the
 image's user, with its environment and working directory. Use `sh -c '...'` for
 pipelines, redirects and shell syntax.
 
+```sh
+flexvm exec -it web bash                   # a shell on a pty; Ctrl-P Ctrl-Q detaches, leaving it running
+tar -c data | flexvm exec -i web tar -x -C /srv   # -i: stdin, to its EOF
+flexvm run -it ubuntu:24.04                # the image's app (bash) on this terminal; the VM exits with it
+flexvm run -it busybox sh                  # with -i or -t, CMD is the app (its argv, as docker's)
+flexvm run -d -it --name dev ubuntu:24.04 && flexvm attach dev
+flexvm cp ./site web:/srv                  # and web:/var/log/app.log ., or - for a tar on stdin/stdout
+```
+
+`-i` sends stdin to the command (or with `run`, keeps the app's stdin open, for
+this run or a later `attach`); `-t` runs it on a pty in the guest, with this
+terminal raw (keys, Ctrl-C and Ctrl-Z too, go to the guest; restored however
+flexvm ends) and its size followed. As with docker, `-it` needs a terminal.
+Stdin survives what exec does: a pause, a checkpoint, an aborted migration
+reconnect it, and the guest takes each byte once, as numbered. A stop or a
+migration ends the client (the app keeps its stdin: `attach` again after `start`,
+or on the target). `attach NAME` shows the app's output from then on; with `-i`
+it is also the app's stdin. `cp` streams a tar through flexvm-init (images need
+no `tar`): guest paths are resolved in the guest, files land there as root, and
+what comes out is unpacked without following its links, setuid bits or devices.
+
 As with ssh, the words of `run IMAGE CMD` are joined with spaces for the guest's
 shell, so quote a command that has its own quoting:
 `flexvm run ubuntu:24.04 "sh -c 'echo -d'"`. Flags after IMAGE (or after `exec NAME`)
