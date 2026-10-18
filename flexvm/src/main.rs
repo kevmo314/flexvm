@@ -1593,13 +1593,16 @@ pub fn exec(host: &Host, name: &str, cmd: &Value) -> Result<i32> {
 /// (and pty size), is sent again from what the guest took.
 pub fn exec_with(host: &Host, name: &str, cmd: &Value, out: &mut dyn Write, feed: Option<std::sync::Arc<attach::Feed>>) -> Result<i32> {
     let session: &'static Mutex<Session> = Box::leak(Box::new(Mutex::new(Session::new()?)));
+    // The VM the command went to: found again under the name it has now, by its cleanup too.
+    let pin: &'static Mutex<Pin> = Box::leak(Box::new(Mutex::new(Pin::default())));
     if cmd["detach"] == true {
-        return exec_request(host, name, cmd, session, false, out, None);
+        return exec_request(host, name, cmd, session, false, out, None, pin);
     }
     let id = session.lock().unwrap().id.clone();
     let close = {
         let (host, name, id) = (host.clone(), name.to_string(), id.clone());
         let once = move || -> Result<()> {
+            let name = pin.lock().unwrap_or_else(|e| e.into_inner()).name(&host, &name);
             let c =
                 vmproc::connect(&host, &name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5), None)?;
             c.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1617,7 +1620,7 @@ pub fn exec_with(host: &Host, name: &str, cmd: &Value, out: &mut dyn Write, feed
         }
     };
     // Interrupted, the command is stopped: left running, it would hold one of the guest's session slots.
-    let (stop, vm) = (close.clone(), name.to_string());
+    let (stop, vm, cleanup_host) = (close.clone(), name.to_string(), host.clone());
     util::on_signal(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], move |sig| {
         attach::restore_terminal();
         // Held until exit, so the stopped command's status is not reported; not waited for long, as
@@ -1632,11 +1635,12 @@ pub fn exec_with(host: &Host, name: &str, cmd: &Value, out: &mut dyn Write, feed
             }
         };
         if let Err(e) = stop() {
+            let vm = pin.lock().unwrap_or_else(|e| e.into_inner()).name(&cleanup_host, &vm);
             crate::log!("flexvm: the command may still be running in vm {vm}: {e}");
         }
         util::raise_signal(sig);
     });
-    let result = exec_request(host, name, cmd, session, false, out, feed.as_ref());
+    let result = exec_request(host, name, cmd, session, false, out, feed.as_ref(), pin);
     // Completed sessions are acknowledged on their attachment. Errors (including a closed
     // stdout, as with `| head`) still need CLOSE to stop a command that may be running.
     if result.is_err() {
@@ -1655,9 +1659,10 @@ pub fn exec_with(host: &Host, name: &str, cmd: &Value, out: &mut dyn Write, feed
 /// suspend, and its VM goes with it anyway. `patient` (a VM's main command):
 /// a paused or checkpointing VM is waited for even before the command started.
 pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>, patient: bool) -> Result<i32> {
-    exec_request(host, name, &json!(cmd), session, patient, &mut std::io::stdout(), None)
+    exec_request(host, name, &json!(cmd), session, patient, &mut std::io::stdout(), None, &Mutex::default())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_request(
     host: &Host,
     name: &str,
@@ -1666,6 +1671,7 @@ fn exec_request(
     patient: bool,
     stdout: &mut dyn Write,
     feed: Option<&std::sync::Arc<attach::Feed>>,
+    pin: &Mutex<Pin>,
 ) -> Result<i32> {
     // Check the actual wire body before trying the VM.
     guest::fits(&guest::command_body(cmd)?)?;
@@ -1673,11 +1679,11 @@ fn exec_request(
     let id = session.lock().unwrap().id.clone();
     let mut error = String::new();
     let mut deadline = Instant::now() + Duration::from_secs(30);
-    // The VM the first request reached: only it is attached to, or asked to start the command again.
-    let mut vm = None;
+    // The VM the first request reached (`pin`): only it is attached to, or asked to start the command again.
     while Instant::now() < deadline {
-        // A VM's own main command follows its renames.
-        let name = &containers::renamed(name);
+        // Under the name it has now: a VM's own main command, and a separate client, follow its renames.
+        let mut vm = pin.lock().unwrap().clone();
+        let name = &vm.name(host, name);
         let (started, offset) = {
             let s = session.lock().unwrap();
             if let Some(code) = s.exit {
@@ -1688,7 +1694,9 @@ fn exec_request(
         let action = if started { "attach" } else { "start" };
         let req = json!({"op": "exec", "session": id, "action": action, "offset": offset, "cmd": cmd, "interactive": feed.is_some()});
         let at = Instant::now() + Duration::from_secs(5);
-        let stream = connect_same(host, name, &req, at, &mut vm).and_then(|c| exec_stream(c, at));
+        let conn = connect_same(host, name, &req, at, &mut vm);
+        *pin.lock().unwrap() = vm.clone();
+        let stream = conn.and_then(|c| exec_stream(c, at));
         // Locked per write, never across a read: a checkpoint takes stdout's lock too.
         match stream.map(|mut r| {
             // Test fault `exec_lose_echo`: the connection is lost before the session id comes back (the guest has the command).
@@ -1733,8 +1741,8 @@ fn exec_request(
                     }
                     deadline = Instant::now() + Duration::from_secs(30);
                 }
-                // Renamed meanwhile (a VM's own main command): asked again under its new name.
-                if !host.alive(name) && containers::renamed(name) == *name {
+                // Renamed meanwhile: asked again under its new name.
+                if !host.alive(name) && vm.name(host, name) == *name {
                     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
                         return Err(format!("vm {name} moved to {to}; the command keeps running there (session {id})").into());
                     }
@@ -1759,14 +1767,14 @@ fn exec_request(
 /// suspend and resume, or a migration, keeps both; a VM made again under the
 /// name (after a kill) has a new generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Instance {
+pub(crate) struct Instance {
     ip: std::net::Ipv4Addr,
     gen: u64,
 }
 
 /// The VM under the name is another than the one a command's request reached first.
 #[derive(Debug)]
-struct Replaced(String);
+pub(crate) struct Replaced(String);
 
 impl std::fmt::Display for Replaced {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -1780,17 +1788,44 @@ impl std::error::Error for Replaced {}
 /// VM `vm` names (recorded by the first connection): one made under the name
 /// since is refused (`Replaced`) before the request reaches it, and one that
 /// cannot be told yet (its registry entry not published) is an error retried.
-fn connect_same(host: &Host, name: &str, req: &Value, at: Instant, vm: &mut Option<Instance>) -> Result<std::os::unix::net::UnixStream> {
+pub(crate) fn connect_same(host: &Host, name: &str, req: &Value, at: Instant, pin: &mut Pin) -> Result<std::os::unix::net::UnixStream> {
     let mut check = |c: &std::os::unix::net::UnixStream| {
         // The process that listens; a VM's own main command needs no check: no other takes the name while it holds it.
         let pid = util::peer_pid(c)?;
         if pid != std::process::id() {
-            let now = host.entry(name).ok().filter(|e| e.ident.pid == pid && e.gen != 0).and_then(|e| Some(Instance { ip: e.ip?, gen: e.gen }));
-            same_instance(name, now.ok_or_else(|| format!("vm {name:?} is starting or its registry entry is unavailable; retry once it is ready"))?, vm)?;
+            let entry = host.entry(name).ok().filter(|e| e.ident.pid == pid && e.gen != 0);
+            let now = entry.as_ref().and_then(|e| Some(Instance { ip: e.ip?, gen: e.gen }));
+            same_instance(
+                name,
+                now.ok_or_else(|| format!("vm {name:?} is starting or its registry entry is unavailable; retry once it is ready"))?,
+                &mut pin.vm,
+            )?;
+            pin.process = entry.map(|e| e.ident);
         }
         Ok(())
     };
     vmproc::connect(host, name, req, &[], at, Some(&mut check))
+}
+
+/// What a client knows of the VM it follows: the instance its first connection reached, the process it
+/// reached last running it (a resume or a migration makes another), and the name it last had.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Pin {
+    vm: Option<Instance>,
+    pub(crate) process: Option<host::Ident>,
+    renamed: Option<String>,
+}
+
+impl Pin {
+    /// The name `name`'s VM has now: this process's own VM's (`containers::renamed`), or, once a connection
+    /// pinned it, the holder of its address's generation, which a rename moves to the new name. Remembered:
+    /// once the VM ended (its claim let go) its records are still under the last name it had.
+    pub(crate) fn name(&mut self, host: &Host, name: &str) -> String {
+        if let Some(now) = self.vm.and_then(|v| host.holder_of(v.ip, v.gen)) {
+            self.renamed = Some(now);
+        }
+        self.renamed.clone().unwrap_or_else(|| containers::renamed(name))
+    }
 }
 
 /// Records the first VM reached; any later one must be it.
@@ -2628,6 +2663,27 @@ mod exec_tests {
     }
 
     #[test]
+    fn a_separate_client_finds_its_vm_under_its_new_name() {
+        let root = crate::test_util::TempDir::new("exec-renamed");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let l = host.lock().unwrap();
+        let c = host.claim_new(&l, "old", None).unwrap();
+        let vm = Instance { ip: c.ip, gen: c.gen };
+        assert_eq!(Pin::default().name(&host, "old"), "old", "not pinned yet: as given");
+        let mut pin = Pin { vm: Some(vm), ..Pin::default() };
+        assert_eq!(pin.name(&host, "old"), "old");
+        host.rename_holder(&l, c.ip, "old", "new", None).unwrap();
+        assert_eq!(pin.name(&host, "old"), "new");
+        // Ended, its claim let go: its records are still under the name it had last.
+        host.release(&l, c.ip, "new", None).unwrap();
+        assert_eq!(host.holder_of(c.ip, c.gen), None);
+        assert_eq!(pin.name(&host, "old"), "new");
+        // Another generation of the address is not it: the name as given (and connect_same refuses another VM).
+        assert_eq!(Pin { vm: Some(Instance { gen: c.gen + 1, ..vm }), ..Pin::default() }.name(&host, "old"), "old");
+        c.keep();
+    }
+
+    #[test]
     fn recovery_refuses_a_vm_made_again_under_the_name() {
         let ip = "10.0.0.2".parse().unwrap();
         let mut vm = None;
@@ -2649,13 +2705,13 @@ mod exec_tests {
         let _name = host.take_name("own", false).unwrap();
         let l = UnixListener::bind(host.sock("own").unwrap()).unwrap();
         // This process listens: a VM's own main command, sent without a check.
-        let mut vm = None;
+        let mut vm = Pin::default();
         let c = connect_same(&host, "own", &json!({"op": "x"}), Instant::now() + Duration::from_secs(5), &mut vm).unwrap();
         assert_eq!(util::peer_pid(&c).unwrap(), std::process::id());
         let mut line = String::new();
         BufReader::new(l.accept().unwrap().0).read_line(&mut line).unwrap();
         assert_eq!(line, "{\"op\":\"x\"}\n");
-        assert_eq!(vm, None);
+        assert_eq!((vm.vm, vm.process), (None, None));
     }
 
     #[test]
@@ -2712,7 +2768,7 @@ mod exec_tests {
             }
         });
         let session = Mutex::new(Session::new().unwrap());
-        assert_eq!(exec_request(&host, "own", &cmd, &session, false, &mut std::io::stdout(), None).unwrap(), 0);
+        assert_eq!(exec_request(&host, "own", &cmd, &session, false, &mut std::io::stdout(), None, &Mutex::default()).unwrap(), 0);
         server.join().unwrap();
         assert!(!session.lock().unwrap().started);
     }
