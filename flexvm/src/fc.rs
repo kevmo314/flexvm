@@ -713,6 +713,49 @@ mod tests {
         api.request(socket, "PATCH", "/vm", Some(serde_json::json!({"state": "Resumed"})), PATIENCE)
     }
 
+    /// #730: a Firecracker killed during an API call fails that call at once (not at its deadline), and the
+    /// next call too: its socket refuses, never retried. Its "Firecracker" is a child process (this test).
+    #[test]
+    fn an_api_call_to_a_firecracker_killed_meanwhile_fails_at_once() {
+        const CHILD: &str = "FLEXVM_TEST_FAKE_FIRECRACKER";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let listener = UnixListener::bind(dir.join("api")).unwrap();
+            std::fs::write(dir.join("listening"), b"").unwrap();
+            let mut r = accept(&listener);
+            read_request(&mut r);
+            std::fs::write(dir.join("read"), b"").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = crate::test_util::TempDir::new("fake-fc");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "fc::tests::an_api_call_to_a_firecracker_killed_meanwhile_fails_at_once", "--nocapture"]).env(CHILD, dir.as_os_str());
+        let mut child = crate::test_util::ChildGuard(child.spawn().unwrap());
+        let socket = dir.join("api");
+        retry(PATIENCE, Duration::from_millis(1), || Ok(std::fs::metadata(dir.join("listening")).map(drop)?))
+            .unwrap_or_else(|e: crate::util::Error| panic!("{e}"));
+        let killer = {
+            let (read, pid) = (dir.join("read"), child.0.id() as i32);
+            std::thread::spawn(move || {
+                retry(PATIENCE, Duration::from_millis(1), || Ok(std::fs::metadata(&read).map(drop)?)).unwrap_or_else(|e: crate::util::Error| panic!("{e}"));
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            })
+        };
+        // Its deadline is PATIENCE (30 s): an error naming the close, not the deadline, is the death's.
+        let api = Api::default();
+        let e = api.request(&socket, "PATCH", "/vm", Some(serde_json::json!({"state": "Paused"})), PATIENCE).unwrap_err();
+        killer.join().unwrap();
+        assert!(e.to_string().contains("closed the connection without answering"), "{e}");
+        // Wholly gone (its listener may close a moment after the connection did).
+        child.0.wait().unwrap();
+        let start = std::time::Instant::now();
+        let e = call(&api, &socket).unwrap_err();
+        assert!(e.downcast_ref::<NotSent>().is_some() && e.to_string().contains("cannot connect"), "{e}");
+        assert!(start.elapsed() < PATIENCE / 2, "refused at once, not retried: {:?}", start.elapsed());
+    }
+
     #[test]
     fn api_reuses_connection_and_reads_exact_bodies() {
         let server = Server::new(|listener| {

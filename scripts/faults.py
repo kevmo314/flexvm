@@ -8061,6 +8061,41 @@ def fc_died():
     check("fc died: rm clears it", n not in vms(A), vms(A).get(n))
 
 
+def fc_died_starting():
+    """A Firecracker that dies once its VM is published running but before its start is done (its
+    guest not set up yet: `guest_net_gate`) ends it as any death does (#730): exit status 124 at once,
+    not flexvm's own 125 once its guest calls run out of time, and `ps -a` shows it failed. Started
+    cold, and claimed from a standby VM (whose foreground claimer exits 124 too)."""
+    t = args.template
+    for standby in (False, True):
+        how = "claimed" if standby else "cold"
+        n = f"ft-fc-died-starting-{how}"
+        scenario_vms.add(n)
+        if standby:
+            ok(set_standby(A, t, 1))
+            check(f"fc died starting {how}: a standby ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
+        with armed_fault(A, "guest_net_gate", 30000):
+            p = spawn_cli(A, "run", "--name", n, t)
+            held = wait_for(lambda: vms(A).get(n, {}).get("state") == "running" and reached(A, "guest_net_gate"), 30)
+            check(f"fc died starting {how}: published, held before its guest is set up", held, vms(A).get(n))
+            v = vms(A)[n]
+            os.kill(v["firecracker"], signal.SIGKILL)
+            started = time.time()
+        code = wait_process(p, 30)
+        took = time.time() - started
+        if standby:
+            cli(A, "pull", t, "--standby", "0")
+            check(f"fc died starting {how}: no standby left", wait_for(lambda: not standby_pids(A, t), 30), standby_pids(A, t))
+        print(f"fc died starting {how}: exited {took:.2f} s after its Firecracker", flush=True)
+        check(f"fc died starting {how}: ended as a death, exit status 124", code == 124, (code, took))
+        # Not a performance bound: guest calls retried on its refusing socket would take their 5 s (guest::TIMEOUT).
+        check(f"fc died starting {how}: its guest calls cut short, not waited out", took < 5, took)
+        failed = vms(A).get(n, {})
+        check(f"fc died starting {how}: ps -a shows it failed, saying how", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
+        check(f"fc died starting {how}: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))
+        ok(cli_json(A, "rm", n))
+
+
 def fc_died_busy():
     """A Firecracker that dies while an operation holds the VM (a slow
     checkpoint copying its memory) ends the VM at once all the same: the
@@ -10023,7 +10058,7 @@ SCENARIOS = dict(
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, rmi_suspend=rmi_suspend,
-    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
+    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died, fc_died_starting=fc_died_starting,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,

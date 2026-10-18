@@ -279,6 +279,11 @@ impl Vm {
         self.fc.try_lock().map_or(true, |fc| fc.as_ref().is_some_and(|f| f.alive()))
     }
 
+    /// Its Firecracker is gone of itself: not killed here (`kill` takes it), but exited.
+    pub fn firecracker_exited(&self) -> bool {
+        self.fc.lock().unwrap().as_ref().is_some_and(|f| !f.alive())
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.fc.lock().unwrap().as_ref().map(|f| f.pid())
     }
@@ -863,7 +868,7 @@ impl Vm {
         while self.reports_held.load(Ordering::SeqCst) {
             match self.fc(|fc| fc.request_within("PATCH", PATH, None, deadline.saturating_duration_since(Instant::now()))) {
                 Ok(_) => self.reports_held.store(false, Ordering::SeqCst),
-                Err(e) if rejected(&e, PATH) || self.pid().is_none() || self.dead() => {
+                Err(e) if rejected(&e, PATH) || self.pid().is_none() || self.dead() || !self.firecracker_alive() => {
                     self.reports_held.store(false, Ordering::SeqCst);
                     return Err(e);
                 }
@@ -886,7 +891,8 @@ impl Vm {
         let body = json!({"stats_polling_interval_s": BALLOON_STATS_S});
         let res = loop {
             match self.fc(|fc| fc.request_within("PATCH", "/balloon/statistics", Some(body.clone()), deadline.saturating_duration_since(Instant::now()))) {
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                // Never retried on a Firecracker that is gone (#730).
+                Err(_) if Instant::now() < deadline && self.firecracker_alive() => std::thread::sleep(Duration::from_millis(10)),
                 r => break r,
             }
         };

@@ -75,6 +75,37 @@ fn relay_input(guest: UnixStream, client: &UnixStream, relay: impl FnOnce() -> R
 pub const FAILED: i32 = 125;
 /// Its Firecracker died under it.
 pub const DIED: i32 = 124;
+
+/// A start answered `died` (`died_starting`): its VM ran, then its Firecracker died. The starter exits with
+/// `DIED`, as the VM process does.
+#[derive(Debug)]
+pub struct Died(pub String);
+
+impl std::fmt::Display for Died {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Died {}
+
+/// The error a start's `reply` carries: `Died` if it says so.
+pub fn start_error(reply: &Value, fallback: &str) -> Error {
+    let e = reply["error"].as_str().unwrap_or(fallback).to_string();
+    match reply["died"] == json!(true) {
+        true => Box::new(Died(e)),
+        false => e.into(),
+    }
+}
+
+/// A VM command's exit status for `e`.
+pub fn exit_code(e: &Error) -> i32 {
+    if e.downcast_ref::<Died>().is_some() {
+        DIED
+    } else {
+        FAILED
+    }
+}
 const OP_WAIT: Duration = Duration::from_secs(30);
 const RELEASE_WAIT: Duration = Duration::from_secs(10);
 const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
@@ -180,6 +211,8 @@ pub struct Runtime {
     /// An attached claimer (a foreground `run`) hung up before it was told the status: the VM
     /// goes, and one a migration kept (refusing the destroy) goes once it runs here again (`abort`).
     pub claimer_gone: AtomicBool,
+    /// Its Firecracker's exit is watched (`watch_death`), from as soon as the VM is set.
+    watching_death: AtomicBool,
     pub cmd: Mutex<Option<String>>,
     /// `run`'s app settings and `-p` ports, and what becomes of the VM once its app exits (`app::RunSpec`).
     pub spec: Mutex<crate::app::RunSpec>,
@@ -351,6 +384,35 @@ impl Proc {
     pub fn set_vm(&self, vm: Arc<Vm>) {
         self.adopt(vm);
         self.start_limit();
+        self.watch_death();
+    }
+
+    /// Its Firecracker's exit, waited on from the moment the VM runs here, not only once its start is
+    /// done (`serve`): a death mid-start (`start_guest`'s guest calls) marks the VM dead at once, so those
+    /// calls fail without waiting out their retries, and the start ends as a death (`died_starting`, #730).
+    /// One that exited already (no pidfd for it: it is gone) is a death at once.
+    fn watch_death(&self) {
+        let (Some(p), Some(vm)) = (self.me.upgrade(), self.vm.get()) else { return };
+        let fc = vm.pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten());
+        if fc.is_none() && !vm.firecracker_exited() {
+            // Not watchable, yet running: the controller's tick notices its exit (`firecracker_alive`).
+            return;
+        }
+        if self.watching_death.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        thread::spawn(move || {
+            if let Some(fc) = fc {
+                while !fc.wait(Duration::from_secs(3600)) {}
+            }
+            p.died();
+        });
+    }
+
+    /// A start (or a claim) failing now: whether its VM ran here and then lost its Firecracker. If so
+    /// it ends as a death (`end_died`: exit 124 and its failed record), not as a start that failed (#730).
+    pub fn died_starting(&self) -> bool {
+        self.vm.get().is_some_and(|vm| !matches!(vm.state(), State::Source(_)) && (vm.dead() || vm.firecracker_exited()))
     }
 
     /// The VM is this process's: its start's grant is spent. Its memory mark
@@ -1110,7 +1172,14 @@ impl Proc {
         drop(still);
         t.mark("resume");
         self.set_vm(vm);
-        let mut v = self.start_guest(&mut t)?;
+        let started = self.start_guest(&mut t);
+        // It ran, then died: no longer exited, as its failed record will say (#730).
+        if let (Err(_), Some(path)) = (&started, &record) {
+            if self.died_starting() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let mut v = started?;
         v["standby"] = json!(false);
         // Kept until it runs: a rerun that fails before leaves the VM exited, to start again.
         if let Some(path) = record {
@@ -1127,6 +1196,8 @@ impl Proc {
         self.publish();
         t.mark("register");
         let running = t.total();
+        // Test gate: published running, its guest not set up yet (a death here ends it as a death, #730).
+        crate::host::gate("guest_net_gate");
         vm.guest_net(vm.ip, self.host.config_now().dns.as_deref())?;
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();
@@ -1198,13 +1269,7 @@ impl Proc {
         if self.spec.lock().unwrap().has_app(self.vm().template.meta.image.as_ref()) {
             spawn(Proc::follow_app);
         }
-        if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten()) {
-            let p = self.clone();
-            thread::spawn(move || {
-                while !fc.wait(Duration::from_secs(3600)) {}
-                p.died();
-            });
-        }
+        self.watch_death();
         // In order, what comes meanwhile queued behind; and before the main
         // command starts: a Ctrl-Z taken during startup pauses the VM first.
         loop {
@@ -1781,6 +1846,11 @@ impl Proc {
             }
             let code = res.unwrap_or_else(|e| {
                 crate::log!("vm {}: {e}", self.name());
+                // Its session broke as its Firecracker died: the death ends it (124), not this (#730).
+                let vm = self.vm();
+                if vm.dead() || vm.firecracker_exited() {
+                    self.died();
+                }
                 FAILED
             });
             let refused = self.exit_with(code);
@@ -2109,8 +2179,10 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         s.signal(sig);
     });
     let op = p.op();
+    // An arrival's failure is its source's to decide (`prepare_in`): it never ends as a death here.
+    let incoming = matches!(start, Start::Incoming { .. });
     // Checked where the failure is answered: to the starter (`notify`), or to the source (`prepare_in`).
-    let kvm = if matches!(start, Start::Incoming { .. }) { Ok(()) } else { crate::util::check_kvm() };
+    let kvm = if incoming { Ok(()) } else { crate::util::check_kvm() };
     let res = match start {
         _ if kvm.is_err() => kvm.map(|()| Value::Null),
         Start::Run { name, template, ip, cmd, resources, generated, spec, tty, rerun } => {
@@ -2162,7 +2234,17 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         crate::standby::maintain(p.host.clone());
         Ok(v)
     });
-    let reply = crate::util::reply(&res);
+    // Its Firecracker died under the VM before the start was done (#730): it ends as any death does, even
+    // a start that went on regardless (a restore's guest steps are never fatal), so it is never answered ok.
+    let died = !incoming && p.died_starting();
+    let res = match res {
+        Ok(_) if died => Err(Box::new(Died("its firecracker exited".into())) as Error),
+        res => res,
+    };
+    let mut reply = crate::util::reply(&res);
+    if died {
+        reply["died"] = json!(true);
+    }
     match notify.take() {
         Some(mut f) => drop(send_json(&mut f, &reply)),
         None if res.is_ok() && !reply["result"].is_null() => crate::info!("{}", reply["result"]),
@@ -2170,6 +2252,9 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     }
     if let Err(e) = res {
         crate::log!("flexvm: {e}");
+        if died {
+            p.end_died(&op);
+        }
         p.finish(&op, End::NotStarted, FAILED, None);
     }
     drop(op);
@@ -3476,6 +3561,17 @@ mod tests {
         assert!(!p.host.vms("forged", "lock").unwrap().exists());
         assert!(!p.host.state.join("addrs").join(ip).exists());
         assert!(std::fs::read_dir(p.host.state.join("migs")).unwrap().next().is_none());
+    }
+
+    /// #730: a start answered `died` (its VM ran, then its Firecracker died) makes its starter exit as the VM
+    /// process does (124); any other failure is flexvm's (125).
+    #[test]
+    fn a_start_that_died_is_answered_as_a_death() {
+        let died = start_error(&json!({"ok": false, "error": "its firecracker exited", "died": true}), "failed");
+        assert_eq!((died.to_string().as_str(), exit_code(&died)), ("its firecracker exited", DIED));
+        let failed = start_error(&json!({"ok": false, "error": "no room"}), "failed");
+        assert_eq!((failed.to_string().as_str(), exit_code(&failed)), ("no room", FAILED));
+        assert_eq!(start_error(&json!({"ok": false}), "claim failed").to_string(), "claim failed");
     }
 
     /// A VM process with no VM, holding `name` if given.

@@ -450,6 +450,27 @@ mod tests {
         (stream, line)
     }
 
+    /// #730: a guest call that finds its Firecracker gone (its vsock socket refusing) is retried until the VM is
+    /// marked dead (`abandon`), then fails at once saying so, rather than waiting out its deadline.
+    #[test]
+    fn a_retried_call_ends_once_its_firecracker_is_marked_dead() {
+        let (_dir, path, listener) = agent("dead-fc");
+        // Bound and closed: a dead Firecracker's socket, refusing every connect.
+        drop(listener);
+        let mut attempts = 0;
+        // A deadline far off: only the death can end the retries in time.
+        let e = answered("TEST", Instant::now() + Duration::from_secs(600), |by| {
+            attempts += 1;
+            // Its first try refused (and retried); the death comes before the second.
+            if attempts == 2 {
+                abandon(&path);
+            }
+            ask(&path, "START", by)
+        })
+        .unwrap_err();
+        assert_eq!((e.to_string().as_str(), attempts), ("its firecracker exited", 2), "ended by the death, not its deadline");
+    }
+
     #[test]
     fn run_settings_must_be_applied_by_the_agent() {
         assert_eq!(app_started("ok 42", false).unwrap(), 42);
