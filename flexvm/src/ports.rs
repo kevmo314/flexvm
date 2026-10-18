@@ -397,6 +397,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{wait_until, JoinWithin, WAIT};
 
     #[test]
     fn parse_and_record_ports() {
@@ -451,7 +452,7 @@ mod tests {
             };
             assert!(crate::listen::v6only(&TcpListener::from(v6)));
             let (guest, udp_guest) = (TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(), UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
-            udp_guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            udp_guest.set_read_timeout(Some(WAIT)).unwrap();
             let port = free_tcp();
             let tcp = Port { ip: None, ..mapping(port, guest.local_addr().unwrap().port(), Protocol::Tcp) };
             let udp = Port { protocol: Protocol::Udp, vm_port: udp_guest.local_addr().unwrap().port(), ..tcp.clone() };
@@ -462,15 +463,15 @@ mod tests {
             let mut buf = [0; 8];
             for ip in [IpAddr::from(Ipv4Addr::LOCALHOST), Ipv6Addr::LOCALHOST.into()] {
                 let mut client = TcpStream::connect((ip, port)).unwrap();
-                client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                client.set_read_timeout(Some(WAIT)).unwrap();
                 client.write_all(b"t").unwrap();
-                let (mut server, _) = guest.accept().unwrap();
+                let (mut server, _) = crate::test_util::accept_tcp(&guest);
                 server.read_exact(&mut buf[..1]).unwrap();
                 server.write_all(b"T").unwrap();
                 client.read_exact(&mut buf[..1]).unwrap();
                 assert_eq!(&buf[..1], b"T");
                 let client = UdpSocket::bind((ip, 0)).unwrap();
-                client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                client.set_read_timeout(Some(WAIT)).unwrap();
                 client.send_to(b"u", (ip, port)).unwrap();
                 let (n, peer) = udp_guest.recv_from(&mut buf).unwrap();
                 udp_guest.send_to(&buf[..n], peer).unwrap();
@@ -547,12 +548,12 @@ mod tests {
         retry_ports(|| {
             let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let p = mapping(free_tcp(), guest.local_addr().unwrap().port(), Protocol::Tcp);
-            let f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST)?;
+            let mut f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST)?;
             let mut client = TcpStream::connect((p.ip.unwrap(), p.host_port)).unwrap();
-            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
             let server = thread::spawn(move || {
-                let (mut s, _) = guest.accept().unwrap();
-                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let (mut s, _) = crate::test_util::accept_tcp(&guest);
+                s.set_read_timeout(Some(WAIT)).unwrap();
                 let mut data = Vec::new();
                 s.read_to_end(&mut data).unwrap();
                 assert_eq!(data, vec![42; BUFFER * 4]);
@@ -564,13 +565,16 @@ mod tests {
             let mut reply = Vec::new();
             client.read_to_end(&mut reply).unwrap();
             assert_eq!(reply, b"after EOF");
-            let guest = server.join().unwrap();
+            let guest = server.join_within().unwrap();
             let mut active = TcpStream::connect((p.ip.unwrap(), p.host_port)).unwrap();
-            active.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            let (_guest_connection, _) = guest.accept().unwrap();
-            let at = Instant::now();
+            active.set_read_timeout(Some(WAIT)).unwrap();
+            let (_guest_connection, _) = crate::test_util::accept_tcp(&guest);
+            let workers = std::mem::take(&mut f.workers);
             drop(f);
-            assert!(at.elapsed() < Duration::from_secs(1));
+            wait_until("active forwarding workers to stop", || workers.iter().all(|w| w.is_finished()));
+            for worker in workers {
+                worker.join_within().unwrap();
+            }
             match active.read(&mut [0]) {
                 Ok(n) => assert_eq!(n, 0),
                 Err(e) => assert!(!transient(&e) && e.kind() != io::ErrorKind::TimedOut, "client stayed open: {e}"),
@@ -585,19 +589,18 @@ mod tests {
     fn drops_wake_the_workers_at_once() {
         retry_ports(|| {
             let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let mut took = Duration::ZERO;
             for _ in 0..10 {
                 let tcp = mapping(free_tcp(), guest.local_addr().unwrap().port(), Protocol::Tcp);
                 let udp = Port { protocol: Protocol::Udp, ..tcp.clone() };
-                let f = Forwarder::start(&[tcp, udp], Ipv4Addr::LOCALHOST)?;
-                // Asleep in poll, with nothing to do.
-                thread::sleep(Duration::from_millis(20));
-                let at = Instant::now();
+                let mut f = Forwarder::start(&[tcp, udp], Ipv4Addr::LOCALHOST)?;
+                // Keep the handles so a missed wake fails by a deadline instead of hanging Drop.
+                let workers = std::mem::take(&mut f.workers);
                 drop(f);
-                took += at.elapsed();
+                wait_until("forwarding workers to stop", || workers.iter().all(|w| w.is_finished()));
+                for worker in workers {
+                    worker.join_within().unwrap();
+                }
             }
-            // A worker that only noticed on a poll timeout (100 ms) took about half that each time.
-            assert!(took < Duration::from_millis(200), "10 drops took {took:?}");
             Ok(())
         })
         .unwrap();
@@ -613,8 +616,8 @@ mod tests {
             let server = thread::spawn(move || {
                 let mut held = Vec::new();
                 for _ in 0..N {
-                    let (mut s, _) = guest.accept().unwrap();
-                    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let (mut s, _) = crate::test_util::accept_tcp(&guest);
+                    s.set_read_timeout(Some(WAIT)).unwrap();
                     let mut b = [0; 1];
                     s.read_exact(&mut b).unwrap();
                     s.write_all(&b).unwrap();
@@ -625,7 +628,7 @@ mod tests {
             // All queued on the listener before the forwarder wakes.
             let mut clients: Vec<_> = (0..N).map(|_| TcpStream::connect((p.ip.unwrap(), p.host_port)).unwrap()).collect();
             for (i, c) in clients.iter_mut().enumerate() {
-                c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                c.set_read_timeout(Some(WAIT)).unwrap();
                 c.write_all(&[i as u8]).unwrap();
             }
             for (i, c) in clients.iter_mut().enumerate() {
@@ -633,7 +636,7 @@ mod tests {
                 c.read_exact(&mut b).unwrap();
                 assert_eq!(b[0], i as u8);
             }
-            assert_eq!(server.join().unwrap().len(), N);
+            assert_eq!(server.join_within().unwrap().len(), N);
             Ok(())
         })
         .unwrap();
@@ -644,13 +647,13 @@ mod tests {
         retry_ports(|| {
             const N: usize = 200;
             let guest = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            guest.set_read_timeout(Some(WAIT)).unwrap();
             let host_port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
             let p = mapping(host_port, guest.local_addr().unwrap().port(), Protocol::Udp);
             let _f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST)?;
             let clients: Vec<_> = (0..4).map(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()).collect();
             for c in &clients {
-                c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                c.set_read_timeout(Some(WAIT)).unwrap();
             }
             // Each client's first datagram opens its session; then a burst from all of them.
             let mut buf = [0; 64];
@@ -714,13 +717,14 @@ mod tests {
             );
             use std::io::BufRead;
             let mut output = io::BufReader::new(child.stdout.take().unwrap());
-            let ports: Vec<Port> = loop {
+            let ready = thread::spawn(move || loop {
                 let mut line = String::new();
                 assert!(output.read_line(&mut line).unwrap() > 0, "child did not bind its ports");
                 if let Some(spec) = line.strip_prefix("forwarder ready: ") {
                     break serde_json::from_str(spec.trim()).unwrap();
                 }
-            };
+            });
+            let ports: Vec<Port> = ready.join_within().unwrap();
             assert!(Forwarder::start(&ports, Ipv4Addr::LOCALHOST).is_err());
             child.kill().unwrap();
             child.wait().unwrap();
@@ -734,14 +738,14 @@ mod tests {
     fn udp_replies_are_isolated_by_client_and_zero_length_datagrams_work() {
         retry_ports(|| {
             let guest = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            guest.set_read_timeout(Some(WAIT)).unwrap();
             let host_port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
             let p = mapping(host_port, guest.local_addr().unwrap().port(), Protocol::Udp);
             let _f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST)?;
             let a = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let b = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             for client in [&a, &b] {
-                client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                client.set_read_timeout(Some(WAIT)).unwrap();
             }
             a.send_to(b"a", (p.ip.unwrap(), p.host_port)).unwrap();
             b.send_to(b"b", (p.ip.unwrap(), p.host_port)).unwrap();

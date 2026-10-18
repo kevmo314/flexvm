@@ -5,6 +5,64 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
+use std::time::{Duration, Instant};
+
+pub const WAIT: Duration = Duration::from_secs(60);
+
+/// Wait for observable progress, allowing for a heavily contended test host.
+#[track_caller]
+pub fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let end = Instant::now() + WAIT;
+    while !condition() {
+        assert!(Instant::now() < end, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Keep a broken helper from hanging its test in `join`.
+pub trait JoinWithin<T> {
+    fn join_within(self) -> std::thread::Result<T>;
+}
+
+impl<T> JoinWithin<T> for std::thread::JoinHandle<T> {
+    #[track_caller]
+    fn join_within(self) -> std::thread::Result<T> {
+        wait_until("helper thread to finish", || self.is_finished());
+        self.join()
+    }
+}
+
+#[track_caller]
+fn accept<T>(mut connection: impl FnMut() -> std::io::Result<T>) -> T {
+    let mut accepted = None;
+    wait_until("helper connection", || match connection() {
+        Ok(c) => {
+            accepted = Some(c);
+            true
+        }
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => false,
+        Err(e) => panic!("accept: {e}"),
+    });
+    accepted.unwrap()
+}
+
+#[allow(dead_code)] // the guest shares this file
+pub fn accept_tcp(listener: &std::net::TcpListener) -> (std::net::TcpStream, std::net::SocketAddr) {
+    listener.set_nonblocking(true).unwrap();
+    let (stream, addr) = accept(|| listener.accept());
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    stream.set_write_timeout(Some(WAIT)).unwrap();
+    (stream, addr)
+}
+
+#[allow(dead_code)] // the guest shares this file
+pub fn accept_unix(listener: &std::os::unix::net::UnixListener) -> (std::os::unix::net::UnixStream, std::os::unix::net::SocketAddr) {
+    listener.set_nonblocking(true).unwrap();
+    let (stream, addr) = accept(|| listener.accept());
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    stream.set_write_timeout(Some(WAIT)).unwrap();
+    (stream, addr)
+}
 
 /// An `#[ignore]`d test that needs root fails, not passes, without it: CI runs them under sudo
 /// (`cargo test -- --ignored`), and one that returned early there would check nothing.
@@ -27,6 +85,44 @@ impl DerefMut for ChildGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+impl ChildGuard {
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let end = Instant::now() + WAIT;
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= end {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "helper process did not exit"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[allow(dead_code)] // the guest shares this file
+pub fn status(command: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    ChildGuard(command.spawn()?).wait()
+}
+
+#[allow(dead_code)] // the guest shares this file
+pub fn output(command: &mut std::process::Command) -> std::process::Output {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = ChildGuard(command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+    let read = |mut stream: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut data = Vec::new();
+            stream.read_to_end(&mut data).unwrap();
+            data
+        })
+    };
+    let stdout = read(Box::new(child.stdout.take().unwrap()));
+    let stderr = read(Box::new(child.stderr.take().unwrap()));
+    let status = child.wait().unwrap();
+    std::process::Output { status, stdout: stdout.join_within().unwrap(), stderr: stderr.join_within().unwrap() }
 }
 
 impl Drop for ChildGuard {

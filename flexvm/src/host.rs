@@ -3847,6 +3847,7 @@ pub fn use_lock(st: &libc::stat) -> String {
 #[cfg(test)]
 mod lock_tests {
     use super::*;
+    use crate::test_util::{JoinWithin, WAIT};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc,
@@ -3881,7 +3882,7 @@ mod lock_tests {
             let held = lock_at_with(lock_dir(&waiter_dir).unwrap(), "key", |file| {
                 if first.swap(false, Ordering::SeqCst) {
                     opened.send(()).unwrap();
-                    resumed.recv().unwrap();
+                    resumed.recv_timeout(WAIT).unwrap();
                 }
                 flock(file, libc::LOCK_EX)
             })
@@ -3889,15 +3890,15 @@ mod lock_tests {
             finished.send(()).unwrap();
             held
         });
-        opening.recv_timeout(Duration::from_secs(5)).unwrap();
+        opening.recv_timeout(WAIT).unwrap();
         drop(first);
         assert!(!dir.join("key").exists());
         let next = lock_at(lock_dir(&dir).unwrap(), "key", libc::LOCK_EX).unwrap();
         resume.send(()).unwrap();
         assert!(done.recv_timeout(Duration::from_millis(100)).is_err(), "waiter must contend on the replacement inode");
         drop(next);
-        done.recv_timeout(Duration::from_secs(5)).unwrap();
-        let held = waiter.join().unwrap();
+        done.recv_timeout(WAIT).unwrap();
+        let held = waiter.join_within().unwrap();
         let current = std::fs::metadata(dir.join("key")).unwrap();
         assert_eq!(current.ino(), held.file.metadata().unwrap().ino());
         drop(held);
@@ -4214,6 +4215,7 @@ pub fn name_busy(e: &crate::util::Error) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_util::{wait_until, JoinWithin, WAIT};
 
     /// Parks `n` threads at gate `g` on `marker` (one latch set), returning once the marker counts all of them.
     fn parked(latches: &'static Latches, marker: &Path, n: usize) -> Vec<std::thread::JoinHandle<()>> {
@@ -4223,7 +4225,7 @@ pub(crate) mod tests {
                 std::thread::spawn(move || park_at(latches, "g", 7, &m, Duration::from_secs(60)))
             })
             .collect();
-        let end = std::time::Instant::now() + Duration::from_secs(10);
+        let end = std::time::Instant::now() + WAIT;
         while std::fs::read_to_string(marker).ok().as_deref() != Some(n.to_string().as_str()) {
             assert!(std::time::Instant::now() < end, "never all {n} parked: {:?}", std::fs::read_to_string(marker));
             std::thread::sleep(Duration::from_millis(5));
@@ -4232,10 +4234,9 @@ pub(crate) mod tests {
     }
 
     fn all_leave(ths: Vec<std::thread::JoinHandle<()>>) {
-        let end = std::time::Instant::now() + Duration::from_secs(5);
-        while !ths.iter().all(|t| t.is_finished()) {
-            assert!(std::time::Instant::now() < end, "a parked thread was left parked");
-            std::thread::sleep(Duration::from_millis(5));
+        wait_until("parked threads to leave", || ths.iter().all(|t| t.is_finished()));
+        for th in ths {
+            th.join_within().unwrap();
         }
     }
 
@@ -4283,12 +4284,11 @@ pub(crate) mod tests {
         std::fs::remove_file(&marker).unwrap();
         let m = marker.clone();
         let th = std::thread::spawn(move || park_at(&L, "g", 8, &m, Duration::from_secs(60)));
-        let end = std::time::Instant::now() + Duration::from_secs(10);
+        let end = std::time::Instant::now() + WAIT;
         while !marker.exists() {
             assert!(std::time::Instant::now() < end);
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(100));
         assert!(!th.is_finished(), "a new arming did not park");
         std::fs::remove_file(&marker).unwrap();
         all_leave(vec![th]);
@@ -4628,12 +4628,13 @@ pub(crate) mod tests {
         } else {
             // umask is process-wide: keep other tests out of these changes.
             for mask in [0, 0o077] {
-                assert!(std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "host::tests::host_directories_have_explicit_modes"])
-                    .env(MASK, mask.to_string())
-                    .status()
-                    .unwrap()
-                    .success());
+                assert!(crate::test_util::status(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", "host::tests::host_directories_have_explicit_modes"])
+                        .env(MASK, mask.to_string())
+                )
+                .unwrap()
+                .success());
             }
             return;
         }
@@ -4746,15 +4747,13 @@ pub(crate) mod tests {
         let base = crate::test_util::TempDir::new("host-run-race");
         let run = base.join("run");
         std::fs::create_dir(&run).unwrap();
-        let opened: Vec<bool> = std::thread::scope(|s| {
-            let opens: Vec<_> = (0..8)
-                .map(|i| {
-                    let (state, run) = (base.join(format!("state{i}")), run.clone());
-                    s.spawn(move || Host::open(&state, &run).is_ok())
-                })
-                .collect();
-            opens.into_iter().map(|t| t.join().unwrap()).collect()
-        });
+        let opens: Vec<_> = (0..8)
+            .map(|i| {
+                let (state, run) = (base.join(format!("state{i}")), run.clone());
+                std::thread::spawn(move || Host::open(&state, &run).is_ok())
+            })
+            .collect();
+        let opened: Vec<bool> = opens.into_iter().map(|t| t.join_within().unwrap()).collect();
         assert_eq!(opened.iter().filter(|o| **o).count(), 1, "{opened:?}");
         assert!(std::fs::read_dir(&run).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
     }
@@ -5411,7 +5410,7 @@ pub(crate) mod tests {
         // b has it: the claim is retired before the record goes and before b is told done.
         let order = std::cell::RefCell::new(Vec::new());
         // Again while its lock was busy for a moment (another test's forked child: #374).
-        while order.borrow().is_empty() {
+        wait_until("owed release to settle", || {
             h.settle_owed_with(
                 5,
                 |_, _| Ok("released".into()),
@@ -5421,7 +5420,8 @@ pub(crate) mod tests {
                 },
                 |_, _| (),
             );
-        }
+            !order.borrow().is_empty()
+        });
         assert_eq!(order.into_inner(), [(9, true, false)], "decided on the address, then the record gone, then done");
         // b has forgotten it (an unknown id reads aborted there): later sweeps owe nothing, withdraw nothing.
         h.withdraw_dead(false).unwrap();
@@ -5442,9 +5442,10 @@ pub(crate) mod tests {
         };
         h.put_addr(y, &a, false).unwrap();
         h.owe(10, &Owed { to: "b".into(), ip: y, gen: 5, by: gone }).unwrap();
-        while h.owed_path(10).exists() {
+        wait_until("owed abort to settle", || {
             h.settle_owed_with(5, |_, _| Ok("aborted".into()), |_, _| (), |_, _| ());
-        }
+            !h.owed_path(10).exists()
+        });
         let a = h.addr(&h.lock().unwrap(), y).unwrap();
         assert!(a.withdrawn && a.lent.is_none() && a.leaving.is_none() && a.holder.is_none() && !h.owed_path(10).exists(), "{a:?}");
     }
@@ -5537,9 +5538,10 @@ pub(crate) mod tests {
             drop(l);
             std::fs::remove_dir(&blocked).unwrap();
             if case == "release-owed" {
-                while h.owed_path(10).exists() {
+                wait_until("owed release to settle", || {
                     h.settle_owed_with(5, |_, _| Ok("released".into()), |_, _| (), |_, _| ());
-                }
+                    !h.owed_path(10).exists()
+                });
             }
             h.collect_garbage_with(false).unwrap();
             assert!(h.addr(&h.lock().unwrap(), x).unwrap().holder.is_none(), "{case}: retried");
@@ -6852,7 +6854,7 @@ pub(crate) mod tests {
         assert!(finished.recv_timeout(Duration::from_millis(50)).is_err(), "sweep must wait for writers' host lock");
         assert!(dead.exists());
         drop(l);
-        sweep.join().unwrap();
+        sweep.join_within().unwrap();
         assert!(!dead.exists(), "interrupted write swept");
         assert!(live.exists(), "a live writer may still publish its file");
         assert!(unrelated.exists());
@@ -6980,17 +6982,19 @@ pub(crate) mod tests {
     fn a_pass_lets_go_of_its_lock_though_a_forked_child_shares_it() {
         const CHILD: &str = "FLEXVM_TEST_RETIRE_FORK";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "host::tests::a_pass_lets_go_of_its_lock_though_a_forked_child_shares_it"])
-                .env(CHILD, "1")
-                .status()
-                .unwrap();
+            let status = crate::test_util::status(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "host::tests::a_pass_lets_go_of_its_lock_though_a_forked_child_shares_it"])
+                    .env(CHILD, "1"),
+            )
+            .unwrap();
             assert!(status.success(), "retirement fork child: {status}");
             return;
         }
         let (_h_dir, h) = host("retire-fork");
         released_migration(&h, 1, "reachable");
         let (forked, mut told) = std::os::unix::net::UnixStream::pair().unwrap();
+        told.set_read_timeout(Some(WAIT)).unwrap();
         let mut spawner = None;
         h.retire_migrations_with(1, |_, _| {
             // Another thread forks while the pass holds its lock, and its child is slow to
@@ -7005,14 +7009,14 @@ pub(crate) mod tests {
                         Ok(())
                     })
                 };
-                cmd.status().unwrap();
+                crate::test_util::status(&mut cmd).unwrap();
             }));
             std::io::Read::read_exact(&mut told, &mut [0]).unwrap();
             Ok(false)
         });
         let retirement = File::open(locks(&h.run).join("retire")).unwrap();
         let free = flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_ok();
-        spawner.unwrap().join().unwrap();
+        spawner.unwrap().join_within().unwrap();
         assert!(free, "the pass let go of its lock, not only closed it");
     }
 
@@ -7233,15 +7237,15 @@ pub(crate) mod tests {
         let t = std::thread::spawn(move || {
             let _l = other.lock().unwrap();
             held.0.send(()).unwrap();
-            release.1.recv().unwrap();
+            release.1.recv_timeout(WAIT).unwrap();
         });
-        held.1.recv().unwrap();
+        held.1.recv_timeout(WAIT).unwrap();
         let start = std::time::Instant::now();
         let err = h.lock_by(Some(start + Duration::from_millis(50))).err().unwrap();
         assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < WAIT);
         release.0.send(()).unwrap();
-        t.join().unwrap();
+        t.join_within().unwrap();
         // Had once let go of; not within 1 s, as other tests' host locks take the same
         // per-process mutex, and one may hold it for longer than that.
         assert!(h.lock_by(Some(std::time::Instant::now() + Duration::from_secs(30))).is_ok());
@@ -7545,17 +7549,21 @@ pub(crate) mod tests {
     /// `take_room_inner`, again while another test has the host lock (takes never wait for it).
     fn take_at<R>(h: &Host, mib: u64, available: impl Fn() -> Option<u64>, populate: impl FnOnce() -> R) -> (u64, Option<R>) {
         let mut populate = Some(populate);
+        let end = std::time::Instant::now() + WAIT;
         loop {
             if let (Some(left), r) = h.take_room_inner(mib, &available, || populate.take().unwrap()()) {
                 return (left, r);
             }
+            assert!(std::time::Instant::now() < end, "host lock stayed busy during take");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
 
     /// Marks this process's populated takes, again while another test has the host lock.
     fn settle(h: &Host) {
+        let end = std::time::Instant::now() + WAIT;
         while UNMARKED.lock().unwrap().iter().any(|u| u.0 == h.debits()) {
+            assert!(std::time::Instant::now() < end, "populated takes did not settle");
             h.settle_room(TAKE_TRIES);
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -7697,15 +7705,15 @@ pub(crate) mod tests {
         let t = std::thread::spawn(move || {
             let _l = holder.lock().unwrap();
             held_tx.send(()).unwrap();
-            rx.recv().unwrap();
+            rx.recv_timeout(WAIT).unwrap();
         });
-        held_rx.recv().unwrap();
+        held_rx.recv_timeout(WAIT).unwrap();
         let start = std::time::Instant::now();
         assert_eq!(h.take_room_inner(1, || Some(AVAIL), || panic!("nothing populated")), (None, None));
         // Returning at all shows it never waited: the holder keeps the lock until told to let it go.
         crate::log!("a busy take was refused in {:?}", start.elapsed());
         tx.send(()).unwrap();
-        t.join().unwrap();
+        t.join_within().unwrap();
     }
 
     #[test]
@@ -7723,13 +7731,13 @@ pub(crate) mod tests {
         let t = std::thread::spawn(move || {
             let _l = other.lock().unwrap();
             held.0.send(()).unwrap();
-            let _ = release.1.recv();
+            let _ = release.1.recv_timeout(WAIT);
         });
-        held.1.recv().unwrap();
+        held.1.recv_timeout(WAIT).unwrap();
         let err = h.grant(1, Some(std::time::Instant::now() + Duration::from_millis(50))).unwrap_err();
         assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
         release.0.send(()).unwrap();
-        t.join().unwrap();
+        t.join_within().unwrap();
         assert_eq!(grants().len(), 1);
     }
 
@@ -7758,7 +7766,6 @@ pub(crate) mod tests {
         drop(worker);
         assert!(above(1).is_ok());
         // `listen` raises the reserve while this process runs: admission sees it.
-        std::thread::sleep(Duration::from_millis(20));
         h.configure(|c| {
             c.reserve_mib = Some(AVAIL - 1000);
             Ok(())
@@ -7870,19 +7877,12 @@ pub(crate) mod tests {
         let path = base.join("lock");
         let open = || private_file(&path).unwrap();
         let held = Flock::new(open(), libc::LOCK_EX).unwrap();
-        // Let go of while the wait is under way: had then, long before its deadline.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let start = std::time::Instant::now();
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            drop(held);
-            tx.send(()).unwrap();
-        });
-        let got = flock_by(&path, start + Duration::from_secs(30)).unwrap();
-        let had = start.elapsed();
-        rx.recv().unwrap();
-        releaser.join().unwrap();
-        assert!(had >= Duration::from_millis(100) && had < Duration::from_secs(5), "had once let go of, not at the deadline: {had:?}");
+        // Let go of once the bounded waiter has registered its flock helper.
+        let waiting = path.clone();
+        let waiter = std::thread::spawn(move || flock_by(&waiting, std::time::Instant::now() + WAIT));
+        wait_until("flock helper to start", || FLOCK_HELPERS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&path)));
+        drop(held);
+        let got = waiter.join_within().unwrap().unwrap();
         assert!(probe(&open(), libc::LOCK_EX).is_err(), "the lock returned is held");
         // Held past the deadline: refused then, and what the helper gets later with no one waiting it lets go of.
         let start = std::time::Instant::now();
@@ -7890,7 +7890,7 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         assert!(start.elapsed() >= Duration::from_millis(50) && start.elapsed() < Duration::from_secs(5));
         flock(&got, libc::LOCK_UN).unwrap();
-        let end = std::time::Instant::now() + Duration::from_secs(10);
+        let end = std::time::Instant::now() + WAIT;
         let free = loop {
             // Probed (let go of at once), not left to the close: a child another test forks may share the file.
             match probe(&open(), libc::LOCK_EX) {
@@ -7915,15 +7915,10 @@ pub(crate) mod tests {
         }
         assert_eq!(helpers(), 1, "repeated timeouts leave one helper blocked in flock");
         // A later wait takes over that helper's lock as soon as the holder lets go.
-        let start = std::time::Instant::now();
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            drop(held);
-        });
-        let got = flock_by(&path, start + Duration::from_secs(30)).unwrap();
-        let had = start.elapsed();
-        releaser.join().unwrap();
-        assert!(had < Duration::from_secs(5), "had once let go of: {had:?}");
+        let waiting = path.clone();
+        let waiter = std::thread::spawn(move || flock_by(&waiting, std::time::Instant::now() + WAIT));
+        drop(held);
+        let got = waiter.join_within().unwrap().unwrap();
         assert_eq!(helpers(), 1, "the waiting helper's lock was handed over, no new one started");
         assert!(probe(&open(), libc::LOCK_EX).is_err(), "the lock handed over is held");
         flock(&got, libc::LOCK_UN).unwrap();

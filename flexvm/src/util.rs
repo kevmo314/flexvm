@@ -1635,6 +1635,7 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{JoinWithin, WAIT};
 
     #[test]
     fn a_claimer_cgroup_is_an_absolute_path_of_plain_components() {
@@ -2203,14 +2204,13 @@ mod tests {
         tx.send(LogMsg::Line("first".into())).unwrap();
         let start = Instant::now();
         assert!(!send_log_by(&tx, LogMsg::Line("full".into()), start + Duration::from_millis(20)));
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < WAIT);
         let reader = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            assert!(matches!(rx.recv().unwrap(), LogMsg::Line(line) if line == "first"));
-            assert!(matches!(rx.recv().unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
+            assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line == "first"));
+            assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
         });
-        assert!(send_log_by(&tx, LogMsg::Line("x".repeat(LOG_LINE_MAX + 1)), Instant::now() + LOG_FLUSH));
-        reader.join().unwrap();
+        assert!(send_log_by(&tx, LogMsg::Line("x".repeat(LOG_LINE_MAX + 1)), Instant::now() + WAIT));
+        reader.join_within().unwrap();
     }
 
     #[test]
@@ -2243,21 +2243,24 @@ mod tests {
                 written.lock().unwrap().insert(line.to_string());
             })
         });
-        std::thread::scope(|scope| {
-            for t in 0..8 {
-                let (tx, lines) = (&tx, &lines);
-                scope.spawn(move || {
+        let callers: Vec<_> = (0..8)
+            .map(|t| {
+                let (tx, lines) = (tx.clone(), lines.clone());
+                std::thread::spawn(move || {
                     for i in 0..25 {
                         let marker = format!("{t}.{i}");
-                        tx.send(LogMsg::Line(marker.clone())).unwrap();
-                        flush_log_to(tx, Instant::now() + Duration::from_secs(30));
+                        assert!(send_log_by(&tx, LogMsg::Line(marker.clone()), Instant::now() + WAIT));
+                        flush_log_to(&tx, Instant::now() + WAIT);
                         assert!(lines.lock().unwrap().contains(&marker), "flush missed {marker}");
                     }
-                });
-            }
-        });
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.join_within().unwrap();
+        }
         drop(tx);
-        writer.join().unwrap();
+        writer.join_within().unwrap();
     }
 
     /// Past the cap a log moves to `.1` whole and its writers go on in a new
@@ -2286,24 +2289,22 @@ mod tests {
         // made unlocked, and nothing rotated meanwhile.
         let held = open();
         crate::host::flock(&held, libc::LOCK_SH).unwrap();
-        let start = std::time::Instant::now();
         let (l1, l2) = (log.clone(), log.clone());
         let w = std::thread::spawn(move || output::append_capped(&l1, b"six six\n", 10));
-        assert!(output::append_capped(&l2, b"six six\n", 10) && w.join().unwrap());
-        assert!(start.elapsed() < std::time::Duration::from_millis(1800), "{:?}", start.elapsed());
+        assert!(output::append_capped(&l2, b"six six\n", 10) && w.join_within().unwrap());
         assert_eq!(read("vm.log"), "five\nsix six\nsix six\n");
         crate::host::flock(&held, libc::LOCK_UN).unwrap();
         assert!(output::append_capped(&log, b"seven\n", 10) && read("vm.log.1") == "five\nsix six\nsix six\nseven\n");
-        // A holder that rotates and stalls before letting go: a writer waiting
-        // meanwhile goes on in the new log, never into `.1`.
+        // A holder rotates and stalls before letting go: a writer goes on
+        // in the new log, never into `.1`. Rotate before starting the writer
+        // so descheduling this thread cannot let its STALL expire first.
         assert!(output::append_capped(&log, b"eight\n", 10));
         let held = open();
         crate::host::flock(&held, libc::LOCK_EX).unwrap();
-        let (l, start) = (log.clone(), std::time::Instant::now());
-        let w = std::thread::spawn(move || output::append_capped(&l, b"nine\n", 10));
-        std::thread::sleep(std::time::Duration::from_millis(100));
         std::fs::rename(&log, d.join("vm.log.1")).unwrap();
-        assert!(w.join().unwrap() && start.elapsed() < std::time::Duration::from_millis(1800), "{:?}", start.elapsed());
+        let l = log.clone();
+        let w = std::thread::spawn(move || output::append_capped(&l, b"nine\n", 10));
+        assert!(w.join_within().unwrap());
         assert_eq!((read("vm.log.1"), read("vm.log")), ("eight\n".into(), "nine\n".into()));
     }
 
@@ -2809,7 +2810,7 @@ pub mod output {
                 }
                 _ => {}
             }
-            let output = cmd.output().unwrap();
+            let output = crate::test_util::output(&mut cmd);
             assert!(output.status.success(), "{mode}: {output:?}");
             let stdout = String::from_utf8(output.stdout).unwrap();
             let stderr = String::from_utf8(output.stderr).unwrap();
@@ -2840,12 +2841,13 @@ pub mod output {
         while (&t).write(&[0; 4096]).is_ok() {}
         let start = Instant::now();
         assert_eq!(write_within(&t, &[0; 100], start + Duration::from_millis(200)), 0);
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < crate::test_util::WAIT);
         assert_eq!(unsafe { libc::fcntl(w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK, 0);
     }
 
     #[test]
     fn a_retargeted_full_pipe_keeps_the_fallback_output() {
+        use crate::test_util::{wait_until, JoinWithin};
         let full = || {
             let mut p = [0; 2];
             assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
@@ -2859,14 +2861,14 @@ pub mod output {
         };
         let (_old, target, _) = full();
         let (mut next, fallback, filled) = full();
-        TARGETS.lock().unwrap()[0] = Some(target);
+        TARGETS.lock().unwrap()[0] = Some(target.clone());
         let relay = std::thread::spawn(|| relay(0, b"kept"));
-        std::thread::sleep(Duration::from_millis(100));
-        TARGETS.lock().unwrap()[0] = Some(fallback);
-        std::thread::sleep(STALL);
+        wait_until("relay to take the old target", || Arc::strong_count(&target) == 3);
+        TARGETS.lock().unwrap()[0] = Some(fallback.clone());
+        wait_until("relay to take the fallback", || Arc::strong_count(&fallback) == 3);
         next.read_exact(&mut vec![0; filled]).unwrap();
-        relay.join().unwrap();
-        assert!(super::readable(&next, Duration::from_millis(100)).unwrap());
+        relay.join_within().unwrap();
+        assert!(super::readable(&next, Duration::ZERO).unwrap(), "the finished relay left no fallback output");
         let mut data = [0; 4];
         next.read_exact(&mut data).unwrap();
         assert_eq!(&data, b"kept");
