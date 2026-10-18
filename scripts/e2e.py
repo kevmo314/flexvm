@@ -1032,6 +1032,8 @@ def interactive():
     time.sleep(0.5)
     A.resume(vm)
     writer.join()
+    # Closed by the writer already (communicate would flush it).
+    proc.stdin = None
     out, err = proc.communicate(timeout=120)
     check("exec -i: through a checkpoint and a pause, stdin intact", proc.returncode == 0 and out.split()[0].decode() == hashlib.sha256(data).hexdigest(),
           (proc.returncode, out[:100], err[-500:]))
