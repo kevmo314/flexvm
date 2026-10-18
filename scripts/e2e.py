@@ -613,6 +613,11 @@ def app_lifecycle():
     # --rm: no record once it exits.
     run_d("e2e-app-rm", "--rm", *entry("exit 0"))
     check("--rm: gone once its app exits", wait_for(lambda: "e2e-app-rm" not in A.ps(), 30), A.ps().get("e2e-app-rm"))
+    # -d -i: no client to wait for, so it exits as soon as its app does.
+    began = time.monotonic()
+    run_d("e2e-app-di", "-i", *entry("exit 2"))
+    check("-d -i: exited at once", wait_for(lambda: exited("e2e-app-di"), 30) and time.monotonic() - began < 8, (time.monotonic() - began, A.ps().get("e2e-app-di")))
+    A.rm("e2e-app-di")
 
     # --keep: up once its app exited, to exec into.
     run_d("e2e-app-keep", "--keep", *entry("echo kept; exit 4"))
@@ -642,6 +647,17 @@ def app_lifecycle():
     check("foreground: no informational output", not r.stdout and "flexvm-init:" not in r.stderr and "guest clock" not in r.stderr, (r.stdout, r.stderr))
     check("foreground: diagnostics kept in log", "exited with status 5" in A.logs("e2e-app-fg"), A.logs("e2e-app-fg")[-2000:])
 
+    # run -i of an app done before its client attaches: its output and status still, --rm or not (#748).
+    def fast_fg(how):
+        for i, (cmd, want, rm) in enumerate([("echo fast-$((1 + 1))", 0, ["--rm"]), ("true", 0, ["--rm"]), ("echo fast-2; exit 3", 3, [])] * 2):
+            n = f"e2e-app-fast-{i}"
+            A.vms.add(n)
+            r = A.cli("run", "-i", *rm, "--name", n, t, "sh", "-c", cmd, check=False, stdin=subprocess.DEVNULL, timeout=120)
+            check(f"{how} {' '.join(['run -i', *rm])} {cmd!r}: its output and status", r.returncode == want and r.stdout == ("" if cmd == "true" else "fast-2\n"),
+                  (r.returncode, r.stdout, r.stderr[-500:]))
+            check(f"{how} run -i {cmd!r}: no record left", wait_for(lambda: n not in A.ps(), 10), A.ps().get(n))
+    fast_fg("cold:")
+
     # A standby VM's claim carries the run's settings.
     try:
         flexvm_json = json.loads(A.cli("pull", t, "--standby", "1", timeout=300).stdout)
@@ -651,6 +667,7 @@ def app_lifecycle():
         check("standby: its app got -e and --entrypoint", wait_for(lambda: exited("e2e-app-sb"), 30) and A.ps()["e2e-app-sb"].get("status") == 6
               and "sb-standby" in A.logs("e2e-app-sb"), (A.ps().get("e2e-app-sb"), A.logs("e2e-app-sb")[-2000:]))
         A.rm("e2e-app-sb")
+        fast_fg("standby:")
     finally:
         A.cli("pull", t, "--standby", "0", timeout=300)
 
@@ -960,8 +977,7 @@ def containers():
     r = A.cli("inspect", vm, "e2e-ctr-none", check=False)
     check("inspect: a missing name fails", r.returncode != 0 and [g["name"] for g in json.loads(r.stdout)] == [vm], (r.stdout, r.stderr))
     # A command's VM: wait prints its status; it is then exited (listed, inspected, its log kept) until
-    # rm or start; restart runs it again; renamed, its record goes with it, and logs -f (which followed it
-    # across the rerun) ends with the name.
+    # rm or start; restart runs it again; renamed, its record goes with it. logs -f ends once it exited, as docker's.
     A.vms.add(job)
     A.cli("run", "--name", job, "-d", args.template, "--", "for i in 1 2 3; do echo line$i; done; sleep 3; echo late; exit 3")
     follower = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "logs", "-f", job], stdout=subprocess.PIPE,
@@ -982,7 +998,9 @@ def containers():
         tail = A.cli("logs", "--tail", "2", job).stdout
         check("logs --tail 2: its last two lines", tail == "\n".join(log.splitlines()[-2:]) + "\n" and len(tail.splitlines()) == 2, (tail, log))
         check("wait: again, its last status", A.cli("wait", job).stdout == "3\n")
-        check("logs -f: still following an exited vm", follower.poll() is None)
+        out, err = follower.communicate(timeout=30)
+        check("logs -f: ends once the vm exited, its whole log read", "line1\nline2\nline3\n" in out and out.endswith(log), (out, err))
+        check("logs -f: of an exited vm, at once", A.cli("logs", "-f", "--tail", "1", job, timeout=30).stdout == log.splitlines(True)[-1])
         A.cli("restart", job, timeout=240)
         check("restart: an exited vm runs again", A.ps().get(job, {}).get("state") in ("running", "exited"), A.ps().get(job))
         check("wait: the rerun's status", A.cli("wait", job, timeout=120).stdout == "3\n")
@@ -992,8 +1010,6 @@ def containers():
         vms = A.ps()
         check("rename: exited, listed under its new name", job not in vms and vms.get(renamed_job, {}).get("state") == "exited", vms)
         check("rename: an exited vm's status goes with it", A.cli("wait", renamed_job).stdout == "3\n")
-        out, err = follower.communicate(timeout=30)
-        check("logs -f: followed both runs, until the name went", out.count("line1\n") == 2 and out.count("late\n") == 2, (out, err))
         check("logs: under the new name", A.cli("logs", renamed_job).stdout.count("late\n") == 2)
         A.rm(renamed_job)
     finally:
@@ -1007,9 +1023,16 @@ def containers():
     A.suspend(other)
     check("wait: a stopped vm's status", waiter.communicate(timeout=60)[0] == "143\n")
     check("wait: of a stopped vm, at once", A.cli("wait", other, timeout=10).stdout == "143\n")
-    # restart: stop then start, same address, same guest processes.
+    # restart: stop then start, same address, same guest processes; logs -f follows it through.
     proc = marker(A, vm)
-    r = A.cli("restart", vm, timeout=240)
+    follower = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "logs", "-f", "--tail", "0", vm], stdout=subprocess.PIPE, text=True)
+    try:
+        r = A.cli("restart", vm, timeout=240)
+        time.sleep(2)
+        check("logs -f: follows a restart", follower.poll() is None, follower.poll() is not None and follower.communicate())
+    finally:
+        follower.kill()
+        follower.wait()
     check("restart: running again", A.ps().get(vm, {}).get("state") == "running" and A.ps()[vm]["ip"] == ip, (r.stdout, A.ps().get(vm)))
     check("restart: same guest process", marker_id(A, vm) == proc)
     A.cli("restart", other, timeout=240)

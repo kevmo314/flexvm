@@ -28,6 +28,8 @@ use crate::vm::{Snapshot, State, Vm};
 /// A client that takes no output for this long is dropped, freeing its relay and control slot; its
 /// session stays in the guest for a reattach.
 const CLIENT_STALL: Duration = Duration::from_secs(60);
+/// How long an app's end waits for its foreground client to attach, and attaches to pass its status on.
+const ATTACH_WAIT: Duration = Duration::from_secs(10);
 /// How long app output may go silent before it is asked for again: the guest sends a keepalive every 5 s.
 const APP_LOG_SILENCE: Duration = Duration::from_secs(15);
 
@@ -140,6 +142,8 @@ pub enum Start {
         tty: bool,
         /// `start` of an exited VM: its record (`app::Exited`) gives way to it.
         rerun: bool,
+        /// A foreground `run -i`/`-t` attaches to it (`Proc::attacher`).
+        attacher: bool,
     },
     Resume {
         name: String,
@@ -220,6 +224,10 @@ pub struct Runtime {
     pub tty: AtomicBool,
     /// In the foreground (a `run` or `start -a` follows it): it leaves no exited record.
     pub attached: AtomicBool,
+    /// A foreground `run -i`/`-t` attaches to its app: the app's end waits for it (`app_exited`).
+    pub attacher: AtomicBool,
+    /// Attaches to the app's output under way: the app's end waits for them to pass on its status.
+    attaching: AtomicUsize,
     /// When this process started the app, for the hint.
     app_started: Mutex<Option<Instant>>,
     /// The status the VM ends with because its command or app exited (`exit_with`).
@@ -1538,6 +1546,10 @@ impl Proc {
             Ok(g) => g,
             Err(e) => return drop(send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))),
         };
+        if !input {
+            self.attaching.fetch_add(1, Ordering::SeqCst);
+            self.attacher.store(false, Ordering::SeqCst);
+        }
         let _ = (|| -> Result<()> {
             // The app's log keeps alive every 5 s; its input says nothing until it takes some.
             g.get_ref().set_read_timeout((!input).then_some(Duration::from_secs(15)))?;
@@ -1547,6 +1559,9 @@ impl Proc {
                 false => relay_session(&mut g, &mut w, CLIENT_STALL, true),
             }
         })();
+        if !input {
+            self.attaching.fetch_sub(1, Ordering::SeqCst);
+        }
         vm.untrack_exec(id);
     }
 
@@ -1878,6 +1893,12 @@ impl Proc {
             let image = vm.template.meta.image.as_ref();
             crate::log!("{}", crate::app::hint(&self.spec.lock().unwrap().program(image), &crate::template::image_of(&vm.template.name)));
         }
+        // Not before its foreground client attached, and its attaches passed its status on (the guest ends them
+        // after it): a fast app's output and status are theirs still, with no record to fall back on (`--rm`).
+        let until = Instant::now() + ATTACH_WAIT;
+        while (self.attacher.load(Ordering::SeqCst) || self.attaching.load(Ordering::SeqCst) > 0) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
         for tries in 0.. {
             let mut s = self.suspending.lock().unwrap();
             match *s {
@@ -2185,7 +2206,8 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let kvm = if incoming { Ok(()) } else { crate::util::check_kvm() };
     let res = match start {
         _ if kvm.is_err() => kvm.map(|()| Value::Null),
-        Start::Run { name, template, ip, cmd, resources, generated, spec, tty, rerun } => {
+        Start::Run { name, template, ip, cmd, resources, generated, spec, tty, rerun, attacher } => {
+            p.attacher.store(attacher, Ordering::SeqCst);
             *p.cmd.lock().unwrap() = cmd;
             *p.resources.lock().unwrap() = resources;
             *p.spec.lock().unwrap() = spec;

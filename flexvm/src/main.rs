@@ -573,7 +573,7 @@ fn real_main(args: &Args) -> Result<()> {
             let host = open_host(args)?;
             each(args.names(), |n| match resume(&host, n)? {
                 true => output(format_args!("{n}\n")),
-                false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?)?),
+                false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?, false)?),
             })
         }
         Some("ps") => ps(&open_host(args)?, args),
@@ -616,7 +616,7 @@ fn real_main(args: &Args) -> Result<()> {
                 }
                 match resume(&host, n)? {
                     true => output(format_args!("{n}\n")),
-                    false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?)?),
+                    false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?, false)?),
                 }
             })
         }
@@ -854,19 +854,19 @@ fn run_as(
     resources: vm::Resources,
     spec: &app::RunSpec,
 ) -> Result<()> {
+    // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
+    let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
     // A foreground -i or -t runs it in the background, and attaches to it (as `attach`).
-    let attached = (args.has("interactive") || args.has("tty")) && !args.has("detach") && std::env::var_os("FLEXVM_NOTIFY_FD").is_none();
+    let attached = (args.has("interactive") || args.has("tty")) && !args.has("detach") && !tried;
     // A claimed standby VM writes where this process would, to opens made here (`own`).
     let log = (args.has("detach") || attached).then(|| log_file(host, &name)).transpose()?;
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
     let tty = log.is_none() && std::io::stdin().is_terminal();
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none()});
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none(), "attacher": attached});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
-    // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
-    let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
     // A foreground claim's signals wait from before it is sent: the VM it makes gets them
     // (`follow`), as a cold start would, never orphaned by this process dying mid-claim.
     let set = (!tried && log.is_none()).then(|| util::block_signals(&FOLLOW_SIGNALS));
@@ -889,7 +889,7 @@ fn run_as(
         (None, Some(log)) => {
             // The child takes the name made up here.
             let child = [&["--name".to_string(), name.clone()][..], &args.child_args].concat();
-            let v = spawn_detached(host, &name, &child, &log)?;
+            let v = spawn_detached(host, &name, &child, &log, attached)?;
             match attached {
                 true => run_attached(host, &name, args.has("keep")),
                 false => print(v),
@@ -898,10 +898,13 @@ fn run_as(
         (None, None) => {
             let generated = args.get("name").is_none();
             let (spec, rerun) = (spec.clone(), false);
+            // Its child args have no -d either way: its parent says whether it attaches.
+            let attacher = std::env::var_os("FLEXVM_ATTACHER").is_some();
+            std::env::remove_var("FLEXVM_ATTACHER");
             vmproc::main(
                 host.clone(),
                 paths.clone(),
-                Start::Run { name, template: template.into(), ip, cmd, resources, generated, spec, tty, rerun },
+                Start::Run { name, template: template.into(), ip, cmd, resources, generated, spec, tty, rerun, attacher },
                 notify_fd(),
             )
         }
@@ -969,6 +972,7 @@ fn rerun(host: &Host, name: &str) -> Result<Option<Start>> {
         spec,
         tty: std::io::stdin().is_terminal(),
         rerun: true,
+        attacher: false,
     }))
 }
 
@@ -1001,7 +1005,7 @@ fn run_checkpoint(args: &Args) -> Result<()> {
             Some(name) => name.to_string(),
             None => checkpoint::read_manifest(&dir)?.name,
         };
-        return print(spawn_detached(&host, &name, &args.child_args, &log_file(&host, &name)?)?);
+        return print(spawn_detached(&host, &name, &args.child_args, &log_file(&host, &name)?, false)?);
     }
     vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }
@@ -1021,10 +1025,12 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
 }
 
 /// Starts `child` (this binary's arguments) in the background, and prints its VM's answer.
-fn spawn_detached(host: &Host, name: &str, child: &[String], log: &std::fs::File) -> Result<Value> {
+/// `attacher`: a foreground `run -i`/`-t` attaches to it (`Proc::attacher`).
+fn spawn_detached(host: &Host, name: &str, child: &[String], log: &std::fs::File, attacher: bool) -> Result<Value> {
     let log_path = host.vms(name, "log")?;
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
-    util::spawn_self(child, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+    let env = [("FLEXVM_NOTIFY_FD", "3"), ("FLEXVM_ATTACHER", "1")];
+    util::spawn_self(child, log, w.as_raw_fd(), &env[..1 + usize::from(attacher)])?;
     drop(w);
     let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", log_path.display()))?;
     if reply["ok"] != json!(true) {
