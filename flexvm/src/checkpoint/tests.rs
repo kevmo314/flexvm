@@ -830,3 +830,54 @@ fn the_store_names_lists_and_removes_dependants_first() {
     assert_eq!(store::prune(&state, None).unwrap(), [gone(&y), gone(&x)]);
     assert!(ids().is_empty());
 }
+
+#[test]
+fn store_cleanup_propagates_manifest_permission_errors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        return; // Root can traverse a directory without search permission.
+    }
+    let state = tmp("store-permissions");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let id = stored(&state, None, 1);
+    let checkpoint = state.join("contents");
+    fs::rename(store::dir(&state).join(&id), &checkpoint).unwrap();
+    // Removing a symlink would succeed even though looking up its manifest fails.
+    std::os::unix::fs::symlink(&checkpoint, store::dir(&state).join(&id)).unwrap();
+    fs::set_permissions(&checkpoint, fs::Permissions::from_mode(0o600)).unwrap();
+    let result = store::prune(&state, None);
+    fs::set_permissions(&checkpoint, fs::Permissions::from_mode(0o700)).unwrap();
+    let err = result.unwrap_err();
+    assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(fs::symlink_metadata(store::dir(&state).join(&id)).unwrap().is_symlink());
+    assert!(checkpoint.join("manifest.json").is_file());
+}
+
+#[test]
+fn store_leaf_queue_preserves_order_across_branches() {
+    let state = tmp("store-branches");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let a = stored(&state, None, 1);
+    let b = stored(&state, Some(&a), 2);
+    let c = stored(&state, Some(&a), 3);
+    let d = stored(&state, Some(&b), 4);
+    let z = stored(&state, None, 5);
+    let removed = store::remove(&state, &[a.clone(), z.clone()], true).unwrap();
+    assert_eq!(removed, [c, d, b, a, z].map(|id| json!({"deleted": id, "name": null})));
+}
+
+#[test]
+fn store_prune_keeps_every_ancestor_of_a_kept_leaf() {
+    let state = tmp("store-prune-chain");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let mut ids = vec![stored(&state, None, 100)];
+    for ms in (93..100).rev() {
+        ids.push(stored(&state, ids.last().map(String::as_str), ms));
+    }
+    ids.push(stored(&state, ids.last().map(String::as_str), 200));
+    let unrelated = stored(&state, None, 1);
+    assert_eq!(store::prune(&state, Some(150)).unwrap(), [json!({"deleted": unrelated, "name": null})]);
+    let removed = store::prune(&state, None).unwrap();
+    assert_eq!(removed, ids.into_iter().rev().map(|id| json!({"deleted": id, "name": null})).collect::<Vec<_>>());
+}
