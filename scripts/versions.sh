@@ -11,5 +11,5 @@ CI=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$CI_VERSION/$ARCH
 # pushed; flexvm and fetch.sh download from it only once scripts/checksums.sha256 pins its assets
 # (scripts/pin-artifacts.sh writes those lines). Cut a new tag whenever firecracker/*.patch, FC_VERSION or
 # the kernel change: a release's assets never change.
-ARTIFACTS_TAG=${ARTIFACTS_TAG:-artifacts-1}
+ARTIFACTS_TAG=${ARTIFACTS_TAG:-artifacts-2}
 ARTIFACTS_URL=https://github.com/kevmo314/flexvm/releases/download/$ARTIFACTS_TAG
