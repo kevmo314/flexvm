@@ -4711,10 +4711,11 @@ def memwriter_b64():
     global _memwriter
     if _memwriter is None:
         src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memwriter.c")
-        out = os.path.join(tempfile.mkdtemp(prefix="memwriter-"), "memwriter")
         cc = "musl-gcc" if subprocess.run(["which", "musl-gcc"], capture_output=True).returncode == 0 else "gcc"
-        subprocess.run([cc, "-O2", "-static", "-mrdrnd", "-pthread", "-o", out, src], check=True)
-        _memwriter = base64.b64encode(open(out, "rb").read()).decode()
+        with tempfile.TemporaryDirectory(prefix="memwriter-") as d:
+            out = os.path.join(d, "memwriter")
+            subprocess.run([cc, "-O2", "-static", "-mrdrnd", "-pthread", "-o", out, src], check=True)
+            _memwriter = base64.b64encode(open(out, "rb").read()).decode()
     return _memwriter
 
 
