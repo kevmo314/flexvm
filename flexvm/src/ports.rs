@@ -283,6 +283,8 @@ struct Connection {
     client: TcpStream,
     guest: TcpStream,
     connected: bool,
+    /// Connected on this pass, not yet admitted: it has moved nothing.
+    fresh: bool,
     since: Instant,
     /// When it last moved data (or connected).
     active: Instant,
@@ -299,6 +301,18 @@ fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
 /// How many connected forwards have been idle for `idle`: each may make way for one more client.
 fn spare(connections: &[Connection], idle: Duration) -> usize {
     connections.iter().filter(|c| c.connected && c.active.elapsed() >= idle).count()
+}
+
+/// Keeps at most `cap` connected: each fresh one over it replaces the idlest, or else is closed itself.
+/// Only fresh ones take it over, so there is always one to close.
+fn admit(connections: &mut Vec<Connection>, cap: usize, idle: Duration) {
+    while connections.iter().filter(|c| c.connected).count() > cap {
+        let Some(i) = idlest(connections, idle).or_else(|| connections.iter().position(|c| c.fresh)) else { break };
+        connections.swap_remove(i);
+    }
+    for c in connections.iter_mut() {
+        c.fresh = false;
+    }
 }
 
 /// At most `cap` connected, and as many more connecting as forwards are idle: each replaces one once
@@ -331,7 +345,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                     return c.since.elapsed() <= CONNECT_WAIT;
                 }
                 // It moves nothing until it is admitted below.
-                c.active = Instant::now();
+                (c.fresh, c.active) = (true, Instant::now());
                 return true;
             } else if !ready(client) && !ready(guest) {
                 return true;
@@ -343,13 +357,8 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
             }
             !(c.out.shut && c.incoming.shut)
         });
-        // Only now: a replacement whose connect fails closes nothing, and one that finds none idle any
-        // more (the newest connected) is closed itself.
-        while connections.iter().filter(|c| c.connected).count() > cap {
-            let newest = connections.iter().enumerate().filter(|(_, c)| c.connected).max_by_key(|(_, c)| c.since).map(|(i, _)| i);
-            let Some(i) = idlest(&connections, idle).or(newest) else { break };
-            connections.swap_remove(i);
-        }
+        // Only now: a replacement whose connect fails closes nothing.
+        admit(&mut connections, cap, idle);
         let spare = spare(&connections, idle);
         for (listener, fd) in listeners.iter().zip(&accepting) {
             // Attempts are bounded too: a client whose guest connect fails (EMFILE, say) is dropped,
@@ -372,6 +381,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                             client,
                             guest,
                             connected: false,
+                            fresh: false,
                             since: Instant::now(),
                             active: Instant::now(),
                             out: Direction::default(),
@@ -584,13 +594,33 @@ mod tests {
         let connection = |connected, active| {
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            Connection { client, guest, connected, since: active, active, out: Direction::default(), incoming: Direction::default() }
+            Connection { client, guest, connected, fresh: false, since: active, active, out: Direction::default(), incoming: Direction::default() }
         };
         let mut connections = vec![connection(true, ago(IDLE / 2)), connection(false, ago(IDLE * 3))];
         assert_eq!(idlest(&connections, IDLE), None, "a busy forward and a pending connect stay");
         connections.push(connection(true, ago(IDLE)));
         connections.push(connection(true, ago(IDLE * 2)));
         assert_eq!(idlest(&connections, IDLE), Some(3));
+    }
+
+    #[test]
+    fn with_none_idle_the_replacement_just_connected_is_closed_not_one_already_forwarding() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ago = |d: Duration| Instant::now().checked_sub(d).unwrap();
+        let connection = |since, fresh| {
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            Connection { client, guest, connected: true, fresh, since, active: Instant::now(), out: Direction::default(), incoming: Direction::default() }
+        };
+        // Replacements a and then b were accepted for two idle forwards; b connected first and replaced
+        // one, the other is busy again, and now a connects.
+        let (old, a, b) = (ago(IDLE * 2), ago(Duration::from_secs(2)), ago(Duration::from_secs(1)));
+        let mut connections = vec![connection(old, false), connection(b, false), connection(a, true)];
+        admit(&mut connections, 2, IDLE);
+        let mut left: Vec<_> = connections.iter().map(|c| c.since).collect();
+        left.sort();
+        assert_eq!(left, [old, b], "b, already forwarding, stays");
+        assert!(connections.iter().all(|c| !c.fresh));
     }
 
     /// A TCP worker of `cap` connections to a new guest listener: its address, the guest, and its stop.
