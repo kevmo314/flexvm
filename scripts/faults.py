@@ -1066,6 +1066,57 @@ def guest_calls():
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
 
 
+def exec_burst():
+    """#702. 32 execs started at once into one VM all run. The guest reads at most 16 commands at a
+    time and asks the rest to try again: with all 16 readers held by commands still arriving, execs
+    wait for one and run. A command over the guest's 1 MiB limit fails at once."""
+    n = "ft-exec-burst"
+    ok(run(A, n))
+    # Each argument under the kernel's 128 KiB per-argument limit (the guest's sh -c gets the command as one).
+    pad = lambda k: [f": {'x' * 100000};" for _ in range(k)]
+    results = [None] * 32
+
+    def one(i):
+        results[i] = cli(A, "exec", n, "--", f": {'x' * 120000};", f"echo {i}")
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(len(results))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    bad = [(i, r[0], r[1][-80:], r[2][-200:]) if r else (i, None) for i, r in enumerate(results) if not r or r[:2] != (0, str(i))]
+    check("exec burst: 32 concurrent execs into one vm all succeed", not bad, bad[:3])
+    check("exec burst: none was refused", not any(r and "try again" in r[2] for r in results), [r[2][-200:] for r in results if r and r[2]][:3])
+    # All 16 of the guest's body readers taken by commands still arriving (straight on its vsock):
+    # execs meanwhile are asked to try again, and run once the readers are free.
+    held = []
+    for _ in range(16):
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(10)
+        s.connect(vsock_path(A, n))
+        s.sendall(f"CONNECT 52\nSESSION {os.urandom(8).hex()} 100000\n".encode() + b"x" * 1000)
+        held.append((s, s.makefile("rb").readline()))
+    check("exec burst: 16 commands held arriving", all(r.startswith(b"OK") for _, r in held), [r for _, r in held][:3])
+    time.sleep(0.5)
+    results = [None] * 8
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(len(results))]
+    for t in threads:
+        t.start()
+    time.sleep(2)
+    for s, _ in held:
+        s.close()
+    for t in threads:
+        t.join()
+    bad = [(i, r[0], r[1][-80:], r[2][-200:]) if r else (i, None) for i, r in enumerate(results) if not r or r[:2] != (0, str(i))]
+    check("exec burst: execs while every body reader is taken wait for one and run", not bad, bad[:3])
+    t = time.time()
+    code, out, err = cli(A, "exec", n, "--", *pad(11), "echo ran")
+    took = time.time() - t
+    check("exec burst: a command over 1 MiB fails at once", code != 0 and "at most" in err and "ran" not in out and took < 5, (code, err[-200:], took))
+    check("exec burst: execs still run after it", sh(A, n, "echo hi") == (0, "hi"))
+    cleanup(n)
+
+
 def exec_background():
     """An exec whose command leaves a background process holding its output returns once the
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
@@ -9920,7 +9971,7 @@ SCENARIOS = dict(
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
-    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_pause_grace=exec_pause_grace, guest_hang=guest_hang,
+    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_burst=exec_burst, exec_pause_grace=exec_pause_grace, guest_hang=guest_hang,
     source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded,
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
