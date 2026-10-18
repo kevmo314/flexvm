@@ -5205,24 +5205,28 @@ def ckpt_hot():
     (hot pages) during the pause and leaves them unprotected; the next one
     leaves out of its delta those whose contents did not change since. A chain
     of deltas of a guest that rewrites memory, some of it back to what it had
-    at the last checkpoint: each link restores exactly its pause-time memory,
-    across a failed checkpoint (which drops what the next compares with)."""
+    at the last checkpoint and some always with the same bytes: each link
+    restores exactly its pause-time memory, across a failed checkpoint whose
+    hot read failed (#801: the next still compares with the last good one) and
+    one whose read succeeded (which drops what the next compares with)."""
     n = "ft-hot"
     paths = [ckpt_path(f"ft-hot{i}") for i in range(6)]
     ok(run(A, n))
     start_writer(A, n, mib=8)
-    # 1024 pages rewritten all the time, alternately all with one byte and the other.
-    flip = "import time\nb = bytearray(4 << 20)\nk = 0\nwhile True:\n    b[:] = bytes([k % 2]) * len(b)\n    k += 1\n    time.sleep(0.05)\n"
+    # 1024 pages rewritten all the time, alternately all with one byte and the other; 1024 more always with the same one.
+    flip = ("import time\nb = bytearray(4 << 20)\nz = bytearray(4 << 20)\nk = 0\nwhile True:\n"
+            "    b[:] = bytes([k % 2]) * len(b)\n    z[:] = b'Z' * len(z)\n    k += 1\n    time.sleep(0.05)\n")
     code, out = sh(A, n, f"printf '{flip.replace('%', '%%')}' > /tmp/flip.py && (setsid python3 /tmp/flip.py >/dev/null 2>&1 </dev/null &) && sleep 0.5 && pgrep -f flip.py")
     check("hot: flipper started", code == 0 and out.strip(), out)
+    failing = {3: ("ckpt_hot_read_fail", "ckpt_fail_write"), 5: ("ckpt_fail_write",)}
     with armed_fault(A, "ckpt_memhash", 120000):
         res = []
         for i, p in enumerate(paths):
-            if i == 3:
+            if i in failing:
                 failed = ckpt_path("ft-hot-failed")
-                with armed_fault(A, "ckpt_fail_write", 60000):
+                with armed_fault(A, failing[i], 60000):
                     r = checkpoint(A, n, failed, incremental=True)
-                check("hot: the injected failure fails a checkpoint", not r["ok"], r)
+                check(f"hot: the injected failure ({'+'.join(failing[i])}) fails a checkpoint", not r["ok"], r)
                 time.sleep(0.3)
             r = ok(checkpoint(A, n, p, incremental=i > 0))
             res.append(r)
@@ -5231,17 +5235,24 @@ def ckpt_hot():
             time.sleep(0.3)
     hot = [r["hot"] for r in res]
     check("hot: checkpoints after the first two copy hot pages during the pause", all(h["mib"] > 0 for h in hot[2:]), hot)
-    check("hot: unchanged hot pages are left out of deltas", any(h["unchanged_mib"] > 0 for h in hot[2:]), hot)
+    check("hot: unchanged hot pages are left out of deltas", all(h["unchanged_mib"] > 0 for h in hot[2:5]), hot)
+    check("hot: a failed checkpoint whose hot read failed keeps the comparison", hot[3]["unchanged_mib"] > 0, hot[3])
+    check("hot: a failed checkpoint whose hot read succeeded drops it", hot[5]["unchanged_mib"] == 0, hot[5])
     for i, p in enumerate(paths):
         h = ckhash(A, p)
         check(f"hot: link {i} == memory at its pause", h["hash"] == res[i]["pause_memhash"] and len(h["chain"]) == i, h)
-    ok(restore(B, paths[-1], name="ft-hot2", ip="auto"))
-    errors, _, out = writer_check(B, "ft-hot2")
-    check("hot: the restored last link is intact", errors == 0, out)
     errors, _, out = writer_check(A, n)
     check("hot: the original is intact", errors == 0, out)
     cleanup(n)
+    ok(restore(B, paths[-1], name="ft-hot2", ip="auto"))
+    errors, _, out = writer_check(B, "ft-hot2")
+    check("hot: the restored last link is intact", errors == 0, out)
     cleanup("ft-hot2")
+    # The delta right after the failed hot read, which left out pages by the comparison it kept.
+    ok(restore(B, paths[3], name="ft-hot3", ip="auto"))
+    errors, _, out = writer_check(B, "ft-hot3")
+    check("hot: the restored link after the failed hot read is intact", errors == 0, out)
+    cleanup("ft-hot3")
 
 
 def ckpt_incremental():

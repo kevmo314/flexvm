@@ -69,6 +69,8 @@ pub struct Frozen {
     pub hot_unchanged: usize,
     /// The last checkpoint's hot pages, whose memory the next one takes once this one ends (`Pager::recycle`).
     prev: Mutex<Option<Arc<Held>>>,
+    /// Only a failed hot read may restore `prev`, and only to the same delta base.
+    prev_generation: Option<u64>,
 }
 
 impl Pager {
@@ -303,7 +305,11 @@ impl Pager {
             self.tracking.store(true, Ordering::SeqCst);
         }
         // No delta base now, nor hot pages.
-        *self.hot_prev.lock().unwrap() = None;
+        {
+            let mut prev = self.hot_prev.lock().unwrap();
+            prev.0 = prev.0.checked_add(1).unwrap();
+            prev.1 = None;
+        }
         *self.hot_dirty.lock().unwrap() = Arc::default();
         self.hot_kept.lock().unwrap().clear();
         // In chunks: while the kernel changes a range, KVM retries guest faults anywhere in it, so one call over a
@@ -358,11 +364,15 @@ impl Pager {
     pub fn freeze(&self, runs: &Runs, incremental: bool, cow: bool) -> Result<Frozen> {
         // Hot pages (see `hot`), copied first, outside the fault lock.
         let start = Instant::now();
-        let mut hot = if cow && self.tracking() { self.copy_hot() } else { None };
+        let (mut hot, prev_generation, prev) = match if cow && self.tracking() { self.copy_hot() } else { Ok(None) } {
+            Ok(hot) => (hot, None, None),
+            Err((generation, prev)) => (None, Some(generation), prev),
+        };
         let hot_time = start.elapsed();
         let _wp = self.wp.lock().unwrap();
         if (cow || incremental) && !self.tracking() {
             self.recycle_hot(hot);
+            self.recycle(prev);
             bail!("write tracking is off");
         }
         let pages = self.pages();
@@ -390,6 +400,7 @@ impl Pager {
                 Ok(n) => protected += n,
                 Err(e) => {
                     self.recycle_hot(hot);
+                    self.recycle(prev);
                     return Err(e);
                 }
             }
@@ -442,26 +453,38 @@ impl Pager {
         }
         *self.cow.lock().unwrap() = cow.clone();
         let taken = if cow.is_some() { dirty } else { Arc::default() };
-        let prev = hot.as_mut().and_then(|h| h.prev.take());
+        let prev = prev.or_else(|| hot.as_mut().and_then(|h| h.prev.take()));
         let (hot, held) = held.map_or((0, None), |(n, h)| (n, Some(h)));
-        Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect, held, hot, hot_time, hot_unchanged, prev: Mutex::new(prev) })
+        Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect, held, hot, hot_time, hot_unchanged, prev: Mutex::new(prev), prev_generation })
     }
 
     /// Undoes `freeze` for a checkpoint that failed: stops its copy and marks dirty again what it took, so the previous
     /// checkpoint is still the base of the next delta. Pages the freeze protected stay protected until written, which
-    /// marks them dirty, so nothing is lost either way.
+    /// marks them dirty, so nothing is lost either way. A freeze whose hot read failed gives the last checkpoint's hot
+    /// pages back for comparison, unless the delta base changed meanwhile (its generation moved on) or tracking is off.
     pub fn unfreeze(&self, frozen: &Frozen) {
         self.end_copy();
-        self.recycle(frozen.prev.lock().unwrap().take());
         let _wp = self.wp.lock().unwrap();
         self.pages().restore_dirty(&frozen.taken);
+        let mut prev = frozen.prev.lock().unwrap().take();
+        {
+            let mut base = self.hot_prev.lock().unwrap();
+            if self.tracking() && frozen.prev_generation == Some(base.0) && base.1.is_none() {
+                base.1 = prev.take();
+            }
+        }
+        self.recycle(prev);
     }
 
     /// Ends the copy of a checkpoint that was taken: it is the delta base now, so its hot pages are what the next one
     /// compares its own with.
     pub fn commit_copy(&self, frozen: &Frozen) {
         self.end_copy();
-        *self.hot_prev.lock().unwrap() = frozen.held.clone();
+        {
+            let mut prev = self.hot_prev.lock().unwrap();
+            prev.0 = prev.0.checked_add(1).unwrap();
+            prev.1 = frozen.held.clone();
+        }
         self.recycle(frozen.prev.lock().unwrap().take());
     }
 
@@ -947,30 +970,106 @@ mod tests {
         pager.pages().mark_dirty(1);
         *pager.hot_dirty.lock().unwrap() = Arc::new(pager.pages().dirty_bits(false));
         pager.prepare_hot();
-        *pager.hot_prev.lock().unwrap() = Some(Arc::new(Held::of(&[(1, 42)])));
-        assert!(pager.copy_hot().is_none());
+        pager.hot_prev.lock().unwrap().1 = Some(Arc::new(Held::of(&[(1, 42)])));
+        let Err((_, prev)) = pager.copy_hot() else { panic!("read should fail") };
+        pager.recycle(prev);
         assert!(pager.hot_spare.lock().unwrap().is_some(), "failed read recycles its allocation");
-        assert!(pager.hot_prev.lock().unwrap().is_none(), "failed copy invalidates comparisons");
+        assert!(pager.hot_prev.lock().unwrap().1.is_none(), "failed copy invalidates comparisons");
 
         // No hot candidates now: the hot copy succeeds without a read, but protecting the dirty page fails.
         *pager.hot_dirty.lock().unwrap() = Arc::default();
         *pager.hot_spare.lock().unwrap() = None;
-        *pager.hot_prev.lock().unwrap() = Some(Arc::new(Held::of(&[(1, 42)])));
+        pager.hot_prev.lock().unwrap().1 = Some(Arc::new(Held::of(&[(1, 42)])));
         pager.prepare_hot();
         pager.fail_protect.store(true, Ordering::SeqCst);
         assert!(pager.freeze(&vec![], true, true).is_err());
         assert!(pager.hot_spare.lock().unwrap().is_some(), "failed freeze recycles its allocation");
-        assert!(pager.hot_prev.lock().unwrap().is_none());
+        assert!(pager.hot_prev.lock().unwrap().1.is_none());
         assert!(pager.pages().is_dirty(1), "failed freeze restores dirty bits");
 
         // If the new snapshot is still shared, recycle the previous snapshot instead.
         pager.tracking.store(true, Ordering::SeqCst);
         pager.prepare_hot();
-        *pager.hot_prev.lock().unwrap() = Some(Arc::new(Held::of(&[(1, 42)])));
-        let hot = pager.copy_hot().unwrap();
+        pager.hot_prev.lock().unwrap().1 = Some(Arc::new(Held::of(&[(1, 42)])));
+        let hot = pager.copy_hot().ok().flatten().unwrap();
         let _shared = hot.held.clone();
         pager.recycle_hot(Some(hot));
         assert!(pager.hot_spare.lock().unwrap().is_some(), "previous snapshot can become the spare");
+    }
+
+    // Exercise the failed read and rollback without write-protect ioctls: a paused-only freeze supplies Frozen,
+    // then we give it the dirty bits and previous snapshot a keep-running freeze would retain after that read.
+    fn failed_hot_read(pager: &mut Pager) -> (Frozen, Arc<Held>) {
+        pager.runtime.pages.get_mut().unwrap().fill(1, 1, PRESENT);
+        pager.pages().mark_dirty(1);
+        *pager.hot_dirty.lock().unwrap() = Arc::new(pager.pages().dirty_bits(false));
+        pager.prepare_hot();
+        let held = Arc::new(Held::of(&[(1, 42)]));
+        pager.hot_prev.lock().unwrap().1 = Some(held.clone());
+        let Err((generation, prev)) = pager.copy_hot() else { panic!("read should fail") };
+        let mut frozen = pager.freeze(&vec![], true, false).unwrap();
+        frozen.taken = Arc::new(pager.pages().dirty_bits(true));
+        frozen.prev = Mutex::new(prev);
+        frozen.prev_generation = Some(generation);
+        (frozen, held)
+    }
+
+    #[test]
+    fn failed_hot_read_unfreeze_restores_previous_snapshot() {
+        let (_dir, mut pager) = test_pager(4096);
+        let (frozen, held) = failed_hot_read(&mut pager);
+        assert!(pager.hot_prev.lock().unwrap().1.is_none());
+        assert!(!pager.pages().is_dirty(1));
+        pager.pages().mark_dirty(2);
+        pager.unfreeze(&frozen);
+        assert!(pager.pages().is_dirty(1) && pager.pages().is_dirty(2));
+        assert!(Arc::ptr_eq(pager.hot_prev.lock().unwrap().1.as_ref().unwrap(), &held));
+        // Repeated rollback cannot take the restored snapshot away.
+        pager.unfreeze(&frozen);
+        assert!(Arc::ptr_eq(pager.hot_prev.lock().unwrap().1.as_ref().unwrap(), &held));
+    }
+
+    #[test]
+    fn failed_hot_read_unfreeze_rejects_a_changed_base() {
+        for with_hot in [false, true] {
+            let (_dir, mut pager) = test_pager(4096);
+            let (frozen, _held) = failed_hot_read(&mut pager);
+            let mut later = pager.freeze(&vec![], true, false).unwrap();
+            later.held = with_hot.then(|| Arc::new(Held::of(&[(1, 99)])));
+            pager.commit_copy(&later);
+            pager.unfreeze(&frozen);
+            let prev = pager.hot_prev.lock().unwrap();
+            match &later.held {
+                Some(held) => assert!(Arc::ptr_eq(prev.1.as_ref().unwrap(), held)),
+                None => assert!(prev.1.is_none(), "a commit without hot pages also changes the base"),
+            }
+        }
+    }
+
+    #[test]
+    fn failed_hot_read_unfreeze_rejects_disabled_tracking_and_released_memory() {
+        for release in [false, true] {
+            let (_dir, mut pager) = test_pager(4096);
+            let (frozen, _held) = failed_hot_read(&mut pager);
+            if release {
+                pager.release_kept();
+            } else {
+                pager.tracking.store(false, Ordering::SeqCst);
+            }
+            pager.unfreeze(&frozen);
+            assert!(pager.hot_prev.lock().unwrap().1.is_none());
+        }
+    }
+
+    #[test]
+    fn successful_hot_read_unfreeze_still_recycles_previous_snapshot() {
+        let (_dir, pager) = test_pager(4096);
+        pager.prepare_hot();
+        pager.hot_prev.lock().unwrap().1 = Some(Arc::new(Held::of(&[(1, 42)])));
+        let frozen = pager.freeze(&vec![], true, true).unwrap();
+        assert!(frozen.held.is_some());
+        pager.unfreeze(&frozen);
+        assert!(pager.hot_prev.lock().unwrap().1.is_none());
     }
 
     #[test]
@@ -993,9 +1092,9 @@ mod tests {
         assert_eq!(kept(), (0, false), "released when short");
         // The last checkpoint's hot pages go too (#691): the next compares with none.
         keep();
-        *pager.hot_prev.lock().unwrap() = Some(Arc::new(Held::of(&[(2, 3)])));
+        pager.hot_prev.lock().unwrap().1 = Some(Arc::new(Held::of(&[(2, 3)])));
         pager.release_kept();
-        assert!(pager.hot_prev.lock().unwrap().is_none() && kept() == (0, false));
+        assert!(pager.hot_prev.lock().unwrap().1.is_none() && kept() == (0, false));
         // Under the reserve: no hot pages' memory, and a copy keeps none of its rescue memory.
         pager.mem_room.set(0);
         pager.prepare_hot();
