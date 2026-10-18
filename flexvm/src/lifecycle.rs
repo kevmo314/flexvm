@@ -809,6 +809,9 @@ impl Proc {
             if fault("ckpt_fail_protect") {
                 vm.pager.fail_protect.store(true, Ordering::SeqCst);
             }
+            if fault("ckpt_hot_read_fail") {
+                vm.pager.fail_hot_read.store(true, Ordering::SeqCst);
+            }
             let frozen = vm.pager.freeze(&runs, incremental, cow)?;
             t.mark("freeze");
             let checked = match vm.pager.discards() != vm.snapshot_discards.load(Ordering::SeqCst) {

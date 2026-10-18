@@ -460,7 +460,8 @@ impl Pager {
 
     /// Undoes `freeze` for a checkpoint that failed: stops its copy and marks dirty again what it took, so the previous
     /// checkpoint is still the base of the next delta. Pages the freeze protected stay protected until written, which
-    /// marks them dirty, so nothing is lost either way.
+    /// marks them dirty, so nothing is lost either way. A freeze whose hot read failed gives the last checkpoint's hot
+    /// pages back for comparison, unless the delta base changed meanwhile (its generation moved on) or tracking is off.
     pub fn unfreeze(&self, frozen: &Frozen) {
         self.end_copy();
         let _wp = self.wp.lock().unwrap();

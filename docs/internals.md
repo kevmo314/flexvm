@@ -783,7 +783,7 @@ processes' environment) cover each failure path: migration (`pages`,
 `slow_preload`, `kill_prepared`), restores (`restore_no_hold`,
 `restore_before_run`, `restore_after_run`, `resume_kill`, `started_fsync`,
 `started_unmark`, `resume_fence_fail`), checkpoints (`prealloc_fail`, `ckpt_memhash`, `ckpt_fail_protect`,
-`ckpt_no_hold`, `ckpt_abort`, `ckpt_slow`, `ckpt_fail_write`,
+`ckpt_hot_read_fail`, `ckpt_no_hold`, `ckpt_abort`, `ckpt_slow`, `ckpt_fail_write`,
 `ckpt_copy_wait`) and guest requests (`guest_drop`, `guest_lose_reply`);
 `scripts/faults.py` uses them.
 

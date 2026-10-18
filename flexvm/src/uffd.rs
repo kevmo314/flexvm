@@ -253,6 +253,8 @@ pub struct Runtime {
     hot_kept: Mutex<std::collections::BTreeMap<usize, u64>>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,
+    /// Test fault: the next freeze fails to read its hot pages.
+    pub fail_hot_read: AtomicBool,
     /// Test fault: write faults during a copy dawdle before claiming pages.
     pub wp_race: AtomicBool,
     /// Test fault: every other rescue during a copy fails after its claim, once a writer may be waiting on the page.

@@ -146,7 +146,11 @@ impl Pager {
         let hot_before = |p: usize| before.bits.get(p / 64).is_some_and(|w| w >> (p % 64) & 1 != 0);
         let candidate = |p: usize| pages.is_dirty(p) && hot_before(p) && eligible(p);
         let hot = select_hot(pages.hot_pages(&before.bits), prev.as_ref().map_or(&[], |h| h.pages()), candidate, buf.pages());
-        let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
+        let fail = self.fail_hot_read.swap(false, Ordering::SeqCst);
+        let read = |p: usize, dst: &mut [u8]| match fail {
+            true => Err(io::Error::other("injected fault")),
+            false => self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]),
+        };
         match copy(buf, prev, hot, |p| next_to(self.mappings(), p), read) {
             Ok(hot) => Ok(Some(hot)),
             Err(CopyError { error, buf, prev }) => {
