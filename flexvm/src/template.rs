@@ -568,6 +568,8 @@ fn data_extents(file: &File, len: u64) -> Result<Vec<(u64, u64)>> {
 }
 
 /// Punches out zero pages, reading 1 MiB at a time and punching each run of them at once.
+/// Firecracker leaves holes for the pages that hold no data (firecracker/0006), so this reads only
+/// what the guest touched: tens of MiB of zeroes for an ubuntu:24.04 template, in tens of ms.
 fn sparsify(path: &Path) -> Result<u64> {
     let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     let mut buf = vec![0u8; 1 << 20];
@@ -974,12 +976,14 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
         );
     }
     fc.pause(crate::fc::API_TIMEOUT)?;
+    let snapshotting = Instant::now();
     fc.request_within(
         "PUT",
         "/snapshot/create",
         Some(json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")})),
         memory_timeout(mem_mib + hotplug),
     )?;
+    let snapshotted = snapshotting.elapsed();
     let compatibility = crate::compat::local(fc.pid())?;
     drop(fc);
     interrupted()?;
@@ -1011,10 +1015,11 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
     let size = std::fs::metadata(dir.join("mem"))?.len();
     crate::output(format_args!(
         "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged, \
-         {reported} MiB reported free), booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out in {} ms), working set {} MiB\n",
+         {reported} MiB reported free), booted in {} ms, memory file {} MiB (snapshot in {} ms, {} MiB of zeroes punched out in {} ms), working set {} MiB\n",
         meta.id,
         ms(booted),
         size >> 20,
+        ms(snapshotted),
         punched >> 20,
         ms(sparsified),
         wset >> 20
