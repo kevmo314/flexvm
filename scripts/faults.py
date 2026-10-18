@@ -874,17 +874,23 @@ def quiet_source():
     t = tx()
     time.sleep(0.3)
     check("quiet source: flood reaches the tap while running", tx() > t + 10, (t, tx()))
-    r = ok(migrate(A, n, B))
-    paused = where(n).get(A) == "source"
-    # Each sample needs the tap: one gone reads as down, unroutable and quiet, and proves nothing.
-    there = os.path.exists(sysfs)
-    flags = int(open(f"{sysfs}/flags").read(), 16) if there else None
-    routed = to_tap()
-    t0 = tx() if there else None
-    time.sleep(0.3)
-    t1 = tx() if os.path.exists(sysfs) else None
+    # Every page reply a second late: the target's pull is unfinished, so the source stays
+    # (paused, its tap there) through the sampling, rather than for as long as the pull happens to take.
+    # (The downtime printed below includes the slowed preload.)
+    with armed_fault(A, "pages_slow", 120000):
+        r = ok(migrate(A, n, B))
+        paused = where(n).get(A) == "source"
+        # Each sample needs the tap: one gone reads as down, unroutable and quiet, and proves nothing.
+        there = os.path.exists(sysfs)
+        flags = int(open(f"{sysfs}/flags").read(), 16) if there else None
+        routed = to_tap()
+        t0 = tx() if there else None
+        time.sleep(0.3)
+        there = there and os.path.exists(sysfs)
+        t1 = tx() if there else None
+        paused = paused and where(n).get(A) == "source"
     check("quiet source: still paused while sampled", paused, where(n))
-    check("quiet source: its tap still there while paused", there and os.path.exists(sysfs), tap)
+    check("quiet source: its tap still there while paused", there, tap)
     check("quiet source: tap down while paused", flags is not None and flags & 1 == 0, flags is not None and hex(flags))
     check("quiet source: cannot route to the tap while paused", there and routed.returncode != 0 and "Cannot find device" not in routed.stderr,
           routed.stderr.strip())
@@ -1339,9 +1345,10 @@ def exec_background():
             buf = receive_until(s, lambda buf: until not in buf)
             return buf
 
-    # Still running after the resume (its sleep outlasts 4 s and the 12 s pause, which the guest's clock
-    # counts): a command that ended during the pause has no running session left to sweep.
-    started = session({"action": "start", "cmd": {"argv": ["sh", "-c", "echo ready; sleep 20; echo done"]}}, b"ready")
+    # Still running after the resume: it ends only once told to, after the reattach (a command that
+    # ended during the pause would leave no running session to sweep, and prove nothing).
+    go = "/tmp/exec-bg-go"
+    started = session({"action": "start", "cmd": {"argv": ["sh", "-c", f"echo ready; while [ ! -e {go} ]; do sleep 0.1; done; echo done"]}}, b"ready")
     check("exec bg: a session started, then its client left", b"ready" in started, started[-200:])
     # Heartbeats find the client gone within about 2 s.
     time.sleep(4)
@@ -1352,10 +1359,18 @@ def exec_background():
     resume(A, n)
     counted = uptime() - before
     check("exec bg: the guest's clock counted the pause", counted >= 12, counted)
-    t = time.time()
-    out = session({"action": "attach", "offset": 0}, b"done")
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(30)
+        s.connect(sock)
+        s.sendall((json.dumps({"op": "exec", "session": sid, "action": "attach", "offset": 0}) + "\n").encode())
+        out = receive_until(s, lambda buf: b"ready" not in buf)
+        running = b"ready" in out and b"done" not in out
+        if running:
+            sh(A, n, f"touch {go}")
+            out += receive_until(s, lambda buf: b"done" not in buf)
     check("exec bg: a session whose client left just before a long pause reattaches after it, still running",
-          b"done" in out and time.time() - t > 1, (round(time.time() - t, 1), out[-200:]))
+          running and b"done" in out, out[-200:])
+    sh(A, n, f"rm -f {go}")
     sh(A, n, f"rm -f {knob}")
 
 
@@ -6236,6 +6251,11 @@ class Watch:
                 continue
             if r.get("ok") and r["result"].get("controller"):
                 self.ticks[n].append(r["result"]["controller"])
+            elif registry_state(self.host, n) == "running":
+                # An error reply (a hang-up, say) from a VM still running here is no tick either.
+                self.stuck[n].append((round((time.time() - t) * 1000), f"reply: {json.dumps(r)[:200]}"))
+            else:
+                return
 
     def mem(self):
         while not self.stop.wait(0.1):
