@@ -8,10 +8,10 @@
 
 use std::fs::File;
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::bail;
-use crate::host::{boot_id, probe, Flock, Host, Ident, Liveness};
+use crate::host::{boot_id, probe, unwritten_for, Flock, Host, Ident, Liveness};
 use crate::util::{locked, Result};
 
 /// How often `periodic` sweeps (some process on the host does).
@@ -105,7 +105,7 @@ pub fn recover(host: &Host) {
 /// A sweep if no process on the host swept within `EVERY`.
 pub fn sweep_due(host: &Host) {
     let stamp = host.run.join(".gc");
-    if age(&stamp).is_none_or(|a| a >= EVERY) {
+    if unwritten_for(&stamp).is_none_or(|a| a >= EVERY) {
         let _ = crate::host::write_record(&stamp, b"");
         sweep(host);
     }
@@ -194,14 +194,10 @@ fn cleanup_locked(host: &Host, lock: Option<Flock>) -> Result<()> {
 /// run directory may serve several templates directories, and this sweep knows none.
 fn load_sets(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if e.file_name().to_string_lossy().starts_with(".loadset-") && age(&e.path()).is_some_and(|a| a > LOADSET_TTL) {
+        if e.file_name().to_string_lossy().starts_with(".loadset-") && unwritten_for(&e.path()).is_some_and(|a| a > LOADSET_TTL) {
             let _ = std::fs::remove_file(e.path());
         }
     }
-}
-
-fn age(path: &Path) -> Option<Duration> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok())
 }
 
 /// The name a log in `RUN/vms` is of (`NAME.log`, or its predecessor `NAME.log.1`).
@@ -216,7 +212,7 @@ fn vm_files(host: &Host) {
     // Markers first: a log is kept for its VM's.
     for (file, path) in files() {
         let Some(name) = file.strip_suffix(".moved").filter(|_| !file.starts_with('.')) else { continue };
-        if age(&path).is_some_and(|a| a > MOVED_TTL) && host.holder_gone(name) {
+        if unwritten_for(&path).is_some_and(|a| a > MOVED_TTL) && host.holder_gone(name) {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -226,14 +222,14 @@ fn vm_files(host: &Host) {
         if file.starts_with(ARRIVAL_LOG) && file.ends_with(".log") {
             // Its lock is made first, so one missing is an arrival's that ended.
             let lock = crate::host::locks(&host.run.join("vms")).join(&file);
-            if age(&path).is_some_and(|a| a > ARRIVAL_GRACE) && locked(&lock, libc::LOCK_EX) != Some(true) {
+            if unwritten_for(&path).is_some_and(|a| a > ARRIVAL_GRACE) && locked(&lock, libc::LOCK_EX) != Some(true) {
                 let _ = std::fs::remove_file(&path);
                 let _ = std::fs::remove_file(&lock);
             }
             continue;
         }
         let Some(name) = log_name(&file) else { continue };
-        if logs.is_none() || age(&path).is_none_or(|a| a <= ORPHAN_LOG_TTL) {
+        if logs.is_none() || unwritten_for(&path).is_none_or(|a| a <= ORPHAN_LOG_TTL) {
             continue;
         }
         // Not a VM's name: never one of its logs.
@@ -305,6 +301,7 @@ fn standby_sockets(dir: &Path) {
 mod tests {
     use super::*;
     use crate::host::flock;
+    use std::time::SystemTime;
 
     fn dir(tag: &str) -> crate::test_util::TempDir {
         crate::test_util::TempDir::new(&format!("gc-{tag}"))

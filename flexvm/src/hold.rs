@@ -751,7 +751,7 @@ impl Injector {
         header[..6].copy_from_slice(&crate::net::GUEST_MAC);
         header[6..12].copy_from_slice(&crate::net::GATEWAY_MAC);
         header[12..].copy_from_slice(&[0x08, 0x00]);
-        Ok(Injector { fd, tap: tap.into(), ifindex: crate::net::ifindex(tap)?, header, tx_dropped: tap_tx_dropped(tap) })
+        Ok(Injector { fd, tap: tap.into(), ifindex: crate::net::ifindex(tap)?, header, tx_dropped: tap_tx_dropped(tap).unwrap_or(0) })
     }
 
     pub fn send(&self, packet: &[u8]) -> bool {
@@ -775,12 +775,12 @@ impl Injector {
 
     /// Dropped by the tap since this was made (with the guest's own traffic): reported with the injected packets.
     pub fn dropped(&self) -> u64 {
-        tap_tx_dropped(&self.tap).saturating_sub(self.tx_dropped)
+        tap_tx_dropped(&self.tap).unwrap_or(0).saturating_sub(self.tx_dropped)
     }
 }
 
-fn tap_tx_dropped(tap: &str) -> u64 {
-    std::fs::read_to_string(format!("/sys/class/net/{tap}/statistics/tx_dropped")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+pub(crate) fn tap_tx_dropped(tap: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/sys/class/net/{tap}/statistics/tx_dropped")).ok().and_then(|s| s.trim().parse().ok())
 }
 
 // Stream (over TCP: nothing lost or reordered): `START`, answered `b'a'`. Frames: u32 BE
