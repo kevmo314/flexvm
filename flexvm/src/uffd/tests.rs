@@ -20,7 +20,7 @@ fn states(p: &Pages) -> Vec<u8> {
 }
 
 fn discard(p: &Pages, page: usize) -> bool {
-    p.discard(&p.removing(), page)
+    p.discard(&p.removing(), page, page + 1) == 1
 }
 
 /// A page server's listener on loopback, and a source naming it.
@@ -962,4 +962,68 @@ fn protect_ranges_stay_bounded() {
     assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     assert_eq!(ranges.len(), pages.len());
     covers(&ranges, &pages, &kept);
+}
+
+/// A REMOVE of a range settles each page as one of a page would: across dirty words and chunks, every page in it is
+/// dirty and its chunk touched, claimed pages turn DISCARDED, the rest ZERO, and only those forget their failures.
+#[test]
+fn removes_apply_to_whole_ranges() {
+    let n = 2 * CHUNK + 100;
+    let mut p = Pages::new(n);
+    p.fill(0, n, REMOTE);
+    p.fill(CHUNK - 3, 2, PRESENT);
+    p.fill(CHUNK + 1, 1, ZERO);
+    let failing = |pg: usize| p.failing_since(pg, 1).is_some();
+    for pg in [CHUNK + 2, CHUNK + 4] {
+        assert_eq!(p.claim(pg, 1, REMOTE, |_| true), 1);
+        assert!(p.install(pg, 1, REMOTE, None, |_, _| Err(os(libc::ENOMEM))).1.is_err());
+        assert!(failing(pg));
+    }
+    assert_eq!(p.claim(CHUNK + 2, 2, REMOTE, |_| true), 2);
+    let (first, end) = (CHUNK - 5, CHUNK + 70);
+    let before: Vec<u8> = states(&p);
+    let resolved = p.discard(&p.removing(), first, end);
+    let remote = before[first..end].iter().filter(|&&s| s == REMOTE).count();
+    assert_eq!(resolved, remote);
+    for (pg, &was) in before.iter().enumerate() {
+        let want = match (pg >= first && pg < end, was) {
+            (true, INFLIGHT) => DISCARDED,
+            (true, _) => ZERO,
+            (false, s) => s,
+        };
+        assert_eq!(p.get(pg), want, "page {pg}");
+        assert_eq!(p.is_dirty(pg), pg >= first && pg < end, "page {pg}");
+    }
+    assert!(failing(CHUNK + 2), "claimed: its installer settles it");
+    assert!(!failing(CHUNK + 4), "gone: it no longer keeps failing");
+    assert!(p.touched(0) && p.touched(CHUNK));
+    // Out of bounds, empty and backwards ranges change nothing.
+    assert_eq!(p.discard(&p.removing(), n - 1, n + 10), 1);
+    assert_eq!(p.discard(&p.removing(), 10, 10), 0);
+    assert_eq!(p.discard(&p.removing(), 10, 5), 0);
+    assert_eq!(p.get(9), REMOTE);
+}
+
+/// With a stop flag (preload's, prefetch's), a copy refused while a REMOVE is queued is tried again for the same run,
+/// and starts no failure clock; once stopped, it ends.
+#[test]
+fn eagain_with_a_stop_flag_keeps_the_run_and_its_failure_history_clear() {
+    let p = pages(&[REMOTE; 4]);
+    let stop = AtomicBool::new(false);
+    p.claim(0, 4, REMOTE, |_| true);
+    let mut script = vec![Err(os(libc::EAGAIN)), Ok(2), Err(os(libc::EAGAIN)), Ok(2)].into_iter();
+    let (resolved, res) = p.install(0, 4, REMOTE, Some(&stop), |_, _| script.next().unwrap());
+    assert!(res.is_ok());
+    assert_eq!((resolved, states(&p)), (4, vec![PRESENT; 4]));
+    assert_eq!(p.failing_since(0, 4), None);
+    assert_eq!(p.install_eagain.load(Ordering::Relaxed), 2);
+
+    let p = pages(&[BASE; 4]);
+    p.claim(0, 4, BASE, |_| true);
+    let (_, res) = p.install(0, 4, BASE, Some(&stop), |_, _| {
+        stop.store(true, Ordering::SeqCst);
+        Err(os(libc::EAGAIN))
+    });
+    assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+    assert_eq!(states(&p), [BASE; 4], "given back once stopped");
 }
