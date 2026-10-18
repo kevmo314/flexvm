@@ -9,8 +9,12 @@ pub fn resolve_user(user: &str, passwd: &str, group: &str) -> io::Result<(u32, u
     // As in Docker, `user:` names no group.
     let (u, g) = user.split_once(':').map_or((user, None), |(u, g)| (u, Some(g).filter(|g| !g.is_empty())));
     let u = if u.is_empty() { "0" } else { u };
-    let entry = passwd.iter().find(|f| f[0] == u || (u.parse::<u32>().is_ok() && f[2] == u));
-    let uid: u32 = match (u.parse(), entry) {
+    let numeric_uid = u.parse::<u32>();
+    let entry = passwd.iter().find(|f| match numeric_uid {
+        Ok(uid) => f[2].parse::<u32>() == Ok(uid),
+        Err(_) => f[0] == u,
+    });
+    let uid: u32 = match (numeric_uid, entry) {
         (Ok(n), _) => n,
         (Err(_), Some(f)) => f[2].parse().map_err(|_| io::Error::other(format!("bad uid for {u} in /etc/passwd")))?,
         (Err(_), None) => return Err(io::Error::other(format!("user {u:?} is not in the image's /etc/passwd"))),
@@ -37,4 +41,25 @@ pub fn resolve_user(user: &str, passwd: &str, group: &str) -> io::Result<(u32, u
         }
     }
     Ok((uid, gid, home, groups))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_ids_match_values_and_names_match_only_names() {
+        assert_eq!(resolve_user("01000", "app:x:1000:123::/home/app:", "").unwrap(), (1000, 123, "/home/app".into(), vec![123]));
+        let passwd = "1000:x:42:43::/numeric-name:\napp:x:01000:123::/home/app:\n";
+        let group = "2000:x:44:\nextra:x:02000:app\n";
+        for user in ["1000", "01000", "app"] {
+            assert_eq!(resolve_user(user, passwd, group).unwrap(), (1000, 123, "/home/app".into(), vec![123, 2000]));
+            for g in ["2000", "02000", "extra"] {
+                assert_eq!(resolve_user(&format!("{user}:{g}"), passwd, group).unwrap(), (1000, 2000, "/home/app".into(), vec![2000]));
+            }
+        }
+        assert_eq!(resolve_user("9999:09999", passwd, group).unwrap(), (9999, 9999, "/".into(), vec![9999]));
+        assert!(resolve_user("missing", passwd, group).is_err());
+        assert!(resolve_user("app:missing", passwd, group).is_err());
+    }
 }
