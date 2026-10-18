@@ -217,8 +217,15 @@ flexvm logs -f web              # and follow it, until nothing of the VM is left
 starts on the new one) and restarts (a VM started again appends to its log);
 it ends once the name has no VM left (`kill`, `rm`, a `--rm` VM's command
 or app that ended; an exited VM's log stays, to read, until `rm`) or its
-reader is gone. A foreground VM's output is its terminal's, so
-its log holds only what came after a closed terminal.
+reader is gone. Foreground `run`, `start -a`, and `attach` print only the
+app's output, errors, and the hint for an app that exits at once without a terminal.
+The VM log also records flexvm and flexvm-init informational messages. Use the
+global `--verbose` (`-v`) flag or `FLEXVM_LOG=debug` to show those messages on
+stderr too. Detached `run -d` still prints its JSON start result.
+
+When an app starts, the guest hostname is set to the VM's name (for example,
+`root@web` in a shell prompt). A rename takes effect in the guest on the next
+app start; templates and already running apps keep their hostname.
 
 ## Forward host ports
 

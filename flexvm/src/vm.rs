@@ -427,7 +427,7 @@ impl Vm {
             std::thread::sleep(Duration::from_millis(1));
         }
         if queued {
-            crate::log!("vm {}: its guest took what was queued on its tap in {:.1} ms before the pause", self.name, start.elapsed().as_secs_f64() * 1e3);
+            crate::info!("vm {}: its guest took what was queued on its tap in {:.1} ms before the pause", self.name, start.elapsed().as_secs_f64() * 1e3);
         }
         true
     }

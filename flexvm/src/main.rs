@@ -123,7 +123,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm bench ...                   latency benchmarks, for development (see README)
 
 options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs, host.json), --run DIR
-         (/run/flexvm, or /run/flexvm-PREFIX for another --state), --version
+         (/run/flexvm, or /run/flexvm-PREFIX for another --state), --version, --verbose/-v
 Each state directory is bound to its first run directory; a different --run is refused (and so is
 none, if it is bound to another than its default); /run/flexvm is /var/lib/flexvm's alone.
 run and start -a exit with the VM's command's (or else its app's) status, 128+signal, 125 when
@@ -151,6 +151,7 @@ const SWITCHES: &[&str] = &[
     "quiet",
     "password-stdin",
     "follow",
+    "verbose",
 ];
 
 /// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`.
@@ -225,6 +226,7 @@ impl Args {
                 "-p" => Some("publish"),
                 "-h" => Some("help"),
                 "-q" => Some("quiet"),
+                "-v" => Some("verbose"),
                 "-a" => Some(if cmd == Some("start") { "attach" } else { "all" }),
                 "-i" if matches!(cmd, Some("run" | "exec")) => Some("interactive"),
                 "-t" if matches!(cmd, Some("run" | "exec")) => Some("tty"),
@@ -322,6 +324,7 @@ fn main() {
         }
     }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
+    util::set_verbose(args.has("verbose"));
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec"));
     let result = error.map_or_else(|| real_main(&args), Err);
     if let Some(sig) = template::interrupted_signal() {
@@ -339,7 +342,7 @@ fn main() {
 }
 
 /// Flags every command takes.
-const GLOBAL: &[&str] = &["state", "run", "help", "version"];
+const GLOBAL: &[&str] = &["state", "run", "help", "version", "verbose"];
 
 /// What `pull` takes besides the sizes.
 const IMAGE_FLAGS: &[&str] = &[
@@ -693,6 +696,9 @@ fn child_args(args: &Args, words: &[&str]) -> Vec<String> {
             v.extend([format!("--{flag}"), value.into()]);
         }
     }
+    if args.has("verbose") {
+        v.push("--verbose".into());
+    }
     v.extend(words.iter().map(|w| w.to_string()));
     v
 }
@@ -853,7 +859,7 @@ fn run_as(
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
     let tty = log.is_none() && stdin_tty();
     // `ports` beside the spec too, for a standby process of an older flexvm.
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "attached": log.is_none(), "ports": spec.ports});
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none(), "ports": spec.ports});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
@@ -872,7 +878,8 @@ fn run_as(
         (Some(_), Some(_)) if attached => run_attached(host, &name, args.has("keep")),
         (Some((v, _)), Some(_)) => print(v),
         (Some((v, conn)), None) => {
-            crate::log!("{v}");
+            util::output::fall_back_to(host.vms(&name, "log")?);
+            crate::info!("{v}");
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
         }
@@ -1372,10 +1379,11 @@ fn pull_missing_args(args: &Args, name: &str) -> Vec<String> {
 /// `run IMAGE` of an image not pulled here: `flexvm pull IMAGE` first, its output on stderr.
 fn pull_missing(args: &Args, name: &str) -> Result<()> {
     let image = template::image_of(name);
-    crate::log!("flexvm: unable to find image {image} here; pulling it");
+    crate::info!("flexvm: unable to find image {image} here; pulling it");
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.args(pull_missing_args(args, name));
-    let status = cmd.stdout(std::io::stderr()).status()?;
+    let out = if util::verbose() { std::process::Stdio::from(std::io::stderr()) } else { std::process::Stdio::null() };
+    let status = cmd.stdout(out).status()?;
     if !status.success() {
         bail!("pulling {image} failed ({status})");
     }
@@ -1945,6 +1953,20 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn verbose_is_global_and_preserved_for_children_but_not_app_arguments() {
+        for argv in [&["-v", "start", "web"][..], &["start", "--verbose", "web"]] {
+            let args = parse(argv);
+            assert!(args.has("verbose"));
+            assert!(check_applies(&args).is_ok());
+            assert_eq!(child_args(&args, &["start", "--attach", "web"]), ["--verbose", "start", "--attach", "web"]);
+        }
+        let args = parse(&["run", "image", "--verbose", "-v"]);
+        assert!(!args.has("verbose"));
+        assert_eq!(args.rest, ["--verbose", "-v"]);
+        assert!(parse(&["run", "-v", "-d", "image"]).child_args.contains(&"-v".into()));
     }
 
     #[test]

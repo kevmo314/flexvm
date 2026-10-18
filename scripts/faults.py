@@ -7583,7 +7583,7 @@ def standby_claim_signal():
             with armed_fault(A, "claim_stall", 60000):
                 # Output to a file: an orphaned VM would hold a pipe open, and reading it would never end.
                 out = tempfile.TemporaryFile("w+")
-                p = spawn_cli(A, "run", "--name", n, t, "sleep 600", stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
+                p = spawn_cli(A, "run", "--verbose", "--name", n, t, "sleep 600", stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
                 # At the gate: the claim has started the VM, its answer is yet to come.
                 check(f"standby claim {what}: the claim got to its gate", wait_for(lambda: reached(A, "claim_stall"), 60))
                 p.send_signal(sig)
@@ -7632,7 +7632,7 @@ def standby_claim_orphan():
         check("standby claim orphan: a standby ready", fresh_standby(A, t, 1), standby_pids(A, t))
         # Output to a file: an orphaned VM would hold a pipe open, and reading it would never end.
         out = tempfile.TemporaryFile("w+")
-        p = spawn_cli(A, "run", "--name", n, t, "sleep 600", stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
+        p = spawn_cli(A, "run", "--verbose", "--name", n, t, "sleep 600", stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
 
         def said():
             out.seek(0)
@@ -7657,7 +7657,7 @@ def standby_claim_orphan():
         check("standby claim orphan: a detached claim runs on after its run exits", vms(A).get(d, {}).get("state") == "running" and alive(r["pid"]), vms(A).get(d))
         # A foreground claim whose command ends: its run is told the status, and hangs up then, unremarked.
         check("standby claim orphan: a standby ready for a command", wait_for(lambda: len(standby_socks(A, t)) == 1, 60), standby_pids(A, t))
-        code, out, err = cli(A, "run", "--name", e, t, "echo hi")
+        code, out, err = cli(A, "run", "--verbose", "--name", e, t, "echo hi")
         check("standby claim orphan: a foreground claim's command ends, its status told", code == 0 and out == "hi" and '"standby":true' in err.replace(" ", ""), (code, out, err))
         check("standby claim orphan: a told claimer's hang-up destroys nothing", "is gone" not in err, err)
     finally:
@@ -7685,7 +7685,7 @@ def standby_claim_cgroupns():
             scenario_vms.add(n)
             check(f"standby claim cgroupns {n}: a standby ready", fresh_standby(A, t, 1), standby_pids(A, t))
             standby = open(f"/proc/{standby_pids(A, t)[0]}/cgroup").read()
-            cmd = shlex.join([BIN, "--state", A.state, "--run", A.run, "run", "--name", n, t, "sleep 600"])
+            cmd = shlex.join([BIN, "--state", A.state, "--run", A.run, "run", "--verbose", "--name", n, t, "sleep 600"])
             # A namespace rooted at the test cgroup, then into its child: inside, its cgroup is "/sub".
             enter = f"echo $$ > {inner}/cgroup.procs && exec {cmd}"
             script = f"echo $$ > {cg}/cgroup.procs && exec " + wrap("sh -c " + shlex.quote(enter))
@@ -7728,7 +7728,7 @@ def standby_claim_orphan_migrating():
         check("standby claim orphan migrating: a standby ready", fresh_standby(A, t, 1), standby_pids(A, t))
         out = tempfile.TemporaryFile("w+")
         # No command: a VM that runs one cannot migrate.
-        p = spawn_cli(A, "run", "--name", n, t, stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
+        p = spawn_cli(A, "run", "--verbose", "--name", n, t, stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True)
 
         def said():
             out.seek(0)
@@ -8302,7 +8302,7 @@ def run_status():
     standby VM (whose exit frame may arrive before the claimer reads it)."""
     n = "ft-run-status"
     scenario_vms.add(n)
-    argv = [BIN, "--state", A.state, "--run", A.run, "run", "--name", n]
+    argv = [BIN, "--state", A.state, "--run", A.run, "run", "--verbose", "--name", n]
     r = subprocess.run(argv + [args.template, "exit 7"], capture_output=True, text=True, env=ENV, timeout=120)
     check("run status: cold, CMD's own", r.returncode == 7, (r.returncode, r.stderr[-300:]))
     # flexvm's own failures are 125, never a status CMD could have. An image not pulled here is

@@ -73,6 +73,11 @@ impl RunSpec {
         s
     }
 
+    /// Hostname follows the current VM name at app start, without becoming a saved run option.
+    pub fn app_settings_for(&self, name: &str) -> String {
+        format!("{}hostname {}\n", self.app_settings(), crate::image::escape(name))
+    }
+
     /// What goes with the VM to another host: its forwards stay here, as host-local proxies.
     pub fn moving(&self) -> RunSpec {
         RunSpec { ports: Vec::new(), ..self.clone() }
@@ -251,6 +256,15 @@ mod tests {
             "source": "x", "digest": "d", "config_digest": "c", "app_conf": "", "argv": argv, "warm": warm,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn app_hostname_uses_the_current_name_without_changing_the_saved_spec() {
+        let spec = RunSpec { env: vec!["A=run".into()], ..Default::default() };
+        assert_eq!(spec.app_settings_for("web"), "env A=run\nhostname web\n");
+        assert_eq!(spec.app_settings_for("renamed"), "env A=run\nhostname renamed\n");
+        assert_eq!(spec.app_settings(), "env A=run\n");
+        assert_eq!(RunSpec::default().app_settings_for("web"), "hostname web\n");
     }
 
     #[test]

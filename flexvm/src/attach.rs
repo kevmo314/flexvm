@@ -510,8 +510,10 @@ fn follow_output(vm: &Pinned, from: Option<u64>) -> Result<i32> {
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut r) {
                     match kind {
                         FRAME_STDOUT | FRAME_STDERR | FRAME_NOTE => {
-                            let out: &mut dyn Write = if kind == FRAME_STDERR { &mut stderr } else { &mut stdout };
-                            if kind != FRAME_NOTE {
+                            if kind == FRAME_NOTE && crate::util::verbose() {
+                                stderr.write_all(&data).and_then(|()| stderr.flush())?;
+                            } else if kind != FRAME_NOTE {
+                                let out: &mut dyn Write = if kind == FRAME_STDERR { &mut stderr } else { &mut stdout };
                                 out.write_all(&data).and_then(|()| out.flush())?;
                             }
                             offset = offset.wrapping_add(data.len() as u64);

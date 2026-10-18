@@ -39,7 +39,7 @@ macro_rules! syscall_check {
     };
 }
 
-/// Queues a diagnostic line for stderr without blocking (`log_line`).
+/// Queues an error or warning for the VM log and stderr without blocking (`log_line`).
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {{
@@ -47,6 +47,31 @@ macro_rules! log {
         line.push('\n');
         $crate::util::log_line(line);
     }};
+}
+
+/// Informational diagnostics stay in the VM log; verbose mode also shows them on stderr.
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {{
+        $crate::util::info_line(format!("{}\n", format_args!($($arg)*)));
+    }};
+}
+
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_verbose(verbose: bool) {
+    VERBOSE.store(verbose, Ordering::Relaxed);
+}
+
+pub fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed) || std::env::var("FLEXVM_LOG").is_ok_and(|v| v == "debug")
+}
+
+pub fn info_line(mut line: String) {
+    cap_line(&mut line, LOG_LINE_MAX);
+    if log_writer().is_none_or(|tx| tx.try_send(LogMsg::Info(line)).is_err()) {
+        LOG_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// Lines dropped since the log writer last got through (`log_line`).
@@ -60,11 +85,12 @@ const LOG_LINE_MAX: usize = 16 << 10;
 /// once every line handed to it before is written.
 enum LogMsg {
     Line(String),
+    Info(String),
     Flush(std::sync::mpsc::Sender<()>),
 }
 
 /// Hands `line` to this process's log writer, a thread that writes each line
-/// to stderr in one write (so lines from other processes sharing the pipe
+/// to its log and stderr (so lines from other processes sharing the pipe
 /// don't interleave with it), ignoring write errors. A stalled stderr never
 /// blocks the caller, who may hold the host lock or a pager's state: past
 /// 1024 queued lines a line is dropped, and the writer reports how many when
@@ -103,13 +129,12 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
         *tried = Some(Instant::now());
         let (tx, rx) = sync_channel::<LogMsg>(1024);
         let writer = move || {
-            write_logs(rx, |line| {
-                let mut err = io::stderr().lock();
+            write_logs(rx, |line, info| {
                 let dropped = LOG_DROPPED.swap(0, Ordering::SeqCst);
                 if dropped > 0 {
-                    let _ = err.write_all(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes());
+                    output::diagnostic(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes(), false);
                 }
-                let _ = err.write_all(line.as_bytes());
+                output::diagnostic(line.as_bytes(), info);
             })
         };
         // Started with every signal blocked, so that a signal for the process
@@ -129,10 +154,11 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
 }
 
 /// The sink finishes each line before a later flush is acknowledged.
-fn write_logs(rx: std::sync::mpsc::Receiver<LogMsg>, mut write: impl FnMut(&str)) {
+fn write_logs(rx: std::sync::mpsc::Receiver<LogMsg>, mut write: impl FnMut(&str, bool)) {
     for msg in rx {
         match msg {
-            LogMsg::Line(line) => write(&line),
+            LogMsg::Line(line) => write(&line, false),
+            LogMsg::Info(line) => write(&line, true),
             LogMsg::Flush(done) => {
                 let _ = done.send(());
             }
@@ -2145,7 +2171,7 @@ mod tests {
         let lines = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let written = lines.clone();
         let writer = std::thread::spawn(move || {
-            write_logs(rx, |line| {
+            write_logs(rx, |line, _| {
                 written.lock().unwrap().insert(line.to_string());
             })
         });
@@ -2452,6 +2478,25 @@ pub mod output {
         Ok(())
     }
 
+    /// Diagnostics bypass the app's streams, and are recorded exactly once even in detached mode.
+    pub fn diagnostic(data: &[u8], info: bool) {
+        let _moving = MOVING.read().unwrap_or_else(|e| e.into_inner());
+        let target_log = LOGS.lock().unwrap()[1].clone();
+        let log = LOG.lock().unwrap().clone().or(target_log.clone());
+        if let Some(log) = &log {
+            append_capped(log, data, LOG_CAP);
+        }
+        if target_log.is_some() || (info && !super::verbose()) {
+            return;
+        }
+        let target = TARGETS.lock().unwrap()[1].clone();
+        if let Some(target) = target {
+            write_within(&target, data, Instant::now() + STALL);
+        } else {
+            let _ = std::io::stderr().write_all(data);
+        }
+    }
+
     fn relay(i: usize, data: &[u8]) {
         let _moving = MOVING.read().unwrap_or_else(|e| e.into_inner());
         // A capped log's output is appended there or dropped, never written twice.
@@ -2460,6 +2505,7 @@ pub mod output {
             append_capped(&log, data, LOG_CAP);
             return;
         }
+        let recorded = LOG.lock().unwrap().clone().is_some_and(|log| append_capped(&log, data, LOG_CAP));
         let target = TARGETS.lock().unwrap()[i].clone();
         let sent = target.as_ref().map_or(0, |t| write_within(t, data, Instant::now() + STALL));
         if sent == data.len() {
@@ -2482,7 +2528,9 @@ pub mod output {
             (targets[i].clone(), LOGS.lock().unwrap()[i].clone())
         };
         if let Some(log) = fallback.1 {
-            append_capped(&log, &data[sent..], LOG_CAP);
+            if !recorded {
+                append_capped(&log, &data[sent..], LOG_CAP);
+            }
         } else if let Some(f) = fallback.0.as_deref() {
             write_within(f, &data[sent..], Instant::now() + STALL);
         }
@@ -2491,6 +2539,8 @@ pub mod output {
     /// What was written by `deadline`: in pieces no bigger than a pipe takes
     /// at once, each only once the target is ready for it.
     fn write_within(f: &File, data: &[u8], deadline: Instant) -> usize {
+        use std::os::unix::fs::FileTypeExt;
+        let socket = f.metadata().is_ok_and(|m| m.file_type().is_socket());
         let mut sent = 0;
         while sent < data.len() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -2501,10 +2551,7 @@ pub mod output {
             let piece = &data[sent..(sent + 4096).min(data.len())];
             let (fd, buf, len) = (f.as_raw_fd(), piece.as_ptr().cast(), piece.len());
             // Another relay may have filled a shared target since the poll: retried.
-            let n = match unsafe { libc::send(fd, buf, len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } {
-                -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) => unsafe { libc::write(fd, buf, len) },
-                n => n,
-            };
+            let n = if socket { unsafe { libc::send(fd, buf, len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } } else { unsafe { libc::write(fd, buf, len) } };
             match n {
                 n if n > 0 => sent += n as usize,
                 _ if matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) => {}
@@ -2649,6 +2696,68 @@ pub mod output {
         for r in relays {
             while !r.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostics_and_app_streams_are_routed_and_logged_once() {
+        const CHILD: &str = "FLEXVM_OUTPUT_TEST_LOG";
+        if let Some(log) = std::env::var_os(CHILD) {
+            // Run alone: these targets and the diagnostic writer are process globals.
+            super::set_verbose(std::env::var_os("FLEXVM_OUTPUT_TEST_VERBOSE").is_some());
+            guard().unwrap();
+            let log = PathBuf::from(log);
+            if std::env::var_os("FLEXVM_OUTPUT_TEST_DETACHED").is_some() {
+                *LOGS.lock().unwrap() = [Some(log.clone()), Some(log.clone())];
+            }
+            fall_back_to(log);
+            std::io::stdout().write_all(b"app-out-marker\n").unwrap();
+            std::io::stderr().write_all(b"app-err-marker\n").unwrap();
+            super::info_line("info-marker\n".into());
+            super::log_line("error-marker\n".into());
+            super::log_final("hint-marker\n".into(), true);
+            super::flush_log(super::LOG_FLUSH);
+            drain();
+            return;
+        }
+        for mode in ["quiet", "flag", "debug", "detached"] {
+            let dir = crate::test_util::TempDir::new("output-routing");
+            let log = dir.join("vm.log");
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "util::output::diagnostics_and_app_streams_are_routed_and_logged_once", "--nocapture"])
+                .env(CHILD, &log)
+                .env_remove("FLEXVM_LOG")
+                .env_remove("FLEXVM_OUTPUT_TEST_VERBOSE")
+                .env_remove("FLEXVM_OUTPUT_TEST_DETACHED");
+            match mode {
+                "flag" => {
+                    cmd.env("FLEXVM_OUTPUT_TEST_VERBOSE", "1");
+                }
+                "debug" => {
+                    cmd.env("FLEXVM_LOG", "debug");
+                }
+                "detached" => {
+                    cmd.env("FLEXVM_OUTPUT_TEST_DETACHED", "1");
+                }
+                _ => {}
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{mode}: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let log = std::fs::read_to_string(log).unwrap();
+            if mode == "detached" {
+                assert!(!stdout.contains("marker") && !stderr.contains("marker"), "{stdout} {stderr}");
+            } else {
+                assert!(stdout.contains("app-out-marker") && !stdout.contains("app-err-marker"), "{stdout}");
+                assert!(stderr.contains("app-err-marker") && !stderr.contains("app-out-marker"), "{stderr}");
+                assert!(!stdout.contains("info-marker") && !stdout.contains("error-marker") && !stdout.contains("hint-marker"), "{stdout}");
+                assert_eq!(stderr.contains("info-marker"), mode != "quiet", "{stderr}");
+                assert!(stderr.contains("error-marker") && stderr.contains("hint-marker"), "{stderr}");
+            }
+            for marker in ["app-out-marker", "app-err-marker", "info-marker", "error-marker", "hint-marker"] {
+                assert_eq!(log.matches(marker).count(), 1, "{mode}: {log}");
             }
         }
     }
