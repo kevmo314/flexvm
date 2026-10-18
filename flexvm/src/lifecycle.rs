@@ -38,8 +38,10 @@ const GEN: &str = "GEN";
 const QUARANTINE: &str = "QUARANTINE";
 /// A suspended `run -- CMD` VM's command and its session (`{"cmd", "session"}`), reattached on resume.
 const CMD: &str = "CMD";
-/// A suspended VM's `app::RunSpec` (JSON), when it has one other than the default.
+/// A suspended VM's `app::RunSpec` (JSON), its `-p` ports included, when it has one other than the default.
 const SPEC: &str = "SPEC";
+/// An older suspended VM's `-p` ports, kept apart from its `SPEC`: read into it (`read_spec`), never written.
+const PORTS: &str = "PORTS";
 
 /// Set while a suspend or `checkpoint --stop` saves the VM, and for good once
 /// it did: the app log follower writes nothing past the offset the checkpoint
@@ -210,7 +212,6 @@ impl Proc {
             self.record_for_suspend()?;
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
-            staging.add_file("PORTS", &serde_json::to_vec(&*self.ports.lock().unwrap())?)?;
             self.save_spec(&staging)?;
             let cmd = match self.cmd.lock().unwrap().clone() {
                 Some(cmd) => Some((cmd, self.cmd_session()?, staging.create(CMD)?)),
@@ -275,7 +276,7 @@ impl Proc {
         }
     }
 
-    /// What becomes of the VM once its app exits goes with its checkpoint (`SPEC`).
+    /// What becomes of the VM once its app exits, and its ports, go with its checkpoint (`SPEC`).
     fn save_spec(&self, staging: &Staging) -> Result<()> {
         let spec = self.spec.lock().unwrap().clone();
         if spec != crate::app::RunSpec::default() {
@@ -310,7 +311,6 @@ impl Proc {
         crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         self.set_resources(ck.manifest.resources, &tpl.meta)?;
-        *self.ports.lock().unwrap() = read_ports(&dir)?;
         self.bind_ports()?;
         let claim = {
             let l = self.host.lock()?;
@@ -359,12 +359,21 @@ impl Proc {
     }
 
     /// Another host's address is borrowed.
-    pub fn restore(&self, dir: &Path, name: Option<&str>, ip: Option<&str>, paused: bool, resources: crate::vm::Resources) -> Result<Value> {
+    pub fn restore(
+        &self,
+        dir: &Path,
+        name: Option<&str>,
+        ip: Option<&str>,
+        paused: bool,
+        resources: crate::vm::Resources,
+        ports: Vec<crate::ports::Port>,
+    ) -> Result<Value> {
         let mut t = Phases::new();
         let ck = Checkpoint::open(dir)?;
-        // Its app's settings and what becomes of it; not the address its original asked for.
+        // Its app's settings and what becomes of it; not the address its original asked for, nor
+        // its ports (its original may hold them still): only those this `run` gives.
         let spec = read_spec(dir).map_err(|e| format!("its run settings {}: {e}", dir.join(SPEC).display()))?;
-        *self.spec.lock().unwrap() = crate::app::RunSpec { ip: None, ..spec };
+        *self.spec.lock().unwrap() = crate::app::RunSpec { ip: None, ports, ..spec };
         t.mark("verify_checkpoint");
         let name = name.unwrap_or(&ck.manifest.name).to_string();
         let want = match ip {
@@ -1008,12 +1017,21 @@ fn read_cmd(dir: &Path) -> Result<Option<(String, crate::Session)>> {
     Ok(Some((cmd, serde_json::from_value(v["session"].clone())?)))
 }
 
+/// With an older checkpoint's `PORTS`, if its `SPEC` has none.
 fn read_spec(dir: &Path) -> Result<crate::app::RunSpec> {
-    match std::fs::read(dir.join(SPEC)) {
-        Ok(b) => Ok(serde_json::from_slice(&b)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::app::RunSpec::default()),
-        Err(e) => Err(e.into()),
+    let mut spec: crate::app::RunSpec = match std::fs::read(dir.join(SPEC)) {
+        Ok(b) => serde_json::from_slice(&b)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::app::RunSpec::default(),
+        Err(e) => return Err(e.into()),
+    };
+    if spec.ports.is_empty() {
+        match std::fs::read(dir.join(PORTS)) {
+            Ok(b) => spec.ports = serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", dir.join(PORTS).display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(spec)
 }
 
 pub fn read_gen(dir: &Path) -> Option<u64> {
@@ -1091,14 +1109,6 @@ pub(crate) fn quarantined<'a>(q: &'a str, boot: &str) -> Option<&'a str> {
     (written == boot).then_some(why)
 }
 
-fn read_ports(dir: &Path) -> Result<Vec<crate::ports::Port>> {
-    match std::fs::read(dir.join("PORTS")) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     if !host.is_suspended(name) {
         return None;
@@ -1110,7 +1120,7 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };
     Some(json!({
         "name": name, "ip": m.ip.to_string(), "template": m.template, "template_id": m.template_id,
-        "ports": read_ports(&dir).unwrap_or_default(),
+        "ports": read_spec(&dir).map(|s| s.ports).unwrap_or_default(),
         "state": state, "vcpus": m.vcpus, "cpus": m.resources.cpus, "resources": m.resources,
         "guest_mib": m.mem_mib.saturating_add(m.hotplug_mib), "max_mib": m.resources.ceiling(m.mem_mib, m.max_mib),
         "checkpoint_mib": (m.data_pages.saturating_mul(PAGE_SIZE as u64)) >> 20,
@@ -1127,17 +1137,27 @@ pub fn ckhash(paths: &crate::template::Paths, dir: &Path) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quarantined, read_ports};
+    use super::{quarantined, read_spec, PORTS, SPEC};
+    use crate::app::RunSpec;
 
     #[test]
-    fn suspended_port_records_roundtrip_and_missing_old_records_are_empty() {
+    fn suspended_ports_go_in_the_spec_and_an_older_records_ports_file_is_read_into_it() {
         let dir = crate::test_util::TempDir::new("suspended-ports");
-        assert!(read_ports(&dir).unwrap().is_empty());
+        assert_eq!(read_spec(&dir).unwrap(), RunSpec::default());
         let ports = vec!["127.0.0.1:8080:80".parse::<crate::ports::Port>().unwrap(), "5353:53/udp".parse().unwrap()];
-        std::fs::write(dir.join("PORTS"), serde_json::to_vec(&ports).unwrap()).unwrap();
-        assert_eq!(read_ports(&dir).unwrap(), ports);
-        std::fs::write(dir.join("PORTS"), b"broken").unwrap();
-        assert!(read_ports(&dir).is_err(), "a corrupt record must refuse start");
+        let spec = RunSpec { keep: true, ports: ports.clone(), ..Default::default() };
+        std::fs::write(dir.join(SPEC), serde_json::to_vec(&spec).unwrap()).unwrap();
+        assert_eq!(read_spec(&dir).unwrap(), spec);
+        // An older suspend wrote them apart, with or without a spec.
+        std::fs::write(dir.join(PORTS), serde_json::to_vec(&ports).unwrap()).unwrap();
+        std::fs::write(dir.join(SPEC), serde_json::to_vec(&RunSpec { keep: true, ..Default::default() }).unwrap()).unwrap();
+        assert_eq!(read_spec(&dir).unwrap(), spec);
+        std::fs::remove_file(dir.join(SPEC)).unwrap();
+        assert_eq!(read_spec(&dir).unwrap(), RunSpec { ports: ports.clone(), ..Default::default() });
+        std::fs::write(dir.join(PORTS), b"broken").unwrap();
+        assert!(read_spec(&dir).is_err(), "a corrupt record must refuse start");
+        std::fs::write(dir.join(SPEC), b"broken").unwrap();
+        assert!(read_spec(&dir).is_err(), "a corrupt record must refuse start");
     }
 
     #[test]

@@ -87,7 +87,7 @@ pub enum Start {
         resources: crate::vm::Resources,
         /// Made up (`host::generated_name`): made up again if taken meanwhile.
         generated: bool,
-        ports: Vec<crate::ports::Port>,
+        /// Its `-p` ports included.
         spec: crate::app::RunSpec,
         /// Its `run`'s stdin is a terminal (`app::hint`).
         tty: bool,
@@ -102,6 +102,7 @@ pub enum Start {
         name: Option<String>,
         ip: Option<String>,
         paused: bool,
+        /// `run --checkpoint -p`: the checkpoint's own are not taken.
         ports: Vec<crate::ports::Port>,
         /// Each set overrides the checkpoint's.
         resources: crate::vm::Resources,
@@ -146,7 +147,6 @@ pub struct Proc {
 #[derive(Default)]
 pub struct Runtime {
     vm: OnceLock<Arc<Vm>>,
-    pub ports: Mutex<Vec<crate::ports::Port>>,
     forwards: Mutex<Option<crate::ports::Forwarder>>,
     op: Mutex<()>,
     holder: OnceLock<Option<Arc<Holder>>>,
@@ -165,7 +165,7 @@ pub struct Runtime {
     /// goes, and one a migration kept (refusing the destroy) goes once it runs here again (`abort`).
     pub claimer_gone: AtomicBool,
     pub cmd: Mutex<Option<String>>,
-    /// `run`'s app settings, and what becomes of the VM once its app exits (`app::RunSpec`).
+    /// `run`'s app settings and `-p` ports, and what becomes of the VM once its app exits (`app::RunSpec`).
     pub spec: Mutex<crate::app::RunSpec>,
     /// Its `run`'s stdin is a terminal: no hint when its app exits at once.
     pub tty: AtomicBool,
@@ -306,13 +306,14 @@ impl Proc {
         }))
     }
 
-    /// Before the address is claimed (`Forwarder::bind`); `serve_ports` once it is.
+    /// The spec's `-p` ports, before the address is claimed (`Forwarder::bind`); `serve_ports` once it is.
     pub fn bind_ports(&self) -> Result<()> {
-        *self.forwards.lock().unwrap() = Some(crate::ports::Forwarder::bind(&self.ports.lock().unwrap())?);
+        let ports = self.spec.lock().unwrap().ports.clone();
+        *self.forwards.lock().unwrap() = Some(crate::ports::Forwarder::bind(&ports)?);
         Ok(())
     }
 
-    /// What is bound, an entry per address; `ports` stays as asked, for its records.
+    /// What is bound, an entry per address; the spec's `ports` stay as asked, for its records.
     pub fn bound_ports(&self) -> Vec<crate::ports::Port> {
         self.forwards.lock().unwrap().as_ref().map_or_else(Vec::new, |f| f.ports.clone())
     }
@@ -321,21 +322,10 @@ impl Proc {
         self.forwards.lock().unwrap().as_mut().map_or(Ok(()), |f| f.serve(ip))
     }
 
-    /// Released before it returns: a retried claim can bind them again.
+    /// Released before it returns: a retried claim can bind them again. The spec keeps them,
+    /// for the VM's exited record.
     pub fn drop_ports(&self) {
         self.forwards.lock().unwrap().take();
-        self.ports.lock().unwrap().clear();
-    }
-
-    /// Off the migration's switchover: joining the forwarder takes up to a poll's wait.
-    pub fn drop_ports_later(&self) {
-        let forwards = self.forwards.lock().unwrap().take();
-        self.ports.lock().unwrap().clear();
-        let Some(p) = self.arc() else { return };
-        thread::spawn(move || {
-            drop(forwards);
-            p.publish();
-        });
     }
 
     pub fn vm(&self) -> &Arc<Vm> {
@@ -820,8 +810,7 @@ impl Proc {
         }
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let cmd = self.cmd.lock().unwrap().clone();
-        let ports = self.ports.lock().unwrap().clone();
-        let rec = crate::app::Exited { status: code, template: vm.template.name.clone(), cmd, resources: vm.resources(), spec, ports, at };
+        let rec = crate::app::Exited::new(code, vm.template.name.clone(), cmd, vm.resources(), spec, at);
         if let Err(e) = serde_json::to_vec(&rec).map_err(Error::from).and_then(|b| Ok(crate::host::write_record(&path, &b)?)) {
             crate::log!("vm {}: its exited record {}: {e}", vm.name, path.display());
         }
@@ -1054,7 +1043,6 @@ impl Proc {
                 let r = crate::app::Exited::read(path)?;
                 *self.cmd.lock().unwrap() = r.cmd;
                 *self.resources.lock().unwrap() = r.resources;
-                *self.ports.lock().unwrap() = r.ports;
                 let ip = r.spec.ip;
                 *self.spec.lock().unwrap() = r.spec;
                 (r.template, ip)
@@ -2044,8 +2032,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let kvm = if matches!(start, Start::Incoming { .. }) { Ok(()) } else { crate::util::check_kvm() };
     let res = match start {
         _ if kvm.is_err() => kvm.map(|()| Value::Null),
-        Start::Run { name, template, ip, cmd, resources, generated, ports, spec, tty, rerun } => {
-            *p.ports.lock().unwrap() = ports;
+        Start::Run { name, template, ip, cmd, resources, generated, spec, tty, rerun } => {
             *p.cmd.lock().unwrap() = cmd;
             *p.resources.lock().unwrap() = resources;
             *p.spec.lock().unwrap() = spec;
@@ -2058,9 +2045,8 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
             p.resume_suspended(&name)
         }
         Start::Restore { dir, name, ip, paused, resources, ports } => {
-            *p.ports.lock().unwrap() = ports;
             p.attached.store(notify.is_none(), Ordering::SeqCst);
-            p.restore(&dir, name.as_deref(), ip.as_deref(), paused, resources)
+            p.restore(&dir, name.as_deref(), ip.as_deref(), paused, resources, ports)
         }
         Start::Incoming { req } => {
             let log = std::env::var_os("FLEXVM_INCOMING_LOG").map(PathBuf::from);
@@ -3413,6 +3399,22 @@ mod tests {
             p.set_name(p.host.take_name(name, false).unwrap());
         }
         (p, root)
+    }
+
+    #[test]
+    fn dropping_the_forwards_keeps_the_ports_for_the_vms_records() {
+        let (p, _root) = test_proc("drop-ports", None);
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
+        let ports: Vec<crate::ports::Port> = vec![format!("127.0.0.1:{port}:80").parse().unwrap()];
+        p.spec.lock().unwrap().ports = ports.clone();
+        p.bind_ports().unwrap();
+        p.serve_ports(Ipv4Addr::LOCALHOST).unwrap();
+        assert_eq!(p.bound_ports(), ports);
+        // As `finish` does, before `record_exit` reads the spec.
+        p.drop_ports();
+        assert!(p.bound_ports().is_empty());
+        assert!(std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(), "released");
+        assert_eq!(p.spec.lock().unwrap().ports, ports, "an exited record keeps them, for start");
     }
 
     #[test]

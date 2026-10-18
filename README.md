@@ -192,12 +192,15 @@ them in the kernel immediately, so garbage collection has no forwarding
 rules or reservations left to remove.
 
 `stop` releases the ports and saves their configuration with the stopped
-VM. `start` binds them again, and refuses if they have been taken meanwhile.
-A checkpoint restore uses only ports explicitly given with `run -p` again,
-even when restoring a stopped VM's checkpoint. Migration drops the forwards
-on the source once the target commits and does **not** recreate them on the
-target. Existing proxied connections end; use routed VM addresses for
-services that must remain reachable through migration.
+VM, as an exited VM's record does. `start` binds them again, and refuses if
+they have been taken meanwhile. A checkpoint restore uses only ports
+explicitly given with `run -p` again, even when restoring a stopped VM's
+checkpoint. Migration does **not** recreate the forwards on the target. The
+source keeps them, reaching the VM through its route to the target, until
+the target has all the VM's memory, and drops them then; a migration that
+aborts before that leaves the VM here with its forwards. Existing proxied
+connections end with them; use routed VM addresses for services that must
+remain reachable through migration.
 
 ## Stop, start, pause, kill, rm
 

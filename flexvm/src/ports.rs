@@ -3,8 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,6 +15,12 @@ use crate::util::Result;
 const CONNECTIONS: usize = 256;
 const BUFFER: usize = 65536;
 const UDP_IDLE: Duration = Duration::from_secs(60);
+const CONNECT_WAIT: Duration = Duration::from_secs(10);
+/// The most datagrams taken from one socket per wakeup: a flood on one cannot starve the others.
+const BURST: usize = 1024;
+/// Workers wake for their sockets or `Forwarder::drop`'s eventfd; this only bounds when idle
+/// sessions and stalled connects are noticed.
+const TICK: libc::c_int = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -72,7 +77,8 @@ impl std::fmt::Display for Port {
 /// atomically refuses overlapping forwards across processes and run directories and
 /// ordinary bound ports; a failed batch releases everything it acquired.
 pub struct Forwarder {
-    stop: Arc<AtomicBool>,
+    /// Readable once the forwarder is dropped: in every worker's poll set, so they stop at once.
+    stop: Arc<OwnedFd>,
     /// A worker's: one -p's sockets, of each address it binds.
     bound: Vec<(Vec<OwnedFd>, Protocol, u16)>,
     workers: Vec<JoinHandle<()>>,
@@ -99,7 +105,12 @@ impl Forwarder {
             }
             bound.push((fds, p.protocol, p.vm_port));
         }
-        Ok(Self { stop: Arc::new(AtomicBool::new(false)), bound, workers: Vec::new(), ports: bound_ports })
+        let stop = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if stop < 0 {
+            crate::bail!("forward: eventfd: {}", io::Error::last_os_error());
+        }
+        let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(stop) });
+        Ok(Self { stop, bound, workers: Vec::new(), ports: bound_ports })
     }
 
     /// Proxies to the VM at `vm`, once its address is known.
@@ -107,8 +118,8 @@ impl Forwarder {
         for (fds, protocol, port) in self.bound.drain(..) {
             let (stop, target) = (self.stop.clone(), SocketAddrV4::new(vm, port));
             self.workers.push(thread::Builder::new().name("port-forward".into()).spawn(move || match protocol {
-                Protocol::Tcp => tcp(fds.into_iter().map(TcpListener::from).collect(), target, &stop),
-                Protocol::Udp => udp(fds.into_iter().map(UdpSocket::from).collect(), target, &stop),
+                Protocol::Tcp => tcp(fds.into_iter().map(TcpListener::from).collect(), target, stop.as_fd()),
+                Protocol::Udp => udp(fds.into_iter().map(UdpSocket::from).collect(), target, stop.as_fd()),
             })?);
         }
         Ok(())
@@ -124,16 +135,24 @@ impl Forwarder {
 
 impl Drop for Forwarder {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        let one = 1u64;
+        unsafe { libc::write(self.stop.as_raw_fd(), (&one as *const u64).cast(), 8) };
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
     }
 }
 
-fn wait(fds: &mut [libc::pollfd]) {
-    // Bounded so Drop joins promptly, even with idle or stalled connections.
-    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 100) };
+/// Waits on `fds` and the stop eventfd (last); false once stopped.
+fn wait(fds: &mut Vec<libc::pollfd>, stop: BorrowedFd) -> bool {
+    fds.push(libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, TICK) };
+    fds.pop().is_some_and(|s| s.revents == 0)
+}
+
+/// Whether the socket has something for us (data, room, or an error or hangup to find out by trying).
+fn ready(fd: &libc::pollfd) -> bool {
+    fd.revents != 0
 }
 
 fn poll(fd: &impl AsRawFd, events: i16) -> libc::pollfd {
@@ -257,33 +276,44 @@ struct Connection {
     incoming: Direction,
 }
 
-fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: &AtomicBool) {
+fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd) {
     let mut connections: Vec<Connection> = Vec::new();
-    while !stop.load(Ordering::SeqCst) {
+    loop {
         let room = if connections.len() < CONNECTIONS { libc::POLLIN } else { 0 };
         let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, room)).collect();
         for c in &connections {
             fds.push(poll(&c.client, if c.connected { c.out.events(&c.incoming) } else { 0 }));
             fds.push(poll(&c.guest, if c.connected { c.incoming.events(&c.out) } else { libc::POLLOUT }));
         }
-        wait(&mut fds);
+        if !wait(&mut fds, stop) {
+            return;
+        }
+        let (accepting, mut each) = (fds[..listeners.len()].to_vec(), fds[listeners.len()..].chunks(2));
         connections.retain_mut(|c| {
+            let [client, guest] = each.next().unwrap() else { unreachable!() };
             if !c.connected {
-                if c.guest.take_error().ok().flatten().is_some() || c.since.elapsed() > Duration::from_secs(10) {
+                if !ready(guest) {
+                    return c.since.elapsed() <= CONNECT_WAIT;
+                }
+                if c.guest.take_error().ok().flatten().is_some() {
                     return false;
                 }
                 c.connected = c.guest.peer_addr().is_ok();
                 if !c.connected {
-                    return true;
+                    return c.since.elapsed() <= CONNECT_WAIT;
                 }
+            } else if !ready(client) && !ready(guest) {
+                return true;
             }
             c.out.pump(&c.client, &c.guest).is_ok() && c.incoming.pump(&c.guest, &c.client).is_ok() && !(c.out.shut && c.incoming.shut)
         });
-        for listener in &listeners {
-            if connections.len() >= CONNECTIONS {
-                break;
-            }
-            if let Ok((client, _)) = listener.accept() {
+        for (listener, fd) in listeners.iter().zip(&accepting) {
+            while ready(fd) && connections.len() < CONNECTIONS {
+                let client = match listener.accept() {
+                    Ok((client, _)) => client,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
                 if let Ok(guest) = connect(target) {
                     if client.set_nonblocking(true).is_ok() {
                         connections.push(Connection {
@@ -301,37 +331,58 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: &AtomicBool) {
     }
 }
 
-fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: &AtomicBool) {
+fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
     // A connected guest socket per client preserves reply isolation. Idle sessions expire,
     // and both protocols bound the number of sockets and per-stream queued bytes.
     // Replies leave by the listener the client sent to.
     let mut clients: HashMap<SocketAddr, (UdpSocket, Instant, usize)> = HashMap::new();
     let mut buf = vec![0; BUFFER];
-    while !stop.load(Ordering::SeqCst) {
+    loop {
         let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, libc::POLLIN)).collect();
-        fds.extend(clients.values().map(|(s, _, _)| poll(s, libc::POLLIN)));
-        wait(&mut fds);
-        for (i, listener) in listeners.iter().enumerate() {
-            let Ok((n, peer)) = listener.recv_from(&mut buf) else { continue };
-            if !clients.contains_key(&peer) && clients.len() < CONNECTIONS {
-                if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
-                    if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
-                        clients.insert(peer, (s, Instant::now(), i));
+        let peers: Vec<SocketAddr> = clients.keys().copied().collect();
+        fds.extend(peers.iter().map(|p| poll(&clients[p].0, libc::POLLIN)));
+        if !wait(&mut fds, stop) {
+            return;
+        }
+        // Replies first: the sessions polled are those in `peers`, before any is added below.
+        for (peer, fd) in peers.iter().zip(&fds[listeners.len()..]) {
+            let Some((s, at, i)) = clients.get_mut(peer).filter(|_| ready(fd)) else { continue };
+            for _ in 0..BURST {
+                match s.recv(&mut buf) {
+                    Ok(n) => {
+                        let _ = listeners[*i].send_to(&buf[..n], peer);
+                        *at = Instant::now();
                     }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    // WouldBlock, or the guest refused one (ICMP): the session goes on.
+                    Err(_) => break,
                 }
             }
-            if let Some((s, at, _)) = clients.get_mut(&peer) {
-                let _ = s.send(&buf[..n]);
-                *at = Instant::now();
+        }
+        for ((i, listener), fd) in listeners.iter().enumerate().zip(&fds) {
+            if !ready(fd) {
+                continue;
+            }
+            for _ in 0..BURST {
+                let (n, peer) = match listener.recv_from(&mut buf) {
+                    Ok(got) => got,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                if !clients.contains_key(&peer) && clients.len() < CONNECTIONS {
+                    if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+                        if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
+                            clients.insert(peer, (s, Instant::now(), i));
+                        }
+                    }
+                }
+                if let Some((s, at, _)) = clients.get_mut(&peer) {
+                    let _ = s.send(&buf[..n]);
+                    *at = Instant::now();
+                }
             }
         }
-        clients.retain(|peer, (s, at, i)| {
-            if let Ok(n) = s.recv(&mut buf) {
-                let _ = listeners[*i].send_to(&buf[..n], peer);
-                *at = Instant::now();
-            }
-            at.elapsed() < UDP_IDLE
-        });
+        clients.retain(|_, (_, at, _)| at.elapsed() < UDP_IDLE);
     }
 }
 
@@ -492,6 +543,98 @@ mod tests {
             Err(e) => assert!(!transient(&e) && e.kind() != io::ErrorKind::TimedOut, "client stayed open: {e}"),
         }
         let _again = Forwarder::start(&[p], Ipv4Addr::LOCALHOST).unwrap();
+    }
+
+    #[test]
+    fn drops_wake_the_workers_at_once() {
+        let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut took = Duration::ZERO;
+        for _ in 0..10 {
+            let tcp = mapping(free_tcp(), guest.local_addr().unwrap().port(), Protocol::Tcp);
+            let udp = Port { protocol: Protocol::Udp, ..tcp.clone() };
+            let f = Forwarder::start(&[tcp, udp], Ipv4Addr::LOCALHOST).unwrap();
+            // Asleep in poll, with nothing to do.
+            thread::sleep(Duration::from_millis(20));
+            let at = Instant::now();
+            drop(f);
+            took += at.elapsed();
+        }
+        // A worker that only noticed on a poll timeout (100 ms) took about half that each time.
+        assert!(took < Duration::from_millis(200), "10 drops took {took:?}");
+    }
+
+    #[test]
+    fn a_burst_of_tcp_clients_is_taken_at_once() {
+        const N: usize = 64;
+        let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = mapping(free_tcp(), guest.local_addr().unwrap().port(), Protocol::Tcp);
+        let _f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST).unwrap();
+        let server = thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..N {
+                let (mut s, _) = guest.accept().unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut b = [0; 1];
+                s.read_exact(&mut b).unwrap();
+                s.write_all(&b).unwrap();
+                held.push(s);
+            }
+            held
+        });
+        // All queued on the listener before the forwarder wakes.
+        let mut clients: Vec<_> = (0..N).map(|_| TcpStream::connect((p.ip.unwrap(), p.host_port)).unwrap()).collect();
+        for (i, c) in clients.iter_mut().enumerate() {
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.write_all(&[i as u8]).unwrap();
+        }
+        for (i, c) in clients.iter_mut().enumerate() {
+            let mut b = [0; 1];
+            c.read_exact(&mut b).unwrap();
+            assert_eq!(b[0], i as u8);
+        }
+        assert_eq!(server.join().unwrap().len(), N);
+    }
+
+    #[test]
+    fn a_burst_of_datagrams_reaches_the_guest_and_back() {
+        const N: usize = 200;
+        let guest = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        guest.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let host_port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
+        let p = mapping(host_port, guest.local_addr().unwrap().port(), Protocol::Udp);
+        let _f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST).unwrap();
+        let clients: Vec<_> = (0..4).map(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()).collect();
+        for c in &clients {
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        // Each client's first datagram opens its session; then a burst from all of them.
+        let mut buf = [0; 64];
+        for c in &clients {
+            c.send_to(b"open", (p.ip.unwrap(), p.host_port)).unwrap();
+            let (_, peer) = guest.recv_from(&mut buf).unwrap();
+            guest.send_to(b"open", peer).unwrap();
+            assert_eq!(c.recv(&mut buf).unwrap(), 4);
+        }
+        for i in 0..N {
+            clients[i % clients.len()].send_to(&(i as u32).to_be_bytes(), (p.ip.unwrap(), p.host_port)).unwrap();
+        }
+        let mut peers = Vec::new();
+        for _ in 0..N {
+            let (n, peer) = guest.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 4);
+            peers.push((peer, buf[..4].to_vec()));
+        }
+        for (peer, msg) in &peers {
+            guest.send_to(msg, peer).unwrap();
+        }
+        let mut got = std::collections::HashSet::new();
+        for i in 0..N {
+            let n = clients[i % clients.len()].recv(&mut buf).unwrap();
+            let v = u32::from_be_bytes(buf[..n].try_into().unwrap()) as usize;
+            assert_eq!(v % clients.len(), i % clients.len(), "a reply went to another client");
+            got.insert(v);
+        }
+        assert_eq!(got.len(), N);
     }
 
     #[test]

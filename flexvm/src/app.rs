@@ -5,7 +5,7 @@
 //! A VM has no disk of its own: its root is the image's read-only filesystem with an overlay in guest
 //! memory, so what it wrote ends with it (a suspend keeps it, in its memory). `start` of an exited VM
 //! is therefore a new run of its image's current template, under its name, with what it was run with
-//! (`RunSpec`, its command, `--cpus`/`--memory`).
+//! (`RunSpec`, its `-p` ports included, its command, `--cpus`/`--memory`).
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use crate::bail;
 use crate::image::ImageMeta;
 use crate::util::Result;
 
-/// What `run` was given for the VM's app beyond its image: kept with the VM (in a suspended
+/// What `run` was given for the VM beyond its image: kept with the VM as a unit (in a suspended
 /// checkpoint, a migration, a claim of a standby VM and its exited record).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,6 +36,10 @@ pub struct RunSpec {
     /// `--ip`: the address asked for (a rerun asks for it again; otherwise it gets the next free one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<Ipv4Addr>,
+    /// `-p`: forwarded while the VM runs on this host. Neither a migration (`moving`) nor a
+    /// restore of a checkpoint (`run --checkpoint` gives its own) takes them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<crate::ports::Port>,
 }
 
 /// The most of the app's settings sent to the guest (hex-encoded on its request line).
@@ -52,6 +56,11 @@ impl RunSpec {
             s += &format!("env {}\n", crate::image::escape(kv));
         }
         s
+    }
+
+    /// What goes with the VM to another host: its forwards stay here, as host-local proxies.
+    pub fn moving(&self) -> RunSpec {
+        RunSpec { ports: Vec::new(), ..self.clone() }
     }
 
     pub fn changes_app(&self) -> bool {
@@ -118,20 +127,33 @@ pub struct Exited {
     pub cmd: Option<String>,
     #[serde(default)]
     pub resources: crate::vm::Resources,
+    /// Its `-p` ports included: forwarded again when it runs again.
     #[serde(default)]
     pub spec: RunSpec,
-    /// `run -p`: forwarded again when it runs again.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ports: Vec<crate::ports::Port>,
+    /// An older record's `-p` ports, kept apart from `spec`: read into it (`read`), never written.
+    #[serde(default, skip_serializing)]
+    ports: Vec<crate::ports::Port>,
     /// When it exited (seconds since the epoch).
     #[serde(default)]
     pub at: u64,
 }
 
 impl Exited {
+    pub fn new(status: i32, template: String, cmd: Option<String>, resources: crate::vm::Resources, spec: RunSpec, at: u64) -> Exited {
+        Exited { status, template, cmd, resources, spec, ports: Vec::new(), at }
+    }
+
     pub fn read(path: &std::path::Path) -> Result<Exited> {
         let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()).into())
+        Self::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()).into())
+    }
+
+    fn parse(bytes: &[u8]) -> serde_json::Result<Exited> {
+        let mut e: Exited = serde_json::from_slice(bytes)?;
+        if e.spec.ports.is_empty() {
+            e.spec.ports = std::mem::take(&mut e.ports);
+        }
+        Ok(e)
     }
 }
 
@@ -257,14 +279,31 @@ mod tests {
 
     #[test]
     fn the_spec_and_record_round_trip_and_default() {
-        let s = RunSpec { env: vec!["A=1".into()], entrypoint: Some(vec!["x".into()]), keep: true, rm: true, ip: Some("10.0.0.9".parse().unwrap()) };
+        let ports: Vec<crate::ports::Port> = vec!["8080:80".parse().unwrap(), "127.0.0.1:53:53/udp".parse().unwrap()];
+        let s = RunSpec {
+            env: vec!["A=1".into()],
+            entrypoint: Some(vec!["x".into()]),
+            keep: true,
+            rm: true,
+            ip: Some("10.0.0.9".parse().unwrap()),
+            ports: ports.clone(),
+        };
         assert_eq!(serde_json::from_value::<RunSpec>(serde_json::to_value(&s).unwrap()).unwrap(), s);
         assert_eq!(serde_json::to_string(&RunSpec::default()).unwrap(), "{}");
         assert_eq!(serde_json::from_str::<RunSpec>("{}").unwrap(), RunSpec::default());
-        let e = Exited { status: 3, template: "t".into(), cmd: None, resources: Default::default(), spec: s, ports: vec!["8080:80".parse().unwrap()], at: 5 };
+        // A migration takes everything but the forwards.
+        assert_eq!(s.moving(), RunSpec { ports: Vec::new(), ..s.clone() });
+        assert_eq!(RunSpec { ports: ports.clone(), ..Default::default() }.moving(), RunSpec::default());
+        let e = Exited::new(3, "t".into(), None, Default::default(), s.clone(), 5);
         let dir = crate::test_util::TempDir::new("exited-record");
         std::fs::write(dir.join("x.exited"), serde_json::to_vec(&e).unwrap()).unwrap();
         assert_eq!(Exited::read(&dir.join("x.exited")).unwrap(), e);
+        assert!(serde_json::to_value(&e).unwrap().get("ports").is_none(), "the ports are written once, in the spec");
+        // An older record kept them beside its spec.
+        let mut old = serde_json::to_value(Exited::new(3, "t".into(), None, Default::default(), RunSpec { ports: Vec::new(), ..s.clone() }, 5)).unwrap();
+        old["ports"] = serde_json::to_value(&ports).unwrap();
+        std::fs::write(dir.join("old.exited"), serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(Exited::read(&dir.join("old.exited")).unwrap(), e);
         std::fs::write(dir.join("y.exited"), "{\"status\": 0, \"template\": \"t\"}").unwrap();
         assert_eq!(Exited::read(&dir.join("y.exited")).unwrap().spec, RunSpec::default());
         std::fs::write(dir.join("z.exited"), "garbage").unwrap();

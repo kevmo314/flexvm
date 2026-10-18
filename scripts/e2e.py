@@ -805,8 +805,8 @@ def kill_releases():
 @case
 def port_forward():
     """run -p: TCP (bulk, half-close) and UDP through the VM process's proxy; a clash refused before
-    anything starts; kept by stop/start; freed by kill and SIGKILL; not taken by a restore without -p;
-    dropped by a migration."""
+    anything starts; kept by stop/start and by an app's exit and start; freed by kill and SIGKILL; not
+    taken by a restore without -p; kept by a migration that aborts after switchover, dropped by one that ends."""
     vm, hp = "e2e-ports", A.port + 20000
     fwd = ["-p", f"127.0.0.1:{hp}:7000", "-p", f"127.0.0.1:{hp}:7001/udp"]
     r = A.run_json(vm, extra=fwd)
@@ -818,9 +818,9 @@ def port_forward():
     echo_server(A, vm, ip)
     must(A, vm, "setsid socat UDP-RECVFROM:7001,fork EXEC:cat >/dev/null 2>&1 </dev/null &")
 
-    def tcp_ok():
+    def tcp_ok(port=hp):
         try:
-            with socket.create_connection(("127.0.0.1", hp), timeout=2) as s:
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
                 return echo(s, b"through the forward\n")
         except OSError:
             return False
@@ -878,8 +878,23 @@ def port_forward():
     check("restore without -p: no ports", not r.get("ports") and not A.ps()[fork].get("ports"), r)
     A.kill(fork)
     shutil.rmtree(path, ignore_errors=True)
+    # Aborted after switchover: the target's pull cannot finish (every page a second late) when its
+    # VM process is killed, so the source runs its copy again, with its forwards.
+    try:
+        A.cli("debug", "fault", "pages_slow", "120000")
+        A.migrate(vm, B)
+        check("migrate aborted: the source keeps the ports while the target pulls", A.ps()[vm].get("ports") == want, A.ps()[vm])
+        os.kill(B.pid(vm), signal.SIGKILL)
+        check("migrate aborted: the vm runs here again",
+              wait_for(lambda: A.ps(all=False).get(vm, {}).get("state") == "running", 60), (A.ps().get(vm), B.ps().get(vm)))
+    finally:
+        A.cli("debug", "fault", "pages_slow", "0")
+    B.cli("debug", "gc")
+    check("migrate aborted: ps lists the ports", A.ps()[vm].get("ports") == want, A.ps()[vm])
+    check("migrate aborted: tcp forwarded still", wait_for(tcp_ok, 10))
+    check("migrate aborted: udp forwarded still", udp_ok())
     A.migrate(vm, B)
-    check("migrate: freed on the source", wait_for(lambda: free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM), 10))
+    check("migrate: freed on the source", wait_for(lambda: free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM), 60))
     check("migrate: none on the target", not B.ps()[vm].get("ports"), B.ps()[vm])
     B.kill(vm)
     A.run_json(vm, extra=fwd)
@@ -890,6 +905,21 @@ def port_forward():
     check("SIGKILL: frees the ports", wait_for(lambda: free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM), 10))
     # What the killed process left (its tap, its name) is a sweep's.
     A.cli("debug", "gc")
+    # An app that serves one connection, then exits: its exited record keeps -p, and start forwards again.
+    app = "e2e-ports-app"
+    app_want = [{"ip": "127.0.0.1", "host_port": hp + 1, "vm_port": 7000, "protocol": "tcp"}]
+    r = A.run_json(app, extra=["-p", f"127.0.0.1:{hp + 1}:7000", "--entrypoint", json.dumps(["sh", "-c", "socat TCP-LISTEN:7000,reuseaddr EXEC:cat; exit 3"])])
+    check("app: its ports", r.get("ports") == app_want, r)
+    for n in range(2):
+        check(f"app run {n}: tcp through the forward", wait_for(lambda: tcp_ok(hp + 1), 30))
+        check(f"app run {n}: the app exits, the vm with it", wait_for(lambda: A.ps().get(app, {}).get("state") == "exited", 30), A.ps().get(app))
+        check(f"app run {n}: its ports are free", wait_for(lambda: free(hp + 1, socket.SOCK_STREAM), 10))
+        check(f"app run {n}: ps -a lists its ports", A.ps()[app].get("ports") == app_want, A.ps()[app])
+        if n == 0:
+            r = json.loads(A.cli("start", app).stdout)
+            A.pids.add((r["pid"], r["start"]))
+            check("app: start binds them again", r.get("ports") == app_want, r)
+    A.rm(app)
 
 
 # --- the image case's registry pull and its cache --------------------------------
