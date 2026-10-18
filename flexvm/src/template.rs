@@ -660,8 +660,8 @@ fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
     Ok(mib)
 }
 
-/// So freed plug memory is reported in the template, not in every VM after restore (~64 MiB
-/// RSS each). Done: 4 s quiet after `expect_mib` reported. Returns (MiB, done).
+/// So memory warm-up freed, which still holds its data, is discarded before the snapshot. Done: 4 s
+/// quiet after `expect_mib` reported. Returns (MiB, done).
 fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Result<(u64, bool)> {
     let (start, mut quiet, mut total) = (Instant::now(), 0, 0u64);
     let mut reader = BufReader::new(File::open(metrics)?);
@@ -968,7 +968,12 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
     // Images may have no shell.
     guest::quiesce(&vsock)?;
     interrupted()?;
-    let (reported, done) = wait_reporting_done(&fc, &metrics, plugged * 3 / 4)?;
+    // Only warm-up leaves freed memory with data in it; for the rest, waiting takes ~26 s, and VMs
+    // report it after restore instead (~7 MiB RSS each).
+    let (reported, done) = match image.warm {
+        true => wait_reporting_done(&fc, &metrics, plugged * 3 / 4)?,
+        false => (0, true),
+    };
     if !done {
         crate::log!(
             "template {name}: free page reporting did not finish ({reported} MiB reported of {plugged} MiB \

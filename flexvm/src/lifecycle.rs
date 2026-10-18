@@ -763,6 +763,16 @@ impl Proc {
             vm.pager.prepare_hot();
             t.mark("prepare_hot");
         }
+        // Hold free page reports from before the pause through the copy: paused vCPUs do not stop
+        // Firecracker discarding what the guest queued, and discarding an unsaved page would stall
+        // it. Guard first: a lost answer may still apply.
+        let _held = (!fault("ckpt_no_hold")).then(|| {
+            let held = HeldReports(vm);
+            if let Err(e) = vm.hold_reports() {
+                crate::log!("vm {}: free page reports may not be held during the checkpoint: {e}", vm.name);
+            }
+            held
+        });
         let plugged = vm.hotplug_plugged();
         cancelled()?;
         let _lifted = vm.limit.lift(vm.pid());
@@ -805,15 +815,6 @@ impl Proc {
             staging.app_log = self.app_log_written(false).0;
         }
         let (mut pause, mut growth) = (None, None);
-        // Hold free page reports during the copy (discarding an unsaved page
-        // would stall the guest). Guard first: a lost answer may still apply.
-        let _held = (cow && !fault("ckpt_no_hold")).then(|| {
-            let held = HeldReports(vm);
-            if let Err(e) = vm.hold_reports() {
-                crate::log!("vm {}: free page reports may not be held during the copy: {e}", vm.name);
-            }
-            held
-        });
         if cow {
             hold.end().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
             // Up to the vCPUs running: the balloon re-arm after it is the guest's time (#190).
