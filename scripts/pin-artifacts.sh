@@ -5,12 +5,14 @@
 #                                    GitHub; needs gh), checks they were built from this checkout's inputs, and pins
 #                                    them in scripts/checksums.sha256 (commit it). Nothing downloaded is ever run.
 #        pin-artifacts.sh --inputs   prints what a release is built from (the release's inputs.txt): Firecracker's
-#                                    version, commit and patches, the build recipe and runner image, and the kernel
+#                                    version, commit and patches, the build recipe (release.yml and the scripts it
+#                                    runs), and the kernel
 #        pin-artifacts.sh --check    whether ARTIFACTS_TAG is pinned and was built from this checkout's inputs; exits
-#                                    0 if so; 1 if it is stale (pinned, or released, from other inputs: bump
-#                                    ARTIFACTS_TAG) or its pins are broken; 3 if it is pending (not pinned yet, and
-#                                    not released from other inputs) since the commit that named it, less than
-#                                    RELEASE_WINDOW_HOURS ago; 4 if pending for longer (or for how long is unknown).
+#                                    0 if so; 1 if it is stale (pinned, or tagged at a commit, with other inputs:
+#                                    bump ARTIFACTS_TAG), its pins are broken, or the tag cannot be looked up; 3 if
+#                                    it is pending (not pinned yet, and not tagged at other inputs) since it came to
+#                                    name it on this branch less than RELEASE_WINDOW_HOURS ago; 4 if pending for
+#                                    longer (or for how long is unknown).
 #                                    CI fails on 1 everywhere and on 4 on main (RELEASING in README.md).
 set -euo pipefail
 
@@ -29,48 +31,70 @@ pinned() {
 }
 
 # What a release is built from, by content: Firecracker's version, the commit its tag names and the patches; the
-# recipe (scripts/release-assets.sh, which build-firecracker.sh does the build for) and the runner image release.yml
-# runs it on; and the kernel.
+# recipe (release.yml, which runs scripts/release-assets.sh, which runs build-firecracker.sh and fetch.sh); and the
+# kernel.
 inputs() {
-  local kernel runner
+  local kernel
   kernel=$(pinned "$CI/$KERNEL")
   if [[ ! $kernel =~ ^[[:xdigit:]]{64}$ ]]; then
     echo "No pinned SHA256 for $CI/$KERNEL in scripts/checksums.sha256" >&2
     return 1
   fi
-  runner=$(awk '$1 == "runs-on:" {print $2}' "$root/.github/workflows/release.yml")
-  if [[ ! $runner =~ ^[[:alnum:].-]+$ ]]; then
-    echo "release.yml must have one runs-on: line, naming a runner image" >&2
-    return 1
-  fi
   printf 'firecracker %s %s\n' "$FC_VERSION" "$ARCH"
   printf 'commit %s\n' "$FC_COMMIT"
   (cd "$root/firecracker" && sha256sum -- *.patch)
-  (cd "$root" && sha256sum scripts/release-assets.sh scripts/build-firecracker.sh)
-  printf 'runner %s\n' "$runner"
+  (cd "$root" && sha256sum .github/workflows/release.yml scripts/release-assets.sh scripts/build-firecracker.sh scripts/fetch.sh)
   printf 'vmlinux %s %s\n' "$kernel" "$KERNEL"
 }
 
-# Not pinned yet: stale if the release exists and was built from other inputs, else pending, for how long since
-# the commit that named ARTIFACTS_TAG.
-pending() {
-  local released since age
-  released=$(curl -fsSL --max-time 30 "$ARTIFACTS_URL/inputs.txt" 2> /dev/null) || released=
-  if [ -n "$released" ] && [ "$released" != "$(inputs)" ]; then
-    echo "$ARTIFACTS_TAG is released, but from other inputs than this checkout's: bump ARTIFACTS_TAG in scripts/versions.sh (RELEASING in README.md)" >&2
-    inputs | diff - <(printf '%s\n' "$released") >&2 || true
+# The commit ARTIFACTS_TAG names upstream; returns 2 if there is no such tag, 1 if that cannot be told.
+tag_commit() {
+  local refs status=0
+  refs=$(git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 ls-remote --exit-code "https://github.com/$REPO.git" "refs/tags/$ARTIFACTS_TAG" "refs/tags/$ARTIFACTS_TAG^{}") || status=$?
+  if [ "$status" = 2 ]; then return 2; fi
+  if [ "$status" != 0 ]; then
+    echo "cannot tell whether $REPO has a tag $ARTIFACTS_TAG (git ls-remote failed)" >&2
     return 1
   fi
-  if [ -n "$released" ]; then
-    echo "$ARTIFACTS_TAG is released from this checkout's inputs but not pinned yet: run scripts/pin-artifacts.sh and commit it" >&2
+  awk -v t="refs/tags/$ARTIFACTS_TAG" '$2 == t "^{}" {p = $1} $2 == t {l = $1} END {print (p != "" ? p : l)}' <<< "$refs"
+}
+
+# The tag's commit must be in this checkout's history (reviewed, on main): a tag pushed at any other commit would
+# run that commit's release.yml, recipe and patches, and write its own inputs.txt.
+in_history() {
+  if [[ ! $1 =~ ^[[:xdigit:]]{40}$ ]] || ! git -C "$root" merge-base --is-ancestor "$1" HEAD 2> /dev/null; then
+    echo "$ARTIFACTS_TAG names ${1:-nothing}, which is not in this checkout's history (fetch main, or the tag is not main's)" >&2
+    return 1
+  fi
+}
+
+# Not pinned yet. Stale if the tag exists at a commit with other inputs (its release is, or will be, built from
+# them); else pending, for how long since ARTIFACTS_TAG came to name it on this branch (its first-parent history:
+# when a pull request merged, not when its commit was written).
+pending() {
+  local tagged status=0 since age tree
+  tagged=$(tag_commit) || status=$?
+  if [ "$status" = 1 ]; then return 1; fi
+  if [ "$status" = 0 ]; then
+    in_history "$tagged" || return 1
+    tree=$(mktemp -d)
+    git -C "$root" archive "$tagged" .github scripts firecracker | tar -x -C "$tree"
+    if ! "$tree/scripts/pin-artifacts.sh" --inputs | cmp -s - <(inputs); then
+      echo "$ARTIFACTS_TAG is tagged at $tagged, whose inputs differ from this checkout's: bump ARTIFACTS_TAG in scripts/versions.sh (RELEASING in README.md)" >&2
+      "$tree/scripts/pin-artifacts.sh" --inputs | diff - <(inputs) >&2 || true
+      rm -rf -- "$tree"
+      return 1
+    fi
+    rm -rf -- "$tree"
+    echo "$ARTIFACTS_TAG is tagged at $tagged, with this checkout's inputs, but not pinned yet: once release.yml has published it, run scripts/pin-artifacts.sh and commit it" >&2
   else
-    echo "$ARTIFACTS_TAG is not released yet: push its tag at the commit on main that names it, then run scripts/pin-artifacts.sh (RELEASING in README.md)" >&2
+    echo "$ARTIFACTS_TAG is not tagged yet: push its tag at the commit on main that names it, then run scripts/pin-artifacts.sh (RELEASING in README.md)" >&2
   fi
   if [ "$(git -C "$root" rev-parse --is-shallow-repository 2> /dev/null)" != false ]; then
     echo "for how long is unknown: this is not a full clone" >&2
     return 4
   fi
-  since=$(git -C "$root" log -1 --format=%ct -G '^ARTIFACTS_TAG=' -- scripts/versions.sh)
+  since=$(git -C "$root" log --first-parent --diff-merges=first-parent -s -1 --format=%ct -G '^ARTIFACTS_TAG=' -- scripts/versions.sh)
   age=$(( ($(date +%s) - ${since:-0}) / 3600 ))
   echo "pending for ${age} h (the window is ${RELEASE_WINDOW_HOURS} h)" >&2
   if [ "$age" -ge "$RELEASE_WINDOW_HOURS" ]; then return 4; fi
@@ -83,6 +107,8 @@ case "${1:-}" in
     exit 0
     ;;
   --check)
+    # This checkout's inputs must be well-formed whatever the release's state.
+    inputs > /dev/null || exit 1
     pins=0
     for asset in "${ASSETS[@]}"; do
       if [[ $(pinned "$ARTIFACTS_URL/$asset") =~ ^[[:xdigit:]]{64}$ ]]; then pins=$((pins + 1)); fi
@@ -120,18 +146,8 @@ for asset in "${ASSETS[@]}"; do
   curl -fsSL -o "$work/$asset" "$ARTIFACTS_URL/$asset"
   chmod 644 "$work/$asset"
 done
-# The commit the tag names must be in this checkout's history (reviewed, on main): a tag pushed at any other commit
-# would have run that commit's release.yml, recipe and patches, and written its own inputs.txt.
-tagged=$(git ls-remote "https://github.com/$REPO.git" "refs/tags/$ARTIFACTS_TAG^{}" "refs/tags/$ARTIFACTS_TAG" |
-  awk -v t="refs/tags/$ARTIFACTS_TAG" '$2 == t "^{}" {p = $1} $2 == t {l = $1} END {print (p != "" ? p : l)}')
-if [[ ! $tagged =~ ^[[:xdigit:]]{40}$ ]]; then
-  echo "no tag $ARTIFACTS_TAG in $REPO" >&2
-  exit 1
-fi
-if ! git -C "$root" merge-base --is-ancestor "$tagged" HEAD 2> /dev/null; then
-  echo "$ARTIFACTS_TAG names $tagged, which is not in this checkout's history (fetch main, or the tag is not main's)" >&2
-  exit 1
-fi
+tagged=$(tag_commit) || { echo "no tag $ARTIFACTS_TAG in $REPO" >&2; exit 1; }
+in_history "$tagged"
 # Each asset must have been built by this repository's release workflow, from this tag at that commit, on a
 # GitHub-hosted runner.
 for asset in "${ASSETS[@]}"; do

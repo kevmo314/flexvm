@@ -54,12 +54,20 @@ cd "$src"
 # a stale one left in build/cargo_target.
 target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-build/cargo_target}}
 cargo build --release --target x86_64-unknown-linux-musl --target-dir "$target" -p firecracker
-# Installed to a temporary file beside its final path, then renamed into place: a concurrent start never runs a
-# half-copied binary, and an interrupted install never leaves a short one there.
-sudo mkdir -p "$state/artifacts"
-placing=$(sudo mktemp -p "$state/artifacts" .firecracker.XXXXXX)
-trap 'sudo rm -f -- "$placing"' EXIT
-sudo install -m 755 "$target"/x86_64-unknown-linux-musl/release/firecracker "$placing"
-sudo mv -T "$placing" "$state/artifacts/firecracker"
+# Installed to temporary files beside their final paths, then renamed into place: a concurrent start never runs a
+# half-copied binary, and an interrupted install never leaves a short one there. firecracker.custom records the build
+# as this host's own: flexvm refuses a Firecracker there that is neither the pinned release's nor recorded.
+built=$target/x86_64-unknown-linux-musl/release/firecracker
+out=$state/artifacts
+sudo mkdir -p "$out"
+placing=$(sudo mktemp -p "$out" .firecracker.XXXXXX)
+recording=$(sudo mktemp -p "$out" .firecracker.custom.XXXXXX)
+trap 'sudo rm -f -- "$placing" "$recording"' EXIT
+sudo install -m 755 "$built" "$placing"
+printf '%s  built by scripts/build-firecracker.sh (%s %s, patches %s)\n' "$(sha256sum < "$built" | cut -d' ' -f1)" "$FC_VERSION" \
+  "$FC_COMMIT" "$(cd "$root/firecracker" && cat -- *.patch | sha256sum | cut -c1-16)" | sudo tee "$recording" > /dev/null
+sudo chmod 644 "$recording"
+sudo mv -T "$recording" "$out/firecracker.custom"
+sudo mv -T "$placing" "$out/firecracker"
 trap - EXIT
 "$target"/x86_64-unknown-linux-musl/release/firecracker --version

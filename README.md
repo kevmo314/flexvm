@@ -28,8 +28,12 @@ prebuilt: the first command that needs them downloads them into
 `artifacts/` from the release this build pins (`ARTIFACTS_TAG` in
 `scripts/versions.sh`) and checks them against the sha256 pinned in
 `scripts/checksums.sha256`. A file already there is never downloaded or
-replaced: it is checked against the pin, and one that differs (your own
-build, say) is used with a warning.
+replaced. It must match the pin or be recorded as a build of your own
+(`firecracker.custom` beside it holds its sha256, which
+`scripts/build-firecracker.sh` writes). Anything else is refused, never run:
+a corrupted or replaced download, a copy cut short, an older release's.
+Remove such a file to download the pinned one. A Firecracker of your own
+copied to another host takes its `.custom` file along.
 
 To build your own, or for a host without network access, put the files in
 `artifacts/` first (the scripts install with sudo; give them `--state DIR`
@@ -66,8 +70,9 @@ assume that.
 A release (`ARTIFACTS_TAG` in `scripts/versions.sh`) is built from what
 `scripts/pin-artifacts.sh --inputs` lists: Firecracker's version, the commit
 its tag names (`FC_COMMIT`; the build refuses any other), the patches, the
-recipe (`scripts/release-assets.sh`, `scripts/build-firecracker.sh`, the
-runner image in `.github/workflows/release.yml`) and the kernel. That list is
+recipe (`.github/workflows/release.yml` and the scripts it runs:
+`scripts/release-assets.sh`, `scripts/build-firecracker.sh`,
+`scripts/fetch.sh`) and the kernel. That list is
 the release's `inputs.txt`, and its assets never change. So a change to any
 of those inputs bumps `ARTIFACTS_TAG` in the same pull request; CI fails it
 otherwise. Then:
@@ -86,10 +91,11 @@ otherwise. Then:
    `scripts/checksums.sha256`. Merge that commit.
 
 CI's "Pinned artifacts release" check fails any change whose inputs differ
-from the pinned release's, or from a pending tag's release if it exists
-already. A pending tag is a warning on pull requests. On main (pushes and the
-nightly run) it is an error once more than 24 hours
-(`RELEASE_WINDOW_HOURS`) have passed since the commit that named it. The
+from the pinned release's, or from those at the commit a pending tag names if it is
+tagged already. It also fails if the tag can't be looked up. A pending tag is a
+warning on pull requests. On main (pushes and the nightly run) it is an error
+once more than 24 hours (`RELEASE_WINDOW_HOURS`) have passed since the tag
+was named on main (first-parent history: when the pull request merged). The
 release flow never fails CI: the bump merges with a warning, the tag push
 runs only release.yml, and the pin commit matches.
 

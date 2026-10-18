@@ -167,7 +167,9 @@ jobs:
         id: fc-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.STATE }}/artifacts/firecracker
+          path: |
+            ${{ env.STATE }}/artifacts/firecracker
+            ${{ env.STATE }}/artifacts/firecracker.custom
           key: firecracker-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh', 'scripts/versions.sh') }}
       - name: Build Firecracker
         if: steps.fc-cache.outputs.cache-hit != 'true'
@@ -179,7 +181,9 @@ jobs:
         if: steps.fc-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.STATE }}/artifacts/firecracker
+          path: |
+            ${{ env.STATE }}/artifacts/firecracker
+            ${{ env.STATE }}/artifacts/firecracker.custom
           key: ${{ steps.fc-cache.outputs.cache-primary-key }}
 
       # Guest kernel and the test image's base root filesystem (fetch.sh skips the stock Firecracker: the patched one is there).

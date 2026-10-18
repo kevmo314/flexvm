@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The artifacts release's build recipe: .github/workflows/release.yml runs this on a fresh runner (its `runs-on`
-# image) to build the assets into OUT, using STATE as a scratch state directory. This file, build-firecracker.sh
-# and that runner image are hashed into the release's inputs.txt (scripts/pin-artifacts.sh --inputs), so a
-# change to how a release is built needs a new ARTIFACTS_TAG, as a change to what it is built from does.
+# The artifacts release's build recipe: .github/workflows/release.yml runs this on a fresh runner to build the
+# assets into OUT, using STATE as a scratch state directory. release.yml, this file and the scripts it runs are
+# hashed into the release's inputs.txt (scripts/pin-artifacts.sh --inputs), so a change to how a release is built
+# needs a new ARTIFACTS_TAG, as a change to what it is built from does.
 # usage: release-assets.sh STATE OUT
 set -euo pipefail
 

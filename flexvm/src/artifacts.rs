@@ -1,9 +1,10 @@
 //! The prebuilt patched Firecracker and guest kernel: on first use, a missing `STATE/artifacts/firecracker` or
 //! `vmlinux` is downloaded from the release scripts/versions.sh names (`ARTIFACTS_TAG`), checked against the sha256
 //! scripts/checksums.sha256 pins for it (build.rs), and renamed into place. A file already there is used as it is:
-//! one built with the scripts, or copied in for an offline host; it is checked against the pin, and one that differs
-//! is used with a warning (a host's own build never matches it). Every host that migrates VMs to another needs
-//! byte-identical Firecracker; hosts built from the same pins get it.
+//! one built with the scripts, or copied in for an offline host. It must match the pin, or be recorded as a build of
+//! the host's own (`NAME.custom` beside it holds its sha256; scripts/build-firecracker.sh writes it): anything else (a
+//! corrupted or replaced download, a copy cut short, an older release's) is refused, never run. Every host that
+//! migrates VMs to another needs byte-identical Firecracker; hosts built from the same pins get it.
 
 use std::fs::File;
 use std::io::Write;
@@ -55,19 +56,10 @@ pub fn ensure(want: &[(&Path, &Asset)]) -> Result<()> {
 
 fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> Result<()> {
     if path.exists() {
-        if let Some(sha256) = sha256 {
-            match pinned_file(path, sha256) {
-                Ok(None) => {}
-                Ok(Some(got)) => crate::log!(
-                    "flexvm: warning: {} is not the pinned {} ({got}, pinned sha256:{sha256}): using it as it is (one built or copied \
-                     by hand?); remove it to download the pinned one",
-                    path.display(),
-                    asset.name
-                ),
-                Err(e) => crate::log!("flexvm: warning: {}: cannot check it against its pinned sha256: {e}", path.display()),
-            }
-        }
-        return Ok(());
+        return match sha256 {
+            Some(sha256) => check_existing(path, asset, sha256),
+            None => Ok(()),
+        };
     }
     let Some(sha256) = sha256 else {
         bail!(
@@ -91,12 +83,39 @@ fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> R
     Ok(())
 }
 
-/// `None` if the file at `path` has the pinned sha256, or the digest it has instead.
-fn pinned_file(path: &Path, sha256: &str) -> Result<Option<String>> {
-    let mut f = crate::image::Hashed::new(File::open(path)?);
-    std::io::copy(&mut f, &mut std::io::sink())?;
-    let got = f.digest();
-    Ok((got.strip_prefix("sha256:") != Some(sha256)).then_some(got))
+/// Where a build of the host's own of the asset at `path` is recorded: its sha256 (hex), as the first word of a line.
+fn custom_record(path: &Path) -> std::path::PathBuf {
+    let mut record = path.as_os_str().to_owned();
+    record.push(".custom");
+    record.into()
+}
+
+/// The file already at `path` must be the pinned one, or one `custom_record` records.
+fn check_existing(path: &Path, asset: &Asset, sha256: &str) -> Result<()> {
+    let got = (|| -> Result<String> {
+        let mut f = crate::image::Hashed::new(File::open(path)?);
+        std::io::copy(&mut f, &mut std::io::sink())?;
+        Ok(f.digest().trim_start_matches("sha256:").to_string())
+    })()
+    .map_err(|e| format!("{}: cannot check it against its pinned sha256: {e}", path.display()))?;
+    if got == sha256 {
+        return Ok(());
+    }
+    let record = custom_record(path);
+    let recorded = std::fs::read_to_string(&record).unwrap_or_default();
+    if recorded.lines().any(|l| l.split_whitespace().next() == Some(got.as_str())) {
+        return Ok(());
+    }
+    bail!(
+        "{}: not the pinned {} (sha256 {got}, pinned {sha256}), and {} does not record it as a build of this host's own. \
+         Remove it to download the pinned one; or, if it is your own build, record it ({} does): sha256sum {} > {}",
+        path.display(),
+        asset.name,
+        record.display(),
+        asset.by_hand,
+        path.display(),
+        record.display()
+    )
 }
 
 /// `url` into `path`, written to a part of its own beside it and renamed over it once its sha256 checks: a
@@ -186,11 +205,8 @@ mod tests {
         ensure_one(&path, &FIRECRACKER, Some(&hex(b"patched firecracker")), &format!("{base}/moved")).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"patched firecracker");
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
-        // There now: never fetched again (the server is gone), whatever its content (one that differs from the pin is
-        // used with a warning).
-        std::fs::write(&path, b"built by hand").unwrap();
-        ensure_one(&path, &FIRECRACKER, Some(&hex(b"other")), "http://127.0.0.1:1").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"built by hand");
+        // There now: never fetched again (the server is gone).
+        ensure_one(&path, &FIRECRACKER, Some(&hex(b"patched firecracker")), "http://127.0.0.1:1").unwrap();
         assert_eq!(std::fs::read_dir(dir.join("artifacts")).unwrap().count(), 1);
     }
 
@@ -208,15 +224,29 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_file_is_checked_against_its_pin() {
+    fn an_existing_file_must_match_its_pin_or_be_recorded_as_custom() {
         let dir = crate::test_util::TempDir::new("artifacts-existing");
         let path = dir.join("firecracker");
+        let pin = hex(b"patched firecracker");
+        let check = || ensure_one(&path, &FIRECRACKER, Some(&pin), "http://127.0.0.1:1");
         std::fs::write(&path, b"patched firecracker").unwrap();
-        assert_eq!(pinned_file(&path, &hex(b"patched firecracker")).unwrap(), None);
-        // Cut short, or built by hand: its own digest.
+        check().unwrap();
+        // Cut short, replaced, or built by hand and not recorded: refused, never downloaded over.
         std::fs::write(&path, b"patched").unwrap();
-        assert_eq!(pinned_file(&path, &hex(b"patched firecracker")).unwrap(), Some(format!("sha256:{}", hex(b"patched"))));
-        assert!(pinned_file(&dir.join("missing"), &hex(b"x")).is_err());
+        let error = check().unwrap_err().to_string();
+        assert!(error.contains("not the pinned firecracker") && error.contains(&hex(b"patched")), "{error}");
+        assert!(error.contains("firecracker.custom") && error.contains("scripts/build-firecracker.sh"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"patched");
+        // A record of another build does not let it through; one of this build does.
+        std::fs::write(dir.join("firecracker.custom"), format!("{}  firecracker\n", hex(b"other"))).unwrap();
+        assert!(check().is_err());
+        std::fs::write(dir.join("firecracker.custom"), format!("{}  firecracker\n", hex(b"patched"))).unwrap();
+        check().unwrap();
+        // Unreadable: refused, not trusted.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = check().unwrap_err().to_string();
+        assert!(error.contains("cannot check it against its pinned sha256"), "{error}");
     }
 
     #[test]

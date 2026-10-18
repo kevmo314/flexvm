@@ -4,7 +4,8 @@ name: Release artifacts
 # release flexvm downloads from on first use. The tag must be ARTIFACTS_TAG in scripts/versions.sh at the
 # tagged commit. Afterwards, scripts/pin-artifacts.sh pins the assets' sha256 in scripts/checksums.sha256
 # (a follow-up commit) once their build provenance (attested here) verifies: from then on, flexvm builds
-# download them. A release's assets never change. The steps: RELEASING in README.md.
+# download them. A release's assets never change. This file is one of a release's inputs (scripts/pin-artifacts.sh
+# --inputs hashes it): changing it needs a new ARTIFACTS_TAG. The steps: "Releasing the artifacts" in README.md.
 
 on:
   push:
@@ -20,7 +21,6 @@ concurrency:
 jobs:
   release:
     name: build and publish ${{ github.ref_name }}
-    # The runner image is one of the release's inputs (scripts/pin-artifacts.sh reads this line).
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -50,7 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      # The recipe (hashed into inputs.txt, with this job's runs-on: scripts/pin-artifacts.sh --inputs).
+      # The recipe (hashed into inputs.txt, with this file: scripts/pin-artifacts.sh --inputs).
       - name: Build the assets
         run: ./scripts/release-assets.sh "$RUNNER_TEMP/state" "$RUNNER_TEMP/assets"
 
