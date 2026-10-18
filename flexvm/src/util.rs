@@ -2215,16 +2215,25 @@ mod tests {
     fn a_final_log_waits_for_queue_space_but_only_until_its_deadline() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         tx.send(LogMsg::Line("first".into())).unwrap();
-        let start = Instant::now();
-        assert!(!send_log_by(&tx, LogMsg::Line("full".into()), start + Duration::from_millis(20)));
-        assert!(start.elapsed() < Duration::from_secs(5));
-        let reader = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line == "first"));
-            assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
+        let (full, waited) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            let start = Instant::now();
+            let delay = Duration::from_millis(20);
+            assert!(!send_log_by(&tx, LogMsg::Line("full".into()), start + delay));
+            assert!(start.elapsed() >= delay && start.elapsed() < Duration::from_secs(5));
+            let long = LogMsg::Line("x".repeat(LOG_LINE_MAX + 1));
+            full.send(unsafe { libc::gettid() }).unwrap();
+            assert!(send_log_by(&tx, long, Instant::now() + WAIT));
         });
-        assert!(send_log_by(&tx, LogMsg::Line("x".repeat(LOG_LINE_MAX + 1)), Instant::now() + WAIT));
-        reader.join_within().unwrap();
+        let tid = waited.recv_timeout(WAIT).unwrap();
+        // Asleep with "first" still queued: only send_log_by's wait for space sleeps there.
+        crate::test_util::wait_until("the second send to wait for queue space", || {
+            assert!(!sender.is_finished(), "the second send returned with the queue full");
+            crate::test_util::asleep(tid)
+        });
+        assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line == "first"));
+        assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
+        sender.join_within().unwrap();
     }
 
     #[test]
@@ -2914,6 +2923,15 @@ pub mod output {
     #[test]
     fn a_retargeted_full_pipe_keeps_the_fallback_output() {
         use crate::test_util::{wait_until, JoinWithin};
+        struct Restore(Option<Arc<File>>, Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // Also after a panic, which may have poisoned either lock.
+                TARGETS.lock().unwrap_or_else(|e| e.into_inner())[0] = self.0.take();
+                LOGS.lock().unwrap_or_else(|e| e.into_inner())[0] = self.1.take();
+            }
+        }
+        let _restore = Restore(TARGETS.lock().unwrap()[0].clone(), LOGS.lock().unwrap()[0].clone());
         let full = || {
             let mut p = [0; 2];
             assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
@@ -2938,6 +2956,5 @@ pub mod output {
         let mut data = [0; 4];
         next.read_exact(&mut data).unwrap();
         assert_eq!(&data, b"kept");
-        TARGETS.lock().unwrap()[0] = None;
     }
 }

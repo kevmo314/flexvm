@@ -65,6 +65,13 @@ pub fn accept_unix(listener: &std::os::unix::net::UnixListener) -> (std::os::uni
     (stream, addr)
 }
 
+/// Whether thread `tid` of this process is asleep (blocked in a wait or sleep), as the kernel reports it.
+#[allow(dead_code)] // the guest shares this file
+pub fn asleep(tid: libc::pid_t) -> bool {
+    let stat = fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap_or_default();
+    stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('S'))
+}
+
 /// An `#[ignore]`d test that needs root fails, not passes, without it: CI runs them under sudo
 /// (`cargo test -- --ignored`), and one that returned early there would check nothing.
 #[allow(dead_code)] // not every crate that shares this file has one
