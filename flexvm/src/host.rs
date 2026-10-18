@@ -586,6 +586,10 @@ impl Host {
         }
         // Name locks (`vms`): made by root, so a non-root reader leaves it be.
         let _ = private_dir(&locks(&run.join("vms")));
+        match crate::template::note_shared(&crate::template::Paths::new(state)) {
+            Err(e) if !unwritable(&e) => Err(root(e))?,
+            _ => {}
+        }
         let (state, run) = (state.to_path_buf(), run.to_path_buf());
         let binding = state.join("run.json");
         reserved_run(&state, &run, Path::new(DEFAULT_STATE), Path::new(DEFAULT_RUN))?;

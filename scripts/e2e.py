@@ -1726,44 +1726,56 @@ def image_template():
 @case
 def pull_gc():
     """pull: a rebuild deletes the generation it superseded, unless a stopped VM or a checkpoint here still uses it."""
-    name = "e2e-gc"
+    # A host of its own (no listener), with its own templates: A's and B's are shared, which keeps them all.
+    h = Host("gc", args.port_a, args.port_a + 1, args.net_a)
+    os.makedirs(h.run_dir)
+    os.makedirs(h.state_dir)
+    os.symlink(ARTIFACTS, os.path.join(h.state_dir, "artifacts"))
+    h.configure(vm_ips=f"{args.net_a}.200-{args.net_a}.220", reserve_mib=256)
+    name, vm = "e2e-gc", "e2e-gc"
 
     def pull(n):
-        """Rebuilt (another --env); A's own pull, so A's VMs count. Returns the ids it deleted."""
-        r = A.cli("pull", TEST_IMAGE, "--tag", name, "--vcpus", "2", "--max", "2048", "--env", f"GC={n}", timeout=600)
+        """Rebuilt (another --env); returns the ids it deleted."""
+        r = h.cli("pull", TEST_IMAGE, "--tag", name, "--vcpus", "2", "--max", "2048", "--env", f"GC={n}", timeout=600)
         return [json.loads(line)["deleted"] for line in r.stdout.splitlines() if line.startswith("{")]
 
     def images():
-        return {v["id"]: v["name"] for v in json.loads(A.cli("images", "--json").stdout)}
+        return {v["id"]: v["name"] for v in json.loads(h.cli("images", "--json").stdout)}
 
     def current():
         return next(i for i, n in images().items() if n == name)
-    pull(1)
-    first = current()
-    deleted = pull(2)
-    second = current()
-    check("rebuild: the superseded generation is deleted", deleted == [first] and first not in images(), (first, deleted, images()))
-    vm = "e2e-gc"
-    A.run(vm, template=name)
-    A.suspend(vm)
-    deleted = pull(3)
-    check("rebuild: a stopped VM's generation stays", deleted == [] and images().get(second, "missing") is None, (second, deleted, images()))
-    A.rm(vm)
-    out = A.cli("image", "prune", "-f").stdout
-    check("prune: collected once free", second in out and second not in images(), (second, out))
-    # A checkpoint in STATE/checkpoints (flexvm's own, #775) keeps its generation too.
-    third = current()
-    A.run(vm, template=name)
-    managed = os.path.join(A.state_dir, "checkpoints")
-    os.makedirs(managed, exist_ok=True)
-    A.checkpoint(vm, os.path.join(managed, "gc"), stop=True)
-    deleted = pull(4)
-    check("rebuild: a checkpoint's generation stays", deleted == [] and images().get(third, "missing") is None, (third, deleted, images()))
-    shutil.rmtree(managed)
-    out = A.cli("image", "prune", "-f").stdout
-    check("prune: collected once its checkpoint is gone", third in out and third not in images(), (third, out))
-    A.cli("rmi", name)
-    check("rmi: nothing left", name not in images().values())
+
+    def prune():
+        return h.cli("image", "prune", "-f").stdout
+    try:
+        pull(1)
+        first = current()
+        deleted = pull(2)
+        second = current()
+        check("rebuild: the superseded generation is deleted", deleted == [first] and first not in images(), (first, deleted, images()))
+        h.run(vm, template=name)
+        h.suspend(vm)
+        deleted = pull(3)
+        check("rebuild: a stopped VM's generation stays", deleted == [] and images().get(second, "missing") is None, (second, deleted, images()))
+        h.rm(vm)
+        out = prune()
+        check("prune: collected once free", second in out and second not in images(), (second, out))
+        # A checkpoint in STATE/checkpoints (flexvm's own, #775) keeps its generation too.
+        third = current()
+        h.run(vm, template=name)
+        managed = os.path.join(h.state_dir, "checkpoints")
+        os.makedirs(managed)
+        h.checkpoint(vm, os.path.join(managed, "gc"), stop=True)
+        deleted = pull(4)
+        check("rebuild: a checkpoint's generation stays", deleted == [] and images().get(third, "missing") is None, (third, deleted, images()))
+        shutil.rmtree(managed)
+        out = prune()
+        check("prune: collected once its checkpoint is gone", third in out and third not in images(), (third, out))
+        h.cli("rmi", name)
+        check("rmi: nothing left", not images(), images())
+    finally:
+        for v in h.ps():
+            h.rm(v, force=True, check=False)
 
 
 @case

@@ -721,8 +721,8 @@ pub fn interrupted() -> Result<()> {
     }
 }
 
-/// Held shared while a build makes its staging directory and while it publishes, exclusive
-/// while one sweeps: a staging directory without a lock, or a link, seen under it is dead.
+/// Held shared while a build makes its staging directory, exclusive while one publishes or sweeps:
+/// a staging directory without a lock, or a link, seen under it is dead.
 pub(crate) fn templates_lock(paths: &Paths, how: i32) -> Result<crate::host::Flock> {
     Ok(crate::host::Flock::new(template_lock(paths, "templates", "")?, how)?)
 }
@@ -881,6 +881,22 @@ pub fn up_to_date(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: &
     Some(meta.id)
 }
 
+/// In a templates directory another state links to: VMs this host does not know of (a suspended
+/// one there holds no lock) may use its generations, so pulls leave those they supersede to `image prune`.
+const SHARED: &str = ".shared";
+
+/// Marks the templates directory `STATE/templates` links to as shared (`Host::open`).
+pub fn note_shared(paths: &Paths) -> std::io::Result<()> {
+    match paths.templates.is_symlink() && paths.templates.is_dir() && !paths.templates.join(SHARED).exists() {
+        true => crate::util::write_file(&paths.templates, SHARED, b"", true),
+        false => Ok(()),
+    }
+}
+
+pub fn shared(paths: &Paths) -> bool {
+    paths.templates.is_symlink() || paths.templates.join(SHARED).exists()
+}
+
 /// Builds `name` from an image's root filesystem and publishes it as a new generation; returns
 /// the generation the name linked to before, for the caller to delete if nothing uses it.
 pub fn create(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: ImageMeta, tap: &str) -> Result<Option<String>> {
@@ -917,7 +933,8 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
             File::open(entry.path())?.sync_all()?;
         }
     }
-    let _l = templates_lock(paths, libc::LOCK_SH)?;
+    // Exclusive: two pulls of a name each see the link the other replaced (the one each supersedes).
+    let _l = templates_lock(paths, libc::LOCK_EX)?;
     crate::util::sync_dir(staged)?;
     check_interrupt()?;
     match std::fs::rename(staged, &gen) {
@@ -1200,7 +1217,7 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
 pub fn remove(paths: &Paths, name: Option<&str>, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Value> {
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
-    // No build publishes meanwhile (they take it shared).
+    // No build publishes meanwhile (they take it too).
     let _l = templates_lock(paths, libc::LOCK_EX)?;
     remove_locked(paths, name, id, in_use)
 }
@@ -1574,6 +1591,15 @@ mod tests {
         // Collected once free.
         remove(&f.paths, Some("alias"), &old, &none).unwrap();
         assert!(Template::generation(&f.paths, &old).is_none());
+        // Another state linking to this templates directory marks it shared (its VMs are not seen here).
+        let other = crate::test_util::TempDir::new("template-sharer");
+        std::os::unix::fs::symlink(&f.paths.templates, other.join("templates")).unwrap();
+        let theirs = Paths { templates: other.join("templates"), ..f.paths.clone() };
+        assert!(!shared(&f.paths) && shared(&theirs));
+        note_shared(&f.paths).unwrap();
+        assert!(!shared(&f.paths), "only a link marks it");
+        note_shared(&theirs).unwrap();
+        assert!(shared(&f.paths));
     }
 
     #[test]

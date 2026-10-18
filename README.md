@@ -643,7 +643,9 @@ them, listed as `<none>` by `images`, until `image prune` or `rmi ID` removes
 it once they are gone. Checkpoints written to other directories (`flexvm
 checkpoint VM DIR`) are not tracked, as with `image prune`: once their
 generation is deleted they cannot be restored here (managed checkpoints, #775,
-replace them). Nor can VMs of it elsewhere migrate here.
+replace them). Nor can VMs of it elsewhere migrate here. A templates directory
+that other states link to (see Paths and knobs) may hold generations their VMs
+use, so pulls through it leave the old generation to `image prune`.
 
 **Removing.** `rmi IMAGE` removes the name and, unless a VM here still uses
 them, its generation and its root filesystem (`images/rootfs/`); `rmi ID` (or
