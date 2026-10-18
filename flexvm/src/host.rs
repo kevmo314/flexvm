@@ -3006,7 +3006,6 @@ impl Host {
         }
         let mut ok = match self.collect_garbage_with(true) {
             Ok(_) => true,
-            Err(e) if name_busy(&e) => return Err(e),
             Err(e) => {
                 crate::log!("after boot: {e}");
                 false
@@ -3053,7 +3052,7 @@ impl Host {
             Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {
                 // A sweep, or a start before it writes its identity, may hold this briefly.
                 // Only a recorded holder lets the old instance go without a lost record.
-                return if self.holder_gone(name) { Err(e.into()) } else { Ok(()) };
+                return if self.holder_gone(name) { Err(std::io::Error::new(e.kind(), format!("{}: {e}", lock.display())).into()) } else { Ok(()) };
             }
             Err(e) => bail!("{}: {e}", lock.display()),
         };
@@ -3189,8 +3188,8 @@ impl Host {
             crate::net::unroute(ip);
             withdrawn.push((name.to_string(), ip, gen));
         }
-        // Failed writes and busy names keep boot recovery incomplete. Report write failures
-        // first; contention alone is a quiet retry, never a failure of the caller's operation.
+        // Failed writes and busy names keep boot recovery incomplete. Write failures first:
+        // contention alone fails no sweep (`gc::cleanup_locked`).
         match unrecorded.or(busy) {
             Some(e) => Err(e),
             None => Ok(withdrawn),
@@ -6048,11 +6047,8 @@ pub(crate) mod tests {
             assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
             for _ in 0..2 {
                 assert!(h.withdraw_dead(true).is_err());
-                assert!(h.after_boot_with("boot-busy", |_, _| Ok(())).is_err());
-                // Neither a foreground opener nor an explicit sweep fails on contention.
-                for rest in [false, true] {
-                    assert!(!crate::gc::after_boot(&h, rest).unwrap());
-                }
+                // Incomplete, but the rest of the recovery still runs; a sweep does not fail.
+                assert_eq!(h.after_boot_with("boot-busy", |_, _| Ok(())).unwrap(), Some(false));
                 crate::gc::sweep_now(&h).unwrap();
                 let a = h.addr(&h.lock().unwrap(), ip).unwrap();
                 assert!(!a.withdrawn && a.holder_id.as_ref() == Some(&dead));

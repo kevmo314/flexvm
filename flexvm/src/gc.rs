@@ -60,8 +60,6 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     let local = match host.after_boot() {
         Ok(Some(local)) => local,
         Ok(None) => return Ok(false),
-        // A lost record is waiting for a name lock: leave recovery incomplete, quietly.
-        Err(e) if crate::host::name_busy(&e) => return Ok(false),
         // Retried on the next open; a full pass still sweeps and refills now.
         Err(e) => {
             if rest {
