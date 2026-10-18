@@ -624,11 +624,13 @@ def app_lifecycle():
     # kill -s: to the app, which the VM follows.
     vm = "e2e-app-sig"
     run_d(vm, *entry("trap 'echo got-term; exit 7' TERM; echo trap-set; while :; do sleep 0.1; done"))
-    check("kill -s: the app is up", wait_for(lambda: "trap-set" in A.logs(vm), 30), A.logs(vm)[-2000:])
+    # Whole lines: the log's "started" line quotes the command, which holds both markers.
+    said = lambda line: line in A.logs(vm).splitlines()
+    check("kill -s: the app is up", wait_for(lambda: said("trap-set"), 30), A.logs(vm)[-2000:])
     check("kill -s: prints the name", A.cli("kill", "-s", "SIGTERM", vm).stdout == vm + "\n")
     check("kill -s: the app took it, the vm exits with it", wait_for(lambda: exited(vm), 30) and A.ps()[vm].get("status") == 7,
           (A.ps().get(vm), A.logs(vm)[-2000:]))
-    check("kill -s: the app's handler ran", "got-term" in A.logs(vm))
+    check("kill -s: the app's handler ran", wait_for(lambda: said("got-term"), 10), A.logs(vm)[-2000:])
     A.rm(vm)
 
     # Foreground: run returns the app's status; an app that exits at once without a terminal gets the hint.
