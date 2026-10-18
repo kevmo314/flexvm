@@ -87,6 +87,7 @@ pub enum Start {
         resources: crate::vm::Resources,
         /// Made up (`host::generated_name`): made up again if taken meanwhile.
         generated: bool,
+        ports: Vec<crate::ports::Port>,
     },
     Resume {
         name: String,
@@ -96,6 +97,7 @@ pub enum Start {
         name: Option<String>,
         ip: Option<String>,
         paused: bool,
+        ports: Vec<crate::ports::Port>,
         /// Each set overrides the checkpoint's.
         resources: crate::vm::Resources,
     },
@@ -139,6 +141,8 @@ pub struct Proc {
 #[derive(Default)]
 pub struct Runtime {
     vm: OnceLock<Arc<Vm>>,
+    pub ports: Mutex<Vec<crate::ports::Port>>,
+    forwards: Mutex<Option<crate::ports::Forwarder>>,
     op: Mutex<()>,
     holder: OnceLock<Option<Arc<Holder>>>,
     /// The migration this VM arrived by, until all its pages are in.
@@ -285,6 +289,33 @@ impl Proc {
             me: me.clone(),
             announcer,
         }))
+    }
+
+    /// Before the address is claimed (`Forwarder::bind`); `serve_ports` once it is.
+    pub fn bind_ports(&self) -> Result<()> {
+        *self.forwards.lock().unwrap() = Some(crate::ports::Forwarder::bind(&self.ports.lock().unwrap())?);
+        Ok(())
+    }
+
+    pub fn serve_ports(&self, ip: Ipv4Addr) -> Result<()> {
+        self.forwards.lock().unwrap().as_mut().map_or(Ok(()), |f| f.serve(ip))
+    }
+
+    /// Released before it returns: a retried claim can bind them again.
+    pub fn drop_ports(&self) {
+        self.forwards.lock().unwrap().take();
+        self.ports.lock().unwrap().clear();
+    }
+
+    /// Off the migration's switchover: joining the forwarder takes up to a poll's wait.
+    pub fn drop_ports_later(&self) {
+        let forwards = self.forwards.lock().unwrap().take();
+        self.ports.lock().unwrap().clear();
+        let Some(p) = self.arc() else { return };
+        thread::spawn(move || {
+            drop(forwards);
+            p.publish();
+        });
     }
 
     pub fn vm(&self) -> &Arc<Vm> {
@@ -702,6 +733,7 @@ impl Proc {
             starved: vm.starving(),
             growth_mib_s: self.growth.load(Ordering::SeqCst),
             cmd: self.cmd.lock().unwrap().is_some(),
+            ports: self.ports.lock().unwrap().clone(),
         };
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
             crate::log!("vm {n}: registry: {e}");
@@ -713,6 +745,7 @@ impl Proc {
         if matches!(end, End::NotStarted) {
             self.refund_start();
         }
+        self.drop_ports();
         self.drop_held_in();
         self.set_leaving(true);
         if let Some(vm) = self.vm.get() {
@@ -972,8 +1005,10 @@ impl Proc {
         t.mark("template");
         // Before the claim: a refused start mints no generation (nor withdraws one).
         self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
+        self.bind_ports()?;
         let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
         let ip = self.set_addr(claim);
+        self.serve_ports(ip)?;
         t.mark("claim_ip");
         crate::host::stall("start_stall");
         let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;
@@ -1026,6 +1061,7 @@ impl Proc {
             "ip": vm.ip.to_string(),
             "pid": self.ident.pid,
             "start": self.ident.start,
+            "ports": *self.ports.lock().unwrap(),
             "running_ms": ms(running),
             "ready_ms": ms(t.total()),
             "timings_ms": t.json(),
@@ -1877,13 +1913,17 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let kvm = if matches!(start, Start::Incoming { .. }) { Ok(()) } else { crate::util::check_kvm() };
     let res = match start {
         _ if kvm.is_err() => kvm.map(|()| Value::Null),
-        Start::Run { name, template, ip, cmd, resources, generated } => {
+        Start::Run { name, template, ip, cmd, resources, generated, ports } => {
+            *p.ports.lock().unwrap() = ports;
             *p.cmd.lock().unwrap() = cmd;
             *p.resources.lock().unwrap() = resources;
             p.run(&name, &template, ip, generated)
         }
         Start::Resume { name } => p.resume_suspended(&name),
-        Start::Restore { dir, name, ip, paused, resources } => p.restore(&dir, name.as_deref(), ip.as_deref(), paused, resources),
+        Start::Restore { dir, name, ip, paused, resources, ports } => {
+            *p.ports.lock().unwrap() = ports;
+            p.restore(&dir, name.as_deref(), ip.as_deref(), paused, resources)
+        }
         Start::Incoming { req } => {
             let log = std::env::var_os("FLEXVM_INCOMING_LOG").map(PathBuf::from);
             std::env::remove_var("FLEXVM_INCOMING_LOG");

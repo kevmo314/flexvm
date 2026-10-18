@@ -129,6 +129,36 @@ the host (no VM, stopped VM, `failed` or moved record) are removed once
 unwritten for an hour, by sweeps that run when a VM starts and about every
 30 s while a listener or any VM process runs. Logs do not survive a reboot.
 
+## Forward host ports
+
+```sh
+flexvm run -d --name web -p 8080:80 -p 127.0.0.1:5353:53/udp ubuntu:24.04
+```
+
+`run -p [IP:]HOST_PORT:VM_PORT[/tcp|/udp]` forwards a host IPv4 port to
+its VM's address. Repeat `-p` for more ports. The default bind address is
+`0.0.0.0` (all host IPv4 interfaces), and the default protocol is TCP.
+Ports must be 1–65535. A port already bound by an application or another
+VM is refused at `run`, before anything starts, including overlapping
+wildcard binds; TCP and UDP can use the same number. `ps` shows a PORTS
+column; `ps --json` and `run -d` return `ports` objects with `ip`, `host_port`, `vm_port`, and `protocol`.
+
+These are single-host userspace proxies in the VM process. The guest sees
+the host as the client. Each mapping uses one thread, with up to 256 TCP
+connections or UDP client sessions; UDP sessions expire after 60 idle
+seconds. TCP buffers are bounded and support half-close. Killing or
+removing the VM closes its listeners and connections. Process death closes
+them in the kernel immediately, so garbage collection has no forwarding
+rules or reservations left to remove.
+
+`stop` releases the ports and saves their configuration with the stopped
+VM. `start` binds them again, and refuses if they have been taken meanwhile.
+A checkpoint restore uses only ports explicitly given with `run -p` again,
+even when restoring a stopped VM's checkpoint. Migration drops the forwards
+on the source once the target commits and does **not** recreate them on the
+target. Existing proxied connections end; use routed VM addresses for
+services that must remain reachable through migration.
+
 ## Stop, start, pause, kill, rm
 
 ```sh

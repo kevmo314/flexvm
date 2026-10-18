@@ -6131,7 +6131,7 @@ def mem_refused_fill():
         said = log(A, n).count("starved: the host's reserve refused")
         check("refused fill: its starving is logged once, not at each retry", said == 1, log(A, n)[-1500:])
         rows = [l.split() for l in cli(A, "ps")[1].splitlines()]
-        check("refused fill: plain ps shows it starved", rows[0][-1] == "STARVED" and any(r[0] == n and r[-1] == "yes" for r in rows[1:]), rows)
+        check("refused fill: plain ps shows it starved", "STARVED" in rows[0] and any(r[0] == n and r[-1] == "yes" for r in rows[1:]), rows)
         # Relief: moved to B, where it grows.
     check("refused fill: moved to B", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-1500:]))
     st = wait_released(B, n, timeout=60)

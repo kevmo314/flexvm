@@ -2,7 +2,9 @@
 //! logs on the run directory's tmpfs, `NAME.moved` markers and standby
 //! sockets. `sweep` runs once a boot as the host is first opened (`after_boot`), and about every `EVERY` on a host with a listener or
 //! any VM process (as one starts, then through `periodic`), whether or not
-//! VMs start. Logs are capped by their writers (`util::output`).
+//! VMs start. Port forwards own only process sockets (`ports`): process death
+//! releases them before a sweep, leaving no NAT rules or reservations to collect.
+//! Logs are capped by their writers (`util::output`).
 
 use std::fs::File;
 use std::path::Path;

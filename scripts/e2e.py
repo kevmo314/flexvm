@@ -242,9 +242,9 @@ class Host:
         assert wait_for(lambda: self.ps().get(vm, {}).get("state") == state, timeout), (vm, self.ps().get(vm))
 
     # VM commands
-    def run_json(self, vm=None, template=None, ip=None):
+    def run_json(self, vm=None, template=None, ip=None, extra=()):
         """Starts a VM (in the background; without a name flexvm makes one up); returns its JSON."""
-        opts = (["--name", vm] if vm else []) + (["--ip", ip] if ip else [])
+        opts = (["--name", vm] if vm else []) + (["--ip", ip] if ip else []) + list(extra)
         r = json.loads(self.cli("run", *opts, "-d", template or args.template).stdout)
         self.vms.add(r["name"])
         self.pids.add((r["pid"], r["start"]))
@@ -690,6 +690,96 @@ def kill_releases():
     check("kill: address free again", A.run(vm, ip=ip) == ip)
     A.kill(vm)
     check("kill: second kill of the name fails", A.kill(vm, check=False).returncode != 0)
+
+
+@case
+def port_forward():
+    """run -p: TCP (bulk, half-close) and UDP through the VM process's proxy; a clash refused before
+    anything starts; kept by stop/start; freed by kill and SIGKILL; not taken by a restore without -p;
+    dropped by a migration."""
+    vm, hp = "e2e-ports", A.port + 20000
+    fwd = ["-p", f"127.0.0.1:{hp}:7000", "-p", f"127.0.0.1:{hp}:7001/udp"]
+    r = A.run_json(vm, extra=fwd)
+    ip = r["ip"]
+    want = [{"ip": "127.0.0.1", "host_port": hp, "vm_port": 7000, "protocol": "tcp"},
+            {"ip": "127.0.0.1", "host_port": hp, "vm_port": 7001, "protocol": "udp"}]
+    check("run -d: its JSON has the ports", r.get("ports") == want, r)
+    check("ps: lists the ports", A.ps()[vm].get("ports") == want, A.ps()[vm])
+    echo_server(A, vm, ip)
+    must(A, vm, "setsid socat UDP-RECVFROM:7001,fork EXEC:cat >/dev/null 2>&1 </dev/null &")
+
+    def tcp_ok():
+        try:
+            with socket.create_connection(("127.0.0.1", hp), timeout=2) as s:
+                return echo(s, b"through the forward\n")
+        except OSError:
+            return False
+
+    def udp_ok():
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.5)
+            for _ in range(10):
+                s.sendto(b"udp ping", ("127.0.0.1", hp))
+                try:
+                    if s.recv(64) == b"udp ping":
+                        return True
+                except OSError:
+                    pass
+        return False
+
+    def bulk(mib=32):
+        data = os.urandom(1 << 20) * mib
+        with socket.create_connection(("127.0.0.1", hp), timeout=30) as s:
+            t = threading.Thread(target=lambda: (s.sendall(data), s.shutdown(socket.SHUT_WR)))
+            t.start()
+            got = bytearray()
+            while chunk := s.recv(1 << 20):
+                got += chunk
+            t.join()
+        return got == data
+
+    def free(port, kind):
+        with socket.socket(socket.AF_INET, kind) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
+
+    check("tcp through the forward", wait_for(tcp_ok, 10))
+    t = time.time()
+    check("tcp: 32 MiB echoed intact, then the half-close", bulk())
+    print(f"  bulk: 32 MiB each way in {(time.time() - t) * 1000:.0f} ms")
+    check("udp through the forward", udp_ok())
+    other = "e2e-ports-clash"
+    c = A.cli("run", "--name", other, "-d", "-p", f"127.0.0.1:{hp}:80", args.template, check=False)
+    check("clash: refused at run", c.returncode != 0 and "bind" in c.stderr, (c.returncode, c.stderr))
+    check("clash: nothing left of it", other not in A.ps(), A.ps().get(other))
+    A.suspend(vm)
+    check("stop: the ports are free meanwhile", free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM))
+    check("stop: ps -a keeps them", A.ps()[vm].get("ports") == want, A.ps()[vm])
+    A.resume(vm)
+    check("start: tcp forwarded again", wait_for(tcp_ok, 10))
+    check("start: udp forwarded again", udp_ok())
+    path = ckpt_dir(vm)
+    A.checkpoint(vm, path)
+    fork = vm + "-fork"
+    r = A.restore(path, name=fork, ip="auto")
+    check("restore without -p: no ports", not r.get("ports") and not A.ps()[fork].get("ports"), r)
+    A.kill(fork)
+    shutil.rmtree(path, ignore_errors=True)
+    A.migrate(vm, B)
+    check("migrate: freed on the source", wait_for(lambda: free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM), 10))
+    check("migrate: none on the target", not B.ps()[vm].get("ports"), B.ps()[vm])
+    B.kill(vm)
+    A.run_json(vm, extra=fwd)
+    A.kill(vm)
+    check("kill: frees the ports", free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM))
+    A.run_json(vm, extra=fwd)
+    os.kill(A.pid(vm), signal.SIGKILL)
+    check("SIGKILL: frees the ports", wait_for(lambda: free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM), 10))
+    # What the killed process left (its tap, its name) is a sweep's.
+    A.cli("debug", "gc")
 
 
 # --- the image case's registry pull and its cache --------------------------------

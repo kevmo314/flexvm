@@ -19,6 +19,7 @@ mod listen;
 mod management;
 mod migrate;
 mod net;
+mod ports;
 mod socket;
 mod standby;
 mod template;
@@ -47,6 +48,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      start a VM of IMAGE (pulled first if missing); the process is the VM
       --name NAME                    its name (without: one is made up, as docker does)
       -d, --detach                   in the background: prints {\"name\", \"ip\", \"pid\", ...} once it runs
+      -p [IP:]HOST_PORT:VM_PORT[/tcp|/udp]
+                                     forward a host port here (repeatable; default IP 0.0.0.0, TCP)
       --ip IP                        its address (without: the next free one)
       --cpus N                       cap its CPU time at N CPUs (1.5: one and a half); its vCPUs are IMAGE's
       --memory SIZE                  cap its memory growth (512m, 2g; plain bytes, as docker): from IMAGE's
@@ -153,6 +156,7 @@ impl Args {
             let cmd = a.positional.first().map(String::as_str);
             let short = match arg.as_str() {
                 "-d" => Some("detach"),
+                "-p" => Some("publish"),
                 "-h" => Some("help"),
                 "-q" => Some("quiet"),
                 "-a" => Some(if cmd == Some("start") { "attach" } else { "all" }),
@@ -179,6 +183,11 @@ impl Args {
                         None => bail!("unknown option --{f} (see flexvm --help)"),
                     };
                     a.flags.push((f.into(), value));
+                }
+                None if short == Some("publish") => {
+                    let value = it.next().filter(|v| !v.starts_with('-')).ok_or("-p needs a port mapping")?;
+                    a.child_args.push(value.clone());
+                    a.flags.push(("publish".into(), value));
                 }
                 None if short.is_some() => a.flags.push((short.unwrap_or_default().into(), "1".into())),
                 None if arg.starts_with('-') => bail!("unknown option {arg} (see flexvm --help)"),
@@ -276,7 +285,7 @@ const NAMES: usize = usize::MAX;
 
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
-    ("run", 2, &["name", "detach", "ip", "cpus", "memory", "checkpoint", "paused", "standby", "incoming"]),
+    ("run", 2, &["name", "detach", "ip", "cpus", "memory", "checkpoint", "paused", "standby", "incoming", "publish"]),
     ("ps", 1, &["all", "json"]),
     ("exec", 2, &[]),
     ("stop", NAMES, &[]),
@@ -611,6 +620,7 @@ fn run(args: &Args, image: &str) -> Result<()> {
     let (host, paths) = (open_host(args)?, paths(args)?);
     let template = template::name_of(image)?;
     let resources = resources(args)?;
+    port_specs(args)?;
     let ip = args.get("ip").filter(|&s| s != "auto");
     let ip: Option<std::net::Ipv4Addr> = ip.map(|s| s.parse().map_err(|_| format!("bad --ip {s:?}"))).transpose()?;
     if let Some(name) = args.get("name") {
@@ -653,7 +663,9 @@ fn run_as(
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "attached": log.is_none()});
+    let ports = port_specs(args)?;
+    let req =
+        json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "attached": log.is_none(), "ports": ports});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
@@ -682,9 +694,13 @@ fn run_as(
         }
         (None, None) => {
             let generated = args.get("name").is_none();
-            vmproc::main(host.clone(), paths.clone(), Start::Run { name, template: template.into(), ip, cmd, resources, generated }, notify_fd())
+            vmproc::main(host.clone(), paths.clone(), Start::Run { name, template: template.into(), ip, cmd, resources, generated, ports }, notify_fd())
         }
     }
+}
+
+fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
+    args.all("publish").iter().map(|s| s.parse()).collect()
 }
 
 /// `run --checkpoint DIR`: the checkpoint's name and address unless `--name`, `--ip`.
@@ -697,6 +713,7 @@ fn run_checkpoint(args: &Args) -> Result<()> {
         ip: args.get("ip").map(String::from),
         paused: args.has("paused"),
         resources,
+        ports: port_specs(args)?,
     };
     if args.has("detach") {
         let host = open_host(args)?;
@@ -1013,10 +1030,11 @@ fn ps(host: &Host, all: bool, as_json: bool) -> Result<()> {
     if as_json {
         return print(json!(vms));
     }
-    let row =
-        |c: [&str; 9]| output(format_args!("{:<24} {:<15} {:<16} {:<12} {:>8} {:>5} {:>8} {:>8} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]));
+    let row = |c: [&str; 10]| {
+        output(format_args!("{:<24} {:<15} {:<16} {:<12} {:>8} {:>5} {:>8} {:>8} {} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9]))
+    };
     // STARVED: refused memory here and throttled (moved to a peer if there is one).
-    row(["NAME", "IP", "IMAGE", "STATE", "PID", "CPUS", "RSS MiB", "MAX MiB", "STARVED"])?;
+    row(["NAME", "IP", "IMAGE", "STATE", "PID", "CPUS", "RSS MiB", "MAX MiB", "STARVED", "PORTS"])?;
     for v in &vms {
         let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
         let [a, b, d, e, g, h] = ["name", "ip", "state", "pid", "rss_mib", "max_mib"].map(s);
@@ -1024,7 +1042,9 @@ fn ps(host: &Host, all: bool, as_json: bool) -> Result<()> {
         // The --cpus cap, else its vCPUs.
         let cpus = v["cpus"].as_f64().map_or_else(|| s("vcpus"), |c| c.to_string());
         let starved = if v["starved"].as_bool() == Some(true) { "yes" } else { "" };
-        row([&a, &b, &image, &d, &e, &cpus, &g, &h, starved])?;
+        let ports: Vec<ports::Port> = serde_json::from_value(v["ports"].clone()).unwrap_or_default();
+        let ports = ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+        row([&a, &b, &image, &d, &e, &cpus, &g, &h, starved, &ports])?;
     }
     Ok(())
 }
@@ -1486,6 +1506,28 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn published_ports_repeat_and_survive_detaching_and_checkpoint_arguments() {
+        let args = parse(&["run", "-d", "-p", "8080:80", "--publish", "127.0.0.1:5353:53/udp", "image"]);
+        check_applies(&args).unwrap();
+        let ports = port_specs(&args).unwrap();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].protocol, ports::Protocol::Tcp);
+        assert_eq!(ports[1].protocol, ports::Protocol::Udp);
+        let child = Args::parse(args.child_args.clone()).unwrap();
+        assert!(!child.has("detach"));
+        assert_eq!(port_specs(&child).unwrap(), ports);
+        let restored = parse(&["run", "--checkpoint", "/checkpoint", "-p", "8080:80"]);
+        check_applies(&restored).unwrap();
+        assert_eq!(port_specs(&restored).unwrap(), ports[..1]);
+        assert!(port_specs(&parse(&["run", "--checkpoint", "/checkpoint"])).unwrap().is_empty());
+        assert!(Args::parse(["run", "-p"].map(String::from)).is_err());
+        assert!(check_applies(&parse(&["start", "-p", "8080:80", "vm"])).is_err());
+        let command = parse(&["run", "-p", "8080:80", "image", "echo", "-p", "123"]);
+        assert_eq!(command.rest, ["echo", "-p", "123"]);
+        assert_eq!(port_specs(&command).unwrap().len(), 1);
     }
 
     #[test]
