@@ -556,9 +556,14 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                     (entry.group, entry.token) = (child.0.id() as i32, child.2);
                     let _ = tx.send(child);
                 }
-                // Closed while the shell was being spawned: it is killed, as the close would have.
+                // Closed while the shell was being spawned: its whole group is killed, jobs too, since
+                // the client never had it. Even once the shell is reaped: the group lives on in its jobs,
+                // and while it does its id cannot be another's.
                 (Ok((child, tx)), None) => {
-                    kill_running(statuses, child.0.id() as i32, child.2, true, libc::SIGKILL);
+                    let group = child.0.id() as i32;
+                    if !kill_running(statuses, group, child.2, true, libc::SIGKILL) {
+                        unsafe { libc::kill(-group, libc::SIGKILL) };
+                    }
                     let _ = tx.send(child);
                 }
                 (Err(e), _) => {
@@ -1223,6 +1228,37 @@ mod tests {
         assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL, "the shell outlived its close");
         assert!(statuses.0.lock().unwrap().running.is_empty(), "the retry spawned a second shell");
         assert!(sessions.lock().unwrap().closed.contains_key("spawning"));
+    }
+
+    #[test]
+    fn a_close_during_the_spawn_kills_the_jobs_of_a_shell_already_reaped() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let held = statuses.0.lock().unwrap();
+        let starting = {
+            let (sessions, statuses) = (sessions.clone(), statuses.clone());
+            thread::spawn(move || request(&sessions, &statuses, "SESSION jobs 16", b"sleep 600 & exit"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sessions.lock().unwrap().live.contains_key("jobs") {
+            assert!(Instant::now() < deadline, "the session was never reserved");
+            thread::sleep(Duration::from_millis(5));
+        }
+        sessions.lock().unwrap().close("jobs", None);
+        // The handler, once its shell runs, waits here while the shell exits and is reaped.
+        let table = sessions.lock().unwrap();
+        drop(held);
+        let pid = loop {
+            if let Some(&pid) = statuses.0.lock().unwrap().running.keys().next() {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the shell never ran");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(reap(&statuses, pid), 0);
+        assert_eq!(unsafe { libc::kill(-pid, 0) }, 0, "the background job should still be running");
+        drop(table);
+        starting.join().unwrap();
+        wait_group_gone(pid, "the reaped shell's background job outlived the close");
     }
 
     #[test]
