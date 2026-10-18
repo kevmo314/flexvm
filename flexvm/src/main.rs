@@ -324,7 +324,8 @@ fn main() {
         }
     }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
-    util::set_verbose(args.has("verbose"));
+    // A listener's stderr is its service's log: it keeps what it did (recoveries, routes, migrations).
+    util::set_verbose(args.has("verbose") || args.positional.first().is_some_and(|c| c == "listen"));
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec"));
     let result = error.map_or_else(|| real_main(&args), Err);
     if let Some(sig) = template::interrupted_signal() {

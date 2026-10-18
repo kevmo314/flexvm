@@ -2482,7 +2482,8 @@ pub mod output {
     pub fn diagnostic(data: &[u8], info: bool) {
         let _moving = MOVING.read().unwrap_or_else(|e| e.into_inner());
         let target_log = LOGS.lock().unwrap()[1].clone();
-        let log = LOG.lock().unwrap().clone().or(target_log.clone());
+        // Where stderr goes, if that is a log (a standby's own until claimed); else a terminal's VM log.
+        let log = target_log.clone().or_else(|| LOG.lock().unwrap().clone());
         if let Some(log) = &log {
             append_capped(log, data, LOG_CAP);
         }
