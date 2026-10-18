@@ -780,12 +780,27 @@ impl Host {
         if !resuming && suspended.exists() {
             bail!("vm {name:?} exists (stopped); flexvm start or rm it");
         }
+        // Its record stays until `rm` or `start` (`take_exited_name`) takes it.
+        if !resuming && self.vms(name, "exited")?.exists() {
+            bail!("vm {name:?} exists (exited); flexvm start or rm it");
+        }
         for ext in ["json", "sock", "moved", "failed", "lost"] {
             let _ = std::fs::remove_file(self.vms(name, ext)?);
         }
         f.set_len(0)?;
         f.write_all_at(&serde_json::to_vec(&Ident::me())?, 0)?;
         Ok(NameLock { name: name.into(), host: self.clone(), _file: f })
+    }
+
+    /// `start` of an exited VM: its name, and its record (read, then removed: the rerun replaces it).
+    pub fn take_exited_name(&self, name: &str) -> Result<NameLock> {
+        let lock = self.take_name(name, true)?;
+        if self.suspended(name)?.exists() {
+            bail!("vm {name:?} exists (stopped); flexvm start or rm it");
+        }
+        let exited = self.vms(name, "exited")?;
+        std::fs::remove_file(&exited).map_err(|e| format!("vm {name:?} has not exited (its record {}: {e})", exited.display()))?;
+        Ok(lock)
     }
 
     /// Whether no process runs `name`, by its lock's record alone (never a
@@ -3478,7 +3493,7 @@ pub fn generated_name(host: &Host) -> Result<String> {
         let name = format!("{}_{}", ADJECTIVES[(r % ADJECTIVES.len() as u64) as usize], NAMES[((r >> 32) % NAMES.len() as u64) as usize]);
         let taken = host.alive(&name)
             || host.suspended(&name)?.exists()
-            || ["failed", "lost", "moved"].iter().any(|ext| host.vms(&name, ext).is_ok_and(|p| p.exists()));
+            || ["failed", "lost", "moved", "exited"].iter().any(|ext| host.vms(&name, ext).is_ok_and(|p| p.exists()));
         if !taken {
             return Ok(name);
         }
@@ -3490,7 +3505,7 @@ pub fn generated_name(host: &Host) -> Result<String> {
 /// name is then made up again (`generated_name`), an explicit one is the caller's error.
 pub fn name_taken(e: &crate::util::Error) -> bool {
     let e = e.to_string();
-    e.contains("is taken") || e.contains("exists (stopped)")
+    e.contains("is taken") || e.contains("exists (stopped)") || e.contains("exists (exited)")
 }
 
 pub fn check_name(name: &str) -> Result<()> {
@@ -4792,6 +4807,31 @@ pub(crate) mod tests {
         std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
         std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
         assert!(h.take_name("s", false).is_err() && h.take_name("s", true).is_ok());
+    }
+
+    #[test]
+    fn an_exited_record_keeps_its_name_until_rm_or_start() {
+        let (_h_dir, h) = host("exited-name");
+        std::fs::write(h.vms("x", "exited").unwrap(), "{}").unwrap();
+        let e = h.take_name("x", false).err().unwrap();
+        assert!(e.to_string().contains("exists (exited)") && name_taken(&e), "{e}");
+        assert!(generated_name(&h).is_ok_and(|n| n != "x"));
+        // `rm` takes it as a stopped VM's: the record stays until it removes it.
+        drop(h.take_name("x", true).unwrap());
+        assert!(h.vms("x", "exited").unwrap().exists());
+        // `start`'s rerun takes the record with the name; then the name is a running VM's.
+        let lock = h.take_exited_name("x").unwrap();
+        assert!(!h.vms("x", "exited").unwrap().exists());
+        assert!(h.take_name("x", false).is_err(), "held");
+        drop(lock);
+        assert!(h.take_exited_name("x").err().unwrap().to_string().contains("has not exited"), "no record: nothing to rerun");
+        drop(h.take_name("x", false).unwrap());
+        // A stopped VM of the name is resumed, not rerun.
+        std::fs::write(h.vms("s", "exited").unwrap(), "{}").unwrap();
+        std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
+        std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
+        assert!(h.take_exited_name("s").err().unwrap().to_string().contains("stopped"));
+        assert!(h.vms("s", "exited").unwrap().exists());
     }
 
     #[test]

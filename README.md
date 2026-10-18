@@ -18,7 +18,8 @@ artifacts (`artifacts/`), templates (`templates/`), pulled images
 ```sh
 cargo build --release && sudo install target/release/flexvm /usr/local/bin/
 sudo flexvm pull ubuntu:24.04    # pull an image; its template is a cold boot of it, snapshotted (needs e2fsprogs)
-sudo flexvm run ubuntu:24.04     # a VM of it (pulled first if missing), in the foreground
+sudo flexvm run ubuntu:24.04 uname -a   # a VM of it (pulled first if missing), in the foreground: runs
+                                       # the command and exits with it
 ```
 
 flexvm-init (the guest's PID 1 and agent) is built by the same `cargo build`
@@ -68,11 +69,36 @@ the VM's process, and the other commands find VMs by name in the state
 directory.
 
 ```sh
-flexvm run ubuntu:24.04                      # foreground: the VM's output here, Ctrl-Z pauses, Ctrl-C destroys
+flexvm run nginx:1.27                        # foreground: the app's output here, Ctrl-Z pauses, Ctrl-C destroys
 flexvm run -d --name web nginx:1.27          # in the background; prints {"name", "ip", "pid", ...} once it runs
 flexvm run --name job ubuntu:24.04 make test # runs one command; exits with its status, the VM goes with it
 flexvm run -d --ip 10.200.0.9 --cpus 2 --memory 8g nginx:1.27
+flexvm run -d -e PORT=8080 --env-file app.env --entrypoint "python3 -m http.server" python:3.12
+flexvm run -d --keep busybox                 # stays up once its app exits, for exec
 ```
+
+A VM follows its image's app (its entrypoint and command), as a container
+does: when the app exits, the VM exits with the app's status. In the
+foreground `run` returns that status. With `-d` the VM becomes an `exited`
+record: `ps -a` lists it with its status, its output stays in its log, `rm`
+removes it and `start` runs it again. `--rm` leaves no record (its log goes
+with the next sweep). `--keep` keeps the VM up once its app exits, to `exec`
+into. An image with no entrypoint and no command has no app: its VMs idle
+until told what to run (`exec`, `run IMAGE CMD`), and so does
+`run -d IMAGE sleep infinity`. With CMD, the VM follows CMD instead (the
+image's app, if any, still starts, but its exit does not end the VM). When the
+app exits within about a second and stdin is not a terminal, `run` says
+`bash exited at once (it needs a terminal?): use flexvm run -it ubuntu:24.04`:
+a shell with no terminal reads end-of-file and exits.
+
+`-e K=V` (again for more; a bare `-e K` takes `K` from this environment, and
+is left out if it has none), `--env-file FILE` (Docker's form: `K=V` lines,
+`#` comments; `-e` wins over it) and `--entrypoint CMD` (words, or a JSON
+array; it drops the image's command too, as in Docker) set the app's
+environment and program for this run, as `pull`'s options do for every run.
+The guest's agent applies them as it starts the app, so a standby VM's claim
+carries them; a `--warm` image's app is running already in its snapshot, so
+it refuses them. They stay with the VM through `stop`/`start` and migrations.
 
 `run` pulls an image it does not find here first, as `docker run` does.
 Without `--name` it makes one up (`epic_yalow`, as Docker does; one
@@ -106,10 +132,11 @@ web                      10.200.0.1      nginx:1.27       running         41522 
 | `source` | migrating away: paused here until the target has its memory |
 | `suspended` | stopped: on disk, no process (`flexvm stop`, SIGTERM); `flexvm start` brings it back |
 | `quarantined` | a stopped VM that cannot be started (its address generation is unknown); `run --checkpoint` its directory with a new name and `--ip auto`, or `flexvm rm` it |
+| `exited` | its app (or CMD) exited in the background, with the status `ps` shows; `flexvm start` runs it again, `flexvm rm` removes it |
 | `failed` | died under its process (exit 124); `ps -a --json` (or `/run/flexvm/vms/NAME.failed`) says why, until `flexvm rm` |
 | `lost` | ran here when the host went down (a reboot, or its process was SIGKILLed); its address is withdrawn, until `flexvm rm` |
 
-The last four are stopped: `ps` lists them with `-a`. Standby VMs are not
+The last five are stopped: `ps` lists them with `-a`. Standby VMs are not
 listed: `flexvm images` shows their configured count in `STANDBY`.
 
 ```sh
@@ -125,7 +152,7 @@ A background VM's output (an image app's stdout and stderr, flexvm's own
 messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: past
 8 MiB, `NAME.log` becomes `NAME.log.1` (replacing the one before) and a new
 one is started; the logs of a name with nothing left on
-the host (no VM, stopped VM, `failed` or moved record) are removed once
+the host (no VM, stopped VM, `exited`, `failed` or moved record) are removed once
 unwritten for an hour, by sweeps that run when a VM starts and about every
 30 s while a listener or any VM process runs. Logs do not survive a reboot.
 
@@ -167,7 +194,8 @@ flexvm start web                # bring it back, in the background (-a: in the f
 flexvm pause web                # pause the vCPUs, memory kept (as SIGTSTP; Ctrl-Z in the foreground)
 flexvm unpause web              # resume them (as SIGCONT)
 flexvm kill web                 # destroy a running VM (as SIGINT; Ctrl-C or Ctrl-\ in the foreground)
-flexvm rm web                   # remove a stopped VM (suspended, quarantined, failed, lost)
+flexvm kill -s HUP web          # send a signal (name or number) to its app instead
+flexvm rm web                   # remove a stopped VM (suspended, quarantined, exited, failed, lost)
 flexvm rm -f web                # destroy it, running or not
 ```
 
@@ -187,17 +215,31 @@ of its output and exits with its status. `start` of a paused VM unpauses it;
 `start -a` attaches only to a VM it starts, so it refuses a running or paused
 one (`unpause` that), after waiting out a stop under way.
 
+`start` of an `exited` VM runs it again: a new VM of its image under its
+name, with what it was run with (its command, `-e`, `--entrypoint`, `--keep`,
+`--rm`, `--cpus`, `--memory`, and its `--ip` if one was given). A VM has no
+disk of its own: its root is the image's read-only filesystem with an overlay
+in the guest's memory, so what it wrote ends when it exits (a `stop` keeps it,
+in the memory it saves). The rerun starts from the image's current template,
+so a pull since then is what it runs; `start -a` runs it in the foreground,
+and its exit leaves the record again.
+
+`kill -s SIGNAL` sends SIGNAL (`TERM`, `SIGHUP`, `9`, ...) to the VM's app
+(its process alone, as `docker kill -s` does) and leaves the VM to follow it;
+plain `kill` destroys the VM. A VM with no app refuses it.
+
 A closed terminal (SIGHUP) leaves a foreground VM running; its output then
 goes to `/run/flexvm/vms/NAME.log`.
 
 Exit statuses of `flexvm run` and `flexvm start -a`: with CMD, CMD's own;
+without, its app's;
 128 + the signal that ended it (130: destroyed by SIGINT, Ctrl-C or
 `flexvm kill`; 143: stopped, by `flexvm stop` or SIGTERM); 0 when it
 migrated away or `checkpoint --stop` stopped it. flexvm's own failures use
 the range shells and container runtimes keep for themselves: 125 when it
 could not start the VM (or gave it up; also for `run -d` and `start`), 124
 when the VM died under it (`flexvm ps -a` then shows it `failed`, and `ps -a
---json` why, until `flexvm rm`). Without CMD they are the same, so a script
+--json` why, until `flexvm rm`). For a VM with neither they are the same, so a script
 can tell a VM that never ran (125) from one that did. `flexvm exec` returns
 the command's status, or 125 for flexvm's own failures. Other commands exit
 1 when they fail.
@@ -462,9 +504,11 @@ flexvm rmi nginx:1.27                                   # refused while a VM her
 its root filesystem with flexvm-init as PID 1, cold-boots a VM of it and
 snapshots it once its agent answers: that snapshot, the image's *template*,
 is what every `run` restores. The image's entrypoint and command start at
-`run`; an image with neither has no app, and its VMs idle until told what to
-run (`exec`, `run IMAGE CMD`). ubuntu:24.04's command is `bash`, which exits at
-once without a terminal: its VMs log that and idle.
+`run`, and the VM exits when the app does (see Run a VM); an image with
+neither has no app, and its VMs idle until told what to run (`exec`,
+`run IMAGE CMD`). ubuntu:24.04's command is `bash`, which exits at once
+without a terminal, and its VM with it, saying so; `run -d ubuntu:24.04 sleep
+infinity` (or `--keep`) gives an idle machine to `exec` into.
 
 **Names.** A template is named after its image reference, resolved as
 `docker pull` does (`ubuntu` is `docker.io/library/ubuntu:latest`), in
@@ -543,7 +587,7 @@ and `--memory` cap a VM below them):
 | `--plug MIB` | 4096 | plugged in the snapshot (free until touched); a VM never shrinks below it |
 
 Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K=V`,
-`--workdir`, `--user`. `--warm` snapshots the app once it is ready
+`--workdir`, `--user` (`run` takes `-e`, `--env-file` and `--entrypoint` per VM). `--warm` snapshots the app once it is ready
 (`--ready-port N` or `--ready-cmd CMD`); every VM from a warm template starts
 with the same userland state (RNG seeds, keys), so use it only for apps that
 hold no secrets at startup. Details: [docs/images.md](docs/images.md).

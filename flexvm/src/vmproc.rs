@@ -88,6 +88,11 @@ pub enum Start {
         /// Made up (`host::generated_name`): made up again if taken meanwhile.
         generated: bool,
         ports: Vec<crate::ports::Port>,
+        spec: crate::app::RunSpec,
+        /// Its `run`'s stdin is a terminal (`app::hint`).
+        tty: bool,
+        /// `start` of an exited VM: its record (`app::Exited`) gives way to it.
+        rerun: bool,
     },
     Resume {
         name: String,
@@ -160,6 +165,16 @@ pub struct Runtime {
     /// goes, and one a migration kept (refusing the destroy) goes once it runs here again (`abort`).
     pub claimer_gone: AtomicBool,
     pub cmd: Mutex<Option<String>>,
+    /// `run`'s app settings, and what becomes of the VM once its app exits (`app::RunSpec`).
+    pub spec: Mutex<crate::app::RunSpec>,
+    /// Its `run`'s stdin is a terminal: no hint when its app exits at once.
+    pub tty: AtomicBool,
+    /// In the foreground (a `run` or `start -a` follows it): it leaves no exited record.
+    pub attached: AtomicBool,
+    /// When this process started the app, for the hint.
+    app_started: Mutex<Option<Instant>>,
+    /// The status the VM ends with because its command or app exited (`exit_with`).
+    exiting: Mutex<Option<i32>>,
     /// `run --cpus/--memory` (or a checkpoint's, an arrival's): the VM's once it is adopted.
     pub resources: Mutex<crate::vm::Resources>,
     /// The main command's session: a suspend holds it, so what it records is
@@ -760,9 +775,13 @@ impl Proc {
         if let Some(rec) = arrived {
             rec.settle(matches!(end, End::Gone));
         }
+        let exited = matches!(end, End::Gone) && *self.exiting.lock().unwrap() == Some(code);
         self.end_claim(end, source_runs);
         if let Some(dir) = self.consumed.lock().unwrap().take() {
             crate::lifecycle::delete_consumed(&self.name(), &dir);
+        }
+        if exited {
+            self.record_exit(code);
         }
         drop(self.name.lock().unwrap().take());
         for f in self.files.lock().unwrap().drain(..) {
@@ -784,6 +803,22 @@ impl Proc {
         crate::util::flush_log(crate::util::LOG_FLUSH);
         crate::util::output::drain();
         std::process::exit(code)
+    }
+
+    /// A background VM whose command or app exited leaves `RUN/vms/NAME.exited` (under its name,
+    /// so a `run` or `start` of the name waits for it), unless `run --rm`.
+    fn record_exit(&self, code: i32) {
+        let spec = self.spec.lock().unwrap().clone();
+        let (Some(vm), Ok(path)) = (self.vm.get(), self.host.vms(&self.name(), "exited")) else { return };
+        if self.attached.load(Ordering::SeqCst) || spec.rm {
+            return;
+        }
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let cmd = self.cmd.lock().unwrap().clone();
+        let rec = crate::app::Exited { status: code, template: vm.template.name.clone(), cmd, resources: vm.resources(), spec, at };
+        if let Err(e) = serde_json::to_vec(&rec).map_err(Error::from).and_then(|b| Ok(crate::host::write_record(&path, &b)?)) {
+            crate::log!("vm {}: its exited record {}: {e}", vm.name, path.display());
+        }
     }
 
     /// What becomes of the address claim as the process ends. Taken out of `addr`
@@ -988,11 +1023,12 @@ impl Proc {
         }
     }
 
-    fn run(&self, name: &str, template: &str, want: Option<Ipv4Addr>, generated: bool) -> Result<Value> {
+    fn run(&self, name: &str, template: &str, want: Option<Ipv4Addr>, generated: bool, rerun: bool) -> Result<Value> {
         let mut t = Phases::new();
         let mut name = name.to_string();
         let lock = loop {
-            match self.host.take_name(&name, false) {
+            let taken = if rerun { self.host.take_exited_name(&name) } else { self.host.take_name(&name, false) };
+            match taken {
                 Err(e) if generated && crate::host::name_taken(&e) => name = crate::host::generated_name(&self.host)?,
                 r => break r?,
             }
@@ -1002,6 +1038,7 @@ impl Proc {
         let tpl = Template::open(&self.paths, template)?;
         let resources = *self.resources.lock().unwrap();
         self.set_resources(resources, &tpl.meta)?;
+        self.spec.lock().unwrap().check(tpl.meta.image.as_ref())?;
         t.mark("template");
         // Before the claim: a refused start mints no generation (nor withdraws one).
         self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
@@ -1050,8 +1087,10 @@ impl Proc {
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();
         }
-        if vm.template.meta.image.as_ref().is_some_and(|i| i.starts_at_run()) {
-            vm.start_app().map_err(|e| format!("{e} (see the vm's output)"))?;
+        let spec = self.spec.lock().unwrap().clone();
+        if spec.starts_app(vm.template.meta.image.as_ref()) {
+            vm.start_app(&spec.app_settings()).map_err(|e| format!("{e} (see the vm's output)"))?;
+            *self.app_started.lock().unwrap() = Some(Instant::now());
             t.mark("app_start");
         }
         self.announce();
@@ -1111,7 +1150,7 @@ impl Proc {
         spawn(Proc::release_on_request);
         spawn(Proc::serve_memory);
         spawn(Proc::watch_memory);
-        if self.vm().template.meta.image.as_ref().is_some_and(|i| i.has_app()) {
+        if self.spec.lock().unwrap().has_app(self.vm().template.meta.image.as_ref()) {
             spawn(Proc::follow_app);
         }
         if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten()) {
@@ -1276,6 +1315,7 @@ impl Proc {
             "migrate" => self.migrate(req["to"].as_str().unwrap_or(""), req["if_idle"] == true, req["evict"] == true),
             "debug" => self.debug(&req),
             "resume" => self.resume_request(),
+            "signal" => self.signal_app(&req),
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
         };
@@ -1359,6 +1399,17 @@ impl Proc {
             Ok(())
         })();
         vm.untrack_exec(id);
+    }
+
+    /// `kill -s SIGNAL`: to the VM's app, not the VM.
+    fn signal_app(&self, req: &Value) -> Result<Value> {
+        let vm = self.vm();
+        if !self.spec.lock().unwrap().has_app(vm.template.meta.image.as_ref()) {
+            bail!("vm {} has no app to signal (its image has no entrypoint or command); flexvm kill {} destroys it", vm.name, vm.name);
+        }
+        let sig = req["signal"].as_i64().and_then(|s| i32::try_from(s).ok()).ok_or("missing signal")?;
+        vm.signal_app(sig).map_err(|e| format!("vm {}: signalling its app: {e}", vm.name))?;
+        Ok(json!({"name": vm.name, "signal": sig}))
     }
 
     fn debug(&self, req: &Value) -> Result<Value> {
@@ -1594,7 +1645,7 @@ impl Proc {
                         if !status.starts_with("running") {
                             crate::log!("vm {}: app {}", vm.name, status.rsplit_once(' ').map(|(s, _)| s).unwrap_or(&status));
                             vm.untrack_exec(id);
-                            return;
+                            return self.app_exited(&status);
                         }
                         break;
                     }
@@ -1637,10 +1688,55 @@ impl Proc {
                 crate::log!("vm {}: {e}", self.name());
                 FAILED
             });
-            let refused = self.destroy(code);
-            *self.suspending.lock().unwrap() = Suspend::Idle;
+            let refused = self.exit_with(code);
             return crate::log!("vm {}: {refused}", self.name());
         }
+    }
+
+    /// The app's final status (`exited <code> <offset>`) ends the VM with that code, unless it
+    /// runs a command (`run IMAGE CMD`, which it follows instead) or `run --keep`. A suspend under
+    /// way is waited out: it takes the exited app along (the resumed VM sees it exit and ends), or
+    /// fails and the VM ends here. A migration away refuses the end: the VM ends at its target, or
+    /// here once it runs here again (the migration aborted).
+    fn app_exited(&self, status: &str) {
+        let Some(code) = crate::app::exit_status(status) else { return };
+        if self.cmd.lock().unwrap().is_some() || self.spec.lock().unwrap().keep {
+            return;
+        }
+        let quick = self.app_started.lock().unwrap().is_some_and(|t| t.elapsed() < crate::app::AT_ONCE);
+        if quick && !self.tty.load(Ordering::SeqCst) {
+            let vm = self.vm();
+            let image = vm.template.meta.image.as_ref();
+            crate::log!("{}", crate::app::hint(&self.spec.lock().unwrap().program(image), &crate::template::image_of(&vm.template.name)));
+        }
+        for tries in 0.. {
+            let mut s = self.suspending.lock().unwrap();
+            match *s {
+                Suspend::Suspending => {
+                    drop(s);
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Suspend::Ending => return,
+                Suspend::Idle => *s = Suspend::Ending,
+            }
+            drop(s);
+            let refused = self.exit_with(code);
+            if tries == 0 {
+                crate::log!("vm {}: {refused}", self.name());
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// The VM's command or app exited with `code` (`Suspend::Ending` set): the VM ends with it,
+    /// leaving an exited record if it ran in the background (`record_exit`). Returns only if refused.
+    fn exit_with(&self, code: i32) -> Error {
+        *self.exiting.lock().unwrap() = Some(code);
+        let refused = self.destroy(code);
+        *self.exiting.lock().unwrap() = None;
+        *self.suspending.lock().unwrap() = Suspend::Idle;
+        refused
     }
 
     /// One per VM, whoever asks first (the command, or a suspend before it started).
@@ -1913,15 +2009,22 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let kvm = if matches!(start, Start::Incoming { .. }) { Ok(()) } else { crate::util::check_kvm() };
     let res = match start {
         _ if kvm.is_err() => kvm.map(|()| Value::Null),
-        Start::Run { name, template, ip, cmd, resources, generated, ports } => {
+        Start::Run { name, template, ip, cmd, resources, generated, ports, spec, tty, rerun } => {
             *p.ports.lock().unwrap() = ports;
             *p.cmd.lock().unwrap() = cmd;
             *p.resources.lock().unwrap() = resources;
-            p.run(&name, &template, ip, generated)
+            *p.spec.lock().unwrap() = spec;
+            p.tty.store(tty, Ordering::SeqCst);
+            p.attached.store(notify.is_none(), Ordering::SeqCst);
+            p.run(&name, &template, ip, generated, rerun)
         }
-        Start::Resume { name } => p.resume_suspended(&name),
+        Start::Resume { name } => {
+            p.attached.store(notify.is_none(), Ordering::SeqCst);
+            p.resume_suspended(&name)
+        }
         Start::Restore { dir, name, ip, paused, resources, ports } => {
             *p.ports.lock().unwrap() = ports;
+            p.attached.store(notify.is_none(), Ordering::SeqCst);
             p.restore(&dir, name.as_deref(), ip.as_deref(), paused, resources)
         }
         Start::Incoming { req } => {

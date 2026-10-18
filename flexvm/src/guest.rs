@@ -286,11 +286,24 @@ pub fn forks(uds: &Path) -> Result<usize> {
     Ok(m.strip_prefix("ok ").ok_or_else(|| refused("FORKS", m.as_bytes()))?.trim().parse()?)
 }
 
-pub fn start_app(uds: &Path) -> Result<u32> {
-    let reply = message(uds, "APP", TIMEOUT)?;
+/// `settings`: a run's (`vmproc::RunSpec::app_settings`), in app.conf's form; empty for the image's own.
+pub fn start_app(uds: &Path, settings: &str) -> Result<u32> {
+    let line = match settings {
+        "" => "APP".to_string(),
+        s => format!("APP {}", s.bytes().map(|b| format!("{b:02x}")).collect::<String>()),
+    };
+    let reply = message(uds, &line, TIMEOUT)?;
     match reply.strip_prefix("ok ") {
         Some(pid) => Ok(pid.trim().parse()?),
         None => bail!("starting the app: {}", reply.trim_start_matches("error: ")),
+    }
+}
+
+/// `kill -s`: `sig` to the app's process.
+pub fn signal_app(uds: &Path, sig: i32) -> Result<()> {
+    match message(uds, &format!("SIGNAL {sig}"), TIMEOUT)?.as_str() {
+        "ok" => Ok(()),
+        m => bail!("{}", m.trim_start_matches("error: ")),
     }
 }
 

@@ -877,9 +877,14 @@ impl Vm {
         res
     }
 
-    pub fn start_app(&self) -> Result<u32> {
+    pub fn start_app(&self, settings: &str) -> Result<u32> {
         self.running_here()?;
-        crate::guest::start_app(&self.vsock)
+        crate::guest::start_app(&self.vsock, settings)
+    }
+
+    pub fn signal_app(&self, sig: i32) -> Result<()> {
+        self.running_here()?;
+        crate::guest::signal_app(&self.vsock, sig)
     }
 
     pub fn untrack_exec(&self, id: u64) {

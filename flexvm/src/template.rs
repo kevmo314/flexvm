@@ -621,7 +621,7 @@ fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<Socket
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;
     if tpl.meta.image.as_ref().is_some_and(|i| i.starts_at_run()) {
-        guest::start_app(&fc.sockets.vsock)?;
+        guest::start_app(&fc.sockets.vsock, "")?;
     }
     // An exec records the session path's pages, so the first exec after a restore is fast;
     // an image with no shell can't run one, and an agent round trip stands in.

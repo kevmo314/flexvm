@@ -283,6 +283,8 @@ impl Proc {
                 // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
                 "plugged_mib": vm.hotplug_plugged(),
                 "resources": vm.resources(),
+                // What becomes of it once its app exits goes with it.
+                "spec": *self.spec.lock().unwrap(),
                 "regions": vm.pager.regions(),
                 // The MSRs its vmstate will hold: this host's, which may be more than the template's.
                 "msrs": msrs,
@@ -860,6 +862,7 @@ impl Proc {
         // Its caps move with it (the same template: they fit).
         // Refused before the source pauses: a capped VM never runs uncapped here.
         self.keep_resources(serde_json::from_value(req["resources"].clone()).unwrap_or_default())?;
+        *self.spec.lock().unwrap() = serde_json::from_value(req["spec"].clone()).unwrap_or_default();
         t.mark("template");
         going()?;
         // Admission, the record and the claim under one wait for the lock, which gives up in time.

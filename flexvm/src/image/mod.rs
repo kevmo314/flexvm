@@ -212,7 +212,7 @@ pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
 
 fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()> + Sync) -> Result<()> {
     let start = Instant::now();
-    guest::start_app(vsock)?;
+    guest::start_app(vsock, "")?;
     loop {
         stop()?;
         let left = meta.ready_timeout.saturating_sub(start.elapsed());
@@ -669,7 +669,7 @@ fn unpack_layers(root: &mut Root, img: &source::Image) -> Result<()> {
     Ok(())
 }
 
-fn escape(s: &str) -> String {
+pub fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n")
 }
 

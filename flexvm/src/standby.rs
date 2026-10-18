@@ -1,7 +1,7 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
 //! `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters) and holds
-//! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, generation}` with
+//! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, spec, tty, generation}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows. An
 //! `attached` claim (a foreground `run`'s, with its cgroup directory fd, which the VM joins) ends the
@@ -614,6 +614,10 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         }
         // Before it is published: eviction leaves a CMD VM alone.
         *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
+        // The claim's app settings are applied as it starts the app (`start_guest`).
+        *p.spec.lock().unwrap() = serde_json::from_value(req["spec"].clone()).unwrap_or_default();
+        p.tty.store(req["tty"] == json!(true), std::sync::atomic::Ordering::SeqCst);
+        p.attached.store(req["attached"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         match claim(p, &req) {
             Ok(v) => {
                 p.forget_stop();
@@ -676,6 +680,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             Err((e, retry)) => {
                 p.drop_ports();
                 *p.cmd.lock().unwrap() = None;
+                *p.spec.lock().unwrap() = crate::app::RunSpec::default();
                 // Nor its caps (`--memory` included): the next claim sets its own.
                 let _ = p.keep_resources(crate::vm::Resources::default());
                 let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": retry}));
@@ -721,6 +726,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     let resources: crate::vm::Resources = serde_json::from_value(req["resources"].clone()).map_err(|e| (format!("bad resources: {e}").into(), false))?;
     let tpl = p.standby.lock().unwrap().as_ref().map(|s| s.template()).ok_or_else(|| ("standby vm gone".into(), true))?;
     p.set_resources(resources, &tpl.meta).map_err(|e| (e, false))?;
+    p.spec.lock().unwrap().check(tpl.meta.image.as_ref()).map_err(|e| (e, false))?;
     // Taken ahead of any claim: every claim sets its cgroup's cap, `max` for none, so one an
     // earlier claim that failed set (after this point) never carries over to this VM.
     {
