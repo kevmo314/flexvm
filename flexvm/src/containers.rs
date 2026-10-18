@@ -381,6 +381,9 @@ pub fn renamed(name: &str) -> String {
     }
 }
 
+/// How long a running VM's rename waits for `op`.
+const RENAME_WAIT: Duration = Duration::from_secs(2);
+
 impl Proc {
     /// `rename` of this running VM, holding `op` (refused at once while a checkpoint, migration
     /// or suspend has it). Not while a migration's outcome or an arrival's pages are pending,
@@ -388,8 +391,15 @@ impl Proc {
     /// claim on the address (read by the name, `Host::held`) is the VM's under either name.
     pub fn rename(&self, to: &str) -> Result<Value> {
         let vm = self.vm();
-        let Some(_op) = self.op_now() else {
-            bail!("vm {} is busy (a checkpoint, migration or suspend is under way): try again once it is done", vm.name);
+        // A moment's holder (a start finishing, a resize) is waited out; a checkpoint, migration or
+        // suspend is refused, not waited for.
+        let deadline = Instant::now() + RENAME_WAIT;
+        let _op = loop {
+            match self.op_now() {
+                Some(op) => break op,
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                None => bail!("vm {} is busy (a checkpoint, migration or suspend is under way): try again once it is done", vm.name),
+            }
         };
         self.not_destroyed()?;
         let from = self.name();
