@@ -275,6 +275,20 @@ fn described(host: &Host, paths: &template::Paths, name: &str, mut v: Value) -> 
             }
         }
     }
+    // Its ports and run settings: a running VM's registry entry has them, a stopped one's
+    // checkpoint, an exited one's record (with what it ran, as `start` runs it again).
+    config["ports"] = v.get("ports").cloned().unwrap_or_else(|| json!([]));
+    config["run"] = v.get("spec").cloned().unwrap_or_else(|| json!({}));
+    if let Some(spec) = host.is_suspended(name).then(|| host.suspended(name).ok().and_then(|d| crate::lifecycle::read_spec(&d).ok())).flatten() {
+        config["run"] = json!(spec);
+    }
+    if let Some(e) = host.vms(name, "exited").ok().filter(|_| v["state"] == "exited").and_then(|p| crate::app::Exited::read(&p).ok()) {
+        config["image"] = json!(template::image_of(&e.template));
+        config["template"] = json!(e.template);
+        (config["ports"], config["run"], config["cmd"]) = (json!(e.ports), json!(e.spec), json!(e.cmd));
+        config["cpus"] = json!(e.resources.cpus);
+        v["exit_code"] = json!(e.status);
+    }
     if !running {
         if let Some(e) = exit_record(host, name) {
             v["exit_code"] = json!(e.code);
@@ -305,9 +319,13 @@ pub fn rename(host: &Host, from: &str, to: &str) -> Result<()> {
 /// are held throughout, so no start of either runs meanwhile; the directory and the claim move
 /// together under the host lock, so no sweep or claim sees one moved without the other.
 fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
+    let exited = |n: &str| host.vms(n, "exited").is_ok_and(|p| p.exists());
+    if !host.is_suspended(from) && exited(from) {
+        return rename_exited(host, from, to);
+    }
     if !host.is_suspended(from) {
         return Err(match ["failed", "lost"].iter().find(|ext| host.vms(from, ext).is_ok_and(|p| p.exists())) {
-            Some(ext) => format!("vm {from} is {ext}: only a running or stopped vm can be renamed").into(),
+            Some(ext) => format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed").into(),
             None => format!("no vm named {from:?}").into(),
         });
     }
@@ -349,6 +367,21 @@ fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
         }
         crate::util::unlink_durably(&journal)?;
     }
+    move_records(host, from, to)
+}
+
+/// An exited VM (`app::Exited`): no checkpoint or address claim, only its record (what `start`
+/// runs again), logs and exit status move, both names held.
+fn rename_exited(host: &Host, from: &str, to: &str) -> Result<()> {
+    let _from = host.take_name(from, true).map_err(|e| match host.alive(from) {
+        true => format!("vm {from} started meanwhile: try again").into(),
+        false => e,
+    })?;
+    if !host.vms(from, "exited")?.exists() || host.is_suspended(from) {
+        bail!("vm {from} changed meanwhile: try again");
+    }
+    // Refuses a `failed`, `lost` or `exited` record of `to`, and a stopped vm of it.
+    let _to = host.take_unrecorded_name(to)?;
     move_records(host, from, to)
 }
 
@@ -698,7 +731,10 @@ mod tests {
         assert!(f(&["name=web"]).matches(&web) && !f(&["name=web"]).matches(&db), "a part of the name");
         assert!(f(&["name=web", "name=db"]).matches(&db), "either value of one key");
         assert!(!f(&["name=web", "status=suspended"]).matches(&web), "both keys");
-        assert!(f(&["status=exited"]).matches(&db) && !f(&["status=exited"]).matches(&web));
+        assert!(f(&["status=stopped"]).matches(&db) && !f(&["status=stopped"]).matches(&web), "stopped: any state no process runs");
+        let job = json!({"name": "job", "state": "exited", "status": 3, "template": "ci"});
+        assert!(f(&["status=exited"]).matches(&job) && !f(&["status=exited"]).matches(&db), "exited: that state alone");
+        assert!(f(&["status=stopped"]).matches(&job));
         assert!(f(&["ip=10.0.0.3"]).matches(&db) && !f(&["ip=10.0.0.30"]).matches(&db));
         assert!(f(&["status=running"]).has_status() && !f(&["ip=1.2.3.4"]).has_status());
         for bad in ["name", "color=red", ""] {
@@ -895,6 +931,43 @@ mod tests {
         drop(l);
         assert!(rename_stopped(&host, "old", "other").unwrap_err().to_string().contains("no vm named"));
         assert!(rename_stopped(&host, "taken", "other").unwrap_err().to_string().contains("failed"));
+    }
+
+    /// An exited VM's record (`app::Exited`), as a background VM whose app exited leaves it.
+    fn exited_vm(host: &Host, name: &str, status: i32) {
+        let rec = crate::app::Exited {
+            status,
+            template: "ci".into(),
+            cmd: Some("make".into()),
+            resources: crate::vm::Resources::default(),
+            spec: crate::app::RunSpec { env: vec!["A=1".into()], keep: false, rm: false, ..Default::default() },
+            ports: vec!["127.0.0.1:8080:80".parse().unwrap()],
+            at: 1,
+        };
+        std::fs::write(host.vms(name, "exited").unwrap(), serde_json::to_vec(&rec).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_exited_vm_is_waited_logged_inspected_and_renamed() {
+        let (d, host) = host("exited");
+        exited_vm(&host, "job", 3);
+        std::fs::write(host.vms("job", "log").unwrap(), "out\n").unwrap();
+        assert_eq!(wait(&host, "job").unwrap(), 3, "its record's status, its own exit record gone");
+        assert!(known(&host, "job"), "logs reads (and follows) an exited vm's log");
+        let paths = template::Paths::new(&d.join("state"));
+        let listed = crate::vms(&host).into_iter().find(|v| v["name"] == "job").unwrap();
+        let v = described(&host, &paths, "job", listed);
+        assert_eq!((v["state"].as_str(), v["exit_code"].as_i64()), (Some("exited"), Some(3)), "{v}");
+        let c = &v["config"];
+        assert_eq!(c["ports"][0]["host_port"], 8080, "{c}");
+        assert_eq!((c["run"]["env"][0].as_str(), c["cmd"].as_str(), c["template"].as_str()), (Some("A=1"), Some("make"), Some("ci")), "{c}");
+        // A name an exited vm keeps is refused; renamed, its record, log and status move.
+        exited_vm(&host, "other", 0);
+        assert!(rename_stopped(&host, "job", "other").unwrap_err().to_string().contains("exited"));
+        rename_stopped(&host, "job", "job2").unwrap();
+        assert!(!host.vms("job", "exited").unwrap().exists() && crate::app::Exited::read(&host.vms("job2", "exited").unwrap()).unwrap().status == 3);
+        assert_eq!(std::fs::read_to_string(host.vms("job2", "log").unwrap()).unwrap(), "out\n");
+        assert!(host.vms("other", "exited").unwrap().exists(), "the refused name's record stays");
     }
 
     #[test]

@@ -130,15 +130,16 @@ flexvm inspect web db           # a JSON array: per VM, what ps --json says and 
 ```
 
 `--filter` keys are `name` (a part of it, as docker's), `status` (a state
-below, or `exited`/`stopped` for any of the last four; a status filter lists
-stopped VMs without `-a`), `image` (as `pull` took it, or its template name)
+below, as `exited`, or `stopped` for any no process runs; a status filter
+lists stopped and exited VMs without `-a`), `image` (as `pull` took it, or its template name)
 and `ip`. `--format` fields are `.Name`, `.IP`, `.Image`, `.State` (or
 `.Status`), `.PID`, `.CPUs`, `.VCPUs`, `.RSS`, `.MaxMiB`, `.Starved`,
 `.Template`, `.TemplateID` and `.Error`, any case; `{{json .}}` is the whole
 object; `\t` and `\n` are a tab and a newline. `inspect` adds `config` to
 what `ps --json` says of each VM: its image, template and the image's app,
-caps, its log, and its control socket (running) or checkpoint directory
-(stopped); a stopped one has its `exit_code` too. A name that is not a VM
+caps, ports (`ports`), run settings (`run`: `-e`, `--entrypoint`, `--keep`,
+`--rm`, `--ip`), its log, and its control socket (running) or checkpoint
+directory (stopped); a stopped or exited one has its `exit_code` too. A name that is not a VM
 fails `inspect` once the others are printed.
 
 | state | meaning |
@@ -214,8 +215,9 @@ flexvm logs -f web              # and follow it, until nothing of the VM is left
 
 `logs -f` reads on across rotations (it finishes the rotated log, then
 starts on the new one) and restarts (a VM started again appends to its log);
-it ends once the name has no VM left (`kill`, `rm`, a `run IMAGE CMD` that
-ended) or its reader is gone. A foreground VM's output is its terminal's, so
+it ends once the name has no VM left (`kill`, `rm`, a `--rm` VM's command
+or app that ended; an exited VM's log stays, to read, until `rm`) or its
+reader is gone. A foreground VM's output is its terminal's, so
 its log holds only what came after a closed terminal.
 
 ## Forward host ports
@@ -263,15 +265,15 @@ flexvm kill web                 # destroy a running VM (as SIGINT; Ctrl-C or Ctr
 flexvm kill -s HUP web          # send a signal (name or number) to its app instead
 flexvm rm web                   # remove a stopped VM (suspended, quarantined, exited, failed, lost)
 flexvm rm -f web                # destroy it, running or not
-flexvm restart web              # stop, then start (a stopped VM is started)
+flexvm restart web              # stop, then start (a stopped VM is started, an exited one run again)
 flexvm wait web                 # block until its process ends; print its exit status
 flexvm rename web web2          # a running or stopped VM
 ```
 
 `wait` takes several names and prints each one's status in turn: its
 process's (as `run`'s, below: 143 for a stop, 130 for a kill, 124 when it
-died, CMD's for a `run IMAGE CMD`), and at once for one with no process (a
-stopped VM: 143; `failed` or `lost`: 124). It needs no daemon: it waits on
+died, CMD's or the app's when it exits), and at once for one with no process
+(a stopped VM: 143; an exited one: its status; `failed` or `lost`: 124). It needs no daemon: it waits on
 a pidfd of the process holding the name, then reads `RUN/vms/NAME.exit`,
 which the VM's process writes as it ends; a process that ended without one
 (SIGKILLed) is an error. `rm` removes the record.
@@ -279,8 +281,9 @@ which the VM's process writes as it ends; a process that ended without one
 `rename` keeps everything but the name: a running VM's own process takes the
 new name (its registry entry, control socket, the claim on its address and
 its log move, and its command and execs go on under it); a stopped VM's
-checkpoint, address claim and logs move. It refuses a name in use (a VM,
-stopped or not, or a `failed` or `lost` record: `rm` that first), and a VM
+checkpoint, address claim and logs move; an exited VM's record (what `start`
+runs again) and logs move. It refuses a name in use (a VM,
+stopped or not, or an `exited`, `failed` or `lost` record: `rm` that first), and a VM
 that is checkpointing, migrating (either way, or still pulling its memory
 after an arrival), being stopped, or `failed` or `lost`. An `exec` started
 before keeps its stream, but cannot reattach (after a checkpoint or a stop)

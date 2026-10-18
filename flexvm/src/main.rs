@@ -84,14 +84,14 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      -f follows it, across rotations and restarts, until the VM is gone
   flexvm inspect NAME...             a JSON array: per VM, what ps --json says and its config
   flexvm wait NAME...                wait until each VM's process ends, and print its exit status
-                                     (a stopped one: 143; failed or lost: 124)
+                                     (a stopped one: 143; an exited one: its status; failed or lost: 124)
   flexvm stop NAME...                suspend a VM to disk, freeing its memory (as SIGTERM to its process)
   flexvm start [-a] NAME...          resume a stopped VM in the background (-a: in the foreground); an
                                      exited one runs again from its image (its writes were in its memory)
   flexvm pause NAME...               pause a VM's vCPUs, keeping its memory (as SIGTSTP; Ctrl-Z works too)
   flexvm unpause NAME...             resume a paused VM
-  flexvm restart NAME...             stop, then start a VM (a stopped one is started)
-  flexvm rename OLD NEW              rename a running or stopped VM (not while it checkpoints or migrates)
+  flexvm restart NAME...             stop, then start a VM (a stopped one is started, an exited one rerun)
+  flexvm rename OLD NEW              rename a running, stopped or exited VM (not while it checkpoints or migrates)
   flexvm kill NAME...                destroy a running VM (Ctrl-C or Ctrl-\\ in the foreground)
   flexvm kill -s SIGNAL NAME...      send SIGNAL (TERM, HUP, 9, ...) to the VM's app instead
   flexvm rm [-f] NAME...             remove a stopped VM (suspended, exited, failed or lost); -f: a running
@@ -603,7 +603,10 @@ fn real_main(args: &Args) -> Result<()> {
         Some("restart") => {
             let host = open_host(args)?;
             each(args.names(), |n| {
-                stop(&host, n)?;
+                // An exited VM has nothing to stop: `start` runs it again.
+                if host.alive(n) || !host.vms(n, "exited")?.exists() {
+                    stop(&host, n)?;
+                }
                 match resume(&host, n)? {
                     true => output(format_args!("{n}\n")),
                     false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?)?),

@@ -927,9 +927,10 @@ def port_forward():
 
 @case
 def containers():
-    """ps -q, --filter and --format; inspect; logs (-f, --tail); wait; restart; rename running and stopped."""
+    """ps -q, --filter and --format; inspect; logs (-f, --tail); wait; restart; rename running, stopped and exited."""
     vm, other, job = "e2e-ctr", "e2e-ctr-other", "e2e-ctr-job"
-    ip, ip2 = A.run(vm), A.run(other)
+    hp = A.port + 20100
+    ip, ip2 = A.run(vm), A.run_json(other, extra=["-e", "E2E_CTR=1", "-p", f"127.0.0.1:{hp}:80"])["ip"]
     names = lambda *argv: sorted(A.cli("ps", "-q", *argv).stdout.split())
     check("ps -q: names only", names() == sorted([vm, other]), names())
     check("ps --filter: name and ip both", names("--filter", f"name={vm}", "--filter", f"ip={ip}") == [vm])
@@ -949,9 +950,14 @@ def containers():
     cfg = got[0].get("config", {})
     check("inspect: its config", cfg.get("template") == args.template and cfg.get("log", "").endswith(f"/{vm}.log")
           and cfg.get("socket", "").endswith(f"/{vm}.sock"), cfg)
+    cfg = got[1].get("config", {})
+    check("inspect: its ports and run settings", [p.get("host_port") for p in cfg.get("ports", [])] == [hp]
+          and cfg.get("run", {}).get("env") == ["E2E_CTR=1"], cfg)
     r = A.cli("inspect", vm, "e2e-ctr-none", check=False)
     check("inspect: a missing name fails", r.returncode != 0 and [g["name"] for g in json.loads(r.stdout)] == [vm], (r.stdout, r.stderr))
-    # A command's VM: logs -f follows it to its end, wait prints its status.
+    # A command's VM: wait prints its status; it is then exited (listed, inspected, its log kept) until
+    # rm or start; restart runs it again; renamed, its record goes with it, and logs -f (which followed it
+    # across the rerun) ends with the name.
     A.vms.add(job)
     A.cli("run", "--name", job, "-d", args.template, "--", "for i in 1 2 3; do echo line$i; done; sleep 3; echo late; exit 3")
     follower = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "logs", "-f", job], stdout=subprocess.PIPE,
@@ -963,18 +969,34 @@ def containers():
         check("wait: blocks while the vm runs", waiter.poll() is None, waiter.poll() is not None and waiter.communicate())
         out, _ = waiter.communicate(timeout=120)
         check("wait: the command's status", out == "3\n", repr(out))
+        check("ps --filter status=exited: the exited vm alone", names("--filter", "status=exited") == [job], A.ps().get(job))
+        got = json.loads(A.cli("inspect", job).stdout)[0]
+        check("inspect: an exited vm, its status and what it ran", got.get("state") == "exited" and got.get("exit_code") == 3
+              and "exit 3" in (got.get("config", {}).get("cmd") or ""), got)
+        log = A.cli("logs", job).stdout
+        check("logs: an exited vm's whole log", "line1\nline2\nline3\n" in log and "late\n" in log, repr(log))
+        tail = A.cli("logs", "--tail", "2", job).stdout
+        check("logs --tail 2: its last two lines", tail == "\n".join(log.splitlines()[-2:]) + "\n" and len(tail.splitlines()) == 2, (tail, log))
+        check("wait: again, its last status", A.cli("wait", job).stdout == "3\n")
+        check("logs -f: still following an exited vm", follower.poll() is None)
+        A.cli("restart", job, timeout=240)
+        check("restart: an exited vm runs again", A.ps().get(job, {}).get("state") in ("running", "exited"), A.ps().get(job))
+        check("wait: the rerun's status", A.cli("wait", job, timeout=120).stdout == "3\n")
+        renamed_job = job + "-renamed"
+        A.vms.add(renamed_job)
+        check("rename: an exited vm", A.cli("rename", job, renamed_job).stdout == renamed_job + "\n")
+        vms = A.ps()
+        check("rename: exited, listed under its new name", job not in vms and vms.get(renamed_job, {}).get("state") == "exited", vms)
+        check("rename: an exited vm's status goes with it", A.cli("wait", renamed_job).stdout == "3\n")
         out, err = follower.communicate(timeout=30)
-        check("logs -f: followed it to its end", all(f"line{i}\n" in out for i in (1, 2, 3)) and "late\n" in out, (out, err))
+        check("logs -f: followed both runs, until the name went", out.count("line1\n") == 2 and out.count("late\n") == 2, (out, err))
+        check("logs: under the new name", A.cli("logs", renamed_job).stdout.count("late\n") == 2)
+        A.rm(renamed_job)
     finally:
         for p in (follower, waiter):
             if p and p.poll() is None:
                 p.kill()
                 p.wait()
-    log = A.cli("logs", job).stdout
-    check("logs: the whole log", "line1\nline2\nline3\n" in log, repr(log))
-    tail = A.cli("logs", "--tail", "2", job).stdout
-    check("logs --tail 2: its last two lines", tail == "\n".join(log.splitlines()[-2:]) + "\n" and len(tail.splitlines()) == 2, (tail, log))
-    check("wait: again, its last status", A.cli("wait", job).stdout == "3\n")
     # wait on a stop: 143, as SIGTERM's; a stopped vm's at once.
     waiter = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "wait", other], stdout=subprocess.PIPE, text=True)
     time.sleep(0.5)
