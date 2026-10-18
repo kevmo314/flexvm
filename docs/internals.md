@@ -1253,14 +1253,23 @@ retrying SESSION with the same ID and command attaches to the existing process
 from offset zero. Reusing an ID for another command fails. IDs contain up to
 64 ASCII letters, digits, underscores or hyphens; commands are at most 1 MiB.
 
-Frames retain `[kind u8][payload length u32 LE][payload]`. SESSION and ATTACH
+`ARGV <id> <len>\n` starts an exec without a shell, with exactly `len` body
+bytes. Its body has NUL-terminated fields, each a tag byte followed by its
+value: `a` an argument (in order, including empty arguments), `e` an environment
+entry (`K=V`), `w` the working directory, `u` `USER[:GROUP]`, `d` detach,
+`i` client stdin, `t` a pty, and `s` its initial size (`ROWS COLS`). The `d`,
+`i` and `t` fields have no value. IDs, retries and body limits work as for SESSION.
+
+Frames retain `[kind u8][payload length u32 LE][payload]`. SESSION, ARGV and ATTACH
 first return kind 4 with the session ID. A session has at most one attachment
-(connection streaming its output): SESSION or ATTACH replaces it, and the guest
+(connection streaming its output): SESSION, ARGV or ATTACH replaces it, and the guest
 shuts the previous connection down, so its stream just ends. Session stdout/stderr (kinds 1/2)
 prefix their bytes with an absolute `u64 LE` offset in the combined output
 stream. Kind 3 contains the final `u64 LE` offset and `i32 LE` exit code.
 Kind 5 contains the earliest retained `u64 LE` offset and reports output loss;
-clients must not silently skip it. Kind 4 also carries `waiting` heartbeats,
+clients must not silently skip it. Kind 6 acknowledges the stdin bytes taken
+so far (`u64 LE`); the client drops those bytes and resends from that offset
+after reattachment. Kind 4 also carries `waiting` heartbeats,
 `error: ...` failures, or `closed` for CLOSE. Socket writes happen outside the
 output ring mutex. Reading an exit does not discard it: after receiving an
 exec's exit, the CLI sends the one-byte `SESSION_DONE` (`d`) on the attachment.
@@ -1269,6 +1278,14 @@ if acknowledged; otherwise the exit stays available for reattachment. A VM's
 main command leaves its session open so it can be reattached after a suspend.
 Closed sessions retain the ID as a tombstone until expiry so a delayed
 creation retry cannot execute the command again.
+
+Interactive input uses the same frame layout on the session connection after
+the request, or on an `APPIN` connection. `IN_DATA` (kind 1) carries a `u64 LE`
+stdin offset followed by at most 32 KiB of data; the guest takes bytes once,
+in order, skipping bytes already taken on a resend. `IN_EOF` (kind 2) carries
+the `u64 LE` offset where stdin ends. `IN_RESIZE` (kind 3) carries rows and
+columns (`u16 LE` each). `IN_DETACH` (kind 4) leaves an exec running detached.
+The client may still send the one-byte `SESSION_DONE` after exit.
 
 At most 64 sessions are running or still sending output; another SESSION fails
 with `error: too many sessions: ...`. Once an exit is sent, its session counts

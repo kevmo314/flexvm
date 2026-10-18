@@ -44,9 +44,11 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   (auth.docker.io for Docker Hub); redirects to blob storage carry none.
 - **Root filesystem.** Layers are applied in order as root, with whiteouts and
   opaque directories, ownership, modes, xattrs, device nodes, symlinks and
-  hard links. Every path resolves inside the image (`openat2(RESOLVE_IN_ROOT)`),
-  so absolute symlinks behave as in a container and a layer cannot write
-  outside it; whiteouts must name one entry, and removal walks directory fds.
+  hard links. A file capability or POSIX ACL that cannot be set fails the pull;
+  another xattr that cannot be set is logged and dropped. Every path resolves
+  inside the image (`openat2(RESOLVE_IN_ROOT)`), so absolute symlinks behave
+  as in a container and a layer cannot write outside it; whiteouts must name
+  one entry, and removal walks directory fds.
   Layers are unpacked in `STATE/staging` (default `/var/lib/flexvm/staging`),
   which must be root-owned and 0700 with an ancestry only root can change, and
   is used through a descriptor, so other users can neither reach the image's

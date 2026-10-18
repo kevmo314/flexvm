@@ -223,12 +223,14 @@ fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()> +
             Some(Ready::Cmd(c)) => guest::check(vsock, c, left.max(Duration::from_millis(100)), &stop)?,
             None => true,
         };
-        if ready {
+        // Ready counts only for a running app; a check that ends past the deadline still counts.
+        let status = guest::app_status(vsock)?;
+        let running = status.starts_with("running ");
+        if ready && running {
             crate::log!("image: app ready after {} ms", ms(start.elapsed()));
             return Ok(());
         }
-        let status = guest::app_status(vsock)?;
-        if status.starts_with("exited") || start.elapsed() > meta.ready_timeout {
+        if !running || start.elapsed() > meta.ready_timeout {
             let logs = read_logs(vsock, Instant::now() + LOGS_TIMEOUT, &stop)?;
             let tail = String::from_utf8_lossy(&logs[logs.len().saturating_sub(4096)..]).into_owned();
             bail!("app not ready ({:?}) after {} ms, status {status}; its output:\n{tail}", meta.ready, ms(start.elapsed()));
@@ -765,6 +767,78 @@ mod tests {
 
     fn read(p: impl AsRef<Path>) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn warm_readiness_requires_a_running_app_before_the_deadline() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        for (status, timeout, ok) in [
+            ("exited 0", Duration::from_secs(5), false),
+            ("idle", Duration::from_secs(5), false),
+            ("running 1", Duration::ZERO, true),
+            ("running 1", Duration::from_secs(5), true),
+        ] {
+            let dir = tmpdir("warm-status");
+            let path = dir.join("vsock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let meta = ImageMeta {
+                source: String::new(),
+                digest: String::new(),
+                config_digest: String::new(),
+                app_conf: String::new(),
+                argv: vec![],
+                warm: true,
+                ready: Some(Ready::Cmd("true".into())),
+                ready_timeout: timeout,
+            };
+            std::thread::scope(|scope| {
+                let server = scope.spawn(|| {
+                    for request in 0..if ok { 3 } else { 4 } {
+                        let (stream, _) = listener.accept().unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut r = BufReader::new(stream);
+                        let mut line = String::new();
+                        r.read_line(&mut line).unwrap();
+                        assert_eq!(line, format!("CONNECT {}\n", guest::PORT));
+                        line.clear();
+                        r.read_line(&mut line).unwrap();
+                        let reply = match request {
+                            0 => {
+                                assert_eq!(line, "APP\n");
+                                "ok 1"
+                            }
+                            1 => {
+                                assert!(line.starts_with("CHECK "));
+                                "ok"
+                            }
+                            2 => {
+                                assert_eq!(line, "APPSTATUS\n");
+                                status
+                            }
+                            _ => {
+                                assert!(line.starts_with("LOGS "));
+                                "done"
+                            }
+                        };
+                        r.get_mut().write_all(b"OK 1\n").unwrap();
+                        if request == 3 {
+                            guest::write_frame(r.get_mut(), guest::FRAME_STDOUT, b"app output").unwrap();
+                        }
+                        guest::write_frame(r.get_mut(), guest::FRAME_MSG, reply.as_bytes()).unwrap();
+                    }
+                });
+                let result = warm_up_until(&path, &meta, || Ok(()));
+                if ok {
+                    result.unwrap();
+                } else {
+                    let e = result.unwrap_err().to_string();
+                    assert!(e.contains(status) && e.contains("app output"), "{e}");
+                }
+                server.join().unwrap();
+            });
+        }
     }
 
     #[test]

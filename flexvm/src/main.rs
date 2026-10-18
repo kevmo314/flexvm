@@ -660,8 +660,8 @@ fn real_main(args: &Args) -> Result<()> {
             // Before any thread that would take these signals is started.
             util::on_signal(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP], |sig| util::raise_signal(sig));
             let mut host = open_host(args)?;
-            let listener = configure_listener(&mut host, pos.get(1).copied(), listen::activated())?;
-            listen::main(host, listener)
+            let (listener, validated) = configure_listener(&mut host, pos.get(1).copied(), listen::activated())?;
+            listen::main(host, listener, validated)
         }
         Some("info") => print(info(&open_host(args)?)),
         Some("bench") => bench::run(args),
@@ -718,7 +718,7 @@ fn info(host: &Host) -> Value {
 }
 
 /// Bind and validate before publishing any host configuration.
-fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std::net::TcpListener>) -> Result<std::net::TcpListener> {
+fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std::net::TcpListener>) -> Result<(std::net::TcpListener, listen::Cached)> {
     let mut listener = None;
     host.configure(|c| {
         if let Some(a) = addr {
@@ -739,8 +739,8 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
                 std::net::TcpListener::bind(addr).map_err(|e| format!("listen on {addr}: {e}"))?
             }
         };
-        listen::validate(&bound, c)?;
-        listener = Some(bound);
+        let validated = listen::validate(&bound, c)?;
+        listener = Some((bound, validated));
         Ok(())
     })?;
     for warning in host.cfg.warnings() {

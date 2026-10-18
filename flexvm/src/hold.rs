@@ -755,17 +755,22 @@ impl Injector {
     }
 
     pub fn send(&self, packet: &[u8]) -> bool {
-        let frame = [&self.header[..], packet].concat();
         let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         addr.sll_family = libc::AF_PACKET as u16;
         addr.sll_ifindex = self.ifindex as i32;
         addr.sll_protocol = 0x0800u16.to_be();
         addr.sll_halen = 6;
         addr.sll_addr[..6].copy_from_slice(&self.header[..6]);
-        let size = std::mem::size_of::<libc::sockaddr_ll>() as u32;
-        unsafe {
-            libc::sendto(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT, (&addr as *const libc::sockaddr_ll).cast(), size) >= 0
-        }
+        let mut iov = [
+            libc::iovec { iov_base: self.header.as_ptr().cast_mut().cast(), iov_len: self.header.len() },
+            libc::iovec { iov_base: packet.as_ptr().cast_mut().cast(), iov_len: packet.len() },
+        ];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = (&mut addr as *mut libc::sockaddr_ll).cast();
+        msg.msg_namelen = std::mem::size_of_val(&addr) as u32;
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = iov.len();
+        unsafe { libc::sendmsg(self.fd.as_raw_fd(), &msg, libc::MSG_DONTWAIT) == (self.header.len() + packet.len()) as isize }
     }
 
     /// Dropped by the tap since this was made (with the guest's own traffic): reported with the injected packets.
@@ -996,6 +1001,23 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injector_sends_header_and_payload_in_order() {
+        // An established TCP socket ignores the destination address; no raw socket privilege needed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let injector = Injector { fd: stream.into(), tap: String::new(), ifindex: 0, header: [7; 14], tx_dropped: 0 };
+        for packet in [b"".as_slice(), b"payload", &[42; 1500]] {
+            assert!(injector.send(packet));
+            let mut frame = vec![0; 14 + packet.len()];
+            peer.read_exact(&mut frame).unwrap();
+            assert_eq!(&frame[..14], &injector.header);
+            assert_eq!(&frame[14..], packet);
+        }
+    }
 
     /// Reading `tun`, with no routes or raw socket: nothing here needs root.
     fn holder(tun: OwnedFd) -> Holder {

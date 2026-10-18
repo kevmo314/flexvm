@@ -343,13 +343,8 @@ impl Transport for PeerTcp {
         Ok(n > 0)
     }
 
-    /// Open while nothing is waiting to be read and the peer has not hung up.
     fn is_open(&mut self) -> bool {
-        if self.stream.set_nonblocking(true).is_err() {
-            return false;
-        }
-        let idle = matches!(self.stream.read(&mut [0]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
-        self.stream.set_nonblocking(false).is_ok() && idle
+        false
     }
 }
 
@@ -579,6 +574,7 @@ pub struct Registry {
 }
 
 impl Registry {
+    #[cfg(test)]
     pub fn new(r: Reference) -> Registry {
         // Credentials only ever travel over TLS.
         let base = r.base_url();
@@ -594,14 +590,12 @@ impl Registry {
 
     /// Probe the registry API with the supplied credentials, including its token exchange.
     pub fn verify(registry: &str, basic: &str) -> Result<()> {
-        let mut reg = Self::new(Reference::parse(&format!("{registry}/login"))?);
-        if !reg.base.starts_with("https://") {
+        let mut r = Reference::parse(&format!("{registry}/login"))?;
+        if !r.base_url().starts_with("https://") {
             bail!("login requires HTTPS; credentials never travel over plain HTTP");
         }
-        reg.r.repository.clear();
-        reg.base = format!("https://{registry}/v2");
-        reg.basic = Some(basic.into());
-        *reg.auth.lock().unwrap() = Some(format!("Basic {basic}").into());
+        r.repository.clear();
+        let reg = Registry { r, base: format!("https://{registry}/v2"), basic: Some(basic.into()), auth: Mutex::new(Some(format!("Basic {basic}").into())) };
         reg.get_inner("", "application/json", Instant::now() + Duration::from_secs(30), false)?;
         Ok(())
     }
