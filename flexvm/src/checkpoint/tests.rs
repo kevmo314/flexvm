@@ -744,6 +744,11 @@ fn template_users_count_every_suspended_vm() {
     assert!(host.alive("b"));
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222"].map(String::from).into();
     assert_eq!(host.template_users(), want);
+    // flexvm's own checkpoints (#775) keep theirs; a directory there without one is no checkpoint.
+    link(&host.state.join("checkpoints/ck1"), None, |m| m.template_id = "dddd4444".into());
+    fs::create_dir_all(host.state.join("checkpoints/.staging")).unwrap();
+    let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222", "dddd4444"].map(String::from).into();
+    assert_eq!(host.template_users(), want);
 }
 
 #[test]

@@ -776,10 +776,16 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   locked (a build's staging and publication stay in it whatever its path
   names meanwhile). A pull that would build the same template again (same
   image manifest, app, root filesystem, sizes, build recipe, kernel and
-  Firecracker; `template::up_to_date`) publishes nothing. Pulls never delete
-  a generation: VMs, migrations, standby VMs and checkpoints refer to them
-  by content id. Standby VMs of an older generation exit; running VMs keep
-  theirs. An incoming migration uses the generation with the source's
+  Firecracker; `template::up_to_date`) publishes nothing. VMs, migrations,
+  standby VMs and checkpoints refer to generations by content id. Standby VMs
+  of an older generation exit; running VMs keep theirs. A pull that moved a
+  name waits a few seconds for those standby VMs, then deletes the generation
+  the name linked to before as `image prune` would (`template::prune` of that
+  id alone), unless the templates directory is shared: a state whose
+  `templates` is a link marks its target `.shared` when opened
+  (`template::note_shared`, under the templates lock, which the pull's
+  decision holds exclusively), since its suspended VMs hold no lock the
+  owner could see. An incoming migration uses the generation with the source's
   content id if the host has it. `flexvm rmi` removes a name and the
   generation and root filesystem nothing uses any more: see below.
 - **Image removal: users and locks.** What uses a template generation
@@ -808,10 +814,11 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   - An incoming migration: the target's process, from opening the source's
     content id (`open_id`) until it is a running VM.
   - A checkpoint restore: the restoring process, from `open_id`. A checkpoint
-    at rest (`checkpoint`, `checkpoint --stop`) does not keep its generation:
-    like an exported image it names it by content id, and restoring it after
-    `rmi` fails until the image is pulled again (the same inputs make the same
-    content id).
+    at rest (`checkpoint`, `checkpoint --stop`) does not keep its generation
+    unless it is in `STATE/checkpoints` (flexvm's own, #775: any manifest
+    there, `checkpoint::managed`, read with the VM records): elsewhere, like
+    an exported image, it names it by content id, and restoring it after `rmi`,
+    `image prune` or a rebuilding pull fails.
   - A suspended VM: no process, only its record, the published checkpoint in
     `STATE/suspended/NAME` (a manifest, neither STARTED nor DISCARDED) whose
     manifest names the content id. A suspend publishes it before its process
@@ -833,8 +840,9 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     sweep removes.
 
   The locks, in the order they are taken:
-  1. The templates lock (`templates-DEV-INO`): exclusive for `rmi` and
-     sweeps, shared while a build makes its staging directory and publishes,
+  1. The templates lock (`templates-DEV-INO`): exclusive for `rmi`, sweeps
+     and publication (which reads the link it replaces), shared while a build
+     makes its staging directory,
      and while `standby::set` checks the name and writes its count. `set` drops
      it before refilling. `rmi` takes the pool's refill lock before it and
      holds that throughout, so no refill starts a standby between its snapshot

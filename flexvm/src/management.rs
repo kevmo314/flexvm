@@ -143,7 +143,7 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
             }
         }
     }
-    for removed in crate::template::prune(&paths, &|| host.template_users())? {
+    for removed in crate::template::prune(&paths, None, &|| host.template_users())? {
         crate::print(removed)?;
     }
     if system {

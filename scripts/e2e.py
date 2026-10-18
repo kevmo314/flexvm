@@ -1751,6 +1751,61 @@ def image_template():
 
 
 @case
+def pull_gc():
+    """pull: a rebuild deletes the generation it superseded, unless a stopped VM or a checkpoint here still uses it."""
+    # A host of its own (no listener), with its own templates: A's and B's are shared, which keeps them all.
+    h = Host("gc", args.port_a, args.port_a + 1, args.net_a)
+    os.makedirs(h.run_dir)
+    os.makedirs(h.state_dir)
+    os.symlink(ARTIFACTS, os.path.join(h.state_dir, "artifacts"))
+    h.configure(vm_ips=f"{args.net_a}.200-{args.net_a}.220", reserve_mib=256)
+    name, vm = "e2e-gc", "e2e-gc"
+
+    def pull(n):
+        """Rebuilt (another --env); returns the ids it deleted."""
+        r = h.cli("pull", TEST_IMAGE, "--tag", name, "--vcpus", "2", "--max", "2048", "--env", f"GC={n}", timeout=600)
+        return [json.loads(line)["deleted"] for line in r.stdout.splitlines() if line.startswith("{")]
+
+    def images():
+        return {v["id"]: v["name"] for v in json.loads(h.cli("images", "--json").stdout)}
+
+    def current():
+        return next(i for i, n in images().items() if n == name)
+
+    def prune():
+        return h.cli("image", "prune", "-f").stdout
+    try:
+        pull(1)
+        first = current()
+        deleted = pull(2)
+        second = current()
+        check("rebuild: the superseded generation is deleted", deleted == [first] and first not in images(), (first, deleted, images()))
+        h.run(vm, template=name)
+        h.suspend(vm)
+        deleted = pull(3)
+        check("rebuild: a stopped VM's generation stays", deleted == [] and images().get(second, "missing") is None, (second, deleted, images()))
+        h.rm(vm)
+        out = prune()
+        check("prune: collected once free", second in out and second not in images(), (second, out))
+        # A checkpoint in STATE/checkpoints (flexvm's own, #775) keeps its generation too.
+        third = current()
+        h.run(vm, template=name)
+        managed = os.path.join(h.state_dir, "checkpoints")
+        os.makedirs(managed)
+        h.checkpoint(vm, os.path.join(managed, "gc"), stop=True)
+        deleted = pull(4)
+        check("rebuild: a checkpoint's generation stays", deleted == [] and images().get(third, "missing") is None, (third, deleted, images()))
+        shutil.rmtree(managed)
+        out = prune()
+        check("prune: collected once its checkpoint is gone", third in out and third not in images(), (third, out))
+        h.cli("rmi", name)
+        check("rmi: nothing left", not images(), images())
+    finally:
+        for v in h.ps():
+            h.rm(v, force=True, check=False)
+
+
+@case
 def faults():
     """The selected scripts/faults.py scenarios against the same two hosts."""
     if not args.faults.split():
@@ -1889,7 +1944,7 @@ COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "f
         "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
         "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
-        "faults/resume_suspending": 16, "image_template": 15, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
+        "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
         "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
         "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,
@@ -2049,7 +2104,7 @@ def main():
         cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker", "--lane", str(i), "--bin", BIN,
                "--state", args.state, "--log-dir", os.path.join(args.log_dir, f"lane-{label}"),
                "--port-a", str(port), "--net-a", net_a, "--net-b", net_b, "--tag", args.tag,
-               "--template", args.template, "--templates", TEMPLATES, "--image", args.image, "--results", res,
+               "--template", args.template, "--templates", TEMPLATES, "--test-image", TEST_IMAGE, "--image", args.image, "--results", res,
                *(["--image-cache", os.path.abspath(args.image_cache)] if args.image_cache else []),
                "--faults", " ".join(scens), *(["--no-image"] if args.no_image else []),
                *(["--own-listeners"] if any(own(c) for c in batch) else []), *(["--no-skips"] if args.no_skips else []),

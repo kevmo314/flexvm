@@ -1472,12 +1472,19 @@ fn pull(args: &Args, src: &str) -> Result<()> {
         // Held until the template is published: `rmi` leaves the root filesystem to this build.
         let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
         if let Some(id) = template::up_to_date(&paths, &name, size, &rootfs, &meta) {
-            return output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)));
+            output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)))?;
+            return Ok(None);
         }
         template::create(&paths, &name, size, &rootfs, meta, &tap)
     })();
     net::delete_tap(&tap);
-    res?;
+    // The generation the name linked to before, unless a VM here (or another name) still uses it.
+    if let Some(old) = res? {
+        standby::superseded(&host, &name);
+        for removed in template::prune(&paths, Some(&old), &|| host.template_users())? {
+            output(format_args!("{removed}\n"))?;
+        }
+    }
     match standby {
         // Kept per image (`STATE/standby/NAME`): refilled now, and by every listener and VM process.
         Some(n) => print(standby::set(&host, &name, n)?),

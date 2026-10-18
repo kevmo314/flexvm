@@ -23,6 +23,12 @@ pub use format::{Canon, FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL};
 pub use staging::{CommitError, Staging};
 pub(crate) use write::{Buf, GuestPages};
 
+/// The checkpoints flexvm keeps itself (`STATE/checkpoints/ID`, #775): their generations stay
+/// (`Host::template_users`). None while the directory is missing.
+pub fn managed(state: &std::path::Path) -> impl Iterator<Item = (std::path::PathBuf, Manifest)> {
+    std::fs::read_dir(state.join("checkpoints")).into_iter().flatten().flatten().filter_map(|e| Some((e.path(), read_manifest(&e.path()).ok()?)))
+}
+
 fn create_at(dir: RawFd, name: &str) -> io::Result<File> {
     openat(dir, &cname(name), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW).map(File::from)
 }

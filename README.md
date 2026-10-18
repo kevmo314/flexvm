@@ -671,24 +671,33 @@ unnamed or named generations and combines with the reference filters.
 **Pulling again** asks the registry again. If the image (its manifest), the
 options, the sizes, the kernel, Firecracker and flexvm's build recipe are the
 same, the template is up to date and nothing is built. Otherwise (a tag that
-moved, say) a new template generation is built and the name moves to it:
-running and suspended VMs, checkpoints and migrations of the old one keep
-using it (they name it by content id), and standby VMs of the old one are
-replaced from the new. The old generation stays, listed as `<none>` by
-`images`, until `flexvm rmi ID` removes it.
+moved, say) a new template generation is built and the name moves to it.
+Standby VMs of the old one are replaced from the new, and the pull deletes the
+old generation and the root filesystem only it used, printing what it removed
+(as `image prune` does), unless another name links to it or a VM here
+(running, paused, stopped, standby, or migrating in or out) or a checkpoint in
+`STATE/checkpoints` uses it. Those name it by content id, so it stays for
+them, listed as `<none>` by `images`, until `image prune` or `rmi ID` removes
+it once they are gone. Checkpoints written to other directories (`flexvm
+checkpoint VM DIR`) are not tracked, as with `image prune`: once their
+generation is deleted they cannot be restored here (managed checkpoints, #775,
+replace them). Nor can VMs of it elsewhere migrate here. A templates directory
+that other states link to (see Paths and knobs) may hold generations their VMs
+use, so pulls through it leave the old generation to `image prune`.
 
 **Removing.** `rmi IMAGE` removes the name and, unless a VM here still uses
 them, its generation and its root filesystem (`images/rootfs/`); `rmi ID` (or
 a unique prefix of it) removes a `<none>` generation. Both are refused while a
 VM here (running, paused or stopped) uses the image; `rmi IMAGE` sets its
-standby count to 0 and waits for its standby VMs to go first. Checkpoints elsewhere that pin a removed
-generation cannot be restored here any more. Layer blobs (`images/blobs/`)
+standby count to 0 and waits for its standby VMs to go first. Checkpoints in
+other directories than `STATE/checkpoints` that pin a removed generation cannot
+be restored here any more. Layer blobs (`images/blobs/`)
 are a download cache and stay until `system prune`.
 
 `image prune` removes each `<none>` generation as `rmi ID` would: those a
-VM here uses (running, paused, standby or stopped) stay, and, as with `rmi`,
-checkpoints elsewhere that pin a pruned generation cannot be restored here any
-more. `system prune` also removes failed and lost VM records and the layer
+VM here (running, paused, standby or stopped) or a checkpoint in
+`STATE/checkpoints` uses stay, and, as with `rmi`, checkpoints elsewhere that
+pin a pruned generation cannot be restored here any more. `system prune` also removes failed and lost VM records and the layer
 blob cache (left alone while a pull runs). Both list what they remove and the
 bytes reclaimed, and ask first on a terminal; without one they need `-f`.
 `system df` reports allocated bytes for image root filesystems, templates,
@@ -741,7 +750,10 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 `pull` writes the flexvm-init built into flexvm into the image as PID 1 (`--init PATH`
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
-host's. On first open, each state directory permanently records its canonical run
+host's. A state whose `templates` is a link marks its target shared when opened, and
+pulls through a shared one leave old generations to `image prune` (see Images);
+after upgrading to this release, run a command with each such state (`flexvm --state S
+ps`) before pulling, or a stopped VM there may lose its generation. On first open, each state directory permanently records its canonical run
 path in `run.json`, and the run directory records its state in `state.json`; using
 either with a different partner is refused. Without `--run`, the run directory follows
 from the state's path alone (`/run/flexvm` for `/var/lib/flexvm`, `/run/flexvm-PREFIX` for
