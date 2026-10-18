@@ -3011,6 +3011,16 @@ impl Host {
                 }
                 continue;
             }
+            // A withdrawal recorded before a failed release leaves a non-current claim.
+            if !a.current(gen) {
+                if self.dead_and_reaped(&a, true) {
+                    if let Err(e) = self.release(&l, ip, name, a.holder_id.as_ref()) {
+                        crate::log!("letting go of {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
+                        unrecorded.get_or_insert(e);
+                    }
+                }
+                continue;
+            }
             if !self.died_holding(&a, ip, &pulling, &released) {
                 continue;
             }
@@ -3025,7 +3035,10 @@ impl Host {
                 continue;
             }
             crate::log!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
-            let _ = self.release(&l, ip, name, a.holder_id.as_ref());
+            if let Err(e) = self.release(&l, ip, name, a.holder_id.as_ref()) {
+                crate::log!("letting go of {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
+                unrecorded.get_or_insert(e);
+            }
             crate::net::unroute(ip);
             withdrawn.push((name.to_string(), ip, gen));
         }
@@ -5308,6 +5321,38 @@ pub(crate) mod tests {
             h.collect_garbage_with(false).unwrap();
             assert!(h.addr(&h.lock().unwrap(), x).unwrap().holder.is_none(), "{case}: retried");
         }
+    }
+
+    #[test]
+    fn gc_reports_failed_release_after_withdrawal_and_retries_it() {
+        let (_dir, mut h) = host("release-withdrawn");
+        h.cfg.peers = vec!["peer".into()];
+        let (x, y) = (ip("10.9.1.1"), ip("10.9.1.2"));
+        let gone = dead_owner(&h, 999_999_951, &[]);
+        let a = Addr { seen: 4, held: 4, holder: Some("failed".into()), holder_id: Some(gone.clone()), ..Addr::default() };
+        h.put_addr(x, &a, false).unwrap();
+        h.put_addr(y, &Addr { holder: Some("healthy".into()), holder_id: Some(gone), ..a.clone() }, false).unwrap();
+        // The state left when the notice and withdrawal succeed but releasing the claim fails.
+        let l = h.lock().unwrap();
+        h.withdraw_noted(&l, x, 4).unwrap();
+        let a = h.addr(&l, x).unwrap();
+        assert!(a.withdrawn && a.holder.is_some() && h.notice_path(x).exists(), "{a:?}");
+        drop(l);
+        let path = h.addr_path(x);
+        let blocked = path.with_file_name(format!(".{}.{}.tmp", path.file_name().unwrap().to_str().unwrap(), crate::util::write_tag()));
+        std::fs::create_dir(&blocked).unwrap();
+        for _ in 0..2 {
+            let error = h.collect_garbage_with(false).unwrap_err().to_string();
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            let l = h.lock().unwrap();
+            assert_eq!(h.addr(&l, x).unwrap(), a, "failed release keeps its claim");
+            let other = h.addr(&l, y).unwrap();
+            assert!(other.withdrawn && other.holder.is_none(), "sweep continues after errors: {other:?}");
+        }
+        std::fs::remove_dir(&blocked).unwrap();
+        h.collect_garbage_with(false).unwrap();
+        let a = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(a.withdrawn && a.holder.is_none() && a.holder_id.is_none(), "retried: {a:?}");
     }
 
     #[test]
