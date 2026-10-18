@@ -49,12 +49,12 @@ impl Buf {
     }
 
     fn pages(&self) -> usize {
-        self.0.len / PAGE_SIZE
+        self.0.len() / PAGE_SIZE
     }
 
     fn page(&self, i: usize) -> &[u8] {
         assert!(i < self.pages());
-        unsafe { std::slice::from_raw_parts(self.0.ptr.add(i * PAGE_SIZE), PAGE_SIZE) }
+        unsafe { std::slice::from_raw_parts(self.0.ptr().add(i * PAGE_SIZE), PAGE_SIZE) }
     }
 }
 
@@ -232,7 +232,7 @@ fn copy(
     let work = || loop {
         let Some(&(a, b)) = runs.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
         // Each run is taken once: its part of `buf` is written by this thread only.
-        let dst = unsafe { std::slice::from_raw_parts_mut(buf.0.ptr.add(a * PAGE_SIZE), (b - a) * PAGE_SIZE) };
+        let dst = unsafe { std::slice::from_raw_parts_mut(buf.0.ptr().add(a * PAGE_SIZE), (b - a) * PAGE_SIZE) };
         if let Err(e) = read(hot[a], dst) {
             *failed.lock().unwrap() = Some(e);
             return;
@@ -278,7 +278,7 @@ impl Held {
     pub fn of(pages: &[(usize, u8)]) -> Held {
         let buf = Buf::new(pages.len()).unwrap();
         for (i, &(_, b)) in pages.iter().enumerate() {
-            unsafe { std::ptr::write_bytes(buf.0.ptr.add(i * PAGE_SIZE), b, PAGE_SIZE) };
+            unsafe { std::ptr::write_bytes(buf.0.ptr().add(i * PAGE_SIZE), b, PAGE_SIZE) };
         }
         Held { pages: pages.iter().map(|&(p, _)| p).collect(), buf }
     }

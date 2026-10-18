@@ -279,8 +279,8 @@ pub const PAGE_SIZE: usize = 4096;
 
 /// Anonymous writable memory, unmapped on drop. Nonzero alignment also requests huge pages.
 pub struct Mmap {
-    pub ptr: *mut u8,
-    pub len: usize,
+    ptr: *mut u8,
+    len: usize,
 }
 
 // Owned memory, shared read-only once filled; callers write only through disjoint ranges.
@@ -316,6 +316,14 @@ impl Mmap {
             }
         }
         Ok(Self { ptr: start as *mut u8, len })
+    }
+
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     /// Faults in every page for writing; any madvise failure falls back to per-page writes.

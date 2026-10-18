@@ -727,7 +727,7 @@ impl Slots {
             while inner.free.len() < n {
                 let chunk = Mmap::new(SLOT_CHUNK, SLOT_CHUNK)?;
                 chunk.populate();
-                let c = chunk.ptr as usize;
+                let c = chunk.ptr() as usize;
                 inner.chunks.push(chunk);
                 self.mapped.fetch_add(1, Ordering::Relaxed);
                 // Descending: they are taken from the end.
@@ -768,7 +768,7 @@ impl Slots {
         *self.mapped.get_mut() = keep;
         inner.free.clear();
         let chunks = &inner.chunks;
-        inner.free.extend(chunks.iter().rev().flat_map(|c| (0..SLOT_CHUNK / PAGE_SIZE).rev().map(move |i| Slot(c.ptr as usize + i * PAGE_SIZE))));
+        inner.free.extend(chunks.iter().rev().flat_map(|c| (0..SLOT_CHUNK / PAGE_SIZE).rev().map(move |i| Slot(c.ptr() as usize + i * PAGE_SIZE))));
         (*self.used.get_mut(), *self.peak.get_mut()) = (0, 0);
     }
 
