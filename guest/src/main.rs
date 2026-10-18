@@ -539,19 +539,26 @@ fn set_hostname(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Most of `/etc/hosts` that is read.
-const MAX_HOSTS: u64 = 1 << 20;
+/// Most of an /etc file (hosts, passwd, group) that is read.
+const MAX_ETC: u64 = 1 << 20;
 
-/// `hosts` (a regular file: no link followed, nothing else opened but to be refused) rewritten
-/// `with_hostname`, replaced whole by a renamed copy, so a lookup sees the old file or the new one.
-fn name_in_hosts(hosts: &std::path::Path, name: &str) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let f = File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY).open(hosts)?;
+/// `path`'s text and metadata, if it is a regular file of at most `MAX_ETC`: no link followed, nothing
+/// else (a FIFO, a device) waited on but refused.
+fn read_etc(path: &std::path::Path) -> io::Result<(String, std::fs::Metadata)> {
+    let f = File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
     let meta = f.metadata()?;
-    let mut old = String::new();
-    if !meta.is_file() || f.take(MAX_HOSTS + 1).read_to_string(&mut old)? as u64 > MAX_HOSTS {
+    let mut text = String::new();
+    if !meta.is_file() || f.take(MAX_ETC + 1).read_to_string(&mut text)? as u64 > MAX_ETC {
         return Err(io::Error::other("not a regular file of at most 1 MiB"));
     }
+    Ok((text, meta))
+}
+
+/// `hosts` (`read_etc`'s) rewritten `with_hostname`, replaced whole by a renamed copy, so a lookup
+/// sees the old file or the new one.
+fn name_in_hosts(hosts: &std::path::Path, name: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let (old, meta) = read_etc(hosts)?;
     let new = with_hostname(&old, name);
     if new == old {
         return Ok(());
@@ -687,9 +694,9 @@ mod tests {
         assert!(std::os::unix::fs::FileTypeExt::is_fifo(&std::fs::symlink_metadata(&hosts).unwrap().file_type()));
 
         std::fs::remove_file(&hosts).unwrap();
-        std::fs::write(&hosts, vec![b'#'; (super::MAX_HOSTS + 1) as usize]).unwrap();
+        std::fs::write(&hosts, vec![b'#'; (super::MAX_ETC + 1) as usize]).unwrap();
         assert!(super::name_in_hosts(&hosts, "web").is_err());
-        assert_eq!(std::fs::metadata(&hosts).unwrap().len(), super::MAX_HOSTS + 1);
+        assert_eq!(std::fs::metadata(&hosts).unwrap().len(), super::MAX_ETC + 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

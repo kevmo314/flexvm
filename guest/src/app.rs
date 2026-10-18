@@ -227,7 +227,8 @@ pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)
         Some(c) => c,
         None => config()?.clone(),
     };
-    let read = |p| std::fs::read_to_string(p).unwrap_or_default();
+    // Only `-u` needs them: the image's user was resolved at pull.
+    let read = |p: &str| e.user.as_ref().and_then(|_| crate::read_etc(p.as_ref()).ok()).map(|(text, _)| text).unwrap_or_default();
     let c = exec_conf(base, e, &read("/etc/passwd"), &read("/etc/group"))?;
     Ok((command(&c, &e.argv), c))
 }

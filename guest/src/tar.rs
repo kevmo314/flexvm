@@ -635,6 +635,17 @@ fn finish_at(d: RawFd, name: &CString, e: &Header, owner: Option<(u32, u32)>, ch
 }
 
 fn unpack(base: &OwnedFd, parent: &[Vec<u8>], leaf: &[u8], link: &[Vec<u8>], e: &Header, rd: &mut Reader, owner: Option<(u32, u32)>) -> io::Result<()> {
+    // Before anything is made or removed: what it would replace is left as it is.
+    let path = || String::from_utf8_lossy(&e.path);
+    let skip = match e.kind {
+        b'3' | b'4' if owner.is_none() => Some(format!("device {}: devices are copied into a vm only", path())),
+        0 | b'0'..=b'7' => None,
+        k => Some(format!("{} (tar entry type {:?})", path(), k as char)),
+    };
+    if let Some(why) = skip {
+        warn!("flexvm: cp: skipping {why}");
+        return Ok(());
+    }
     let dir = walk_dir(base, parent, Some(owner))?;
     let (d, name) = (dir.as_raw_fd(), cstr(leaf)?);
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -675,23 +686,15 @@ fn unpack(base: &OwnedFd, parent: &[Vec<u8>], leaf: &[u8], link: &[Vec<u8>], e: 
             os(unsafe { libc::mkfifoat(d, name.as_ptr(), 0o600) })?;
             finish_at(d, &name, e, owner, true)
         }
-        b'3' | b'4' if owner.is_none() => {
-            warn!("flexvm: cp: skipping device {}: devices are copied into a vm only", String::from_utf8_lossy(&e.path));
-            Ok(())
-        }
-        b'3' | b'4' => {
+        _ => {
             let kind = if e.kind == b'3' { libc::S_IFCHR } else { libc::S_IFBLK };
             match os(unsafe { libc::mknodat(d, name.as_ptr(), kind | 0o600, libc::makedev(e.dev.0, e.dev.1)) }) {
                 Ok(_) => finish_at(d, &name, e, owner, true),
                 Err(err) => {
-                    warn!("flexvm: cp: skipping device {}: {err}", String::from_utf8_lossy(&e.path));
+                    warn!("flexvm: cp: skipping device {}: {err}", path());
                     Ok(())
                 }
             }
-        }
-        k => {
-            warn!("flexvm: cp: skipping {} (tar entry type {:?})", String::from_utf8_lossy(&e.path), k as char);
-            Ok(())
         }
     }
 }
@@ -964,6 +967,19 @@ mod tests {
         assert_eq!(std::fs::read(t.0.join("existing/abs/z")).unwrap(), b"z");
         assert_eq!(std::fs::read(t.0.join("existing/rel")).unwrap(), b"r");
         assert!(unpack_to(&file, Dest::Into(&t.s("nonexistent"))).is_err());
+    }
+
+    /// A device unpacked outside a vm, or an entry of a kind not known, leaves what is there and makes no parent.
+    #[test]
+    fn skipped_entries_change_nothing() {
+        let t = Tmp::new("skipped");
+        std::fs::write(t.0.join("existing"), "kept").unwrap();
+        for kind in [b'3', b'4', b'Z'] {
+            unpack_to(&archive(&[("null", kind, "")]), Dest::Cp(&t.s("existing"))).unwrap();
+            assert_eq!(std::fs::read(t.0.join("existing")).unwrap(), b"kept");
+            unpack_to(&archive(&[("d/", b'5', ""), ("d/new/null", kind, "")]), Dest::Cp(&t.s("d"))).unwrap();
+            assert!(!t.0.join("d/new").exists());
+        }
     }
 
     #[test]

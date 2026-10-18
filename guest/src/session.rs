@@ -383,7 +383,7 @@ impl Output {
     }
 
     /// Appends, then drops the oldest to fit `capacity` and `MAX_CHUNKS`. Same-kind output joins the
-    /// last chunk up to `BLOCK`; only the newest chunk has spare allocation.
+    /// last chunk up to `BLOCK`; only the newest chunk has spare allocation, and the oldest bytes before `start`.
     pub(crate) fn push(&mut self, kind: u8, data: &[u8], capacity: usize) {
         match self.chunks.back_mut() {
             Some(last) if last.kind == kind && last.data.len() + data.len() <= BLOCK => last.data.extend_from_slice(data),
@@ -401,19 +401,10 @@ impl Output {
             self.chunks.pop_front();
         }
         let keep = self.end.saturating_sub(capacity as u64);
-        while let Some(chunk) = self.chunks.front_mut() {
-            if chunk.offset + chunk.data.len() as u64 <= keep {
-                self.chunks.pop_front();
-                continue;
-            }
-            if chunk.offset < keep {
-                chunk.data.drain(..(keep - chunk.offset) as usize);
-                chunk.data.shrink_to_fit();
-                chunk.offset = keep;
-            }
-            break;
+        while self.chunks.front().is_some_and(|c| c.offset + c.data.len() as u64 <= keep) {
+            self.chunks.pop_front();
         }
-        self.start = self.chunks.front().map_or(self.end, |c| c.offset);
+        self.start = self.chunks.front().map_or(self.end, |c| c.offset.max(keep));
     }
 
     pub(crate) fn read_chunk(&self, offset: u64) -> Option<(u8, &[u8])> {
@@ -593,13 +584,13 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             let (stdin, tty) = spec.as_ref().map_or((false, false), |s| (s.stdin, s.tty));
             let pty = tty.then(|| crate::input::openpty(spec.as_ref().and_then(|s| s.size))).transpose()?;
             // Start the pump first: if no thread can be had, nothing has run yet.
-            let (tx, rx) = mpsc::sync_channel::<(Vec<(File, u8)>, Option<OwnedFd>, u64)>(1);
+            let (tx, rx) = mpsc::sync_channel::<(Vec<(File, u8)>, OwnedFd, u64)>(1);
             let output = session(Output { detached, gone: detached.then(awake), ..table.new_output() });
             let (pumped, statuses_) = (output.clone(), statuses.clone());
             thread::Builder::new()
                 .spawn(move || {
                     if let Ok((streams, exited, token)) = rx.recv() {
-                        let rest = crate::pump_until(streams, exited, DRAIN, |kind, data| deliver(&pumped, kind, data));
+                        let rest = crate::pump_until(streams, Some(exited), DRAIN, |kind, data| deliver(&pumped, kind, data));
                         // Closed, they would kill a background process's next write with SIGPIPE.
                         crate::discard(rest);
                         // By token: the pid may be another child's by now, however long the client took.
@@ -644,6 +635,8 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             drop(cmd);
             // Failing from here on, the command is killed: left running, it would be no session's.
             let pid = child.id() as i32;
+            // Unwatched, its output would be read until background processes close it, not `DRAIN` past its exit.
+            let exited = exited.ok_or_else(|| crate::app::unwatched(statuses, pid, token, io::Error::other("cannot open a pidfd to watch it")))?;
             let (streams, input) =
                 crate::input::streams(&mut child, pty.map(|(master, _)| master)).map_err(|e| crate::app::unwatched(statuses, pid, token, e))?;
             output.0.lock().unwrap().input = input.map(Arc::new);
@@ -1531,6 +1524,18 @@ mod tests {
         assert_eq!((tiny.chunks.len(), tiny.start), (MAX_CHUNKS, 1));
         let n = MAX_CHUNKS as u64;
         assert_eq!([0, n, n + 1].map(|o| tiny.chunks_from(o)), [MAX_CHUNKS, 1, 0]);
+        // Trimming moves `start`, not bytes: the oldest chunk is freed whole, once all of it is out.
+        let mut full = Output::default();
+        for _ in 0..4 {
+            full.push(FRAME_STDOUT, &[b'x'; BLOCK], 4 * BLOCK);
+        }
+        let front = full.chunks[0].data.as_ptr();
+        full.push(FRAME_STDERR, b"y", 4 * BLOCK);
+        assert_eq!((full.start, full.chunks.len(), full.chunks[0].data.as_ptr()), (1, 5, front));
+        assert_eq!(full.read_chunk(1), Some((FRAME_STDOUT, &[b'x'; BLOCK - 1][..])));
+        full.push(FRAME_STDOUT, &[b'z'; BLOCK], 4 * BLOCK);
+        assert_eq!((full.start, full.chunks.len()), (BLOCK as u64 + 1, 5));
+        assert_eq!(full.read_chunk(BLOCK as u64 + 1), Some((FRAME_STDOUT, &[b'x'; BLOCK - 1][..])));
     }
 
     fn read_to_exit(peer: &mut UnixStream) {
