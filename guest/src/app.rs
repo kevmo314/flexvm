@@ -650,8 +650,12 @@ mod tests {
         assert_eq!(c.env, [("KEEP".into(), "run".into()), ("K".into(), "last=two".into()), ("EMPTY".into(), "".into())]);
         assert_eq!((c.uid, c.gid, c.groups.clone()), (1000, 2000, vec![2000, 42]));
         let cmd = command(&c, &["true"]);
-        let env: std::collections::BTreeMap<_, _> = cmd.get_envs().map(|(k, v)| (k.to_str().unwrap(), v.unwrap().to_str().unwrap())).collect();
+        let mut env: std::collections::BTreeMap<_, _> = cmd.get_envs().map(|(k, v)| (k.to_str().unwrap(), v.unwrap().to_str().unwrap())).collect();
+        // The host's own hostname here; the VM's in a guest.
+        assert!(env.remove("HOSTNAME").is_some());
         assert_eq!(env, [("EMPTY", ""), ("K", "last=two"), ("KEEP", "run")].into());
+        let named = with_settings(&image, "env HOSTNAME=set\n").unwrap();
+        assert_eq!(command(&named, &["true"]).get_envs().filter(|(k, _)| *k == "HOSTNAME").count(), 1);
         assert_eq!(exec_conf(run.clone(), &exec(&["true"], &[], None, None), "", "").unwrap().cwd, "/");
         for bad in [exec(&["true"], &["BAD"], None, None), exec(&["true"], &["=x"], None, None), exec(&[], &[], None, None), exec(&[""], &[], None, None)] {
             assert!(exec_conf(run.clone(), &bad, "", "").is_err());
@@ -931,7 +935,10 @@ mod tests {
             assert_eq!((c.uid, c.gid, c.groups.as_slice()), (1000, 2000, [2000, 42].as_slice()));
             let cmd = command(c, &["/bin/sh", "-c", "ready"]);
             assert_eq!(cmd.get_current_dir().unwrap(), std::path::Path::new("/srv"));
-            assert_eq!(cmd.get_envs().collect::<Vec<_>>(), [(std::ffi::OsStr::new("PATH"), Some(std::ffi::OsStr::new("/usr/bin")))]);
+            assert_eq!(
+                cmd.get_envs().filter(|(k, _)| *k != "HOSTNAME").collect::<Vec<_>>(),
+                [(std::ffi::OsStr::new("PATH"), Some(std::ffi::OsStr::new("/usr/bin")))]
+            );
             assert_eq!(c.argv, ["/bin/app"]);
         }
     }
