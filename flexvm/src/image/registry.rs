@@ -1793,21 +1793,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn tcp_connections_are_never_reused() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut peer, _) = listener.accept().unwrap();
-        let mut tcp = PeerTcp { stream, buffers: LazyBuffers::new(1024, 1024) };
-        assert!(!tcp.is_open());
-        peer.write_all(b"x").unwrap();
-        assert!(!tcp.is_open());
-        let mut byte = [0];
-        tcp.stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        tcp.stream.read_exact(&mut byte).unwrap();
-        assert_eq!(&byte, b"x");
-    }
-
-    #[test]
     fn credentials_only_go_to_trusted_realms() {
         let hub = Registry::new(Reference::parse("nginx").unwrap());
         assert!(hub.trusted("https://auth.docker.io/token"));

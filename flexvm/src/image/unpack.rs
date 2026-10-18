@@ -587,8 +587,8 @@ impl Root {
             check(unsafe { libc::fchmodat(dfd, name, h.mode()? & 0o7777, 0) }, "chmod", rel)?;
             for (key, value) in &m.xattrs {
                 if let Err(e) = at.set_xattr(key, value) {
-                    // Only user metadata may be dropped; all other namespaces can affect execution or access.
-                    if !key.starts_with("user.") {
+                    // Capabilities and ACLs decide who may run or read what; other xattrs are best-effort.
+                    if key == "security.capability" || key.starts_with("system.posix_acl_") {
                         bail!("xattr {key} on {rel:?}: {e}");
                     }
                     crate::log!("image: xattr {key} on {rel:?}: {e}");
@@ -963,6 +963,7 @@ pub(super) mod tests {
             "unknown.attribute",
             "user.note",
         ] {
+            let functional = key == "security.capability" || key.starts_with("system.posix_acl_");
             let s = Sandbox::new("xattr");
             let mut b = tar::Builder::new(Vec::new());
             // Too large for any Linux xattr, regardless of privileges or filesystem support.
@@ -972,7 +973,7 @@ pub(super) mod tests {
             b.get_mut().extend_from_slice(&bytes);
             let bytes = b.into_inner().unwrap();
             let result = s.open().apply_layer(bytes.as_slice());
-            if key.starts_with("user.") {
+            if !functional {
                 result.unwrap();
                 assert_eq!(s.read("file").as_deref(), Some("contents"));
             } else {

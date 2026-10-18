@@ -223,15 +223,17 @@ fn warm_up_until(vsock: &Path, meta: &ImageMeta, stop: impl Fn() -> Result<()> +
             Some(Ready::Cmd(c)) => guest::check(vsock, c, left.max(Duration::from_millis(100)), &stop)?,
             None => true,
         };
+        // Ready counts only for a running app; a check that ends past the deadline still counts.
         let status = guest::app_status(vsock)?;
-        if !status.starts_with("running ") || start.elapsed() >= meta.ready_timeout {
+        let running = status.starts_with("running ");
+        if ready && running {
+            crate::log!("image: app ready after {} ms", ms(start.elapsed()));
+            return Ok(());
+        }
+        if !running || start.elapsed() > meta.ready_timeout {
             let logs = read_logs(vsock, Instant::now() + LOGS_TIMEOUT, &stop)?;
             let tail = String::from_utf8_lossy(&logs[logs.len().saturating_sub(4096)..]).into_owned();
             bail!("app not ready ({:?}) after {} ms, status {status}; its output:\n{tail}", meta.ready, ms(start.elapsed()));
-        }
-        if ready {
-            crate::log!("image: app ready after {} ms", ms(start.elapsed()));
-            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -775,7 +777,7 @@ mod tests {
         for (status, timeout, ok) in [
             ("exited 0", Duration::from_secs(5), false),
             ("idle", Duration::from_secs(5), false),
-            ("running 1", Duration::ZERO, false),
+            ("running 1", Duration::ZERO, true),
             ("running 1", Duration::from_secs(5), true),
         ] {
             let dir = tmpdir("warm-status");
