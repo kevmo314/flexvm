@@ -914,6 +914,13 @@ impl Vm {
         res
     }
 
+    /// Logged, not fatal: the VM runs on with its old hostname.
+    pub fn set_hostname(&self, name: &str) {
+        if let Err(e) = self.running_here().and_then(|()| crate::guest::set_hostname(&self.vsock, name)) {
+            crate::log!("vm {name}: {e}");
+        }
+    }
+
     pub fn start_app(&self, settings: &str) -> Result<u32> {
         self.running_here()?;
         crate::guest::start_app(&self.vsock, settings)

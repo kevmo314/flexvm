@@ -557,6 +557,10 @@ impl Proc {
             Some(e) => Err(format!("guest agent not answering: {e}").into()),
         };
         t.mark("clock");
+        // Renamed since it was saved, or restored under another name.
+        if guest_error.is_none() {
+            vm.set_hostname(name);
+        }
         if let Some(e) = &address_error {
             crate::log!("vm {name}: {e}");
         }
@@ -613,6 +617,7 @@ impl Proc {
                         crate::guest::ping(&vm.vsock)?;
                         answered = true;
                         crate::info!("vm {}: its guest agent answered {} ms after it resumed", vm.name, ms(start.elapsed()));
+                        vm.set_hostname(&p.name());
                     }
                     // The clock is not held up by an address that keeps failing.
                     let address = match vm.pending_net.load(Ordering::SeqCst) {

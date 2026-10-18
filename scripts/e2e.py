@@ -1503,7 +1503,7 @@ def pull_template(name, opts):
     waits (or what Retry-After asks); a registry that stays rate limited fails as that."""
     waits = (15, 30, 60, 120)
     for i in range(len(waits) + 1):
-        r = flexvm("pull", "--verbose", args.image, "--tag", name, *opts, timeout=600, check=False)
+        r = flexvm("pull", args.image, "--tag", name, *opts, timeout=600, check=False)
         if r.returncode == 0:
             return r
         if "HTTP 429" not in r.stderr:

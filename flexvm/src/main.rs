@@ -1379,11 +1379,10 @@ fn pull_missing_args(args: &Args, name: &str) -> Vec<String> {
 /// `run IMAGE` of an image not pulled here: `flexvm pull IMAGE` first, its output on stderr.
 fn pull_missing(args: &Args, name: &str) -> Result<()> {
     let image = template::image_of(name);
-    crate::info!("flexvm: unable to find image {image} here; pulling it");
+    crate::log!("flexvm: unable to find image {image} here; pulling it");
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.args(pull_missing_args(args, name));
-    let out = if util::verbose() { std::process::Stdio::from(std::io::stderr()) } else { std::process::Stdio::null() };
-    let status = cmd.stdout(out).status()?;
+    let status = cmd.stdout(std::io::stderr()).status()?;
     if !status.success() {
         bail!("pulling {image} failed ({status})");
     }

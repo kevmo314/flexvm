@@ -1131,9 +1131,10 @@ impl Proc {
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();
         }
+        vm.set_hostname(&self.name());
         let spec = self.spec.lock().unwrap().clone();
         if spec.starts_app(vm.template.meta.image.as_ref()) {
-            vm.start_app(&spec.app_settings_for(&self.name())).map_err(|e| format!("{e} (see the vm's output)"))?;
+            vm.start_app(&spec.app_settings()).map_err(|e| format!("{e} (see the vm's output)"))?;
             *self.app_started.lock().unwrap() = Some(Instant::now());
             t.mark("app_start");
         }

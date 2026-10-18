@@ -65,7 +65,7 @@ fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> R
         );
     };
     let url = format!("{}/{}", base.trim_end_matches('/'), asset.name);
-    crate::info!("flexvm: downloading {} (sha256 {sha256}) from {url}", asset.name);
+    crate::log!("flexvm: downloading {} (sha256 {sha256}) from {url}", asset.name);
     fetch(&url, sha256, path, asset.mode).map_err(|e| {
         format!(
             "{}: missing, and downloading it failed: {e}. Offline, copy a file with sha256 {sha256} there (from a host that has it, \
@@ -74,7 +74,7 @@ fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> R
             asset.by_hand
         )
     })?;
-    crate::info!("flexvm: installed {}", path.display());
+    crate::log!("flexvm: installed {}", path.display());
     Ok(())
 }
 

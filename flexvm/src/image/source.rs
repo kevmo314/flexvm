@@ -38,7 +38,7 @@ impl Image {
             .collect();
         for (i, (d, size, (blobs, _))) in descs.iter().enumerate() {
             let cached = if blob_path(blobs, d)?.exists() { " (cached)" } else { "" };
-            crate::info!("image: layer {}/{} {d} {:.1} MiB{cached}", i + 1, descs.len(), *size as f64 / 1048576.0);
+            crate::log!("image: layer {}/{} {d} {:.1} MiB{cached}", i + 1, descs.len(), *size as f64 / 1048576.0);
         }
         download_layers(&descs, |d, size, (blobs, registry)| {
             if !blob_path(blobs, d)?.exists() {
@@ -269,7 +269,7 @@ fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
     super::registry::sweep_parts(&blobs.join("sha256"));
     let (manifest, digest) = reg.manifest(&reg.r.reference.clone())?;
     let (manifest, digest) = resolve_index(manifest, digest, |d| Ok(reg.manifest(d)?.0))?;
-    crate::info!("image: {} -> {digest}", reg.r);
+    crate::log!("image: {} -> {digest}", reg.r);
     let descs = descriptors(&manifest, limits)?;
     let config_digest = manifest["config"]["digest"].as_str().ok_or("manifest has no config")?.to_string();
     let config_size = manifest["config"]["size"].as_u64().ok_or("config without size")?;

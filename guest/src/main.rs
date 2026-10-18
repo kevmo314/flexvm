@@ -413,7 +413,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             }
         };
         // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
-        if ["PING", "START ", "CLOCK ", "FORKS"].iter().any(|v| line.starts_with(v)) {
+        if ["PING", "START ", "CLOCK ", "FORKS", "HOSTNAME "].iter().any(|v| line.starts_with(v)) {
             let _ = handle(&stream, &line, &statuses);
             continue;
         }
@@ -527,10 +527,49 @@ fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
         },
         "CLOCK" => parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock).map(|off| format!("ok {off}")),
         "FORKS" => forks().map(|n| format!("ok {n}")).map_err(|e| e.to_string()),
+        "HOSTNAME" => set_hostname(arg.trim()).map(|()| "ok".into()).map_err(|e| e.to_string()),
         v if app::VERBS.contains(&v) => return app::handle(v, arg, out, statuses),
         _ => return msg(out, format!("unknown request {verb:?}")),
     };
     reply.map_or_else(|e| fail(out, e), |m| msg(out, m))
+}
+
+/// The VM's name as the hostname, and as /etc/hosts' 127.0.1.1 so that it resolves (left as it is if
+/// unwritable or absent). Set at each start, restore and rename: a template's snapshot has "flexvm".
+fn set_hostname(name: &str) -> io::Result<()> {
+    if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+        return Err(io::Error::other(format!("bad hostname {name:?}")));
+    }
+    os(unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) })?;
+    if let Ok(hosts) = std::fs::read_to_string("/etc/hosts") {
+        let new = with_hostname(&hosts, name);
+        if new != hosts {
+            let _ = std::fs::write("/etc/hosts", new);
+        }
+    }
+    Ok(())
+}
+
+/// `hosts` with its 127.0.1.1 lines (or a new one) naming `name` alone.
+fn with_hostname(hosts: &str, name: &str) -> String {
+    let line = format!("127.0.1.1\t{name}\n");
+    let mut found = false;
+    let mut out = String::new();
+    for l in hosts.lines() {
+        if l.split_whitespace().next() == Some("127.0.1.1") {
+            if !found {
+                out += &line;
+            }
+            found = true;
+        } else {
+            out += l;
+            out.push('\n');
+        }
+    }
+    if !found {
+        out += &line;
+    }
+    out
 }
 
 fn parse_time(s: &str) -> Option<libc::timespec> {
@@ -585,6 +624,15 @@ fn request_line(r: &mut impl BufRead) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hosts_name_the_vm_once() {
+        let image = "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tflexvm\n";
+        assert_eq!(super::with_hostname(image, "web"), "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tweb\n");
+        assert_eq!(super::with_hostname("127.0.0.1 localhost", "web"), "127.0.0.1 localhost\n127.0.1.1\tweb\n");
+        assert_eq!(super::with_hostname("127.0.1.1 a\n127.0.1.1 b\n", "web"), "127.0.1.1\tweb\n");
+        assert!(super::set_hostname(&"x".repeat(65)).is_err() && super::set_hostname("a b").is_err());
+    }
+
     #[test]
     fn discarder_keeps_at_most_its_cap() {
         let d = Discarder::start(4).unwrap();

@@ -5,8 +5,7 @@
 //! `APP`'s settings are a run's (`run -e`, `--entrypoint`, `-i`, `-t`), in app.conf's form: `env` lines
 //! replace the image's of their key, `arg` lines (if any) its whole argv, `stdin` keeps its stdin open
 //! (for `APPIN`), `tty` gives it a pty. `LOGS` frames are the app's stdout and stderr (a pty's output is
-//! stdout) and FRAME_NOTE, flexvm-init's lines. A run's `hostname` is set before spawning its app.
-//! `APPIN` (input.rs) feeds client `stream`'s input frames to
+//! stdout) and FRAME_NOTE, flexvm-init's lines. `APPIN` (input.rs) feeds client `stream`'s input frames to
 //! the app's stdin, answering `ok <taken> <tty 0|1>` (or `closed <tty>`), then FRAME_ACK as it takes
 //! them; a newer `APPIN` takes over. `SIGNAL` goes to the app's process alone, as docker kill's does. A non-root app runs with no_new_privs and an empty bounding set, so setuid binaries and file
 //! capabilities cannot take it back to root.
@@ -133,7 +132,6 @@ pub(crate) struct Conf {
     /// A run's `-i` and `-t`.
     stdin: bool,
     tty: bool,
-    hostname: Option<String>,
 }
 
 fn unescape(s: &str) -> String {
@@ -150,7 +148,7 @@ fn unescape(s: &str) -> String {
 }
 
 fn parse_conf(text: &str) -> io::Result<Conf> {
-    let mut c = Conf { argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![], stdin: false, tty: false, hostname: None };
+    let mut c = Conf { argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![], stdin: false, tty: false };
     let num = |v: &str| v.trim().parse::<u32>().map_err(|_| io::Error::other(format!("{CONF}: bad id {v:?}")));
     // Only LF delimits records; str::lines() also removes a value's trailing CR.
     for line in text.split('\n') {
@@ -181,13 +179,6 @@ fn with_settings(c: &Conf, text: &str) -> io::Result<Conf> {
         match k {
             "arg" => argv.get_or_insert_with(Vec::new).push(unescape(v)),
             "env" => set_env(&mut c, &unescape(v)),
-            "hostname" => {
-                let name = unescape(v);
-                if name.is_empty() || name.len() > 64 || name.contains('\0') {
-                    return Err(io::Error::other("invalid app hostname"));
-                }
-                c.hostname = Some(name);
-            }
             "stdin" => c.stdin = true,
             "tty" => c.tty = true,
             _ => return Err(io::Error::other(format!("unknown app setting {k:?}"))),
@@ -220,6 +211,10 @@ fn unhex(hex: &str) -> Option<Vec<u8>> {
 fn command<S: AsRef<std::ffi::OsStr>>(c: &Conf, argv: &[S]) -> Command {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).env_clear().envs(c.env.iter().map(|(k, v)| (k, v))).current_dir(&c.cwd).stdin(Stdio::null());
+    // Docker's: the hostname (the VM's name, `HOSTNAME` in main.rs), unless the image or run sets one.
+    if !c.env.iter().any(|(k, _)| k == "HOSTNAME") {
+        cmd.env("HOSTNAME", std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim_end());
+    }
     cmd
 }
 
@@ -501,9 +496,6 @@ fn start(settings: &str, statuses: &Statuses) -> io::Result<i32> {
     }
     if c.tty {
         terminal_env(c);
-    }
-    if let Some(name) = &c.hostname {
-        crate::os(unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) })?;
     }
     let pty = c.tty.then(|| crate::input::openpty(None)).transpose()?;
     let mut cmd = command(c, &c.argv);
@@ -966,19 +958,6 @@ mod tests {
         assert_eq!(cmd.get_program(), "/bin/app\r");
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["\r", " a\r\nb\\r \t\r"]);
         assert!(cmd.get_envs().any(|(k, v)| k == "FOO" && v == Some(std::ffi::OsStr::new("bar\r"))));
-    }
-
-    #[test]
-    fn hostname_is_a_validated_per_start_setting() {
-        let image = parse_conf("arg sh\n").unwrap();
-        assert_eq!(image.hostname, None);
-        let first = with_settings(&image, "hostname web\n").unwrap();
-        assert_eq!(first.hostname.as_deref(), Some("web"));
-        assert_eq!(with_settings(&image, "hostname renamed\n").unwrap().hostname.as_deref(), Some("renamed"));
-        assert_eq!(with_settings(&image, "").unwrap().hostname, None);
-        for name in [String::new(), "x".repeat(65), "nul\0name".into()] {
-            assert!(with_settings(&image, &format!("hostname {name}\n")).is_err());
-        }
     }
 
     #[test]

@@ -2505,7 +2505,6 @@ pub mod output {
             append_capped(&log, data, LOG_CAP);
             return;
         }
-        let recorded = LOG.lock().unwrap().clone().is_some_and(|log| append_capped(&log, data, LOG_CAP));
         let target = TARGETS.lock().unwrap()[i].clone();
         let sent = target.as_ref().map_or(0, |t| write_within(t, data, Instant::now() + STALL));
         if sent == data.len() {
@@ -2528,9 +2527,7 @@ pub mod output {
             (targets[i].clone(), LOGS.lock().unwrap()[i].clone())
         };
         if let Some(log) = fallback.1 {
-            if !recorded {
-                append_capped(&log, &data[sent..], LOG_CAP);
-            }
+            append_capped(&log, &data[sent..], LOG_CAP);
         } else if let Some(f) = fallback.0.as_deref() {
             write_within(f, &data[sent..], Instant::now() + STALL);
         }
@@ -2539,8 +2536,6 @@ pub mod output {
     /// What was written by `deadline`: in pieces no bigger than a pipe takes
     /// at once, each only once the target is ready for it.
     fn write_within(f: &File, data: &[u8], deadline: Instant) -> usize {
-        use std::os::unix::fs::FileTypeExt;
-        let socket = f.metadata().is_ok_and(|m| m.file_type().is_socket());
         let mut sent = 0;
         while sent < data.len() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -2551,7 +2546,10 @@ pub mod output {
             let piece = &data[sent..(sent + 4096).min(data.len())];
             let (fd, buf, len) = (f.as_raw_fd(), piece.as_ptr().cast(), piece.len());
             // Another relay may have filled a shared target since the poll: retried.
-            let n = if socket { unsafe { libc::send(fd, buf, len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } } else { unsafe { libc::write(fd, buf, len) } };
+            let n = match unsafe { libc::send(fd, buf, len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } {
+                -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) => unsafe { libc::write(fd, buf, len) },
+                n => n,
+            };
             match n {
                 n if n > 0 => sent += n as usize,
                 _ if matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) => {}
@@ -2757,7 +2755,9 @@ pub mod output {
                 assert!(stderr.contains("error-marker") && stderr.contains("hint-marker"), "{stderr}");
             }
             for marker in ["app-out-marker", "app-err-marker", "info-marker", "error-marker", "hint-marker"] {
-                assert_eq!(log.matches(marker).count(), 1, "{mode}: {log}");
+                // A foreground VM's own output is its terminal's alone.
+                let want = usize::from(mode == "detached" || !marker.starts_with("app-"));
+                assert_eq!(log.matches(marker).count(), want, "{mode} {marker}: {log}");
             }
         }
     }
