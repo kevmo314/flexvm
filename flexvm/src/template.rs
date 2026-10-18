@@ -1403,6 +1403,30 @@ mod tests {
     }
 
     #[test]
+    fn pinned_template_errors_name_real_generation() {
+        let f = Fixture::new();
+        let generation = f.paths.templates.join(GENERATIONS).join(&f.meta.id);
+        std::fs::create_dir_all(generation.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&f.dir, &generation).unwrap();
+        // The named template has been rebuilt, but saved VMs still pin the old id.
+        let rebuilt = f.paths.templates.join("rebuilt");
+        std::fs::create_dir(&rebuilt).unwrap();
+        let mut rebuilt_meta = f.meta.clone();
+        rebuilt_meta.id = "0000000000000000".into();
+        f.write_meta(&rebuilt_meta, &rebuilt);
+        std::os::unix::fs::symlink(&rebuilt, f.paths.templates.join("t")).unwrap();
+        let mut meta = serde_json::to_value(&f.meta).unwrap();
+        meta.as_object_mut().unwrap().remove("vcpus");
+        std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let error = Template::open_id(&f.paths, "t", &f.meta.id).err().unwrap().to_string();
+        assert!(error.contains(&generation.display().to_string()) && error.contains("vcpus"), "{error}");
+        assert!(error.contains("pins this template generation") && !error.contains("/proc/"), "{error}");
+        let error = f.open().err().unwrap().to_string();
+        assert!(error.contains(&f.dir.display().to_string()) && error.contains("pull it again"), "{error}");
+        assert!(!error.contains("/proc/"), "{error}");
+    }
+
+    #[test]
     fn resolve_requires_a_symlink() {
         let f = Fixture::new();
         let entry = f.paths.templates.join("t");
