@@ -758,13 +758,12 @@ def b_unpulled():
     link, images = os.path.join(B.state_dir, "templates"), os.path.join(B.state_dir, "images")
     B.stop()
     os.remove(link)
-    os.makedirs(link)
     B.start()
     try:
         yield link
     finally:
         B.stop()
-        shutil.rmtree(link)
+        shutil.rmtree(link, ignore_errors=True)
         shutil.rmtree(images, ignore_errors=True)
         os.symlink(TEMPLATES, link)
         B.start()

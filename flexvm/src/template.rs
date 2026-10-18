@@ -64,7 +64,7 @@ pub const FORMAT_VERSION: u64 = 2;
 
 /// The root filesystem as a template's snapshot names it: a file in its Firecracker's directory,
 /// linked to the generation's own at every load (`Firecracker::link_rootfs`), so it can be anywhere
-/// (a pushed generation's is in its directory). Generations built before name theirs by its path.
+/// (a pushed generation's is in its directory). Those built by v0.1.0 name theirs by its path.
 pub const ROOTFS: &str = "rootfs";
 
 /// What a build does that its inputs do not record: the boot command line, the memory and
@@ -1025,6 +1025,8 @@ pub fn turn(paths: &Paths, id: &str, by: Instant) -> Result<crate::host::HeldLoc
     if !valid_id(id) {
         bail!("bad template id {id:?}");
     }
+    // A host that never pulled anything has none yet.
+    crate::util::create_dir_durably(&paths.templates, 0o777)?;
     let name = template_lock_name(paths, "template-in", &format!("-{id}"))?;
     let take = |f: &File| loop {
         match crate::host::flock(f, libc::LOCK_EX | libc::LOCK_NB) {
@@ -1736,6 +1738,9 @@ mod tests {
     #[test]
     fn arrivals_of_one_template_take_turns() {
         let f = Fixture::new();
+        let (_dir, mut paths) = elsewhere(&f);
+        paths.templates = paths.templates.join("templates");
+        drop(turn(&paths, "abcd", Instant::now()).unwrap());
         let first = turn(&f.paths, "abcd", Instant::now()).unwrap();
         assert!(turn(&f.paths, "abcd", Instant::now() + Duration::from_millis(100)).is_err());
         assert!(turn(&f.paths, "abce", Instant::now()).is_ok());

@@ -126,6 +126,10 @@ impl Firecracker {
     /// What a template's snapshot names its root filesystem (`template::ROOTFS`), in this Firecracker's directory.
     pub fn link_rootfs(&self, rootfs: &Path) -> Result<()> {
         let link = self.dir.join(crate::template::ROOTFS);
+        // Linked already by the prepare: a migration's load, while paused, only checks.
+        if std::fs::read_link(&link).is_ok_and(|l| l == rootfs) {
+            return Ok(());
+        }
         match std::fs::remove_file(&link) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             r => r?,

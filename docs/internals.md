@@ -10,7 +10,7 @@ migration protocol are in [process-per-vm.md](process-per-vm.md).
 | CPU | vCPUs = host cores (FC max 32). Idle vCPUs halt and cost nothing. Each VM's Firecracker runs in a cgroup of its own with the `cpu` controller on, all at the default `cpu.weight`, so busy VMs share contended CPU equally however many threads each runs. |
 | Memory growth | Boot memory (256 MiB + 1/32 of the ceiling) + a virtio-mem region up to host RAM, of which 4 GiB is already plugged in the template. Past that the guest asks for more over vsock the moment it runs low, and its VM process keeps a quarter of the guest (at least 1 GiB) free. See [Memory](#memory). |
 | Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds. |
-| Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. |
+| Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. Snapshots name it `rootfs`, a file in each Firecracker's directory that every load links to the generation's own (`template::ROOTFS`): a generation's root filesystem can be anywhere, so a migration target need not have pulled the image (generations built by v0.1.0 name it by its path, which a target must then hold). |
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. **Standby VMs** are already restored and paused, so `run` is usually just a resume. |
 | Migration | **Post-copy**: the target gets everything ready first (template, address, a Firecracker with the template's VM structure already built); then pause, save vCPU and device state only (~20–200 KiB), load it and resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
 | Pressure | If a VM needs to grow and the host would drop below its reserve (`reserve_mib`), or the host is already below it, that VM is migrated to a peer with room. |
@@ -262,6 +262,29 @@ request; the source's header, vmstate and preloaded pages; the target's
 answer once it committed and resumed the VM; the held packets (`hold`); the
 target's reply to them.
 
+0. Before anything else, on a connection of its own (`template`): the source
+   asks whether the target has the template generation, by content id only
+   (a name there never counts: it may name another build of the same tag). If
+   not, it sends it: `meta.json`, then the vmstate, root filesystem and memory
+   file, each as its length, its data extents and their bytes, so holes stay
+   holes (ubuntu:24.04's 47 GB memory file and its root filesystem are 236 MiB
+   of data, sent in about 0.5 s here). The target's listener receives it into a
+   build's staging directory (`template::receive`), checks the content id and
+   that each file hashes to its component (its own Firecracker included, which
+   `artifacts::ensure` fetches if missing; the kernel is not needed: it is in
+   guest memory) and only then renames it into `templates/.gen/ID` under the
+   templates lock, like a build, with no name: the target's tags never move,
+   and `images` lists it as `<none>`. The root filesystem goes in the
+   generation's own directory, which takes it along when it is removed. Two
+   arrivals of one template take turns (`template::turn`), so the second sends
+   nothing. A push that fails or is killed leaves its staging directory, which
+   the next build or push sweeps, never a generation. The listener holds the
+   generation open for 17 s, until the arrival has opened it itself, so no
+   `rmi` or prune removes it in between; from then on the VM holds it as any
+   VM does. Caps: 4 pushes at once (2 from one peer), 64 GiB of data, 1 GiB
+   left free on the disk, and 10 minutes for the whole push. A v0.1.0 target
+   answers `unknown op`: the migration goes on and needs the generation there,
+   as before. All of this happens while the VM runs: none of it is downtime.
 1. Before the pause, over one connection (`migrate_in`): the target checks the
    template, reserves the name and address, spawns a Firecracker and
    starts its pager (the listener started a VM process for it). With `firecracker/0002-*.patch` it also has Firecracker
@@ -826,7 +849,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   (`template::note_shared`, under the templates lock, which the pull's
   decision holds exclusively), since its suspended VMs hold no lock the
   owner could see. An incoming migration uses the generation with the source's
-  content id if the host has it. `flexvm rmi` removes a name and the
+  content id, which the source sends first if the host does not have it
+  (step 0 above). `flexvm rmi` removes a name and the
   generation and root filesystem nothing uses any more: see below.
 - **Image removal: users and locks.** What uses a template generation
   (`templates/.gen/ID`), and what shows it:
@@ -851,8 +875,9 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     the one to keep, rechecks that no standby VM is live, and removes. It
     deletes the count only after the name's link is gone, or restores it if the
     name survives, including on timeout or a failed removal.
-  - An incoming migration: the target's process, from opening the source's
-    content id (`open_id`) until it is a running VM.
+  - An incoming migration: the listener, for 17 s after it said it has the
+    generation or received it, then the target's process, from opening the
+    source's content id (`open_id`) until it is a running VM.
   - A checkpoint restore: the restoring process, from `open_id`.
   - A stored checkpoint (`checkpoint create`): its manifest in
     `STATE/checkpoints` (any there, removed ones' too, `checkpoint::managed`,
