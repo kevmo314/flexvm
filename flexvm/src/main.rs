@@ -785,7 +785,9 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
             }
             None => {
                 let addr = c.listen.as_deref().ok_or("listen needs an address (flexvm listen ADDR)")?;
-                std::net::TcpListener::bind(addr).map_err(|e| format!("listen on {addr}: {e}"))?
+                // Under the host lock: a hostname's lookup is bounded, as `activated_at`'s.
+                let resolved = util::resolve(addr, Instant::now() + Duration::from_secs(2)).map_err(|e| format!("listen address {addr}: {e}"))?;
+                std::net::TcpListener::bind(&resolved[..]).map_err(|e| format!("listen on {addr}: {e}"))?
             }
         };
         let validated = listen::validate(&bound, c)?;
@@ -1522,8 +1524,14 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     // The generation the name linked to before, unless a VM here (or another name) still uses it.
     if let Some(old) = res? {
         standby::superseded(&host, &name);
-        for removed in template::prune(&paths, Some(&old), &|| host.template_users())? {
-            output(format_args!("{removed}\n"))?;
+        // Published already: a failed prune leaves the old generation to `image prune`.
+        match template::prune(&paths, Some(&old), &|| host.template_users()) {
+            Ok(removed) => {
+                for removed in removed {
+                    output(format_args!("{removed}\n"))?;
+                }
+            }
+            Err(e) => crate::log!("flexvm: pull {name}: the superseded generation stays for image prune: {e}"),
         }
     }
     match standby {
@@ -2723,6 +2731,11 @@ mod exec_tests {
         }
         // Port 0 binds, but peers could not be told the port.
         assert!(configure_listener(&mut host, Some("127.0.0.1:0"), None).is_err());
+        // A hostname is looked up within a bound, and one with no address saves nothing.
+        let before = std::fs::read(host.state.join("host.json")).unwrap();
+        let e = configure_listener(&mut host, Some("flexvm-no-such-host.invalid:7070"), None).unwrap_err().to_string();
+        assert!(e.starts_with("listen address flexvm-no-such-host.invalid:7070: DNS lookup"), "{e}");
+        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
     }
 
     #[test]

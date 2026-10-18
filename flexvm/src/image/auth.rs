@@ -47,6 +47,7 @@ fn update(state: &Path, registry: &str, auth: Option<&str>) -> Result<()> {
     let parent = crate::host::Directory::open(state)?;
     let key = crate::host::keyed("registry-auth", &parent.stat()?, "");
     let _lock = crate::host::lock_at(crate::host::host_locks()?, &key, libc::LOCK_EX)?;
+    sweep(&parent.path);
     let mut config = read(&parent.path)?;
     let auths = config["auths"].as_object_mut().ok_or("auth.json has no auths object")?;
     match auth {
@@ -72,6 +73,16 @@ fn update(state: &Path, registry: &str, auth: Option<&str>) -> Result<()> {
         let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+/// The `.auth-*` copies a crashed update left: under the lock, no update is writing one.
+fn sweep(state: &Path) {
+    let Ok(entries) = std::fs::read_dir(state) else { return };
+    for e in entries.flatten() {
+        if e.file_name().as_encoded_bytes().starts_with(b".auth-") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 fn prompt(label: &str, secret: bool) -> Result<String> {
@@ -157,6 +168,18 @@ mod tests {
         assert!(Registry::with_state(Reference::parse("ghcr.io/o/a").unwrap(), &dir).is_err());
         assert!(Registry::with_state(Reference::parse("localhost:5000/a").unwrap(), &dir).is_ok());
         assert!(read(&dir).is_err());
+    }
+
+    #[test]
+    fn sweep_removes_only_crashed_update_copies() {
+        let dir = crate::test_util::TempDir::new("auth-sweep");
+        for f in [".auth-0123456789abcdef", ".auth-", "auth.json", ".authx"] {
+            std::fs::write(dir.join(f), b"{}").unwrap();
+        }
+        sweep(&dir);
+        let mut left: Vec<_> = std::fs::read_dir(&*dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, [".authx", "auth.json"]);
     }
 
     #[test]

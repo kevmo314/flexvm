@@ -1249,9 +1249,9 @@ impl Proc {
         let p = self.arc().ok_or("vm process gone")?;
         let sock = self.host.sock(&self.name())?;
         let _ = std::fs::remove_file(&sock);
-        let l = UnixListener::bind(&sock).map_err(|e| format!("vm {}: no control socket at {}: {e}", self.name(), sock.display()))?;
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+        // Bound in `RUN/vms/.locks` (0700, where its lock is held), never reachable by others.
+        let private = crate::host::locks(sock.parent().ok_or("control socket has no directory")?).join(format!(".{}.sock", std::process::id()));
+        let l = crate::socket::bind_private(&private, &sock).map_err(|e| format!("vm {}: no control socket at {}: {e}", self.name(), sock.display()))?;
         thread::Builder::new().spawn(move || {
             for c in l.incoming() {
                 let c = match c {
@@ -1261,6 +1261,10 @@ impl Proc {
                         continue;
                     }
                 };
+                // Should its mode ever loosen, still only root or this user.
+                if !crate::socket::trusted_peer(&c) {
+                    continue;
+                }
                 let Some(slot) = control_slot(&c, &CONTROL) else { continue };
                 let p = p.clone();
                 if let Err(e) = thread::Builder::new().spawn(move || p.control(c, slot)) {
@@ -3885,6 +3889,9 @@ mod tests {
         let sock = p.host.sock("bound").unwrap();
         p.serve_control().unwrap();
         let inode = std::fs::metadata(&sock).unwrap().ino();
+        // Moved from the 0700 lock directory, already private.
+        assert_eq!(std::fs::metadata(&sock).unwrap().mode() & 0o777, 0o600);
+        assert!(!crate::host::locks(sock.parent().unwrap()).join(format!(".{}.sock", std::process::id())).exists());
         p.serve_control().unwrap();
         assert_eq!(std::fs::metadata(&sock).unwrap().ino(), inode);
         let mut c = UnixStream::connect(&sock).unwrap();
