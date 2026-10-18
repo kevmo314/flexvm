@@ -52,6 +52,10 @@ pub struct Manifest {
     /// restore follows it from there, not from the start of the ring again.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub app_log: u64,
+    /// Its template's SHA-256 digests (`Meta::digests`): a restore onto a generation received from a peer
+    /// needs them to match (`Template::check_vouched`). None from v0.1.0, or a template built by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_digests: Option<BTreeMap<String, String>>,
     /// Its `run --cpus/--memory` caps, which a restore or resume keeps.
     #[serde(default, skip_serializing_if = "crate::vm::Resources::is_empty")]
     pub resources: crate::vm::Resources,

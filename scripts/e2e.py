@@ -31,7 +31,7 @@ Shards (CI runs pr in four splits side by side, heavy on a schedule):
 A scenario that finds this host lacks what it tests ends SKIP, not PASS; with
 --no-skips (CI) a SKIP fails the run.
 """
-import argparse, fcntl, glob, hashlib, ipaddress, json, os, re, select, shutil, signal, socket, struct, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, contextlib, fcntl, glob, hashlib, ipaddress, json, os, re, select, shutil, signal, socket, struct, subprocess, sys, tempfile, termios, threading, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -750,6 +750,154 @@ def migrate():
         check(f"{src.label} -> {dst.label}: same process", marker_id(dst, vm) == proc)
     conn.close()
     A.kill(vm)
+
+
+@contextlib.contextmanager
+def b_unpulled():
+    """B on an empty templates directory of its own (and no image cache), as a host that never pulled anything."""
+    link, images = os.path.join(B.state_dir, "templates"), os.path.join(B.state_dir, "images")
+    B.stop()
+    os.remove(link)
+    os.makedirs(link)
+    B.start()
+    try:
+        yield link
+    finally:
+        B.stop()
+        shutil.rmtree(link, ignore_errors=True)
+        shutil.rmtree(images, ignore_errors=True)
+        os.symlink(TEMPLATES, link)
+        B.start()
+
+
+def generations(templates):
+    gens = os.path.join(templates, ".gen")
+    return sorted(g for g in os.listdir(gens) if not g.startswith(".")) if os.path.isdir(gens) else []
+
+
+def template_id(host, name):
+    return {i["name"]: i["id"] for i in json.loads(host.cli("images", "--json").stdout)}.get(name)
+
+
+def moved(src, dst, vm, m, proc):
+    check(f"{src.label} -> {dst.label}: only on {dst.label}, running", wait_for(lambda: where(vm) == {dst.label: "running"}, 60), where(vm))
+    check(f"{src.label} -> {dst.label}: RAM intact", md5(dst, vm) == m)
+    check(f"{src.label} -> {dst.label}: same process", marker_id(dst, vm) == proc)
+
+
+@case
+def migrate_unpulled():
+    """migrate to a host that never pulled the image: the source sends the template first, by content id"""
+    vm, want = "e2e-unpulled", template_id(A, args.template)
+    with b_unpulled() as templates:
+        A.run(vm)
+        m, proc = fill(A, vm), marker(A, vm)
+        r = A.migrate(vm, B)
+        push = r.get("template_push") or {}
+        print(f"  A -> B: template sent ({push.get('sent_mib')} MiB) in {push.get('ms')} ms; downtime {r.get('downtime_ms')} ms")
+        check("A -> B: the template was sent", push.get("sent_mib", 0) > 0, r)
+        moved(A, B, vm, m, proc)
+        check("B: the source's generation, unnamed", generations(templates) == [want] and template_id(B, None) == want and not template_id(B, args.template),
+              json.loads(B.cli("images", "--json").stdout))
+        r = B.migrate(vm, A)
+        check("B -> A: nothing sent to a host that has it", r.get("template_push", {}).get("sent_mib") == 0, r)
+        moved(B, A, vm, m, proc)
+        r = A.migrate(vm, B)
+        check("A -> B again: nothing sent", r.get("template_push", {}).get("sent_mib") == 0, r)
+        moved(A, B, vm, m, proc)
+        # A checkpoint of it records the template's digests, which its restore onto the received copy needs.
+        path = ckpt_dir(vm)
+        B.checkpoint(vm, path, stop=True)
+        check("B: its checkpoint vouches for the received template", want in open(os.path.join(path, "manifest.json")).read()
+              and '"template_digests"' in open(os.path.join(path, "manifest.json")).read())
+        B.restore(path)
+        check("B: restored onto the received copy", md5(B, vm) == m and marker_id(B, vm) == proc)
+        shutil.rmtree(path, ignore_errors=True)
+        B.kill(vm)
+        # Stored checkpoints of it (the restore's) keep it too.
+        for ck in B.cli("checkpoint", "ls", "-q").stdout.split():
+            B.cli("checkpoint", "rm", "-f", ck)
+        # Once the listener lets go of it too (it holds it for the arrival to open).
+        pruned = []
+
+        def prune():
+            pruned.append(B.cli("image", "prune", "-f"))
+            return "deleted" in pruned[-1].stdout
+        check("B: the generation is pruned once unused", wait_for(prune, 40, 2) and generations(templates) == [], (pruned[-1].stdout, B.ps()))
+
+
+@case
+def migrate_other_build():
+    """the target pulled another build under the same tag: the source's generation is sent and the target's tag stays"""
+    vm, want = "e2e-other-build", template_id(A, args.template)
+    with b_unpulled() as templates:
+        B.cli("pull", TEST_IMAGE, "--tag", args.template, "--vcpus", "2", "--max", TEMPLATE_MAX, timeout=600)
+        theirs = template_id(B, args.template)
+        check("B: its own build, another content id", theirs and theirs != want, (theirs, want))
+        A.run(vm)
+        m, proc = fill(A, vm), marker(A, vm)
+        r = A.migrate(vm, B)
+        check("A -> B: the source's template was sent", r.get("template_push", {}).get("sent_mib", 0) > 0, r)
+        moved(A, B, vm, m, proc)
+        check("B: its tag still names its own build", template_id(B, args.template) == theirs)
+        check("B: the source's generation is there unnamed", generations(templates) == sorted([want, theirs]) and template_id(B, None) == want)
+        check("B: the VM runs the source's generation", want in B.cli("inspect", vm).stdout and theirs not in B.cli("inspect", vm).stdout)
+        moved_back = B.migrate(vm, A)
+        check("B -> A: back", moved_back.get("template_push", {}).get("sent_mib") == 0, moved_back)
+        moved(B, A, vm, m, proc)
+        A.kill(vm)
+
+
+@case
+def push_killed():
+    """a push whose receiver is killed half way leaves no generation there, and the VM runs on at its source"""
+    vm, want = "e2e-push-killed", template_id(A, args.template)
+    with b_unpulled() as templates:
+        A.run(vm)
+        m, proc = fill(A, vm), marker(A, vm)
+        B.cli("debug", "fault", "receive_hold", "120000")
+        mig = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "migrate", vm, B.addr], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+        gates = os.path.join(B.run_dir, "gates")
+        check("B: the push reached half way", wait_for(lambda: os.path.isdir(gates) and any(f.startswith("receive_hold.") for f in os.listdir(gates)), 120))
+        B.proc.kill()
+        B.proc.wait()
+        out, err = mig.communicate(timeout=120)
+        check("the migration failed", mig.returncode != 0, out)
+        print(f"  migrate: {err.strip()}")
+        check("A: the VM runs on", where(vm) == {"a": "running"} and md5(A, vm) == m and marker_id(A, vm) == proc, where(vm))
+        check("B: no generation", generations(templates) == [])
+        B.cli("debug", "fault", "receive_hold", "0")
+        shutil.rmtree(gates, ignore_errors=True)
+        B.proc = None
+        B.start()
+        r = A.migrate(vm, B)
+        check("A -> B once B is back: sent", r.get("template_push", {}).get("sent_mib", 0) > 0, r)
+        moved(A, B, vm, m, proc)
+        check("B: the killed push's staging is gone", generations(templates) == [want] and not [f for f in os.listdir(templates) if ".new-" in f], os.listdir(templates))
+        B.kill(vm)
+
+
+@case
+def migrate_unpulled_pair():
+    """two VMs of one template migrate at once to a host without it: it is sent once, both arrive"""
+    vms, want = ("e2e-pair-1", "e2e-pair-2"), template_id(A, args.template)
+    with b_unpulled() as templates:
+        for vm in vms:
+            A.run(vm)
+        state = {vm: (fill(A, vm), marker(A, vm)) for vm in vms}
+        out = {}
+        threads = [threading.Thread(target=lambda vm=vm: out.__setitem__(vm, A.migrate(vm, B))) for vm in vms]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        sent = sorted(out.get(vm, {}).get("template_push", {}).get("sent_mib", -1) for vm in vms)
+        check("both migrated, the template sent once", len(out) == 2 and sent[0] == 0 and sent[1] > 0, out)
+        for vm in vms:
+            moved(A, B, vm, *state[vm])
+        check("B: one generation", generations(templates) == [want])
+        for vm in vms:
+            B.kill(vm)
 
 
 @case

@@ -506,6 +506,13 @@ flexvm listen 192.168.1.11:7070          # on B
 flexvm migrate web 192.168.1.11:7070      # on A: web now runs on B, same address, connections intact
 ```
 
+The target need not have pulled the image: the source sends it the VM's
+template generation first (`template_push` in the output), by content id,
+while the VM runs. A target that pulled another build under the same tag
+(`:latest` moved, or the same image pulled separately) gets the source's too,
+unnamed: its own tag stays as it was, and `images` shows the sent one as
+`<none>` (`image prune` removes it once no VM uses it).
+
 Networking is routed IPv4: flexvm provides no NAT or automatic internet
 egress. Arrange upstream routes or NAT yourself if guests need it. There is
 no default DNS server; set `dns`.

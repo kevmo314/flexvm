@@ -1,8 +1,8 @@
 //! The peer listener (`flexvm listen`): a stateless, restartable helper
 //! (socket-activatable) that serves only configured peers. Each connection
 //! starts with one JSON line, consumed exactly through its newline so nothing after it is:
-//! `migrate_in`, `pages` (handed to the source VM process), `migration`
-//! (status/done), `route`, `lend`, `source` (source liveness).
+//! `template` (a migration's template, pushed before it), `migrate_in`, `pages` (handed to the source
+//! VM process), `migration` (status/done), `route`, `lend`, `source` (source liveness).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -38,6 +38,16 @@ const BUSY: &str = "host busy, try again";
 const MAX_ARRIVALS: usize = 8;
 const MAX_ARRIVALS_FROM: usize = MAX_ARRIVALS / 2;
 static ARRIVALS: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ARRIVALS, MAX_ARRIVALS_FROM));
+/// Templates being received (`template`) at once, in all and from any one peer; more are refused as
+/// busy. Two arrivals of one template take turns at one (`template::turn`): the second sends nothing.
+const MAX_PUSHES: usize = 4;
+const MAX_PUSHES_FROM: usize = 2;
+static PUSHES: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_PUSHES, MAX_PUSHES_FROM));
+/// A push is answered within this of its request, its turn and all its bytes (`template::MAX_DATA`) included.
+pub const PUSH_WAIT: Duration = Duration::from_secs(600);
+/// How long the generation stays open after the answer: until the arrival, whose request follows at once,
+/// has opened it itself (`open_id`) or been refused.
+const PUSH_HOLD: Duration = Duration::from_secs(REQUEST_DEADLINE.as_secs() + PREPARE_WAIT.as_secs());
 /// An arrival is prepared, or refused, within this of its request's accept: well within
 /// its source's preflight (`migrate::PREFLIGHT_TIMEOUT`, 10 s from before it connects).
 pub const PREPARE_WAIT: Duration = Duration::from_secs(7);
@@ -595,6 +605,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
             };
         }
         "pages" => return pages(host, &req, conn),
+        "template" => return push(host, &req, conn),
         _ if matches!(locking, Some(None)) => Err(BUSY.into()),
         "migration" => migration(host, &req),
         // Its peers by address, those configured by name too, and the one asking.
@@ -776,6 +787,66 @@ fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         crate::vmproc::refuse_not_source(conn, name, &req["mig"]);
     }
     Ok(())
+}
+
+/// `template`: whether this host has generation `id` (by content id only: no name here counts), answered
+/// `have`; if not, receiving it (`template::receive`), answered again once published. Both before the
+/// source pauses anything. Either way it stays open for `PUSH_HOLD`, so nothing removes it before the arrival opens it.
+fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
+    let at = Instant::now() + PUSH_WAIT;
+    let answer = |r: &Result<Value>| send_json(&mut crate::util::By { s: &conn, at }, &crate::util::reply(r));
+    let (paths, id) = (crate::template::Paths::new(&host.state), req["id"].as_str().unwrap_or(""));
+    let mut asked = false;
+    let got = PUSHES.take(conn.peer_addr()?.ip()).ok_or(BUSY.into()).and_then(|_slot| {
+        let _turn = crate::template::turn(&paths, id, at)?;
+        let held = HELD.lock().unwrap().get(id).map(|h| h.0.clone());
+        if let Some(tpl) = held.map(Ok).or_else(|| crate::template::Template::generation(&paths, id).map(|dir| crate::template::Template::open_dir(id, dir))) {
+            // A received one's digests, for the source to compare: its content id is no proof of its files.
+            return tpl.inspect(|t| drop(answer(&Ok(json!({"have": true, "digests": t.meta.received.then_some(&t.meta.digests)})))));
+        }
+        answer(&Ok(json!({"have": false})))?;
+        asked = true;
+        crate::template::receive(&paths, &mut std::io::BufReader::new(crate::util::By { s: &conn, at }), id)
+    });
+    match got {
+        Ok(tpl) => {
+            if asked {
+                answer(&Ok(json!({"received": true, "digests": tpl.meta.digests})))?;
+            }
+            hold(tpl);
+        }
+        Err(e) => {
+            answer(&Err(e))?;
+            // What the source still sends, so it reads the answer instead of a reset.
+            let _ = conn.shutdown(std::net::Shutdown::Write);
+            let _ = std::io::copy(&mut crate::util::By { s: &conn, at: Instant::now() + Duration::from_secs(30) }, &mut std::io::sink());
+        }
+    }
+    Ok(())
+}
+
+/// Generations held for arrivals, by content id, until when: one hold (and thread) each, however often asked.
+static HELD: Mutex<std::collections::BTreeMap<String, (Arc<crate::template::Template>, Instant)>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Generations held at once at most: past it, an arrival's own `open_id` must come before any `rmi` does.
+const MAX_HELD: usize = 16;
+
+fn hold(tpl: Arc<crate::template::Template>) {
+    let (id, mut held) = (tpl.meta.id.clone(), HELD.lock().unwrap());
+    if held.len() >= MAX_HELD && !held.contains_key(&id) || held.insert(id.clone(), (tpl, Instant::now() + PUSH_HOLD)).is_some() {
+        return;
+    }
+    drop(held);
+    std::thread::spawn(move || loop {
+        let mut held = HELD.lock().unwrap();
+        let left = held[&id].1.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            held.remove(&id);
+            return;
+        }
+        drop(held);
+        std::thread::sleep(left);
+    });
 }
 
 /// The host lock, waited for `LOCK_WAIT` at most: then refused as busy.

@@ -1,5 +1,6 @@
 //! Post-copy live migration over one TCP connection to the target's listener:
-//! `migrate_in` + answer (before the pause); header, vmstate, preload; commit
+//! `template` (the template, unless the target has it) and `migrate_in` + answer (before the
+//! pause); header, vmstate, preload; commit
 //! answer; held packets. The target pulls the rest via `pages`.
 //! Ownership: the target commits (`STATE/migs/ID`) before the VM runs there.
 //! The source resumes only on a refusal or `aborted` (never committed, or the
@@ -120,8 +121,17 @@ impl Proc {
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
+        // Right before the prepare, which opens it there (`listen::PUSH_HOLD`).
+        let pushed = push_template(to, &vm.template)?;
+        if pushed.is_none() && !vm.template.names_rootfs_by_path()? {
+            bail!("{to} runs flexvm v0.1.0, which cannot load template {} (built since): upgrade it first", vm.template.meta.id);
+        }
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
-        let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
+        let vouched = pushed.as_ref().map_or(Value::Null, |p| p.1.clone());
+        let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict, vouched).map_err(|e| match &pushed {
+            None => format!("{e} ({to} is too old to be sent template {}: it migrates in only VMs of templates it has)", vm.template.meta.id).into(),
+            Some(_) => e,
+        })?;
         // Before the pause: dropped, the connection ends the target's arrival.
         check_app_support(to, &vm.name.get(), &prepared, &self.spec.lock().unwrap().moving(), vm.template.meta.image.as_ref())?;
         let prepare = prep.elapsed();
@@ -242,6 +252,7 @@ impl Proc {
             "name": vm.name,
             "to": to,
             "mig": mig,
+            "template_push": pushed.map(|p| p.0),
             "settle_hotplug_ms": ms(settle),
             "prepare_ms": ms(prepare),
             "unthrottle_ms": ms(unthrottle),
@@ -260,7 +271,8 @@ impl Proc {
         }))
     }
 
-    fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool) -> Result<(TcpStream, Value)> {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool, vouched: Value) -> Result<(TcpStream, Value)> {
         let pid = vm.pid().ok_or("firecracker is gone")?;
         let msrs = crate::compat::local(pid)?.msrs;
         let tsc_khz = vm.tsc_khz;
@@ -274,6 +286,8 @@ impl Proc {
                 "mig": mig,
                 "template": vm.template.name,
                 "id": vm.template.meta.id,
+                // For a copy the target received from a peer: what this host's files digest to (`push_template`).
+                "template_digests": vouched,
                 "ip": vm.ip.to_string(),
                 "gen": gen,
                 "rev": self.rev(),
@@ -859,6 +873,8 @@ impl Proc {
         self.serve_control()?;
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
+        // One received from a peer only for a source with the same files: its content id proves none.
+        tpl.check_vouched(serde_json::from_value(req["template_digests"].clone()).ok().as_ref(), "this source (a v0.1.0 one cannot)")?;
         // Its caps move with it (the same template: they fit).
         // Refused before the source pauses: a capped VM never runs uncapped here.
         self.keep_resources(serde_json::from_value(req["resources"].clone()).unwrap_or_default())?;
@@ -1006,6 +1022,33 @@ impl Proc {
         self.publish();
         Ok(vm)
     }
+}
+
+/// Has `to` take generation `tpl`, by content id, before anything else of a migration (so before the
+/// pause): sent unless it has it. Returns its timings and, for a copy `to` received from a peer, the
+/// digests this host vouches for it with (`template::digests`), which the arrival checks. None if `to`
+/// is too old to be sent one (then it must have it).
+fn push_template(to: &str, tpl: &Template) -> Result<Option<(Value, Value)>> {
+    let (start, at) = (Instant::now(), Instant::now() + crate::listen::PUSH_WAIT);
+    let fail = |e: Error| -> Error { format!("cannot send template {} to {to}: {e}", tpl.meta.id).into() };
+    // Before the request: once answered, the target holds the generation only so long (`listen::PUSH_HOLD`).
+    let ours = json!(tpl.digests()?);
+    let (conn, mut reply) = match crate::util::rpc(to, Duration::from_secs(2), at, &json!({"op": "template", "id": tpl.meta.id})) {
+        Err(e) if e.to_string().contains("unknown op \"template\"") => return Ok(None),
+        r => r.map_err(fail)?,
+    };
+    let mut sent = 0;
+    if reply["have"] != json!(true) {
+        let n = crate::template::send(tpl, &mut std::io::BufWriter::with_capacity(1 << 20, By { s: &conn, at }));
+        // Its answer says more than a failed write: it may have refused the template part way.
+        reply = crate::util::recv_json(&mut BufReader::new(By { s: &conn, at })).and_then(|r| crate::util::answer(r, to, "refused")).map_err(fail)?;
+        sent = n.map_err(fail)?;
+    }
+    let digests = if reply["digests"].is_null() { Value::Null } else { ours };
+    if digests != reply["digests"] {
+        bail!("{to} has a copy of template {} received from a peer whose files differ from this host's: remove it there (flexvm rmi {0})", tpl.meta.id);
+    }
+    Ok(Some((json!({"sent_mib": sent >> 20, "ms": ms(start.elapsed())}), digests)))
 }
 
 /// Header, state, preload and commit reply share one cap: partial writes cannot extend the pause.

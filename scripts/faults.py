@@ -3151,6 +3151,11 @@ def arrival_killed_route():
     forget_peer_route(ip, gen)
 
 
+def rootfs_link(d, template):
+    """What a template's snapshot names its root filesystem (`template::ROOTFS`), as flexvm links it in each Firecracker's directory."""
+    os.symlink(json.load(open(os.path.join(A.state, "templates", template, "meta.json")))["rootfs"], os.path.join(d, "rootfs"))
+
+
 def fc_prepare():
     """Firecracker's prepared load (firecracker/0002-*.patch): refuses a second
     prepare, a snapshot of another layout, and a load after boot config."""
@@ -3168,7 +3173,8 @@ def fc_prepare():
         uffd.listen(1)
         held = []
         threading.Thread(target=lambda: held.append(uffd.accept()), daemon=True).start()
-        p = subprocess.Popen([fc, "--api-sock", f"{d}/api.sock", "--level", "Warn"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        rootfs_link(d, args.template)
+        p = subprocess.Popen([fc, "--api-sock", f"{d}/api.sock", "--level", "Warn"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=d)
         wait_for(lambda: os.path.exists(f"{d}/api.sock"), 5)
 
         def put(path, body):
@@ -3225,8 +3231,9 @@ def forged_vmstate():
         f.write(b"\0" * (1 << 20))
 
     def start_fc(d, *wrap):
+        rootfs_link(d, args.template)
         p = subprocess.Popen([*wrap, fc, "--api-sock", f"{d}/api.sock", "--level", "Warn"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=d)
         wait_for(lambda: os.path.exists(f"{d}/api.sock"), 5)
 
         def api(method, path, body):
@@ -6486,7 +6493,8 @@ def evict_peer_busy():
             configure(A, peers=[B.addr])
     with open(os.path.join(A.run, "evict.backoff")) as f:
         backoff = json.load(f)
-    check("evict peer busy: the stub was asked", "migrate_in" in stub.asked, stub.asked)
+    # Its template first (`template`): refused there, the eviction moves on as for any refusal.
+    check("evict peer busy: the stub was asked", stub.asked and set(stub.asked) <= {"template", "migrate_in"}, stub.asked)
     check("evict peer busy: moved to the next peer", moved, (where(n), log(A, n)[-1500:]))
     check("evict peer busy: the stub is backed off", f"{v['pid']}-{v['start']} {stub.addr}" in backoff, backoff)
     check("evict peer busy: md5 intact", md5(B, n) == m)
