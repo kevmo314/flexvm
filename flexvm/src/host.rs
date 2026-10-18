@@ -1127,14 +1127,7 @@ impl Host {
     /// Durable: a claim let go after an outcome was settled must stay gone across a crash.
     /// Its published revision (`publish_live`) goes with it.
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
-        let mut released = None;
-        self.update(l, ip, true, |a| {
-            let by = |h: &Ident| id.is_none_or(|id| id == h);
-            if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
-                released = a.holder_id.take();
-                (a.holder, a.arriving, a.leaving) = (None, None, None);
-            }
-        })?;
+        let released = self.update(l, ip, true, |a| let_go(a, holder, id))?;
         if let Some(id) = id.or(released.as_ref()) {
             self.unpublish(l, ip, id);
         }
@@ -1202,8 +1195,14 @@ impl Host {
     /// The record's revision may trail the one its holder here runs at (published, `live`): the
     /// newer of the two decides.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
+        self.observe_and(l, ip, gen, rev, via, |_| ())
+    }
+
+    /// `observe`, with `also` applied to the record in the same write.
+    fn observe_and(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>, also: impl FnOnce(&mut Addr)) -> Result<bool> {
         let live = via.and_then(|_| self.live_of(ip, &self.addr(l, ip).ok()?)).unwrap_or(0);
         self.update(l, ip, true, |a| {
+            also(a);
             if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev.max(live))) {
                 return false;
             }
@@ -2182,6 +2181,17 @@ pub struct Addr {
     pub leaving: Option<Leaving>,
 }
 
+/// Lets go of `holder`'s claim in `a`; with `id`, only that instance's. The instance let go, if any.
+fn let_go(a: &mut Addr, holder: &str, id: Option<&Ident>) -> Option<Ident> {
+    let by = |h: &Ident| id.is_none_or(|id| id == h);
+    if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
+        let released = a.holder_id.take();
+        (a.holder, a.arriving, a.leaving) = (None, None, None);
+        return released;
+    }
+    None
+}
+
 impl Addr {
     pub fn current(&self, gen: u64) -> bool {
         gen > self.seen || (gen == self.seen && !self.withdrawn)
@@ -3011,16 +3021,6 @@ impl Host {
                 }
                 continue;
             }
-            // A withdrawal recorded before a failed release leaves a non-current claim.
-            if !a.current(gen) {
-                if self.dead_and_reaped(&a, true) {
-                    if let Err(e) = self.release(&l, ip, name, a.holder_id.as_ref()) {
-                        crate::log!("letting go of {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
-                        unrecorded.get_or_insert(e);
-                    }
-                }
-                continue;
-            }
             if !self.died_holding(&a, ip, &pulling, &released) {
                 continue;
             }
@@ -3029,16 +3029,17 @@ impl Host {
                 unrecorded.get_or_insert(e);
                 continue;
             }
-            if let Err(e) = self.withdraw_noted(&l, ip, gen) {
+            // Withdrawn and let go in one write (#698): should it fail, the claim is still current
+            // and held by the dead process, so the next sweep proves its death and retries both.
+            if let Err(e) = self.withdraw_noted_and(&l, ip, gen, |r| drop(let_go(r, name, a.holder_id.as_ref()))) {
                 crate::log!("withdrawing {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
                 unrecorded.get_or_insert(e);
                 continue;
             }
-            crate::log!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
-            if let Err(e) = self.release(&l, ip, name, a.holder_id.as_ref()) {
-                crate::log!("letting go of {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
-                unrecorded.get_or_insert(e);
+            if let Some(id) = a.holder_id.as_ref() {
+                self.unpublish(&l, ip, id);
             }
+            crate::log!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
             crate::net::unroute(ip);
             withdrawn.push((name.to_string(), ip, gen));
         }
@@ -3055,6 +3056,11 @@ impl Host {
     /// A notice of an older generation is replaced; a newer one is kept.
     /// A notice of the same generation and an older revision is replaced too.
     pub fn withdraw_noted(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
+        self.withdraw_noted_and(l, ip, gen, |_| ())
+    }
+
+    /// `withdraw_noted`, with `also` applied to the record in the withdrawal's write.
+    fn withdraw_noted_and(&self, l: &Locked, ip: Ipv4Addr, gen: u64, also: impl FnOnce(&mut Addr)) -> Result<bool> {
         let peers = self.config_now().peers;
         let path = self.notice_path(ip);
         let rev = self.withdrawal_rev(l, ip, gen);
@@ -3062,7 +3068,7 @@ impl Host {
             let peers = peers.into_iter().map(|peer| Unheard { peer, tries: 0, next_ms: 0 }).collect();
             store(&path, &Notice { gen, rev, peers }, true)?;
         }
-        self.observe(l, ip, gen, 0, None)
+        self.observe_and(l, ip, gen, 0, None, also)
     }
 
     /// The latest revision of generation `gen` of `ip` here: the record's, or what the VM that
@@ -5324,7 +5330,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn gc_reports_failed_release_after_withdrawal_and_retries_it() {
+    fn gc_reports_a_failed_withdrawal_and_release_and_retries_both() {
         let (_dir, mut h) = host("release-withdrawn");
         h.cfg.peers = vec!["peer".into()];
         let (x, y) = (ip("10.9.1.1"), ip("10.9.1.2"));
@@ -5332,12 +5338,7 @@ pub(crate) mod tests {
         let a = Addr { seen: 4, held: 4, holder: Some("failed".into()), holder_id: Some(gone.clone()), ..Addr::default() };
         h.put_addr(x, &a, false).unwrap();
         h.put_addr(y, &Addr { holder: Some("healthy".into()), holder_id: Some(gone), ..a.clone() }, false).unwrap();
-        // The state left when the notice and withdrawal succeed but releasing the claim fails.
-        let l = h.lock().unwrap();
-        h.withdraw_noted(&l, x, 4).unwrap();
-        let a = h.addr(&l, x).unwrap();
-        assert!(a.withdrawn && a.holder.is_some() && h.notice_path(x).exists(), "{a:?}");
-        drop(l);
+        // The record's write, which both withdraws and lets go of the claim, fails.
         let path = h.addr_path(x);
         let blocked = path.with_file_name(format!(".{}.{}.tmp", path.file_name().unwrap().to_str().unwrap(), crate::util::write_tag()));
         std::fs::create_dir(&blocked).unwrap();
@@ -5345,12 +5346,13 @@ pub(crate) mod tests {
             let error = h.collect_garbage_with(false).unwrap_err().to_string();
             assert!(error.contains(path.to_str().unwrap()), "{error}");
             let l = h.lock().unwrap();
-            assert_eq!(h.addr(&l, x).unwrap(), a, "failed release keeps its claim");
+            assert_eq!(h.addr(&l, x).unwrap(), a, "neither withdrawn nor let go: still the dead holder's current claim");
+            assert!(h.notice_path(x).exists(), "the notice is recorded first");
             let other = h.addr(&l, y).unwrap();
             assert!(other.withdrawn && other.holder.is_none(), "sweep continues after errors: {other:?}");
         }
         std::fs::remove_dir(&blocked).unwrap();
-        h.collect_garbage_with(false).unwrap();
+        assert_eq!(h.collect_garbage_with(false).unwrap(), vec![("failed".to_string(), x, 4)]);
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
         assert!(a.withdrawn && a.holder.is_none() && a.holder_id.is_none(), "retried: {a:?}");
     }
