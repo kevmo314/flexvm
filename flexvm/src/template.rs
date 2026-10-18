@@ -1160,9 +1160,8 @@ pub fn tag(paths: &Paths, src: &str, dst: &str) -> Result<Value> {
     Ok(json!({"tagged": image_of(&dst), "id": id}))
 }
 
-/// Prune only generations with no record or open template using them. Named generations
-/// are unlinked only after the use lock and the fresh records both prove them unused.
-pub fn prune(paths: &Paths, all: bool, in_use: &dyn Fn() -> Result<BTreeSet<String>>) -> Result<Vec<Value>> {
+/// `image prune`: each unnamed generation, as `rmi ID` would remove it; those still used stay.
+pub fn prune(paths: &Paths, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Vec<Value>> {
     if !paths.templates.exists() {
         return Ok(vec![]);
     }
@@ -1172,23 +1171,9 @@ pub fn prune(paths: &Paths, all: bool, in_use: &dyn Fn() -> Result<BTreeSet<Stri
     sweep_locked(paths)?;
     let mut removed = vec![];
     for id in generations(&paths.templates)? {
-        let names: Vec<_> = names(&paths.templates)?.into_iter().filter(|(_, g)| g == &id).map(|(n, _)| n).collect();
-        if !all && !names.is_empty() {
-            continue;
+        if let Ok(rootfs) = delete_unused(paths, &id, in_use)? {
+            removed.push(json!({"deleted": id, "rootfs": rootfs}));
         }
-        let gen = paths.templates.join(GENERATIONS).join(&id);
-        let st = crate::util::fstat(File::open(&gen)?.as_raw_fd())?;
-        let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else { continue };
-        if in_use()?.contains(&id) {
-            continue;
-        }
-        for name in &names {
-            std::fs::remove_file(paths.templates.join(name))?;
-        }
-        crate::util::sync_dir(&paths.templates)?;
-        let mut result = delete_generation(paths, &id, None)?;
-        result["untagged"] = json!(names);
-        removed.push(result);
     }
     Ok(removed)
 }
@@ -1221,35 +1206,32 @@ pub(crate) fn remove_locked(paths: &Paths, name: Option<&str>, id: &str, in_use:
         std::fs::remove_file(&link)?;
         crate::util::sync_dir(&paths.templates)?;
     }
-    let kept = |reason: String, refusal: String| -> Result<Value> {
-        if name.is_none() {
-            bail!("{refusal}");
-        }
-        Ok(json!({"untagged": name, "kept": id, "reason": reason}))
-    };
-    let names = names(&paths.templates)?;
-    if let Some((other, _)) = names.iter().find(|(_, i)| i == id) {
-        return kept(format!("{} is the same image", image_of(other)), format!("image {id} is {0}; remove that: flexvm rmi {0}", image_of(other)));
+    match delete_unused(paths, id, in_use)? {
+        Ok(rootfs) => Ok(json!({"untagged": name, "deleted": id, "rootfs": rootfs})),
+        Err((reason, _)) if name.is_some() => Ok(json!({"untagged": name, "kept": id, "reason": reason})),
+        Err((_, refusal)) => bail!("{refusal}"),
+    }
+}
+
+/// Deletes generation `id` and the root filesystem only it used, unless a name links to it or a
+/// VM here has it open or uses it: then it is kept, with the reason and the refusal to give.
+fn delete_unused(paths: &Paths, id: &str, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<std::result::Result<Option<PathBuf>, (String, String)>> {
+    if let Some((other, _)) = names(&paths.templates)?.iter().find(|(_, i)| i == id) {
+        return Ok(Err((format!("{} is the same image", image_of(other)), format!("image {id} is {0}; remove that: flexvm rmi {0}", image_of(other)))));
     }
     let gens = paths.templates.join(GENERATIONS);
     // Kept while a VM process has it open (one starting has no registry entry yet).
     let st = crate::util::fstat(File::open(gens.join(id))?.as_raw_fd())?;
     let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else {
-        return kept("open in a VM process here".into(), format!("image {id} is open in a VM process here"));
+        return Ok(Err(("open in a VM process here".into(), format!("image {id} is open in a VM process here"))));
     };
     if in_use().contains(id) {
-        return kept("used by a VM here".into(), format!("image {id} is used by a VM here"));
+        return Ok(Err(("used by a VM here".into(), format!("image {id} is used by a VM here"))));
     }
-    delete_generation(paths, id, name)
-}
-
-fn delete_generation(paths: &Paths, id: &str, name: Option<&str>) -> Result<Value> {
-    let gens = paths.templates.join(GENERATIONS);
     let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
     std::fs::rename(gens.join(id), &tombstone)?;
     crate::util::sync_dir(&gens)?;
-    let removed_rootfs = finish_remove(paths, &tombstone)?;
-    Ok(json!({"untagged": name, "deleted": id, "rootfs": removed_rootfs}))
+    Ok(Ok(finish_remove(paths, &tombstone)?))
 }
 
 /// Under the templates lock. A tombstone's generation is gone, but it stays a rootfs user until
@@ -1588,46 +1570,32 @@ mod tests {
     }
 
     #[test]
-    fn tag_reuses_generations_and_prune_keeps_all_users() {
+    fn tag_names_generations_and_prune_removes_only_unused_unnamed_ones() {
         let f = Fixture::new();
         let gen = |id: &str| Meta { id: id.into(), image: Some(image("sha256:a", "")), ..f.meta.clone() };
         publish_as(&f, "t", &gen("aaaa1111"));
         tag(&f.paths, "t", "ghcr.io/org/app:v1").unwrap();
         let alias = name_of("ghcr.io/org/app:v1").unwrap();
         assert_eq!(Template::resolve(&f.paths, "t").unwrap(), Template::resolve(&f.paths, &alias).unwrap());
-        assert_eq!(generations(&f.paths.templates).unwrap(), ["aaaa1111"]);
-        tag(&f.paths, "aaaa", "other").unwrap();
         assert!(tag(&f.paths, "t", "../bad").is_err());
         assert!(tag(&f.paths, "missing", "new").is_err());
+        // The name moves on; the alias keeps the old generation, so nothing is unnamed.
         publish_as(&f, "t", &gen("bbbb2222"));
-        assert!(prune(&f.paths, false, &|| Ok(BTreeSet::new())).unwrap().is_empty());
-        let users = || Ok(BTreeSet::from(["aaaa1111".into()]));
-        let deleted = prune(&f.paths, true, &users).unwrap();
-        assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0]["deleted"], "bbbb2222");
-        assert!(f.paths.templates.join(&alias).is_symlink(), "used names stay");
+        assert!(prune(&f.paths, &BTreeSet::new).unwrap().is_empty());
+        // By ID prefix, an existing name moves too: now aaaa1111 is unnamed.
+        tag(&f.paths, "bbbb", &alias).unwrap();
+        publish_as(&f, "t", &gen("cccc3333"));
+        let users = || BTreeSet::from(["aaaa1111".to_string()]);
+        assert!(prune(&f.paths, &users).unwrap().is_empty(), "a VM record uses it");
         let handle = File::open(f.paths.templates.join(GENERATIONS).join("aaaa1111")).unwrap();
         let st = crate::util::fstat(handle.as_raw_fd()).unwrap();
         let held = crate::host::lock_at(crate::host::host_locks().unwrap(), &crate::host::use_lock(&st), libc::LOCK_SH).unwrap();
-        assert!(prune(&f.paths, true, &|| Ok(BTreeSet::new())).unwrap().is_empty());
-        assert!(f.paths.templates.join("other").is_symlink(), "open standby/VM retains its names");
-        drop(held);
-        assert_eq!(prune(&f.paths, true, &|| Ok(BTreeSet::new())).unwrap().len(), 1);
-        assert!(images(&f.paths).unwrap().is_empty());
-    }
-
-    #[test]
-    fn prune_unnamed_generations_and_propagate_record_errors() {
-        let f = Fixture::new();
-        for id in ["aaaa1111", "bbbb2222"] {
-            publish_as(&f, "t", &Meta { id: id.into(), ..f.meta.clone() });
-        }
-        assert!(prune(&f.paths, false, &|| Err("cannot read checkpoint".into())).is_err());
-        assert_eq!(generations(&f.paths.templates).unwrap().len(), 2);
-        let removed = prune(&f.paths, false, &|| Ok(BTreeSet::new())).unwrap();
+        assert!(prune(&f.paths, &BTreeSet::new).unwrap().is_empty(), "a VM process has it open");
+        drop((held, handle));
+        let removed = prune(&f.paths, &BTreeSet::new).unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0]["deleted"], "aaaa1111");
-        assert!(f.paths.templates.join("t").is_symlink());
+        assert_eq!(generations(&f.paths.templates).unwrap(), ["bbbb2222", "cccc3333"]);
     }
 
     #[test]

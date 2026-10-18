@@ -356,9 +356,6 @@ impl Proc {
         }
         self.set_name(self.host.take_name(&name, false)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
-        for checkpoint in std::iter::once(&ck.dir).chain(ck.chain.iter()) {
-            self.host.track_checkpoint(checkpoint)?;
-        }
         self.set_resources(resources.or(ck.manifest.resources), &tpl.meta)?;
         // Decided and claimed under one lock, by one reading of the range: a change
         // between them cannot send a local address to `claim_new` as foreign.
@@ -832,7 +829,6 @@ impl Proc {
         let committed = staging.commit(vm, src, &frozen.runs, parent, plugged.unwrap_or(0), t, || {
             cancelled()?;
             before_publish()?;
-            self.host.track_checkpoint(&dest)?;
             if fault("ckpt_fail_write") {
                 bail!("injected fault: writing the checkpoint failed");
             }

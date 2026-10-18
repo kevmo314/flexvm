@@ -418,13 +418,13 @@ flexvm pull ./oci-layout --tag py --cmd "python3 -m http.server 8000"
 flexvm pull nginx:1.27 --tag web-warm --warm            # snapshot the app running and ready
 flexvm run -d --name web1 nginx:1.27 && curl http://<ip>/
 flexvm images                                           # what is pulled (--json: all of it)
-flexvm images -q --filter 'reference=nginx:*'             # unique generation IDs
-flexvm images --filter dangling=true                     # generations with no name
-flexvm tag nginx:1.27 app:production                      # another name, without a build
-flexvm image prune -f                                    # unused <none> generations
-flexvm system prune -a -f                                # also unused named images, failed/lost records, blobs
-flexvm system df                                         # allocated disk bytes by kind
-flexvm version                                           # version, commit and artifact pins
+flexvm images -q --filter 'reference=nginx:*'           # unique generation IDs
+flexvm images --filter dangling=true                    # generations with no name
+flexvm tag nginx:1.27 app:production                    # another name, without a build
+flexvm image prune -f                                   # unused <none> generations
+flexvm system prune -f                                  # also failed/lost VM records and layer blobs
+flexvm system df                                        # allocated disk bytes by kind
+flexvm version                                          # version, commit and artifact pins
 flexvm rmi nginx:1.27                                   # refused while a VM here uses it
 ```
 
@@ -447,6 +447,7 @@ image built with other options alongside its plain pull. `tag SRC DST` gives
 an already pulled generation another name using those same naming rules;
 SRC can also be a generation ID or unique prefix. An existing DST moves to
 that generation; the previous generation remains available to its users.
+Pulling either name again moves only that name.
 `images -q` prints each selected generation ID once, even with several names.
 `--filter reference=PATTERN` matches the familiar reference (`nginx:latest`,
 for example) with shell wildcards (`*`, `?`, brackets); quote it in the shell.
@@ -471,23 +472,15 @@ standby count to 0 and waits for its standby VMs to go first. Checkpoints elsewh
 generation cannot be restored here any more. Layer blobs (`images/blobs/`)
 are a download cache and stay until `system prune`.
 
-`image prune` removes unnamed generations with no VM, standby or tracked
-checkpoint using them; `-a` includes unused named generations. It keeps all
-names of a used generation and images with a configured standby count.
-`system prune` additionally removes failed/lost VM records and downloaded
-blobs unused by an active pull. Templates use extracted root filesystems,
-so their downloaded blobs can be reclaimed without affecting VMs. Both
-commands list removals and allocated bytes reclaimed, ask for confirmation
-on a terminal, and refuse without one unless `-f` is given. Running, paused
-and suspended VMs and checkpoint data remain.
-
-Checkpoint destinations created or restored by this state directory are
-tracked in `STATE/checkpoints/`; prune protects their generation while the
-manifest exists. Checkpoints moved or copied elsewhere, or created before tracking
-was introduced must be retained by keeping an image name (and avoiding
-`-a`), or restored here once to register them. `system df` reports allocated
-bytes for image root filesystems, templates, blobs, VM records/logs and
-checkpoints, counting hard links once and including tracked destinations.
+`image prune` removes each `<none>` generation as `rmi ID` would: those a
+VM here uses (running, paused, standby or stopped) stay, and, as with `rmi`,
+checkpoints elsewhere that pin a pruned generation cannot be restored here any
+more. `system prune` also removes failed and lost VM records and the layer
+blob cache (left alone while a pull runs). Both list what they remove and the
+bytes reclaimed, and ask first on a terminal; without one they need `-f`.
+`system df` reports allocated bytes for image root filesystems, templates,
+blobs, VM records and logs, and stopped VMs' checkpoints, counting hard links
+once.
 
 **Registry credentials.** `flexvm login [REGISTRY]` defaults to Docker Hub.
 It verifies the supplied credentials over HTTPS before saving them in

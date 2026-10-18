@@ -71,9 +71,9 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      of an image pulled here, alone it only sets that count
   flexvm images [-q] [--json] [--filter reference=PATTERN|dangling=true|false]
                                      list pulled images (-q: unique generation IDs)
-  flexvm tag SRC DST                name a pulled generation again, without rebuilding
-  flexvm image prune [-a] [-f]       remove unused unnamed generations (-a: named ones too)
-  flexvm system prune [-a] [-f]      also remove failed/lost VM records and unused blobs
+  flexvm tag SRC DST                 name a pulled generation again, without rebuilding
+  flexvm image prune [-f]            remove <none> generations no VM here uses (-f: without asking)
+  flexvm system prune [-f]           also failed and lost VM records and the layer blob cache
   flexvm system df                   disk space by images, templates, blobs, VMs and checkpoints
   flexvm version                     version, commit and artifact information
   flexvm login [REGISTRY] [--username USER] [--password-stdin]
@@ -293,8 +293,8 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("pull", 2, &["tag", "vcpus", "mem", "max", "plug", "standby"]),
     ("images", 1, &["json", "quiet", "filter"]),
     ("tag", 3, &[]),
-    ("image", 2, &["all", "force"]),
-    ("system", 2, &["all", "force"]),
+    ("image", 2, &["force"]),
+    ("system", 2, &["force"]),
     ("version", 1, &[]),
     ("login", 2, &["username", "password-stdin"]),
     ("logout", 2, &[]),
@@ -332,7 +332,7 @@ fn check_applies(args: &Args) -> Result<()> {
         "tag" if args.names().len() != 2 => bail!("tag needs SRC DST"),
         "image" if first.map(String::as_str) != Some("prune") => bail!("image needs prune"),
         "system" if !matches!(first.map(String::as_str), Some("prune" | "df")) => bail!("system needs prune or df"),
-        "system" if first.map(String::as_str) == Some("df") && (args.has("all") || args.has("force")) => bail!("system df takes no --all or --force"),
+        "system" if first.map(String::as_str) == Some("df") && args.has("force") => bail!("system df takes no -f"),
         "images" if args.has("quiet") && args.has("json") => bail!("images takes either -q or --json"),
         _ => {}
     }
@@ -1746,7 +1746,7 @@ mod exec_tests {
         for argv in [
             vec!["images", "-q", "--filter", "reference=app:*", "--filter", "dangling=false"],
             vec!["tag", "src", "dst"],
-            vec!["image", "prune", "-a", "-f"],
+            vec!["image", "prune", "-f"],
             vec!["system", "prune", "--force"],
             vec!["system", "df"],
             vec!["version"],
@@ -1761,6 +1761,7 @@ mod exec_tests {
             vec!["image", "df"],
             vec!["system", "df", "-f"],
             vec!["system", "df", "-a"],
+            vec!["image", "prune", "-a"],
             vec!["system"],
             vec!["images", "-q", "--json"],
             vec!["version", "--filter", "x=y"],

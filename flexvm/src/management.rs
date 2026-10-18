@@ -82,14 +82,14 @@ fn usage(path: &Path) -> Result<u64> {
     disk_usage(path, &mut BTreeSet::new())
 }
 
-fn confirm(force: bool) -> Result<()> {
+fn confirm(force: bool, what: &str) -> Result<()> {
     if force {
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
-        bail!("prune needs a terminal for confirmation; use -f to prune without prompting");
+        bail!("prune asks first, on a terminal; -f prunes without asking");
     }
-    output(format_args!("Remove unused images and requested system data? [y/N] "))?;
+    output(format_args!("This removes {what}. Continue? [y/N] "))?;
     std::io::stdout().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
@@ -99,10 +99,12 @@ fn confirm(force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `system df`, and `image prune` / `system prune`: unnamed generations no VM here uses (as `rmi ID`
+/// removes them), and for `system`, failed and lost VM records and the layer blob cache too.
 pub fn system(args: &Args, operation: &str) -> Result<()> {
-    // Refuse before opening the host: even recovery must wait for confirmation.
+    let system = args.positional.first().is_some_and(|c| c == "system");
     if operation == "prune" {
-        confirm(args.has("force"))?;
+        confirm(args.has("force"), if system { "unused <none> images, failed and lost VM records and the layer blob cache" } else { "unused <none> images" })?;
     }
     let host = crate::open_host(args)?;
     let paths = Paths::new(&host.state);
@@ -116,17 +118,10 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
             ("VMs", host.run.join("vms")),
             ("Checkpoints", host.state.join("suspended")),
         ] {
-            let mut bytes = disk_usage(&path, &mut seen)?;
-            if kind == "Checkpoints" {
-                for dir in host.checkpoint_paths()? {
-                    bytes += disk_usage(&dir, &mut seen)?;
-                }
-            }
-            output(format_args!("{kind:<16} {bytes:>16}\n"))?;
+            output(format_args!("{kind:<16} {:>16}\n", disk_usage(&path, &mut seen)?))?;
         }
         return Ok(());
     }
-    let system = args.positional.first().is_some_and(|c| c == "system");
     let total = || -> Result<u64> {
         let mut seen = BTreeSet::new();
         Ok(disk_usage(&paths.images, &mut seen)? + disk_usage(&paths.templates, &mut seen)? + disk_usage(&host.run.join("vms"), &mut seen)?)
@@ -136,24 +131,13 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
         for vm in crate::vms(&host) {
             if matches!(vm["state"].as_str(), Some("failed" | "lost")) {
                 let name = vm["name"].as_str().ok_or("VM record has no name")?;
-                if !prune_vm_record(&host, name)? {
-                    continue;
+                if prune_vm_record(&host, name)? {
+                    output(format_args!("Deleted VM record: {name}\n"))?;
                 }
-                output(format_args!("Deleted VM records: {name}\n"))?;
             }
         }
     }
-    for removed in crate::template::prune(&paths, args.has("all"), &|| {
-        let mut users = host.prune_users()?;
-        for image in crate::template::images(&paths)? {
-            if image["name"].as_str().is_some_and(|n| crate::standby::target(&host, n) > 0) {
-                if let Some(id) = image["id"].as_str() {
-                    users.insert(id.into());
-                }
-            }
-        }
-        Ok(users)
-    })? {
+    for removed in crate::template::prune(&paths, &|| host.template_users())? {
         crate::print(removed)?;
     }
     if system {

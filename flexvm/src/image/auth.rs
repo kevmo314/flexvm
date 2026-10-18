@@ -143,7 +143,7 @@ pub fn login(state: &Path, name: &str, username: Option<&str>, password_stdin: b
         bail!("password is empty");
     }
     let auth = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
-    Registry::verify(&registry, &auth)?;
+    Registry::verify(&registry, &auth).map_err(|e| format!("login to {registry} failed: {e}"))?;
     update(state, &registry, Some(&auth))?;
     output(format_args!("Login succeeded for {registry}\n"))
 }
