@@ -60,6 +60,8 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     let local = match host.after_boot() {
         Ok(Some(local)) => local,
         Ok(None) => return Ok(false),
+        // A lost record is waiting for a name lock: leave recovery incomplete, quietly.
+        Err(e) if crate::host::name_busy(&e) => return Ok(false),
         // Retried on the next open; a full pass still sweeps and refills now.
         Err(e) => {
             if rest {
@@ -182,7 +184,11 @@ fn cleanup_locked(host: &Host, lock: Option<Flock>) -> Result<()> {
         }
     }
     load_sets(&host.run.join("standby"));
-    collected.map(|_| ())
+    match collected {
+        // The address stays held, and the next sweep tries its lost record again.
+        Err(e) if crate::host::name_busy(&e) => Ok(()),
+        other => other.map(|_| ()),
+    }
 }
 
 /// `.loadset-ID` (`standby::save_load_set`) neither read nor written for `LOADSET_TTL`:
