@@ -26,6 +26,11 @@ pub const CLOCK_RTT: Duration = Duration::from_millis(5);
 /// What a guest call is refused with while a checkpoint (a suspend's too) has
 /// the VM paused: a running command's reattach waits it out.
 pub const CHECKPOINTING: &str = " is being checkpointed; try again once it is done";
+
+/// What follows "vm <name> is paused" in a refusal: like `CHECKPOINTING`, transient to a running command.
+fn paused(name: &str) -> String {
+    format!("{} once flexvm unpause {name} resumes it", crate::guest::TRY_AGAIN)
+}
 const NO_REALTIME: &str = "clock_realtime requested but not present in the snapshot state";
 
 /// The vmstate a VM is restored from.
@@ -712,7 +717,7 @@ impl Vm {
     fn running_here(&self) -> Result<()> {
         match self.state() {
             State::Running => {}
-            State::Paused => bail!("vm {} is paused; flexvm unpause {} resumes it", self.name, self.name),
+            State::Paused => bail!("vm {} is paused{}", self.name, paused(&self.name)),
             State::Checkpointing => bail!("vm {}{CHECKPOINTING}", self.name),
             _ => bail!("vm {} is not running here", self.name),
         }

@@ -16,6 +16,10 @@ pub const SESSION_DONE: u8 = b'd';
 
 pub const MAX_BODY: usize = 1024 * 1024;
 
+/// In a refusal that a moment later may not recur (a busy agent, a checkpointing VM): the host
+/// tries the request again rather than give up.
+pub const TRY_AGAIN: &str = "; try again";
+
 /// Free MiB kept plugged for `total` MiB: the host plugs more below it, the guest throttles past it.
 pub fn headroom(total: u64) -> u64 {
     (total / 4).max(1024.min(total / 2))

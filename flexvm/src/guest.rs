@@ -117,12 +117,28 @@ pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, ti
     session_on(action, id, offset, cmd, |line| request_on(s, line, timeout))
 }
 
+/// The agent drops a command longer than `MAX_BODY` unread: refused here, before connecting.
+pub fn fits(cmd: &str) -> Result<()> {
+    if cmd.len() > MAX_BODY {
+        bail!("the command is {} bytes; the guest takes at most {MAX_BODY}", cmd.len());
+    }
+    Ok(())
+}
+
+/// A refusal worth another try (`TRY_AGAIN`), not an answer.
+pub fn transient(m: &str) -> bool {
+    m.contains(TRY_AGAIN)
+}
+
 fn session_on<S: Read + Write>(action: &str, id: &str, offset: u64, cmd: &str, open: impl FnOnce(&str) -> Result<BufReader<S>>) -> Result<BufReader<S>> {
     if !valid_session_id(id) {
         bail!("bad session id");
     }
     let line = match action {
-        "start" => format!("SESSION {id} {}", cmd.len()),
+        "start" => {
+            fits(cmd)?;
+            format!("SESSION {id} {}", cmd.len())
+        }
         "attach" => format!("ATTACH {id} {offset}"),
         "close" => format!("CLOSE {id}"),
         _ => bail!("bad session action"),
@@ -372,6 +388,27 @@ mod tests {
         line.clear();
         stream.read_line(&mut line).unwrap();
         (stream, line)
+    }
+
+    #[test]
+    fn an_oversized_command_is_refused_before_connecting() {
+        let opened = std::cell::Cell::new(false);
+        let open = |_: &str| -> Result<BufReader<UnixStream>> {
+            opened.set(true);
+            Err("opened".into())
+        };
+        let e = session_on("start", "id", 0, &"x".repeat(MAX_BODY + 1), open).unwrap_err();
+        assert!(e.to_string().contains(&format!("at most {MAX_BODY}")), "{e}");
+        assert!(!opened.get());
+        assert_eq!(session_on("start", "id", 0, &"x".repeat(MAX_BODY), open).unwrap_err().to_string(), "opened");
+        assert!(opened.get());
+    }
+
+    #[test]
+    fn transient_refusals_share_one_marker() {
+        assert!(transient(&format!("vm a{}", crate::vm::CHECKPOINTING)));
+        assert!(transient(&format!("error: too many commands arriving at once{TRY_AGAIN}")));
+        assert!(!transient("error: too many sessions: 64 commands are running or awaiting their client"));
     }
 
     #[test]

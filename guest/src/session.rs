@@ -89,8 +89,18 @@ fn awake() -> Duration {
     Duration::from_millis(AWAKE_MS.load(Ordering::Relaxed))
 }
 
+/// `ABANDONED_RUNNING_KNOB` (seconds) as `cleanup` last read it; `u64::MAX` while it is not set.
+static KNOB: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Reads the knob file: by `cleanup` only, once a sweep, outside the sessions lock.
+fn read_knob() -> Option<Duration> {
+    let secs = std::fs::read_to_string(ABANDONED_RUNNING_KNOB).ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&s| s != u64::MAX);
+    KNOB.store(secs.unwrap_or(u64::MAX), Ordering::Relaxed);
+    secs.map(Duration::from_secs)
+}
+
 fn knob() -> Option<Duration> {
-    std::fs::read_to_string(ABANDONED_RUNNING_KNOB).ok().and_then(|s| s.trim().parse().ok()).map(Duration::from_secs)
+    Some(KNOB.load(Ordering::Relaxed)).filter(|&s| s != u64::MAX).map(Duration::from_secs)
 }
 
 /// How long the sweeper sleeps between `cleanup`s.
@@ -427,8 +437,9 @@ pub fn counts(sessions: &Sessions) -> String {
 }
 
 pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
+    let running_after = read_knob().unwrap_or(ABANDONED_RUNNING);
     let mut table = sessions.lock().unwrap();
-    table.reclaim(statuses);
+    table.reclaim_after(statuses, running_after, awake());
     let now = awake();
     table.closed.retain(|_, at| now.saturating_sub(*at) < RETENTION);
     table.cancelled.retain(|_, at| now.saturating_sub(*at) < RETENTION);
