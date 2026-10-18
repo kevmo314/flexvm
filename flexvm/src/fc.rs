@@ -123,11 +123,29 @@ impl Firecracker {
     /// `template` is the vmstate of the template the VM was made from: Firecracker refuses a
     /// `vmstate` with devices other than it has, and takes no host resource (tap, socket, file)
     /// from `vmstate` (#548).
-    pub fn load_snapshot(&self, vmstate: &Path, template: &Path, tap: &str, clock_realtime: Option<bool>, timeout: Duration) -> Result<Value> {
+    /// What a template's snapshot names its root filesystem (`template::ROOTFS`), in this Firecracker's directory.
+    pub fn link_rootfs(&self, rootfs: &Path) -> Result<()> {
+        let link = self.dir.join(crate::template::ROOTFS);
+        match std::fs::remove_file(&link) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            r => r?,
+        }
+        Ok(std::os::unix::fs::symlink(rootfs, link)?)
+    }
+
+    pub fn load_snapshot(
+        &self,
+        vmstate: &Path,
+        template: &crate::template::Template,
+        tap: &str,
+        clock_realtime: Option<bool>,
+        timeout: Duration,
+    ) -> Result<Value> {
         self.join_cgroup()?;
+        self.link_rootfs(&template.meta.rootfs)?;
         let mut body = serde_json::json!({
             "snapshot_path": vmstate,
-            "device_reference_path": template,
+            "device_reference_path": template.vmstate(),
             "mem_backend": {"backend_type": "Uffd", "backend_path": self.sockets.uffd},
             "vsock_override": {"uds_path": self.sockets.vsock},
             "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -62,6 +62,11 @@ pub struct Meta {
 
 pub const FORMAT_VERSION: u64 = 2;
 
+/// The root filesystem as a template's snapshot names it: a file in its Firecracker's directory,
+/// linked to the generation's own at every load (`Firecracker::link_rootfs`), so it can be anywhere
+/// (a pushed generation's is in its directory). Generations built before name theirs by its path.
+pub const ROOTFS: &str = "rootfs";
+
 /// What a build does that its inputs do not record: the boot command line, the memory and
 /// device layout, flexvm's version. Not part of the content id (generations stay compatible).
 pub fn recipe() -> String {
@@ -71,6 +76,7 @@ pub fn recipe() -> String {
         h.word(w);
     }
     h.update(BOOT_ARGS.as_bytes());
+    h.update(ROOTFS.as_bytes());
     h.update(env!("CARGO_PKG_VERSION").as_bytes());
     h.finish()
 }
@@ -212,6 +218,15 @@ impl Meta {
         ]
     }
 
+    /// Names every component, and its id is theirs and the image's.
+    fn identified(&self) -> bool {
+        let names = ["vmstate", "mem", "rootfs", "kernel", "firecracker"];
+        self.components.len() == names.len()
+            && names.iter().all(|n| self.components.contains_key(*n))
+            && valid_id(&self.id)
+            && content_id(&self.components, self.image.as_ref()) == self.id
+    }
+
     fn identify(&mut self, paths: &Paths, dir: &Path) -> Result<()> {
         for (name, path) in self.files(paths, dir) {
             self.components.insert(name.into(), hash_file(&path)?);
@@ -225,8 +240,7 @@ impl Meta {
     /// others are rehashed. Returns whether anything was rehashed.
     fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>) -> Result<bool> {
         let files = self.files(paths, dir);
-        let named = self.components.len() == files.len() && files.iter().all(|(name, _)| self.components.contains_key(*name));
-        if !named || !valid_id(&self.id) || content_id(&self.components, self.image.as_ref()) != self.id {
+        if !self.identified() {
             bail!("template at {} has no valid content id; pull it again with `flexvm pull`", dir.display());
         }
         let mut rehashed = false;
@@ -339,7 +353,7 @@ pub fn image_of(name: &str) -> String {
 }
 
 /// Content ids are hex (`Hash::finish`), so one is a file name too.
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -629,7 +643,7 @@ fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<Socket
     let p = crate::vm::Prepared::new(fc, tpl.clone())?;
     let fc = p.firecracker();
     // Like VM restores: stepping the clock touches pages of its own.
-    fc.load_snapshot(&tpl.vmstate(), &tpl.vmstate(), tap, Some(true), crate::fc::API_TIMEOUT)?;
+    fc.load_snapshot(&tpl.vmstate(), &tpl, tap, Some(true), crate::fc::API_TIMEOUT)?;
     fc.resume(crate::fc::API_TIMEOUT)?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;
@@ -926,6 +940,21 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
     // Every name below is in the directories as opened here, whatever their paths name meanwhile.
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
+    // Exclusive: two pulls of a name each see the link the other replaced (the one each supersedes).
+    let (id, _l) = publish_generation(paths, staged, libc::LOCK_EX, check_interrupt)?;
+    let live = paths.templates.join(name);
+    let tmp = paths.templates.join(format!(".{name}.link-{}", crate::util::random_hex(8)?));
+    std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&id), &tmp)?;
+    let old = std::fs::read_link(&live).ok().and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned())).filter(|old| *old != id);
+    std::fs::rename(&tmp, &live)?;
+    crate::util::sync_dir(&paths.templates)?;
+    Ok(old)
+}
+
+/// Publishes the staged build in `paths.templates` (as the caller opened it) as `.gen/ID`, an identical
+/// one published already kept, and returns ID with the templates lock (taken `how`) still held:
+/// nothing removes the unnamed generation before the caller names it or opens it.
+fn publish_generation(paths: &Paths, staged: &Path, how: i32, check_interrupt: impl FnOnce() -> Result<()>) -> Result<(String, crate::host::Flock)> {
     let staged = &paths.templates.join(staged.file_name().ok_or("staging has no name")?);
     let meta = Meta::read(staged)?;
     match std::fs::create_dir(paths.templates.join(GENERATIONS)) {
@@ -934,7 +963,6 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
     }
     crate::util::sync_dir(&paths.templates)?;
     let gens = crate::host::Directory::open(&paths.templates.join(GENERATIONS))?;
-    let gen = gens.path.join(&meta.id);
     // Its files and their names are durable before the generation is published.
     for entry in std::fs::read_dir(staged)? {
         let entry = entry?;
@@ -942,23 +970,188 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
             File::open(entry.path())?.sync_all()?;
         }
     }
-    // Exclusive: two pulls of a name each see the link the other replaced (the one each supersedes).
-    let _l = templates_lock(paths, libc::LOCK_EX)?;
+    let l = templates_lock(paths, how)?;
     crate::util::sync_dir(staged)?;
     check_interrupt()?;
-    match std::fs::rename(staged, &gen) {
+    match std::fs::rename(staged, gens.path.join(&meta.id)) {
         // An identical build published it already.
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) => {}
         r => r?,
     }
-    let live = paths.templates.join(name);
-    let tmp = paths.templates.join(format!(".{name}.link-{}", crate::util::random_hex(8)?));
-    std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
     crate::util::sync_dir(&gens.path)?;
-    let old = std::fs::read_link(&live).ok().and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned())).filter(|id| *id != meta.id);
-    std::fs::rename(&tmp, &live)?;
-    crate::util::sync_dir(&paths.templates)?;
-    Ok(old)
+    Ok((meta.id, l))
+}
+
+/// What `send` and `receive` refuse: far past any template.
+const MAX_META: u64 = 1 << 20;
+const MAX_VMSTATE: u64 = 64 << 20;
+const MAX_FILE: u64 = 1 << 44;
+const MAX_EXTENTS: u64 = 1 << 20;
+/// The data bytes of one generation's files together.
+pub const MAX_DATA: u64 = 64 << 30;
+/// Room a received generation leaves on its filesystem.
+const KEEP_FREE: u64 = 1 << 30;
+
+/// Writes generation `tpl` for `receive`: its metadata, then its vmstate, root filesystem and memory,
+/// each as its length, its data extents and their bytes, so holes stay holes. Returns the data bytes.
+pub fn send(tpl: &Template, w: &mut impl Write) -> Result<u64> {
+    let meta = serde_json::to_vec(&tpl.meta)?;
+    w.write_all(&(meta.len() as u64).to_le_bytes())?;
+    w.write_all(&meta)?;
+    let (mut sent, mut buf) = (0, vec![0u8; 1 << 20]);
+    for path in [tpl.vmstate(), tpl.meta.rootfs.clone(), tpl.fixed.join("mem")] {
+        let file = File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let len = file.metadata()?.len();
+        let extents = data_extents(&file, len)?;
+        let head = [len, extents.len() as u64].into_iter().chain(extents.iter().flat_map(|&(s, e)| [s, e]));
+        w.write_all(&head.flat_map(u64::to_le_bytes).collect::<Vec<u8>>())?;
+        for (mut off, end) in extents {
+            sent += end - off;
+            while off < end {
+                let n = (end - off).min(buf.len() as u64) as usize;
+                file.read_exact_at(&mut buf[..n], off)?;
+                w.write_all(&buf[..n])?;
+                off += n as u64;
+            }
+        }
+    }
+    w.flush()?;
+    Ok(sent)
+}
+
+/// Whose turn it is to obtain generation `id` here (`receive`), waited for until `by`: a second
+/// push of one template finds the first's generation instead of sending it again.
+pub fn turn(paths: &Paths, id: &str, by: Instant) -> Result<crate::host::HeldLock> {
+    if !valid_id(id) {
+        bail!("bad template id {id:?}");
+    }
+    let name = template_lock_name(paths, "template-in", &format!("-{id}"))?;
+    let take = |f: &File| loop {
+        match crate::host::flock(f, libc::LOCK_EX | libc::LOCK_NB) {
+            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) && Instant::now() < by => std::thread::sleep(Duration::from_millis(50)),
+            r => return r,
+        }
+    };
+    Ok(crate::host::lock_at_with(crate::host::host_locks()?, &name, take).map_err(|e| format!("waiting for another arrival of template {id}: {e}"))?)
+}
+
+/// Reads a generation `send` wrote and publishes it unnamed (no name here is taken or moved), once its
+/// content id is `id` and each file it got hashes to its component: it is never named or found by
+/// tag. Returns it open, so held: no `rmi`, prune or sweep removes it while it is. A failure leaves no
+/// generation: its staging goes, or, killed, the next build's or receive's sweep.
+pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Template>> {
+    let [len] = read_words(r)?;
+    if len > MAX_META {
+        bail!("template {id}: {len} bytes of metadata");
+    }
+    let mut meta: Meta = serde_json::from_slice(&read_vec(r, len)?).map_err(|e| format!("template {id}: its metadata: {e}"))?;
+    if meta.id != id || !meta.identified() {
+        bail!("template {id}: the metadata sent is not that template's");
+    }
+    // The kernel is in guest memory; restores never read it (`Meta::verify`).
+    crate::artifacts::ensure(&[(&paths.firecracker, &crate::artifacts::FIRECRACKER)])?;
+    let firecracker = hash_file(&paths.firecracker)?;
+    if firecracker.hash != meta.components["firecracker"].hash {
+        bail!("template {id} was built with another Firecracker than {}: copy one Firecracker binary to every host", paths.firecracker.display());
+    }
+    let staging = Staging::new(paths, id)?;
+    let gen = std::fs::canonicalize(&staging.parent.path)?.join(GENERATIONS).join(id);
+    let mut budget = MAX_DATA;
+    let file = |r: &mut _, name: &str, max, budget: &mut _| {
+        receive_file(r, &staging.dir.join(name), max, budget).map_err(|e| format!("template {id}: its {name}: {e}"))
+    };
+    file(r, "vmstate", MAX_VMSTATE, &mut budget)?;
+    // Older generations name the root filesystem by its path (not `ROOTFS`), which must hold it here too.
+    let src = meta.rootfs.as_os_str().as_encoded_bytes();
+    let local = match std::fs::read(staging.dir.join("vmstate"))?.windows(src.len()).any(|w| w == src) {
+        false => None,
+        true => Some(
+            Some(&meta.rootfs)
+                .filter(|p| p.is_file())
+                .and_then(|p| hash_file(p).ok())
+                .filter(|c| c.hash == meta.components["rootfs"].hash)
+                .ok_or_else(|| format!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display()))?,
+        ),
+    };
+    file(r, "rootfs", MAX_FILE, &mut budget)?;
+    // Test gate: half received, for a test to kill the receiver.
+    crate::host::hold("receive_hold");
+    file(r, "mem", MAX_FILE, &mut budget)?;
+    let rootfs = match local {
+        Some(have) => {
+            std::fs::remove_file(staging.dir.join("rootfs"))?;
+            have
+        }
+        None => {
+            meta.rootfs = gen.join("rootfs");
+            hash_file(&staging.dir.join("rootfs"))?
+        }
+    };
+    let got = [
+        ("vmstate", hash_file(&staging.dir.join("vmstate"))?),
+        ("mem", hash_file(&staging.dir.join("mem"))?),
+        ("rootfs", rootfs),
+        ("firecracker", firecracker),
+    ];
+    for (name, c) in got {
+        if c.hash != meta.components[name].hash {
+            bail!("template {id}: its {name} does not hash to the template's");
+        }
+        meta.components.insert(name.into(), c);
+    }
+    meta.kernel = paths.kernel.clone();
+    std::fs::write(staging.dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+    let paths = &Paths { templates: staging.parent.path.clone(), ..paths.clone() };
+    let (_, _l) = publish_generation(paths, &staging.dir, libc::LOCK_SH, || Ok(()))?;
+    let tpl = Template::open_dir(id, paths.templates.join(GENERATIONS).join(id))?;
+    tpl.verify(paths)?;
+    Ok(tpl)
+}
+
+fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
+    let (mut out, mut b) = ([0; N], [0u8; 8]);
+    for w in &mut out {
+        r.read_exact(&mut b)?;
+        *w = u64::from_le_bytes(b);
+    }
+    Ok(out)
+}
+
+fn read_vec(r: &mut impl Read, len: u64) -> Result<Vec<u8>> {
+    let mut v = vec![0u8; len as usize];
+    r.read_exact(&mut v)?;
+    Ok(v)
+}
+
+/// One of `send`'s files, written to a new `path` with the same length and holes, within `max` and
+/// what is left of `budget` and of its filesystem's room.
+fn receive_file(r: &mut impl Read, path: &Path, max: u64, budget: &mut u64) -> Result<()> {
+    let [len, n] = read_words(r)?;
+    if len > max || n > MAX_EXTENTS {
+        bail!("{len} bytes in {n} extents is past the limits");
+    }
+    let extents: Vec<(u64, u64)> = (0..n).map(|_| read_words(r).map(|[s, e]| (s, e))).collect::<Result<_>>()?;
+    let data: u64 = extents.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    if !valid_extents(&extents, len) || data > *budget {
+        bail!("bad extents, or {data} bytes of data past the limit");
+    }
+    *budget -= data;
+    let file = File::options().write(true).create_new(true).open(path)?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) } == 0 && st.f_bavail.saturating_mul(st.f_frsize) < data + KEEP_FREE {
+        bail!("{data} bytes of data would leave less than {} MiB free", KEEP_FREE >> 20);
+    }
+    file.set_len(len)?;
+    let mut buf = vec![0u8; 1 << 20];
+    for (mut off, end) in extents {
+        while off < end {
+            let n = (end - off).min(buf.len() as u64) as usize;
+            r.read_exact(&mut buf[..n])?;
+            file.write_all_at(&buf[..n], off)?;
+            off += n as u64;
+        }
+    }
+    Ok(())
 }
 
 fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: &str, image: ImageMeta) -> Result<()> {
@@ -980,7 +1173,8 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
     fc.put("/metrics", json!({"metrics_path": metrics}))?;
     fc.put("/boot-source", json!({"kernel_image_path": kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
-    fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
+    fc.link_rootfs(&rootfs)?;
+    fc.put("/pmem/root", json!({"id": "root", "path_on_host": ROOTFS, "root_device": true, "read_only": true}))?;
     fc.put("/balloon", json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}))?;
     let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
     if hotplug > 0 {
@@ -1439,6 +1633,115 @@ mod tests {
         fn write_meta(&self, meta: &Meta, dir: &Path) {
             std::fs::write(dir.join("meta.json"), serde_json::to_vec(meta).unwrap()).unwrap();
         }
+    }
+
+    /// A generation in `f.dir` with a sparse memory file and a vmstate naming `rootfs` as given, sent.
+    fn sent(f: &mut Fixture, rootfs_named: &str) -> (Arc<Template>, Vec<u8>) {
+        std::fs::write(f.dir.join("vmstate"), format!("state, pmem at {rootfs_named}")).unwrap();
+        let mem = File::create(f.dir.join("mem")).unwrap();
+        mem.set_len(64 * PAGE_SIZE as u64).unwrap();
+        mem.write_all_at(&[7u8; PAGE_SIZE], 3 * PAGE_SIZE as u64).unwrap();
+        mem.write_all_at(&[9u8; PAGE_SIZE], 40 * PAGE_SIZE as u64).unwrap();
+        f.meta.identify(&f.paths, &f.dir).unwrap();
+        f.write_meta(&f.meta, &f.dir);
+        let tpl = f.open().unwrap();
+        let mut buf = vec![];
+        assert_eq!(send(&tpl, &mut buf).unwrap(), 2 * PAGE_SIZE as u64 + std::fs::metadata(&f.meta.rootfs).unwrap().len() + rootfs_named.len() as u64 + 15);
+        (tpl, buf)
+    }
+
+    /// Another host's templates directory, with `f`'s Firecracker.
+    fn elsewhere(f: &Fixture) -> (crate::test_util::TempDir, Paths) {
+        let dir = crate::test_util::TempDir::new("template-in");
+        let paths = Paths { templates: dir.clone(), kernel: dir.join("vmlinux"), ..f.paths.clone() };
+        (dir, paths)
+    }
+
+    /// Nothing of a generation in `paths`: no generation and no staging.
+    fn nothing_in(paths: &Paths) -> bool {
+        generations(&paths.templates).unwrap().is_empty()
+            && std::fs::read_dir(&paths.templates).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".new-"))
+    }
+
+    #[test]
+    fn a_received_generation_is_verified_unnamed_and_keeps_its_holes() {
+        let mut f = Fixture::new();
+        let (tpl, buf) = sent(&mut f, ROOTFS);
+        let (dir, paths) = elsewhere(&f);
+        let got = receive(&paths, &mut &buf[..], &tpl.meta.id).unwrap();
+        assert_eq!(got.meta.id, tpl.meta.id);
+        let gen = std::fs::canonicalize(&*dir).unwrap().join(GENERATIONS).join(&tpl.meta.id);
+        assert_eq!(got.meta.rootfs, gen.join("rootfs"));
+        assert_eq!(std::fs::read(gen.join("rootfs")).unwrap(), std::fs::read(&f.meta.rootfs).unwrap());
+        assert_eq!(got.meta.kernel, paths.kernel);
+        let mem = File::open(gen.join("mem")).unwrap();
+        assert_eq!(mem.metadata().unwrap().len(), 64 * PAGE_SIZE as u64);
+        assert_eq!(data_extents(&mem, 64 * PAGE_SIZE as u64).unwrap().iter().map(|(s, e)| e - s).sum::<u64>(), 2 * PAGE_SIZE as u64, "holes stay holes");
+        assert!(got.has_data(40) && !got.has_data(4) && got.pages(3, 1) == [7u8; PAGE_SIZE]);
+        // No name: listed as <none>, and the name the source has is not taken here.
+        assert!(names(&paths.templates).unwrap().is_empty());
+        assert_eq!(images(&paths).unwrap()[0]["name"], Value::Null);
+        assert!(Template::open_id(&paths, "t", &tpl.meta.id).is_ok());
+        // An identical one arriving again keeps the first.
+        drop(got);
+        receive(&paths, &mut &buf[..], &tpl.meta.id).unwrap();
+        assert_eq!(generations(&paths.templates).unwrap(), [tpl.meta.id.clone()]);
+    }
+
+    #[test]
+    fn a_corrupt_truncated_or_foreign_generation_leaves_nothing() {
+        let mut f = Fixture::new();
+        let (tpl, buf) = sent(&mut f, ROOTFS);
+        let id = &tpl.meta.id;
+        let (_dir, paths) = elsewhere(&f);
+        let mut corrupt = buf.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let e = receive(&paths, &mut &corrupt[..], id).err().unwrap().to_string();
+        assert!(e.contains("its mem does not hash"), "{e}");
+        assert!(receive(&paths, &mut &buf[..buf.len() - 10], id).is_err());
+        let e = receive(&paths, &mut &buf[..], "abcd").err().unwrap().to_string();
+        assert!(e.contains("not that template's"), "{e}");
+        assert!(nothing_in(&paths));
+        // Extents past the file, and more data than the cap.
+        let mut path = paths.templates.join("x");
+        for words in [[8u64, 1, 0, 16], [MAX_DATA + 1, 1, 0, MAX_DATA + 1]] {
+            let head: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            path.set_extension("y");
+            assert!(receive_file(&mut &head[..], &path, u64::MAX, &mut MAX_DATA.clone()).is_err());
+        }
+        let (_other, mut paths) = elsewhere(&f);
+        paths.firecracker = paths.templates.join("firecracker");
+        std::fs::write(&paths.firecracker, "another build").unwrap();
+        let e = receive(&paths, &mut &buf[..], id).err().unwrap().to_string();
+        assert!(e.contains("another Firecracker"), "{e}");
+    }
+
+    #[test]
+    fn an_older_generation_needs_its_root_filesystem_at_its_path() {
+        let mut f = Fixture::new();
+        let rootfs = f.meta.rootfs.to_string_lossy().into_owned();
+        let (tpl, buf) = sent(&mut f, &rootfs);
+        let (_dir, paths) = elsewhere(&f);
+        let got = receive(&paths, &mut &buf[..], &tpl.meta.id).unwrap();
+        assert_eq!(got.meta.rootfs, f.meta.rootfs, "the file its snapshot names, already here");
+        assert!(!got.fixed.join("rootfs").exists());
+        drop(got);
+        let (_dir, paths) = elsewhere(&f);
+        std::fs::write(&f.meta.rootfs, "another build").unwrap();
+        let e = receive(&paths, &mut &buf[..], &tpl.meta.id).err().unwrap().to_string();
+        assert!(e.contains("names its root filesystem by its path"), "{e}");
+        assert!(nothing_in(&paths));
+    }
+
+    #[test]
+    fn arrivals_of_one_template_take_turns() {
+        let f = Fixture::new();
+        let first = turn(&f.paths, "abcd", Instant::now()).unwrap();
+        assert!(turn(&f.paths, "abcd", Instant::now() + Duration::from_millis(100)).is_err());
+        assert!(turn(&f.paths, "abce", Instant::now()).is_ok());
+        assert!(turn(&f.paths, "../x", Instant::now()).is_err());
+        drop(first);
+        turn(&f.paths, "abcd", Instant::now()).unwrap();
     }
 
     #[test]

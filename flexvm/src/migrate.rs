@@ -1,5 +1,6 @@
 //! Post-copy live migration over one TCP connection to the target's listener:
-//! `migrate_in` + answer (before the pause); header, vmstate, preload; commit
+//! `template` (the template, unless the target has it) and `migrate_in` + answer (before the
+//! pause); header, vmstate, preload; commit
 //! answer; held packets. The target pulls the rest via `pages`.
 //! Ownership: the target commits (`STATE/migs/ID`) before the VM runs there.
 //! The source resumes only on a refusal or `aborted` (never committed, or the
@@ -117,11 +118,15 @@ impl Proc {
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.can_leave()?;
         vm.template.verify(&self.paths)?;
+        let pushed = push_template(to, &vm.template)?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
-        let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
+        let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict).map_err(|e| match &pushed {
+            None => format!("{e} ({to} is too old to be sent template {}: it migrates in only VMs of templates it has)", vm.template.meta.id).into(),
+            Some(_) => e,
+        })?;
         // Before the pause: dropped, the connection ends the target's arrival.
         check_app_support(to, &vm.name.get(), &prepared, &self.spec.lock().unwrap().moving(), vm.template.meta.image.as_ref())?;
         let prepare = prep.elapsed();
@@ -242,6 +247,7 @@ impl Proc {
             "name": vm.name,
             "to": to,
             "mig": mig,
+            "template_push": pushed,
             "settle_hotplug_ms": ms(settle),
             "prepare_ms": ms(prepare),
             "unthrottle_ms": ms(unthrottle),
@@ -1006,6 +1012,27 @@ impl Proc {
         self.publish();
         Ok(vm)
     }
+}
+
+/// Has `to` take generation `tpl`, by content id, before anything else of a migration (so before the
+/// pause): sent unless it has it. None if `to` is too old to be sent one (then it must have it).
+fn push_template(to: &str, tpl: &Template) -> Result<Option<Value>> {
+    let (start, at) = (Instant::now(), Instant::now() + crate::listen::PUSH_WAIT);
+    let fail = |e: Error| -> Error { format!("cannot send template {} to {to}: {e}", tpl.meta.id).into() };
+    let (conn, have) = match crate::util::rpc(to, Duration::from_secs(2), at, &json!({"op": "template", "id": tpl.meta.id})) {
+        Err(e) if e.to_string().contains("unknown op \"template\"") => return Ok(None),
+        r => r.map_err(fail)?,
+    };
+    let sent = match have["have"] == json!(true) {
+        true => 0,
+        false => {
+            let sent = crate::template::send(tpl, &mut std::io::BufWriter::with_capacity(1 << 20, By { s: &conn, at }));
+            // Its answer says more than a failed write: it may have refused the template part way.
+            let reply = crate::util::recv_json(&mut BufReader::new(By { s: &conn, at })).and_then(|r| crate::util::answer(r, to, "refused"));
+            reply.and(sent).map_err(fail)?
+        }
+    };
+    Ok(Some(json!({"sent_mib": sent >> 20, "ms": ms(start.elapsed())})))
 }
 
 /// Header, state, preload and commit reply share one cap: partial writes cannot extend the pause.
