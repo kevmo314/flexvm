@@ -758,6 +758,7 @@ def b_unpulled():
     link, images = os.path.join(B.state_dir, "templates"), os.path.join(B.state_dir, "images")
     B.stop()
     os.remove(link)
+    os.makedirs(link)
     B.start()
     try:
         yield link
