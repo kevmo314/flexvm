@@ -682,9 +682,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             Err((e, retry)) => {
                 // Its VM ran, then its Firecracker died (#730): it ends as a death, its claimer told so.
                 if p.died_starting() {
-                    let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": false, "died": true}));
                     crate::log!("standby {template}: claimed as {}: {e}", req["name"].as_str().unwrap_or(""));
-                    p.end_died(op);
+                    p.end_died(op, Some((&mut &c, json!({"ok": false, "error": e.to_string(), "retry": false, "died": true}))));
                 }
                 p.drop_ports();
                 *p.cmd.lock().unwrap() = None;

@@ -244,7 +244,7 @@ impl Proc {
                     if let Err(e) = freed {
                         crate::log!("vm {}: died while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
                     }
-                    self.end_died(&op)
+                    self.end_died(&op, None)
                 }
                 Ok(freed) => {
                     if let Err(e) = freed {

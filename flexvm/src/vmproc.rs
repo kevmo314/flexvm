@@ -1139,8 +1139,7 @@ impl Proc {
                 r => break r?,
             }
         };
-        // Keep the name local through admission: a refusal drops it before the starter is
-        // answered, so `ps -a` sees the old exited record even while this process cleans up.
+        self.set_name(lock);
         let name = name.as_str();
         // A rerun is what its record says, read under the name: never one another start replaced meanwhile.
         let (template, want) = match &record {
@@ -1163,7 +1162,6 @@ impl Proc {
         self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
         self.bind_ports()?;
         let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
-        self.set_name(lock);
         let ip = self.set_addr(claim);
         self.serve_ports(ip)?;
         t.mark("claim_ip");
@@ -1655,18 +1653,18 @@ impl Proc {
         if self.leaving.load(Ordering::SeqCst) {
             return;
         }
-        self.end_died(&op)
+        self.end_died(&op, None)
     }
 
     /// Death's end: why goes in `RUN/vms/NAME.failed`, exit 124.
-    pub fn end_died(&self, op: &Op) -> ! {
+    pub fn end_died(&self, op: &Op, last: Option<(&mut dyn std::io::Write, Value)>) -> ! {
         let vm = self.vm();
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         crate::log!("vm {}: died: {why}", vm.name);
         if let Ok(failed) = self.host.vms(&vm.name.get(), "failed") {
             let _ = crate::host::write_record(&failed, why.as_bytes());
         }
-        self.finish(op, End::Died, DIED, None)
+        self.finish(op, End::Died, DIED, last)
     }
 
     fn controller(self: Arc<Self>) {
@@ -2287,15 +2285,11 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     }
     if let Err(e) = res {
         crate::log!("flexvm: {e}");
-        if died {
-            if let Some(mut f) = notify.take() {
-                let _ = send_json(&mut f, &reply);
-            }
-            p.end_died(&op);
-        }
-        // A refused start is answered only after its ports, address and name are
-        // released: callers can immediately inspect or retry the exited VM.
+        // Answered once its name is let go, so the starter's next `ps` lists its record (#761).
         let last = notify.as_mut().map(|f| (f as &mut dyn std::io::Write, reply));
+        if died {
+            p.end_died(&op, last);
+        }
         p.finish(&op, End::NotStarted, FAILED, last);
     }
     match notify.take() {
@@ -3631,39 +3625,6 @@ mod tests {
             p.set_name(p.host.take_name(name, false).unwrap());
         }
         (p, root)
-    }
-
-    #[test]
-    fn a_refused_rerun_is_exited_before_process_cleanup() {
-        let (p, root) = test_proc("rerun-refused", None);
-        let ip = "10.200.0.2".parse().unwrap();
-        let spec = crate::app::RunSpec { ip: Some(ip), ..Default::default() };
-        let record = crate::app::Exited::new(2, "default".into(), Some("false".into()), Default::default(), spec, 1);
-        let path = p.host.vms("job", "exited").unwrap();
-        let bytes = serde_json::to_vec(&record).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
-        // Enough of a template to reach admission, without a Firecracker or guest.
-        let dir = root.join("templates/.gen/a");
-        let meta = json!({
-            "compatibility": {"cpu": "", "tsc_khz": 0, "tsc_control": false, "msrs": [], "firecracker": "", "features": {}, "xsave": {}},
-            "vcpus": 1, "mem_mib": 256, "max_mib": 1024, "plugged_mib": 0,
-            "kernel": "", "rootfs": "", "id": "a", "components": {}
-        });
-        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
-        std::fs::write(dir.join("mem"), []).unwrap();
-        let _other = p.host.take_name("other", false).unwrap();
-        let _claim = p.host.claim_new(&p.host.lock().unwrap(), "other", Some(ip)).unwrap();
-        let e = p.run("job", "", None, false, true).unwrap_err();
-        assert!(e.to_string().contains("is in use"), "{e}");
-        // The process is still alive, as it is when main sends the failure reply.
-        assert!(!p.host.alive("job"));
-        let vms = crate::vms(&p.host);
-        let job = vms.iter().find(|v| v["name"] == "job").unwrap();
-        assert_eq!((job["state"].as_str(), job["status"].as_i64()), (Some("exited"), Some(2)));
-        assert_eq!(std::fs::read(path).unwrap(), bytes, "the old record is unchanged");
-        assert!(p.name.lock().unwrap().is_none());
-        p.refund_start();
-        p.drop_ports();
     }
 
     #[test]
