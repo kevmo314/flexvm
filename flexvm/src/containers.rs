@@ -285,9 +285,13 @@ fn described(host: &Host, paths: &template::Paths, name: &str, mut v: Value) -> 
     if let Some(e) = host.vms(name, "exited").ok().filter(|_| v["state"] == "exited").and_then(|p| crate::app::Exited::read(&p).ok()) {
         config["image"] = json!(template::image_of(&e.template));
         config["template"] = json!(e.template);
-        (config["ports"], config["run"], config["cmd"]) = (json!(e.ports), json!(e.spec), json!(e.cmd));
+        (config["run"], config["cmd"]) = (json!(e.spec), json!(e.cmd));
         config["cpus"] = json!(e.resources.cpus);
         v["exit_code"] = json!(e.status);
+    }
+    // Its `-p` ports as its run settings keep them (`RunSpec`), else those bound now.
+    if let Some(ports) = config["run"].get("ports").filter(|p| p.as_array().is_some_and(|a| !a.is_empty())).cloned() {
+        config["ports"] = ports;
     }
     if !running {
         if let Some(e) = exit_record(host, name) {
@@ -935,15 +939,7 @@ mod tests {
 
     /// An exited VM's record (`app::Exited`), as a background VM whose app exited leaves it.
     fn exited_vm(host: &Host, name: &str, status: i32) {
-        let rec = crate::app::Exited {
-            status,
-            template: "ci".into(),
-            cmd: Some("make".into()),
-            resources: crate::vm::Resources::default(),
-            spec: crate::app::RunSpec { env: vec!["A=1".into()], keep: false, rm: false, ..Default::default() },
-            ports: vec!["127.0.0.1:8080:80".parse().unwrap()],
-            at: 1,
-        };
+        let rec = json!({"status": status, "template": "ci", "cmd": "make", "spec": {"env": ["A=1"], "ports": ["127.0.0.1:8080:80".parse::<crate::ports::Port>().unwrap()]}, "at": 1});
         std::fs::write(host.vms(name, "exited").unwrap(), serde_json::to_vec(&rec).unwrap()).unwrap();
     }
 
