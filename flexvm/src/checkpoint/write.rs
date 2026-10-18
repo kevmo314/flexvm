@@ -180,7 +180,7 @@ impl Buf {
         let mib = (huge >> 20) as u64;
         let fit = n.min(usize::try_from(room.get() / mib).unwrap_or(usize::MAX));
         let one = || -> io::Result<Buf> {
-            let mem = Buf::map(huge, len, HUGE)?;
+            let mut mem = Buf::map(huge, len, HUGE)?;
             mem.populate();
             Ok(Buf { mem, len })
         };

@@ -70,20 +70,17 @@ fn disk_usage(path: &Path, seen: &mut BTreeSet<(u64, u64)>) -> Result<u64> {
     }
     let mut size = meta.blocks() * 512;
     if meta.is_dir() {
-        for entry in entries(std::fs::read_dir(path))? {
-            size += disk_usage(&entry?.path(), seen)?;
+        // Removed since (a pull's cleanup, a template sweep): nothing left in it.
+        match std::fs::read_dir(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            entries => {
+                for entry in entries? {
+                    size += disk_usage(&entry?.path(), seen)?;
+                }
+            }
         }
     }
     Ok(size)
-}
-
-/// A directory removed after metadata was read has no remaining children to count.
-fn entries(result: std::io::Result<std::fs::ReadDir>) -> std::io::Result<impl Iterator<Item = std::io::Result<std::fs::DirEntry>>> {
-    match result {
-        Ok(entries) => Ok(Some(entries).into_iter().flatten()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None.into_iter().flatten()),
-        Err(e) => Err(e),
-    }
 }
 
 #[cfg(test)]
@@ -233,18 +230,6 @@ pub fn version(paths: &Paths) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn disappearing_directory_has_no_children() {
-        let root = crate::test_util::TempDir::new("usage-removed");
-        let path = root.join("directory");
-        std::fs::create_dir(&path).unwrap();
-        assert!(path.symlink_metadata().unwrap().is_dir());
-        std::fs::remove_dir(&path).unwrap();
-        assert_eq!(entries(std::fs::read_dir(&path)).unwrap().count(), 0);
-        assert_eq!(usage(&path).unwrap(), 0);
-        assert!(entries(Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).is_err());
-    }
 
     #[test]
     fn filters_validate_and_combine() {

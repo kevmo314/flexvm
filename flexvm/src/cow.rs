@@ -725,7 +725,7 @@ impl Slots {
         // Each chunk populated as it is mapped, within the take.
         let grow = |inner: &mut SlotsInner| -> std::io::Result<()> {
             while inner.free.len() < n {
-                let chunk = Mmap::new(SLOT_CHUNK, SLOT_CHUNK)?;
+                let mut chunk = Mmap::new(SLOT_CHUNK, SLOT_CHUNK)?;
                 chunk.populate();
                 let c = chunk.ptr() as usize;
                 inner.chunks.push(chunk);

@@ -294,7 +294,7 @@ thread_local! {
 }
 
 impl Mmap {
-    /// `len` bytes at a multiple of `align` (0: anywhere), populated before sharing.
+    /// `len` bytes at a multiple of `align` (0: anywhere), initially unpopulated.
     pub fn new(len: usize, align: usize) -> io::Result<Self> {
         let full = len + align;
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), full, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
@@ -315,9 +315,7 @@ impl Mmap {
                 libc::madvise(start as *mut _, len, libc::MADV_HUGEPAGE);
             }
         }
-        let mut mem = Self { ptr: start as *mut u8, len };
-        mem.populate_exclusive();
-        Ok(mem)
+        Ok(Self { ptr: start as *mut u8, len })
     }
 
     pub fn ptr(&self) -> *mut u8 {
@@ -328,11 +326,9 @@ impl Mmap {
         self.len
     }
 
-    /// Already populated by `new`; retained for callers that explicitly request resident buffers.
-    pub fn populate(&self) {}
-
-    /// Faults in every page before sharing; failed madvise falls back to per-page writes.
-    fn populate_exclusive(&mut self) {
+    /// Faults in every page for writing; any madvise failure falls back to per-page writes.
+    /// Exclusive: the fallback writes, so it must not race another user.
+    pub fn populate(&mut self) {
         const MADV_POPULATE_WRITE: libc::c_int = 23;
         #[cfg(test)]
         let fail = FAIL_POPULATE.with(|f| f.replace(false));
@@ -1641,26 +1637,6 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 mod tests {
     use super::*;
     use crate::test_util::{JoinWithin, WAIT};
-
-    #[test]
-    fn mmap_fallback_populates_before_shared_access() {
-        FAIL_POPULATE.with(|f| f.set(true));
-        let mem = Mmap::new(PAGE_SIZE * 3, 0).unwrap();
-        assert!(!FAIL_POPULATE.with(|f| f.get()));
-        let mut resident = [0; 3];
-        assert_eq!(unsafe { libc::mincore(mem.ptr().cast(), mem.len(), resident.as_mut_ptr()) }, 0);
-        assert!(resident.iter().all(|v| v & 1 == 1));
-        unsafe { mem.ptr().write(42) };
-        std::thread::scope(|scope| {
-            for _ in 0..2 {
-                let mem = &mem;
-                scope.spawn(move || {
-                    mem.populate();
-                    assert_eq!(unsafe { mem.ptr().read() }, 42);
-                });
-            }
-        });
-    }
 
     #[test]
     fn a_claimer_cgroup_is_an_absolute_path_of_plain_components() {
