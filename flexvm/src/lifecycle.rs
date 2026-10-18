@@ -150,6 +150,7 @@ impl Proc {
         let vm = self.vm();
         let mut t = Phases::new();
         let staging = Staging::new(Path::new(dir), vm.dir.join("checkpoint.vmstate"))?;
+        self.save_spec(&staging)?;
         let dest = staging.dest().to_path_buf();
         t.mark("prepare");
         let saved = self.save(vm, staging, !stop, incremental, &mut t, || Ok(()));
@@ -210,10 +211,7 @@ impl Proc {
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             staging.add_file("PORTS", &serde_json::to_vec(&*self.ports.lock().unwrap())?)?;
-            let spec = self.spec.lock().unwrap().clone();
-            if spec != crate::app::RunSpec::default() {
-                staging.add_file(SPEC, &serde_json::to_vec(&spec)?)?;
-            }
+            self.save_spec(&staging)?;
             let cmd = match self.cmd.lock().unwrap().clone() {
                 Some(cmd) => Some((cmd, self.cmd_session()?, staging.create(CMD)?)),
                 None => None,
@@ -275,6 +273,15 @@ impl Proc {
                 e
             }
         }
+    }
+
+    /// What becomes of the VM once its app exits goes with its checkpoint (`SPEC`).
+    fn save_spec(&self, staging: &Staging) -> Result<()> {
+        let spec = self.spec.lock().unwrap().clone();
+        if spec != crate::app::RunSpec::default() {
+            staging.add_file(SPEC, &serde_json::to_vec(&spec)?)?;
+        }
+        Ok(())
     }
 
     pub fn resume_suspended(&self, name: &str) -> Result<Value> {
@@ -355,6 +362,9 @@ impl Proc {
     pub fn restore(&self, dir: &Path, name: Option<&str>, ip: Option<&str>, paused: bool, resources: crate::vm::Resources) -> Result<Value> {
         let mut t = Phases::new();
         let ck = Checkpoint::open(dir)?;
+        // Its app's settings and what becomes of it; not the address its original asked for.
+        let spec = read_spec(dir).map_err(|e| format!("its run settings {}: {e}", dir.join(SPEC).display()))?;
+        *self.spec.lock().unwrap() = crate::app::RunSpec { ip: None, ..spec };
         t.mark("verify_checkpoint");
         let name = name.unwrap_or(&ck.manifest.name).to_string();
         let want = match ip {

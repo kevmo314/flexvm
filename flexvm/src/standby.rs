@@ -598,7 +598,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         };
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20, ready) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
-        if req["generation"] != mine {
+        if !claims_generation(&req["generation"], &mine) {
             continue;
         }
         // Locked until the claim succeeds or rolls back (dropped): relief does not count it stopped.
@@ -780,6 +780,20 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     Ok(v)
 }
 
+/// A claim's generation: the template's, marked as a claim whose VM follows its app with the run's
+/// settings (`app::RunSpec`). A standby process older than that would take it and ignore them: it
+/// finds no generation of its own, and the claim goes to another (or starts cold).
+fn generation(key: &str) -> String {
+    format!("{key}{FOLLOWS_APP}")
+}
+
+const FOLLOWS_APP: &str = "+app";
+
+/// A claim of this generation: marked, or (an older `run`'s) not.
+fn claims_generation(generation: &Value, mine: &str) -> bool {
+    generation.as_str().is_some_and(|g| g.strip_suffix(FOLLOWS_APP).unwrap_or(g) == mine)
+}
+
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
 /// no answer (by `CLAIM_TIMEOUT`) is then an error, never a reason to start it again.
 pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, BufReader<UnixStream>)>> {
@@ -794,7 +808,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         .collect();
     socks.sort();
     let mut req = req.clone();
-    req["generation"] = json!(key);
+    req["generation"] = json!(generation(&key));
     let mut line = serde_json::to_vec(&req)?;
     line.push(b'\n');
     let name = req["name"].as_str().unwrap_or("");
@@ -1282,6 +1296,16 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_with_run_settings_is_marked_for_standbys_that_apply_them() {
+        let marked = generation("a");
+        assert_eq!(marked, "a+app");
+        assert!(claims_generation(&json!("a"), "a") && claims_generation(&json!(marked), "a"));
+        // What an older standby compares: never its own generation, so it leaves the claim be.
+        assert_ne!(json!(marked), json!("a"));
+        assert!(!claims_generation(&json!("b+app"), "a") && !claims_generation(&json!("a+appx"), "a") && !claims_generation(&json!(null), "a"));
+    }
+
+    #[test]
     fn stopped_standbys_share_one_handshake_budget_and_a_live_one_after_them_wins() {
         let (_root, host, paths, d) = pool("standby-budget");
         let stopped = ["0", "00"].map(|n| UnixListener::bind(d.join(format!("{n}.sock"))).unwrap());
@@ -1289,7 +1313,7 @@ mod tests {
         let live = std::thread::spawn(move || {
             let (c, _) = live.accept().unwrap();
             let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
-            assert_eq!(req["generation"], "a");
+            assert_eq!(req["generation"], "a+app");
             send_json(&mut &c, &json!({"claiming": true})).unwrap();
             send_json(&mut &c, &json!({"ok": true, "result": "live"})).unwrap();
         });

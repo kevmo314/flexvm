@@ -122,6 +122,10 @@ impl Proc {
         let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
+        // Before the pause: dropped, the connection ends the target's arrival.
+        if prepared["follows_app"] != true && *self.spec.lock().unwrap() != crate::app::RunSpec::default() {
+            bail!("{to} runs an older flexvm, which would drop vm {}'s run settings (-e, --entrypoint, --keep, --rm, --ip): upgrade it first", vm.name);
+        }
         let prepare = prep.elapsed();
         // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
         let mut wanted = crate::standby::load_set(&self.host, &vm.template);
@@ -592,7 +596,8 @@ impl Proc {
                 return Err(e);
             }
         };
-        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true}}))?;
+        // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app.
+        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true}}))?;
         let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();

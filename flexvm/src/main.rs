@@ -773,25 +773,24 @@ fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec>
     Ok(app::RunSpec { env, entrypoint, keep: args.has("keep"), rm: args.has("rm"), ip })
 }
 
-/// `start` of an exited VM (`app::Exited`): a new run under its name, as it was run.
+/// `start` of an exited VM (`app::Exited`): a new run under its name, as its record (read under
+/// the name, `Proc::run`) says it was run.
 fn rerun(host: &Host, name: &str) -> Result<Option<Start>> {
     host::check_name(name)?;
-    let path = host.vms(name, "exited")?;
-    if host.suspended(name)?.exists() || !path.exists() {
+    if host.suspended(name)?.exists() || !host.vms(name, "exited")?.exists() {
         return Ok(None);
     }
-    let r = app::Exited::read(&path)?;
-    let (ip, tty) = (r.spec.ip, stdin_tty());
+    let (template, resources, spec) = (String::new(), vm::Resources::default(), app::RunSpec::default());
     Ok(Some(Start::Run {
         name: name.into(),
-        template: r.template,
-        ip,
-        cmd: r.cmd,
-        resources: r.resources,
+        template,
+        ip: None,
+        cmd: None,
+        resources,
         generated: false,
         ports: Vec::new(),
-        spec: r.spec,
-        tty,
+        spec,
+        tty: stdin_tty(),
         rerun: true,
     }))
 }
@@ -1024,6 +1023,11 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         }
         // A suspend that finished first is undone: the kill wins.
         if !host.suspended(name)?.exists() {
+            // `rm -f`: so is the record of an app's exit that won the race, under the name (none took it since).
+            if stopped && host.vms(name, "exited")?.exists() {
+                let _lock = host.take_name(name, true)?;
+                let _ = std::fs::remove_file(host.vms(name, "exited")?);
+            }
             return done();
         }
     }

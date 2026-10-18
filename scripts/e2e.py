@@ -585,6 +585,31 @@ def app_lifecycle():
     check("start: and exits again, with its status", wait_for(lambda: exited(vm) and A.ps()[vm].get("status") == 3, 30), A.ps().get(vm))
     check("rm: removes the exited record", A.rm(vm).stdout == vm + "\n" and vm not in A.ps())
 
+    # A rerun refused before it runs (its --ip taken meanwhile) leaves the record, to start again.
+    ip = f"{args.net_a}.50"
+    run_d("e2e-app-ip", "--ip", ip, *entry("exit 2"))
+    check("rerun: exited at its --ip", wait_for(lambda: exited("e2e-app-ip"), 30), A.ps().get("e2e-app-ip"))
+    A.run("e2e-ip-holder", ip=ip)
+    r = A.cli("start", "e2e-app-ip", check=False)
+    check("rerun: refused while its address is taken", r.returncode != 0, r.stdout + r.stderr)
+    check("rerun: its record stays", exited("e2e-app-ip") and A.ps()["e2e-app-ip"].get("status") == 2, A.ps().get("e2e-app-ip"))
+    A.kill("e2e-ip-holder")
+    out = json.loads(A.cli("start", "e2e-app-ip").stdout)
+    check("rerun: once free, at its address again", out["ip"] == ip, out)
+    check("rerun: and exits again", wait_for(lambda: exited("e2e-app-ip"), 30), A.ps().get("e2e-app-ip"))
+    A.rm("e2e-app-ip")
+
+    # A checkpoint keeps the run's settings: the restored VM follows its --entrypoint app.
+    run_d("e2e-app-ck", *entry("echo ck-up; sleep 4; exit 9"))
+    check("checkpoint: the app is up", wait_for(lambda: "ck-up" in A.logs("e2e-app-ck"), 30), A.logs("e2e-app-ck")[-2000:])
+    ck = ckpt_dir("app-ck")
+    A.checkpoint("e2e-app-ck", ck, stop=True)
+    A.restore(ck, name="e2e-app-ck2", ip="auto")
+    check("checkpoint: the restored vm exits with the app", wait_for(lambda: exited("e2e-app-ck2"), 30) and A.ps()["e2e-app-ck2"].get("status") == 9,
+          (A.ps().get("e2e-app-ck2"), A.logs("e2e-app-ck2")[-2000:]))
+    A.rm("e2e-app-ck2")
+    shutil.rmtree(ck, ignore_errors=True)
+
     # --rm: no record once it exits.
     run_d("e2e-app-rm", "--rm", *entry("exit 0"))
     check("--rm: gone once its app exits", wait_for(lambda: "e2e-app-rm" not in A.ps(), 30), A.ps().get("e2e-app-rm"))

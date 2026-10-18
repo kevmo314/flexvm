@@ -780,7 +780,7 @@ impl Host {
         if !resuming && suspended.exists() {
             bail!("vm {name:?} exists (stopped); flexvm start or rm it");
         }
-        // Its record stays until `rm` or `start` (`take_exited_name`) takes it.
+        // Its record stays until `rm` or `start` (`take_rerun_name`) takes it.
         if !resuming && self.vms(name, "exited")?.exists() {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
@@ -792,15 +792,18 @@ impl Host {
         Ok(NameLock { name: name.into(), host: self.clone(), _file: f })
     }
 
-    /// `start` of an exited VM: its name, and its record (read, then removed: the rerun replaces it).
-    pub fn take_exited_name(&self, name: &str) -> Result<NameLock> {
+    /// `start` of an exited VM: its name, and its record's path, which the rerun reads under it
+    /// (and removes once it runs).
+    pub fn take_rerun_name(&self, name: &str) -> Result<(NameLock, PathBuf)> {
         let lock = self.take_name(name, true)?;
         if self.suspended(name)?.exists() {
             bail!("vm {name:?} exists (stopped); flexvm start or rm it");
         }
         let exited = self.vms(name, "exited")?;
-        std::fs::remove_file(&exited).map_err(|e| format!("vm {name:?} has not exited (its record {}: {e})", exited.display()))?;
-        Ok(lock)
+        if !exited.exists() {
+            bail!("vm {name:?} has not exited (no record at {})", exited.display());
+        }
+        Ok((lock, exited))
     }
 
     /// Whether no process runs `name`, by its lock's record alone (never a
@@ -4819,18 +4822,18 @@ pub(crate) mod tests {
         // `rm` takes it as a stopped VM's: the record stays until it removes it.
         drop(h.take_name("x", true).unwrap());
         assert!(h.vms("x", "exited").unwrap().exists());
-        // `start`'s rerun takes the record with the name; then the name is a running VM's.
-        let lock = h.take_exited_name("x").unwrap();
-        assert!(!h.vms("x", "exited").unwrap().exists());
-        assert!(h.take_name("x", false).is_err(), "held");
+        // `start`'s rerun takes the name with the record, which it removes once the VM runs.
+        let (lock, path) = h.take_rerun_name("x").unwrap();
+        assert!(path.exists() && h.take_name("x", false).is_err(), "held");
+        std::fs::remove_file(path).unwrap();
         drop(lock);
-        assert!(h.take_exited_name("x").err().unwrap().to_string().contains("has not exited"), "no record: nothing to rerun");
+        assert!(h.take_rerun_name("x").err().unwrap().to_string().contains("has not exited"), "no record: nothing to rerun");
         drop(h.take_name("x", false).unwrap());
         // A stopped VM of the name is resumed, not rerun.
         std::fs::write(h.vms("s", "exited").unwrap(), "{}").unwrap();
         std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
         std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
-        assert!(h.take_exited_name("s").err().unwrap().to_string().contains("stopped"));
+        assert!(h.take_rerun_name("s").err().unwrap().to_string().contains("stopped"));
         assert!(h.vms("s", "exited").unwrap().exists());
     }
 

@@ -1026,8 +1026,15 @@ impl Proc {
     fn run(&self, name: &str, template: &str, want: Option<Ipv4Addr>, generated: bool, rerun: bool) -> Result<Value> {
         let mut t = Phases::new();
         let mut name = name.to_string();
+        let mut record = None;
         let lock = loop {
-            let taken = if rerun { self.host.take_exited_name(&name) } else { self.host.take_name(&name, false) };
+            let taken = match rerun {
+                true => self.host.take_rerun_name(&name).map(|(lock, path)| {
+                    record = Some(path);
+                    lock
+                }),
+                false => self.host.take_name(&name, false),
+            };
             match taken {
                 Err(e) if generated && crate::host::name_taken(&e) => name = crate::host::generated_name(&self.host)?,
                 r => break r?,
@@ -1035,7 +1042,19 @@ impl Proc {
         };
         self.set_name(lock);
         let name = name.as_str();
-        let tpl = Template::open(&self.paths, template)?;
+        // A rerun is what its record says, read under the name: never one another start replaced meanwhile.
+        let (template, want) = match &record {
+            Some(path) => {
+                let r = crate::app::Exited::read(path)?;
+                *self.cmd.lock().unwrap() = r.cmd;
+                *self.resources.lock().unwrap() = r.resources;
+                let ip = r.spec.ip;
+                *self.spec.lock().unwrap() = r.spec;
+                (r.template, ip)
+            }
+            None => (template.to_string(), want),
+        };
+        let tpl = Template::open(&self.paths, &template)?;
         let resources = *self.resources.lock().unwrap();
         self.set_resources(resources, &tpl.meta)?;
         self.spec.lock().unwrap().check(tpl.meta.image.as_ref())?;
@@ -1072,6 +1091,10 @@ impl Proc {
         self.set_vm(vm);
         let mut v = self.start_guest(&mut t)?;
         v["standby"] = json!(false);
+        // Kept until it runs: a rerun that fails before leaves the VM exited, to start again.
+        if let Some(path) = record {
+            let _ = std::fs::remove_file(path);
+        }
         Ok(v)
     }
 
@@ -1298,7 +1321,9 @@ impl Proc {
         let _ = c.set_read_timeout(None);
         let reply = match req["op"].as_str().unwrap_or("") {
             // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
-            "exec" | "checkpoint" | "migrate" | "debug" | "resume" if self.vm.get().is_none() => Err(Busy(format!("vm {} is starting", self.name())).into()),
+            "exec" | "checkpoint" | "migrate" | "debug" | "resume" | "signal" if self.vm.get().is_none() => {
+                Err(Busy(format!("vm {} is starting", self.name())).into())
+            }
             "exec" => return self.exec(&req, c),
             "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
