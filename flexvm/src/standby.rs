@@ -236,6 +236,13 @@ pub(crate) fn removing<T>(host: &Host, paths: &Paths, template: &str, remove: im
     }
 }
 
+/// After a pull moved `template` on: its standby VMs (those of the generation it linked to) leave
+/// once they see that, within a second or so, and are waited for a few seconds at most.
+pub(crate) fn superseded(host: &Host, template: &str) {
+    let waiting = live(host, template).into_iter().filter_map(|id| PidFd::open(&id).ok().flatten().map(|fd| (id, fd))).collect();
+    wait_gone(waiting, Instant::now() + Duration::from_secs(5), || host.entries().into_iter().map(|e| e.ident).collect());
+}
+
 /// Whether `path` is no longer the file `f` has open (by device and inode; `f` keeps its inode in use).
 fn replaced(f: &File, path: &std::path::Path) -> bool {
     match (f.metadata(), std::fs::symlink_metadata(path)) {

@@ -741,9 +741,9 @@ impl Host {
         dir.join("manifest.json").is_file() && !dir.join("STARTED").exists() && !dir.join("DISCARDED").exists()
     }
 
-    /// The template content ids VMs here use as far as their records say: registered VMs, and
-    /// every suspended (or quarantined) one, even one a live process holds the name of (a resume
-    /// that has not opened its template yet). `rmi` reads it again under a generation's exclusive
+    /// The template content ids VMs here use as far as their records say: registered VMs, every
+    /// suspended (or quarantined) one, even one a live process holds the name of (a resume that has
+    /// not opened its template yet), and flexvm's own checkpoints (`checkpoint::managed`). `rmi` reads it again under a generation's exclusive
     /// use lock: a suspend publishes its checkpoint before its process lets the lock go, and a resume
     /// takes the lock before it marks the checkpoint STARTED, so one of the two shows every such VM.
     pub fn template_users(&self) -> std::collections::BTreeSet<String> {
@@ -754,6 +754,7 @@ impl Host {
                 ids.extend(crate::checkpoint::read_manifest(&dir).ok().map(|m| m.template_id));
             }
         }
+        ids.extend(crate::checkpoint::managed(&self.state).map(|(_, m)| m.template_id));
         ids
     }
 

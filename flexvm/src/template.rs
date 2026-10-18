@@ -364,8 +364,13 @@ impl Template {
         (valid_id(id) && dir.is_dir()).then_some(dir)
     }
 
+    /// Opened again if a pull moved the name on and deleted what it linked to as it was opened.
     pub fn open(paths: &Paths, name: &str) -> Result<Arc<Template>> {
-        Template::open_dir(name, Template::resolve(paths, name)?)
+        let dir = Template::resolve(paths, name)?;
+        Template::open_dir(name, dir.clone()).or_else(|e| match Template::resolve(paths, name)? {
+            again if again != dir => Template::open_dir(name, again),
+            _ => Err(e),
+        })
     }
 
     /// Generation `id`, even if the name has moved on since, verified. Both may come from a
@@ -876,8 +881,9 @@ pub fn up_to_date(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: &
     Some(meta.id)
 }
 
-/// Builds `name` from an image's root filesystem and publishes it as a new generation.
-pub fn create(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: ImageMeta, tap: &str) -> Result<()> {
+/// Builds `name` from an image's root filesystem and publishes it as a new generation; returns
+/// the generation the name linked to before, for the caller to delete if nothing uses it.
+pub fn create(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: ImageMeta, tap: &str) -> Result<Option<String>> {
     // The caller owns `tap` through image preparation and the build.
     // Running VMs map the old files, which must not be rewritten under them.
     let staging = Staging::new(paths, name)?;
@@ -887,9 +893,11 @@ pub fn create(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: Image
     publish(paths, name, &staging.dir, interrupted)
 }
 
-/// Nothing is deleted: VMs and checkpoints refer to generations by content id, so old ones
-/// stay until an operator removes them.
-fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnce() -> Result<()>) -> Result<()> {
+/// Returns the generation the name linked to before, if another. Nothing is deleted here: VMs
+/// refer to generations by content id, so the pull deletes it (`prune` of only that one) once no
+/// name links to it and nothing here uses it (`Host::template_users`). Checkpoints in other
+/// directories than flexvm's own (`checkpoint::managed`) are not known: theirs may go.
+fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnce() -> Result<()>) -> Result<Option<String>> {
     // Every name below is in the directories as opened here, whatever their paths name meanwhile.
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
@@ -921,8 +929,10 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
     let tmp = paths.templates.join(format!(".{name}.link-{}", crate::util::random_hex(8)?));
     std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
     crate::util::sync_dir(&gens.path)?;
+    let old = std::fs::read_link(&live).ok().and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned())).filter(|id| *id != meta.id);
     std::fs::rename(&tmp, &live)?;
-    Ok(crate::util::sync_dir(&paths.templates)?)
+    crate::util::sync_dir(&paths.templates)?;
+    Ok(old)
 }
 
 fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: &str, image: ImageMeta) -> Result<()> {
@@ -1101,7 +1111,7 @@ fn describe(name: Option<&str>, id: &str, dir: &Path) -> Value {
 }
 
 /// `flexvm images`: every name, and the generations no name links to (`<none>`, kept for VMs
-/// and checkpoints of earlier pulls until `rmi ID`).
+/// of earlier pulls until `rmi ID` or `image prune`).
 pub fn images(paths: &Paths) -> Result<Vec<Value>> {
     let names = names(&paths.templates)?;
     let gens = paths.templates.join(GENERATIONS);
@@ -1162,8 +1172,9 @@ pub fn tag(paths: &Paths, src: &str, dst: &str) -> Result<Value> {
     Ok(json!({"tagged": image_of(&dst), "id": id}))
 }
 
-/// `image prune`: each unnamed generation, as `rmi ID` would remove it; those still used stay.
-pub fn prune(paths: &Paths, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Vec<Value>> {
+/// `image prune`: each unnamed generation (or only `only`, which a pull moved its name off), as
+/// `rmi ID` would remove it; those still used stay.
+pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Vec<Value>> {
     if !paths.templates.exists() {
         return Ok(vec![]);
     }
@@ -1172,7 +1183,7 @@ pub fn prune(paths: &Paths, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Vec
     let _lock = templates_lock(paths, libc::LOCK_EX)?;
     sweep_locked(paths)?;
     let mut removed = vec![];
-    for id in generations(&paths.templates)? {
+    for id in generations(&paths.templates)?.into_iter().filter(|id| only.is_none_or(|o| o == id)) {
         if let Ok(rootfs) = delete_unused(paths, &id, in_use)? {
             removed.push(json!({"deleted": id, "rootfs": rootfs}));
         }
@@ -1525,14 +1536,44 @@ mod tests {
     }
 
     /// Publishes a generation `id` of `name` with the fixture's files and `meta`.
-    fn publish_as(f: &Fixture, name: &str, meta: &Meta) {
+    fn publish_as(f: &Fixture, name: &str, meta: &Meta) -> Option<String> {
         let dir = f.dir.join(format!(".{name}.new-{}", meta.id));
         std::fs::create_dir_all(&dir).unwrap();
         for file in ["vmstate", "mem"] {
             std::fs::copy(f.dir.join(file), dir.join(file)).unwrap();
         }
         f.write_meta(meta, &dir);
-        publish(&f.paths, name, &dir, || Ok(())).unwrap();
+        publish(&f.paths, name, &dir, || Ok(())).unwrap()
+    }
+
+    /// A pull deletes only the generation it moved its name off, and only when nothing uses it.
+    #[test]
+    fn a_pull_deletes_the_generation_it_superseded_once_unused() {
+        let f = Fixture::new();
+        let gen = |id: &str| Meta { id: id.into(), image: Some(image("sha256:a", "")), ..f.meta.clone() };
+        let none = BTreeSet::new;
+        assert_eq!(publish_as(&f, "t", &gen("aaaa1111")), None);
+        assert_eq!(publish_as(&f, "t", &gen("aaaa1111")), None, "an identical build moves nothing");
+        publish_as(&f, "u", &gen("eeee5555"));
+        assert_eq!(publish_as(&f, "u", &gen("ffff6666")).as_deref(), Some("eeee5555"));
+        let old = publish_as(&f, "t", &gen("bbbb2222")).unwrap();
+        assert_eq!(old, "aaaa1111");
+        let removed = prune(&f.paths, Some(&old), &none).unwrap();
+        assert_eq!(removed, [json!({"deleted": "aaaa1111", "rootfs": null})]);
+        assert_eq!(generations(&f.paths.templates).unwrap(), ["bbbb2222", "eeee5555", "ffff6666"], "another unnamed one is prune's");
+        // Kept while a VM record names it, a VM process has it open, or another name links to it.
+        let old = publish_as(&f, "t", &gen("cccc3333")).unwrap();
+        let users = || BTreeSet::from([old.clone()]);
+        assert!(prune(&f.paths, Some(&old), &users).unwrap().is_empty());
+        let open = Template::open_dir("t", f.dir.join(GENERATIONS).join(&old)).unwrap();
+        assert!(prune(&f.paths, Some(&old), &none).unwrap().is_empty());
+        drop(open);
+        tag(&f.paths, &old, "alias").unwrap();
+        assert!(prune(&f.paths, Some(&old), &none).unwrap().is_empty());
+        assert!(Template::generation(&f.paths, &old).is_some());
+        // Collected once free.
+        remove(&f.paths, Some("alias"), &old, &none).unwrap();
+        assert!(Template::generation(&f.paths, &old).is_none());
     }
 
     #[test]
@@ -1579,18 +1620,18 @@ mod tests {
         assert!(tag(&f.paths, "missing", "new").is_err());
         // The name moves on; the alias keeps the old generation, so nothing is unnamed.
         publish_as(&f, "t", &gen("bbbb2222"));
-        assert!(prune(&f.paths, &BTreeSet::new).unwrap().is_empty());
+        assert!(prune(&f.paths, None, &BTreeSet::new).unwrap().is_empty());
         // By ID prefix, an existing name moves too: now aaaa1111 is unnamed.
         tag(&f.paths, "bbbb", &alias).unwrap();
         publish_as(&f, "t", &gen("cccc3333"));
         let users = || BTreeSet::from(["aaaa1111".to_string()]);
-        assert!(prune(&f.paths, &users).unwrap().is_empty(), "a VM record uses it");
+        assert!(prune(&f.paths, None, &users).unwrap().is_empty(), "a VM record uses it");
         let handle = File::open(f.paths.templates.join(GENERATIONS).join("aaaa1111")).unwrap();
         let st = crate::util::fstat(handle.as_raw_fd()).unwrap();
         let held = crate::host::lock_at(crate::host::host_locks().unwrap(), &crate::host::use_lock(&st), libc::LOCK_SH).unwrap();
-        assert!(prune(&f.paths, &BTreeSet::new).unwrap().is_empty(), "a VM process has it open");
+        assert!(prune(&f.paths, None, &BTreeSet::new).unwrap().is_empty(), "a VM process has it open");
         drop((held, handle));
-        let removed = prune(&f.paths, &BTreeSet::new).unwrap();
+        let removed = prune(&f.paths, None, &BTreeSet::new).unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0]["deleted"], "aaaa1111");
         assert_eq!(generations(&f.paths.templates).unwrap(), ["bbbb2222", "cccc3333"]);
