@@ -212,15 +212,14 @@ unwritten for an hour, by sweeps that run when a VM starts and about every
 ```sh
 flexvm logs web                 # its log: NAME.log.1 (before the last rotation), then NAME.log
 flexvm logs --tail 20 web       # the last 20 lines
-flexvm logs -f web              # and follow it, until nothing of the VM is left
+flexvm logs -f web              # and follow it, until the VM exits or is removed
 ```
 
 `logs -f` reads on across rotations (it finishes the rotated log, then
 starts on the new one) and restarts (a VM started again appends to its log);
-it ends once the name has no VM left (`kill`, `rm`, a `--rm` VM's command
-or app that ended; an exited VM's log stays, to read, until `rm`) or its
-reader is gone. A foreground VM's output is its terminal's, so
-its log holds only what came after a closed terminal. Foreground `run`,
+it ends once the VM exits or is removed, or its reader is gone. An exited
+VM's log stays available to read until `rm`. A foreground VM's output is its
+terminal's, so its log holds only what came after a closed terminal. Foreground `run`,
 `start -a` and `attach` print only the app's output, errors and warnings;
 flexvm's and flexvm-init's informational messages go to the log alone, and
 also to stderr with the global `--verbose` (`-v`) or `FLEXVM_LOG=debug`.

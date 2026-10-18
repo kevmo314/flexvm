@@ -598,9 +598,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         };
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20, ready) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
-        if !claims_generation(&req["generation"], &mine) {
-            continue;
-        }
+        let Some(spec) = claim_spec(&req, &mine) else { continue };
         // Locked until the claim succeeds or rolls back (dropped): relief does not count it stopped.
         let claiming = crate::host::private_file(&claim_path)?;
         crate::host::flock(&claiming, libc::LOCK_EX)?;
@@ -615,7 +613,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         // Before it is published: eviction leaves a CMD VM alone.
         *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
         // The claim's app settings are applied as it starts the app (`start_guest`), its ports as it claims.
-        *p.spec.lock().unwrap() = claim_spec(&req);
+        *p.spec.lock().unwrap() = spec;
         crate::util::set_verbose(req["verbose"] == json!(true));
         p.tty.store(req["tty"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         p.attached.store(req["attached"] == json!(true), std::sync::atomic::Ordering::SeqCst);
@@ -787,9 +785,15 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     Ok(v)
 }
 
-/// The run's settings, including its ports; absent in a v0.1.0 claim.
-fn claim_spec(req: &Value) -> crate::app::RunSpec {
-    serde_json::from_value(req["spec"].clone()).unwrap_or_default()
+/// Validate before acknowledging a claim; only v0.1.0 sends an unmarked generation without a spec.
+fn claim_spec(req: &Value, mine: &str) -> Option<crate::app::RunSpec> {
+    if req["generation"] == mine && req.get("spec").is_none() {
+        return Some(crate::app::RunSpec::default());
+    }
+    if req["generation"] != generation(mine) {
+        return None;
+    }
+    serde_json::from_value(req["spec"].clone()).ok()
 }
 
 /// A claim's generation: the template's, marked as a claim whose VM follows its app with the run's
@@ -800,11 +804,6 @@ fn generation(key: &str) -> String {
 }
 
 const FOLLOWS_APP: &str = "+app";
-
-/// A claim of this generation: marked, or (an older `run`'s) not.
-fn claims_generation(generation: &Value, mine: &str) -> bool {
-    generation.as_str().is_some_and(|g| g.strip_suffix(FOLLOWS_APP).unwrap_or(g) == mine)
-}
 
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
 /// no answer (by `CLAIM_TIMEOUT`) is then an error, never a reason to start it again.
@@ -989,10 +988,16 @@ mod tests {
     #[test]
     fn a_claims_ports_come_in_its_spec() {
         let ports: Vec<crate::ports::Port> = vec!["8080:80".parse().unwrap()];
-        let spec = crate::app::RunSpec { keep: true, ports: ports.clone(), ..Default::default() };
-        assert_eq!(claim_spec(&json!({"spec": spec})), spec);
-        assert_eq!(claim_spec(&json!({"spec": {"keep": true}})), crate::app::RunSpec { keep: true, ..Default::default() });
-        assert_eq!(claim_spec(&json!({})), crate::app::RunSpec::default());
+        let spec = crate::app::RunSpec { env: vec!["A=1".into()], entrypoint: Some(vec!["sh".into()]), rm: true, ports, ..Default::default() };
+        assert_eq!(claim_spec(&json!({"generation": "a+app", "spec": spec}), "a"), Some(spec));
+        assert_eq!(claim_spec(&json!({"generation": "a+app", "spec": {"keep": true}}), "a"), Some(crate::app::RunSpec { keep: true, ..Default::default() }));
+        // The request v0.1.0's run sends has no spec and an unmarked generation.
+        assert_eq!(claim_spec(&json!({"generation": "a"}), "a"), Some(crate::app::RunSpec::default()));
+        for spec in [json!(null), json!({"env": "A=1"}), json!({"ports": ["bad"]}), json!({"entrypoint": "sh"}), json!({"rm": "true"})] {
+            assert!(claim_spec(&json!({"generation": "a+app", "spec": spec}), "a").is_none(), "{spec}");
+        }
+        assert!(claim_spec(&json!({"generation": "a+app"}), "a").is_none());
+        assert!(claim_spec(&json!({"generation": "a", "spec": {}}), "a").is_none());
     }
 
     #[test]
@@ -1320,11 +1325,12 @@ mod tests {
     fn a_claim_with_run_settings_is_marked_for_standbys_that_apply_them() {
         let marked = generation("a");
         assert_eq!(marked, "a+app");
-        assert!(claims_generation(&json!("a"), "a") && claims_generation(&json!(marked), "a"));
-        assert!(claims_generation(&json!("a+app"), "a"));
+        assert!(claim_spec(&json!({"generation": marked, "spec": {}}), "a").is_some());
         // What an older standby compares: never its own generation, so it leaves the claim be.
         assert_ne!(json!(marked), json!("a"));
-        assert!(!claims_generation(&json!("b+app"), "a") && !claims_generation(&json!("a+appx"), "a") && !claims_generation(&json!(null), "a"));
+        for generation in [json!("b+app"), json!("a+appx"), json!(null)] {
+            assert!(claim_spec(&json!({"generation": generation, "spec": {}}), "a").is_none());
+        }
     }
 
     #[test]
