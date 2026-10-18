@@ -453,7 +453,7 @@ impl Vm {
 
     /// Frames the tap dropped, its queue full, that were not reported with injected packets.
     pub fn tap_dropped(&self) -> Option<u64> {
-        let n = std::fs::read_to_string(format!("/sys/class/net/{}/statistics/tx_dropped", self.tap)).ok()?.trim().parse::<u64>().ok()?;
+        let n = crate::hold::tap_tx_dropped(&self.tap)?;
         Some(n.saturating_sub(self.tap_drops_reported.load(Ordering::SeqCst)))
     }
 

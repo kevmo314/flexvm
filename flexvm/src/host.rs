@@ -2218,7 +2218,7 @@ fn debits_taken(
 }
 
 /// How long since `path` was last written: None if that cannot be told.
-fn unwritten_for(path: &Path) -> Option<Duration> {
+pub(crate) fn unwritten_for(path: &Path) -> Option<Duration> {
     SystemTime::now().duration_since(std::fs::metadata(path).ok()?.modified().ok()?).ok()
 }
 

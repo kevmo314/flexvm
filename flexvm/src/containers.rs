@@ -972,7 +972,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let body = serde_json::to_vec(&json!({
             "format": crate::checkpoint::FORMAT, "created_unix_ms": 0, "name": name, "ip": ip,
-            "template": "tpl", "template_id": "id", "vcpus": 1, "mem_mib": 1, "max_mib": 1,
+            "template": "tpl", "template_id": "id", "saved_msrs": [], "saved_tsc_khz": 2000000, "vcpus": 1, "mem_mib": 1, "max_mib": 1,
             "hotplug_mib": 0, "guest_pages": 256, "data_pages": 0, "zero_pages": 0, "files": {}
         }))
         .unwrap();

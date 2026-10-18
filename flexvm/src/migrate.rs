@@ -232,9 +232,7 @@ impl Proc {
         };
         t.mark("target");
         let downtime = t.total();
-        // A target that takes this held stream (no sequence numbers) and `SWITCH` says so; to any
-        // other, nothing held is sent (it is counted as dropped).
-        let (held, rerouted) = self.reroute(mig, to, &target, conn.as_ref(), prepared["hold_switch2"] == true);
+        let (held, rerouted) = self.reroute(mig, to, &target, conn.as_ref());
         if let Err(e) = &rerouted {
             crate::log!("vm {}: migration {mig} to {to}: rerouting failed: {e}", self.name());
         }
@@ -409,7 +407,7 @@ impl Proc {
                 match o {
                     Some(Outcome::Committed(target)) => {
                         crate::info!("vm {}: migration {mig} to {to} committed", p.name());
-                        if let (_, Err(e)) = p.reroute(mig, &to, &target, None, false) {
+                        if let (_, Err(e)) = p.reroute(mig, &to, &target, None) {
                             crate::log!("vm {}: migration {mig} to {to}: rerouting failed: {e}", p.name());
                         }
                         return p.wait_release(mig, to);
@@ -468,7 +466,7 @@ impl Proc {
     /// A failed route is retried in the background: the target owns the VM either way.
     /// The forwards stay until `finish` (`End::Moved`): meanwhile they reach the VM by the route to
     /// the target, and an abort after this runs the VM here again with them.
-    fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>, switch: bool) -> (Option<hold::Stats>, Result<()>) {
+    fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>) -> (Option<hold::Stats>, Result<()>) {
         let ip = self.vm().ip;
         let mut route = Route::new(to, target, conn);
         *self.pending_route.lock().unwrap() = Some((mig, route.clone()));
@@ -487,13 +485,10 @@ impl Proc {
         if let Some(h) = self.holder().filter(|h| h.holding_for(ip, mig)) {
             // Its paused Firecracker takes nothing off the tap: what is there came before the hold.
             h.hold_first(ip, mig, |each| self.vm().take_tap_queue(each));
-            if conn.is_some() && !switch {
-                crate::log!("vm {}: {to} takes no held stream of this version; dropping the held packets", self.name());
-            }
-            match conn.filter(|_| switch).map(|c| (c, hold::start(c))) {
+            match conn.map(|c| (c, hold::start(c))) {
                 Some((c, Ok(()))) => {
                     // Sharing our routes, the target takes the address over itself, after the held packets.
-                    let handoff = switch && crate::net::is_local_addr(via).unwrap_or(false);
+                    let handoff = crate::net::is_local_addr(via).unwrap_or(false);
                     (held, res) = hold::send(h, ip, mig, c, handoff, || self.switch_route(mig, via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
                 }
                 started => {

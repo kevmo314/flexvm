@@ -193,10 +193,7 @@ impl Meta {
     fn read_from(dir: &Path, display: &Path, pinned: bool) -> Result<Meta> {
         serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?).map_err(|e| {
             let error = e.to_string();
-            let older = ["tsc_khz", "tsc_control", "msrs"].iter().any(|field| error.starts_with(&format!("missing field `{field}`")));
-            let hint = if pinned && older {
-                "this checkpoint or suspended VM was made with an older flexvm whose template record lacks required host compatibility fields and cannot be restored"
-            } else if pinned {
+            let hint = if pinned {
                 "this checkpoint or suspended VM pins this template generation; rebuilding the named template cannot repair it"
             } else {
                 "pull it again with `flexvm pull`"
@@ -1402,34 +1399,6 @@ mod tests {
             std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
             let error = Meta::read(&f.dir).unwrap_err().to_string();
             assert!(error.contains(field) && error.contains("pull it again with `flexvm pull`"), "{error}");
-        }
-    }
-
-    #[test]
-    fn older_pinned_template_errors_name_real_generation_without_rebuild_hint() {
-        let f = Fixture::new();
-        let generation = f.paths.templates.join(GENERATIONS).join(&f.meta.id);
-        std::fs::create_dir_all(generation.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&f.dir, &generation).unwrap();
-        // The named template has been rebuilt, but saved VMs still pin the old id.
-        let rebuilt = f.paths.templates.join("rebuilt");
-        std::fs::create_dir(&rebuilt).unwrap();
-        let mut rebuilt_meta = f.meta.clone();
-        rebuilt_meta.id = "0000000000000000".into();
-        f.write_meta(&rebuilt_meta, &rebuilt);
-        std::os::unix::fs::symlink(&rebuilt, f.paths.templates.join("t")).unwrap();
-        for field in ["tsc_khz", "tsc_control", "msrs"] {
-            let mut meta = serde_json::to_value(&f.meta).unwrap();
-            meta["compatibility"].as_object_mut().unwrap().remove(field);
-            std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
-            let error = Template::open_id(&f.paths, "t", &f.meta.id).err().unwrap().to_string();
-            assert!(error.contains(&generation.display().to_string()) && error.contains(field), "{error}");
-            assert!(error.contains("checkpoint or suspended VM") && error.contains("older flexvm") && error.contains("cannot be restored"), "{error}");
-            assert!(!error.contains("/proc/") && !error.contains("rebuild"), "{error}");
-            // Fresh template loads retain the useful rebuild hint and a real path too.
-            let error = f.open().err().unwrap().to_string();
-            assert!(error.contains(&f.dir.display().to_string()) && error.contains("pull it again"), "{error}");
-            assert!(!error.contains("/proc/"), "{error}");
         }
     }
 

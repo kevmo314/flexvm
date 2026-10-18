@@ -34,12 +34,9 @@ pub struct Manifest {
     pub template: String,
     pub template_id: String,
     /// MSRs selected by Firecracker on the host saving this VM state, not its template.
-    /// Missing in older checkpoints; never substitute the template's set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub saved_msrs: Option<BTreeSet<u32>>,
+    pub saved_msrs: BTreeSet<u32>,
     /// Effective vCPU rate in this VM state, which can differ from its template's.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub saved_tsc_khz: Option<u32>,
+    pub saved_tsc_khz: u32,
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
@@ -62,15 +59,8 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn saved_cpu(&self) -> Result<(u32, &BTreeSet<u32>)> {
-        let rate = self
-            .saved_tsc_khz
-            .filter(|&khz| khz != 0)
-            .ok_or("this checkpoint or suspended VM was made with an older flexvm without an effective vCPU TSC rate record and cannot be restored")?;
-        let msrs = self
-            .saved_msrs
-            .as_ref()
-            .ok_or("this checkpoint or suspended VM was made with an older flexvm without a saving host MSR record and cannot be restored")?;
-        Ok((rate, msrs))
+        ensure!(self.saved_tsc_khz != 0, "this checkpoint or suspended VM has a zero effective vCPU TSC rate and cannot be restored");
+        Ok((self.saved_tsc_khz, &self.saved_msrs))
     }
 
     #[cfg(test)]
