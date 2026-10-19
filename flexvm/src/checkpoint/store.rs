@@ -122,7 +122,11 @@ pub fn find<'a>(all: &'a [Entry], what: &str) -> Result<&'a Entry> {
     let found: Vec<&Entry> = all.iter().filter(|e| what.len() >= 4 && is_id(&e.id) && e.id.starts_with(what)).collect();
     match found[..] {
         [e] => Ok(e),
-        [] => bail!("no checkpoint {what:?} (see flexvm checkpoint ls)"),
+        [] => match all.iter().find(|e| !is_id(&e.id)) {
+            // It may be among those the listing missed.
+            Some(e) => bail!("no checkpoint {what:?} found: {}", e.manifest.as_ref().unwrap_err()),
+            None => bail!("no checkpoint {what:?} (see flexvm checkpoint ls)"),
+        },
         _ => bail!("{what:?} is the start of {} checkpoint ids; give more of it", found.len()),
     }
 }

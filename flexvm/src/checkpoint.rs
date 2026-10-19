@@ -55,7 +55,7 @@ fn managed_entries(
 /// Only a missing directory is empty; even a partial listing must report its errors.
 pub(crate) fn entries(dir: &std::path::Path) -> impl Iterator<Item = crate::util::Result<std::path::PathBuf>> {
     let path = dir.to_path_buf();
-    listing(std::fs::read_dir(dir)).map(move |e| e.map(|e| e.path()).map_err(|e| format!("{}: {e}", path.display()).into()))
+    listing(std::fs::read_dir(dir)).map(move |e| e.map(|e| e.path()).map_err(|e| format!("listing {}: {e}", path.display()).into()))
 }
 
 fn listing<T>(read: io::Result<impl Iterator<Item = io::Result<T>>>) -> impl Iterator<Item = io::Result<T>> {

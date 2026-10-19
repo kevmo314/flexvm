@@ -1142,7 +1142,11 @@ fn failed_checkpoint_listings_keep_templates_and_refuse_removal() {
                 let err = result.unwrap_err().to_string();
                 assert!(err.starts_with("nothing removed:") && err.contains(&dir.display().to_string()), "{err}");
             }
-            assert!(store::removal(&all, &["checkpoints".into()], true).is_err());
+            let err = store::removal(&all, &["checkpoints".into()], true).unwrap_err().to_string();
+            assert!(err.contains("listing") && err.contains(&dir.display().to_string()), "{err}");
+            let err = store::find(&all, "bbbbbbbbbbbbbbbb").err().unwrap().to_string();
+            assert!(err.starts_with("no checkpoint \"bbbbbbbbbbbbbbbb\" found: listing") && err.contains(&dir.display().to_string()), "{err}");
+            assert_eq!(store::find(&all, id).unwrap().id, id);
         }
         fs::remove_file(dir).unwrap();
         assert!(host.template_users().is_empty());
