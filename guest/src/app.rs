@@ -859,14 +859,20 @@ mod tests {
         let count = |dir: &str| std::fs::read_dir(format!("/proc/self/{dir}")).unwrap().count();
         let (tasks, fds) = (count("task"), count("fd"));
         for _ in 0..3 {
+            let dir = crate::test_util::TempDir::new("app-discard");
+            let (go, done) = (dir.join("go"), dir.join("done"));
             let mut cmd = Command::new("/bin/sh");
-            cmd.args(["-c", "echo early; (sleep 3; echo late) & exit 0"]);
+            let script = format!("echo early; (while [ ! -e {} ]; do sleep 0.01; done; echo late; echo done > {}) & exit 0", go.display(), done.display());
+            cmd.args(["-c", &script]);
             crate::input::stdio(&mut cmd, None, false).unwrap();
             let begun = Instant::now();
             let (_, supervisor) = launch(&mut APP.lock().unwrap(), &mut cmd, &statuses, None).unwrap();
             supervisor.join().unwrap();
             // Not waited for the descendants' `late` (checked in the log below): only reported.
             eprintln!("supervisor done in {:?} (drain {DRAIN:?})", begun.elapsed());
+            // Release the descendant only after the drain, regardless of scheduling delays.
+            std::fs::write(&go, b"").unwrap();
+            crate::test_util::wait_until("the descendant to finish writing its output", || done.exists());
             assert!(matches!(APP.lock().unwrap().state, State::Exited(0)));
             // Only the discarder's thread is added, however many starts. A joined thread
             // can still be in /proc/self/task until the kernel finishes its exit.
