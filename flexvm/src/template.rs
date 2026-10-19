@@ -1197,7 +1197,7 @@ const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_FILE: u64 = 1 << 44;
 const MAX_EXTENTS: u64 = 1 << 20;
 /// A received template's guest memory at most (its bitmap, 64 MiB, is allocated at open).
-const MAX_MEM_MIB: u64 = 2 << 20;
+pub const MAX_MEM_MIB: u64 = 2 << 20;
 /// The data bytes of one generation's files together.
 pub const MAX_DATA: u64 = 64 << 30;
 /// Room a received generation leaves on its filesystem.
