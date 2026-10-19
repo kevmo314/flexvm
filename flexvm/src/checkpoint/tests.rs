@@ -745,7 +745,7 @@ fn template_users_count_every_suspended_vm() {
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222"].map(String::from).into();
     assert_eq!(host.template_users(), want);
     // flexvm's own checkpoints (#775) keep theirs; a directory there without one is no checkpoint.
-    link(&host.state.join("checkpoints/ck1"), None, |m| m.template_id = "dddd4444".into());
+    link(&host.state.join("checkpoints/0123456789abcdef"), None, |m| m.template_id = "dddd4444".into());
     fs::create_dir_all(host.state.join("checkpoints/.staging")).unwrap();
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222", "dddd4444"].map(String::from).into();
     assert_eq!(host.template_users(), want);
@@ -832,6 +832,98 @@ fn the_store_names_lists_and_removes_dependants_first() {
 }
 
 #[test]
+fn store_unreadable_children_block_removal_and_prune() {
+    for damage in ["checksum", "format", "io"] {
+        let state = tmp("store-unreadable");
+        drop(store::lock(&state, libc::LOCK_SH).unwrap());
+        let a = stored(&state, None, 1);
+        let b = stored(&state, Some(&a), 2);
+        let c = stored(&state, Some(&b), 3);
+        let unrelated = stored(&state, None, 4);
+        let dir = store::dir(&state).join(&c);
+        let path = dir.join("manifest.json");
+        match damage {
+            "checksum" => fs::write(&path, b"bad checksum\n{}").unwrap(),
+            "format" => {
+                link(&dir, None, |m| m.format = 999);
+            }
+            _ => {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+        }
+        store::link(&state, "broken", &c).unwrap();
+        assert!(store::list(&state).iter().find(|e| e.id == c).unwrap().manifest.is_err());
+        assert!(store::rows(&state, &[]).iter().any(|r| r["id"] == c && r["error"].is_string()));
+        for result in [
+            store::remove(&state, std::slice::from_ref(&b), false),
+            store::remove(&state, std::slice::from_ref(&b), true),
+            store::remove(&state, std::slice::from_ref(&unrelated), false),
+            store::remove(&state, &["broken".into()], false),
+            store::prune(&state, None),
+            store::prune(&state, Some(2)),
+        ] {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains(&dir.display().to_string()), "{err}");
+        }
+        assert!([&a, &b, &c, &unrelated].iter().all(|id| store::dir(&state).join(id).exists()));
+        store::remove(&state, &["broken".into(), b.clone()], true).unwrap();
+        assert!(!dir.exists() && !store::dir(&state).join(b).exists());
+        assert_eq!(store::prune(&state, None).unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn store_cycles_refuse_before_deleting_anything() {
+    let state = tmp("store-cycle");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let a = stored(&state, None, 1);
+    let b = stored(&state, Some(&a), 2);
+    let unrelated = stored(&state, None, 3);
+    link(&store::dir(&state).join(&a), Some(Parent { path: format!("../{b}").into(), id: b.clone() }), |_| {});
+    for result in [store::remove(&state, &[a.clone(), unrelated.clone()], true), store::prune(&state, None)] {
+        assert!(result.unwrap_err().to_string().contains("dependency cycle"));
+        assert!([&a, &b, &unrelated].iter().all(|id| store::dir(&state).join(id).exists()));
+    }
+    assert_eq!(store::remove(&state, &[unrelated], false).unwrap().len(), 1);
+}
+
+#[test]
+fn host_template_users_keep_all_generations_for_unreadable_records() {
+    let root = tmp("host-unreadable");
+    let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+    let generations = host.state.join("templates").join(crate::template::GENERATIONS);
+    for id in ["aaaa1111", "bbbb2222"] {
+        fs::create_dir_all(generations.join(id)).unwrap();
+    }
+    let want = ["aaaa1111", "bbbb2222"].map(String::from).into();
+    for dir in [host.suspended("bad").unwrap(), host.state.join("checkpoints/0123456789abcdef")] {
+        fs::create_dir_all(&dir).unwrap();
+        assert!(host.template_users().is_empty(), "a missing manifest is revoked");
+        fs::write(dir.join("manifest.json"), b"bad checksum\n{}").unwrap();
+        assert_eq!(host.template_users(), want);
+        fs::rename(&generations, generations.with_extension("saved")).unwrap();
+        fs::write(&generations, b"not a directory").unwrap();
+        assert!(host.template_users().contains(crate::template::ALL_GENERATIONS));
+        fs::remove_file(&generations).unwrap();
+        fs::rename(generations.with_extension("saved"), &generations).unwrap();
+        link(&dir, None, |m| m.format = 999);
+        assert_eq!(host.template_users(), want, "newer formats count too");
+        for marker in ["STARTED", "DISCARDED"] {
+            if dir.starts_with(host.state.join("suspended")) {
+                fs::write(dir.join(marker), b"").unwrap();
+                assert!(host.template_users().is_empty(), "consumed records do not count");
+                fs::remove_file(dir.join(marker)).unwrap();
+            }
+        }
+        fs::remove_file(dir.join("manifest.json")).unwrap();
+        fs::create_dir(dir.join("manifest.json")).unwrap();
+        assert_eq!(host.template_users(), want, "I/O failures count too");
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
 fn store_cleanup_propagates_manifest_permission_errors() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -849,7 +941,7 @@ fn store_cleanup_propagates_manifest_permission_errors() {
     let result = store::prune(&state, None);
     fs::set_permissions(&checkpoint, fs::Permissions::from_mode(0o700)).unwrap();
     let err = result.unwrap_err();
-    assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains(&id), "{err}");
     assert!(fs::symlink_metadata(store::dir(&state).join(&id)).unwrap().is_symlink());
     assert!(checkpoint.join("manifest.json").is_file());
 }
@@ -889,7 +981,7 @@ mod scan {
     use std::collections::BTreeSet;
 
     fn builds_on(e: &Entry, id: &str) -> bool {
-        e.manifest.parent.as_ref().is_some_and(|p| p.id == id)
+        e.manifest.as_ref().unwrap().parent.as_ref().is_some_and(|p| p.id == id)
     }
 
     fn label(e: &Entry) -> &str {
@@ -908,11 +1000,12 @@ mod scan {
             }
             doomed.extend(more.iter().map(|e| e.id.as_str()));
         }
-        Ok(delete(all, doomed))
+        delete(all, doomed)
     }
 
-    pub fn prune(all: &[Entry], before: Option<u64>) -> Vec<String> {
-        let mut doomed: BTreeSet<&str> = all.iter().filter(|e| before.is_none_or(|b| e.manifest.created_unix_ms < b)).map(|e| e.id.as_str()).collect();
+    pub fn prune(all: &[Entry], before: Option<u64>) -> Result<Vec<String>> {
+        let mut doomed: BTreeSet<&str> =
+            all.iter().filter(|e| before.is_none_or(|b| e.manifest.as_ref().unwrap().created_unix_ms < b)).map(|e| e.id.as_str()).collect();
         while let Some(kept) = all.iter().find(|p| doomed.contains(p.id.as_str()) && all.iter().any(|e| !doomed.contains(e.id.as_str()) && builds_on(e, &p.id)))
         {
             doomed.remove(kept.id.as_str());
@@ -920,13 +1013,16 @@ mod scan {
         delete(all, doomed)
     }
 
-    fn delete(all: &[Entry], mut doomed: BTreeSet<&str>) -> Vec<String> {
+    fn delete(all: &[Entry], mut doomed: BTreeSet<&str>) -> Result<Vec<String>> {
         let mut out = vec![];
         while let Some(e) = all.iter().find(|e| doomed.contains(e.id.as_str()) && !all.iter().any(|c| doomed.contains(c.id.as_str()) && builds_on(c, &e.id))) {
             doomed.remove(e.id.as_str());
             out.push(e.id.clone());
         }
-        out
+        if !doomed.is_empty() {
+            bail!("checkpoint dependency cycle; nothing removed");
+        }
+        Ok(out)
     }
 }
 
@@ -948,7 +1044,7 @@ fn store_dependency_index_matches_the_scan_on_every_small_graph() {
                     };
                     let mut m = manifest(1, parent.map(|p| Parent { path: format!("../{p}").into(), id: p }), json!({}));
                     m.created_unix_ms = i as u64 * 10;
-                    store::Entry { id: id(i), name: (i % 2 == 1).then(|| format!("n{i}")), dir: format!("/nonexistent/{i}").into(), manifest: m }
+                    store::Entry { id: id(i), name: (i % 2 == 1).then(|| format!("n{i}")), dir: format!("/nonexistent/{i}").into(), manifest: Ok(m) }
                 })
                 .collect();
             let ids = |order: Vec<usize>| order.into_iter().map(|i| all[i].id.clone()).collect::<Vec<_>>();
@@ -961,7 +1057,11 @@ fn store_dependency_index_matches_the_scan_on_every_small_graph() {
                 }
             }
             for before in std::iter::once(None).chain((0..=n as u64).map(|i| Some(i * 10))) {
-                assert_eq!(ids(store::pruning(&all, before)), scan::prune(&all, before), "prune {before:?} from {code} of {n}");
+                assert_eq!(
+                    store::pruning(&all, before).map(ids).map_err(|e| e.to_string()),
+                    scan::prune(&all, before).map_err(|e| e.to_string()),
+                    "prune {before:?} from {code} of {n}"
+                );
             }
             graphs += 1;
         }

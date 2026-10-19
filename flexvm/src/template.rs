@@ -369,6 +369,8 @@ unsafe impl Sync for Template {}
 /// `templates/.gen/<content id>/` never changes (bar cached stamps); `templates/NAME` is a
 /// symlink to the current one, swapped atomically by `create`.
 pub const GENERATIONS: &str = ".gen";
+/// `template_users` cannot enumerate generations to keep after an unreadable checkpoint.
+pub(crate) const ALL_GENERATIONS: &str = "*";
 
 const MAX_LOAD_SET: usize = 512;
 /// Template builds' guest commands, on a possibly loaded host.
@@ -1608,7 +1610,8 @@ fn delete_unused(paths: &Paths, id: &str, in_use: &dyn Fn() -> BTreeSet<String>)
     let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else {
         return Ok(Err(("open in a VM process here".into(), format!("image {id} is open in a VM process here"))));
     };
-    if in_use().contains(id) {
+    let users = in_use();
+    if users.contains(id) || users.contains(ALL_GENERATIONS) {
         return Ok(Err(("used by a VM here".into(), format!("image {id} is used by a VM here"))));
     }
     let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
@@ -2185,6 +2188,19 @@ pub(crate) mod tests {
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0]["deleted"], "aaaa1111");
         assert_eq!(generations(&f.paths.templates).unwrap(), ["bbbb2222", "cccc3333"]);
+    }
+
+    #[test]
+    fn unreadable_checkpoint_keeps_generations_when_their_listing_failed() {
+        let f = Fixture::new();
+        for id in ["aaaa1111", "bbbb2222"] {
+            publish_as(&f, "t", &Meta { id: id.into(), ..f.meta.clone() });
+        }
+        let users = || BTreeSet::from([ALL_GENERATIONS.into()]);
+        assert!(prune(&f.paths, None, &users).unwrap().is_empty());
+        assert!(remove(&f.paths, None, "aaaa1111", &users).is_err());
+        assert_eq!(remove(&f.paths, Some("t"), "bbbb2222", &users).unwrap()["kept"], "bbbb2222");
+        assert_eq!(generations(&f.paths.templates).unwrap(), ["aaaa1111", "bbbb2222"]);
     }
 
     #[test]

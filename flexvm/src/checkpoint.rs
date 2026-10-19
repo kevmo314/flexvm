@@ -27,8 +27,22 @@ pub(crate) use write::{Buf, GuestPages};
 
 /// The checkpoints flexvm keeps itself (`STATE/checkpoints/ID`, #775): their generations stay
 /// (`Host::template_users`). None while the directory is missing.
-pub fn managed(state: &std::path::Path) -> impl Iterator<Item = (std::path::PathBuf, Manifest)> {
-    std::fs::read_dir(state.join("checkpoints")).into_iter().flatten().flatten().filter_map(|e| Some((e.path(), read_manifest(&e.path()).ok()?)))
+pub fn managed(state: &std::path::Path) -> impl Iterator<Item = (std::path::PathBuf, crate::util::Result<Manifest>)> {
+    std::fs::read_dir(state.join("checkpoints")).into_iter().flatten().flatten().filter_map(|e| {
+        if e.file_name().to_str().is_none_or(|n| !store::is_id(n)) {
+            return None;
+        }
+        record(&e.path()).map(|m| (e.path(), m))
+    })
+}
+
+/// Missing manifests are revoked publications or records already being removed.
+pub(crate) fn record(dir: &std::path::Path) -> Option<crate::util::Result<Manifest>> {
+    let manifest = read_manifest(dir);
+    if manifest.is_err() && std::fs::symlink_metadata(dir.join("manifest.json")).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+        return None;
+    }
+    Some(manifest)
 }
 
 fn create_at(dir: RawFd, name: &str) -> io::Result<File> {

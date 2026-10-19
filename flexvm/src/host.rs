@@ -753,12 +753,33 @@ impl Host {
     pub fn template_users(&self) -> std::collections::BTreeSet<String> {
         let mut ids: std::collections::BTreeSet<String> = self.entries().into_iter().map(|e| e.template_id).filter(|id| !id.is_empty()).collect();
         let suspended = std::fs::read_dir(self.state.join("suspended")).into_iter().flatten().flatten();
-        for name in suspended.filter_map(|e| e.file_name().into_string().ok()).filter(|n| !n.starts_with('.')) {
-            if let (true, Ok(dir)) = (self.is_suspended(&name), self.suspended(&name)) {
-                ids.extend(crate::checkpoint::read_manifest(&dir).ok().map(|m| m.template_id));
+        let suspended = suspended
+            .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
+            .map(|e| e.path())
+            .filter(|d| !d.join("STARTED").exists() && !d.join("DISCARDED").exists())
+            .filter_map(|d| crate::checkpoint::record(&d).map(|m| (d, m)));
+        let mut unreadable = false;
+        for (dir, manifest) in suspended.chain(crate::checkpoint::managed(&self.state)) {
+            match manifest {
+                Ok(m) => {
+                    ids.insert(m.template_id);
+                }
+                Err(err) => {
+                    crate::log!("flexvm: warning: unreadable checkpoint {}: {err}; keeping every template generation", dir.display());
+                    unreadable = true;
+                }
             }
         }
-        ids.extend(crate::checkpoint::managed(&self.state).map(|(_, m)| m.template_id));
+        if unreadable {
+            match std::fs::read_dir(self.state.join("templates").join(crate::template::GENERATIONS))
+                .and_then(|entries| entries.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned())).collect::<std::io::Result<Vec<_>>>())
+            {
+                Ok(all) => ids.extend(all),
+                Err(_) => {
+                    ids.insert(crate::template::ALL_GENERATIONS.into());
+                }
+            }
+        }
         ids
     }
 
