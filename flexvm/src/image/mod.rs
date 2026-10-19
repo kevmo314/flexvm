@@ -515,21 +515,40 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
 /// only for an empty `rel`. The directory, or None if a symlink was on the way.
 fn private_dir(cache: &Path, rel: &Path) -> Result<Option<OwnedFd>> {
     let named = |e: std::io::Error| format!("{}: {e}", cache.join(rel).display());
-    crate::util::create_dir_durably(&cache.join(rel), 0o700)?;
-    let root = std::fs::canonicalize(if cache.as_os_str().is_empty() { Path::new(".") } else { cache }).map_err(named)?;
+    let cache = if cache.as_os_str().is_empty() { Path::new(".") } else { cache };
+    crate::util::create_dir_durably(cache, 0o700)?;
+    let root = std::fs::canonicalize(cache).map_err(named)?;
     let mut fd = crate::util::openat(libc::AT_FDCWD, &cpath(&root)?, libc::O_RDONLY | libc::O_DIRECTORY).map_err(named)?;
     if rel.as_os_str().is_empty() {
         make_private(&fd, 0o700).map_err(named)?;
     }
     for c in rel.components() {
         let std::path::Component::Normal(name) = c else { bail!("{}: not a path below the image cache", rel.display()) };
-        fd = match crate::util::openat(fd.as_raw_fd(), &cpath(Path::new(name))?, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
-            // A symlink (to the directory `create_dir_durably` found).
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => return Ok(None),
+        let name = cpath(Path::new(name))?;
+        let open = |dir: &OwnedFd| crate::util::openat(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        let mut res = open(&fd);
+        if res.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            // Made in the directory as reached; a concurrent pull may make it first.
+            match crate::util::check(unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o700) }) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(named(e).into()),
+                _ => res = open(&fd),
+            }
+        }
+        fd = match res {
+            // A symlink: nothing is made under it, and what is there already is synced as found.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                let path = cache.join(rel);
+                if path.is_dir() {
+                    crate::util::create_dir_durably(&path, 0o700)?;
+                }
+                return Ok(None);
+            }
             res => res.map_err(named)?,
         };
         make_private(&fd, 0o700).map_err(named)?;
     }
+    // Entries handed out must survive a crash, whoever made the directories.
+    crate::util::sync_ancestors_fd(fd.as_raw_fd()).map_err(named)?;
     Ok(Some(fd))
 }
 
@@ -1141,6 +1160,20 @@ mod tests {
         for p in [blob, rootfs.join("key.ext4"), rootfs.join("key.conf"), rootfs.join("key.ok")] {
             assert_eq!(mode(&p), 0o644, "{}", p.display());
         }
+        // Nothing is made under a symlink: a linked blob directory without `sha256` stays without one.
+        let empty = d.join("outside-empty");
+        std::fs::create_dir(&empty).unwrap();
+        let other = d.join("other-images");
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&empty, other.join("blobs")).unwrap();
+        assert!(private_blobs(&other.join("blobs")).unwrap().is_none());
+        assert!(!empty.join("sha256").exists());
+        // Missing directories are made private, through the walk.
+        let fresh = d.join("fresh");
+        assert!(private_blobs(&fresh.join("blobs")).unwrap().is_some());
+        for p in [fresh.join("blobs"), fresh.join("blobs/sha256")] {
+            assert_eq!(mode(&p), 0o700, "{}", p.display());
+        }
         // A symlinked file is refused, its target untouched.
         let file = d.join("file");
         std::fs::write(&file, b"x").unwrap();
@@ -1616,13 +1649,18 @@ mod tests {
         let p = d.join("config");
         let digest = sha256_hex(b"{}");
         std::fs::write(&p, b"{}").unwrap();
-        assert!(source::read_verified(&p, 2, &digest).is_ok());
-        assert!(source::read_verified(&p, 3, &digest).is_err());
+        assert!(source::read_verified(&p, File::open(&p).unwrap(), 2, &digest).is_ok());
+        assert!(source::read_verified(&p, File::open(&p).unwrap(), 3, &digest).is_err());
+        // Read as opened: what the path names afterwards is never read.
+        let opened = File::open(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
         std::fs::write(&p, b"[]").unwrap();
-        assert!(source::read_verified(&p, 2, &digest).is_err());
+        assert_eq!(source::read_verified(&p, opened, 2, &digest).unwrap(), b"{}");
+        std::fs::write(&p, b"[]").unwrap();
+        assert!(source::read_verified(&p, File::open(&p).unwrap(), 2, &digest).is_err());
         let max = unpack::MAX_DOCUMENT + 1;
         std::fs::write(&p, vec![b' '; max as usize]).unwrap();
-        assert!(source::read_verified(&p, max, &digest).is_err());
+        assert!(source::read_verified(&p, File::open(&p).unwrap(), max, &digest).is_err());
     }
 
     #[test]
