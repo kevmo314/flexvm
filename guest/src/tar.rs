@@ -543,8 +543,12 @@ fn components(path: &[u8], into: bool) -> io::Result<Vec<Vec<u8>>> {
     Ok(v)
 }
 
-fn open_dir(path: &str) -> io::Result<OwnedFd> {
-    let fd = os(unsafe { libc::open(cstr(path.as_bytes())?.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) }).map_err(|e| with(path, e))?;
+fn open_dir(path: &str, nofollow: bool) -> io::Result<OwnedFd> {
+    // A trailing slash would make the kernel follow the leaf before O_NOFOLLOW applies.
+    let leaf = path.trim_end_matches('/');
+    let leaf = if leaf.is_empty() && path.starts_with('/') { "/" } else { leaf };
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
+    let fd = os(unsafe { libc::open(cstr(leaf.as_bytes())?.as_ptr(), flags) }).map_err(|e| with(path, e))?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -574,22 +578,32 @@ fn walk_dir(base: &OwnedFd, comps: &[Vec<u8>], make: Option<Option<(u32, u32)>>)
 /// (None: the contents go into the directory).
 type Target = (OwnedFd, Option<(Vec<u8>, Vec<u8>)>);
 
+/// Inspect the leaf itself even with a trailing slash; destinations may not be symlinks.
+fn destination_metadata(dst: &str) -> io::Result<std::fs::Metadata> {
+    let leaf = dst.trim_end_matches('/');
+    let m = std::fs::symlink_metadata(if leaf.is_empty() && dst.starts_with('/') { "/" } else { leaf })?;
+    if m.file_type().is_symlink() {
+        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    Ok(m)
+}
+
 /// DST for a directory's contents: made if missing.
 fn contents(dst: &str) -> io::Result<Target> {
-    match std::fs::metadata(dst) {
+    match destination_metadata(dst) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => return Err(with(dst, io::Error::from_raw_os_error(libc::ENOTDIR))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(dst).map_err(|e| with(dst, e))?,
         Err(e) => return Err(with(dst, e)),
     }
-    Ok((open_dir(dst)?, None))
+    Ok((open_dir(dst, true)?, None))
 }
 
 fn target(dst: &str, comps: &[Vec<u8>], first: &Header) -> io::Result<Target> {
     let Some(root) = comps.first() else { return contents(dst) };
     let is_dir = comps.len() > 1 || first.kind == b'5';
-    match std::fs::metadata(dst) {
-        Ok(m) if m.is_dir() => return Ok((open_dir(dst)?, Some((root.clone(), root.clone())))),
+    match destination_metadata(dst) {
+        Ok(m) if m.is_dir() => return Ok((open_dir(dst, true)?, Some((root.clone(), root.clone())))),
         Ok(_) if is_dir => return Err(io::Error::other(format!("cannot copy a directory onto a file: {dst}"))),
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(with(dst, e)),
         Err(_) if dst.ends_with('/') && !is_dir => return Err(io::Error::other(format!("no such directory: {dst}"))),
@@ -603,7 +617,7 @@ fn target(dst: &str, comps: &[Vec<u8>], first: &Header) -> io::Result<Target> {
     if matches!(leaf, "" | "." | "..") {
         return Err(io::Error::other(format!("bad destination {dst}")));
     }
-    Ok((open_dir(parent)?, Some((root.clone(), leaf.as_bytes().to_vec()))))
+    Ok((open_dir(parent, false)?, Some((root.clone(), leaf.as_bytes().to_vec()))))
 }
 
 /// Unpacks `input` at `dest`. `owner`: everything is chowned to it (lchown for links); None leaves the files
@@ -614,7 +628,7 @@ pub fn extract(input: &mut dyn Read, dest: Dest, owner: Option<(u32, u32)>) -> i
     let Some(first) = rd.next()? else { return Ok(()) };
     let into = matches!(dest, Dest::Into(_));
     let (base, top) = match dest {
-        Dest::Into(dir) => (open_dir(dir)?, None),
+        Dest::Into(dir) => (open_dir(dir, true)?, None),
         Dest::Cp(dst) => target(dst, &components(&first.path, false)?, &first)?,
         Dest::Guest(dst, Top::Contents) => {
             components(&first.path, false)?;
@@ -1035,6 +1049,30 @@ mod tests {
         let got = race(&src, &d, Step::Typed, swap(&d, &t.s("elsewhere")));
         assert!(!leaked(&got), "{got:?}");
         assert!(!got.iter().any(|(p, ..)| p.ends_with(b"hidden")), "{got:?}");
+    }
+
+    #[test]
+    fn copy_refuses_symlinked_destinations() {
+        let t = Tmp::new("destination-symlinks");
+        std::fs::create_dir(t.s("outside")).unwrap();
+        std::fs::write(t.s("outside/file"), b"original").unwrap();
+        for (leaf, to) in [("dir-link", "outside"), ("file-link", "outside/file"), ("dangling", "missing")] {
+            symlink(to, t.s(leaf)).unwrap();
+            for suffix in ["", "/", "///"] {
+                let dst = format!("{}{suffix}", t.s(leaf));
+                for entries in [vec![("file", b'0', "replacement")], vec![("dir", b'5', ""), ("dir/new", b'0', "new")]] {
+                    let data = archive(&entries);
+                    assert!(unpack_to(&data, Dest::Cp(&dst)).is_err(), "{dst}");
+                    let top = Top::Named(entries[0].0.as_bytes().to_vec());
+                    assert!(unpack_to(&data, Dest::Guest(&dst, &top)).is_err(), "{dst}");
+                    assert!(unpack_to(&data, Dest::Guest(&dst, &Top::Contents)).is_err(), "{dst}");
+                    assert!(unpack_to(&data, Dest::Into(&dst)).is_err(), "{dst}");
+                }
+            }
+        }
+        assert_eq!(std::fs::read(t.s("outside/file")).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(t.s("outside")).unwrap().count(), 1);
+        assert!(!t.0.join("missing").exists());
     }
 
     #[test]

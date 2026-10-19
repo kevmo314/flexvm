@@ -1384,10 +1384,18 @@ pub fn write_tag() -> String {
 
 /// Durably: the file is fsynced before the rename, its directory after.
 pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
+    write_file_mode(dir, name, data, durable, 0o644)
+}
+
+/// Like `write_file`, with a creation mode; 0600 also secures a reused temporary file.
+pub fn write_file_mode(dir: &Path, name: &str, data: &[u8], durable: bool, mode: u32) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", write_tag()));
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::File::options().write(true).create(true).truncate(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::File::options().write(true).create(true).truncate(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
     let res = (|| {
+        if mode == 0o600 {
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.write_all(data)?;
         if durable {
             f.sync_all()?;

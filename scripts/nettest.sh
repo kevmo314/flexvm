@@ -21,20 +21,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=${FLEXVM:-$root/target/release/flexvm}
 state=$(realpath -m "${STATE:-${FLEXVM_STATE_DIR:-/var/lib/flexvm}}")
-# Removes the records (#869) of the states under each DIR as users of STATE's templates: a recorded
-# state that is gone keeps every <none> generation there.
-forget_states() {
-  local f d
-  for f in "$state"/templates/.states/*; do
-    [[ -f $f ]] || continue
-    for d in "$@"; do
-      if [[ $(cat "$f" 2>/dev/null) == "$(realpath -m "$d")"/* ]]; then
-        rm -f "$f"
-      fi
-    done
-  done
-  return 0
-}
+source "$root/scripts/net-common.sh"
+
 P=${P:-fv5}
 NET=${NET:-192.168.155}
 ROUNDS=${ROUNDS:-3}
@@ -72,34 +60,16 @@ wait_for() {
     done
 }
 
-# Our processes: listeners and VM processes, by the state directories on
-# their command lines (their Firecrackers die with them).
-our_processes() {
-    local p
-    for p in /proc/[0-9]*; do
-        { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null | grep -qE -- "--state ($dir_A|$dir_B)/state" && echo "${p#/proc/}"
-    done
-}
-
 teardown() {
-    local pid cg pids ids=
+    local pid
     trap - EXIT INT TERM
     set +e
     for pid in "${bg_pids[@]}"; do kill "$pid" 2>/dev/null; done
     for pid in "${bg_pids[@]}"; do wait "$pid" 2>/dev/null; done
-    pids=$(our_processes)
-    # PID-START, read before the kill: the cgroups are named after the instance.
-    for pid in $pids; do ids+=" $pid-$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f20)"; done
-    for pid in "${listener_pids[@]}" $pids; do kill -9 "$pid" 2>/dev/null; done
+    stop_states "$dir_A" "$dir_B"
+    for pid in "${listener_pids[@]}"; do kill -9 "$pid" 2>/dev/null; done
     for pid in "${listener_pids[@]}"; do wait "$pid" 2>/dev/null; done
-    sleep 1
     for ns in "${P}A" "${P}B" "${P}C" "${P}lan"; do ip netns del "$ns" 2>/dev/null; done
-    # Each VM process's Firecracker had a cgroup named after the process (`idle-PID-START-N`).
-    for pid in $ids; do
-        for cg in /sys/fs/cgroup/flexvm/idle-"$pid"-*; do
-            [[ -d $cg ]] && rmdir "$cg" 2>/dev/null
-        done
-    done
     mkdir -p "$work/log/"{A,B}
     cp "$dir_A"/run/vms/*.log "$work/log/A/" 2>/dev/null
     cp "$dir_B"/run/vms/*.log "$work/log/B/" 2>/dev/null

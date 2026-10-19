@@ -12,20 +12,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=$root/target/release/flexvm
 state=$(realpath -m "${STATE:-${FLEXVM_STATE_DIR:-/var/lib/flexvm}}")
-# Removes the records (#869) of the states under each DIR as users of STATE's templates: a recorded
-# state that is gone keeps every <none> generation there.
-forget_states() {
-  local f d
-  for f in "$state"/templates/.states/*; do
-    [[ -f $f ]] || continue
-    for d in "$@"; do
-      if [[ $(cat "$f" 2>/dev/null) == "$(realpath -m "$d")"/* ]]; then
-        rm -f "$f"
-      fi
-    done
-  done
-  return 0
-}
+source "$root/scripts/net-common.sh"
 
 up() (
   created=()
@@ -85,21 +72,7 @@ listeners() {
 }
 
 stop() {
-  # The lab's listeners and VM processes, by their state directories (each
-  # VM's Firecracker dies with its process).
-  local p pids= ids=
-  for p in /proc/[0-9]*; do
-    { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && pids+=" ${p#/proc/}"
-  done
-  # PID-START, read before the kill: the cgroups are named after the instance (`idle-PID-START-N`).
-  for p in $pids; do ids+=" $p-$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | cut -d' ' -f20)"; done
-  for p in $pids; do kill -9 "$p" 2>/dev/null || true; done
-  sleep 1
-  for p in $ids; do
-    for cg in /sys/fs/cgroup/flexvm/idle-"$p"-*; do
-      [[ -d $cg ]] && rmdir "$cg" 2>/dev/null || true
-    done
-  done
+  stop_states /run/flexvm-lab-A /run/flexvm-lab-B
   forget_states /run/flexvm-lab-A /run/flexvm-lab-B
   rm -rf /run/flexvm-lab-A /run/flexvm-lab-B
 }

@@ -493,8 +493,17 @@ fn lock_holder(path: &Path) -> Result<Option<Ident>> {
 }
 
 pub fn store<T: Serialize>(path: &Path, v: &T, durable: bool) -> Result<()> {
+    store_mode(path, v, durable, 0o644)
+}
+
+/// VM run records contain environment values needed by restart and inspect.
+pub fn store_private<T: Serialize>(path: &Path, v: &T, durable: bool) -> Result<()> {
+    store_mode(path, v, durable, 0o600)
+}
+
+fn store_mode<T: Serialize>(path: &Path, v: &T, durable: bool, mode: u32) -> Result<()> {
     let (dir, name) = (path.parent().ok_or("no directory")?, path.file_name().ok_or("no name")?);
-    crate::util::write_file(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable).map_err(|e| format!("{}: {e}", path.display()).into())
+    crate::util::write_file_mode(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable, mode).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
 #[derive(Clone)]
@@ -2797,7 +2806,7 @@ impl NameLock {
     }
 
     pub fn publish(&self, e: &Entry) -> Result<()> {
-        store(&self.host.vms(&self.name, "json")?, e, false)
+        store_private(&self.host.vms(&self.name, "json")?, e, false)
     }
 }
 
@@ -4907,6 +4916,32 @@ pub(crate) mod tests {
         let (_root, h) = host("directory-flock");
         let _held = Flock::new(File::open(&h.state).unwrap(), libc::LOCK_EX).unwrap();
         Host::open(&h.state, &h.run).unwrap();
+    }
+
+    #[test]
+    fn vm_run_records_are_private_and_keep_environment_values() {
+        let base = crate::test_util::TempDir::new("private-run-records");
+        let spec = crate::app::RunSpec { env: vec!["TOKEN=secret=with=equals".into()], ..Default::default() };
+        let entry = Entry { name: "private".into(), ident: Ident::me(), spec: spec.clone(), ..Default::default() };
+        let exited = crate::app::Exited::new(0, "image".into(), None, Default::default(), spec.clone(), 1);
+        for ext in ["json", "exited"] {
+            let path = base.join(format!("private.{ext}"));
+            // Upgrade a public record and a leftover public temporary file, too.
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let tmp = path.parent().unwrap().join(format!(".private.{ext}.{}.tmp", crate::util::write_tag()));
+            std::fs::write(&tmp, b"old temporary data").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+            if ext == "json" {
+                store_private(&path, &entry, false).unwrap();
+                assert_eq!(load::<Entry>(&path).unwrap().unwrap().spec, spec);
+            } else {
+                store_private(&path, &exited, true).unwrap();
+                assert_eq!(crate::app::Exited::read(&path).unwrap().spec, spec);
+            }
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+            assert!(!tmp.exists());
+        }
     }
 
     #[test]
