@@ -500,18 +500,28 @@ content id), and a name another checkpoint has is refused then. Each checkpoint
 is verified as `Link::open` and `PageFile::read` would (its manifest's checksum
 is its id, its parent the chain's next, the same template and size, its files'
 lengths and checksums, its page map, each page's CRC32C), and staged in the
-store (`Staging::import`); one the store has by its id is skipped. A parent is
+store (`Staging::import`), its pages' blocks allocated first under a host-wide
+lock (`checkpoint-load-room`), so concurrent loads do not both count on the same
+free space. Those checks are not cryptographic (the id is a 64-bit hash), so
+a save also has a SHA-256 (`SaveDigest`: per checkpoint, oldest first, its id
+and each file's name, length and SHA-256), which `save` prints and `load`
+computes from what it read; `--sha256` refuses another before the template is
+read. A checkpoint the store has under one of the ids is compared byte for
+byte with what was sent, and refused if it differs. A parent is
 named `../ID` here: a manifest that names it otherwise (a v0.1.0 directory's) is
 rewritten, so it and its descendants get new ids. The template is taken only if
 no generation of that content id is here: received by `template::receive` with
 the head's `template_digests` as `vouched`, refused before publication unless
-they match its files, and after the end of the archive is checked (`finish`).
+they match its files, and after the end of the archive is checked (`finish`:
+two zero blocks, then only zero padding, at most 1 MiB, to the end of the input).
 A generation here that was received with other digests is refused
 (`check_vouched`). No name in `templates/` is read or written: the source's
-tags may name other builds. Then, under the store's lock (shared, ordered with
-`rm` and `prune`), the chain is published oldest first (`publish_as`,
-`RENAME_NOREPLACE`; one published meanwhile is kept), opened as a restore
-would, and named; the template stays open (its use lock) until then, so no
+tags may name other builds. Then, under the store's lock held exclusively (so
+no `rm`, `prune` or another load's publication, which may revoke what it
+published if its fsync fails, runs meanwhile), the chain is published oldest
+first (`publish_as`, `RENAME_NOREPLACE`; one there already is kept), each one
+found here is checked to be there still, and the head is opened as a restore
+would open it and named; the template stays open (its use lock) until then, so no
 prune or `rmi` takes it before a stored checkpoint keeps it. A crash leaves
 staging, which the next staging clears, and perhaps an older part of the chain,
 whole. `load -i DIR` reads the same members from a checkpoint directory and its

@@ -1000,7 +1000,7 @@ def checkpoint_store():
 def relay(src, what, dst, flip=None, cut=None, load_args=()):
     """`checkpoint save WHAT` on src piped into `checkpoint load` on dst, as `save | ssh b flexvm checkpoint
     load`; flip: (member name suffix, offset) of a byte to change on the way, cut: bytes after which the
-    stream ends. Returns load's (exit status, output, error)."""
+    stream ends. Returns load's (exit status, output, error) and what save printed on stderr."""
     save = subprocess.Popen([BIN, "--state", src.state_dir, "--run", src.run_dir, "checkpoint", "save", what],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
     load = subprocess.Popen([BIN, "--state", dst.state_dir, "--run", dst.run_dir, "checkpoint", "load", *load_args],
@@ -1039,13 +1039,18 @@ def relay(src, what, dst, flip=None, cut=None, load_args=()):
     except (BrokenPipeError, EOFError):
         pass
     finally:
+        # Closed here, so communicate does not flush it again (3.12 refuses a closed file).
+        stdin, load.stdin = load.stdin, None
         with contextlib.suppress(BrokenPipeError):
-            load.stdin.close()
-        out, err = load.communicate(timeout=600)
-        if save.poll() is None:
-            save.kill()
-        save.wait()
-    return load.returncode, out.decode(), err.decode()
+            stdin.close()
+        try:
+            out, err = load.communicate(timeout=600)
+        finally:
+            for p in (save, load):
+                if p.poll() is None:
+                    p.kill()
+                p.wait()
+    return load.returncode, out.decode(), err.decode(), save.stderr.read().decode()
 
 
 def stored_ids(host):
@@ -1073,14 +1078,17 @@ def checkpoint_save_load():
             # Refused while a member is cut or changed: nothing of it here after, not even the template.
             layout = [("pages", "a checkpoint's page"), ("manifest.json", "a manifest"), (f"template/{want}", "the template")]
             for member, what in layout:
-                code, out, err = relay(A, "web", B, flip=(member, 300))
+                code, out, err, saved = relay(A, "web", B, flip=(member, 300))
                 check(f"load: a changed byte in {what} is refused", code != 0 and not stored_ids(B) and generations(templates) == [], (code, err))
             for cut in (1 << 20, 64 << 20):
-                code, out, err = relay(A, "web", B, cut=cut)
+                code, out, err, saved = relay(A, "web", B, cut=cut)
                 check(f"load: a save cut at {cut >> 20} MiB is refused", code != 0 and not stored_ids(B) and generations(templates) == [], (code, err))
-            code, out, err = relay(A, "web", B)
+            code, out, err, saved = relay(A, "web", B, load_args=("--sha256", "0" * 64))
+            check("load --sha256: another save's is refused", code != 0 and "SHA-256" in err and not stored_ids(B) and generations(templates) == [], (code, err))
+            code, out, err, saved = relay(A, "web", B)
             loaded = json.loads(out) if code == 0 else {}
             print(f"  save | load: {loaded}")
+            check("save printed the SHA-256 load verified", loaded.get("sha256") and f"sha256 {loaded.get('sha256')}" in saved, (saved, loaded))
             check("save | load: the chain and its template", loaded.get("loaded") == head["id"] and loaded.get("chain") == 2 and loaded.get("stored") == 2
                   and loaded.get("template") == "received", (code, err))
             check("B: the source's generation, unnamed", generations(templates) == [want] and template_id(B, None) == want and not template_id(B, args.template),
@@ -1092,7 +1100,7 @@ def checkpoint_save_load():
             check("B: restored, its memory and files as at the checkpoint", md5(B, fork) == m and marker_id(B, fork) == proc
                   and B.exec(fork, "cat /tmp/one")[1].strip() == "1")
             B.kill(fork)
-            code, out, err = relay(A, "web", B)
+            code, out, err, saved = relay(A, "web", B)
             again = json.loads(out) if code == 0 else {}
             check("load again: nothing new", again.get("stored") == 0 and again.get("template") == "present", (code, err))
             # A stored checkpoint keeps its generation through image prune.
@@ -1124,7 +1132,7 @@ def checkpoint_load_other_build():
             A.run(vm)
             m, proc = fill(A, vm), marker(A, vm)
             ck = A.checkpoint(vm, name="other", stop=True)
-            code, out, err = relay(A, "other", B)
+            code, out, err, saved = relay(A, "other", B)
             loaded = json.loads(out) if code == 0 else {}
             check("load: the source's template received, by content id", loaded.get("loaded") == ck["id"] and loaded.get("template") == "received", (code, err))
             check("B: its tag still names its own build", template_id(B, args.template) == theirs)

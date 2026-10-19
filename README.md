@@ -449,9 +449,13 @@ root filesystem. Stored checkpoints themselves stay lean, sharing the template.
 `checkpoint load` reads a save from stdin, or `-i FILE`, and stores it under the
 same ids and name (`--name NAME` gives another; a name another checkpoint has is
 refused before anything is read). Everything is verified before anything is
-published, so a tampered or truncated save stores nothing: each checkpoint by its
+published, so a damaged or truncated save stores nothing: each checkpoint by its
 id and checksums, and the template by its content id and the SHA-256 digests the
-checkpoint records. The template is stored unnamed, unless this host has a
+checkpoint records. Those ids and checksums catch damage, not forgery: `save` prints
+the save's SHA-256 (of every checkpoint file; on stderr when the tar goes to stdout)
+and `load` prints what it read, and `load --sha256 HEX` stores only the save with that
+SHA-256. A checkpoint this host has under one of the ids is used only if its files are
+the same, byte for byte. The template is stored unnamed, unless this host has a
 generation of that content id already; no image name here is read or moved, as the
 saving host's `:latest` may be another build than this host's. `run --checkpoint NAME`
 then restores it on that generation. A checkpoint taken on a template built by

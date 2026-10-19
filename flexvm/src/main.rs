@@ -110,9 +110,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm checkpoint save NAME|ID [-o FILE]
                                      write a stored checkpoint, its chain and its template as one
                                      tar, to stdout unless -o (save web | ssh b flexvm checkpoint load)
-  flexvm checkpoint load [-i FILE|DIR] [--name NAME]
+  flexvm checkpoint load [-i FILE|DIR] [--name NAME] [--sha256 HEX]
                                      store a save (from stdin unless -i) or a checkpoint directory,
-                                     verified first; its template by content id, unnamed, if not here
+                                     verified first (--sha256: only the save whose SHA-256 save
+                                     printed); its template by content id, unnamed, if not here
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
               [--standby N] ...      pull an image and build its template (an archive or OCI layout
@@ -444,7 +445,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("unpause", NAMES, &[]),
     ("kill", NAMES, &["signal"]),
     ("rm", NAMES, &["force"]),
-    ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name"]),
+    ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -508,7 +509,7 @@ fn check_applies(args: &Args) -> Result<()> {
                 Some(op @ "rm") => (op, NAMES, &["force"]),
                 Some(op @ "prune") => (op, 2, &["older-than", "force"]),
                 Some(op @ "save") => (op, 3, &["output"]),
-                Some(op @ "load") => (op, 2, &["input", "name"]),
+                Some(op @ "load") => (op, 2, &["input", "name", "sha256"]),
                 // `checkpoint VM DIR`, before #775.
                 _ => bail!("checkpoint needs create, ls, rm, prune, save or load: flexvm checkpoint create VM [NAME] keeps a VM's checkpoint in STATE/checkpoints (it took a DIR before), and run --checkpoint NAME restores it"),
             };
@@ -2457,7 +2458,7 @@ mod exec_tests {
             &["checkpoint", "save", "web", "-o", "web.tar"],
             &["checkpoint", "save", "-oweb.tar", "web"],
             &["checkpoint", "load"],
-            &["checkpoint", "load", "-i", "web.tar", "--name", "w"],
+            &["checkpoint", "load", "-i", "web.tar", "--name", "w", "--sha256", "ab"],
         ] {
             check_applies(&parse(argv)).unwrap();
         }
