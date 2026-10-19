@@ -583,8 +583,11 @@ mod tests {
         let binary = root.join("firecracker");
         let calls = root.join("firecracker.calls");
         let write = |version| {
-            std::fs::write(&binary, format!("#!/bin/sh\necho {version}\necho called >> \"$0.calls\"\n")).unwrap();
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let temp = root.join("firecracker.tmp");
+            std::fs::write(&temp, format!("#!/bin/sh\necho {version}\necho called >> \"$0.calls\"\n")).unwrap();
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // Publish the executable only after closing its write descriptor.
+            std::fs::rename(&temp, &binary).unwrap();
         };
         write("v1");
         let first = firecracker_id(&binary, Some(&root)).unwrap();
