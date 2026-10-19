@@ -60,8 +60,9 @@ struct App {
     stdin: Option<Arc<Stdin>>,
     /// `run -t`'s.
     tty: bool,
-    /// The `APPIN` feeding it (a duplicate of its connection, to shut it down when replaced), by number.
-    appin: Option<(u64, File)>,
+    /// The `APPIN` feeding it (a duplicate of its connection, to shut it down when replaced), by number. No
+    /// connection yet while it reads what its stream took: its hello is not sent, so nothing may shut it down.
+    appin: Option<(u64, Option<File>)>,
     appins: u64,
 }
 
@@ -242,24 +243,53 @@ pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)
 /// `APPIN`: feeds the app's stdin until the connection closes, a newer one takes over or the app exits.
 /// `pending`: input that came with the request.
 pub(crate) fn appin(arg: &str, out: &File, pending: &[u8]) -> io::Result<()> {
+    appin_on(&APP, arg, out, pending, || ())
+}
+
+/// `appin` on `apps`; `claimed` runs once its slot is claimed, before its hello (a test's app exits there).
+fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: impl FnOnce()) -> io::Result<()> {
     crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Some(Duration::from_secs(5)));
     let stream = arg.trim().parse::<u64>().map_err(|_| io::Error::other(format!("bad stream {arg:?}")))?;
+    // Claimed with no connection, which the app's end (`app_ended`) would shut down with no hello sent: the client
+    // must always be told "ok" or "closed", or a fast `run -i` app's status is lost (#832).
     let (stdin, me) = {
-        let mut app = APP.lock().unwrap();
+        let mut app = apps.lock().unwrap();
         let Some(stdin) = app.stdin.clone().filter(|_| matches!(app.state, State::Running(_))) else {
             return msg(out, format!("closed {}", u8::from(app.tty)));
         };
         app.appins += 1;
         let me = app.appins;
-        if let Some((_, old)) = app.appin.replace((me, out.try_clone()?)) {
+        if let Some((_, Some(old))) = app.appin.replace((me, None)) {
             unsafe { libc::shutdown(old.as_raw_fd(), libc::SHUT_RDWR) };
         }
         (stdin, me)
     };
-    msg(out, format!("ok {} {}", stdin.taken(stream), u8::from(stdin.tty())))?;
+    // Not under APP's lock: the feeder replaced may hold the stdin's while it asks `current` (APP's) once more.
+    let taken = stdin.taken(stream);
+    claimed();
+    {
+        let mut app = apps.lock().unwrap();
+        let mine = app.appin.as_ref().is_some_and(|(id, _)| *id == me);
+        if !matches!(app.state, State::Running(_)) {
+            return msg(out, format!("closed {}", u8::from(app.tty)));
+        }
+        let hello = msg(out, format!("ok {taken} {}", u8::from(stdin.tty())));
+        // A newer one took over already: told, this one ends as one replaced after its hello does.
+        if !mine {
+            return hello;
+        }
+        let hello = hello.and_then(|()| out.try_clone());
+        match hello {
+            Ok(conn) => app.appin = Some((me, Some(conn))),
+            Err(e) => {
+                app.appin = None;
+                return Err(e);
+            }
+        }
+    }
     crate::sock_timeout(out.as_raw_fd(), libc::SO_RCVTIMEO, None);
     let current = || {
-        let app = APP.lock().unwrap();
+        let app = apps.lock().unwrap();
         app.appin.as_ref().is_some_and(|(id, _)| *id == me) && matches!(app.state, State::Running(_))
     };
     let mut ack_error = None;
@@ -268,12 +298,21 @@ pub(crate) fn appin(arg: &str, out: &File, pending: &[u8]) -> io::Result<()> {
             ack_error.get_or_insert(e);
         }
     });
-    let mut app = APP.lock().unwrap();
+    let mut app = apps.lock().unwrap();
     if app.appin.as_ref().is_some_and(|(id, _)| *id == me) {
         app.appin = None;
     }
     drop(app);
     ack_error.map_or(fed.map(drop), Err)
+}
+
+/// The app's end, once its output is drained: its `APPIN` is shut down (its client then sees it closed).
+fn app_ended(app: &mut App, pid: i32, code: i32) {
+    (app.state, app.stdin) = (State::Exited(code), None);
+    if let Some((_, Some(conn))) = app.appin.take() {
+        unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+    app.push(FRAME_NOTE, format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
 }
 
 /// A user missing from the guest's /etc/passwd (resolved as pull resolves the image's), or a directory
@@ -527,12 +566,7 @@ fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses, pty: Option<Fil
                 Duration::ZERO
             }));
             let code = wait_exit(&watched, token, None).expect("no deadline");
-            let mut app = APP.lock().unwrap();
-            (app.state, app.stdin) = (State::Exited(code), None);
-            if let Some((_, conn)) = app.appin.take() {
-                unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
-            }
-            app.push(FRAME_NOTE, format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
+            app_ended(&mut APP.lock().unwrap(), pid, code);
         })
         .map_err(|e| unwatched(statuses, pid, token, e))?;
     (app.state, app.token, app.tty, app.stdin) = (State::Running(pid), token, tty, stdin.map(Arc::new));
@@ -965,6 +999,64 @@ mod tests {
         assert_eq!(unhex(""), Some(vec![]));
         assert_eq!(unhex("6"), None);
         assert_eq!(unhex("zz"), None);
+    }
+
+    /// The client's `ok` or `closed` frame (its first), the connection's end.
+    fn hello(peer: &mut std::os::unix::net::UnixStream) -> String {
+        let mut head = [0; 5];
+        peer.read_exact(&mut head).unwrap();
+        assert_eq!(head[0], crate::FRAME_MSG);
+        let mut m = vec![0; u32::from_le_bytes(head[1..].try_into().unwrap()) as usize];
+        peer.read_exact(&mut m).unwrap();
+        String::from_utf8(m).unwrap()
+    }
+
+    /// #832: an app that ends between `APPIN` claiming its slot and its hello: its client is told "closed", and
+    /// so goes on to the app's status; never left a connection shut down with nothing said.
+    #[test]
+    fn an_appin_whose_app_ends_before_its_hello_says_closed() {
+        use std::os::unix::net::UnixStream;
+        // The app ending, a newer APPIN claiming the slot, or neither, before the hello.
+        for (ends, newer) in [(true, false), (false, true), (false, false)] {
+            let (r, w) = std::io::pipe().unwrap();
+            let apps = Mutex::new(App {
+                state: State::Running(1),
+                stdin: Some(Arc::new(Stdin::new(File::from(std::os::fd::OwnedFd::from(w)), None).unwrap())),
+                ..App::default()
+            });
+            let (ours, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let out = File::from(std::os::fd::OwnedFd::from(ours));
+            let fed = thread::scope(|s| {
+                let fed = s.spawn(|| {
+                    appin_on(&apps, "7", &out, &[], || {
+                        let mut app = apps.lock().unwrap();
+                        if ends {
+                            app_ended(&mut app, 1, 3)
+                        }
+                        if newer {
+                            app.appins += 1;
+                            app.appin = Some((app.appins, None));
+                        }
+                    })
+                });
+                let said = hello(&mut peer);
+                assert_eq!(said, if ends { "closed 0" } else { "ok 0 0" }, "app ending first: {ends}, a newer one: {newer}");
+                if !ends && !newer {
+                    assert!(apps.lock().unwrap().appin.as_ref().is_some_and(|(_, c)| c.is_some()), "registered once told");
+                    app_ended(&mut apps.lock().unwrap(), 1, 3);
+                }
+                fed.join().unwrap()
+            });
+            assert!(fed.is_ok(), "{fed:?}");
+            drop(out);
+            let mut rest = Vec::new();
+            peer.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty(), "nothing after: {rest:?}");
+            // The newer one's claim is its own still: never cleared by the one it replaced.
+            assert_eq!(apps.lock().unwrap().appin.as_ref().map(|(id, c)| (*id, c.is_some())), newer.then_some((2, false)));
+            drop(r);
+        }
     }
 
     #[test]
