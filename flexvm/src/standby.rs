@@ -308,7 +308,7 @@ pub fn refill_round(host: &Host) {
         if recent(&failed) {
             continue;
         }
-        if let Err(e) = refill_by(host, &template, false, true) {
+        if let Err(e) = refill_by(host, &template, false, true, true) {
             let _ = crate::host::write_record(&failed, b"");
             // As its standby VMs write it: capped, to whichever file is current.
             let path = dir(host, &template).join("standby.log");
@@ -336,13 +336,24 @@ fn recent(path: &std::path::Path) -> bool {
 /// Starts standby VMs up to the target and waits for them. Serialised per
 /// template so the ones starting are counted.
 pub fn refill(host: &Host, template: &str) -> Result<usize> {
-    refill_by(host, template, true, false)
+    refill_by(host, template, true, false, true)
+}
+
+/// After a pull superseded `template`'s pool, or a failed `rmi` restored its count: standby VMs
+/// started up to its target (pressure's cooldown and the refill floor respected), their loads not
+/// waited for, so the command returns once they are listed. Skipped if another refill runs.
+pub(crate) fn refill_later(host: &Host, template: &str) -> Result<usize> {
+    if target(host, template) == 0 {
+        return Ok(0);
+    }
+    refill_by(host, template, false, true, false)
 }
 
 /// `cooldown`: none while `.pressure` is recent, checked for each standby under the stop
 /// lock, so a refill that waited behind another while relief stopped standbys starts none.
-/// Only a count set by hand (`set`) starts them regardless.
-pub(crate) fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<usize> {
+/// Only a count set by hand (`set`) starts them regardless. `ready_wait`: their readiness replies
+/// are waited for (else they go on loading on their own, each listed already).
+fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool, ready_wait: bool) -> Result<usize> {
     let lock = refill_lock(host, template)?;
     let how = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
     let Some(_lock) = refill_locked(Flock::new(lock, how), wait)? else { return Ok(0) };
@@ -371,6 +382,9 @@ pub(crate) fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool)
         }
     }
     let started = ready.len();
+    if !ready_wait {
+        return failed.map_or(Ok(started), Err);
+    }
     for r in ready {
         if let Err(e) = wait_ready(r, READY_TIMEOUT) {
             failed.get_or_insert(e);
@@ -596,14 +610,22 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     }
     let claim_path = l.join(format!("{id}.claim"));
     p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone(), l.join(format!("{id}.take"))]);
-    let check_stop = || {
-        if let Some(code) = p.stop_requested() {
-            p.finish(op, End::NotStarted, code, None);
-        }
+    // A stop while loading (relief, `rmi`) ends it between phases: what it made is torn down
+    // first, and its refill is told it stopped, which is no failed start (no `.failed`).
+    let stopping = || p.stop_requested().is_some();
+    let loaded = if stopping() { Err(Error::from(STOPPED)) } else { p.spawner.take(None).and_then(|idle| load(idle, tpl.clone(), stopping)) };
+    let ready = match loaded {
+        Ok(ready) => ready,
+        Err(e) => match p.stop_requested() {
+            Some(code) => {
+                crate::log!("standby {template}: stopped while loading");
+                let mut f = notify.take();
+                let last = f.as_mut().map(|f| (f as &mut dyn std::io::Write, json!({"ok": true, "stopped": true})));
+                p.finish(op, End::NotStarted, code, last)
+            }
+            None => return Err(e),
+        },
     };
-    check_stop();
-    let idle = p.spawner.take(None)?;
-    let ready = load(idle, tpl.clone(), check_stop)?;
     // Taken now, so a claim does not scan memory or ask Firecracker.
     *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
     *p.standby.lock().unwrap() = Some(ready);
@@ -734,7 +756,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 let (h, t) = (host.clone(), template.to_string());
                 std::thread::spawn(move || {
                     // As `maintain`: none for a while after pressure stopped standby VMs.
-                    if let Err(e) = refill_by(&h, &t, true, true) {
+                    if let Err(e) = refill_by(&h, &t, true, true, true) {
                         crate::log!("standby {t}: {e}");
                     }
                 });
@@ -997,38 +1019,41 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const LATE: Duration = Duration::from_millis(250);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 const SETTLE: Duration = Duration::from_millis(50);
+/// A standby's load ended by a stop (`serve`).
+const STOPPED: &str = "stopped while loading";
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const RESEED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs the restored VM once (the slow first resume, off the request path)
 /// until the guest reseeds, then pauses it.
-fn load(idle: Firecracker, template: Arc<Template>, check_stop: impl Fn()) -> Result<Prepared> {
-    check_stop();
+fn load(idle: Firecracker, template: Arc<Template>, stopping: impl Fn() -> bool) -> Result<Prepared> {
+    let check_stop = || if stopping() { Err(Error::from(STOPPED)) } else { Ok(()) };
+    check_stop()?;
     let p = Vm::prepare(idle, template, &mut Phases::new())?;
-    check_stop();
+    check_stop()?;
     p.pager.learn_load_set();
     let fc = p.firecracker();
     fc.load_snapshot(&p.template().vmstate(), &p.template(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
-    check_stop();
+    check_stop()?;
     // Only an API pause stops the devices writing guest memory.
     fc.pause(API_TIMEOUT)?;
-    check_stop();
+    check_stop()?;
     p.pager.wait_ready(Duration::from_secs(5))?;
-    check_stop();
+    check_stop()?;
     let resumed = fc.resume(API_TIMEOUT);
     p.pager.loaded();
     resumed?;
-    check_stop();
+    check_stop()?;
     wait_for_reseed(&fc.sockets.vsock)?;
-    check_stop();
+    check_stop()?;
     // Set the clock now so START at the claim can skip clock_settime (slow in big guests).
     let _ = guest::clock(&fc.sockets.vsock, guest::TIMEOUT);
-    check_stop();
+    check_stop()?;
     std::thread::sleep(SETTLE);
-    check_stop();
+    check_stop()?;
     fc.pause(API_TIMEOUT)?;
-    check_stop();
+    check_stop()?;
     Ok(p)
 }
 
@@ -1652,10 +1677,10 @@ mod tests {
         let d = create_dir(&host, "default").unwrap();
         // As a listener or VM process from before #850 holds it while it refills.
         let legacy = legacy_refill_lock(&d, libc::LOCK_EX).unwrap();
-        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", false, true, true).unwrap(), 0);
         let (tx, rx) = std::sync::mpsc::channel();
         let waiting = host.clone();
-        let refill = std::thread::spawn(move || tx.send(refill_by(&waiting, "default", true, true).map_err(|e| e.to_string())).unwrap());
+        let refill = std::thread::spawn(move || tx.send(refill_by(&waiting, "default", true, true, true).map_err(|e| e.to_string())).unwrap());
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "a waiting refill waits for it");
         // Nor does it let an older refill in meanwhile: it holds the new lock first.
         assert!(Flock::new(refill_lock(&host, "default").unwrap(), libc::LOCK_EX | libc::LOCK_NB).is_err());
@@ -1675,22 +1700,22 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let lock = refill_lock(&host, "default").unwrap();
         let lock = Flock::new(lock, libc::LOCK_EX).unwrap();
-        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", false, true, true).unwrap(), 0);
         drop(lock);
         // Nor while an older version's refill holds the pool's own lock.
         let legacy = legacy_refill_lock(&d, libc::LOCK_EX).unwrap();
-        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", false, true, true).unwrap(), 0);
         drop(legacy);
         // Nor while relief stops standby VMs.
         let stop = stop_lock(&host).unwrap();
         let stop = Flock::new(stop, libc::LOCK_EX).unwrap();
-        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", false, true, true).unwrap(), 0);
         drop(stop);
         // A busy host lock ends this round without a refill failure or backoff, and lets relief in.
         let held = crate::host::private_file(&host.lock_file()).unwrap();
         let held = Flock::new(held, libc::LOCK_EX).unwrap();
         let start = Instant::now();
-        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", false, true, true).unwrap(), 0);
         assert!(!d.join(".failed").exists());
         // Returning at all shows it gave up: the lock is held until `held` is dropped below.
         crate::log!("a refill round under a busy host lock ended in {:?} (timeout {LOCKED_TIMEOUT:?})", start.elapsed());
@@ -1704,7 +1729,7 @@ mod tests {
         host.cfg.reserve_mib = Some(u64::MAX / 2);
         // Hold the reentrant host lock so another test cannot time out this grant before it checks the reserve.
         let l = host.lock().unwrap();
-        let started = refill_by(&host, "default", false, true).unwrap();
+        let started = refill_by(&host, "default", false, true, true).unwrap();
         drop(l);
         assert_eq!(started, 0);
         assert!(live(&host, "default").is_empty());
@@ -1716,7 +1741,7 @@ mod tests {
         host.cfg.reserve_mib = Some(0);
         let held = Flock::new(crate::host::private_file(&host.lock_file()).unwrap(), libc::LOCK_EX).unwrap();
         let start = Instant::now();
-        assert_eq!(refill_by(&host, "default", true, true).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", true, true, true).unwrap(), 0);
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
         drop(held);
     }
@@ -1732,7 +1757,7 @@ mod tests {
         host.cfg.reserve_mib = Some(0);
         host.cfg.evict_mib = Some(u64::MAX / 2);
         let l = host.lock().unwrap();
-        let started = refill_by(&host, "default", false, true).unwrap();
+        let started = refill_by(&host, "default", false, true, true).unwrap();
         drop(l);
         assert_eq!(started, 0);
         assert!(live(&host, "default").is_empty());
