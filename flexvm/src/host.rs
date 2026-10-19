@@ -832,7 +832,13 @@ impl Host {
                 let _ = std::fs::remove_file(self.vms(name, ext)?);
             }
         }
-        for ext in ["json", "sock", "moved", "failed", "lost"] {
+        // A resume clears them only for a VM it can go on with (stopped or exited): one refused
+        // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log.
+        let records: &[&str] = match !resuming || suspended.exists() || self.has_record(name, "exited") {
+            true => &["json", "sock", "moved", "failed", "lost"],
+            false => &["json", "sock", "moved"],
+        };
+        for ext in records {
             let _ = std::fs::remove_file(self.vms(name, ext)?);
         }
         f.set_len(0)?;
@@ -5057,6 +5063,17 @@ pub(crate) mod tests {
                 assert!(!h.has_record("web", ext), "{ext}");
             }
         }
+        // `start` of a failed VM with no checkpoint: refused after, so its record stays for the next `run`.
+        std::fs::write(h.vms("web", "log").unwrap(), "died").unwrap();
+        std::fs::write(h.vms("web", "failed").unwrap(), "died").unwrap();
+        drop(h.take_name("web", true).unwrap());
+        assert!(h.has_record("web", "failed") && h.has_record("web", "log"));
+        drop(h.take_name("web", false).unwrap());
+        assert!(!h.has_record("web", "failed") && !h.has_record("web", "log"));
+        // A stopped VM's resume clears the record and keeps its log.
+        let dir = h.suspended("web").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
         std::fs::write(h.vms("web", "log").unwrap(), "resume").unwrap();
         std::fs::write(h.vms("web", "failed").unwrap(), "died resuming").unwrap();
         let _name = h.take_name("web", true).unwrap();

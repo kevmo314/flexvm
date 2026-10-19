@@ -1395,7 +1395,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
 
 /// `rm` without -f: under the name, so a `start` meanwhile either wins first (and this is
 /// refused: the VM runs) or waits until it is gone; no process is ever signalled. `had`:
-/// a stopped VM's records were there before (taking the name clears failed and lost ones).
+/// a stopped VM's records were there before.
 fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
     if !had {
         return match std::fs::read_to_string(host.vms(name, "moved")?) {
@@ -1412,7 +1412,9 @@ fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
     if host.suspended(name)?.exists() {
         lifecycle::revoke(host, name)??;
     }
-    let _ = std::fs::remove_file(host.vms(name, "exited")?);
+    for ext in ["exited", "failed", "lost"] {
+        let _ = std::fs::remove_file(host.vms(name, ext)?);
+    }
     Ok(())
 }
 
