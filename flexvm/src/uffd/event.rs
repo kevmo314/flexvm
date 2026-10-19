@@ -366,8 +366,9 @@ impl Pager {
                 // BASE or ZERO: serve a run of neighbours with the same source.
                 let from_template = state == BASE && self.base.has_data(page);
                 let same = |p: usize| state == ZERO || self.base.has_data(p) == from_template;
-                // Recheck after preparation; only copy template pages whose source was faulted in outside wp.
-                let around = if from_template { prepared } else { FAULT_AROUND };
+                // Only template pages whose source was faulted in outside wp, or this one page if preparation saw it
+                // in another state (an install that failed since gave it back).
+                let around = if from_template { prepared.max(1) } else { FAULT_AROUND };
                 let n = pages.claim(page, around.min(region_left), state, same);
                 if n == 0 {
                     return Err(os(libc::EAGAIN));
