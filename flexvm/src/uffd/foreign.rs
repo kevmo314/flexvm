@@ -28,8 +28,9 @@ const PM_SWAP: u64 = 1 << 62;
 /// Regions per `PAGEMAP_SCAN` call, and pages per pagemap read where it is missing.
 const SCAN_REGIONS: usize = 512;
 const READ_PAGES: usize = 64 << 10;
-/// How long `foreign_pages` waits for claimed pages it finds mapped to settle.
-const INFLIGHT_WAIT: Duration = Duration::from_secs(2);
+/// How long `foreign_pages` waits for claimed pages it finds mapped to settle (an install settles each run as its
+/// copy finishes); those that have not by then are not counted.
+const INFLIGHT_WAIT: Duration = Duration::from_secs(10);
 
 #[repr(C)]
 #[derive(Default)]
@@ -155,11 +156,20 @@ impl Pager {
         }
         let deadline = Instant::now() + INFLIGHT_WAIT;
         while !inflight.is_empty() && Instant::now() < deadline {
-            inflight.retain(|&p| pages.get(p) == INFLIGHT);
+            inflight.retain(|&p| match pages.get(p) {
+                INFLIGHT => true,
+                // Given back (a failed install releases its claim) though mapped: not the pager's.
+                s => {
+                    if foreign(s, self.base.has_data(p)) {
+                        note(p);
+                    }
+                    false
+                }
+            });
             std::thread::sleep(Duration::from_millis(1));
         }
-        // Still claimed: no copy of ours mapped it, as a copy settles right after.
-        inflight.iter().filter(|&&p| pages.get(p) == INFLIGHT).for_each(|&p| note(p));
+        // Still claimed: a copy may be mapping a run a page at a time, so that is no proof either way, and the
+        // check never fails a load it cannot prove wrong.
         // Settled PRESENT since, by an install that hit EEXIST.
         pages.preset.lock().unwrap().iter().filter(|&&(p, from)| foreign(from, self.base.has_data(p))).for_each(|&(p, _)| note(p));
         Ok((found + pages.preset_more.load(Ordering::Relaxed), first_found))
