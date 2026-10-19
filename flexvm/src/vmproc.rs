@@ -1680,7 +1680,7 @@ impl Proc {
         let vm = self.vm();
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         crate::log!("vm {}: died: {why}", vm.name);
-        crate::log!("vm {}: its firecracker's log, to its end:\n{}", vm.name, vm.firecracker_log());
+        crate::util::log_long(&format!("vm {}: its firecracker's log, to its end:", vm.name), &vm.firecracker_log());
         if let Ok(failed) = self.host.vms(&vm.name.get(), "failed") {
             let _ = crate::host::write_record(&failed, why.as_bytes());
         }

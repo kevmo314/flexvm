@@ -103,6 +103,41 @@ pub fn log_line(mut line: String) {
     }
 }
 
+/// Logs `text` under `head` as consecutive lines of at most `LOG_CHUNK` bytes each, cut at newlines where it can, so
+/// none is capped (`LOG_LINE_MAX`) and all of it, its end too, is kept.
+pub fn log_long(head: &str, text: &str) {
+    log_line(format!("{head}\n"));
+    for chunk in log_chunks(text, LOG_CHUNK) {
+        let mut line = chunk.to_string();
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        log_line(line);
+    }
+}
+
+const LOG_CHUNK: usize = 8 << 10;
+const _: () = assert!(LOG_CHUNK < LOG_LINE_MAX);
+
+/// `text` in order, in pieces of at most `max` bytes, each ending at a newline unless one line is longer than `max`
+/// (then cut on a character boundary).
+fn log_chunks(mut text: &str, max: usize) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if text.is_empty() {
+            return None;
+        }
+        let mut end = text.len().min(max);
+        if end < text.len() {
+            // A character longer than `max` goes whole.
+            let cut = (1..=end).rev().find(|&i| text.is_char_boundary(i)).unwrap_or_else(|| (end..).find(|&i| text.is_char_boundary(i)).unwrap());
+            end = text[..cut].rfind('\n').map_or(cut, |i| i + 1);
+        }
+        let (chunk, rest) = text.split_at(end);
+        text = rest;
+        Some(chunk)
+    })
+}
+
 /// Cuts `line` to at most `max` bytes, a note of the cut included, on a character boundary.
 fn cap_line(line: &mut String, max: usize) {
     if line.len() > max {
@@ -2425,6 +2460,25 @@ mod tests {
         assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line == "first"));
         assert!(matches!(rx.recv_timeout(WAIT).unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
         sender.join_within().unwrap();
+    }
+
+    /// A long text (a dead Firecracker's log) goes out whole, in order, in pieces each under the line cap, cut at
+    /// newlines, or on a character boundary inside a line longer than a piece.
+    #[test]
+    fn long_text_is_logged_whole_in_pieces_under_the_cap() {
+        let mut text: String = (0..3000).map(|i| format!("[{i:>8}] line {i}\n")).collect();
+        text.push_str(&"é".repeat(5000));
+        text.push_str("\nthe end");
+        let chunks: Vec<&str> = super::log_chunks(&text, super::LOG_CHUNK).collect();
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|c| !c.is_empty() && c.len() <= super::LOG_CHUNK));
+        // Every piece but those of the overlong line and the last ends a line.
+        assert!(chunks.iter().filter(|c| !c.ends_with('\n')).count() <= 2, "{:?}", chunks.iter().map(|c| c.len()).collect::<Vec<_>>());
+        assert!(chunks[0].ends_with('\n') && chunks.last().unwrap().ends_with("the end"));
+        assert_eq!(super::log_chunks("", 8).count(), 0);
+        assert_eq!(super::log_chunks("ab\ncd", 8).collect::<Vec<_>>(), ["ab\ncd"]);
+        assert_eq!(super::log_chunks("ab\ncd", 4).collect::<Vec<_>>(), ["ab\n", "cd"]);
+        assert_eq!(super::log_chunks("éé", 3).collect::<Vec<_>>(), ["é", "é"]);
     }
 
     #[test]
