@@ -510,20 +510,26 @@ pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
 /// Under the reserve, a standby leaves by itself, marking the pressure so it is not
 /// refilled: a host with no running VM has no controller to stop it (#600). A running
 /// VM's controller stops them first (`vmproc::relieve`), holding eviction off meanwhile.
-fn under_reserve(host: &Host, template: &str) -> bool {
-    let Some(mut avail) = crate::vmproc::host_available_mib() else { return false };
+/// Keep the stop lock through cleanup: the next standby reads MemAvailable after this one's memory goes back.
+fn under_reserve(host: &Host, template: &str) -> Option<Flock> {
+    under_reserve_with(host, template, crate::vmproc::host_available_mib)
+}
+
+fn under_reserve_with(host: &Host, template: &str, available: impl Fn() -> Option<u64>) -> Option<Flock> {
+    let lock = Flock::new(stop_lock(host).ok()?, libc::LOCK_EX | libc::LOCK_NB).ok()?;
+    let mut avail = available()?;
     let reserve = host.config_now().reserve();
     // Memory VM processes keep for their next checkpoint goes back first (#648).
     if avail < reserve {
         crate::hostmem::release_kept(host, None);
-        avail = crate::vmproc::host_available_mib().unwrap_or(avail);
+        avail = available().unwrap_or(avail);
     }
     if avail >= reserve {
-        return false;
+        return None;
     }
     crate::log!("standby {template}: host has {avail} MiB available, under its {reserve} MiB reserve: leaving");
     let _ = std::fs::write(pressure(host), b"");
-    true
+    Some(lock)
 }
 
 /// Whether an unclaimed standby leaves, and its exit status: 124 (`DIED`) when its VM
@@ -613,7 +619,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 crate::log!("standby {template}: died: {why}");
             }
             let low = under_reserve(host, template);
-            if let Some(code) = leave_status(died.is_some(), current.as_deref() != Some(&mine) || extra || unreachable || low) {
+            if let Some(code) = leave_status(died.is_some(), current.as_deref() != Some(&mine) || extra || unreachable || low.is_some()) {
                 p.finish(op, End::NotStarted, code, None);
             }
         }
@@ -1294,6 +1300,17 @@ mod tests {
         }
         assert_ne!(first[0], first[1]);
         assert_ne!(first[1], first[2]);
+    }
+
+    #[test]
+    fn standbys_leave_one_at_a_time_and_read_room_again() {
+        let (_dir, mut host) = crate::host::tests::host("standby-reserve");
+        host.cfg.reserve_mib = Some(100);
+        let first = under_reserve_with(&host, "first", || Some(99)).unwrap();
+        assert!(under_reserve_with(&host, "second", || panic!("the first standby is still stopping")).is_none());
+        drop(first);
+        assert!(under_reserve_with(&host, "second", || Some(101)).is_none(), "the first freed enough memory");
+        assert!(under_reserve_with(&host, "second", || Some(99)).is_some(), "still short: another leaves");
     }
 
     #[test]

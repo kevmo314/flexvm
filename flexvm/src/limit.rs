@@ -204,12 +204,24 @@ impl Limit {
 
     /// Before a grow to `cap` MiB, of which `charge` was admitted.
     pub fn plug(&self, cap: u64, charge: u64) {
+        self.plug_with(cap, charge, || Ok(())).unwrap();
+    }
+
+    /// Raises the mark before hotplug, restoring it on failure. Keep the watcher out until it settles.
+    pub fn plug_with<R>(&self, cap: u64, charge: u64, patch: impl FnOnce() -> crate::util::Result<R>) -> crate::util::Result<R> {
         let mut m = self.mark.lock().unwrap();
+        let before = (m.cap, m.admitted);
         m.cap = m.cap.max(cap);
         if m.admitted > 0 {
             m.admitted = (m.admitted + charge).min(m.cap);
             self.write(&m);
         }
+        let result = patch();
+        if result.is_err() {
+            (m.cap, m.admitted) = before;
+            self.write(&m);
+        }
+        result
     }
 
     /// Once a shrink to `cap` MiB settled: never below what the VM uses, so
@@ -329,6 +341,27 @@ mod tests {
 
     fn high(cg: &Path) -> Option<u64> {
         std::fs::read_to_string(cg.join("memory.high")).unwrap().trim().parse::<u64>().ok().map(|b| b >> 20)
+    }
+
+    #[test]
+    fn a_failed_hotplug_restores_the_mark() {
+        let cg = crate::test_util::TempDir::new("limit-plug-failed");
+        std::fs::write(cg.join("memory.high"), "max").unwrap();
+        let l = Limit::new(Some(cg.to_path_buf()));
+        l.start(512, 1024);
+        let before = high(&cg);
+        let result: crate::util::Result<()> = l.plug_with(1280, 256, || {
+            assert_eq!(high(&cg), Some(768 + overhead(768)), "raised before the guest sees the plug");
+            Err("patch failed".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(l.admitted(), 512);
+        assert_eq!(l.mark.lock().unwrap().cap, 1024);
+        assert_eq!(high(&cg), before);
+        l.plug_with(1280, 256, || Ok(())).unwrap();
+        assert_eq!(l.admitted(), 768);
+        assert_eq!(l.mark.lock().unwrap().cap, 1280);
+        assert_eq!(high(&cg), Some(768 + overhead(768)));
     }
 
     #[test]

@@ -1688,7 +1688,7 @@ impl Host {
 
     /// The window's grants, and with the holds and checkpoint memory taken lately (`recent_debits`) what they count
     /// as used that MemAvailable may not show taken yet, with those debits (None if unreadable).
-    /// Fails closed: unread holds would leave out memory still to arrive.
+    /// Fails closed: unread holds or debits would leave out memory still to arrive.
     fn pending(&self, l: &Locked) -> Result<(Grants, u64, Option<Debits>)> {
         let now = boottime_ms();
         let mut grants: Grants = load(&self.grants())?.unwrap_or_default();
@@ -1698,6 +1698,9 @@ impl Host {
             format!("{e}: memory held for migrations and restores still arriving cannot be counted")
         })?;
         let (debits, taken) = self.recent_debits(l, now);
+        if debits.is_none() {
+            bail!("debits unreadable: {}: checkpoint memory still arriving cannot be counted", self.debits().display());
+        }
         let pending = pending(&grants, &held).saturating_add(taken);
         Ok((grants, pending, debits))
     }
@@ -7566,6 +7569,19 @@ pub(crate) mod tests {
         assert!(h.grant_inner(1, Floor::Reserve, true, None, || Some(AVAIL)).is_err(), "nor a held grant");
         std::fs::remove_file(&dir).unwrap();
         assert!(grant().unwrap().is_some() && grants().len() == 2);
+    }
+
+    #[test]
+    fn admission_fails_early_when_debits_cannot_be_read() {
+        let (_dir, mut h) = host("debits-unreadable");
+        h.cfg.reserve_mib = Some(0);
+        std::fs::write(h.debits(), b"{").unwrap();
+        let err = h.grant_inner(1, Floor::Reserve, false, None, || panic!("debits must be readable before checking room")).err().unwrap();
+        assert!(err.to_string().contains("debits unreadable"));
+        assert!(load::<Grants>(&h.grants()).unwrap().unwrap_or_default().is_empty());
+        assert!(!locks(&h.run).join(format!("release-{}", boot_id())).exists(), "no release request for an unreadable ledger");
+        std::fs::remove_file(h.debits()).unwrap();
+        assert!(h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
     }
 
     /// Memory VM processes keep for their next checkpoint never refuses a grant (#648): asked for it before a refusal,
