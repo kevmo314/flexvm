@@ -2742,9 +2742,14 @@ mod exec_tests {
         assert!(listener_addresses("host:7070", vec![]).is_err());
         assert!(listener_addresses("host:0", vec!["127.0.0.1:0".parse().unwrap()]).is_err());
         // Every address gets its own socket, taking connections; one that cannot be bound fails them all.
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let two: Vec<std::net::SocketAddr> = [[127, 0, 0, 1], [127, 0, 0, 2]].map(|ip| (ip, port).into()).to_vec();
-        let bound = bind_each("host", &two).unwrap();
+        // A port free a moment ago may be a parallel test's by now: another one then.
+        let (port, two, bound) = (0..10)
+            .find_map(|_| {
+                let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+                let two: Vec<std::net::SocketAddr> = [[127, 0, 0, 1], [127, 0, 0, 2]].map(|ip| (ip, port).into()).to_vec();
+                bind_each("host", &two).ok().map(|bound| (port, two, bound))
+            })
+            .expect("no free port for both addresses");
         assert_eq!(bound.iter().map(|l| l.local_addr().unwrap()).collect::<Vec<_>>(), two);
         for (l, a) in bound.iter().zip(&two) {
             let _c = std::net::TcpStream::connect(a).unwrap();

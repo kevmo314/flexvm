@@ -1619,16 +1619,17 @@ mod tests {
             })
         };
         let pulls = {
-            let (tries, images) = (tries.clone(), images.clone());
+            let (tries, removed, images) = (tries.clone(), removed.clone(), images.clone());
             std::thread::spawn(move || {
                 // Called under the pull's key lock, after its cache check (and in a publication): refused there.
                 let sync = |dir: &Path| {
                     assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
                     sync_dir(dir)
                 };
+                // A time budget (a slow disk slows the remover tenfold), but past one removal at least.
                 let until = Instant::now() + Duration::from_secs(5);
                 let mut round = 0;
-                while Instant::now() < until {
+                while round < 300 && (Instant::now() < until || removed.load(Ordering::SeqCst) == 0) {
                     let got = cached_rootfs(&cached, build("built"), sync).unwrap();
                     assert_eq!(got.conf, "built config");
                     assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
@@ -1637,7 +1638,7 @@ mod tests {
                     // Every other round, a removal tried wholly after the entry is let go.
                     if round % 2 == 0 {
                         let from = tries.load(Ordering::SeqCst);
-                        while tries.load(Ordering::SeqCst) < from + 2 && Instant::now() < until {
+                        while tries.load(Ordering::SeqCst) < from + 2 {
                             std::thread::sleep(Duration::from_millis(5));
                         }
                     }
