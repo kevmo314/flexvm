@@ -436,16 +436,32 @@ fn ended(vm: &Pinned) -> bool {
     true
 }
 
+/// Tries at the stdin request whose connection ends before its reply (`stdin_hello`).
+const HELLO_TRIES: u32 = 5;
+
+/// The stdin request's reply (`ok TAKEN TTY` or `closed TTY`), and its connection. One that ends with none is
+/// asked again: a guest agent from before #832 shuts down the input of an app that ends before it replied, and
+/// once it ended replies `closed` (the client then goes on to the app's status).
+fn stdin_hello(mut open: impl FnMut() -> Result<BufReader<UnixStream>>, name: &str) -> Result<(BufReader<UnixStream>, String)> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let mut r = open()?;
+        match guest::read_frame(&mut r)? {
+            Some((FRAME_MSG, m)) => return Ok((r, String::from_utf8_lossy(&m).into_owned())),
+            None if tries < HELLO_TRIES => std::thread::sleep(Duration::from_millis(100)),
+            other => bail!("vm {name}: unexpected stdin reply {other:?}"),
+        }
+    }
+}
+
 /// `attach NAME`, and a foreground `run -i`/`-t` (from 0): the app's output from `from` (None: from now on),
 /// and stdin to it if it was run with `-i`, until it exits (its status) or the client detaches.
 pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
     let vm = Pinned { host: host.clone(), name: name.to_string(), pin: Arc::default() };
     let stream = u64::from_str_radix(&util::random_hex(8)?, 16)?;
     let stdin_req = json!({"op": "stdin", "stream": stream});
-    let handshake = open(&vm, &stdin_req).and_then(|mut first| match guest::read_frame(&mut first)? {
-        Some((FRAME_MSG, m)) => Ok((first, String::from_utf8_lossy(&m).into_owned())),
-        other => bail!("vm {name}: unexpected stdin reply {other:?}"),
-    });
+    let handshake = stdin_hello(|| open(&vm, &stdin_req), name);
     let (first, hello) = match handshake {
         Ok(h) => h,
         Err(e) if replaced(&e) => return Err(e),
@@ -808,6 +824,54 @@ mod tests {
         // Its own end: its status.
         crate::containers::record_exit(&host, "web", &ours, 0);
         assert_eq!(gone(&vm).unwrap(), 0);
+    }
+
+    /// #832: the stdin connection of an app that ended at once closed before its reply: asked again, it is
+    /// told `closed`, and goes on to the app's status; one that never replies is an error still.
+    #[test]
+    fn a_stdin_reply_cut_off_by_the_apps_end_is_asked_again() {
+        let reply = |m: Option<&str>| {
+            let (ours, mut peer) = UnixStream::pair().unwrap();
+            if let Some(m) = m {
+                peer.write_all(&[FRAME_MSG]).unwrap();
+                peer.write_all(&(m.len() as u32).to_le_bytes()).unwrap();
+                peer.write_all(m.as_bytes()).unwrap();
+            }
+            drop(peer);
+            Ok(BufReader::new(ours))
+        };
+        let mut asked = 0;
+        let (_, hello) = stdin_hello(
+            || {
+                asked += 1;
+                reply((asked == 2).then_some("closed 0"))
+            },
+            "fast",
+        )
+        .unwrap();
+        assert_eq!((asked, hello.as_str()), (2, "closed 0"));
+        let mut asked = 0;
+        let e = stdin_hello(
+            || {
+                asked += 1;
+                reply(None)
+            },
+            "mute",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("unexpected stdin reply None"), "{e}");
+        assert_eq!(asked, HELLO_TRIES);
+        // A refusal to connect is no reply's: not asked again here.
+        let mut asked = 0;
+        assert!(stdin_hello(
+            || {
+                asked += 1;
+                Err("refused".into())
+            },
+            "gone"
+        )
+        .is_err());
+        assert_eq!(asked, 1);
     }
 
     #[test]
