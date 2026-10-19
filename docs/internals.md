@@ -294,8 +294,10 @@ target's reply to them.
    `rmi` or prune removes it in between; from then on the VM holds it as any
    VM does. Caps: 4 pushes at once (2 from one peer), 64 GiB of data, 2 GiB
    left free on the disk (1 GiB of it for local checkpoints and suspends), and
-   10 minutes for the whole push. Spare received generations (unnamed, used by
-   nothing here or in a state sharing the templates, held for an arrival or
+   a transfer budget of 60 s plus 1 s per 8 MiB transferred, enforced on
+   both sender and receiver. A push waits up to 10 minutes for another
+   arrival of the same template to finish receiving it (`TURN_WAIT`). Spare
+   received generations (unnamed, used by nothing here or in a state sharing the templates, held for an arrival or
    open in no VM process) and pushes under way are budgeted by their allocated
    blocks (templates are sparse): an eighth of the filesystem (4 to 128 GiB) in
    all and a quarter of that per peer, though a push with nothing else charged
@@ -1531,19 +1533,22 @@ the `u64 LE` offset where stdin ends. `IN_RESIZE` (kind 3) carries rows and
 columns (`u16 LE` each). `IN_DETACH` (kind 4) leaves an exec running detached.
 The client may still send the one-byte `SESSION_DONE` after exit.
 
-At most 64 sessions are running or still sending output; another SESSION fails
-with `error: too many sessions: ...`. Once an exit is sent, its session counts
-towards a separate cap of 192 unacknowledged exits, with the oldest closed to
-stay within it. All retained output for these sessions uses the shared pool;
+At most 64 non-detached sessions are running or still sending output; another
+SESSION fails with `error: too many sessions: ...`. Detached commands have
+64 slots of their own, reserved at start also for sessions with stdin on a
+pty, so those can detach while leaving their command running. An attached
+pty-stdin session counts towards both caps until it detaches. Once an exit
+is sent, its session counts towards a separate cap of 192 unacknowledged
+exits, with the oldest closed to stay within it. All retained output for these sessions uses the shared pool;
 the oldest unacknowledged sessions are also closed to make room there. If the
 pool still cannot cover a session's output, it keeps counting towards the 64.
 A finished session whose client has been gone for a minute is closed by the
 guest (checked every minute, and whenever the limit is reached), its output
-freed; a running one is closed after ten minutes, its process group killed as
-CLOSE would (a client killed
-outright never sends CLOSE). Both waits count only time the guest ran: across
-a plain pause the TSC, and so the guest's monotonic clock, runs on, while a
-CLI keeps retrying through it. The agent keeps its own clock, which a thread
+freed; a running non-detached one is closed after ten minutes, its process
+group killed as CLOSE would (a client killed outright never sends CLOSE).
+A running detached command has no such timeout. Both waits count only time
+the guest ran: across a plain pause the TSC, and so the guest's monotonic
+clock, runs on, while a CLI keeps retrying through it. The agent keeps its own clock, which a thread
 advances every second by at most 2 s, so a pause of any length counts as about
 2 s. Closing a session also shuts down its attached
 connection, so a write to a stalled client cannot hold it. Closed sessions leave

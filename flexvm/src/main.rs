@@ -56,7 +56,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      is the app: its argv, as docker's); -t, --tty: on a pty, this terminal
                                      raw (Ctrl-P Ctrl-Q detaches); with -d, to attach to later
       -p [IP:]HOST_PORT:VM_PORT[/tcp|/udp]
-                                     forward a host port here (repeatable; default IP 0.0.0.0, TCP)
+                                     forward a host port here (repeatable; default 0.0.0.0 and [::], TCP)
+                                     IP: IPv4 or [IPv6]; IPv4 alone if IPv6 is unavailable
       --ip IP                        its address (without: the next free one)
       --cpus N                       cap its CPU time at N CPUs (1.5: one and a half); its vCPUs are IMAGE's
       --memory SIZE                  cap its memory growth (512m, 2g; plain bytes, as docker): from IMAGE's
@@ -96,8 +97,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm rename OLD NEW              rename a running, stopped or exited VM (not while it checkpoints or migrates)
   flexvm kill NAME...                destroy a running VM (Ctrl-C or Ctrl-\\ in the foreground)
   flexvm kill -s SIGNAL NAME...      send SIGNAL (TERM, HUP, 9, ...) to the VM's app instead
-  flexvm rm [-f] NAME...             remove a stopped VM (suspended, exited, failed or lost); -f: a running
-                                     one too
+  flexvm rm [-f] NAME...             remove a stopped VM (suspended, quarantined, exited, failed or lost);
+                                     -f: a running one too
   flexvm checkpoint create VM [NAME] [--stop] [--incremental]
                                      store the VM's state in STATE/checkpoints, named NAME if given;
                                      --incremental: as a delta on its last stored checkpoint
@@ -141,7 +142,14 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      derived for those unset
   flexvm reclaim IP [--force GEN]    take back an address lent out with a VM that migrated away,
                                      once its target is gone for good (without --force: say what)
-  flexvm bench ...                   latency benchmarks, for development (see README)
+  flexvm bench ...                   latency benchmarks; needs a Git checkout, writes bench/ at its top level
+      --timeout SECONDS              state/pull/readiness waits (default 120, minimum 1)
+      --iterations N                 measured trials (positive, default 50; lifecycle: default 5, minimum 1)
+      --warmup N                     unmeasured run trials (default 3; unused with --lifecycle)
+      --settle-ms MS                 sleep after each run trial (default 100; unused with --lifecycle)
+      --ready-port PORT              wait for TCP after run (unused with --lifecycle)
+      --ready-http PORT              GET / and wait for a response byte (unused with --lifecycle);
+                                     mutually exclusive with --ready-port; see README for other flags
 
 options: --state DIR (",
     env!("FLEXVM_DEFAULT_STATE"),

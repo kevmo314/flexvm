@@ -57,9 +57,11 @@ a suspend that published meanwhile is revoked and ends as a death, not a kill;
 a start not yet done once its VM ran is one too, watched from the moment it runs:
 its starter, a standby's claimer or `run -d`, exits 124 as well),
 then cleaned up as a
-kill, with why (Firecracker's exit status and the end of its log, the
-guest's console) in `RUN/vms/NAME.failed`, which `ps -a` shows as `failed`
-until `flexvm rm NAME`.
+kill, with why (Firecracker's exit status and its post-mortem summary: the
+last lines, plus the start of a guest crash report) in `RUN/vms/NAME.failed`,
+which `ps -a` shows as `failed` until `flexvm rm NAME`. The full Firecracker
+log tail (up to 64 KiB, including the guest console) is in the VM log,
+read with `flexvm logs NAME`.
 
 Ownership is held in guards that give back exactly what they took: the name
 lock (`NameLock`), the address claim (`AddrClaim`: dropped, it releases the
@@ -142,13 +144,8 @@ a source killed with SIGKILL, which records nothing.
 
 ## On-disk state
 
-Two directories, both overridable (`--state`, `--run`):
-each state directory is bound to one canonical run path on first open.
-A different `--run` for the same state directory is refused, including after a reboot.
-Without `--run`, a state's run directory follows from its path alone (`/run/flexvm` for the default
-state, `/run/flexvm-PREFIX`, its tap prefix, for any other), so no state defaults into a run directory
-another may own; one bound to another run directory (`run.json`) is refused without that `--run`.
-`/run/flexvm` is the default state's alone: any other state is refused it, bound or claimed (`reserved_run`).
+Two directories, both overridable (`--state`, `--run`): see
+[README Setup](../README.md#setup) for their defaults and permanent binding.
 
 ```
 STATE (default /var/lib/flexvm, on disk)
@@ -159,7 +156,7 @@ STATE (default /var/lib/flexvm, on disk)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   checkpoints/           stored checkpoints: ID/ and names/NAME -> ../ID
   auth.json              saved registry credentials (`flexvm login`), root-owned, mode 0600
-  host.json              host config, edited by hand (listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
+  host.json              host config, edited by hand (listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, peer_underlays, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
   run.json               canonical run path, bound on first open under `.locks/open`'s flock; fsynced
   .locks/                root's locks (0700): open (held while a root `Host::open` binds or repairs the root),
                          host (the host lock, held for short critical sections only), evict (one eviction
@@ -231,12 +228,16 @@ RUN (default /run/flexvm, tmpfs)
 Write it atomically (a temp file in `STATE`, renamed over it). It must be a
 regular file, not a symlink, owned by root or the user and writable by no
 one else; an unknown key is refused. Every load validates it
-(`Config::validate`: `vm_ips` inside `cluster_ips`, peers `HOST:PORT`,
-`peer_underlays` unicast and not local, `dns` IPv4, `announce_dev` not
-empty). An invalid one makes every command refuse (`STATE/host.json: ...
-(see README: Configuration)`); running processes re-read it when its mtime
-or inode changes and keep the last valid one meanwhile. `flexvm info` shows
-what is set, what is derived for the rest, and warnings.
+(`Config::validate`: `vm_ips` inside `cluster_ips`, peers and `listen`
+`HOST:PORT` with nonzero ports, `peer_underlays` non-loopback and unicast,
+`dns` IPv4, `announce_dev` not empty). A validation error makes every command
+refuse (`STATE/host.json: ... (see README: Configuration)`); running processes
+re-read it when its mtime or inode changes and keep the last valid one
+meanwhile. An explicit loopback or non-unicast `underlay` is refused on
+write; on read it is ignored with a warning and derived instead. Local
+`peer_underlays` addresses are accepted with a warning; locality depends on
+the current interfaces. `flexvm info` shows what is set, what is derived for
+the rest, and warnings.
 
 Every lock flexvm flocks is a 0600 file in a directory only root may enter
 (0700, root's), opened relative to that directory's descriptor once it was
