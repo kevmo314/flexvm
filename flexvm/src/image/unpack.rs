@@ -365,6 +365,7 @@ pub struct Root {
     pub entries: u64,
     seen: u64,
     unpacked: u64,
+    root_meta: Option<(tar::Header, Meta)>,
 }
 
 impl Root {
@@ -374,7 +375,7 @@ impl Root {
     }
 
     pub fn from_fd(fd: OwnedFd, limits: Limits) -> Root {
-        Root { fd, limits, entries: 0, seen: 0, unpacked: 0 }
+        Root { fd, limits, entries: 0, seen: 0, unpacked: 0, root_meta: None }
     }
 
     /// Check before creating anything, including implicit parents. Deletions do not refund the
@@ -474,11 +475,18 @@ impl Root {
             bail!("image exceeds the unpacked size limit (--max-unpacked-mib)");
         }
         res?;
+        self.restore_root_metadata()?;
         Ok(r.digest())
     }
 
     fn apply<R: Read>(&mut self, e: &mut tar::Entry<R>, m: Meta, mine: &mut Layer) -> Result<()> {
-        let Some((parent, name)) = split(&m.path)? else { return Ok(()) };
+        let Some((parent, name)) = split(&m.path)? else {
+            if e.header().entry_type() == tar::EntryType::Directory {
+                self.root_meta = Some((e.header().clone(), m));
+                self.restore_root_metadata()?;
+            }
+            return Ok(());
+        };
         let name = name.as_bytes();
         if let Some(rest) = name.strip_prefix(b".wh.") {
             // Other `.wh..wh.` names are aufs metadata.
@@ -580,9 +588,16 @@ impl Root {
             }
             other => bail!("unsupported tar entry type {other:?} at {rel:?}"),
         }
+        Self::metadata(&at, &h, &m, rel)?;
+        Ok(at)
+    }
+
+    fn metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path) -> Result<()> {
+        let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
+        let kind = h.entry_type();
         let nofollow = libc::AT_SYMLINK_NOFOLLOW;
         check(unsafe { libc::fchownat(dfd, name, m.uid, m.gid, nofollow) }, "chown", rel)?;
-        if kind != T::Symlink {
+        if kind != tar::EntryType::Symlink {
             // After chown, which clears setuid/setgid bits.
             check(unsafe { libc::fchmodat(dfd, name, h.mode()? & 0o7777, 0) }, "chmod", rel)?;
             for (key, value) in &m.xattrs {
@@ -596,8 +611,16 @@ impl Root {
             }
         }
         let ts = [libc::timespec { tv_sec: h.mtime().unwrap_or(0) as i64, tv_nsec: 0 }; 2];
-        unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) };
-        Ok(at)
+        check(unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) }, "utimensat", rel)
+    }
+
+    /// Child creation (including injected files) changes the root's mtime.
+    pub fn restore_root_metadata(&self) -> Result<()> {
+        if let Some((h, m)) = &self.root_meta {
+            let at = At { dir: self.resolve(Path::new(""))?, name: c".".to_owned() };
+            Self::metadata(&at, h, m, Path::new("/"))?;
+        }
+        Ok(())
     }
 
     pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {

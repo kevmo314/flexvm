@@ -4,11 +4,11 @@
 //! Replies are frames (proto.rs).
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -108,6 +108,27 @@ fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str
     }
 }
 
+/// Overlayfs takes the merged root's attributes from the upper directory.
+fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
+    let lower = File::open(lower)?;
+    let upper = File::open(upper)?;
+    let meta = lower.metadata()?;
+    let (src, dst) = (lower.as_raw_fd(), upper.as_raw_fd());
+    os(unsafe { libc::fchown(dst, meta.uid(), meta.gid()) })?;
+    upper.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    let n = os(unsafe { libc::flistxattr(src, std::ptr::null_mut(), 0) })?;
+    let mut names = vec![0u8; n as usize];
+    let n = os(unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) })?;
+    for name in names[..n as usize].split_inclusive(|&b| b == 0) {
+        let name = CStr::from_bytes_with_nul(name).map_err(io::Error::other)?;
+        let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), std::ptr::null_mut(), 0) })?;
+        let mut value = vec![0u8; n as usize];
+        let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) })?;
+        os(unsafe { libc::fsetxattr(dst, name.as_ptr(), value.as_ptr().cast(), n as usize, 0) })?;
+    }
+    Ok(())
+}
+
 /// Pivots into an overlay whose tmpfs upper layer keeps guest writes in RAM, so they migrate.
 fn setup_root() -> io::Result<()> {
     mount("proc", "/proc", "proc", 0, "")?;
@@ -118,6 +139,7 @@ fn setup_root() -> io::Result<()> {
     for d in ["/run/ovl/upper", "/run/ovl/work", "/run/root"] {
         std::fs::create_dir_all(d)?;
     }
+    copy_root_metadata("/", "/run/ovl/upper")?;
     mount("overlay", "/run/root", "overlay", 0, "lowerdir=/,upperdir=/run/ovl/upper,workdir=/run/ovl/work")?;
     for d in ["/proc", "/sys", "/dev"] {
         mount(d, &format!("/run/root{d}"), "", libc::MS_MOVE, "")?;
@@ -663,6 +685,40 @@ fn request_line(r: &mut impl BufRead) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overlay_upper_keeps_lower_root_metadata() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_util::TempDir::new("overlay-root");
+        let lower = dir.join("lower");
+        let upper = dir.join("upper");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::create_dir(&upper).unwrap();
+        std::fs::set_permissions(&lower, std::fs::Permissions::from_mode(0o2750)).unwrap();
+        let src = std::fs::File::open(&lower).unwrap();
+        assert_eq!(unsafe { libc::fsetxattr(src.as_raw_fd(), c"user.note".as_ptr(), b"root".as_ptr().cast(), 4, 0) }, 0);
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm) in [(1u16, 7u16), (4, 5), (32, 0)] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        assert_eq!(unsafe { libc::fsetxattr(src.as_raw_fd(), c"system.posix_acl_default".as_ptr(), acl.as_ptr().cast(), acl.len(), 0) }, 0);
+        super::copy_root_metadata(lower.to_str().unwrap(), upper.to_str().unwrap()).unwrap();
+        let (src, dst) = (src.metadata().unwrap(), std::fs::metadata(&upper).unwrap());
+        assert_eq!((dst.uid(), dst.gid(), dst.mode()), (src.uid(), src.gid(), src.mode()));
+        let dst = std::fs::File::open(&upper).unwrap();
+        let mut note = [0u8; 4];
+        assert_eq!(unsafe { libc::fgetxattr(dst.as_raw_fd(), c"user.note".as_ptr(), note.as_mut_ptr().cast(), note.len()) }, 4);
+        assert_eq!(&note, b"root");
+        let mut copied = vec![0u8; acl.len()];
+        assert_eq!(
+            unsafe { libc::fgetxattr(dst.as_raw_fd(), c"system.posix_acl_default".as_ptr(), copied.as_mut_ptr().cast(), copied.len()) },
+            acl.len() as isize
+        );
+        assert_eq!(copied, acl);
+    }
+
     #[test]
     fn fork_messages_must_come_from_the_kernel() {
         for pri in 0..24 {
