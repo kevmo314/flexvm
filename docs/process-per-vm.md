@@ -181,12 +181,13 @@ STATE (default /var/lib/flexvm, on disk)
   evict.last             its mtime: when an eviction last started (5 s apart)
   staging/               where image layers unpack (`pull`); its ancestry must be root-owned
 RUN (default /run/flexvm, tmpfs)
-  vms/NAME.{json,sock,log}        registry entry, control socket, log of -d/standby VMs (0600)
+  vms/NAME.{json,sock}            registry entry, control socket (0600)
+  vms/NAME.{log,log.1}            current log and previous rotation of background VMs (0600)
   vms/.locks/NAME.lock            liveness lock; NAME.log, a log's writers' lock; .incoming-*.log, an arrival's lock
-  vms/NAME.{failed,moved}         why a VM died (until `flexvm rm`); where it migrated to (an hour)
+  vms/NAME.{failed,moved}         why a VM died (until `rm` or name reuse); where it migrated to (an hour)
   vms/NAME.exit                   the process's exit status and identity (`flexvm wait`)
   vms/NAME.exited                 a background VM's app exit status and run config (until `start` or `rm`)
-  vms/NAME.lost                   a VM lost with the host, recorded before its address is withdrawn (until `flexvm rm`)
+  vms/NAME.lost                   a VM lost with the host, recorded before its address is withdrawn (until `rm` or name reuse)
   .boot                  the boot id once this boot's recovery completed (`gc::after_boot`)
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
@@ -212,11 +213,11 @@ RUN (default /run/flexvm, tmpfs)
   standby/H/             template T's standby files, H the 16-hex hash of T's name (independent of T's length)
   standby/H/.template    T, the template's name
   standby/H/PID.sock     a standby VM of template T (.locks/PID-START.lock while it lives)
-  standby/H/.locks/      PID-START.claim (locked by a standby VM while a claim of it is under way),
+  standby/H/.locks/      PID-START.lock (liveness), PID-START.claim (locked while a claim is under way),
                          PID-START.take (locked by a `run` while it tries that standby; others try another
                          first), refill (one refill of T at a time), publish (held while a socket is replaced)
   standby/H/.failed      its mtime: T's last failed refill (none for a minute after)
-  standby/H/standby.log  the standby VMs' output and refill errors
+  standby/H/standby.log  the standby VMs' output and refill errors (standby.log.1: previous rotation)
   standby/.pressure      its mtime: when pressure last stopped standby VMs (no refill for a minute)
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
                          (one per generation; swept once neither read nor written for a day)
@@ -294,16 +295,16 @@ VM's socket (its `PID-START.lock` free) and a lock it died before renaming in pl
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
 killed (`rmdir` refuses a populated cgroup). An earlier version's
 Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a name with no
-VM, suspended VM, `failed` or `moved` record go once unwritten for an hour,
+VM, suspended VM, `failed`, `lost`, `exited` or `moved` record go once unwritten for an hour,
 decided and removed holding `RUN/.locks/logs`, which a start holds (shared)
 while it opens and marks its log (whether a VM holds the name is read from its lock's record, never by probing the lock a start takes without waiting); `NAME.moved` goes after an hour.
 Released migration records are retired as below. Logs are capped by their
-writers, not swept (`output::append_capped`): every write a VM process's
-output relay makes to a log in the run directory, whichever process and
-stream, is made under the log's lock (`.locks/NAME` in its directory, never the
-log itself) to the file at the log's path then, and past 8 MiB
-renames it `NAME.log.1` and starts a new one. No write goes to a rotated
-or removed generation, and none is cut.
+writers, not swept (`output::append_capped`): a VM process's output relay
+tries the log's lock (`.locks/NAME.log` in its directory, never the log itself)
+for up to a second, then appends to the file at the log's path. With the lock,
+a write past 8 MiB renames it `NAME.log.1`; the next write starts a new one.
+Without the lock, it appends without rotating, so a concurrent rotation may
+carry that write into `NAME.log.1`. Writes are never retried.
 
 **The tap prefix** names taps and hold devices: `f` and five base-36 digits
 of a hash of the state directory (`Host::tap_prefix`), so it never changes

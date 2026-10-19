@@ -825,6 +825,12 @@ impl Host {
         if !resuming && self.has_record(name, "exited") {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
+        let _logs = self.logs_lock(libc::LOCK_SH)?;
+        if ["failed", "lost"].iter().any(|ext| self.has_record(name, ext)) {
+            for ext in ["log", "log.1"] {
+                let _ = std::fs::remove_file(self.vms(name, ext)?);
+            }
+        }
         for ext in ["json", "sock", "moved", "failed", "lost"] {
             let _ = std::fs::remove_file(self.vms(name, ext)?);
         }
@@ -5034,6 +5040,25 @@ pub(crate) mod tests {
         std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
         std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
         assert!(h.take_name("s", false).is_err() && h.take_name("s", true).is_ok());
+    }
+
+    #[test]
+    fn reusing_a_failed_or_lost_name_removes_both_logs() {
+        let (_dir, h) = host("reuse-logs");
+        for record in ["failed", "lost"] {
+            for ext in [record, "log", "log.1"] {
+                std::fs::write(h.vms("web", ext).unwrap(), "old vm").unwrap();
+            }
+            assert!(h.take_unrecorded_name("web").is_err());
+            assert!(h.has_record("web", "log") && h.has_record("web", "log.1"));
+            let _name = h.take_name("web", false).unwrap();
+            for ext in [record, "log", "log.1"] {
+                assert!(!h.has_record("web", ext), "{ext}");
+            }
+        }
+        std::fs::write(h.vms("web", "log").unwrap(), "resume").unwrap();
+        let _name = h.take_name("web", true).unwrap();
+        assert_eq!(std::fs::read_to_string(h.vms("web", "log").unwrap()).unwrap(), "resume");
     }
 
     #[test]

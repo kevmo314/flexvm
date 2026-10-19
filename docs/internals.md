@@ -937,7 +937,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   its replacement, none start unless they leave the host's eviction mark
   available (so a refill never takes the room eviction moves VMs away to
   make), and the memory controller stops them all when the host goes under
-  its reserve. A standby VM also checks every second and leaves by itself
+  its reserve. A standby VM also checks every 100 ms and leaves by itself
   under the reserve, so a host with no running VM relieves them too.
 - **Generations.** `flexvm pull` publishes each build as an immutable
   `templates/.gen/<content id>/` and points `templates/NAME` at it with one
