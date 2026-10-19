@@ -475,11 +475,13 @@ pub enum Top {
 }
 
 /// The top `create(src)` makes, from `src` alone. A last component of `..` (which `create` resolves in its filesystem) is
-/// taken lexically from `/`, where a guest path starts; a guest that resolves it otherwise has its archive refused.
+/// taken lexically from `/`, where a guest path starts, to a name: a guest that resolves it otherwise has its archive
+/// refused. One that comes to `/` lexically is refused here: through a link (`/bin/..`, with `/bin -> usr/bin`) it is
+/// `usr` in the guest, and taken as contents, it would let the guest name anything below DST.
 #[allow(dead_code)] // Only the host checks a guest's archive.
-pub fn top_of(src: &str) -> Top {
+pub fn top_of(src: &str) -> io::Result<Top> {
     if src == "." || src.ends_with("/.") {
-        return Top::Contents;
+        return Ok(Top::Contents);
     }
     let trimmed = src.trim_end_matches('/');
     let named = |c: &str| if c.is_empty() || c == "." { Top::Contents } else { Top::Named(c.as_bytes().to_vec()) };
@@ -493,9 +495,12 @@ pub fn top_of(src: &str) -> Top {
                     c => comps.push(c),
                 }
             }
-            named(comps.last().copied().unwrap_or(""))
+            match comps.last() {
+                Some(c) => Ok(named(c)),
+                None => Err(io::Error::other(format!("{src}: a path whose .. comes to /; give /. for its contents"))),
+            }
         }
-        c => named(c),
+        c => Ok(named(c)),
     }
 }
 
@@ -1122,15 +1127,20 @@ mod tests {
         for src in
             [d.clone(), format!("{d}/"), format!("{d}//"), format!("{d}/."), format!("{d}/./"), format!("{d}/f"), format!("{d}/sub/.."), format!("{d}/sub/../")]
         {
-            assert_eq!(top_of(&src), first(&src), "{src}");
+            assert_eq!(top_of(&src).unwrap(), first(&src), "{src}");
         }
-        assert_eq!(top_of(&format!("{d}/sub/..")), Top::Named(b"d".to_vec()));
-        for src in ["/", "/.", ".", "..", "/..", "/etc/..", "a/../.."] {
-            assert_eq!(top_of(src), Top::Contents, "{src}");
+        assert_eq!(top_of(&format!("{d}/sub/..")).unwrap(), Top::Named(b"d".to_vec()));
+        for src in ["/", "//", "/.", ".", "./", "a/./"] {
+            assert_eq!(top_of(src).unwrap(), Top::Contents, "{src}");
         }
-        assert_eq!(top_of("/etc/hostname"), Top::Named(b"hostname".to_vec()));
-        assert_eq!(top_of("etc/ssh/"), Top::Named(b"ssh".to_vec()));
-        assert_eq!(top_of("/a/b/../c/.."), Top::Named(b"a".to_vec()));
+        // A `..` that comes to / lexically may be a name in the guest (`/bin/..` through `/bin -> usr/bin`): never contents.
+        for src in ["..", "../", "/..", "/bin/..", "/bin/../", "a/../..", "/a/./.."] {
+            assert!(top_of(src).is_err(), "{src}");
+        }
+        assert_eq!(top_of("/etc/hostname").unwrap(), Top::Named(b"hostname".to_vec()));
+        assert_eq!(top_of("etc/ssh/").unwrap(), Top::Named(b"ssh".to_vec()));
+        assert_eq!(top_of("/a/b/../c/..").unwrap(), Top::Named(b"a".to_vec()));
+        assert_eq!(top_of("/usr/bin/..").unwrap(), Top::Named(b"usr".to_vec()));
     }
 
     #[test]
@@ -1140,7 +1150,7 @@ mod tests {
         std::fs::write(t.0.join("etc/hostname"), "vm\n").unwrap();
         std::fs::write(t.0.join("etc/sub/x"), "x").unwrap();
         std::fs::create_dir(t.0.join("dst")).unwrap();
-        let get = |src: String, dst: String| unpack_to(&tar_of(&src), Dest::Guest(&dst, &top_of(&src)));
+        let get = |src: String, dst: String| unpack_to(&tar_of(&src), Dest::Guest(&dst, &top_of(&src).unwrap()));
         get(t.s("etc/hostname"), t.s("dst")).unwrap();
         assert_eq!(std::fs::read(t.0.join("dst/hostname")).unwrap(), b"vm\n");
         get(t.s("etc/hostname"), t.s("renamed")).unwrap();
