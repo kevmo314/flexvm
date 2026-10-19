@@ -2435,12 +2435,14 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     };
     // Refused, it is not asked again (host lock, grants file, MemAvailable) until its backoff
     // expires: a guest throttled at its mark asks about every 250 ms.
+    let mut grant = None;
     let refused = plan.charge > 0 && {
         let mut backoff = vm.grant_backoff.lock().unwrap();
         let now = Instant::now();
         if !backoff.ready(now) {
             true
-        } else if host.grant(plan.charge, None)?.is_some() {
+        } else if let Some(id) = host.grant(plan.charge, None)? {
+            grant = Some(id);
             backoff.granted();
             false
         } else {
@@ -2469,10 +2471,29 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
             "tick"
         };
         crate::info!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
-        if new > requested {
-            vm.limit.plug(meta.mem_mib + new, if refused { 0 } else { plan.charge });
+        // Restored and refunded only if the plug provably did not happen: never sent, or answered with an error and
+        // Firecracker still reports the old request (a send that got no answer may yet be acted on).
+        let mut undone = false;
+        let result = vm.fc(|fc| {
+            let patch = || fc.patch("/hotplug/memory", json!({"requested_size_mib": new}));
+            let unapplied = |e: &crate::util::Error| {
+                undone = crate::fc::not_sent(e)
+                    || (e.downcast_ref::<std::io::Error>().is_none()
+                        && fc.get("/hotplug/memory").ok().and_then(|hp| hp["requested_size_mib"].as_u64()) == Some(requested));
+                undone
+            };
+            if new > requested {
+                vm.limit.plug_with(meta.mem_mib + new, if refused { 0 } else { plan.charge }, patch, unapplied)
+            } else {
+                patch()
+            }
+        });
+        if let Err(e) = result {
+            if let Some(id) = grant.filter(|_| undone) {
+                host.refund(id);
+            }
+            return Err(e);
         }
-        vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
         *last = Instant::now();
     } else if requested == plugged {
         vm.limit.settled(meta.mem_mib + plugged);

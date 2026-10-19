@@ -1688,7 +1688,7 @@ impl Host {
 
     /// The window's grants, and with the holds and checkpoint memory taken lately (`recent_debits`) what they count
     /// as used that MemAvailable may not show taken yet, with those debits (None if unreadable).
-    /// Fails closed: unread holds would leave out memory still to arrive.
+    /// Fails closed: unread holds or debits would leave out memory still to arrive.
     fn pending(&self, l: &Locked) -> Result<(Grants, u64, Option<Debits>)> {
         let now = boottime_ms();
         let mut grants: Grants = load(&self.grants())?.unwrap_or_default();
@@ -1698,6 +1698,10 @@ impl Host {
             format!("{e}: memory held for migrations and restores still arriving cannot be counted")
         })?;
         let (debits, taken) = self.recent_debits(l, now);
+        // An unreadable ledger unwritten for its window has expired (0 taken): admission and `take_room`'s rewrite go on.
+        if debits.is_none() && taken == u64::MAX {
+            bail!("debits unreadable: {}: checkpoint memory still arriving cannot be counted", self.debits().display());
+        }
         let pending = pending(&grants, &held).saturating_add(taken);
         Ok((grants, pending, debits))
     }
@@ -1714,9 +1718,14 @@ impl Host {
     /// for no more than those deltas can hide (`vmstat_drift_mib`), or in full where that cannot be told.
     fn recent_debits(&self, _l: &Locked, now: u64) -> (Option<Debits>, u64) {
         let path = self.debits();
-        let read = load::<Debits>(&path).ok();
+        // Only a ledger that reads but does not parse can expire: a failed read (EIO) never proves its debits old.
+        let (read, unwritten) = match read_record(&path) {
+            Ok(b) => (serde_json::from_slice::<Debits>(&b).ok().map(Some), unwritten_for(&path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Some(None), None),
+            Err(_) => (None, None),
+        };
         let gone = |d: &Debit| Ident { pid: d.pid, start: d.start, boot: boot_id().into() }.liveness() == Liveness::Gone;
-        debits_taken(read, unwritten_for(&path), now, debit_window_ms(), vmstat_drift_mib(), gone)
+        debits_taken(read, unwritten, now, debit_window_ms(), vmstat_drift_mib(), gone)
     }
 
     /// Marks this process's takes populated whose population ended (`UNMARKED`), if the host lock is free within
@@ -2234,7 +2243,8 @@ fn debit_window_ms() -> u64 {
     })
 }
 
-/// `Host::recent_debits` of what was read (None: unreadable), its file unwritten for that long (None: unknown), at
+/// `Host::recent_debits` of what was read (None: unreadable), its file unwritten for that long (None: unknown, or a
+/// failed read), at
 /// `now`: unpopulated ones in full unless their process is `gone`; populated ones for `window` ms, together for at
 /// most `cap` MiB (None: no cap). An unreadable file counts as all taken until a whole window has passed since its
 /// last write (every debit it held has expired then, but one still to populate: which it was cannot be told, so it
@@ -7566,6 +7576,34 @@ pub(crate) mod tests {
         assert!(h.grant_inner(1, Floor::Reserve, true, None, || Some(AVAIL)).is_err(), "nor a held grant");
         std::fs::remove_file(&dir).unwrap();
         assert!(grant().unwrap().is_some() && grants().len() == 2);
+    }
+
+    #[test]
+    fn admission_fails_early_when_debits_cannot_be_read() {
+        let (_dir, mut h) = host("debits-unreadable");
+        h.cfg.reserve_mib = Some(0);
+        std::fs::write(h.debits(), b"{").unwrap();
+        let err = h.grant_inner(1, Floor::Reserve, false, None, || panic!("debits must be readable before checking room")).err().unwrap();
+        assert!(err.to_string().contains("debits unreadable"));
+        assert!(load::<Grants>(&h.grants()).unwrap().unwrap_or_default().is_empty());
+        assert!(!locks(&h.run).join(format!("release-{}", boot_id())).exists(), "no release request for an unreadable ledger");
+        // A ledger that cannot be read at all (here a directory: EISDIR) never expires, however old.
+        std::fs::rename(h.debits(), h.run.join("ledger-saved")).unwrap();
+        std::fs::create_dir(h.debits()).unwrap();
+        let old = SystemTime::now() - Duration::from_millis(debit_window_ms() + 1000);
+        std::fs::File::open(h.debits()).unwrap().set_modified(old).unwrap();
+        let err = h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).err().unwrap();
+        assert!(err.to_string().contains("debits unreadable"), "{err}");
+        std::fs::remove_dir(h.debits()).unwrap();
+        std::fs::rename(h.run.join("ledger-saved"), h.debits()).unwrap();
+        // Unwritten for its window, the unparsable ledger has expired: admission goes on, and a take rewrites it.
+        let stale = SystemTime::now() - Duration::from_millis(debit_window_ms() + 1000);
+        std::fs::File::options().write(true).open(h.debits()).unwrap().set_modified(stale).unwrap();
+        assert!(h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
+        assert!(h.take_room_inner(1, || Some(AVAIL), || ()).1.is_some());
+        assert!(load::<Debits>(&h.debits()).is_ok(), "the take rewrote the ledger");
+        std::fs::remove_file(h.debits()).unwrap();
+        assert!(h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
     }
 
     /// Memory VM processes keep for their next checkpoint never refuses a grant (#648): asked for it before a refusal,

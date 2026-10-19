@@ -204,12 +204,37 @@ impl Limit {
 
     /// Before a grow to `cap` MiB, of which `charge` was admitted.
     pub fn plug(&self, cap: u64, charge: u64) {
+        self.plug_with(cap, charge, || Ok(()), |_| false).unwrap();
+    }
+
+    /// Raises the mark before hotplug (the guest never sees memory the mark does not allow), keeping the watcher out
+    /// until it settles. A failed `patch` restores it only if `unapplied` proves the plug never took effect: one
+    /// that may have keeps the raise (and its grant).
+    pub fn plug_with<R>(
+        &self,
+        cap: u64,
+        charge: u64,
+        patch: impl FnOnce() -> crate::util::Result<R>,
+        unapplied: impl FnOnce(&crate::util::Error) -> bool,
+    ) -> crate::util::Result<R> {
         let mut m = self.mark.lock().unwrap();
+        let before = (m.cap, m.admitted);
         m.cap = m.cap.max(cap);
         if m.admitted > 0 {
             m.admitted = (m.admitted + charge).min(m.cap);
             self.write(&m);
         }
+        let result = patch();
+        if let Err(e) = &result {
+            if unapplied(e) && (m.cap, m.admitted) != before {
+                let wrote = m.admitted != before.1;
+                (m.cap, m.admitted) = before;
+                if wrote {
+                    self.write(&m);
+                }
+            }
+        }
+        result
     }
 
     /// Once a shrink to `cap` MiB settled: never below what the VM uses, so
@@ -329,6 +354,31 @@ mod tests {
 
     fn high(cg: &Path) -> Option<u64> {
         std::fs::read_to_string(cg.join("memory.high")).unwrap().trim().parse::<u64>().ok().map(|b| b >> 20)
+    }
+
+    #[test]
+    fn a_failed_hotplug_restores_the_mark() {
+        let cg = crate::test_util::TempDir::new("limit-plug-failed");
+        std::fs::write(cg.join("memory.high"), "max").unwrap();
+        let l = Limit::new(Some(cg.to_path_buf()));
+        l.start(512, 1024);
+        let before = high(&cg);
+        let failed = || -> crate::util::Result<()> {
+            assert_eq!(high(&cg), Some(768 + overhead(768)), "raised before the guest sees the plug");
+            Err("patch failed".into())
+        };
+        // One that may have reached the guest keeps the raise.
+        assert!(l.plug_with(1280, 256, failed, |_| false).is_err());
+        assert_eq!((l.admitted(), l.mark.lock().unwrap().cap), (768, 1280));
+        l.start(512, 1024);
+        assert!(l.plug_with(1280, 256, failed, |_| true).is_err());
+        assert_eq!(l.admitted(), 512);
+        assert_eq!(l.mark.lock().unwrap().cap, 1024);
+        assert_eq!(high(&cg), before);
+        l.plug_with(1280, 256, || Ok(()), |_| unreachable!()).unwrap();
+        assert_eq!(l.admitted(), 768);
+        assert_eq!(l.mark.lock().unwrap().cap, 1280);
+        assert_eq!(high(&cg), Some(768 + overhead(768)));
     }
 
     #[test]
