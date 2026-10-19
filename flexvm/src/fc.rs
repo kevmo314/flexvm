@@ -185,6 +185,15 @@ impl Firecracker {
         format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
 
+    /// The end of its log (up to 64 KiB, the guest's console with it), once it exited: a guest crash's cause comes
+    /// well before the few lines `post_mortem` keeps.
+    pub fn log_tail(&self) -> String {
+        if matches!(exited(&self.child), Ok(Some(_))) {
+            self.join_log();
+        }
+        firecracker_log_tail(&self.dir)
+    }
+
     /// An error only under a `--cpus` cap: outside its cgroup, the VM would run uncapped.
     pub fn join_cgroup(&self) -> Result<()> {
         let joined = match self.joining.borrow_mut().take() {

@@ -262,6 +262,10 @@ impl Vm {
         self.fc.lock().unwrap().as_ref().map_or_else(|| "no firecracker".into(), Firecracker::post_mortem)
     }
 
+    pub fn firecracker_log(&self) -> String {
+        self.fc.lock().unwrap().as_ref().map(Firecracker::log_tail).unwrap_or_default()
+    }
+
     /// Its Firecracker died: whatever operation is in progress is cut short
     /// rather than waited out. Guest calls fail without retrying, waits on
     /// Firecracker give up, and the pager stops (`kill` still reaps
