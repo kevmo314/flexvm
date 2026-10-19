@@ -2330,19 +2330,27 @@ pub fn cpu_controller(root: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
+/// `/sys/fs/cgroup/flexvm`, set up once per process (and again should it be removed); None
+/// without cgroup2 or where it cannot be made, tried again at the next call.
 pub fn cgroup_root() -> Option<PathBuf> {
-    static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    ROOT.get_or_init(|| {
-        let root = PathBuf::from("/sys/fs/cgroup/flexvm");
-        match setup_cgroups(&root) {
-            Ok(()) => Some(root),
-            Err(e) => {
-                crate::log!("WARNING: per-VM cgroups unavailable: {e}");
-                None
-            }
+    let root = std::path::Path::new("/sys/fs/cgroup/flexvm");
+    static READY: AtomicBool = AtomicBool::new(false);
+    if READY.load(Ordering::Relaxed) && root.is_dir() {
+        return Some(root.into());
+    }
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    match setup_cgroups(root) {
+        Ok(()) => {
+            READY.store(true, Ordering::Relaxed);
+            Some(root.into())
         }
-    })
-    .clone()
+        Err(e) => {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                crate::log!("WARNING: per-VM cgroups unavailable: {e}");
+            }
+            None
+        }
+    }
 }
 
 fn setup_cgroups(root: &std::path::Path) -> Result<()> {

@@ -666,13 +666,18 @@ process: stopping it sends SIGTERM, which suspends the VM to disk (give it
 `TimeoutStopSec` for that), and `KillSignal=SIGINT` destroys it instead. A
 foreground run that claims a standby VM moves that VM's process into its
 cgroup, so this holds for it too, and killing the run (SIGKILL) destroys the
-VM, as it would a cold run's.
+VM, as it would a cold run's. These cgroups need no controllers: a host that
+cannot enable the memory controller in `/sys/fs/cgroup/flexvm` still makes
+them, and only goes without the per-VM memory limits (`--cpus` likewise needs
+the cpu controller there). A foreground run put in the background
+keeps running under `stty tostop`: its VM process ignores SIGTTOU and SIGTTIN.
 
 Hosts in different PID namespaces must not share `/sys/fs/cgroup/flexvm`.
 Cgroup owners are recorded by PID and start time in the creator's PID namespace;
 garbage collection cannot distinguish a foreign namespace's owner and may kill
-its Firecrackers. Give each PID namespace its own cgroup mount/subtree. Separate
-state and run directories alone do not isolate cgroup collection.
+its Firecrackers. Give each PID namespace a cgroup namespace (or cgroup2 mount)
+of its own. Separate state and run directories alone do not isolate cgroup
+collection.
 
 ## Fast starts
 
