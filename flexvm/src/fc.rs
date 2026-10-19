@@ -45,7 +45,7 @@ pub struct Firecracker {
     child: Child,
     pub sockets: Sockets,
     pub dir: PathBuf,
-    pub cgroup: Option<PathBuf>,
+    cgroup: RefCell<Option<PathBuf>>,
     /// Empty for image builders, which own their directory and network.
     pub tap: String,
     api: Api,
@@ -85,7 +85,7 @@ impl Firecracker {
             child,
             sockets,
             dir: dir.into(),
-            cgroup: None,
+            cgroup: RefCell::new(None),
             tap: String::new(),
             api: Api { bin: bin.into(), ..Api::default() },
             joining: RefCell::new(None),
@@ -191,15 +191,27 @@ impl Firecracker {
             Some(j) => j.join().unwrap_or_else(|_| Err(std::io::Error::other("cgroup thread panicked"))),
             None => Ok(()),
         };
+        if joined.is_err() {
+            if let Some(cg) = self.cgroup.borrow_mut().take() {
+                let _ = std::fs::remove_dir(cg);
+            }
+        }
         match joined {
             Err(e) if self.capped => bail!("--cpus not applied: firecracker {} has no cgroup of its own: {e}", self.pid()),
             _ => Ok(()),
         }
     }
 
+    pub fn cgroup(&self) -> Option<PathBuf> {
+        let _ = self.join_cgroup();
+        self.cgroup.borrow().clone()
+    }
+
     /// `cpu.max` on its cgroup (`vm::Resources::cpu_max`), for a claimed standby's.
     pub fn set_cpu_max(&self, max: &str) -> Result<()> {
-        let cg = self.cgroup.as_ref().ok_or("--cpus needs per-VM cgroups, which this host does not have")?;
+        self.join_cgroup()?;
+        let cgroup = self.cgroup.borrow();
+        let cg = cgroup.as_ref().ok_or("--cpus needs per-VM cgroups, which this host does not have")?;
         std::fs::write(cg.join("cpu.max"), max).map_err(|e| format!("--cpus not applied: {}: {e}", cg.join("cpu.max").display()))?;
         Ok(())
     }
@@ -451,7 +463,7 @@ impl Drop for Firecracker {
         let _ = self.child.wait();
         self.join_log();
         if !self.tap.is_empty() {
-            release(&self.tap, self.cgroup.as_deref(), &self.dir);
+            release(&self.tap, self.cgroup.get_mut().as_deref(), &self.dir);
         }
     }
 }
@@ -571,7 +583,7 @@ impl Spawner {
         let cap = self.cpu_max.lock().unwrap().clone();
         if let Some(max) = &cap {
             fc.capped = true;
-            fc.cgroup = cgroup.clone();
+            *fc.cgroup.get_mut() = cgroup.clone();
             fc.tap = tap.clone();
             let cg = cgroup.as_ref().ok_or("--cpus needs per-VM cgroups (cgroup2 at /sys/fs/cgroup), which this host does not have")?;
             std::fs::create_dir(cg).map_err(|e| format!("--cpus not applied: {}: {e}", cg.join("cpu.max").display()))?;
@@ -598,7 +610,7 @@ impl Spawner {
                 joined
             }));
         }
-        fc.cgroup = cgroup;
+        *fc.cgroup.get_mut() = cgroup;
         fc.tap = tap;
         Ok(fc)
     }
@@ -610,6 +622,35 @@ mod tests {
 
     use std::os::unix::net::UnixListener;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn failed_cgroup_join_disables_limits_and_removes_the_directory() {
+        for capped in [false, true] {
+            let dir = crate::test_util::TempDir::new("fc-no-cgroup");
+            let cg = dir.join("cg");
+            std::fs::create_dir(&cg).unwrap();
+            let sockets = SocketRoot::from_bases(&[dir.join("s")], &dir).unwrap().allocate().unwrap();
+            let fc = Firecracker {
+                child: Command::new("sleep").arg("30").spawn().unwrap(),
+                sockets,
+                dir: dir.to_path_buf(),
+                cgroup: RefCell::new(Some(cg.clone())),
+                tap: String::new(),
+                api: Api::default(),
+                joining: RefCell::new(Some(std::thread::spawn(|| Err(std::io::Error::from_raw_os_error(libc::EACCES))))),
+                capped,
+                logging: RefCell::new(None),
+            };
+            assert_eq!(fc.join_cgroup().is_err(), capped);
+            assert_eq!(fc.cgroup(), None);
+            assert!(!cg.exists());
+            assert!(fc.set_cpu_max("100000 100000").is_err());
+            let limit = crate::limit::Limit::new(fc.cgroup());
+            limit.start(512, 1024);
+            assert_eq!(limit.used(), None);
+            assert_eq!(limit.admitted(), 0);
+        }
+    }
 
     #[test]
     fn firecracker_output_flood_is_capped_and_keeps_final_diagnostics() {

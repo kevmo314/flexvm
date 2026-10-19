@@ -2198,6 +2198,10 @@ fn forget_stop(early: &mut Vec<i32>) {
 pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::File>) -> Result<()> {
     // Blocked first: every thread from here on (the output relays too) inherits it.
     let signals = crate::util::block_signals(&SIGNALS);
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
     crate::util::output::guard()?;
     crate::util::raise_nofile();
     let _ = crate::net::ip_forward();
@@ -2327,35 +2331,35 @@ pub fn cpu_controller(root: Option<&std::path::Path>) -> Result<()> {
 }
 
 pub fn cgroup_root() -> Option<PathBuf> {
-    let root = PathBuf::from("/sys/fs/cgroup/flexvm");
-    let setup = || -> Result<()> {
-        if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-            bail!("no cgroup2 hierarchy mounted at /sys/fs/cgroup");
-        }
-        std::fs::create_dir_all(&root)?;
-        let ctl = std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap_or_default();
-        if !has_controller(&ctl, "memory") {
-            std::fs::write(root.join("cgroup.subtree_control"), "+memory")?;
-        }
-        static NO_CPU: AtomicBool = AtomicBool::new(false);
-        if !has_controller(&ctl, "cpu") {
-            if let Err(e) = std::fs::write(root.join("cgroup.subtree_control"), "+cpu") {
-                if !NO_CPU.swap(true, Ordering::Relaxed) {
-                    crate::log!("cgroup cpu controller unavailable (memory limits still apply): {e}");
-                }
+    static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = PathBuf::from("/sys/fs/cgroup/flexvm");
+        match setup_cgroups(&root) {
+            Ok(()) => Some(root),
+            Err(e) => {
+                crate::log!("WARNING: per-VM cgroups unavailable: {e}");
+                None
             }
         }
-        Ok(())
-    };
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    match setup() {
-        Ok(()) => Some(root),
-        Err(e) if !WARNED.swap(true, Ordering::Relaxed) => {
-            crate::log!("WARNING: per-VM cgroups unavailable: {e}");
-            None
-        }
-        Err(_) => None,
+    })
+    .clone()
+}
+
+fn setup_cgroups(root: &std::path::Path) -> Result<()> {
+    if !root.parent().is_some_and(|p| p.join("cgroup.controllers").exists()) {
+        bail!("no cgroup2 hierarchy mounted at /sys/fs/cgroup");
     }
+    std::fs::create_dir_all(root)?;
+    let ctl = std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap_or_default();
+    // Scopes need no controllers: a missing one only disables its resource features.
+    for controller in ["memory", "cpu"] {
+        if !has_controller(&ctl, controller) {
+            if let Err(e) = std::fs::write(root.join("cgroup.subtree_control"), format!("+{controller}")) {
+                crate::log!("cgroup {controller} controller unavailable: {e}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What an arrival admitted `granted` MiB still needs for (`need` MiB to
@@ -3185,6 +3189,18 @@ mod tests {
         assert_eq!(room_sample(1000, || Some(500), || Some(0))(), Some(0));
         assert_eq!(room_sample(1000, || Some(5000), || None)(), Some(0));
         assert_eq!(room_sample(1000, || None, || Some(0))(), None);
+    }
+
+    #[test]
+    fn scopes_need_no_controllers() {
+        let dir = crate::test_util::TempDir::new("scope-controllers");
+        let root = dir.join("flexvm");
+        assert!(setup_cgroups(&root).is_err());
+        std::fs::write(dir.join("cgroup.controllers"), "").unwrap();
+        std::fs::create_dir_all(root.join("cgroup.subtree_control")).unwrap();
+        assert!(setup_cgroups(&root).is_ok());
+        assert!(root.is_dir());
+        assert!(cpu_controller(Some(&root)).is_err());
     }
 
     #[test]

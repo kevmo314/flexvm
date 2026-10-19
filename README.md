@@ -668,6 +668,12 @@ foreground run that claims a standby VM moves that VM's process into its
 cgroup, so this holds for it too, and killing the run (SIGKILL) destroys the
 VM, as it would a cold run's.
 
+Hosts in different PID namespaces must not share `/sys/fs/cgroup/flexvm`.
+Cgroup owners are recorded by PID and start time in the creator's PID namespace;
+garbage collection cannot distinguish a foreign namespace's owner and may kill
+its Firecrackers. Give each PID namespace its own cgroup mount/subtree. Separate
+state and run directories alone do not isolate cgroup collection.
+
 ## Fast starts
 
 ```sh

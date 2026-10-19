@@ -129,7 +129,7 @@ impl SocketRoot {
         Self::from_bases(&bases(), key)
     }
 
-    fn from_bases(bases: &[PathBuf], key: &Path) -> Result<Arc<Self>> {
+    pub(crate) fn from_bases(bases: &[PathBuf], key: &Path) -> Result<Arc<Self>> {
         let mut errors = Vec::new();
         for base in bases {
             let attempt = (|| -> Result<Arc<Self>> {
