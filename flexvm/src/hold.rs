@@ -1749,7 +1749,8 @@ mod tests {
             got.push(p.to_vec());
             true
         };
-        std::thread::sleep(Duration::from_millis(200));
+        // a re-sends the straggler to b's device; wait until b has queued it.
+        crate::test_util::wait_until("b to queue the straggler", || !b.entry(ip).unwrap().q.lock().unwrap().packets.is_empty());
         let (stats, _) = b.release_local(ip, 2, &mut sink, || Ok(()), Duration::ZERO).unwrap();
         b.forget(ip, 2);
         let _ = crate::net::route_dev(false, ip, b.ifindex);
