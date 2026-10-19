@@ -407,6 +407,8 @@ flexvm run -d --checkpoint base --name web2 --ip auto   # a fork, with a new add
 flexvm run --checkpoint 3f2a --paused               # by the start of its id; held until unpause
 flexvm checkpoint rm base                           # refused while another builds on it
 flexvm checkpoint prune --older-than 7d             # asks first on a terminal (-f: not)
+flexvm checkpoint save base | ssh b flexvm checkpoint load   # to another host, template and all
+flexvm checkpoint save base -o base.tar             # to a file; checkpoint load -i base.tar reads it
 ```
 
 flexvm keeps checkpoints in `STATE/checkpoints`, each under its id (the
@@ -437,8 +439,29 @@ a new one. `run --checkpoint PATH` (any argument with a `/`) restores a
 checkpoint directory as it is: one written by flexvm 0.1.0's `flexvm checkpoint
 VM DIR` (which `checkpoint create` replaces, and now refuses), another state's
 stored one (`STATE/checkpoints/ID`), or a stopped VM's. Its template generation
-must be here. Moving stored checkpoints between hosts (`checkpoint save` and
-`load`) is to come (#775).
+must be here.
+
+`checkpoint save NAME|ID` moves a stored checkpoint to another host: it writes one
+self-contained tar, to stdout (never a terminal) or with `-o FILE` to that file once
+it is whole. The tar holds the checkpoint, the chain it builds on, and the template
+generation it was taken on: its memory file's data (holes stay holes), metadata and
+root filesystem. Stored checkpoints themselves stay lean, sharing the template.
+`checkpoint load` reads a save from stdin, or `-i FILE`, and stores it under the
+same ids and name (`--name NAME` gives another; a name another checkpoint has is
+refused before anything is read). Everything is verified before anything is
+published, so a damaged or truncated save stores nothing: each checkpoint by its
+id and checksums, and the template by its content id and the SHA-256 digests the
+checkpoint records. Those ids and checksums catch damage, not forgery: `save` prints
+the save's SHA-256 (of every checkpoint file; on stderr when the tar goes to stdout)
+and `load` prints what it read, and `load --sha256 HEX` stores only the save with that
+SHA-256. A checkpoint this host has under one of the ids is used only if its files are
+the same, byte for byte. The template is stored unnamed, unless this host has a
+generation of that content id already; no image name here is read or moved, as the
+saving host's `:latest` may be another build than this host's. `run --checkpoint NAME`
+then restores it on that generation. A checkpoint taken on a template built by
+flexvm 0.1.0 records no digests: its save leaves the template out, so the loading
+host must have it. `checkpoint load -i DIR` stores a checkpoint directory (flexvm
+0.1.0's, or any of the above) with its chain; it holds no template.
 
 ## Configuration
 

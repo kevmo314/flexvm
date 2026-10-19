@@ -806,7 +806,7 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         }
         answer(&Ok(json!({"have": false})))?;
         asked = true;
-        crate::template::receive(&paths, &mut std::io::BufReader::new(crate::util::By { s: &conn, at }), id)
+        crate::template::receive(&paths, &mut std::io::BufReader::new(crate::util::By { s: &conn, at }), id, None, |_| Ok(()))
     });
     match got {
         Ok(tpl) => {

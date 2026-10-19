@@ -172,6 +172,8 @@ pub fn checkpoints(args: &Args, operation: &str) -> Result<()> {
     let host = crate::open_host(args)?;
     let removed = match operation {
         "ls" => return list_checkpoints(&host, args),
+        "save" => return save_checkpoint(&host, args),
+        "load" => return load_checkpoint(&host, args),
         "rm" => store::remove(&host.state, &args.names()[1..], args.has("force"))?,
         _ => {
             let before = args.get("older-than").map(|d| -> Result<u64> {
@@ -186,6 +188,68 @@ pub fn checkpoints(args: &Args, operation: &str) -> Result<()> {
         }
     };
     removed.into_iter().try_for_each(crate::print)
+}
+
+/// `checkpoint save NAME|ID [-o FILE]`: to stdout (never a terminal), or to FILE once whole.
+fn save_checkpoint(host: &crate::host::Host, args: &Args) -> Result<()> {
+    use crate::checkpoint::export;
+    let what = args.names().get(1).cloned().unwrap_or_default();
+    let paths = Paths::new(&host.state);
+    let Some(file) = args.get("output") else {
+        if std::io::stdout().is_terminal() {
+            bail!("checkpoint save writes a tar: redirect stdout, or give -o FILE");
+        }
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
+        let saved = export::save(&host.state, &paths, &what, &mut out)?;
+        out.flush()?;
+        // Stdout is the tar: what `load --sha256` takes goes to stderr.
+        let _ = writeln!(
+            std::io::stderr(),
+            "flexvm: saved checkpoint {} (sha256 {})",
+            saved["saved"].as_str().unwrap_or(""),
+            saved["sha256"].as_str().unwrap_or("")
+        );
+        return Ok(());
+    };
+    let path = std::path::Path::new(file);
+    let base = path.file_name().ok_or_else(|| format!("bad -o {file:?}: give a file"))?.to_string_lossy();
+    let tmp = path.with_file_name(format!(".{base}.flexvm-{}", crate::util::random_hex(8)?));
+    let written = (|| -> Result<serde_json::Value> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = std::fs::File::options().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, &f);
+        let saved = export::save(&host.state, &paths, &what, &mut out)?;
+        out.flush()?;
+        drop(out);
+        f.sync_all()?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("{file}: {e}"))?;
+        crate::util::sync_dir(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")))?;
+        Ok(saved)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    crate::print(written?)
+}
+
+/// `checkpoint load [-i FILE|DIR] [--name NAME]`: a save from stdin (never a terminal) or FILE, or a checkpoint directory.
+fn load_checkpoint(host: &crate::host::Host, args: &Args) -> Result<()> {
+    use crate::checkpoint::export;
+    let (paths, name, sha256) = (Paths::new(&host.state), args.get("name"), args.get("sha256"));
+    let loaded = match args.get("input") {
+        Some(dir) if std::path::Path::new(dir).is_dir() => export::load_dir(&host.state, &paths, std::path::Path::new(dir), name, sha256)?,
+        Some(file) => {
+            let f = std::fs::File::open(file).map_err(|e| format!("{file}: {e}"))?;
+            export::load(&host.state, &paths, &mut std::io::BufReader::with_capacity(1 << 20, f), name, sha256)?
+        }
+        None => {
+            if std::io::stdin().is_terminal() {
+                bail!("checkpoint load reads a save from stdin, not a terminal (or give -i FILE|DIR)");
+            }
+            export::load(&host.state, &paths, &mut std::io::BufReader::with_capacity(1 << 20, std::io::stdin().lock()), name, sha256)?
+        }
+    };
+    crate::print(loaded)
 }
 
 fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {

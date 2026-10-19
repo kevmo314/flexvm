@@ -1063,31 +1063,62 @@ pub const MAX_DATA: u64 = 64 << 30;
 /// Room a received generation leaves on its filesystem.
 const KEEP_FREE: u64 = 1 << 30;
 
-/// Writes generation `tpl` for `receive`: its metadata, then its vmstate, root filesystem and memory,
-/// each as its length, its data extents and their bytes, so holes stay holes. Returns the data bytes.
-pub fn send(tpl: &Template, w: &mut impl Write) -> Result<u64> {
-    let meta = serde_json::to_vec(&tpl.meta)?;
-    w.write_all(&(meta.len() as u64).to_le_bytes())?;
-    w.write_all(&meta)?;
-    let (mut sent, mut buf) = (0, vec![0u8; 1 << 20]);
-    for path in [tpl.vmstate(), tpl.meta.rootfs.clone(), tpl.fixed.join("mem")] {
-        let file = File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let len = file.metadata()?.len();
-        let extents = data_extents(&file, len)?;
-        let head = [len, extents.len() as u64].into_iter().chain(extents.iter().flat_map(|&(s, e)| [s, e]));
-        w.write_all(&head.flat_map(u64::to_le_bytes).collect::<Vec<u8>>())?;
-        for (mut off, end) in extents {
-            sent += end - off;
-            while off < end {
-                let n = (end - off).min(buf.len() as u64) as usize;
-                file.read_exact_at(&mut buf[..n], off)?;
-                w.write_all(&buf[..n])?;
-                off += n as u64;
+/// Generation `tpl` as `receive` reads it, its files open and their extents read: `len` is known
+/// before anything is written (a tar member's size, `checkpoint save`).
+pub struct Sending {
+    meta: Vec<u8>,
+    /// Each file, its length and its data extents.
+    files: Vec<(File, u64, Extents)>,
+}
+
+type Extents = Vec<(u64, u64)>;
+
+impl Sending {
+    pub fn new(tpl: &Template) -> Result<Sending> {
+        let meta = serde_json::to_vec(&tpl.meta)?;
+        let mut files = vec![];
+        for path in [tpl.vmstate(), tpl.meta.rootfs.clone(), tpl.fixed.join("mem")] {
+            let file = File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let len = file.metadata()?.len();
+            let extents = data_extents(&file, len)?;
+            files.push((file, len, extents));
+        }
+        Ok(Sending { meta, files })
+    }
+
+    /// The bytes `write` writes.
+    pub fn len(&self) -> u64 {
+        let files: u64 = self.files.iter().map(|(_, _, x)| 16 + x.iter().map(|(s, e)| 16 + e - s).sum::<u64>()).sum();
+        8 + self.meta.len() as u64 + files
+    }
+
+    /// Its metadata, then its vmstate, root filesystem and memory, each as its length, its data
+    /// extents and their bytes, so holes stay holes. Returns the data bytes.
+    pub fn write(self, w: &mut impl Write) -> Result<u64> {
+        w.write_all(&(self.meta.len() as u64).to_le_bytes())?;
+        w.write_all(&self.meta)?;
+        let (mut sent, mut buf) = (0, vec![0u8; 1 << 20]);
+        for (file, len, extents) in self.files {
+            let head = [len, extents.len() as u64].into_iter().chain(extents.iter().flat_map(|&(s, e)| [s, e]));
+            w.write_all(&head.flat_map(u64::to_le_bytes).collect::<Vec<u8>>())?;
+            for (mut off, end) in extents {
+                sent += end - off;
+                while off < end {
+                    let n = (end - off).min(buf.len() as u64) as usize;
+                    file.read_exact_at(&mut buf[..n], off)?;
+                    w.write_all(&buf[..n])?;
+                    off += n as u64;
+                }
             }
         }
+        w.flush()?;
+        Ok(sent)
     }
-    w.flush()?;
-    Ok(sent)
+}
+
+/// Writes generation `tpl` for `receive` (`Sending::write`). Returns the data bytes.
+pub fn send(tpl: &Template, w: &mut impl Write) -> Result<u64> {
+    Sending::new(tpl)?.write(w)
 }
 
 /// Whose turn it is to obtain generation `id` here (`receive`), waited for until `by`: a second
@@ -1111,8 +1142,16 @@ pub fn turn(paths: &Paths, id: &str, by: Instant) -> Result<crate::host::HeldLoc
 /// Reads a generation `send` wrote and publishes it unnamed (no name here is taken or moved), once its
 /// content id is `id` and each file it got hashes to its component: it is never named or found by
 /// tag. Returns it open, so held: no `rmi`, prune or sweep removes it while it is. A failure leaves no
-/// generation: its staging goes, or, killed, the next build's or receive's sweep.
-pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Template>> {
+/// generation: its staging goes, or, killed, the next build's or receive's sweep. With `vouched` (a
+/// checkpoint's `template_digests`), one whose digests differ is refused before it is published, as
+/// is one that `finish` (given the reader, once all of it is read: what follows it) fails.
+pub fn receive<R: Read>(
+    paths: &Paths,
+    r: &mut R,
+    id: &str,
+    vouched: Option<&BTreeMap<String, String>>,
+    finish: impl FnOnce(&mut R) -> Result<()>,
+) -> Result<Arc<Template>> {
     let [len] = read_words(r)?;
     if len > MAX_META {
         bail!("template {id}: {len} bytes of metadata");
@@ -1160,6 +1199,9 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
     let staged = |n: &str| staging.dir.join(n);
     let rootfs = local.as_ref().map_or(staged("rootfs"), |_| meta.rootfs.clone());
     (meta.digests, meta.received) = (Some(digests(&meta, &staged("vmstate"), &staged("mem"), &rootfs)?), true);
+    if vouched.is_some_and(|v| Some(v) != meta.digests.as_ref()) {
+        bail!("template {id}: its files do not match the SHA-256 digests the checkpoint records");
+    }
     let (rootfs, _rootfs_use) = match local {
         Some((have, held)) => {
             std::fs::remove_file(staged("rootfs"))?;
@@ -1184,6 +1226,7 @@ pub fn receive(paths: &Paths, r: &mut impl Read, id: &str) -> Result<Arc<Templat
     }
     meta.kernel = paths.kernel.clone();
     std::fs::write(staging.dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+    finish(r)?;
     let paths = &Paths { templates: staging.parent.path.clone(), ..paths.clone() };
     let (_, _l) = publish_generation(paths, &staging.dir, libc::LOCK_SH, || Ok(()))?;
     let tpl = Template::open_dir(id, paths.templates.join(GENERATIONS).join(id))?;
@@ -1200,8 +1243,9 @@ fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
     Ok(out)
 }
 
-/// Taken while a receive checks its filesystem's room and allocates a file's blocks, so the next one's check sees them gone.
-static ADMIT: Mutex<()> = Mutex::new(());
+/// The host-wide lock taken while a receive (or `checkpoint load`) checks its filesystem's room and
+/// allocates a file's blocks, so the next one's check, in whichever process, sees them gone.
+pub(crate) const ROOM_LOCK: &str = "receive-room";
 
 /// One of `send`'s files, written to a new `path` with the same length (one of `lens`) and holes, within
 /// what is left of the generation's `budget` (`MAX_DATA`) and of its filesystem's room, by blocks.
@@ -1216,7 +1260,7 @@ fn receive_file(r: &mut impl Read, path: &Path, lens: std::ops::RangeInclusive<u
     }
     let file = File::options().write(true).create_new(true).open(path)?;
     file.set_len(len)?;
-    let admit = ADMIT.lock().unwrap();
+    let admit = crate::host::lock_at(crate::host::host_locks()?, ROOM_LOCK, libc::LOCK_EX)?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     crate::util::check(unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) })?;
     let block = st.f_frsize.max(PAGE_SIZE as u64);
@@ -1609,7 +1653,7 @@ fn finish_remove(paths: &Paths, tombstone: &Path) -> Result<Option<PathBuf>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1745,7 +1789,28 @@ mod tests {
         let tpl = f.open().unwrap();
         let mut buf = vec![];
         assert_eq!(send(&tpl, &mut buf).unwrap(), 2 * PAGE_SIZE as u64 + std::fs::metadata(&f.meta.rootfs).unwrap().len() + rootfs_named.len() as u64 + 15);
+        assert_eq!(Sending::new(&tpl).unwrap().len(), buf.len() as u64, "known before it is written");
         (tpl, buf)
+    }
+
+    /// A generation `.gen/ID` that `send` can send, its digests recorded as a build records them, in a
+    /// templates directory of its own (`checkpoint save`'s tests).
+    pub(crate) fn sendable() -> (crate::test_util::TempDir, Paths, Arc<Template>) {
+        let mut f = Fixture::new();
+        let (tpl, _) = sent(&mut f, ROOTFS);
+        f.meta.digests = Some(tpl.digests().unwrap());
+        f.write_meta(&f.meta, &f.dir);
+        std::fs::create_dir_all(f.dir.join(GENERATIONS)).unwrap();
+        std::os::unix::fs::symlink(&*f.dir, f.dir.join(GENERATIONS).join(&f.meta.id)).unwrap();
+        let tpl = f.open().unwrap();
+        (f.dir, f.paths, tpl)
+    }
+
+    /// Another host's templates directory with `paths`' Firecracker (`elsewhere`).
+    pub(crate) fn elsewhere_of(paths: &Paths) -> (crate::test_util::TempDir, Paths) {
+        let dir = crate::test_util::TempDir::new("template-in");
+        let paths = Paths { templates: dir.clone(), kernel: dir.join("vmlinux"), ..paths.clone() };
+        (dir, paths)
     }
 
     /// Another host's templates directory, with `f`'s Firecracker.
@@ -1766,7 +1831,7 @@ mod tests {
         let mut f = Fixture::new();
         let (tpl, buf) = sent(&mut f, ROOTFS);
         let (dir, paths) = elsewhere(&f);
-        let got = receive(&paths, &mut &buf[..], &tpl.meta.id).unwrap();
+        let got = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(())).unwrap();
         assert_eq!(got.meta.id, tpl.meta.id);
         let gen = std::fs::canonicalize(&*dir).unwrap().join(GENERATIONS).join(&tpl.meta.id);
         assert_eq!(got.meta.rootfs, gen.join("rootfs"));
@@ -1792,11 +1857,18 @@ mod tests {
             &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..],
         ]
         .concat();
-        let poisoned = receive(&elsewhere_paths, &mut &forged[..], &tpl.meta.id).unwrap();
+        let poisoned = receive(&elsewhere_paths, &mut &forged[..], &tpl.meta.id, None, |_| Ok(())).unwrap();
         assert!(poisoned.check_vouched(Some(&tpl.digests().unwrap()), "a checkpoint of it").is_err());
+        // Vouched for by other digests (a checkpoint's): refused before it is published.
+        let (_other, vouching) = elsewhere(&f);
+        let mut other = tpl.digests().unwrap();
+        other.insert("mem".into(), "0".repeat(64));
+        let e = receive(&vouching, &mut &buf[..], &tpl.meta.id, Some(&other), |_| Ok(())).err().unwrap().to_string();
+        assert!(e.contains("do not match the SHA-256 digests") && nothing_in(&vouching), "{e}");
+        assert!(receive(&vouching, &mut &buf[..], &tpl.meta.id, Some(&tpl.digests().unwrap()), |_| Ok(())).is_ok());
         // An identical one arriving again keeps the first.
         drop(got);
-        receive(&paths, &mut &buf[..], &tpl.meta.id).unwrap();
+        receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(())).unwrap();
         assert_eq!(generations(&paths.templates).unwrap(), [tpl.meta.id.clone()]);
     }
 
@@ -1808,17 +1880,17 @@ mod tests {
         let (_dir, paths) = elsewhere(&f);
         let mut corrupt = buf.clone();
         *corrupt.last_mut().unwrap() ^= 1;
-        let e = receive(&paths, &mut &corrupt[..], id).err().unwrap().to_string();
+        let e = receive(&paths, &mut &corrupt[..], id, None, |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("its mem does not hash"), "{e}");
-        assert!(receive(&paths, &mut &buf[..buf.len() - 10], id).is_err());
+        assert!(receive(&paths, &mut &buf[..buf.len() - 10], id, None, |_| Ok(())).is_err());
         // A root filesystem path that is empty or relative, or memory past the cap, is refused before anything is read.
         assert!(!names_by_path(b"anything", Path::new("")));
         for (rootfs, max_mib) in [("", tpl.meta.max_mib), ("rootfs", tpl.meta.max_mib), ("/r", MAX_MEM_MIB + 1)] {
             let meta = serde_json::to_vec(&Meta { rootfs: rootfs.into(), max_mib, ..tpl.meta.clone() }).unwrap();
             let forged = [&(meta.len() as u64).to_le_bytes()[..], &meta, &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..]].concat();
-            assert!(receive(&paths, &mut &forged[..], id).err().unwrap().to_string().contains("past the limits"));
+            assert!(receive(&paths, &mut &forged[..], id, None, |_| Ok(())).err().unwrap().to_string().contains("past the limits"));
         }
-        let e = receive(&paths, &mut &buf[..], "abcd").err().unwrap().to_string();
+        let e = receive(&paths, &mut &buf[..], "abcd", None, |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("not that template's"), "{e}");
         assert!(nothing_in(&paths));
         // Extents past the file, and more data than the cap.
@@ -1833,7 +1905,7 @@ mod tests {
         std::fs::write(&paths.firecracker, "another build").unwrap();
         use sha2::Digest;
         std::fs::write(paths.templates.join("firecracker.sha256"), format!("{:x}  firecracker\n", sha2::Sha256::digest("another build"))).unwrap();
-        let e = receive(&paths, &mut &buf[..], id).err().unwrap().to_string();
+        let e = receive(&paths, &mut &buf[..], id, None, |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("another Firecracker"), "{e}");
     }
 
@@ -1843,13 +1915,13 @@ mod tests {
         let rootfs = f.meta.rootfs.to_string_lossy().into_owned();
         let (tpl, buf) = sent(&mut f, &rootfs);
         let (_dir, paths) = elsewhere(&f);
-        let got = receive(&paths, &mut &buf[..], &tpl.meta.id).unwrap();
+        let got = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(())).unwrap();
         assert_eq!(got.meta.rootfs, f.meta.rootfs, "the file its snapshot names, already here");
         assert!(!got.fixed.join("rootfs").exists());
         drop(got);
         let (_dir, paths) = elsewhere(&f);
         std::fs::write(&f.meta.rootfs, "another build").unwrap();
-        let e = receive(&paths, &mut &buf[..], &tpl.meta.id).err().unwrap().to_string();
+        let e = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("names its root filesystem by its path"), "{e}");
         assert!(nothing_in(&paths));
     }

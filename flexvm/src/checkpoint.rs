@@ -14,6 +14,7 @@ macro_rules! ensure {
     ($ok:expr, $($why:tt)*) => { if !$ok { crate::bail!($($why)*) } };
 }
 mod chain;
+pub mod export;
 mod format;
 mod staging;
 pub mod store;
