@@ -613,7 +613,15 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // A stop while loading (relief, `rmi`) ends it between phases: what it made is torn down
     // first, and its refill is told it stopped, which is no failed start (no `.failed`).
     let stopping = || p.stop_requested().is_some();
-    let loaded = if stopping() { Err(Error::from(STOPPED)) } else { p.spawner.take(None).and_then(|idle| load(idle, tpl.clone(), stopping)) };
+    let load_fresh = || if stopping() { Err(Error::from(STOPPED)) } else { p.spawner.take(None).and_then(|idle| load(idle, tpl.clone(), stopping)) };
+    let loaded = match load_fresh() {
+        // Its memory was read while being mapped: a fresh Firecracker maps it again.
+        Err(e) if e.to_string().starts_with(crate::uffd::FOREIGN) => {
+            crate::log!("standby {template}: {e}; once more on a fresh firecracker");
+            load_fresh()
+        }
+        r => r,
+    };
     let ready = match loaded {
         Ok(ready) => ready,
         Err(e) => match p.stop_requested() {
@@ -1044,6 +1052,8 @@ fn load(idle: Firecracker, template: Arc<Template>, stopping: impl Fn() -> bool)
     p.pager.learn_load_set();
     let fc = p.firecracker();
     fc.load_snapshot(&p.template().vmstate(), &p.template(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
+    // Before the guest runs: memory mapped behind the pager's back would read as zeroes (#949).
+    p.pager.check_foreign()?;
     check_stop()?;
     // Only an API pause stops the devices writing guest memory.
     fc.pause(API_TIMEOUT)?;

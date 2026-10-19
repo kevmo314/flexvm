@@ -1325,6 +1325,8 @@ impl Prepared {
             let neighbour = self.neighbour.then(|| std::thread::spawn(move || crate::net::neighbour(ip, &tap)));
             // Before `left` is read: the deadline covers it too.
             let loaded = fc.join_cgroup().and_then(|()| fc.load_snapshot(&path, &self.template, &fc.tap, Some(clock_realtime), left(API_TIMEOUT)));
+            // Before the guest runs: memory mapped behind the pager's back would read as zeroes (#949).
+            let loaded = loaded.and_then(|r| self.pager.check_foreign().map(|()| r));
             if matches!(vmstate, Snapshot::Bytes(_)) {
                 let _ = std::fs::remove_file(&path);
             }
@@ -1354,6 +1356,8 @@ impl Prepared {
                 let idle = self.fc.as_ref().unwrap();
                 let retry = match &load_failed {
                     Some(why) if why.contains(NO_REALTIME) && clock_realtime => Some(false),
+                    // Its memory was read while being mapped: a fresh Firecracker maps it again.
+                    Some(why) if why.starts_with(crate::uffd::FOREIGN) => Some(clock_realtime),
                     // Died on its own, with no page given up.
                     Some(_) if !self.pager.lost_pages() && !idle.alive() => Some(clock_realtime),
                     _ => None,
