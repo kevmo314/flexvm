@@ -8,8 +8,9 @@
 //! SIGPIPE). Closing a session whose shell has not exited kills its process group (not processes that
 //! left it with setsid or setpgid: that would take a cgroup per session); closing an unknown one cancels it, so
 //! a start still in flight never runs. Sessions whose client is gone are closed in time, running ones too.
-//! At most `MAX_LIVE` sessions are running or still sending their output; sessions whose exit was sent
-//! but not acknowledged (a slow reader acknowledges late) do not count towards that, but towards
+//! At most `MAX_LIVE` non-detached sessions are running or still sending their output; detached commands
+//! have `MAX_DETACHED` slots of their own, reserved when an interactive session starts. Sessions whose
+//! exit was sent but not acknowledged (a slow reader acknowledges late) do not count towards that, but towards
 //! `MAX_UNACKNOWLEDGED` of their own, past which the oldest is closed. Closed ones leave a tombstone so a
 //! delayed `SESSION` retry cannot rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY`
 //! from a shared pool; an unacknowledged session's output is all from the pool (the oldest such are
@@ -38,6 +39,7 @@ const MAX_CHUNKS: usize = 4096;
 /// Consecutive output of one kind is coalesced into chunks of up to this size.
 const BLOCK: usize = 16 * 1024;
 const MAX_LIVE: usize = 64;
+const MAX_DETACHED: usize = 64;
 const MAX_UNACKNOWLEDGED: usize = 192;
 const MAX_TOMBSTONES: usize = 4096;
 /// Ids closed before their start arrived; the oldest go first.
@@ -221,9 +223,26 @@ impl Table {
         self.live.values().filter(|e| e.output.0.lock().unwrap().delivered.is_some()).count()
     }
 
-    /// Sessions running or still sending their output.
+    /// Sessions running or still sending their output, excluding detached commands.
     fn running(&self) -> usize {
-        self.live.len() - self.unacknowledged_count()
+        self.live
+            .values()
+            .filter(|e| {
+                let o = e.output.0.lock().unwrap();
+                !o.detached && o.delivered.is_none()
+            })
+            .count()
+    }
+
+    /// Interactive sessions reserve a detached slot so detaching can always leave their command running.
+    fn detachable(&self) -> usize {
+        self.live
+            .values()
+            .filter(|e| {
+                let o = e.output.0.lock().unwrap();
+                (o.detached || o.input.is_some()) && o.delivered.is_none()
+            })
+            .count()
     }
 
     /// The exit went out on attachment `me`: unless a newer attachment has taken over, the session
@@ -260,13 +279,21 @@ impl Table {
         }
     }
 
-    fn admit(&mut self, statuses: &Statuses) -> io::Result<()> {
+    fn admit(&mut self, statuses: &Statuses, detached: bool, interactive: bool) -> io::Result<()> {
         // Detached exits also retain their start acknowledgement for a retry, within the same bound.
         self.trim_unacknowledged();
-        if self.running() >= MAX_LIVE {
+        if !detached && self.running() >= MAX_LIVE {
             self.reclaim(statuses);
             if self.running() >= MAX_LIVE {
                 return Err(io::Error::other(format!("too many sessions: {MAX_LIVE} commands are running or awaiting their client")));
+            }
+        }
+        if (detached || interactive) && self.detachable() >= MAX_DETACHED {
+            self.reclaim(statuses);
+            if self.detachable() >= MAX_DETACHED {
+                return Err(io::Error::other(format!(
+                    "too many detached or interactive sessions: {MAX_DETACHED} commands are running or awaiting their client"
+                )));
             }
         }
         if self.closed.len() >= MAX_TOMBSTONES {
@@ -379,7 +406,7 @@ impl Output {
     /// Whether output must wait for the (just) attached client; half the ring is slack for bytes in flight.
     fn must_wait(&self) -> bool {
         let unsent = self.end.saturating_sub(self.sent) >= self.capacity() as u64 / 2 || self.chunks_from(self.sent) >= MAX_CHUNKS / 2;
-        unsent && (self.attached.is_some() || self.gone.is_some_and(|t| awake().saturating_sub(t) < GRACE))
+        !self.detached && unsent && (self.attached.is_some() || self.gone.is_some_and(|t| awake().saturating_sub(t) < GRACE))
     }
 
     /// Appends, then drops the oldest to fit `capacity` and `MAX_CHUNKS`. Same-kind output joins the
@@ -585,10 +612,10 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 }
                 return Ok(Some((id, 0, attach(&entry.output, 0, conn))));
             }
-            table.admit(statuses)?;
             let (spec, mut cmd, exec) = prepared?;
             let detached = spec.as_ref().is_some_and(|s| s.detach);
             let (stdin, tty) = spec.as_ref().map_or((false, false), |s| (s.stdin, s.tty));
+            table.admit(statuses, detached, stdin || tty)?;
             let pty = tty.then(|| crate::input::openpty(spec.as_ref().and_then(|s| s.size))).transpose()?;
             // Start the pump first: if no thread can be had, nothing has run yet.
             let (tx, rx) = mpsc::sync_channel::<(Vec<(File, u8)>, OwnedFd, u64)>(1);
@@ -739,7 +766,7 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
         ring = output.1.wait_timeout(ring, Duration::from_secs(1)).unwrap().0;
     }
     let waited = start.elapsed();
-    if !ring.closed {
+    if !ring.closed && !ring.detached {
         let capacity = ring.capacity();
         ring.push(kind, data, capacity);
     }
@@ -968,20 +995,84 @@ mod tests {
     }
 
     #[test]
-    fn detaching_releases_the_ring_reservation() {
+    fn detaching_unblocks_output_without_retaining_data_or_reservations() {
         use crate::proto::IN_DETACH;
         let mut table = Table::default();
         let (_r, w) = UnixStream::pair().unwrap();
         let input = Arc::new(Stdin::new(File::from(OwnedFd::from(w)), None).unwrap());
         let output = live(&mut table, "s", Output { input: Some(input.clone()), ..Default::default() });
         let me = attach(&output, 0, None).1;
-        output.0.lock().unwrap().reservation.grow(CAPACITY);
+        {
+            let mut ring = output.0.lock().unwrap();
+            ring.push(FRAME_STDOUT, &vec![0; CAPACITY / 2], CAPACITY);
+        }
+        let pumped = output.clone();
+        let writer = thread::spawn(move || deliver(&pumped, FRAME_STDOUT, &vec![0; BLOCK]));
+        // The writer releases the ring only after it has entered the wait.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while output.0.lock().unwrap().reservation.bytes == 0 && !writer.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
         assert!(table.pool.load(Ordering::Acquire) < POOL);
         let (conn, _peer) = UnixStream::pair().unwrap();
         let detach = frame(IN_DETACH, &[]);
         take_input(&mut (&detach[..]).chain(File::from(OwnedFd::from(conn))), &output, &input, me);
-        assert!(output.0.lock().unwrap().detached);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !writer.is_finished() {
+            assert!(Instant::now() < deadline, "a detached writer kept waiting for its client");
+            thread::sleep(Duration::from_millis(1));
+        }
+        writer.join().unwrap();
+        let ring = output.0.lock().unwrap();
+        assert!(ring.detached && !ring.must_wait());
+        assert!(ring.chunks.is_empty());
+        assert_eq!(ring.start, ring.end);
         assert_eq!(table.pool.load(Ordering::Acquire), POOL, "a detached session holds none of the pool");
+    }
+
+    #[test]
+    fn detached_sessions_have_their_own_limit_and_keep_normal_exec_available() {
+        let (mut table, statuses) = (Table::default(), statuses());
+        let outputs: Vec<_> = (0..MAX_DETACHED)
+            .map(|i| {
+                table.admit(&statuses, true, false).unwrap();
+                live(&mut table, &format!("detached{i}"), Output { detached: true, ..Default::default() })
+            })
+            .collect();
+        assert_eq!(table.running(), 0);
+        assert!(table.admit(&statuses, true, false).unwrap_err().to_string().contains("too many detached or interactive sessions"));
+        assert!(table.admit(&statuses, false, true).is_err());
+        for i in 0..MAX_LIVE {
+            table.admit(&statuses, false, false).unwrap();
+            live(&mut table, &format!("attached{i}"), Output::default());
+        }
+        assert!(table.admit(&statuses, false, false).is_err());
+        let mut ring = outputs[0].0.lock().unwrap();
+        ring.exit = Some(0);
+        ring.delivered = Some(0);
+        drop(ring);
+        table.admit(&statuses, true, false).unwrap();
+        assert!(table.admit(&statuses, false, false).is_err());
+    }
+
+    #[test]
+    fn interactive_sessions_reserve_their_detached_slot() {
+        let (mut table, statuses) = (Table::default(), statuses());
+        let input = Arc::new(Stdin::new(File::options().write(true).open("/dev/null").unwrap(), None).unwrap());
+        let outputs: Vec<_> = (0..MAX_DETACHED)
+            .map(|i| {
+                table.admit(&statuses, false, true).unwrap();
+                live(&mut table, &i.to_string(), Output { input: Some(input.clone()), ..Default::default() })
+            })
+            .collect();
+        for output in outputs {
+            output.0.lock().unwrap().detached = true;
+        }
+        assert_eq!(table.detachable(), MAX_DETACHED);
+        assert!(table.admit(&statuses, false, true).is_err());
+        assert!(table.admit(&statuses, true, false).is_err());
+        table.admit(&statuses, false, false).unwrap();
     }
 
     #[test]
@@ -1039,7 +1130,7 @@ mod tests {
         let (sessions, statuses) = (Sessions::default(), statuses());
         for i in 0..MAX_LIVE * 3 {
             let mut table = sessions.lock().unwrap();
-            table.admit(&statuses).unwrap();
+            table.admit(&statuses, false, false).unwrap();
             finished(&mut table, &i.to_string(), None);
             drop(table);
             assert!(request(&sessions, &statuses, &format!("CLOSE {i}"), b"").ends_with(b"closed"));
@@ -1068,14 +1159,14 @@ mod tests {
         // Clients left at awake time ABANDONED, but 3's and 4's at 0; it is now ABANDONED.
         let outputs: Vec<_> = (0..MAX_LIVE)
             .map(|i| {
-                table.admit(&st).unwrap();
+                table.admit(&st, false, false).unwrap();
                 finished(&mut table, &i.to_string(), Some(if i == 3 || i == 4 { Duration::ZERO } else { ABANDONED }))
             })
             .collect();
-        assert!(table.admit(&st).unwrap_err().to_string().contains("too many sessions"));
+        assert!(table.admit(&st, false, false).unwrap_err().to_string().contains("too many sessions"));
         outputs[4].0.lock().unwrap().attached = Some(Attachment { id: 1, conn: None });
         table.reclaim_after(&st, ABANDONED_RUNNING, ABANDONED);
-        table.admit(&st).unwrap();
+        table.admit(&st, false, false).unwrap();
         assert!(!table.live.contains_key("3") && table.closed.contains_key("3"));
         assert!(outputs[3].0.lock().unwrap().closed);
         assert!(table.live.contains_key("4"), "an attached reader keeps its session");
@@ -1223,16 +1314,16 @@ mod tests {
         }
         // A 20-minute pause adds only one short tick, leaving the tombstones their grace.
         set_clock(old + tick(Duration::from_secs(1200)));
-        assert!(table.admit(&statuses).is_err());
+        assert!(table.admit(&statuses, false, false).is_err());
         set_clock(old + GRACE - Duration::from_secs(1) - Duration::from_millis(1));
-        assert!(table.admit(&statuses).is_err());
+        assert!(table.admit(&statuses, false, false).is_err());
         set_clock(old + GRACE - Duration::from_secs(1));
-        table.admit(&statuses).unwrap();
+        table.admit(&statuses, false, false).unwrap();
         assert_eq!(table.closed.len(), MAX_TOMBSTONES - 1);
         assert!(!table.closed.contains_key("7"), "the oldest tombstone goes first");
         table.closed.insert("new".into(), awake());
         table.closed.values_mut().for_each(|at| *at = awake());
-        assert!(table.admit(&statuses).unwrap_err().to_string().contains("finished in the last"));
+        assert!(table.admit(&statuses, false, false).unwrap_err().to_string().contains("finished in the last"));
         table.closed.values_mut().for_each(|at| *at = old);
         let sessions = Arc::new(Mutex::new(table));
         set_clock(old + GRACE + tick(Duration::from_secs(1200)));
@@ -1262,7 +1353,7 @@ mod tests {
         let mut table = Table::default();
         let outputs: Vec<_> = (0..MAX_LIVE)
             .map(|i| {
-                table.admit(&statuses()).unwrap();
+                table.admit(&statuses(), false, false).unwrap();
                 let output = live(&mut table, &i.to_string(), Output::default());
                 for _ in 0..2 * CAPACITY / BLOCK {
                     deliver(&output, FRAME_STDOUT, &[b'x'; BLOCK]);
@@ -1488,7 +1579,7 @@ mod tests {
         }
         let mut table = sessions.lock().unwrap();
         assert_eq!((table.cancelled.len(), table.closed.len()), (MAX_CANCELLED, 0));
-        table.admit(&statuses).unwrap();
+        table.admit(&statuses, false, false).unwrap();
         drop(table);
         let last = format!("c{}", MAX_CANCELLED * 2 - 1);
         assert!(request(&sessions, &statuses, &format!("SESSION {last} 4"), b"true").ends_with(b"session closed"));
@@ -1667,7 +1758,7 @@ mod tests {
         let clients: Vec<_> = (0..n)
             .map(|i| {
                 let mut table = sessions.lock().unwrap();
-                table.admit(&statuses).unwrap_or_else(|e| panic!("session {i} refused: {e}"));
+                table.admit(&statuses, false, false).unwrap_or_else(|e| panic!("session {i} refused: {e}"));
                 finished(&mut table, &i.to_string(), None);
                 drop(table);
                 attach_to_exit(&sessions, &statuses, &i.to_string())
@@ -1690,7 +1781,7 @@ mod tests {
         for i in 0..MAX_LIVE {
             live(&mut table, &format!("running{i}"), Output::default());
         }
-        assert!(table.admit(&statuses).unwrap_err().to_string().contains("too many sessions"));
+        assert!(table.admit(&statuses, false, false).unwrap_err().to_string().contains("too many sessions"));
     }
 
     #[test]
