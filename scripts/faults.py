@@ -6105,8 +6105,9 @@ def plug_race():
             for h in (src, dst):
                 print(f"plug race {i}: {h}'s log of it:\n{log(h, n)[-6000:]}")
             return
-        hp = lambda: (vms(dst)[n]["requested_mib"], vms(dst)[n]["plugged_mib"])
-        settled = wait_for(lambda: hp()[0] == hp()[1] and (delta > 8192 or hp()[1] == want), 15)
+        # None while its status does not answer (`vms` leaves its fields out then).
+        hp = lambda: (lambda v: (v.get("requested_mib"), v.get("plugged_mib")))(vms(dst).get(n, {}))
+        settled = wait_for(lambda: (lambda r, p: r is not None and r == p and (delta > 8192 or p == want))(*hp()), 15)
         check(f"plug race {i}: hot-plug settled on target", settled, (want, hp()))
         check(f"plug race {i}: md5 intact", md5(dst, n) == m)
         code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
