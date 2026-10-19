@@ -162,7 +162,7 @@ with the VM through `stop`/`start`, checkpoints and migrations; `run
 
 ```sh
 flexvm ps                       # running VMs; -a: stopped ones too; --json: all of it
-NAME                     IP              IMAGE            STATE             PID  CPUS  RSS MiB  MAX MiB STARVED
+NAME                     IP              IMAGE            STATE             PID  CPUS  RSS MiB  MAX MiB STARVED PORTS
 web                      10.200.0.1      nginx:1.27       running         41522     2       27     8192
 flexvm ps -q                    # names only
 flexvm ps --filter name=web --filter status=paused   # both; a key again: either value
@@ -188,8 +188,10 @@ fails `inspect` once the others are printed.
 |---|---|
 | `running` | its vCPUs run |
 | `paused` | stopped by `flexvm pause`, SIGTSTP or Ctrl-Z (or held by `run --checkpoint --paused`); `flexvm unpause` resumes it |
-| `checkpointing` | paused for a checkpoint's or a suspend's copy |
+| `checkpointing` | paused to save a checkpoint; without `--stop`, returns to `running` for the page copy |
+| `suspending` | suspending to disk (`flexvm stop`, SIGTERM); the process exits once the copy is complete |
 | `source` | migrating away: paused here until the target has its memory |
+| `reconciling` | migration outcome unknown: paused here while asking the target whether it committed |
 | `suspended` | stopped: on disk, no process (`flexvm stop`, SIGTERM); `flexvm start` brings it back |
 | `quarantined` | a stopped VM that cannot be started (its address generation is unknown); `run --checkpoint` its directory with a new name and `--ip auto`, or `flexvm rm` it |
 | `exited` | its app (or CMD) exited in the background, with the status `ps` shows; `flexvm start` runs it again, `flexvm rm` removes it |
@@ -377,7 +379,7 @@ Exit statuses of `flexvm run` and `flexvm start -a`: with CMD, CMD's own;
 without, its app's;
 128 + the signal that ended it (130: destroyed by SIGINT, Ctrl-C or
 `flexvm kill`; 143: stopped, by `flexvm stop` or SIGTERM); 0 when it
-migrated away or `checkpoint --stop` stopped it. flexvm's own failures use
+migrated away or `checkpoint create VM --stop` stopped it. flexvm's own failures use
 the range shells and container runtimes keep for themselves: 125 when it
 could not start the VM (or gave it up; also for `run -d` and `start`), 124
 when the VM died under it, even before its start was done (`flexvm ps -a` then shows it `failed`, and `ps -a

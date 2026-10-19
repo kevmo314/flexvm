@@ -5,7 +5,7 @@ sudo flexvm pull nginx:1.27                                     # any registry: 
 sudo flexvm pull ./app.tar --tag app --env PORT=8080            # `docker save` output or an OCI archive
 sudo flexvm pull ./oci-layout --tag py --cmd "python3 -m http.server 8000"
 sudo flexvm pull nginx:1.27 --tag web-warm --warm               # snapshot nginx running and ready
-flexvm run --name web1 nginx:1.27
+flexvm run -d --name web1 nginx:1.27
 curl http://<ip>/
 ```
 
@@ -19,10 +19,12 @@ the image's command), `--env K=V` (repeatable), `--workdir`,
 `--user name|uid[:group|gid]`. An image left with no entrypoint and no
 command has no app: its VMs idle (`--warm` refuses it).
 
-Images are untrusted input processed as root. Every document and blob is
-checked against its digest (layers while unpacking into private staging,
-and their uncompressed contents against the config's `diff_ids`, all before
-publishing the root filesystem), and builds are bounded: `--max-download-mib`
+Images are untrusted input processed as root. Documents and blobs fetched by
+digest are checked against it; a manifest fetched by tag has no expected
+digest to check, so its digest is computed from the response. Layers are
+checked while unpacking into private staging, and their uncompressed contents
+against the config's `diff_ids`, all before publishing the root filesystem.
+Builds are bounded: `--max-download-mib`
 (8192, all layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
 `--max-entries` (1,000,000, applied both to tar entries read and to files and
 directories created, implicit parents included), plus 4 MiB per manifest or config and 1 MiB per
@@ -36,12 +38,14 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
 - **Pull.** Native registry v2 client (no docker or skopeo): anonymous bearer
   tokens, or credentials saved by `flexvm login` in root-owned, mode 0600
   `STATE/auth.json`, falling back to `$DOCKER_CONFIG`, `~/.docker/config.json`
-  or, under sudo, the invoking user's. Indexes resolve to linux/amd64. Blobs
+  or, under sudo, the invoking user's. Credential helpers and `identitytoken`
+  are not supported. Indexes resolve to linux/amd64. Blobs
   are streamed to `STATE/images/blobs/sha256/` and checked against their
   digests; gzip, zstd and uncompressed layers are supported. Archives are read
   in place (layers are located inside the tarball, not extracted). Registry
-  credentials go only over HTTPS to the registry itself or its token service
-  (auth.docker.io for Docker Hub); redirects to blob storage carry none.
+  credentials go only over HTTPS to the registry itself or a token service on
+  the same host (including its port); Docker Hub also allows auth.docker.io.
+  Other token services get anonymous requests; redirects to blob storage carry none.
 - **Root filesystem.** Layers are applied in order as root, with whiteouts and
   opaque directories, ownership, modes, xattrs, device nodes, symlinks and
   hard links. A file capability or POSIX ACL that cannot be set fails the pull;
@@ -63,9 +67,9 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   the image's own `/etc/passwd` and `/etc/group`), an `/etc/hosts`, and an
   empty `/etc/resolv.conf` if the image has none (host.json's `dns` fills
   it at `run`). `mkfs.ext4 -d` writes the read-only image. Built filesystems
-  are cached in `STATE/images/rootfs/` by image config digest, flexvm-init
-  and overrides, and templates attach the cached file in place, so templates of
-  one image share one copy in the page cache (it is never rewritten; `rmi`
+  are cached in `STATE/images/rootfs/` by image config digest, layer `diff_ids`,
+  flexvm-init and overrides, and templates attach the cached file in place, so
+  templates of one image share one copy in the page cache (it is never rewritten; `rmi`
   removes it once no template uses it, and deleting it by hand breaks those
   templates). Builds of the same cache key are serialized with
   a lock; entries are published with fsync and no-replace rename, with their

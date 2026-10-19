@@ -46,7 +46,7 @@ claim, so they survive stop/start, checkpoints and migration;
 `run --checkpoint DIR` with either replaces the manifest's.
 
 Exit status: with a command (`run IMAGE CMD...`), CMD's; else 0 when it migrated away or was
-stopped by `checkpoint --stop`; 128 + the signal when one ended it (130:
+stopped by `checkpoint create VM --stop`; 128 + the signal when one ended it (130:
 SIGINT destroyed it, 143: SIGTERM suspended it); 125 when flexvm failed (it
 could not start the VM, or gave it up); 124 when it died under the process
 (its Firecracker exited, watched through a pidfd, or its memory was lost):
@@ -82,8 +82,9 @@ the suspend holds its session, recording in the checkpoint (`CMD`) the
 command, its guest session, how much of its output was written out and its
 exit status if it had one; `flexvm start -a` reattaches it from there (or
 takes that status) and exits with its status.
-Its control socket serves `exec`, `checkpoint` and `migrate`, plus `claim` (a
-standby), `pages` (passed on by the listener) and `debug` (tests).
+Its control socket serves `exec`, `checkpoint`, `migrate`, `resume`, `signal`,
+`rename`, `attach` and `stdin`, plus `claim` (a standby), `pages` (passed on by
+the listener) and `debug` (tests).
 
 ### Signals
 
@@ -156,6 +157,8 @@ STATE (default /var/lib/flexvm, on disk)
                          base rootfs (scripts/fetch.sh, for scripts/test-image.py)
   templates/             pulled images' templates: NAME -> .gen/ID (see internals.md; NAME: README.md#images)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
+  checkpoints/           stored checkpoints: ID/ and names/NAME -> ../ID
+  auth.json              saved registry credentials (`flexvm login`), root-owned, mode 0600
   host.json              host config, edited by hand (listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
   run.json               canonical run path, bound on first open under `.locks/open`'s flock; fsynced
   .locks/                root's locks (0700): open (held while a root `Host::open` binds or repairs the root),
@@ -174,12 +177,15 @@ STATE (default /var/lib/flexvm, on disk)
   standby/TEMPLATE       how many standby VMs to keep for a template
   migs/ID                incoming migration records (fencing), JSON, fsynced
   owed/ID                migrations away whose source was killed before it knew the outcome: target, address, generation (`Host::settle_owed`)
+  withdrawals/           per IP: withdrawn generation and peers still to notify, durably recorded
   evict.last             its mtime: when an eviction last started (5 s apart)
   staging/               where image layers unpack (`pull`); its ancestry must be root-owned
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{json,sock,log}        registry entry, control socket, log of -d/standby VMs (0600)
   vms/.locks/NAME.lock            liveness lock; NAME.log, a log's writers' lock; .incoming-*.log, an arrival's lock
   vms/NAME.{failed,moved}         why a VM died (until `flexvm rm`); where it migrated to (an hour)
+  vms/NAME.exit                   the process's exit status and identity (`flexvm wait`)
+  vms/NAME.exited                 a background VM's app exit status and run config (until `start` or `rm`)
   vms/NAME.lost                   a VM lost with the host, recorded before its address is withdrawn (until `flexvm rm`)
   .boot                  the boot id once this boot's recovery completed (`gc::after_boot`)
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
@@ -189,12 +195,18 @@ RUN (default /run/flexvm, tmpfs)
                          gone (or of another boot); a bare PID (older ones) once no such pid runs or older than the boot
   claims/IP              the boot id, written before an address record is written without fsync (a fresh start's
                          claim), removed once a durable write replaces it
+  live/IP                a live process's address generation and revision, published before its durable write
+  peers.json             peer names and their last-known addresses, cached by the listener
+  compat.json            cached CPU/KVM compatibility probe, keyed by boot and build inputs
   .gens.next             the next generation, with the boot id and the synced mark it is under; trusted only while
                          addrs/.gens holds that mark, else the next generation reserves and syncs a new one
   .locks/                root's locks (0700): gc (one sweep at a time), logs (logs are opened holding it
                          shared, swept holding it exclusively), owed, retire, withdrawals
   .locks/holds/ID-MIB    memory admitted to a live process, flocked by it (`.ID` while being made)
+  .locks/release-BOOT    numbered request to release kept checkpoint memory
+  .locks/released-BOOT/  per process identity: the release request it answered
   grants-BOOTID          recent grants not yet held, counted against the reserve
+  room-ledger-BOOT       checkpoint memory taken lately, counted against the reserve
   evict.active           present while the host is under its eviction mark
   evict.backoff          refused VM and peer pairs and when to try them again
   standby/H/             template T's standby files, H the 16-hex hash of T's name (independent of T's length)
@@ -387,7 +399,7 @@ removes that debris (that resume never ran its VM).
 **Admission** (`reserve_mib`): every start (run, restore, resume, standby
 claim, arrival: what the VM brings or pages in, and a step), growth and
 incoming migrations are admitted under the host lock against MemAvailable
-minus the reserve and the grants of the last 10 s (`RUN/grants`); an
+minus the reserve and the grants of the last 10 s (`RUN/grants-BOOTID`); an
 arrival's or checkpoint restore's grant (including a suspended resume) is
 held past that until all its memory is here, or it ends, as it comes in only
 as the pull goes: made with the grant in one critical
@@ -712,7 +724,7 @@ committed, never ends the process,
    takes its loan back), the arrival is unsettled. Settling happens in one
    place (`Proc::settle_arrival`), under `op`, so it never races the VM's
    end. Every operation that changes who owns the VM (suspend, migrating
-   on, `checkpoint --stop`) settles first, waiting a bounded time, and is
+   on, `checkpoint create VM --stop`) settles first, waiting a bounded time, and is
    refused as "still arriving" otherwise (or as failed, once the arrival's
    pager has given up on its source); later operations see a settled VM.
    A migration's rollback removes only a loan that migration made. A

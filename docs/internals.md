@@ -52,7 +52,7 @@ not wait on the host:
   Firecracker, not from the guest; what it says is free only steers growth.
   Each step grows by at most a quarter of the guest. All growth, from guest
   requests and ticks alike, is admitted against the reserve (`reserve_mib`) under the host
-  lock, with the last 10 s of grants (`RUN/grants`, every VM process's) counted as used (plugged memory shows up
+  lock, with the last 10 s of grants (`RUN/grants-BOOTID`, every VM process's) counted as used (plugged memory shows up
   in MemAvailable only once touched). A refused guest is told `full` and
   marked starved. Before it refuses, every VM process is asked to release
   the memory it keeps for its next checkpoint: the request is a number in
@@ -337,19 +337,19 @@ its resume 4 ms: vCPU threads, state parsing).
 
 ```
 starting -> running <-> paused                     (pause / unpause)
-running | paused -> checkpointing -> running | paused | gone   (checkpoint [--stop])
-running | paused -> checkpointing -> suspended -> running      (stop / start)
+running | paused -> checkpointing -> running | paused | gone   (checkpoint create VM [--stop])
+running | paused -> suspending -> suspended -> running         (stop / start)
 running | paused -> source (migrating) -> gone, or back if the target aborted
 any -> failed (memory lost) -> gone                (rm)
 ```
 
-Every lifecycle operation (and each controller resize) first reserves the
-VM's name, so operations on one VM never interleave; the controller skips a
+Every lifecycle operation (and each controller resize) holds the VM process's
+`op` mutex, so operations on one VM never interleave; the controller skips a
 VM that is busy, paused or suspended.
 
 - **pause / unpause** stop and restart the vCPUs; memory and devices stay.
   Both take under a millisecond (2 vCPU) to 1.5 ms (24 vCPU).
-- **checkpoint create NAME [CKPT]** first waits for any VM still pulling memory (from a
+- **checkpoint create VM [NAME]** first waits for any VM still pulling memory (from a
   migration source or its checkpoint), and for virtio-mem to settle (see
   below). It then pauses the VM, quiesces its devices and pager like a
   migration source does, saves the vCPU/device state and writes every page
@@ -654,7 +654,7 @@ through, so the checkpoint is exactly the memory at the pause.
 - **The tap's queue is taken before the pause.** Frames already routed to
   the tap wait in tun's ring until the guest posts rx buffers, and paused
   vCPUs post none, so whatever is queued there at the pause dies with the
-  tap when the VM leaves (a migration, `checkpoint --stop`, a suspend),
+  tap when the VM leaves (a migration, `checkpoint create VM --stop`, a suspend),
   uncounted. A guest slow to refill under load leaves hundreds (#136). Once
   the address is held nothing new reaches the tap, so the VM process waits,
   up to 500 ms, for the running guest to empty the ring before pausing it.
@@ -1104,12 +1104,13 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   flexvm set it to the gateway MAC, which leaves the guest's pinned
   gateway entry pointing nowhere. The VM process puts the MAC back (one
   `RTM_SETLINK`) whenever it hands a tap to a VM. To stop udev touching the
-  taps at all, install a link file:
+  taps at all, match their state directory's prefix (`f` and five base-36
+  digits, followed by the process and tap suffix) in a link file:
 
   ```ini
   # /etc/systemd/network/10-flexvm-taps.link
   [Match]
-  OriginalName=fv*
+  OriginalName=f[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]*
 
   [Link]
   MACAddressPolicy=none
