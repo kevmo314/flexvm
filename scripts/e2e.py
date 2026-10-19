@@ -78,7 +78,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
 # never gets its pages, gated deterministically).
 LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_listen", "peer_by_name", "peer_moved",
-                   "peer_unresolvable", "late_withdrawal", "resume_listener_restart", "arrival_cap_restart", "reboot"}
+                   "peer_unresolvable", "late_withdrawal", "resume_listener_restart", "arrival_cap_restart", "reboot", "connect_after_pull"}
 RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd_err fetch_tail_enomem fetch_enomem_stuck cow_wp_race"
 # GiB-scale guests (pages_dead, source_killed_basic, which runs source_killed, pull_died, kill_source,
 # kill_refused_checkpoint, quiet_source, checkpoint_crash, suspend_disk_freed), long device and
@@ -2346,7 +2346,7 @@ COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "f
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
         "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
         "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "checkpoint_store": 12, "checkpoint_save_load": 20, "checkpoint_load_other_build": 15, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
-        "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
+        "faults/page_refusals": 14, "faults/connect_after_pull": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
         "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,
         "faults/standby_admission": 11, "faults/wildcard_listen": 11, "faults/arrival_abort_route": 10,
