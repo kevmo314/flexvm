@@ -811,6 +811,8 @@ mod tests {
             let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
             let out = Mutex::new(vec![0u8; n * PAGE_SIZE]);
             let rescued = AtomicUsize::new(0);
+            // Save one unit before rescuing, then wait for a rescue before reading on: both paths must run.
+            crate::checkpoint::GuestPages::read(&pages, 0, &mut out.lock().unwrap()[..32 * PAGE_SIZE]).unwrap();
             thread::scope(|s| {
                 s.spawn(|| {
                     // Blocks of all sizes, all over, from the end down: they meet the writer's units at every offset.
@@ -826,7 +828,12 @@ mod tests {
                         rescued.fetch_add(rescue_block(&cow, first, (first + size).min(n), map, guest_read(&guest.0)).unwrap().unwrap(), Ordering::Relaxed);
                     }
                 });
-                for unit in (0..n).step_by(32) {
+                let start = Instant::now();
+                while rescued.load(Ordering::Relaxed) == 0 {
+                    assert!(start.elapsed() < Duration::from_secs(5), "some pages rescued before reading on");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                for unit in (32..n).step_by(32) {
                     let mut buf = vec![0u8; 32 * PAGE_SIZE];
                     crate::checkpoint::GuestPages::read(&pages, unit, &mut buf).unwrap();
                     out.lock().unwrap()[unit * PAGE_SIZE..(unit + 32) * PAGE_SIZE].copy_from_slice(&buf);
