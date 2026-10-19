@@ -350,7 +350,8 @@ struct Connection {
     /// only for what its directions still want of it, or poll would return at once every pass.
     client_down: i16,
     guest_down: i16,
-    /// Since when either side has failed: drainage and the other side's FIN have LINGER to finish.
+    /// Since either side failed, or it last relayed data after: drainage and the other side's FIN
+    /// have LINGER to make progress.
     lingering: Option<Instant>,
 }
 
@@ -368,9 +369,11 @@ impl Connection {
         let (out, incoming) = (self.out.pump(&self.client, &self.guest), self.incoming.pump(&self.guest, &self.client));
         if out || incoming {
             self.active = idle_now();
+            // What is still delivered keeps it: a slow reader gets the rest, and LINGER for its FIN after.
+            self.lingering = self.lingering.and(Some(self.active));
         }
         // A failed socket (an error polled, or found reading or writing it): nothing reaches it any
-        // more. Allow buffered data to drain, but bound that wait even if the sink never reads.
+        // more. Allow buffered data to drain, but bound each stall even if the sink never reads.
         let failed = |down: i16, from: &Direction, to: &Direction| down & (libc::POLLERR | libc::POLLNVAL) != 0 || from.failed || to.broken;
         let client_failed = failed(self.client_down, &self.out, &self.incoming);
         if client_failed || failed(self.guest_down, &self.incoming, &self.out) {
@@ -1325,15 +1328,20 @@ mod tests {
             lingering: None,
         };
         // The client never reads: fill its receive queue and the proxy's send queue and buffer.
+        // Then wait out ACKs still due (with its queue full, the client drops what is in flight
+        // rather than ACK it): none may free send space during the assertions below.
+        let mut settled = (u32::MAX, Instant::now());
         wait_until("the reply to block", || {
             connection.incoming.start = 0;
             connection.incoming.end = BUFFER;
             let moved = connection.incoming.pump(&connection.guest, &connection.client);
-            // Wait for the last ACK too: it must not free send space during the assertions below.
             let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
             let mut len = size_of_val(&info) as libc::socklen_t;
             assert_eq!(unsafe { libc::getsockopt(connection.client.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_INFO, (&raw mut info).cast(), &mut len) }, 0);
-            !moved && info.tcpi_unacked == 0
+            if moved || info.tcpi_unacked != settled.0 {
+                settled = (info.tcpi_unacked, Instant::now());
+            }
+            settled.1.elapsed() > Duration::from_millis(200)
         });
         reset(server);
         let mut fd = poll(&connection.guest, libc::POLLIN);
@@ -1358,7 +1366,19 @@ mod tests {
             assert_eq!(connection.lingering, Some(start));
             assert!(!connection.incoming.done, "the reply must still be blocked");
         }
+        // A client that reads a little is still being delivered to: its deadline restarts.
+        client.set_nonblocking(true).unwrap();
+        let mut taken = [0; 4096];
+        wait_until("the reply to move again", || {
+            let _ = client.read(&mut taken);
+            connection.forward(libc::POLLOUT, 0) && connection.lingering == Some(start + LINGER)
+        });
+        assert_eq!(connection.active, start + LINGER);
         *clock.lock().unwrap() = start + LINGER + Duration::from_secs(2);
+        tick_clock();
+        assert!(connection.forward(0, 0), "progress restarts the deadline");
+        assert!(!connection.incoming.done, "the reply must still be blocked");
+        *clock.lock().unwrap() = start + 2 * LINGER + Duration::from_secs(2);
         tick_clock();
         assert!(!connection.forward(0, 0), "a blocked reply must not prevent expiry");
         CLOCK.with(|c| *c.borrow_mut() = None);
