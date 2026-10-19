@@ -8,7 +8,7 @@
 //! commands run on there; `attach` to the app there).
 
 use std::collections::VecDeque;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -496,6 +496,9 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
     if open_stdin && tty && !is_tty(0) {
         bail!("the input device is not a TTY");
     }
+    // From now on: the guest fixes where "now" is before any stdin goes (#866), else what it echoes or prints
+    // first can come before that and be left out. Failed, the follow retries as it would.
+    let output = if from.is_none() { open_output(&vm, u64::MAX).ok() } else { None };
     let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
     // Before the terminal goes raw, so that no signal finds it raw and nothing to put it back.
     match tty {
@@ -548,7 +551,7 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
     } else {
         drop(first);
     }
-    let code = follow_output(&vm, from);
+    let code = follow_output(&vm, from, output);
     drop(raw);
     code
 }
@@ -572,15 +575,25 @@ fn proxy_signals(vm: Pinned, signals: [i32; 3]) {
     });
 }
 
-/// The app's output (FRAME_NOTE, flexvm-init's own lines, is left out) until it exits.
-fn follow_output(vm: &Pinned, from: Option<u64>) -> Result<i32> {
+/// A follow of the app's output from `offset`. From now on (u64::MAX), it is open once its first frame is in:
+/// the guest sends one (where it clamped to, or a keepalive) only after fixing where "now" is.
+fn open_output(vm: &Pinned, offset: u64) -> Result<BufReader<UnixStream>> {
+    let mut r = open(vm, &json!({"op": "attach", "offset": offset}))?;
+    if offset == u64::MAX && r.fill_buf()?.is_empty() {
+        bail!("vm {}: its output follow ended at once", vm.name());
+    }
+    r.get_ref().set_read_timeout(Some(Duration::from_secs(20)))?;
+    Ok(r)
+}
+
+/// The app's output (FRAME_NOTE, flexvm-init's own lines, is left out) until it exits; `first`: its follow opened already.
+fn follow_output(vm: &Pinned, from: Option<u64>, mut first: Option<BufReader<UnixStream>>) -> Result<i32> {
     let mut offset = from.unwrap_or(u64::MAX);
     let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
     loop {
         let name = &vm.name();
-        match open(vm, &json!({"op": "attach", "offset": offset})) {
+        match first.take().map_or_else(|| open_output(vm, offset), Ok) {
             Ok(mut r) => {
-                r.get_ref().set_read_timeout(Some(Duration::from_secs(20)))?;
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut r) {
                     match kind {
                         FRAME_STDOUT | FRAME_STDERR | FRAME_NOTE => {
