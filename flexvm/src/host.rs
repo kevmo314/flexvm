@@ -1594,9 +1594,10 @@ impl Host {
         Ok(self.grant_inner(mib, floor, false, deadline, crate::vmproc::host_available_mib)?.ok().map(|g| g.0))
     }
 
-    /// A refusal is an error too; `hold` keeps the grant past `GRANT_WINDOW`.
-    pub fn grant_start(&self, mib: u64, floor: Floor, hold: bool) -> Result<(u64, Option<Hold>)> {
-        self.grant_inner(mib, floor, hold, None, crate::vmproc::host_available_mib)?
+    /// A refusal is an error too; `hold` keeps the grant past `GRANT_WINDOW`. Never under the host lock: a refusal
+    /// waits for VM processes without it (`room`), which a guard further out would keep held.
+    pub fn grant_start(&self, mib: u64, floor: Floor, hold: bool, deadline: Option<std::time::Instant>) -> Result<(u64, Option<Hold>)> {
+        self.grant_inner(mib, floor, hold, deadline, crate::vmproc::host_available_mib)?
     }
 
     /// MemAvailable lags a grant until the guest touches the memory, so all
@@ -1673,6 +1674,8 @@ impl Host {
                 return Ok(Err(format!("not enough memory here for {mib} MiB above the {mark} MiB {what}").into()));
             }
             drop(l);
+            // A guard further out would keep the lock held through the wait.
+            debug_assert_eq!(DEPTH.with(|d| d.get()), 0, "waiting for VM processes under the host lock");
             crate::hostmem::release_kept(self, deadline);
             released = true;
         }
@@ -7636,9 +7639,11 @@ pub(crate) mod tests {
                 let h = h.clone();
                 std::thread::spawn(move || {
                     crate::hostmem::pin_release(Some(Duration::from_secs(30)), None);
+                    // Sampled before it counts: the release waits for both counts, so both first reads see it kept.
                     let avail = || {
+                        let a = AVAIL - kept.load(SeqCst);
                         reads.fetch_add(1, SeqCst);
-                        Some(AVAIL - kept.load(SeqCst))
+                        Some(a)
                     };
                     h.grant_inner(6000, Floor::Reserve, false, None, avail).unwrap().map(|g| g.0)
                 })

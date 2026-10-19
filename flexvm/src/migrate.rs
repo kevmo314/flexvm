@@ -899,10 +899,17 @@ impl Proc {
         *self.spec.lock().unwrap() = serde_json::from_value::<crate::app::RunSpec>(req["spec"].clone()).unwrap_or_default().moving();
         t.mark("template");
         going()?;
-        // Admission, the record and the claim under one wait for the lock, which gives up in time.
-        let l = self.host.lock_by(Some(until)).map_err(|e| format!("not admitted within {} s: {e}", crate::listen::PREPARE_WAIT.as_secs()))?;
+        // Admission, then the record and the claim, each giving up in time. Admitted before the lock is taken: a
+        // refusal waits for VM processes without the host lock, which a guard held here would keep.
+        let late = |e: Error| -> Error {
+            match e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) {
+                true => format!("not admitted within {} s: {e}", crate::listen::PREPARE_WAIT.as_secs()).into(),
+                false => e,
+            }
+        };
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo. Never past the guest's size.
-        self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req))?;
+        self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req), Some(until)).map_err(late)?;
+        let l = self.host.lock_by(Some(until)).map_err(late)?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
