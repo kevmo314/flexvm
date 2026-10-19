@@ -59,8 +59,9 @@ macro_rules! info {
 
 static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn set_verbose(verbose: bool) {
-    VERBOSE.store(verbose, Ordering::Relaxed);
+/// Returns what it was (as set, not `FLEXVM_LOG`), for a caller to put back.
+pub fn set_verbose(verbose: bool) -> bool {
+    VERBOSE.swap(verbose, Ordering::Relaxed)
 }
 
 pub fn verbose() -> bool {

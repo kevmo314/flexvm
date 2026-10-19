@@ -831,10 +831,17 @@ def resume_kill():
     cleanup(n)
     n = "ft-resume-kill-hot"
     ok(set_standby(A, args.template, 1))
+    ips = lambda: {f: addr(A, f).get("seen") for f in os.listdir(os.path.join(A.state, "addrs")) if re.fullmatch(r"[0-9.]+", f)}
+    seen = ips()
     with armed_fault(A, "resume_kill", 60000):
         r = run(A, n)
     check("resume kill: a run claiming a standby vm fails", not r["ok"] and "may have run" in r.get("error", ""), r)
     check("resume kill: no vm left", n not in vms(A), vms(A).get(n))
+    # Its fresh generation is withdrawn and unrouted, as a cold start's that never ran (#850).
+    claimed = [ip for ip, gen in ips().items() if gen != seen.get(ip)]
+    check("resume kill: the failed claim's address is withdrawn, held by none and unrouted",
+          claimed and all(addr(A, ip).get("withdrawn") and not addr(A, ip).get("holder") and not peer_route(ip) for ip in claimed),
+          {ip: (addr(A, ip), peer_route(ip)) for ip in claimed})
     ok(set_standby(A, args.template, 0))
     r = run(A, n)
     check("resume kill: the name runs again", r["ok"], r)
@@ -9318,8 +9325,16 @@ def gc_debris():
     sbd = standby_dir(A.run, args.template)
     os.makedirs(sbd, exist_ok=True)
     sock = made(os.path.join(sbd, "999999990.sock"))
+    # The pool of a template removed meanwhile, with nothing in it but its failed refill's log (#850).
+    unused = standby_dir(A.run, "ft-gc-gone")
+    os.makedirs(os.path.join(unused, ".locks"), mode=0o700)
+    with open(os.path.join(unused, ".template"), "w") as f:
+        f.write("ft-gc-gone")
+    made(os.path.join(unused, "standby.log"))
     ok(cli_json(A, "debug", "gc"))
     gone = lambda p: not os.path.exists(p)
+    check("gc: an unused pool of a removed template goes; one of a template here stays", gone(unused) and not gone(sbd))
+    check("gc: nothing made in the pools' refill locks", not os.path.exists(os.path.join(A.run, "standby", ".locks", ".locks")))
     check("gc: an old .moved marker goes, a recent one stays", gone(moved) and not gone(moved_new))
     check("gc: a quiet orphan log goes, a fresh one stays", gone(orphan) and not gone(fresh))
     check("gc: a live vm's log stays", not gone(os.path.join(vd, f"{n}.log")))

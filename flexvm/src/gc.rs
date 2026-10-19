@@ -176,7 +176,8 @@ fn cleanup_locked(host: &Host, lock: Option<Flock>) -> Result<()> {
     vm_files(host);
     orphan_log_locks(&host.run.join("vms"));
     for e in std::fs::read_dir(host.run.join("standby")).into_iter().flatten().flatten() {
-        if e.file_type().is_ok_and(|t| t.is_dir()) {
+        // Pools only (hashes): not `.locks`, the pools' refill locks.
+        if e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.') {
             standby_sockets(&e.path());
             orphan_log_locks(&e.path());
             standby_pool(host, &e.path());

@@ -570,13 +570,14 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     if let Some(mut f) = notify.take() {
         let _ = send_json(&mut f, &json!({"ok": true, "result": {"pid": me.pid, "template": template}}));
     }
-    let mut checked = Instant::now() - Duration::from_millis(100);
+    // Every pass, whether or not a connection came: a busy standby still leaves when it should.
+    let mut checked: Option<Instant> = None;
     loop {
         if let Some(code) = p.stop_requested() {
             p.finish(op, End::NotStarted, code, None);
         }
-        if checked.elapsed() >= Duration::from_millis(100) {
-            checked = Instant::now();
+        if checked.is_none_or(|c| c.elapsed() >= CHECK_EVERY) {
+            checked = Some(Instant::now());
             let current = key(&p.paths, template).ok();
             let extra = live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
             let died = p.standby.lock().unwrap().as_ref().map_or(Some("it was given up".to_string()), |s| {
@@ -625,8 +626,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
         // The claim's app settings are applied as it starts the app (`start_guest`), its ports as it claims.
         *p.spec.lock().unwrap() = spec;
-        let verbose = crate::util::verbose();
-        crate::util::set_verbose(req["verbose"] == json!(true));
+        // Only this thread sets it once the process runs: a failed claim puts back the standby's own.
+        let verbose = crate::util::set_verbose(req["verbose"] == json!(true));
         p.tty.store(req["tty"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         p.attached.store(req["attached"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         p.attacher.store(req["attacher"] == json!(true), std::sync::atomic::Ordering::SeqCst);
@@ -753,7 +754,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     };
     p.bind_ports().map_err(|e| not_run(e, false))?;
     let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| not_run(e, false))?;
-    let mut failed = FailedClaim { p, name: Some(lock), claim: Some(claim) };
+    let mut failed = FailedClaim { p, name: Some(lock), claim: Some(claim), holder: name };
     let claim = failed.claim.as_ref().unwrap();
     p.serve_ports(claim.ip).map_err(|e| not_run(e, false))?;
     t.mark("claim_ip");
@@ -787,16 +788,18 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
 }
 
 /// Roll back as a cold start's `finish(NotStarted)` does, even after installing a route.
+/// Its fields drop after `drop`: the name is held until the address is withdrawn.
 struct FailedClaim<'a> {
     p: &'a Proc,
     name: Option<crate::host::NameLock>,
     claim: Option<crate::host::AddrClaim>,
+    holder: &'a str,
 }
 
 impl Drop for FailedClaim<'_> {
     fn drop(&mut self) {
         if let Some(claim) = self.claim.take() {
-            self.p.withdraw_claim(claim, &self.name.as_ref().unwrap().name);
+            self.p.withdraw_claim(claim, self.holder);
         }
     }
 }
@@ -930,6 +933,10 @@ pub fn publish_lock(sock: &std::path::Path) -> PathBuf {
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often an unclaimed standby checks its generation, the pool's target, its Firecracker and the
+/// host's memory, connections arriving or not (#850).
+const CHECK_EVERY: Duration = Duration::from_millis(100);
 /// What a refill grants a standby at least (`grant_mib`).
 const MIN_GRANT_MIB: u64 = 256;
 /// How long a refill holds relief off for each standby it starts: its grant, then its lock file.
