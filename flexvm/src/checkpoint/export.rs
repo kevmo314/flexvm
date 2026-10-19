@@ -251,16 +251,32 @@ impl TarIn<'_> {
 
 // --- save -------------------------------------------------------------------------------------
 
-/// A chain member's files, read and checked under the store's lock: its pages stay readable once open.
+/// A chain member's files, opened under the store's lock: they stay readable once open. Its
+/// manifest and run settings (1 MiB each at most) are read then; its VM state and page map are
+/// read and checked as they are written, one checkpoint's at a time, so a chain's metadata is never
+/// all in memory at once.
 struct Saved {
     id: String,
     manifest: Manifest,
     text: Vec<u8>,
     spec: Option<Vec<u8>>,
-    vmstate: Vec<u8>,
-    pagemap: Vec<u8>,
+    vmstate: File,
+    pagemap: File,
     pages: File,
     pages_len: u64,
+}
+
+impl Saved {
+    /// Its file `name` (`vmstate` or `pagemap`), checked against its manifest.
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        let bad = |why: &str| format!("checkpoint {}: {name} {why}", self.id);
+        let want = self.manifest.files.get(name).ok_or_else(|| bad("is not in its manifest"))?;
+        let f = if name == "vmstate" { &self.vmstate } else { &self.pagemap };
+        let mut bytes = Vec::with_capacity(want.len.min(1 << 26) as usize);
+        f.take(want.len + 1).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 == want.len && sum(&bytes) == want.hash, "{}", bad("does not match its checksum"));
+        Ok(bytes)
+    }
 }
 
 /// Its run settings, as a restore reads them: refused here if a load would refuse them.
@@ -277,11 +293,11 @@ fn read_member(dir: &Path, id: &str) -> Result<Saved> {
     let (sum_line, body) = text.split_at(text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("manifest has no checksum".into()))?);
     ensure!(sum_line == id.as_bytes() && sum(&body[1..]) == id, "{}", bad("it changed as it was saved".into()));
     let manifest: Manifest = serde_json::from_slice(&body[1..])?;
-    let read = |name: &str| -> Result<Vec<u8>> {
+    let open = |name: &str| -> Result<File> {
         let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
-        let (_, bytes) = read_at(dfd.as_raw_fd(), name, want.len + 1).map_err(|e| bad(format!("{name}: {e}")))?;
-        ensure!(bytes.len() as u64 == want.len && sum(&bytes) == want.hash, "{}", bad(format!("{name} does not match its checksum")));
-        Ok(bytes)
+        let (f, _) = read_at(dfd.as_raw_fd(), name, 0).map_err(|e| bad(format!("{name}: {e}")))?;
+        ensure!(f.metadata()?.len() == want.len, "{}", bad(format!("{name} has the wrong length")));
+        Ok(f)
     };
     let spec = match read_at(dfd.as_raw_fd(), SPEC, MAX_SPEC + 1) {
         Ok((_, bytes)) => Some(bytes),
@@ -291,7 +307,7 @@ fn read_member(dir: &Path, id: &str) -> Result<Saved> {
     if let Some(spec) = &spec {
         check_spec(spec).map_err(|e| bad(e.to_string()))?;
     }
-    let (vmstate, pagemap) = (read("vmstate")?, read("pagemap")?);
+    let (vmstate, pagemap) = (open("vmstate")?, open("pagemap")?);
     let (pages, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
     let pages_len = pages.metadata()?.len();
     ensure!(Some(pages_len) == manifest.files.get("pages").map(|f| f.len), "{}", bad("pages has the wrong length".into()));
@@ -344,7 +360,8 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
     let mut buf = vec![0u8; CHUNK];
     for m in members {
         digest.checkpoint(&m.id);
-        let files = [("manifest.json", Some(&m.text)), (SPEC, m.spec.as_ref()), ("vmstate", Some(&m.vmstate)), ("pagemap", Some(&m.pagemap))];
+        let (vmstate, pagemap) = (m.read("vmstate")?, m.read("pagemap")?);
+        let files = [("manifest.json", Some(&m.text)), (SPEC, m.spec.as_ref()), ("vmstate", Some(&vmstate)), ("pagemap", Some(&pagemap))];
         for (name, bytes) in files.into_iter().filter_map(|(n, b)| Some((n, b?))) {
             out.bytes(&checkpoint_member(&m.id, name), bytes)?;
             digest.file(name, bytes.len() as u64, &Sha256::digest(bytes));
@@ -866,14 +883,16 @@ fn import(
     }
     let (id, stored) = match publish(state, &mut loaded, name.as_deref()) {
         Ok(done) => done,
-        Err(e) => {
-            // Nothing of it stays: not the template it brought either, unless something here uses it by now.
+        // Nothing of it stays: not the template it brought either, unless something here uses it by now.
+        Err(Abort::Undo(e)) => {
             drop(tpl);
             if how == How::Received {
                 let _ = template::prune(paths, Some(tid), in_use);
             }
             return Err(e);
         }
+        // A checkpoint of it may stay (or come back after a crash), which `in_use` may not see: so does its template.
+        Err(Abort::Keep(e)) => return Err(e),
     };
     drop(tpl);
     let meta: u64 = loaded.iter().map(|l| l.meta).sum();
@@ -908,7 +927,7 @@ impl<E: Into<crate::util::Error>> From<E> for Abort {
 /// revoke it) or removed (`rm`, `prune`) meanwhile. Whatever is under an id now, found before or
 /// published since, is used only if it has the very files verified here, its id being no
 /// cryptographic check. On failure, what it published goes again.
-fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> Result<(String, usize)> {
+fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> std::result::Result<(String, usize), Abort> {
     let _lock = store::lock(state, libc::LOCK_EX)?;
     let store_dir = store::dir(state);
     let mut published = vec![];
@@ -947,11 +966,18 @@ fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> Result<(S
         if let Some(n) = name {
             if named(state, n).as_deref() != Some(id.as_str()) {
                 if let Err(e) = store::link(state, n, &id) {
-                    // Perhaps linked, not durably: it goes before what it names, or that stays.
-                    if named(state, n).as_deref() == Some(id.as_str()) {
-                        if let Err(u) = crate::util::unlink_durably(&store::dir(state).join("names").join(n)) {
-                            return Err(Abort::Keep(format!("{e}; removing the name failed too: {u}").into()));
+                    // Perhaps linked, not durably: it goes before what it names, or that stays (also
+                    // when whether it is there is not known).
+                    let link = store::dir(state).join("names").join(n);
+                    match std::fs::read_link(&link) {
+                        Ok(to) if to.file_name() == Some(id.as_ref()) => {
+                            if let Err(u) = crate::util::unlink_durably(&link) {
+                                return Err(Abort::Keep(format!("{e}; removing the name failed too: {u}").into()));
+                            }
                         }
+                        Ok(_) => {}
+                        Err(r) if r.kind() == io::ErrorKind::NotFound => {}
+                        Err(r) => return Err(Abort::Keep(format!("{e}; and whether the name is there is not known: {r}").into())),
                     }
                     return Err(e.into());
                 }
@@ -961,13 +987,13 @@ fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> Result<(S
     })();
     match done {
         Ok(id) => Ok((id, published.len())),
-        Err(Abort::Keep(e)) if published.is_empty() => Err(e),
-        Err(Abort::Keep(e)) => Err(format!("{e} (the checkpoints it published are kept, whole: flexvm checkpoint rm removes them)").into()),
+        Err(Abort::Keep(e)) if published.is_empty() => Err(Abort::Keep(e)),
+        Err(Abort::Keep(e)) => Err(Abort::Keep(format!("{e} (the checkpoints it published are kept, whole: flexvm checkpoint rm removes them)").into())),
         Err(Abort::Undo(e)) => {
             published.reverse();
             match store::unpublish(state, &published) {
-                Ok(()) => Err(e),
-                Err(u) => Err(format!("{e} (removing the checkpoints it published: {u}; flexvm checkpoint rm removes them)").into()),
+                Ok(()) => Err(Abort::Undo(e)),
+                Err(u) => Err(Abort::Keep(format!("{e} (removing the checkpoints it published: {u}; flexvm checkpoint rm removes them)").into())),
             }
         }
     }
