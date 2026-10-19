@@ -770,7 +770,9 @@ impl Host {
             Err(e) => Some(Err(e)),
         });
         let mut unreadable = vec![];
-        for manifest in suspended.chain(crate::checkpoint::managed(&self.state).map(|(_, m)| m)) {
+        // Names cannot hide a checkpoint's template: their listing does not matter here.
+        let stored = crate::checkpoint::managed(&self.state).map(|c| c.and_then(|(_, m)| m));
+        for manifest in suspended.chain(stored) {
             match manifest {
                 Ok(m) => drop(ids.insert(m.template_id)),
                 Err(err) => unreadable.push(err.to_string()),

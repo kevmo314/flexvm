@@ -35,14 +35,14 @@ pub fn holding(dir: &Path) -> Result<Option<Flock>> {
 
 pub struct Entry {
     pub id: String,
-    pub name: Option<String>,
+    pub names: Vec<String>,
     pub dir: PathBuf,
     pub manifest: Result<Manifest>,
 }
 
 impl Entry {
     fn label(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.id)
+        self.names.first().map_or(&self.id, String::as_str)
     }
 }
 
@@ -91,22 +91,70 @@ impl<'a> Index<'a> {
     }
 }
 
-/// Every stored checkpoint, oldest first, with its name: staging and removed ones are not.
-/// Listing failures are unreadable entries named for the directory, never checkpoint ids.
-pub fn list(state: &Path) -> Vec<Entry> {
-    let mut names: BTreeMap<String, String> = std::fs::read_dir(dir(state).join(NAMES))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| Some((std::fs::read_link(e.path()).ok()?.file_name()?.to_str()?.to_string(), e.file_name().into_string().ok()?)))
-        .collect();
-    let mut all: Vec<Entry> = managed(state)
-        .map(|(dir, manifest)| {
-            let id = dir.file_name().unwrap().to_string_lossy().into_owned();
-            Entry { name: names.remove(&id), id, dir, manifest }
-        })
-        .collect();
-    all.sort_by(|a, b| (a.manifest.as_ref().map_or(0, |m| m.created_unix_ms), &a.id).cmp(&(b.manifest.as_ref().map_or(0, |m| m.created_unix_ms), &b.id)));
+/// A partial listing is useful for `ls` and exact lookups, never for removal or prefixes.
+#[derive(Default)]
+pub struct Listing {
+    pub entries: Vec<Entry>,
+    pub errors: Vec<crate::util::Error>,
+    /// Names whose checkpoint is not listed: gone (left by a removal before #862), or hidden by an error.
+    pub dangling: Vec<String>,
+    /// `names`, probed for a name the listing may have missed.
+    pub(super) names: PathBuf,
+}
+
+impl Listing {
+    fn complete(&self) -> Result<()> {
+        if let Some(e) = self.errors.first() {
+            bail!("incomplete checkpoint listing: {e}");
+        }
+        Ok(())
+    }
+}
+
+/// Every stored checkpoint, oldest first, with all its names; staging and removed ones are not.
+pub fn list(state: &Path) -> Listing {
+    let names = dir(state).join(NAMES);
+    listed(managed(state), super::entries(&names), names)
+}
+
+pub(super) fn listed(
+    checkpoints: impl Iterator<Item = Result<(PathBuf, Result<Manifest>)>>,
+    links: impl Iterator<Item = Result<PathBuf>>,
+    names_dir: PathBuf,
+) -> Listing {
+    let mut all = Listing { names: names_dir, ..Listing::default() };
+    let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for link in links {
+        let read = (|| -> Result<_> {
+            let path = link?;
+            let target = std::fs::read_link(&path).map_err(|e| format!("reading checkpoint name {}: {e}", path.display()))?;
+            let name = path.file_name().and_then(|n| n.to_str());
+            let id = target.file_name().and_then(|n| n.to_str()).filter(|id| is_id(id));
+            match (name, id) {
+                (Some(name), Some(id)) => Ok((id.to_string(), name.to_string())),
+                _ => bail!("invalid checkpoint name {} -> {}", path.display(), target.display()),
+            }
+        })();
+        match read {
+            Ok((id, name)) => names.entry(id).or_default().push(name),
+            Err(e) => all.errors.push(e),
+        }
+    }
+    for checkpoint in checkpoints {
+        match checkpoint {
+            Ok((dir, manifest)) => {
+                let id = dir.file_name().unwrap().to_string_lossy().into_owned();
+                let mut names = names.remove(&id).unwrap_or_default();
+                names.sort();
+                all.entries.push(Entry { names, id, dir, manifest });
+            }
+            Err(e) => all.errors.push(e),
+        }
+    }
+    all.dangling = names.into_values().flatten().collect();
+    all.dangling.sort();
+    all.entries
+        .sort_by(|a, b| (a.manifest.as_ref().map_or(0, |m| m.created_unix_ms), &a.id).cmp(&(b.manifest.as_ref().map_or(0, |m| m.created_unix_ms), &b.id)));
     all
 }
 
@@ -115,26 +163,54 @@ pub(crate) fn is_id(name: &str) -> bool {
 }
 
 /// The checkpoint `what` names: by its name, else its id or the start of one (4 or more digits).
-pub fn find<'a>(all: &'a [Entry], what: &str) -> Result<&'a Entry> {
-    if let Some(e) = all.iter().find(|e| e.name.as_deref() == Some(what)) {
-        return Ok(e);
+/// A name and an id of two checkpoints (a name given before #862 may look like an id) is refused,
+/// as is an id while a name the listing missed may be it, or an id-shaped name while a checkpoint
+/// the listing missed may have that id.
+pub fn find<'a>(all: &'a Listing, what: &str) -> Result<&'a Entry> {
+    let named = all.entries.iter().find(|e| e.names.iter().any(|n| n == what));
+    let by_id = all.entries.iter().find(|e| is_id(what) && e.id == what);
+    if named.is_none() && all.dangling.iter().any(|n| n == what) {
+        all.complete().map_err(|e| format!("cannot resolve checkpoint {what:?}: {e}"))?;
+        bail!("checkpoint name {what:?} is of a checkpoint no longer here: flexvm checkpoint rm {what} removes the name");
     }
-    let found: Vec<&Entry> = all.iter().filter(|e| what.len() >= 4 && is_id(&e.id) && e.id.starts_with(what)).collect();
+    match (named, by_id) {
+        (Some(n), Some(i)) if n.id != i.id => bail!("{what:?} is a name of checkpoint {} and the id of another; give that one's name, or rename", n.id),
+        // An id-shaped name (one given before #862): the checkpoint with that id may be one the listing missed.
+        (Some(n), None) if is_id(what) && !all.errors.is_empty() => {
+            bail!("cannot resolve checkpoint {what:?}: it is a name of checkpoint {}, and may be the id of one the listing missed ({})", n.id, all.errors[0])
+        }
+        (Some(e), _) => return Ok(e),
+        (None, Some(e)) => {
+            let Some(missed) = all.errors.first() else { return Ok(e) };
+            // A name `what` the listing missed, or one of a checkpoint it missed, may be another's.
+            let hidden = match std::fs::symlink_metadata(all.names.join(what)) {
+                Ok(_) => Ok(true),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENOTDIR) => Ok(false),
+                Err(err) => Err(err),
+            };
+            match hidden {
+                Ok(false) => return Ok(e),
+                Ok(true) => bail!("cannot resolve checkpoint {what:?}: it is also a checkpoint name, of one the listing missed ({missed})"),
+                Err(err) => bail!(
+                    "cannot resolve checkpoint {what:?}: whether it is also a checkpoint name is not known ({err}), as the listing is incomplete ({missed})"
+                ),
+            }
+        }
+        (None, None) => {}
+    }
+    all.complete().map_err(|e| format!("cannot resolve checkpoint {what:?}: {e}"))?;
+    let found: Vec<&Entry> = all.entries.iter().filter(|e| what.len() >= 4 && e.id.starts_with(what)).collect();
     match found[..] {
         [e] => Ok(e),
-        [] => match all.iter().find(|e| !is_id(&e.id)) {
-            // It may be among those the listing missed.
-            Some(e) => bail!("no checkpoint {what:?} found: {}", e.manifest.as_ref().unwrap_err()),
-            None => bail!("no checkpoint {what:?} (see flexvm checkpoint ls)"),
-        },
+        [] => bail!("no checkpoint {what:?} (see flexvm checkpoint ls)"),
         _ => bail!("{what:?} is the start of {} checkpoint ids; give more of it", found.len()),
     }
 }
 
 /// Refused if `name` is no checkpoint name or is taken.
 pub fn check_free(state: &Path, name: &str) -> Result<()> {
-    if crate::host::check_name(name).is_err() {
-        bail!("bad checkpoint name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.'");
+    if crate::host::check_name(name).is_err() || is_id(name) {
+        bail!("bad checkpoint name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.', and not 16 hex digits (an id)");
     }
     if std::fs::symlink_metadata(dir(state).join(NAMES).join(name)).is_ok() {
         bail!("checkpoint name {name:?} is taken (see flexvm checkpoint ls)");
@@ -155,8 +231,17 @@ pub fn link(state: &Path, name: &str, id: &str) -> Result<()> {
 pub fn remove(state: &Path, whats: &[String], force: bool) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
     let all = list(state);
-    let order = removal(&all, whats, force)?;
-    delete(state, &all, order)
+    // A name whose checkpoint is gone (`find` resolves it to none) goes on its own.
+    let (names, whats): (Vec<String>, Vec<String>) = whats.iter().cloned().partition(|w| all.dangling.contains(w));
+    let order = removal(&all, &whats, force)?;
+    let mut out = unname(state, &names)?;
+    out.extend(delete(state, &all.entries, order)?);
+    Ok(out)
+}
+
+/// Unlinks names whose checkpoint is gone, under the lock, from a complete listing.
+fn unname(state: &Path, names: &[String]) -> Result<Vec<Value>> {
+    names.iter().map(|n| Ok(crate::util::unlink_durably(&dir(state).join(NAMES).join(n)).map(|()| json!({"deleted": null, "name": n}))?)).collect()
 }
 
 /// `checkpoint prune`: every checkpoint created before `before` (Unix ms; all without), unless
@@ -165,13 +250,17 @@ pub fn prune(state: &Path, before: Option<u64>) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
     let all = list(state);
     let order = pruning(&all, before)?;
-    delete(state, &all, order)
+    let mut out = unname(state, &all.dangling)?;
+    out.extend(delete(state, &all.entries, order)?);
+    Ok(out)
 }
 
 /// What `remove` deletes, as positions in `all`, in the order it deletes them.
-pub(super) fn removal(all: &[Entry], whats: &[String], force: bool) -> Result<Vec<usize>> {
-    let index = Index::new(all);
+pub(super) fn removal(all: &Listing, whats: &[String], force: bool) -> Result<Vec<usize>> {
+    all.complete().map_err(|e| format!("nothing removed: {e}"))?;
+    let index = Index::new(&all.entries);
     let mut doomed: BTreeSet<usize> = whats.iter().map(|w| Ok(index.ids[find(all, w)?.id.as_str()])).collect::<Result<_>>()?;
+    let all = &all.entries;
     readable_or_removed(all, &doomed, force)?;
     let more: BTreeSet<usize> = doomed.iter().flat_map(|i| &index.children[*i]).copied().filter(|i| !doomed.contains(i)).collect();
     if let Some(&first) = more.first().filter(|_| !force) {
@@ -189,7 +278,9 @@ pub(super) fn removal(all: &[Entry], whats: &[String], force: bool) -> Result<Ve
 }
 
 /// What `prune` deletes, as positions in `all`, in the order it deletes them.
-pub(super) fn pruning(all: &[Entry], before: Option<u64>) -> Result<Vec<usize>> {
+pub(super) fn pruning(all: &Listing, before: Option<u64>) -> Result<Vec<usize>> {
+    all.complete().map_err(|e| format!("nothing removed: {e}"))?;
+    let all = &all.entries;
     readable_or_removed(all, &BTreeSet::new(), false)?;
     let index = Index::new(all);
     let mut doomed: BTreeSet<usize> =
@@ -206,9 +297,6 @@ pub(super) fn pruning(all: &[Entry], before: Option<u64>) -> Result<Vec<usize>> 
 /// An unreadable checkpoint may build on any other: refused while one is kept (only `rm -f` of
 /// it removes it). Nothing is removed, so a passing error (EMFILE) fails only this command.
 fn readable_or_removed(all: &[Entry], doomed: &BTreeSet<usize>, force: bool) -> Result<()> {
-    if let Some(e) = all.iter().find(|e| !is_id(&e.id)) {
-        bail!("nothing removed: {}", e.manifest.as_ref().unwrap_err());
-    }
     let unreadable: Vec<&Entry> = all.iter().enumerate().filter(|(i, e)| e.manifest.is_err() && !(force && doomed.contains(i))).map(|(_, e)| e).collect();
     if unreadable.is_empty() {
         return Ok(());
@@ -236,14 +324,14 @@ fn delete(state: &Path, all: &[Entry], order: Vec<usize>) -> Result<Vec<Value>> 
     }
     let mut out = vec![];
     for e in order.into_iter().map(|i| &all[i]) {
-        if let Some(name) = &e.name {
+        for name in &e.names {
             crate::util::unlink_durably(&store.join(NAMES).join(name))?;
         }
         let gone = store.join(format!("{REMOVED}{}", e.id));
         std::fs::rename(&e.dir, &gone)?;
         crate::util::sync_dir(&store)?;
         std::fs::remove_dir_all(&gone)?;
-        out.push(json!({"deleted": e.id, "name": e.name}));
+        out.push(json!({"deleted": e.id, "name": display_names(e)}));
     }
     Ok(out)
 }
@@ -266,16 +354,22 @@ pub(super) fn unpublish(state: &Path, ids: &[String]) -> Result<()> {
 pub fn rows(state: &Path, templates: &[Value]) -> Vec<Value> {
     let all = list(state);
     let image = |id: &str| templates.iter().find(|t| t["id"] == id && t["name"].is_string()).map(|t| t["name"].clone());
-    all.iter()
+    all.entries
+        .iter()
         .map(|e| {
             let m = match &e.manifest {
                 Ok(m) => m,
-                Err(err) => return json!({"name": e.name, "id": e.id, "error": err.to_string()}),
+                Err(err) => return json!({"name": display_names(e), "id": e.id, "error": err.to_string()}),
             };
-            let parent = m.parent.as_ref().map(|p| all.iter().find(|a| a.id == p.id).map_or(p.id.as_str(), Entry::label));
+            let parent = m.parent.as_ref().map(|p| all.entries.iter().find(|a| a.id == p.id).map_or(p.id.as_str(), Entry::label));
             let size = crate::management::disk_usage(&e.dir, &mut BTreeSet::new()).unwrap_or(0);
-            json!({"name": e.name, "id": e.id, "vm": m.name, "template": image(&m.template_id), "template_id": m.template_id,
+            json!({"name": display_names(e), "id": e.id, "vm": m.name, "template": image(&m.template_id), "template_id": m.template_id,
                    "parent": parent, "size": size, "created": m.created_unix_ms / 1000})
         })
+        .chain(all.errors.iter().map(|e| json!({"error": e.to_string()})))
         .collect()
+}
+
+fn display_names(e: &Entry) -> Option<String> {
+    (!e.names.is_empty()).then(|| e.names.join(", "))
 }
