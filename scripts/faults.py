@@ -106,9 +106,60 @@ for h in () if args.no_listeners else (A, B):
 listeners = {}
 
 
+# What `rm` deleted of a VM's NAME.log, by (run directory, name): `log` reads it first, so it reads
+# on as from one file across the removal (a VM's last words, written as `rm -f` kills it, included).
+REMOVED_LOGS = {}
+
+
+class HeldLogs:
+    """`rm [-f] NAME...` deletes the VMs' logs. Each NAME.log there while it runs is held open (one
+    a rotation made as the VM ended too), so `kept` reads what the removal unlinked, in order."""
+
+    def __init__(self, vms_dir, names):
+        self.paths = {n: os.path.join(vms_dir, f"{n}.log") for n in names}
+        self.held = {n: {} for n in names}
+        self.done = threading.Event()
+        self.look()
+        self.watcher = threading.Thread(target=self.watch, daemon=True)
+        self.watcher.start()
+
+    def look(self):
+        for n, path in self.paths.items():
+            try:
+                f = open(path, errors="replace")
+            except OSError:
+                continue
+            ino = os.fstat(f.fileno()).st_ino
+            if ino in self.held[n]:
+                f.close()
+            else:
+                self.held[n][ino] = f
+
+    def watch(self):
+        while not self.done.wait(0.005):
+            self.look()
+
+    def kept(self):
+        """{name: what its logs held}, of those `rm` unlinked."""
+        self.done.set()
+        self.watcher.join()
+        kept = {}
+        for n, files in self.held.items():
+            for f in files.values():
+                with f:
+                    if os.fstat(f.fileno()).st_nlink == 0:
+                        kept[n] = kept.get(n, "") + f.read()
+        return kept
+
+
 def cli(host, *a, timeout=120):
     """Runs flexvm against `host`; returns (exit code, stdout, stderr)."""
-    r = subprocess.run([BIN, "--state", host.state, "--run", host.run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
+    held = HeldLogs(os.path.join(host.run, "vms"), a[1:]) if a[:1] == ("rm",) else None
+    try:
+        r = subprocess.run([BIN, "--state", host.state, "--run", host.run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
+    finally:
+        for n, text in (held.kept() if held else {}).items():
+            REMOVED_LOGS[(host.run, n)] = REMOVED_LOGS.get((host.run, n), "") + text
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -458,14 +509,16 @@ class Skip(Exception):
 
 
 def log(host, name):
-    """What VM processes named `name` on `host` wrote (incoming ones included)."""
+    """What VM processes named `name` on `host` wrote (incoming ones included), removed ones too."""
     try:
-        return open(os.path.join(host.run, "vms", f"{name}.log")).read()
+        cur = open(os.path.join(host.run, "vms", f"{name}.log")).read()
     except OSError:
-        return ""
+        cur = ""
+    return REMOVED_LOGS.get((host.run, name), "") + cur
 
 
 def clear_log(host, name):
+    REMOVED_LOGS.pop((host.run, name), None)
     with suppress(OSError):
         os.unlink(os.path.join(host.run, "vms", f"{name}.log"))
 

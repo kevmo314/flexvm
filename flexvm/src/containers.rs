@@ -187,6 +187,8 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
     host::check_name(name)?;
     let (path, prev) = (host.vms(name, "log")?, host.vms(name, "log.1")?);
     let open = || std::fs::File::open(&path).ok();
+    // Who held the name as it was first read (`removed`, where there is no birth time).
+    let holder = host.name_holder(name).ok().flatten();
     // The current log first: one rotated meanwhile is then the previous one read below.
     let mut cur = open();
     let ino = |f: &std::fs::File| f.metadata().ok().map(|m| (m.dev(), m.ino()));
@@ -226,6 +228,10 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
                 f.rewind()?;
             }
         }
+        // Removed with its VM (`rm`): whatever is at its path now is a later VM's.
+        if cur.as_ref().is_some_and(|f| removed(f, &prev, || host.name_holder(name).ok().flatten() != holder)) {
+            return Ok(());
+        }
         // Rotated (or removed and made again): what was written before the rename is drained, then the new one.
         let now = std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
         if now.is_some() && now != cur.as_ref().and_then(ino) {
@@ -252,6 +258,27 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
             (false, Some(t)) if t.elapsed() > Duration::from_secs(1) => return Ok(()),
             (false, Some(_)) => {}
         }
+    }
+}
+
+/// Whether `cur` was unlinked by `rm`, not a second rotation. A rotation unlinks it only by
+/// renaming over it the log made after it, which is `prev` (born before) from then on; `rm`
+/// removes `prev` too, so any `prev` there now was made after (a later VM's). Where the file
+/// system keeps no birth time: removed once the name has another holder than it had (`moved_on`).
+fn removed(cur: &std::fs::File, prev: &Path, moved_on: impl FnOnce() -> bool) -> bool {
+    let Ok(m) = cur.metadata() else { return false };
+    if m.nlink() > 0 {
+        return false;
+    }
+    let unlinked = std::time::UNIX_EPOCH + Duration::new(m.ctime().max(0) as u64, m.ctime_nsec().clamp(0, 999_999_999) as u32);
+    by_rm(unlinked, std::fs::metadata(prev).map(|p| p.created()), moved_on)
+}
+
+/// `removed`'s decision, given when the log was unlinked and `prev`'s birth time (if it is there).
+fn by_rm(unlinked: std::time::SystemTime, prev_born: std::io::Result<std::io::Result<std::time::SystemTime>>, moved_on: impl FnOnce() -> bool) -> bool {
+    match prev_born {
+        Err(_) => true,
+        Ok(born) => born.map_or_else(|_| moved_on(), |born| born >= unlinked),
     }
 }
 
@@ -801,6 +828,62 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || tx.send(logs(&host, "job", true, Some(1)).is_ok()));
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "logs -f of an exited vm ends");
+    }
+
+    #[test]
+    fn logs_follow_of_a_removed_vm_ends_before_its_name_runs_again() {
+        let root = TempDir::new("logs-removed");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        std::fs::write(host.vms("job", "log").unwrap(), b"old\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follower = host.clone();
+        std::thread::spawn(move || tx.send(logs(&follower, "job", true, Some(1)).is_ok()));
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        // `rm -f`: the VM ends, its logs go; a new VM of the name starts a fresh log soon after.
+        drop(name);
+        std::fs::remove_file(host.vms("job", "log").unwrap()).unwrap();
+        let _again = host.take_name("job", false).unwrap();
+        std::fs::write(host.vms("job", "log").unwrap(), b"new\n").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "logs -f of a removed vm ends");
+    }
+
+    #[test]
+    fn logs_follow_reads_on_across_two_rotations_and_a_new_holder() {
+        let root = TempDir::new("logs-rotated-twice");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let (log, prev) = (host.vms("job", "log").unwrap(), host.vms("job", "log.1").unwrap());
+        let name = host.take_name("job", false).unwrap();
+        std::fs::write(&log, b"first\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follower = host.clone();
+        std::thread::spawn(move || tx.send(logs(&follower, "job", true, Some(1)).is_ok()));
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        // Rotated twice (the follower may see either), and the name passes to a resume's process.
+        std::fs::rename(&log, &prev).unwrap();
+        std::fs::write(&log, b"between\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::rename(&log, &prev).unwrap();
+        std::fs::write(&log, b"third\n").unwrap();
+        let other = Ident { pid: 1, start: 1, boot: host::boot_id().into() };
+        std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&other).unwrap()).unwrap();
+        assert!(rx.recv_timeout(FOLLOW_EVERY * 4).is_err(), "a rotated log is followed on, not taken for a removed one");
+        drop(name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "and ends with its vm");
+    }
+
+    #[test]
+    fn a_removed_log_is_told_from_a_rotated_one() {
+        let at = std::time::SystemTime::now();
+        let (before, after) = (at - Duration::from_millis(5), at + Duration::from_millis(5));
+        let unsupported = || std::io::Error::from(std::io::ErrorKind::Unsupported);
+        assert!(by_rm(at, Err(std::io::ErrorKind::NotFound.into()), || false), "no log.1: rm took it");
+        assert!(!by_rm(at, Ok(Ok(before)), || true), "log.1 born before: a second rotation");
+        assert!(by_rm(at, Ok(Ok(after)), || false), "log.1 born after: a later vm's");
+        assert!(by_rm(at, Ok(Ok(at)), || false), "born then: a later vm's");
+        // No birth time: the name's holder decides.
+        assert!(!by_rm(at, Ok(Err(unsupported())), || false), "the same holder: a rotation");
+        assert!(by_rm(at, Ok(Err(unsupported())), || true), "another holder: removed");
     }
 
     #[test]

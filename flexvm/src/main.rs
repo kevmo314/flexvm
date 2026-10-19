@@ -1067,7 +1067,8 @@ fn run_attached(host: &Host, name: &str, keep: bool) -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     if !keep && !host.alive(name) && host.vms(name, "exited")?.exists() {
-        let _ = remove_stopped(host, name, true);
+        // Its log stays, as a foreground run's without a terminal (its diagnostics are there alone).
+        let _ = remove_stopped(host, name, true, false);
     }
     util::exit(code)
 }
@@ -1349,13 +1350,14 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     }
     let done = || output(format_args!("{name}\n"));
     if !running {
-        return remove_stopped(host, name, records()?).and_then(|()| done());
+        return remove_stopped(host, name, records()?, true).and_then(|()| done());
     }
     // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
     if host.entry(name).is_ok_and(|e| e.state == "source") {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
     }
-    if let Ok(vm) = host.signal(name, libc::SIGINT) {
+    let killed = host.signal(name, libc::SIGINT).ok();
+    if let Some(vm) = &killed {
         if !vm.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
         }
@@ -1363,15 +1365,14 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
             return Err(format!("vm {name} moved to {to} before the kill took; kill it there").into());
         }
-        // A suspend that finished first is undone: the kill wins.
-        if !host.suspended(name)?.exists() {
-            // `rm -f`: so is the record of an app's exit that won the race, under the name (none took it since).
-            if stopped && host.has_record(name, "exited") {
-                let _lock = host.take_name(name, true)?;
-                let _ = std::fs::remove_file(host.vms(name, "exited")?);
-            }
-            return done();
-        }
+    }
+    // `rm -f` also removes logs and any exit or suspend record that won the race, under the name.
+    if stopped {
+        return remove_stopped(host, name, killed.is_some() || records()?, true).and_then(|()| done());
+    }
+    // A suspend that finished first is undone: the kill wins.
+    if killed.is_some() && !host.suspended(name)?.exists() {
+        return done();
     }
     if host.suspended(name)?.exists() {
         let _lock = host.take_name(name, true)?;
@@ -1390,20 +1391,24 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
             format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()).into()
         );
     }
-    remove_stopped(host, name, false)
+    remove_stopped(host, name, false, true)
 }
 
-/// `rm` without -f: under the name, so a `start` meanwhile either wins first (and this is
-/// refused: the VM runs) or waits until it is gone; no process is ever signalled. `had`:
-/// a stopped VM's records were there before.
-fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
+/// `rm` (after killing a running VM for -f): under the name, so a `start` meanwhile either
+/// wins first (and this is refused: the VM runs) or waits until it is gone; signals nothing.
+/// `had`: a stopped VM's records were there before, or -f just killed its process. `logs`: its logs
+/// go too (`rm`, so a new VM of the name starts a fresh one).
+fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool) -> Result<()> {
     if !had {
+        if host.alive(name) {
+            bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
+        }
         return match std::fs::read_to_string(host.vms(name, "moved")?) {
             Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
             Err(_) => Err(format!("no vm named {name:?}").into()),
         };
     }
-    let _lock = match host.take_name(name, true) {
+    let lock = match host.take_name(name, true) {
         Ok(lock) => lock,
         Err(_) if host.alive(name) => bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"),
         Err(e) => return Err(e),
@@ -1411,6 +1416,9 @@ fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
     // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
     if host.suspended(name)?.exists() {
         lifecycle::revoke(host, name)??;
+    }
+    if logs {
+        lock.remove_logs()?;
     }
     for ext in ["exited", "failed", "lost"] {
         let _ = std::fs::remove_file(host.vms(name, ext)?);
@@ -2483,6 +2491,88 @@ mod exec_tests {
     }
 
     #[test]
+    fn rm_removes_both_logs_before_a_detached_run_reuses_the_name() {
+        let root = crate::test_util::TempDir::new("rm-logs");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        for force in [false, true] {
+            for record in ["failed", "lost", "exited", "suspended"] {
+                if record == "suspended" {
+                    let dir = host.suspended("web").unwrap();
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+                } else {
+                    std::fs::write(host.vms("web", record).unwrap(), "old vm").unwrap();
+                }
+                for ext in ["log", "log.1"] {
+                    std::fs::write(host.vms("web", ext).unwrap(), "old vm").unwrap();
+                }
+                remove(&host, "web", force, true).unwrap();
+                assert!(!host.suspended("web").unwrap().exists());
+                for ext in ["failed", "lost", "exited", "log", "log.1"] {
+                    assert!(!host.has_record("web", ext), "{record}, force={force}: {ext}");
+                }
+                // The parent opens the log first; taking the name in the child must keep that file.
+                let mut out = new_run_log(&host, "web").unwrap();
+                let _name = host.take_name("web", false).unwrap();
+                out.write_all(b"new vm").unwrap();
+                assert_eq!(std::fs::read_to_string(host.vms("web", "log").unwrap()).unwrap(), "new vm");
+            }
+        }
+        // Missing logs are fine too.
+        std::fs::remove_file(host.vms("web", "log").unwrap()).unwrap();
+        std::fs::write(host.vms("web", "exited").unwrap(), "{}").unwrap();
+        remove(&host, "web", false, true).unwrap();
+    }
+
+    #[test]
+    fn force_rm_clears_a_running_vms_logs_but_kill_keeps_them() {
+        use crate::test_util::JoinWithin;
+        use std::os::unix::process::ExitStatusExt;
+        let root = crate::test_util::TempDir::new("force-rm-logs");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        for (force, record) in [(false, "none"), (true, "none"), (true, "exited"), (true, "suspended")] {
+            let name = host.take_name("web", false).unwrap();
+            let mut command = std::process::Command::new("sleep");
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    Ok(())
+                });
+            }
+            let mut child = crate::test_util::ChildGuard(command.arg("60").spawn().unwrap());
+            let entry = host::Entry { name: "web".into(), ident: host::Ident::of(child.id()).unwrap(), state: "running".into(), ..host::Entry::default() };
+            std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
+            name.publish(&entry).unwrap();
+            for ext in ["log", "log.1"] {
+                std::fs::write(host.vms("web", ext).unwrap(), "old vm").unwrap();
+            }
+            let ended_host = host.clone();
+            let ended = std::thread::spawn(move || {
+                let status = child.wait().unwrap();
+                // Model an app exit or a suspend winning the race with the kill.
+                if record == "exited" {
+                    std::fs::write(ended_host.vms("web", "exited").unwrap(), "{}").unwrap();
+                } else if record == "suspended" {
+                    let dir = ended_host.suspended("web").unwrap();
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+                }
+                drop(name);
+                status
+            });
+            let result = remove(&host, "web", true, force);
+            let status = ended.join_within().unwrap();
+            result.unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGINT));
+            for ext in ["log", "log.1"] {
+                assert_eq!(host.has_record("web", ext), !force, "{record}, force={force}: {ext}");
+            }
+            assert!(!host.has_record("web", "exited"));
+            assert!(!host.suspended("web").unwrap().exists());
+        }
+    }
+
+    #[test]
     fn ps_lists_a_suspended_vm_while_its_name_is_held() {
         let root = crate::test_util::TempDir::new("ps-held");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
@@ -2597,9 +2687,15 @@ mod exec_tests {
         // A VM started meanwhile holds its name: a plain rm takes it to remove, so is refused,
         // signalling nothing; the record it saw stays.
         std::fs::write(host.vms("web", "failed").unwrap(), "died").unwrap();
-        let e = remove_stopped(&host, "web", true).unwrap_err().to_string();
+        for ext in ["log", "log.1"] {
+            std::fs::write(host.vms("web", ext).unwrap(), "running vm").unwrap();
+        }
+        let e = remove_stopped(&host, "web", true, true).unwrap_err().to_string();
         assert!(e.contains("is running") && e.contains("rm -f web"), "{e}");
         assert!(host.vms("web", "failed").unwrap().exists());
+        for ext in ["log", "log.1"] {
+            assert_eq!(std::fs::read_to_string(host.vms("web", ext).unwrap()).unwrap(), "running vm");
+        }
         // start -a: a paused VM is unpaused, not attached to.
         let entry = host::Entry { name: "web".into(), ident: host::Ident::me(), state: "paused".into(), ..host::Entry::default() };
         std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();

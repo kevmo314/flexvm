@@ -174,6 +174,7 @@ class Host:
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here
         self.pids = set()  # their processes (pid, start), seen here
+        self.removed_logs = {}  # what `rm` deleted of a VM's NAME.log, by name (`cli`)
 
     # lifecycle of the host itself
     def start(self):
@@ -212,7 +213,13 @@ class Host:
             raise AssertionError(f"host {self.label}'s listener did not stop within {timeout} s; killed it")
 
     def cli(self, *argv, **kw):
-        return flexvm("--state", self.state_dir, "--run", self.run_dir, *argv, env=ENV, **kw)
+        # `rm` deletes the VMs' logs: what they held is kept for `logs` (and `save_logs`).
+        held = HeldLogs(os.path.join(self.run_dir, "vms"), argv[1:]) if argv[:1] == ("rm",) else None
+        try:
+            return flexvm("--state", self.state_dir, "--run", self.run_dir, *argv, env=ENV, **kw)
+        finally:
+            for n, text in (held.kept() if held else {}).items():
+                self.removed_logs[n] = self.removed_logs.get(n, "") + text
 
     def configure(self, **keys):
         """Sets keys of STATE/host.json (None removes one): read, updated and replaced atomically."""
@@ -327,9 +334,10 @@ class Host:
     def logs(self, vm):
         """A background VM's output (an image app's stdout and stderr)."""
         try:
-            return open(os.path.join(self.run_dir, "vms", f"{vm}.log")).read()
+            cur = open(os.path.join(self.run_dir, "vms", f"{vm}.log")).read()
         except OSError:
-            return ""
+            cur = ""
+        return self.removed_logs.get(vm, "") + cur
 
     # what the host holds on this machine, to check that it gives it back
     def firecrackers(self):
@@ -385,9 +393,56 @@ class Host:
             dest = os.path.join(args.log_dir, f"run-{self.label}", os.path.relpath(log, self.run_dir))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy(log, dest)
+        for vm, text in self.removed_logs.items():
+            dest = os.path.join(args.log_dir, f"run-{self.label}", "vms", f"{vm}.log.removed")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w") as f:
+                f.write(text)
 
 
 # --- helpers -------------------------------------------------------------------
+
+
+class HeldLogs:
+    """`rm [-f] NAME...` deletes the VMs' logs. Each NAME.log there while it runs is held open (one
+    a rotation made as the VM ended too), so `kept` reads what the removal unlinked, in order."""
+
+    def __init__(self, vms_dir, names):
+        self.paths = {n: os.path.join(vms_dir, f"{n}.log") for n in names}
+        self.held = {n: {} for n in names}
+        self.done = threading.Event()
+        self.look()
+        self.watcher = threading.Thread(target=self.watch, daemon=True)
+        self.watcher.start()
+
+    def look(self):
+        for n, path in self.paths.items():
+            try:
+                f = open(path, errors="replace")
+            except OSError:
+                continue
+            ino = os.fstat(f.fileno()).st_ino
+            if ino in self.held[n]:
+                f.close()
+            else:
+                self.held[n][ino] = f
+
+    def watch(self):
+        while not self.done.wait(0.005):
+            self.look()
+
+    def kept(self):
+        """{name: what its logs held}, of those `rm` unlinked."""
+        self.done.set()
+        self.watcher.join()
+        kept = {}
+        for n, files in self.held.items():
+            for f in files.values():
+                with f:
+                    if os.fstat(f.fileno()).st_nlink == 0:
+                        kept[n] = kept.get(n, "") + f.read()
+        return kept
+
 
 
 def vm_resources(ip):
@@ -1441,6 +1496,7 @@ def containers():
         check("rename: an exited vm's status goes with it", A.cli("wait", renamed_job).stdout == "3\n")
         check("logs: under the new name", A.cli("logs", renamed_job).stdout.count("late\n") == 2)
         A.rm(renamed_job)
+        check("rm: its logs go with it", not any(os.path.exists(os.path.join(A.run_dir, "vms", f"{renamed_job}.{e}")) for e in ("log", "log.1")))
     finally:
         for p in (follower, waiter):
             if p and p.poll() is None:
@@ -1477,6 +1533,7 @@ def containers():
         follower.wait()
         reader.join(10)
     A.rm(ticker, force=True)
+    check("rm -f: a running vm's logs go with it", not any(os.path.exists(os.path.join(A.run_dir, "vms", f"{ticker}.{e}")) for e in ("log", "log.1")))
     check("restart: running again", A.ps().get(vm, {}).get("state") == "running" and A.ps()[vm]["ip"] == ip, (r.stdout, A.ps().get(vm)))
     check("restart: same guest process", marker_id(A, vm) == proc)
     A.cli("restart", other, timeout=240)

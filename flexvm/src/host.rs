@@ -843,9 +843,7 @@ impl Host {
         // A new VM of a failed or lost one's name starts a fresh log; a resume (`start`) keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
         if !resuming && ["failed", "lost"].iter().any(|ext| self.has_record(name, ext)) {
-            for ext in ["log", "log.1"] {
-                let _ = std::fs::remove_file(self.vms(name, ext)?);
-            }
+            let _ = self.remove_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
         // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log.
@@ -895,6 +893,17 @@ impl Host {
     pub fn reap_dead_holder(&self, name: &str) -> Result<()> {
         if let Some(owner) = lock_holder(&self.vms(name, "lock")?)?.filter(|o| o.liveness() == Liveness::Gone) {
             reap(&self.run, &owner)?;
+        }
+        Ok(())
+    }
+
+    /// Both of `name`'s logs, those missing too; under its name and the logs lock (shared).
+    fn remove_logs(&self, name: &str) -> Result<()> {
+        for ext in ["log", "log.1"] {
+            match std::fs::remove_file(self.vms(name, ext)?) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -2738,6 +2747,13 @@ pub struct NameLock {
 }
 
 impl NameLock {
+    /// Explicit removal clears both rotations before the name can be reused. A detached run's parent
+    /// opens its log before the child takes the name, so clearing at the child's start is too late.
+    pub fn remove_logs(&self) -> Result<()> {
+        let _logs = self.host.logs_lock(libc::LOCK_SH)?;
+        self.host.remove_logs(&self.name)
+    }
+
     pub fn publish(&self, e: &Entry) -> Result<()> {
         store(&self.host.vms(&self.name, "json")?, e, false)
     }
