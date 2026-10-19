@@ -1791,7 +1791,7 @@ def leave_fail():
     check("leave and stay fail: reached", hit(A, "leave_fail", n), reached(A, "leave_fail"))
     check("leave and stay fail: migrate refused", not r["ok"] and "leaving failed" in r["error"], r)
     check("leave and stay fail: says the loan stays",
-          "undoing its loan after a refused migration: injected fault" in log(A, n)[seen:], log(A, n)[seen:][-500:])
+          wait_for(lambda: "undoing its loan after a refused migration: injected fault" in log(A, n)[seen:], 5), log(A, n)[seen:][-500:])
     one_owner("leave and stay fail", n, m, A, ip, gen, before, lent=gen, leaving=True)
     r = migrate(A, n, B)
     st = wait_released(B, n)
@@ -2265,7 +2265,7 @@ def ckpt_paused_backlog():
     time.sleep(0.2)
     r = checkpoint(A, n, path)
     check("paused backlog: checkpoint written, still paused", r["ok"] and r["result"]["state"] == "paused" and vms(A)[n]["state"] == "paused", (r, vms(A).get(n)))
-    check("paused backlog: the drain did not wait for its tap's queue", "frames still queued on its tap, which its paused guest does not take" in log(A, n), log(A, n)[-2000:])
+    check("paused backlog: the drain did not wait for its tap's queue", wait_for(lambda: "frames still queued on its tap, which its paused guest does not take" in log(A, n), 5), log(A, n)[-2000:])
     ok(kill(A, n))
     left = re.compile(r"dropped (\d+) frames still queued on its tap when it left")
     found = wait_for(lambda: left.search(log(A, n)), 10)
@@ -4071,7 +4071,7 @@ def resume_slow_guest():
     check("slow guest: the late answer is logged", wait_for(lambda: "guest agent answered" in log(A, n), 30), log(A, n)[-2000:])
     check("slow guest: paged in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 60), vms(A)[n])
     check("slow guest: checkpoint deleted once all is in", wait_for(lambda: not os.path.exists(d), 30), d)
-    check("slow guest: deleted only once completely paged in", "paged in from" in log(A, n) and "(complete: true" in log(A, n), log(A, n)[-2000:])
+    check("slow guest: deleted only once completely paged in", wait_for(lambda: "paged in from" in log(A, n) and "(complete: true" in log(A, n), 5), log(A, n)[-2000:])
     check("slow guest: still running after", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
 
 
@@ -4115,7 +4115,7 @@ def resume_readdress_fail():
                   code != 0 and "setting its address" in err and wait_for(lambda: sigcont_failed() > before, 10), (code, err, log(B, n)[-2000:]))
             check(f"readdress fails ({what}): the background retries too", wait_for(lambda: "trying again" in log(B, n), 30), log(B, n)[-2000:])
         check(f"readdress fails ({what}): set once it can be, unasked", wait_for(lambda: has(r["ip"]), 30), sh(B, n, "ip -4 -o addr show eth0"))
-        check(f"readdress fails ({what}): logged as taken", "took its address" in log(B, n), log(B, n)[-2000:])
+        check(f"readdress fails ({what}): logged as taken", wait_for(lambda: "took its address" in log(B, n), 5), log(B, n)[-2000:])
         check(f"readdress fails ({what}): md5 intact", md5(B, n) == m)
         r2 = checkpoint(B, n, path + "-x")
         check(f"readdress fails ({what}): checkpoints again", r2["ok"], r2)
@@ -4189,7 +4189,7 @@ def resume_outcome():
     check("resume outcome: paused", pause(A, n))
     with armed_fault(A, "resume_partial", 60000):
         code, out, err = cli(A, "unpause", n)
-    check("resume outcome: the fault was reached", "injected fault: firecracker PATCH /vm: 400 the resume failed part way" in log(A, n), log(A, n)[-1000:])
+    check("resume outcome: the fault was reached", wait_for(lambda: "injected fault: firecracker PATCH /vm: 400 the resume failed part way" in log(A, n), 5), log(A, n)[-1000:])
     check("resume outcome: a failed resume exits non-zero, saying why", code != 0 and "resume failed part way" in err, (code, out, err))
     check("resume outcome: still paused", vms(A).get(n, {}).get("state") == "paused", vms(A).get(n))
     code, out, err = cli(A, "unpause", n)
@@ -4248,7 +4248,7 @@ def resume_migrating():
         check(f"{what}: outcome unknown, the source reconciling", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
         code, out, err = cli(A, "unpause", n)
         check(f"{what}: resume fails, saying so", code != 0 and "migrating away" in err, (code, out, err))
-        check(f"{what}: the vm process said so", "migrating away" in log(A, n), log(A, n)[-500:])
+        check(f"{what}: the vm process said so", wait_for(lambda: "migrating away" in log(A, n), 5), log(A, n)[-500:])
         fault(B, "status", 0)
         st = wait_released(B, n, timeout=60)
         check(f"{what}: then it moves on", st["released"] is True and st["state"] == ("paused" if paused else "running"), st)
@@ -6865,7 +6865,7 @@ def grew_admitted():
     r = res["r"]
     check("grew admitted: b's hold grew by what the guest grew by", more, (first, holds()))
     check("grew admitted: the migration commits", r["ok"], r)
-    check("grew admitted: b says so", "MiB more: it grew to" in log(B, n), log(B, n)[-1500:])
+    check("grew admitted: b says so", wait_for(lambda: "MiB more: it grew to" in log(B, n), 5), log(B, n)[-1500:])
     st = wait_released(B, n, timeout=60)
     check("grew admitted: pulled and released", st["released"] is True and st["failed"] is None, st)
     grew_to = max((more or {0: 0}).values())
@@ -8718,7 +8718,7 @@ def resume_suspending():
     fault(A, "suspend_slow", 0)
     check("resume suspending: a failed suspend's vm runs on, start exits 0",
           code == 0 and alive(pid) and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 10), (code, err, vms(A).get(n)))
-    check("resume suspending: the suspend did fail", "injected fault: writing the checkpoint failed" in log(A, n), log(A, n)[-500:])
+    check("resume suspending: the suspend did fail", wait_for(lambda: "injected fault: writing the checkpoint failed" in log(A, n), 5), log(A, n)[-500:])
     # start -a attaches only to a vm it starts: a running one is refused, and runs on.
     code, out, err = cli(A, "start", "-a", n)
     check("resume suspending: start -a of the running vm is refused", code == 125 and "not stopped" in err and alive(pid), (code, err))
