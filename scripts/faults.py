@@ -8294,6 +8294,40 @@ def pull_died():
     check("home died: and not handed out again", not r["ok"] and "lent" in r.get("error", ""), r)
 
 
+
+def connect_after_pull():
+    """#881: a fault fetcher whose connect ahead is still under way when the pull ends and the source lets go, its
+    listener gone too, gives up on it: nothing remote is left, so the target runs on instead of failing once the source
+    has been unreachable for SOURCE_TIMEOUT (10 s). Test gate `fetch_connect_gate` holds the last fault fetcher's
+    connect, after it saw remote pages left."""
+    own_listeners("connect after pull")
+    n = "ft-connect-after-pull"
+    m = setup(n, mib=16)
+    gate = "fetch_connect_gate"
+    clear_gate(B, gate)
+    try:
+        with armed_fault(B, gate, 600000):
+            ok(migrate(A, n, B))
+            held = lambda: [parked(B, gate, p) for p in reached(B, gate)]
+            check("connect after pull: a fault fetcher's connect is held", wait_for(lambda: held() == [1], 30), held())
+            st = wait_released(B, n)
+            check("connect after pull: the pull ends and the source lets go meanwhile", st["released"] is True and not st.get("failed"), st)
+            before = listener_id(A)
+            stop_listener(A)
+            check("connect after pull: the source's listener is gone", before is not None and not alive(before[0]), before)
+            release(B, gate)
+        # Past SOURCE_TIMEOUT of the source being unreachable.
+        time.sleep(12)
+        v = vms(B).get(n, {})
+        check("connect after pull: the target runs on", v.get("state") == "running" and not v.get("failed"), v)
+        check("connect after pull: md5 intact on B", md5(B, n) == m)
+        check("connect after pull: the fetcher logged no failure", "killing the vm" not in log(B, n), log(B, n)[-500:])
+    finally:
+        release(B, gate)
+        if A.addr not in listeners:
+            start_listener(A)
+
+
 @with_third_peer
 def route_abort():
     """#231: a source whose route switch failed retries it in the background. Its target
@@ -10168,6 +10202,7 @@ SCENARIOS = dict(
     source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,
     pull_died=pull_died,
+    connect_after_pull=connect_after_pull,
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),

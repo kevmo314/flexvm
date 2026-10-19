@@ -127,7 +127,9 @@ impl Pager {
     /// passing over one busy writing requests.
     pub(super) fn queue_fault(&self, job: Job) {
         let queued = |l: &Lane| l.q.try_lock().map_or(usize::MAX, |q| q.jobs.len());
-        let lane = self.lanes[..FAULT_FETCHERS].iter().min_by_key(|l| queued(l)).unwrap();
+        // Test gate `fetch_connect_gate` holds the last fault fetcher: none of its runs go there meanwhile.
+        let n = FAULT_FETCHERS - usize::from(crate::host::fault("fetch_connect_gate"));
+        let lane = self.lanes[..n].iter().min_by_key(|l| queued(l)).unwrap();
         lane.push(job);
     }
 

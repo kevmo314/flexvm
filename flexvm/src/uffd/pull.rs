@@ -47,6 +47,11 @@ impl Pager {
                     let mut link = link.take().filter(|_| !puller).unwrap_or_else(|| Link::new(source.clone()));
                     let p = self.clone();
                     Box::new(move |off, buf, stop, progress| {
+                        // Test gate `fetch_connect_gate`: the last fault fetcher's connect ahead (on a link of its own)
+                        // waits until the test lets it; no fault runs go to it meanwhile (`queue_fault`).
+                        if i == FAULT_FETCHERS - 1 && buf.is_empty() {
+                            crate::host::hold("fetch_connect_gate");
+                        }
                         link.fetch_with(Some(&p.lanes[i]), off, buf, &|| stop.load(Ordering::SeqCst) || p.remote_left() == 0, progress)
                     })
                 }
