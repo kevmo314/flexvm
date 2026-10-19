@@ -6,7 +6,6 @@
 //! The source resumes only on a refusal or `aborted` (never committed, or the
 //! target died without every page), and exits only on `released`.
 
-use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream};
 use std::sync::atomic::Ordering;
@@ -14,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 
 use crate::bail;
@@ -44,15 +45,72 @@ const STRAGGLERS: Duration = Duration::from_millis(5);
 const ARRIVAL_WAIT: Duration = Duration::from_secs(10);
 
 /// What the source sends once paused, as one JSON line: the page states, then the vmstate's and the preloaded pages'
-/// lengths (their bytes follow the line). Deserialized directly from the bounded line: no `Value` tree, which for a long
-/// `runs` would be many times the line's size.
-#[derive(Serialize, Deserialize)]
+/// lengths (their bytes follow the line).
+#[derive(Serialize)]
 struct Header<'a> {
-    runs: Cow<'a, [(u64, u64, u8)]>,
+    runs: &'a [(u64, u64, u8)],
     vmstate_len: u64,
-    preload: Cow<'a, [u64]>,
+    preload: &'a [u64],
     paused: bool,
     app_log: u64,
+}
+
+/// A `Header` as the target reads it: no `Value` tree, which for a long `runs` would be many times the line's size, and
+/// `runs` and `preload` left raw for `capped`, so an overlong one is refused at its cap, never decoded whole first.
+#[derive(Deserialize)]
+struct Incoming<'a> {
+    #[serde(borrow)]
+    runs: &'a RawValue,
+    vmstate_len: u64,
+    #[serde(borrow)]
+    preload: &'a RawValue,
+    paused: bool,
+    app_log: u64,
+}
+
+impl Incoming<'_> {
+    /// Its runs and preload list, refused as soon as either holds more than `regions` can (a run has a page at least,
+    /// the preload `MAX_PRELOAD`) or falls out of order. `check_incoming` still checks the rest.
+    fn decode(&self, regions: &[(u64, u64)]) -> Result<(Runs, Vec<u64>)> {
+        let runs = capped(self.runs, guest_pages(regions), |a: &(u64, u64, u8), b| a.0.saturating_add(a.1) <= b.0);
+        let preload = capped(self.preload, MAX_PRELOAD, |a: &u64, b| a < b);
+        Ok((runs.map_err(|e| format!("runs: {e}"))?, preload.map_err(|e| format!("preload: {e}"))?))
+    }
+}
+
+fn guest_pages(regions: &[(u64, u64)]) -> usize {
+    regions.iter().map(|r| (r.1 / crate::util::PAGE_SIZE as u64) as usize).sum()
+}
+
+/// The longest header an honest source sends for `regions`: a run per page, and a full preload, at their longest numbers.
+fn header_max(regions: &[(u64, u64)]) -> u64 {
+    MAX_HEADER
+        .min((guest_pages(regions) * "[18446744073709551615,18446744073709551615,255],".len() + MAX_PRELOAD * "18446744073709551615,".len() + 4096) as u64)
+}
+
+/// A JSON list of at most `max` items, each `after` the one before.
+fn capped<T: de::DeserializeOwned>(raw: &RawValue, max: usize, after: fn(&T, &T) -> bool) -> serde_json::Result<Vec<T>> {
+    struct List<T>(usize, fn(&T, &T) -> bool);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for List<T> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a list of at most {} items in order", self.0)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<T>, A::Error> {
+            let mut v: Vec<T> = Vec::new();
+            while let Some(x) = seq.next_element()? {
+                if v.len() == self.0 {
+                    return Err(de::Error::custom(format!("more than {} items", self.0)));
+                }
+                if v.last().is_some_and(|l| !(self.1)(l, &x)) {
+                    return Err(de::Error::custom(format!("item {} out of order", v.len())));
+                }
+                v.push(x);
+            }
+            Ok(v)
+        }
+    }
+    de::Deserializer::deserialize_seq(&mut serde_json::Deserializer::from_str(raw.get()), List(max, after))
 }
 
 enum Outcome {
@@ -224,9 +282,9 @@ impl Proc {
         let sent = send_paused(
             &conn,
             &Header {
-                runs: Cow::Borrowed(&runs),
+                runs: &runs,
                 vmstate_len: state.len() as u64,
-                preload: Cow::Borrowed(&pages),
+                preload: &pages,
                 paused: vm.was_paused(),
                 app_log: match self.hold_app_log() {
                     // Test fault `bad_app_log`: an offset past all of the guest's output.
@@ -630,14 +688,16 @@ impl Proc {
         // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
         let owed = &std::sync::atomic::AtomicU64::new(arrival_owed(u64::MAX, usize::MAX));
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
-            let hdr: Header<'static> = crate::util::recv_json_max(&mut r, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
-            owed.store(arrival_owed(hdr.vmstate_len, hdr.preload.len()), Ordering::SeqCst);
-            let preload_len = (hdr.preload.len() * crate::util::PAGE_SIZE) as u64;
+            // A copy: `prepared` goes to `take_in`.
+            let regions = &prepared.2.regions.clone();
+            let line = crate::util::recv_line_max(&mut r, header_max(regions))?.ok_or("source hung up before sending the vmstate")?;
+            let hdr: Incoming = serde_json::from_str(&line)?;
+            let (runs, pages) = hdr.decode(regions).map_err(|e| format!("bad migration header: {e}"))?;
+            owed.store(arrival_owed(hdr.vmstate_len, pages.len()), Ordering::SeqCst);
+            let preload_len = (pages.len() * crate::util::PAGE_SIZE) as u64;
             let mut t = Phases::new();
-            let runs: Runs = hdr.runs.into_owned();
-            let pages: Vec<u64> = hdr.preload.into_owned();
             // Before anything counts or walks them: a bad page index would otherwise overflow, or hang the preload.
-            crate::uffd::check_incoming(&runs, &pages, &prepared.2.regions).map_err(|e| format!("bad migration header: {e}"))?;
+            crate::uffd::check_incoming(&runs, &pages, regions).map_err(|e| format!("bad migration header: {e}"))?;
             let sizes = arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64());
             // The guest ran on while this side prepared: what it pulls now is admitted
             // before anything is seeded or loaded, else refused while the source can resume.
@@ -1471,7 +1531,7 @@ mod tests {
             }
             drained
         });
-        let header = Header { runs: Cow::Borrowed(&[]), vmstate_len: 1, preload: Cow::Borrowed(&[]), paused: false, app_log: 0 };
+        let header = Header { runs: &[], vmstate_len: 1, preload: &[], paused: false, app_log: 0 };
         let data = vec![7; 16 << 20];
         let start = Instant::now();
         let budget = Duration::from_millis(200);
@@ -1492,7 +1552,7 @@ mod tests {
         let (mut peer, _) = listener.accept().unwrap();
         // Takes everything at once, then never answers.
         let reader = thread::spawn(move || std::io::copy(&mut peer, &mut std::io::sink()).unwrap());
-        let header = Header { runs: Cow::Borrowed(&[]), vmstate_len: 1, preload: Cow::Borrowed(&[]), paused: false, app_log: 0 };
+        let header = Header { runs: &[], vmstate_len: 1, preload: &[], paused: false, app_log: 0 };
         let data = vec![7; 1 << 20];
         let start = Instant::now();
         let budget = Duration::from_millis(300);
@@ -1524,6 +1584,49 @@ mod tests {
         refuse_arrival(&w, &mut r, &json!({"ok": false, "error": "no room"}), (LEN - 100) as u64, at);
         drop((w, r));
         assert_eq!(source.join().unwrap().unwrap()["error"], "no room");
+    }
+
+    /// A header's runs and preload list are refused at their caps, or at the first item out of order: what follows (here
+    /// not even a run) is never decoded.
+    #[test]
+    fn a_header_is_refused_while_decoding() {
+        let regions = [(0, 4 * crate::util::PAGE_SIZE as u64)];
+        let decode = |runs: &str, preload: &str| {
+            let line = format!(r#"{{"runs":{runs},"vmstate_len":1,"preload":{preload},"paused":false,"app_log":0}}"#);
+            let hdr: Incoming = serde_json::from_str(&line).unwrap();
+            hdr.decode(&regions).map_err(|e| e.to_string())
+        };
+        let ok = decode("[[0,1,3],[1,3,0]]", "[0]").unwrap();
+        assert_eq!(ok, (vec![(0, 1, 3), (1, 3, 0)], vec![0]));
+        let err = decode(r#"[[0,1,3],[1,1,0],[2,1,3],[3,1,0],[0,1,3],"junk"]"#, "[]").unwrap_err();
+        assert!(err.contains("runs: more than 4 items"), "{err}");
+        let err = decode(r#"[[0,2,3],[1,1,0],"junk"]"#, "[]").unwrap_err();
+        assert!(err.contains("runs: item 1 out of order"), "{err}");
+        let many = format!("[{}\"junk\"]", (0..=MAX_PRELOAD).map(|p| format!("{p},")).collect::<String>());
+        let err = decode("[]", &many).unwrap_err();
+        assert!(err.contains(&format!("preload: more than {MAX_PRELOAD} items")), "{err}");
+        let err = decode("[]", r#"[2,2,"junk"]"#).unwrap_err();
+        assert!(err.contains("preload: item 1 out of order"), "{err}");
+    }
+
+    /// The header line is capped by what an honest source could send for the guest's memory, a run per page.
+    #[test]
+    fn a_header_line_is_capped_by_guest_memory() {
+        let regions = [(0, 1u64 << 30)];
+        let pages = (1 << 30) / crate::util::PAGE_SIZE;
+        let honest = Header {
+            runs: &vec![(u64::MAX, u64::MAX, 255); pages],
+            vmstate_len: u64::MAX,
+            preload: &[u64::MAX; MAX_PRELOAD],
+            paused: false,
+            app_log: u64::MAX,
+        };
+        let line = serde_json::to_string(&honest).unwrap() + "\n";
+        assert!(line.len() as u64 <= header_max(&regions), "{} > {}", line.len(), header_max(&regions));
+        assert!(header_max(&regions) < MAX_HEADER);
+        assert_eq!(header_max(&[(0, 1 << 50)]), MAX_HEADER);
+        let long = "[".repeat(header_max(&regions) as usize + 1);
+        assert!(crate::util::recv_line_max(&mut long.as_bytes(), header_max(&regions)).is_err());
     }
 
     /// A header declaring more than a source may send (a million preload pages) drains no more than that.

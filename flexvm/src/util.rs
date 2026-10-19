@@ -363,6 +363,14 @@ pub fn recv_json(r: &mut impl BufRead) -> Result<Option<serde_json::Value>> {
 }
 
 pub fn recv_json_max<T: serde::de::DeserializeOwned>(r: &mut impl BufRead, max: u64) -> Result<Option<T>> {
+    Ok(match recv_line_max(r, max)? {
+        Some(line) => Some(serde_json::from_str(&line)?),
+        None => None,
+    })
+}
+
+/// One line of at most `max` bytes; None on EOF.
+pub fn recv_line_max(r: &mut impl BufRead, max: u64) -> Result<Option<String>> {
     let mut line = String::new();
     if r.take(max).read_line(&mut line)? == 0 {
         return Ok(None);
@@ -370,7 +378,7 @@ pub fn recv_json_max<T: serde::de::DeserializeOwned>(r: &mut impl BufRead, max: 
     if line.len() as u64 == max && !line.ends_with('\n') {
         bail!("JSON line exceeds limit of {max} bytes");
     }
-    Ok(Some(serde_json::from_str(&line)?))
+    Ok(Some(line))
 }
 
 pub fn cname(name: &str) -> CString {
