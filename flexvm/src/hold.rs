@@ -618,21 +618,29 @@ impl Holder {
     }
 
     fn drain_stragglers(&self, mut send: impl FnMut(Ipv4Addr, &[u8]) -> bool) {
+        // Counts whose record went meanwhile, one report per run of a record's packets.
+        let mut orphaned: Option<(Ipv4Addr, Gone)> = None;
         loop {
-            let (ip, count, p) = {
+            let next = {
                 let mut q = self.stragglers.lock().unwrap();
-                match q.packets.pop_front() {
-                    Some(p) => p,
-                    None => {
-                        q.draining = false;
-                        return;
+                let next = q.packets.pop_front();
+                q.draining = next.is_some();
+                next
+            };
+            let Some((ip, count, p)) = next else { break };
+            let sent = send(ip, &p);
+            let Some(c) = self.count_straggler(ip, count, sent) else { continue };
+            match &mut orphaned {
+                Some((o, g)) if *o == ip && g.at == c.at => (g.resent, g.dropped) = (g.resent + c.resent, g.dropped + c.dropped),
+                _ => {
+                    if let Some((o, g)) = orphaned.replace((ip, c)) {
+                        report(o, &self.dev, &g);
                     }
                 }
-            };
-            let sent = send(ip, &p);
-            if let Some(g) = self.count_straggler(ip, count, sent) {
-                report(ip, &self.dev, &g);
             }
+        }
+        if let Some((ip, g)) = orphaned {
+            report(ip, &self.dev, &g);
         }
     }
 
