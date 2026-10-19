@@ -268,13 +268,18 @@ impl Direction {
     /// still writes what came before it (a reply the guest sent before resetting); a write error
     /// ends only this direction.
     fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> bool {
-        let mut moved = false;
-        while !self.eof && self.end < BUFFER {
+        let (mut moved, mut taken) = (false, 0);
+        while !self.eof && self.end < BUFFER && taken < BUFFER {
             self.bytes.resize(BUFFER, 0);
             match from.read(&mut self.bytes[self.end..]) {
                 Ok(0) => (self.eof, moved) = (true, true),
                 Ok(n) => {
-                    self.end += n;
+                    taken += n;
+                    // Broken, it reads only to discard: closing a socket with data unread would reset
+                    // it, and the peer would lose what the other direction has yet to deliver.
+                    if !self.broken {
+                        self.end += n;
+                    }
                     moved = true;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -310,9 +315,9 @@ impl Direction {
         moved
     }
 
-    /// Its sink failed: nothing more is read for it, and what it held cannot be delivered.
+    /// Its sink failed: what it held, and reads from now on, cannot be delivered.
     fn broken(&mut self) {
-        (self.eof, self.broken, self.done, self.start, self.end) = (true, true, true, 0, 0);
+        (self.broken, self.done, self.start, self.end) = (true, true, 0, 0);
     }
 }
 
@@ -1284,8 +1289,17 @@ mod tests {
         // A request the reset guest cannot take: that direction ends, the reply still goes out.
         client.write_all(b"next request").unwrap();
         thread::sleep(Duration::from_millis(50));
-        let mut got = Vec::new();
-        let _ = client.read_to_end(&mut got);
+        // Slowly: the proxy writes the last of the reply long before it is read.
+        let (mut got, mut chunk) = (Vec::new(), [0; 2048]);
+        loop {
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&chunk[..n]),
+                // A reset: the proxy closed with the request unread, which can lose the reply's tail.
+                Err(e) => panic!("after {} of the reply: {e}", got.len()),
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
         assert_eq!(got.len(), reply.len());
         assert!(got == reply);
         halt(&stop, worker);
