@@ -192,7 +192,8 @@ fn firecracker_id(path: &Path, run: Option<&Path>) -> Result<(Stamp, String)> {
     {
         return Ok(cached);
     }
-    let version = std::process::Command::new(path).arg("--version").output()?;
+    // As a VM process spawns Firecracker: signals unblocked, its open-file limit as found.
+    let version = crate::util::unblock_signals_in(std::process::Command::new(path).arg("--version")).output()?;
     let version = String::from_utf8_lossy(&version.stdout);
     let version = version.lines().next().filter(|v| !v.is_empty()).ok_or("firecracker --version printed nothing")?;
     let binary = hash_file(path)?;

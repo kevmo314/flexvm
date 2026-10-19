@@ -22,6 +22,8 @@ const BURST: usize = 1024;
 /// Workers wake for their sockets or `Forwarder::drop`'s eventfd; this only bounds when idle
 /// sessions and stalled connects are noticed.
 const TICK: libc::c_int = 1000;
+/// How long accepting rests once out of descriptors (or memory).
+const ACCEPT_REST: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -120,7 +122,7 @@ impl Forwarder {
             let (stop, target) = (self.stop.clone(), SocketAddrV4::new(vm, port));
             self.workers.push(thread::Builder::new().name("port-forward".into()).spawn(move || match protocol {
                 Protocol::Tcp => tcp(fds.into_iter().map(TcpListener::from).collect(), target, stop.as_fd(), CONNECTIONS, IDLE),
-                Protocol::Udp => udp(fds.into_iter().map(UdpSocket::from).collect(), target, stop.as_fd()),
+                Protocol::Udp => udp(fds.into_iter().map(UdpSocket::from).collect(), target, stop.as_fd(), CONNECTIONS, IDLE),
             })?);
         }
         Ok(())
@@ -150,9 +152,10 @@ impl Drop for Forwarder {
 }
 
 /// Waits on `fds` and the stop eventfd (last); false once stopped.
-fn wait(fds: &mut Vec<libc::pollfd>, stop: BorrowedFd) -> bool {
+fn wait(fds: &mut Vec<libc::pollfd>, stop: BorrowedFd, until: Option<Instant>) -> bool {
     fds.push(libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 });
-    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, TICK) };
+    let ms = until.map_or(TICK, |u| (u.saturating_duration_since(Instant::now()).as_millis() as libc::c_int + 1).min(TICK));
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, ms) };
     fds.pop().is_some_and(|s| s.revents == 0)
 }
 
@@ -324,15 +327,18 @@ fn admit(connections: &mut Vec<Connection>, cap: usize, idle: Duration) {
 /// connected, or is closed if none is idle by then.
 fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap: usize, idle: Duration) {
     let mut connections: Vec<Connection> = Vec::new();
+    // Out of descriptors, accepting rests a while (the forwards go on): a pending client would wake it at once.
+    let mut resting: Option<Instant> = None;
     loop {
+        resting = resting.filter(|&r| r > Instant::now());
         // Idle forwards cannot hold the cap: at it, a waiting client replaces the idlest once it connects.
-        let room = if connections.len() < cap + spare(&connections, idle) { libc::POLLIN } else { 0 };
+        let room = if resting.is_none() && connections.len() < cap + spare(&connections, idle) { libc::POLLIN } else { 0 };
         let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, room)).collect();
         for c in &connections {
             fds.push(poll(&c.client, if c.connected { c.out.events(&c.incoming) } else { 0 }));
             fds.push(poll(&c.guest, if c.connected { c.incoming.events(&c.out) } else { libc::POLLOUT }));
         }
-        if !wait(&mut fds, stop) {
+        if !wait(&mut fds, stop, resting) {
             return;
         }
         let (accepting, mut each) = (fds[..listeners.len()].to_vec(), fds[listeners.len()..].chunks(2));
@@ -378,6 +384,10 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 let client = match listener.accept() {
                     Ok((client, _)) => client,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)) => {
+                        resting = Some(Instant::now() + ACCEPT_REST);
+                        break;
+                    }
                     Err(_) => break,
                 };
                 if let Ok(guest) = connect(target) {
@@ -485,7 +495,14 @@ fn send_datagram(socket: &UdpSocket, data: &[u8], peer: SocketAddr, local: Optio
     }
 }
 
-fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
+/// The session quiet longest, if for at least `quiet`: the one a new client replaces at the cap.
+fn udp_idle<T: Copy>(clients: &HashMap<T, (UdpSocket, Instant, usize)>, now: Instant, quiet: Duration) -> Option<T> {
+    clients.iter().min_by_key(|(_, (_, at, _))| *at).filter(|(_, (_, at, _))| now.duration_since(*at) >= quiet).map(|(peer, _)| *peer)
+}
+
+/// At most `cap` sessions, each expiring `idle` after its last datagram; at the cap a new client
+/// replaces the session quiet longest, if for half that, once its own socket is ready.
+fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: usize, idle: Duration) {
     // A connected guest socket per client preserves reply isolation. Idle sessions expire,
     // and both protocols bound the number of sockets and per-stream queued bytes.
     // Replies leave by the listener the client sent to.
@@ -496,7 +513,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
         let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, libc::POLLIN)).collect();
         let peers: Vec<_> = clients.keys().copied().collect();
         fds.extend(peers.iter().map(|p| poll(&clients[p].0, libc::POLLIN)));
-        if !wait(&mut fds, stop) {
+        if !wait(&mut fds, stop, None) {
             return;
         }
         // Replies first: the sessions polled are those in `peers`, before any is added below.
@@ -524,10 +541,18 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
-                if !clients.contains_key(&peer) && clients.len() < CONNECTIONS {
-                    if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
-                        if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
-                            clients.insert(peer, (s, Instant::now(), i));
+                if !clients.contains_key(&peer) {
+                    // Half the expiry protects recent traffic while letting new clients through.
+                    // Admitted (in place of the victim, if any) only once its socket is ready.
+                    let admit = if clients.len() < cap { Some(None) } else { udp_idle(&clients, Instant::now(), idle / 2).map(Some) };
+                    if let Some(victim) = admit {
+                        if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+                            if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
+                                if let Some(v) = victim {
+                                    clients.remove(&v);
+                                }
+                                clients.insert(peer, (s, Instant::now(), i));
+                            }
                         }
                     }
                 }
@@ -537,7 +562,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
                 }
             }
         }
-        clients.retain(|_, (_, at, _)| at.elapsed() < IDLE);
+        clients.retain(|_, (_, at, _)| at.elapsed() < idle);
     }
 }
 
@@ -545,6 +570,65 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn udp_admission_preserves_recent_sessions() {
+        let now = Instant::now();
+        let mut clients = HashMap::new();
+        for (peer, idle) in [(1, IDLE / 4), (2, IDLE / 2), (3, IDLE * 3 / 4)] {
+            clients.insert(peer, (UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(), now - idle, 0));
+        }
+        assert_eq!(udp_idle(&clients, now, IDLE / 2), Some(3));
+        clients.remove(&3);
+        assert_eq!(udp_idle(&clients, now, IDLE / 2), Some(2));
+        clients.remove(&2);
+        assert_eq!(udp_idle(&clients, now, IDLE / 2), None);
+    }
+
+    #[test]
+    fn at_the_udp_cap_a_new_client_replaces_only_the_session_quiet_longest() {
+        const IDLE: Duration = Duration::from_secs(4);
+        let ip = Ipv4Addr::new(127, 0, 0, 2);
+        let guest = UdpSocket::bind((ip, 0)).unwrap();
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (addr, target) = (listener.local_addr().unwrap(), SocketAddrV4::new(ip, guest.local_addr().unwrap().port()));
+        let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
+        let worker = {
+            let stop = stop.clone();
+            thread::spawn(move || udp(vec![listener], target, stop.as_fd(), 2, IDLE))
+        };
+        let client = || UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (a, b, c) = (client(), client(), client());
+        // What the guest gets next, and from which session, if anything within `within`.
+        let got = |within: Duration| {
+            guest.set_read_timeout(Some(within)).unwrap();
+            let mut buf = [0; 16];
+            guest.recv_from(&mut buf).ok().map(|(n, from)| (String::from_utf8_lossy(&buf[..n]).into_owned(), from))
+        };
+        let start = Instant::now();
+        a.send_to(b"a", addr).unwrap();
+        let (_, from_a) = got(WAIT).unwrap();
+        b.send_to(b"b", addr).unwrap();
+        let (_, from_b) = got(WAIT).unwrap();
+        c.send_to(b"c", addr).unwrap();
+        assert_eq!(got(Duration::from_millis(300)), None, "admitted over the cap with both sessions recent");
+        thread::sleep((start + IDLE * 3 / 8).saturating_duration_since(Instant::now()));
+        b.send_to(b"b", addr).unwrap();
+        assert_eq!(got(WAIT).unwrap(), ("b".into(), from_b));
+        // a quiet for half the expiry, b not: a goes for c.
+        thread::sleep((start + IDLE * 5 / 8).saturating_duration_since(Instant::now()));
+        c.send_to(b"c", addr).unwrap();
+        let (data, from_c) = got(WAIT).unwrap();
+        assert!(data == "c" && from_c != from_a && from_c != from_b);
+        assert!(start.elapsed() < IDLE, "too slow to tell eviction from expiry");
+        a.send_to(b"a", addr).unwrap();
+        assert_eq!(got(Duration::from_millis(300)), None, "a's session was not the one replaced");
+        b.send_to(b"b", addr).unwrap();
+        assert_eq!(got(WAIT).unwrap(), ("b".into(), from_b), "b's busy session was replaced");
+        unsafe { libc::write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
+        worker.join_within().unwrap();
+    }
 
     #[test]
     fn wildcard_udp_replies_from_each_destination() {
@@ -694,6 +778,52 @@ mod tests {
         }
         assert!(!accepted.is_empty(), "the replacement never connected");
         echo(&mut client, &mut server);
+        halt(&stop, worker);
+    }
+
+    #[test]
+    fn out_of_descriptors_accepting_rests_and_forwards_go_on() {
+        const CHILD: &str = "FLEXVM_TEST_ACCEPT_EMFILE";
+        if std::env::var_os(CHILD).is_none() {
+            // Alone in a process: it runs out of descriptors.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ports::tests::out_of_descriptors_accepting_rests_and_forwards_go_on"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{status}");
+            return;
+        }
+        unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            limit.rlim_cur = limit.rlim_cur.min(1024);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+        }
+        let (addr, guest, stop, worker) = worker(CONNECTIONS, IDLE);
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut client, &mut server);
+        let mut fillers: Vec<std::fs::File> = std::iter::from_fn(|| std::fs::File::open("/dev/null").ok()).collect();
+        // One free for the pending client, none for the worker to accept it with.
+        fillers.pop();
+        let _pending = TcpStream::connect(addr).unwrap();
+        let cpu = || unsafe {
+            let mut u: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut u);
+            Duration::new(u.ru_utime.tv_sec as u64, u.ru_utime.tv_usec as u32 * 1000)
+                + Duration::new(u.ru_stime.tv_sec as u64, u.ru_stime.tv_usec as u32 * 1000)
+        };
+        let (from, used) = (Instant::now(), cpu());
+        for _ in 0..50 {
+            echo(&mut client, &mut server);
+        }
+        assert!(from.elapsed() < Duration::from_secs(2), "the forward slowed to {:?} for 50 echoes", from.elapsed());
+        thread::sleep(Duration::from_secs(1));
+        assert!(cpu() - used < Duration::from_millis(500), "spinning: {:?} of CPU", cpu() - used);
+        drop(fillers);
+        let _accepted = crate::test_util::accept_tcp(&guest);
         halt(&stop, worker);
     }
 

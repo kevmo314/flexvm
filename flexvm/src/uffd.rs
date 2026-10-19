@@ -663,6 +663,10 @@ impl Pager {
         Ok(())
     }
 
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         // Also ends a prefetch still running (e.g. for a drained hot pool's VM).

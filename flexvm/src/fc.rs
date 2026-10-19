@@ -332,6 +332,19 @@ impl Api {
     }
 }
 
+const API_LINE: u64 = 8192;
+const API_HEADERS: usize = 64;
+const API_BODY: usize = 1 << 20;
+
+fn response_line(r: &mut impl BufRead) -> Result<String> {
+    let mut line = String::new();
+    r.take(API_LINE + 1).read_line(&mut line)?;
+    if line.len() as u64 > API_LINE {
+        bail!("response line too long");
+    }
+    Ok(line)
+}
+
 fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent: &mut bool) -> Result<(u16, Vec<u8>, bool)> {
     // After a partial write the request may have reached Firecracker: never replay it.
     while !req.is_empty() {
@@ -345,8 +358,8 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
             Err(e) => return Err(e.into()),
         }
     }
-    let mut status = String::new();
-    if r.read_line(&mut status)? == 0 {
+    let status = response_line(r)?;
+    if status.is_empty() {
         bail!("closed the connection without answering");
     }
     let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
@@ -355,20 +368,27 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     }
     let mut len = None;
     let mut close = false;
+    let mut headers = 0;
     loop {
-        let mut h = String::new();
-        r.read_line(&mut h)?;
+        let h = response_line(r)?;
         if !h.ends_with("\r\n") {
             bail!("incomplete response headers");
         }
         if h == "\r\n" {
             break;
         }
+        headers += 1;
+        if headers > API_HEADERS {
+            bail!("too many response headers");
+        }
         let Some((k, v)) = h.trim_end().split_once(':') else {
             bail!("invalid response header");
         };
         if k.eq_ignore_ascii_case("content-length") {
             let n: usize = v.trim().parse()?;
+            if n > API_BODY {
+                bail!("response body too large");
+            }
             if len.is_some_and(|previous| previous != n) {
                 bail!("conflicting content lengths");
             }
@@ -920,6 +940,23 @@ mod tests {
             assert!(!not_sent(&call(&api, &server.path).unwrap_err()));
             assert!(api.connection.borrow().is_none());
         }
+    }
+
+    #[test]
+    fn api_bounds_response_lines_headers_and_body() {
+        let responses = [
+            format!("HTTP/1.1 200 {}", "x".repeat(API_LINE as usize)),
+            format!("HTTP/1.1 200 OK\r\nX: {}", "x".repeat(API_LINE as usize)),
+            format!("HTTP/1.1 200 OK\r\n{}Content-Length: 0\r\n\r\n", "X: y\r\n".repeat(API_HEADERS + 1)),
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", API_BODY + 1),
+        ];
+        for response in responses {
+            let server = Server::new(move |listener| answer(&mut accept(&listener), response.as_bytes()));
+            let api = Api::default();
+            assert!(!not_sent(&call(&api, &server.path).unwrap_err()));
+            assert!(api.connection.borrow().is_none());
+        }
+        assert_eq!(response_line(&mut &b"ok\r\n"[..]).unwrap(), "ok\r\n");
     }
 
     #[test]

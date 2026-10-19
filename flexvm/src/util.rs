@@ -1191,15 +1191,53 @@ pub fn unlink_durably(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The soft RLIMIT_NOFILE this process had before `raise_nofile`, plus one (0: never raised).
+static NOFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Raises the soft open-file limit to the hard one (a VM process's forwards hold two descriptors a
+/// connection). Children spawned through `unblock_signals_in` or `spawn_self_child` get the limit this process had back:
+/// some programs close every descriptor up to it, or `select` on them.
+pub fn raise_nofile() {
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 || limit.rlim_cur >= limit.rlim_max {
+            return;
+        }
+        let was = limit.rlim_cur;
+        limit.rlim_cur = limit.rlim_max;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+            crate::log!("raising the open file limit: {}", io::Error::last_os_error());
+            return;
+        }
+        NOFILE.store(was.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// In a child before exec: the soft open-file limit back to what `raise_nofile` found.
+fn restore_nofile() -> io::Result<()> {
+    let was = NOFILE.load(std::sync::atomic::Ordering::SeqCst);
+    if was == 0 {
+        return Ok(());
+    }
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        check(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit))?;
+        limit.rlim_cur = (was - 1).min(limit.rlim_max);
+        check(libc::setrlimit(libc::RLIMIT_NOFILE, &limit))
+    }
+}
+
 /// Clears the signal mask of `cmd`'s child, which exec keeps: a spawner that blocks signals to
-/// wait for them itself (`block_signals`) would otherwise pass them on blocked.
+/// wait for them itself (`block_signals`) would otherwise pass them on blocked. Its soft open-file
+/// limit is the one this process started with too (`raise_nofile`).
 pub fn unblock_signals_in(cmd: &mut std::process::Command) -> &mut std::process::Command {
     use std::os::unix::process::CommandExt;
     unsafe {
         cmd.pre_exec(|| {
             let mut none: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut none);
-            check(libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()))
+            check(libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()))?;
+            restore_nofile()
         })
     }
 }
@@ -1476,6 +1514,8 @@ pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(
                     None => Ok(None),
                 }
             };
+            // A VM process's raised limit is its own: a flexvm child raises its own if it needs to.
+            restore_nofile()?;
             let (fd4, fd5) = (aside(fd4)?, aside(fd5)?);
             // dup2 onto itself would leave it close-on-exec.
             let moved = if fd3 == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd3, 3) };
@@ -2244,6 +2284,49 @@ mod tests {
                 .unwrap();
             assert_eq!(status.signal(), Some(sig), "{status}");
         }
+    }
+
+    #[test]
+    fn a_raised_open_file_limit_is_not_passed_on() {
+        const CHILD: &str = "FLEXVM_TEST_NOFILE";
+        let soft = || unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            (limit.rlim_cur, limit.rlim_max)
+        };
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "util::tests::a_raised_open_file_limit_is_not_passed_on"]).env(CHILD, "1");
+            // Started below its hard limit, as under most service managers.
+            unsafe {
+                cmd.pre_exec(|| {
+                    let mut limit: libc::rlimit = std::mem::zeroed();
+                    check(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit))?;
+                    limit.rlim_cur = 256.min(limit.rlim_max);
+                    check(libc::setrlimit(libc::RLIMIT_NOFILE, &limit))
+                });
+            }
+            assert!(cmd.status().unwrap().success());
+            return;
+        }
+        let (was, hard) = soft();
+        if std::env::var(CHILD).unwrap() == "self" {
+            // A flexvm child (a standby a VM process refills, say): started where its parent was.
+            assert_eq!(std::env::var("FLEXVM_TEST_NOFILE_WAS").unwrap(), was.to_string());
+            return;
+        }
+        raise_nofile();
+        assert_eq!(soft(), (hard, hard));
+        let out = run_until(std::process::Command::new("sh").args(["-c", "ulimit -Sn"]), || Ok(())).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), was.to_string());
+        let dir = crate::test_util::TempDir::new("nofile");
+        let log = std::fs::File::create(dir.join("log")).unwrap();
+        let was = was.to_string();
+        let args = ["--exact", "util::tests::a_raised_open_file_limit_is_not_passed_on"];
+        let mut child = spawn_self_child(&args, &log, log.as_raw_fd(), None, None, &[(CHILD, "self"), ("FLEXVM_TEST_NOFILE_WAS", &was)]).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{status}: {}", std::fs::read_to_string(dir.join("log")).unwrap_or_default());
     }
 
     #[test]

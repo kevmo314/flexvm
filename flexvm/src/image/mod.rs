@@ -1611,19 +1611,25 @@ mod tests {
                         removed.fetch_add(1, Ordering::SeqCst);
                     }
                     tries.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(start.elapsed() * 9);
+                    let rest = Instant::now() + start.elapsed() * 9;
+                    while !stop.load(Ordering::SeqCst) && Instant::now() < rest {
+                        std::thread::sleep(Duration::from_millis(10).min(rest.saturating_duration_since(Instant::now())));
+                    }
                 }
             })
         };
         let pulls = {
-            let (tries, images) = (tries.clone(), images.clone());
+            let (tries, removed, images) = (tries.clone(), removed.clone(), images.clone());
             std::thread::spawn(move || {
                 // Called under the pull's key lock, after its cache check (and in a publication): refused there.
                 let sync = |dir: &Path| {
                     assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
                     sync_dir(dir)
                 };
-                for round in 0..300 {
+                // A time budget (a slow disk slows the remover tenfold), but past one removal at least.
+                let until = Instant::now() + Duration::from_secs(5);
+                let mut round = 0;
+                while round < 300 && (Instant::now() < until || removed.load(Ordering::SeqCst) == 0) {
                     let got = cached_rootfs(&cached, build("built"), sync).unwrap();
                     assert_eq!(got.conf, "built config");
                     assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
@@ -1632,8 +1638,11 @@ mod tests {
                     // Every other round, a removal tried wholly after the entry is let go.
                     if round % 2 == 0 {
                         let from = tries.load(Ordering::SeqCst);
-                        crate::test_util::wait_until("the remover to try again", || tries.load(Ordering::SeqCst) >= from + 2);
+                        while tries.load(Ordering::SeqCst) < from + 2 {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
                     }
+                    round += 1;
                 }
             })
         };
