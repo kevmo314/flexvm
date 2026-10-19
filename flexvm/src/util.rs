@@ -1195,7 +1195,7 @@ pub fn unlink_durably(path: &Path) -> io::Result<()> {
 static NOFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Raises the soft open-file limit to the hard one (a VM process's forwards hold two descriptors a
-/// connection). Children spawned through `unblock_signals_in` get the limit this process had back:
+/// connection). Children spawned through `unblock_signals_in` or `spawn_self_child` get the limit this process had back:
 /// some programs close every descriptor up to it, or `select` on them.
 pub fn raise_nofile() {
     unsafe {
@@ -1514,6 +1514,8 @@ pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(
                     None => Ok(None),
                 }
             };
+            // A VM process's raised limit is its own: a flexvm child raises its own if it needs to.
+            restore_nofile()?;
             let (fd4, fd5) = (aside(fd4)?, aside(fd5)?);
             // dup2 onto itself would leave it close-on-exec.
             let moved = if fd3 == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd3, 3) };
@@ -2309,10 +2311,22 @@ mod tests {
             return;
         }
         let (was, hard) = soft();
+        if std::env::var(CHILD).unwrap() == "self" {
+            // A flexvm child (a standby a VM process refills, say): started where its parent was.
+            assert_eq!(std::env::var("FLEXVM_TEST_NOFILE_WAS").unwrap(), was.to_string());
+            return;
+        }
         raise_nofile();
         assert_eq!(soft(), (hard, hard));
         let out = run_until(std::process::Command::new("sh").args(["-c", "ulimit -Sn"]), || Ok(())).unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), was.to_string());
+        let dir = crate::test_util::TempDir::new("nofile");
+        let log = std::fs::File::create(dir.join("log")).unwrap();
+        let was = was.to_string();
+        let args = ["--exact", "util::tests::a_raised_open_file_limit_is_not_passed_on"];
+        let mut child = spawn_self_child(&args, &log, log.as_raw_fd(), None, None, &[(CHILD, "self"), ("FLEXVM_TEST_NOFILE_WAS", &was)]).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{status}: {}", std::fs::read_to_string(dir.join("log")).unwrap_or_default());
     }
 
     #[test]
