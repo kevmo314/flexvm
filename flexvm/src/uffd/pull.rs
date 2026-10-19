@@ -32,9 +32,8 @@ impl Pager {
         if !self.pulling() {
             return;
         }
-        // The connection made for the snapshot load goes to a fault fetcher.
-        let mut link = self.remote.lock().unwrap().take();
-        let source = link.as_ref().map(|l| l.source.clone());
+        // Each worker connects on its own thread, alongside `serve`.
+        let source = self.remote.lock().unwrap().take();
         for i in 0..FAULT_FETCHERS + PULL_THREADS {
             let (p, puller) = (self.clone(), i >= FAULT_FETCHERS);
             // Reads from the checkpoint file (directly, or evicting what it read for a puller where that is buffered) or
@@ -46,7 +45,7 @@ impl Pager {
                     })
                 }),
                 (None, Some(source)) => {
-                    let mut link = link.take().filter(|_| !puller).unwrap_or_else(|| Link::new(source.clone()));
+                    let mut link = Link::new(source.clone());
                     let p = self.clone();
                     Box::new(move |off, buf, stop, progress| {
                         // Test gate `fetch_connect_gate`: the last fault fetcher's connect ahead (on a link of its own)

@@ -58,7 +58,7 @@ mod wp;
 
 pub use event::FaultStats;
 pub use fetch::probe;
-use fetch::{Lane, Link};
+use fetch::Lane;
 pub use hot::Held;
 pub(crate) use pages::zeroed_atomics;
 pub use pages::{Pages, BASE, DISCARDED, INFLIGHT, PRESENT, REMOTE, ZERO};
@@ -206,7 +206,8 @@ pub struct Runtime {
     pid: AtomicU32,
     /// Firecracker as a pidfd, so killing it never hits a reused pid.
     pidfd: OnceLock<OwnedFd>,
-    remote: Mutex<Option<Link>>,
+    /// The migration source REMOTE pages come from; each fetcher connects to it on its own thread (`spawn_pullers`).
+    remote: Mutex<Option<Source>>,
     /// Checkpoint file held until the last REMOTE page settles (`pulled`), so deletion frees its disk space.
     file: Mutex<Option<Arc<PageFile>>>,
     /// The VM's REMOTE pages came from a checkpoint file (not a peer).
@@ -432,11 +433,9 @@ impl Pager {
             self.remote_left.store(remote, Ordering::SeqCst);
             match origin {
                 Origin::Peer(source) => {
-                    // Connect now: the restore itself faults on remote pages.
+                    // Fetchers connect alongside `serve`; faults queue until their links are ready.
                     if remote > 0 {
-                        let mut link = Link::new(source);
-                        link.client = link.connect().ok();
-                        *self.remote.lock().unwrap() = Some(link);
+                        *self.remote.lock().unwrap() = Some(source);
                     }
                 }
                 Origin::File(file) => {

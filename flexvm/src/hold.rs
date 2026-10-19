@@ -68,8 +68,16 @@ pub struct Holder {
     /// uncounted (#254). It is re-sent (`resend`), routed to where the address is now, or
     /// counted as dropped (`Holder::straggler`).
     gone: Mutex<HashMap<Ipv4Addr, Gone>>,
+    /// Queued under `rx`, drained by one reader outside the locks, in read order.
+    stragglers: Mutex<Stragglers>,
     /// A raw socket (IPPROTO_RAW: the packet's own header) the kernel routes re-sent packets by.
     resend: Option<OwnedFd>,
+}
+
+#[derive(Default)]
+struct Stragglers {
+    packets: VecDeque<(Ipv4Addr, Instant, Vec<u8>)>,
+    draining: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -165,6 +173,7 @@ impl Holder {
             routes: Mutex::new(()),
             rx: Mutex::new(()),
             gone: Mutex::default(),
+            stragglers: Mutex::default(),
             resend,
         });
         let reader = h.clone();
@@ -552,7 +561,7 @@ impl Holder {
             }
             return true;
         };
-        match self.entry(ip) {
+        let drain = match self.entry(ip) {
             Some(e) => {
                 let mut q = e.q.lock().unwrap();
                 if q.bytes + p.len() > CAP && !q.switched {
@@ -561,8 +570,13 @@ impl Holder {
                     q.bytes += p.len();
                     q.packets.push_back(p.to_vec());
                 }
+                false
             }
             None => self.straggler(ip, p),
+        };
+        drop(_rx);
+        if drain {
+            self.drain_stragglers(|ip, p| self.resend(ip, p));
         }
         true
     }
@@ -587,27 +601,54 @@ impl Holder {
     /// longer reassemble with its siblings), and a packet larger than the new route's MTU
     /// (EMSGSIZE). A re-sent packet can arrive after newer ones that took the new route (and
     /// behind what a plugged tap holds): late rather than lost.
-    fn straggler(&self, ip: Ipv4Addr, p: &mut [u8]) {
+    /// Queues under `rx`; true gives this reader the drain, after it drops `rx`.
+    fn straggler(&self, ip: Ipv4Addr, p: &mut [u8]) -> bool {
         let mut gone = self.gone.lock().unwrap();
-        let Some(g) = gone.get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR) else { return };
+        let Some(g) = gone.get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR) else { return false };
         let fragment = u16::from_be_bytes([p[6], p[7]]) & 0x3fff != 0;
         let zero_id = p[4] == 0 && p[5] == 0;
-        let sent = g.moved
-            && !(fragment && zero_id)
-            && p[8] > 1
-            && self.resend.as_ref().is_some_and(|fd| {
-                p[8] -= 1;
-                // The kernel fills the header checksum in.
-                let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-                to.sin_family = libc::AF_INET as u16;
-                to.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
-                let size = std::mem::size_of::<libc::sockaddr_in>() as u32;
-                unsafe { libc::sendto(fd.as_raw_fd(), p.as_ptr().cast(), p.len(), libc::MSG_DONTWAIT, (&to as *const libc::sockaddr_in).cast(), size) >= 0 }
-            });
-        match sent {
-            true => g.resent += 1,
-            false => g.dropped += 1,
+        if !g.moved || (fragment && zero_id) || p[8] <= 1 || self.resend.is_none() {
+            g.dropped += 1;
+            return false;
         }
+        p[8] -= 1;
+        let mut q = self.stragglers.lock().unwrap();
+        q.packets.push_back((ip, g.at, p.to_vec()));
+        !std::mem::replace(&mut q.draining, true)
+    }
+
+    fn drain_stragglers(&self, mut send: impl FnMut(Ipv4Addr, &[u8]) -> bool) {
+        loop {
+            let (ip, at, p) = {
+                let mut q = self.stragglers.lock().unwrap();
+                match q.packets.pop_front() {
+                    Some(p) => p,
+                    None => {
+                        q.draining = false;
+                        return;
+                    }
+                }
+            };
+            let sent = send(ip, &p);
+            // A new hold or release may have replaced this address while sending.
+            if let Some(g) = self.gone.lock().unwrap().get_mut(&ip).filter(|g| g.at == at) {
+                match sent {
+                    true => g.resent += 1,
+                    false => g.dropped += 1,
+                }
+            }
+        }
+    }
+
+    fn resend(&self, ip: Ipv4Addr, p: &[u8]) -> bool {
+        self.resend.as_ref().is_some_and(|fd| {
+            // The kernel fills the header checksum in.
+            let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            to.sin_family = libc::AF_INET as u16;
+            to.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
+            let size = std::mem::size_of::<libc::sockaddr_in>() as u32;
+            unsafe { libc::sendto(fd.as_raw_fd(), p.as_ptr().cast(), p.len(), libc::MSG_DONTWAIT, (&to as *const libc::sockaddr_in).cast(), size) >= 0 }
+        })
     }
 }
 
@@ -1051,6 +1092,96 @@ mod tests {
     }
 
     #[test]
+    fn stragglers_keep_read_order_while_the_sender_waits() {
+        let (mut h, _w) = paired();
+        // The send is supplied below; only socket presence is checked when queueing.
+        h.resend = Some(h.tun.try_clone().unwrap());
+        let ip = Ipv4Addr::new(10, 9, 0, 3);
+        h.gone.lock().unwrap().insert(ip, Gone::new(true));
+        let (sending, started) = std::sync::mpsc::channel();
+        let (queued, pending) = std::sync::mpsc::channel();
+        let mut output = Vec::new();
+        std::thread::scope(|sc| {
+            let (h, output) = (&h, &mut output);
+            sc.spawn(move || {
+                {
+                    let _rx = h.rx.lock().unwrap();
+                    assert!(h.straggler(ip, &mut udp_to(ip)));
+                }
+                h.drain_stragglers(|_, p| {
+                    assert!(h.rx.try_lock().is_ok());
+                    assert!(h.gone.try_lock().is_ok());
+                    assert!(h.stragglers.try_lock().is_ok());
+                    if output.is_empty() {
+                        sending.send(()).unwrap();
+                        pending.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    output.push(p[28]);
+                    true
+                });
+            });
+            sc.spawn(move || {
+                started.recv_timeout(Duration::from_secs(5)).unwrap();
+                for i in 1..=128 {
+                    let _rx = h.rx.lock().unwrap();
+                    let mut p = udp_to(ip);
+                    p[28] = i;
+                    assert!(!h.straggler(ip, &mut p), "the first reader still owns the drain");
+                }
+                queued.send(()).unwrap();
+            });
+        });
+        assert_eq!(output, (0..=128).collect::<Vec<_>>());
+        assert_eq!(h.gone.lock().unwrap()[&ip].resent, 129);
+        assert!(!h.stragglers.lock().unwrap().draining);
+        // An empty drain hands ownership back; a later reader starts it again.
+        {
+            let _rx = h.rx.lock().unwrap();
+            assert!(h.straggler(ip, &mut udp_to(ip)));
+        }
+        h.drain_stragglers(|_, _| false);
+        assert_eq!(h.gone.lock().unwrap()[&ip].dropped, 1);
+    }
+
+    #[test]
+    fn concurrent_stragglers_match_read_order() {
+        let (mut h, _w) = paired();
+        h.resend = Some(h.tun.try_clone().unwrap());
+        let ip = Ipv4Addr::new(10, 9, 0, 3);
+        h.gone.lock().unwrap().insert(ip, Gone::new(true));
+        let (read, output) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|sc| {
+            for t in 0..2u16 {
+                let (h, read, output, start) = (&h, &read, &output, &start);
+                sc.spawn(move || {
+                    start.wait();
+                    for i in 0..256u16 {
+                        let id = t * 256 + i;
+                        let drain = {
+                            let _rx = h.rx.lock().unwrap();
+                            read.lock().unwrap().push(id);
+                            let mut p = udp_to(ip);
+                            p[4..6].copy_from_slice(&id.to_be_bytes());
+                            h.straggler(ip, &mut p)
+                        };
+                        std::thread::yield_now();
+                        if drain {
+                            h.drain_stragglers(|_, p| {
+                                output.lock().unwrap().push(u16::from_be_bytes([p[4], p[5]]));
+                                std::thread::yield_now();
+                                true
+                            });
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(*output.lock().unwrap(), *read.lock().unwrap());
+        assert_eq!(h.gone.lock().unwrap()[&ip].resent, 512);
+    }
+
+    #[test]
     fn injector_sends_header_and_payload_in_order() {
         // An established TCP socket ignores the destination address; no raw socket privilege needed.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1070,7 +1201,18 @@ mod tests {
     /// Reading `tun`, with no routes or raw socket: nothing here needs root.
     fn holder(tun: OwnedFd) -> Holder {
         let (held, gone) = (Mutex::default(), Mutex::default());
-        Holder { dev: "test".into(), ifindex: 0, tun, held, reading: AtomicBool::new(false), routes: Mutex::new(()), rx: Mutex::new(()), gone, resend: None }
+        Holder {
+            dev: "test".into(),
+            ifindex: 0,
+            tun,
+            held,
+            reading: AtomicBool::new(false),
+            routes: Mutex::new(()),
+            rx: Mutex::new(()),
+            gone,
+            stragglers: Mutex::default(),
+            resend: None,
+        }
     }
 
     /// A holder reading a datagram socket standing in for its tun (the kernel's reads: one frame each), and the
@@ -1568,10 +1710,14 @@ mod tests {
         let mut frag = [0x45u8, 0, 0, 28, 0, 0, 0x20, 0, 64, 17, 0, 0, 10, 100, 254, 1, 10, 100, 254, 9, 0, 1, 0, 9, 0, 8, 0, 0];
         frag[16..20].copy_from_slice(&ip.octets());
         let before = counts(&a);
-        a.straggler(ip, &mut frag);
+        if a.straggler(ip, &mut frag) {
+            a.drain_stragglers(|ip, p| a.resend(ip, p));
+        }
         assert_eq!(counts(&a), (before.0, before.1 + 1));
         frag[4..6].copy_from_slice(&[0x12, 0x34]);
-        a.straggler(ip, &mut frag);
+        if a.straggler(ip, &mut frag) {
+            a.drain_stragglers(|ip, p| a.resend(ip, p));
+        }
         assert_eq!(counts(&a), (before.0 + 1, before.1 + 1));
     }
 }
