@@ -55,7 +55,14 @@ fn pins(root: &Path) {
     let checksums = std::fs::read_to_string(&checksums).expect("scripts/checksums.sha256");
     for (asset, var) in ASSETS {
         let url = format!("{base}/{asset}");
-        let found: Vec<&str> = checksums.lines().filter_map(|l| l.split_once(' ').filter(|(_, u)| u.trim() == url).map(|(h, _)| h)).collect();
+        let found: Vec<&str> = checksums
+            .lines()
+            .filter_map(|l| {
+                let mut fields = l.split_whitespace();
+                let hash = fields.next()?;
+                (fields.next()? == url).then_some(hash)
+            })
+            .collect();
         match found[..] {
             [] => println!(
                 "cargo:warning=scripts/checksums.sha256 pins no {url}: this flexvm cannot download {asset} (scripts/pin-artifacts.sh pins it once the release exists)"
