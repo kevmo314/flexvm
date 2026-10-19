@@ -91,8 +91,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
         crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Some(Duration::from_secs(5)));
     }
     let reply = match verb {
-        // `applied`: the run's settings were (an older agent ignored them).
-        "APP" => start(arg, statuses).map(|pid| format!("ok {pid}{}", if arg.trim().is_empty() { "" } else { " applied" })),
+        "APP" => start(arg, statuses),
         "APPSTATUS" => Ok(APP.lock().unwrap().status()),
         "CHECK" => check(arg, statuses),
         "SIGNAL" => signal(arg, statuses),
@@ -101,7 +100,6 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
             let offset = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             return logs(out, offset, a.next() == Some("1"));
         }
-        "APPIN" => return appin(arg, out, &[]),
         "PROBE" => match arg.trim().parse::<u16>() {
             Ok(port) => TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), Duration::from_millis(500)).map(|_| "ok".into()),
             Err(_) => Err(io::Error::other(format!("bad port {arg:?}"))),
@@ -537,10 +535,10 @@ pub(crate) fn credentials(cmd: &mut Command, c: &Conf, own_session: bool) {
     }
 }
 
-fn start(settings: &str, statuses: &Statuses) -> io::Result<i32> {
+fn start(settings: &str, statuses: &Statuses) -> io::Result<String> {
     let mut app = APP.lock().unwrap();
     if let State::Running(pid) = app.state {
-        return Ok(pid);
+        return Ok(format!("ok {pid}{}", if settings.trim().is_empty() { "" } else { " ignored" }));
     }
     let settings = unhex(settings.trim()).ok_or_else(|| io::Error::other("bad app settings encoding"))?;
     let c = &mut with_settings(config()?, &String::from_utf8_lossy(&settings))?;
@@ -565,7 +563,7 @@ fn start(settings: &str, statuses: &Statuses) -> io::Result<i32> {
     }
     *RUN.lock().unwrap() = Some(c.clone());
     app.push(FRAME_NOTE, format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
-    Ok(pid)
+    Ok(format!("ok {pid}{}", if settings.is_empty() { "" } else { " applied" }))
 }
 
 /// Its supervisor (returned) logs output as an exec session's: until its exit and `DRAIN` more, then
@@ -669,6 +667,21 @@ fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn running_app_ignores_new_settings() {
+        // Alone in a process: this test owns APP.
+        const CHILD: &str = "FLEXVM_APP_SETTINGS_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "app::tests::running_app_ignores_new_settings";
+            assert!(Command::new(std::env::current_exe().unwrap()).args(["--exact", name]).env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        APP.lock().unwrap().state = State::Running(42);
+        let statuses = Statuses::default();
+        assert_eq!(start("", &statuses).unwrap(), "ok 42");
+        assert_eq!(start("656e76204b3d560a", &statuses).unwrap(), "ok 42 ignored");
+    }
 
     fn exec(argv: &[&str], env: &[&str], workdir: Option<&str>, user: Option<&str>) -> crate::proto::Exec {
         let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();

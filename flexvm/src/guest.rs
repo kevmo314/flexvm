@@ -329,13 +329,17 @@ pub fn start_app(uds: &Path, settings: &str) -> Result<u32> {
     app_started(&reply, !settings.is_empty())
 }
 
-/// `ok <pid>`, and ` applied` if settings were sent: an agent that predates them starts the image's app as is.
+/// `ok <pid>`, and ` applied` or ` ignored` if settings were sent: an older agent starts the image's app as is.
 fn app_started(reply: &str, settings: bool) -> Result<u32> {
     let Some(rest) = reply.strip_prefix("ok ") else { bail!("starting the app: {}", reply.trim_start_matches("error: ")) };
     let mut words = rest.split_whitespace();
     let pid = words.next().ok_or("starting the app: no pid")?.parse()?;
-    if settings && words.next() != Some("applied") {
-        bail!("its template's flexvm-init predates -e, --env-file and --entrypoint at run, so its app started without them: pull its image again");
+    if settings {
+        match words.next() {
+            Some("applied") => {}
+            Some("ignored") => bail!("the app is already running, so its run settings were ignored"),
+            _ => bail!("its template's flexvm-init predates -e, --env-file and --entrypoint at run, so its app started without them: pull its image again"),
+        }
     }
     Ok(pid)
 }
@@ -475,6 +479,8 @@ mod tests {
     fn run_settings_must_be_applied_by_the_agent() {
         assert_eq!(app_started("ok 42", false).unwrap(), 42);
         assert_eq!(app_started("ok 42 applied", true).unwrap(), 42);
+        assert_eq!(app_started("ok 42 ignored", false).unwrap(), 42);
+        assert!(app_started("ok 42 ignored", true).unwrap_err().to_string().contains("already running"));
         assert!(app_started("ok 42", true).unwrap_err().to_string().contains("pull its image again"), "an older agent ignores them");
         assert!(app_started("error: no app", false).unwrap_err().to_string().contains("no app"));
         assert!(app_started("ok x", false).is_err());
