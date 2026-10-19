@@ -127,7 +127,9 @@ impl Pager {
     /// passing over one busy writing requests.
     pub(super) fn queue_fault(&self, job: Job) {
         let queued = |l: &Lane| l.q.try_lock().map_or(usize::MAX, |q| q.jobs.len());
-        let lane = self.lanes[..FAULT_FETCHERS].iter().min_by_key(|l| queued(l)).unwrap();
+        // Test gate `fetch_connect_gate` holds the last fault fetcher: none of its runs go there meanwhile.
+        let n = FAULT_FETCHERS - usize::from(crate::host::fault("fetch_connect_gate"));
+        let lane = self.lanes[..n].iter().min_by_key(|l| queued(l)).unwrap();
         lane.push(job);
     }
 
@@ -141,10 +143,8 @@ impl Pager {
         let buf = storage.bytes();
         let pages = self.pages();
         // Connects ahead of the first fault (nothing to read).
-        if let Err(e) = fetch(0, &mut [], &self.stop, &mut |_| true) {
-            if !self.stop.load(Ordering::SeqCst) {
-                return self.fail(format!("fetching pages for faults: {e}"));
-            }
+        if let Err(e) = connect_ahead(fetch, &self.stop, || self.pulling()) {
+            return self.fail(format!("fetching pages for faults: {e}"));
         }
         loop {
             let (page, n, queued) = {
@@ -254,6 +254,17 @@ impl Pager {
             Err(Failed::Fetch(_)) if resolved == n => Ok(()),
             r => r,
         }
+    }
+}
+
+/// Connects ahead only while pages remain; another worker may finish during the attempt.
+pub(super) fn connect_ahead(fetch: &mut FetchAny<'_>, stop: &AtomicBool, pulling: impl Fn() -> bool) -> io::Result<()> {
+    if !pulling() {
+        return Ok(());
+    }
+    match fetch(0, &mut [], stop, &mut |_| true) {
+        Err(_) if !pulling() => Ok(()),
+        res => res,
     }
 }
 
@@ -385,25 +396,30 @@ impl Link {
         PageClient::new(stream, &self.source, at)
     }
 
-    /// Reads guest memory, optionally from `lane`'s queued request. Reconnects until stopped or the outage is too long.
+    /// Reads guest memory, optionally from `lane`'s queued request. Reconnects until `stopped` says so or the outage is too long.
     pub(super) fn fetch_with(
         &mut self,
         lane: Option<&Lane>,
         offset: u64,
         buf: &mut [u8],
-        stop: &AtomicBool,
+        stopped: &dyn Fn() -> bool,
         progress: &mut dyn FnMut(&[u8]) -> bool,
     ) -> io::Result<()> {
         // A fault waits for the first page of its run: it is asked for first.
         let head = if lane.is_some() { PAGE_SIZE } else { 0 };
         loop {
+            if stopped() {
+                return Err(io::Error::other(FetchFailure::Cancelled));
+            }
             let Some(client) = self.client.as_mut() else {
-                if stop.load(Ordering::SeqCst) {
-                    return Err(io::Error::other("pager stopped"));
+                let wait = self.retry_at.saturating_duration_since(Instant::now());
+                if !wait.is_zero() {
+                    thread::sleep(wait.min(BACKOFF_MIN));
+                    continue;
                 }
-                thread::sleep(self.retry_at.saturating_duration_since(Instant::now()));
                 match self.connect() {
                     Ok(c) => self.client = Some(c),
+                    Err(_) if stopped() => return Err(io::Error::other(FetchFailure::Cancelled)),
                     Err(e) => self.lost(e)?,
                 }
                 continue;
@@ -431,7 +447,7 @@ impl Link {
                         lane.detach();
                     }
                     // Stopped by the caller: the source is fine.
-                    if matches!(fetch_failure(&e), Some(FetchFailure::Cancelled)) {
+                    if stopped() || matches!(fetch_failure(&e), Some(FetchFailure::Cancelled)) {
                         return Err(e);
                     }
                     // Pages kept arriving, just not all in time: the source is alive, and the caller asks for the rest
@@ -718,6 +734,60 @@ pub(super) fn fatal(e: &io::Error) -> bool {
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+
+    #[test]
+    fn eager_connect_stops_when_pages_finish_or_the_pager_stops() {
+        use std::sync::atomic::AtomicUsize;
+        for (before, after, stopped) in [(0, 0, false), (1, 0, false), (1, 1, true), (1, 1, false)] {
+            let remote = AtomicUsize::new(before);
+            let stop = AtomicBool::new(false);
+            let mut fetch = |_: u64, _: &mut [u8], _: &AtomicBool, _: &mut dyn FnMut(&[u8]) -> bool| {
+                assert!(before > 0, "no connect without remote pages");
+                remote.store(after, Ordering::SeqCst);
+                stop.store(stopped, Ordering::SeqCst);
+                Err(io::Error::other("source gone"))
+            };
+            let res = connect_ahead(&mut fetch, &stop, || !stop.load(Ordering::SeqCst) && remote.load(Ordering::SeqCst) > 0);
+            assert_eq!(res.is_err(), before > 0 && after > 0 && !stopped);
+        }
+    }
+
+    #[test]
+    fn reconnect_checks_completion_before_reporting_source_timeout() {
+        for finish in [true, false] {
+            let source = Source { addr: "invalid address".into(), vm: "v".into(), mig: 1, regions: Vec::new() };
+            let mut link = Link::new(source);
+            link.down = Some(Instant::now() - SOURCE_TIMEOUT);
+            let checks = std::cell::Cell::new(0);
+            let stopped = || {
+                checks.set(checks.get() + 1);
+                finish && checks.get() > 1
+            };
+            let e = link.fetch_with(None, 0, &mut [], &stopped, &mut |_| true).unwrap_err();
+            assert_eq!(fatal(&e), !finish);
+            assert_eq!(checks.get(), 2, "completion checked before and after connecting");
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_notices_completion_and_stop_promptly() {
+        for remote_done in [true, false] {
+            let source = Source { addr: "invalid address".into(), vm: "v".into(), mig: 1, regions: Vec::new() };
+            let mut link = Link::new(source);
+            link.retry_at = Instant::now() + BACKOFF_MAX;
+            let start = Instant::now();
+            let stopped = || {
+                let done = start.elapsed() >= BACKOFF_MIN;
+                let remote = usize::from(!(remote_done && done));
+                let stop = !remote_done && done;
+                stop || remote == 0
+            };
+            let e = link.fetch_with(None, 0, &mut [], &stopped, &mut |_| true).unwrap_err();
+            assert!(matches!(fetch_failure(&e), Some(FetchFailure::Cancelled)));
+            assert!(start.elapsed() < CONNECT_TIMEOUT, "did not wait out the backoff");
+            assert!(link.down.is_none(), "no connect after completion or stop");
+        }
+    }
 
     #[test]
     fn source_addresses_are_kept_and_looked_up_again_only_after_a_failed_connect() {

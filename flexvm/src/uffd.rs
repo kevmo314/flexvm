@@ -433,9 +433,11 @@ impl Pager {
             match origin {
                 Origin::Peer(source) => {
                     // Connect now: the restore itself faults on remote pages.
-                    let mut link = Link::new(source);
-                    link.client = link.connect().ok();
-                    *self.remote.lock().unwrap() = Some(link);
+                    if remote > 0 {
+                        let mut link = Link::new(source);
+                        link.client = link.connect().ok();
+                        *self.remote.lock().unwrap() = Some(link);
+                    }
                 }
                 Origin::File(file) => {
                     self.from_file.store(true, Ordering::SeqCst);

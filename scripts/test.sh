@@ -77,8 +77,9 @@ finish() {
         wait "$client_pid" 2>/dev/null
     fi
     if (( lab_started )); then
-        mkdir -p "$work/log"
-        cp /run/flexvm-lab-{A,B}/run/vms/*.log "$work/log/" 2>/dev/null
+        mkdir -p "$work/log/"{A,B}
+        cp /run/flexvm-lab-A/run/vms/*.log "$work/log/A/" 2>/dev/null
+        cp /run/flexvm-lab-B/run/vms/*.log "$work/log/B/" 2>/dev/null
         if ! "$netlab" down; then
             results[5]=FAIL
             echo 'FAIL: netlab.sh down'
@@ -113,7 +114,7 @@ finish() {
     done
     printf 'Summary: %d PASS, %d FAIL, %d SKIP\n' "$passed" "$failed" "$skipped"
     if (( failed != 0 || status != 0 )); then
-        echo "See $root/listen-A.log, $root/listen-B.log and the VM logs in $work/log." >&2
+        echo "See $root/listen-A.log, $root/listen-B.log and the VM logs in $work/log/A and $work/log/B." >&2
         if [[ -n "$work" ]]; then echo "Test diagnostics retained in $work" >&2; fi
         exit 1
     fi
