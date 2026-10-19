@@ -1752,7 +1752,9 @@ pub fn collect(paths: &Paths, idle: Duration, in_use: &dyn Fn() -> BTreeSet<Stri
         let Ok(handle) = File::open(&dir) else { continue };
         let st = crate::util::fstat(handle.as_raw_fd())?;
         let open = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))?.is_none();
-        if open || users.get_or_insert_with(in_use).contains(&id) {
+        // A checkpoint here that cannot be read (`KEEP_ALL`) may use any: each counts as used now.
+        let users = users.get_or_insert_with(in_use);
+        if open || users.contains(&id) || users.iter().any(|u| u.starts_with(KEEP_ALL)) {
             crate::util::check(unsafe { libc::futimens(handle.as_raw_fd(), std::ptr::null()) })?;
             continue;
         }
@@ -2264,6 +2266,9 @@ pub(crate) mod tests {
         // Used by a VM record or checkpoint here: kept.
         age(7200);
         assert!(collect(&paths, RECEIVED_IDLE, &|| BTreeSet::from([id.clone()])).unwrap().is_empty());
+        // While a checkpoint record here cannot be read: kept, and stamped.
+        age(7200);
+        assert!(collect(&paths, Duration::ZERO, &|| BTreeSet::from([format!("{KEEP_ALL}a checkpoint here cannot be read")])).unwrap().is_empty());
         // Unused, but not for long: kept.
         assert!(collect(&paths, RECEIVED_IDLE, &none).unwrap().is_empty() && Template::generation(&paths, &id).is_some());
         // Named here: kept (`image prune` and `rmi` decide).
