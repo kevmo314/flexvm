@@ -959,22 +959,32 @@ mod tests {
 
     #[test]
     fn wait_blocks_until_the_holder_ends_and_takes_its_record() {
+        use crate::test_util::{asleep, sleeper, wait_until, JoinWithin, WAIT};
+
         let (_d, host) = host("wait-live");
         // Held here, as a VM process holds its name: the holder it names is a child, waited on by its pidfd.
         let lock = host.take_name("job", false).unwrap();
-        let mut child = std::process::Command::new("sleep").arg("0.3").spawn().unwrap();
+        let mut child = sleeper(60);
         let id = Ident::of(child.id()).unwrap();
         std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&id).unwrap()).unwrap();
         record_exit(&host, "job", &Ident { pid: 1, start: 1, boot: "b".into() }, 1);
         let h = host.clone();
-        let started = Instant::now();
-        let waiter = std::thread::spawn(move || wait(&h, "job"));
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!waiter.is_finished(), "an earlier instance's record is not this one's");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(unsafe { libc::gettid() }).unwrap();
+            wait(&h, "job")
+        });
+        let tid = rx.recv_timeout(WAIT).unwrap();
+        // With a populated lock record, the waiter blocks on the holder's pidfd.
+        wait_until("the waiter to block on the holder", || {
+            assert!(!waiter.is_finished(), "an earlier instance's record is not this one's");
+            asleep(tid)
+        });
         record_exit(&host, "job", &id, 5);
+        assert!(!waiter.is_finished(), "it must wait for the holder's process even with its exit record present");
+        child.kill().unwrap();
         child.wait().unwrap();
-        assert_eq!(waiter.join().unwrap().unwrap(), 5);
-        assert!(started.elapsed() >= Duration::from_millis(200), "it waited for the holder's process");
+        assert_eq!(waiter.join_within().unwrap().unwrap(), 5);
         drop(lock);
     }
 
