@@ -1193,7 +1193,7 @@ impl Prepared {
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
             grant_backoff: Mutex::default(),
-            limit: crate::limit::Limit::new(idle.cgroup.clone()),
+            limit: crate::limit::Limit::new(idle.cgroup()),
             reports_held: AtomicBool::new(false),
             cow_copy: Mutex::new(false),
             execs: Mutex::new(HashMap::new()),

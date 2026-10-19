@@ -80,6 +80,7 @@ pub struct Limit {
 
 impl Limit {
     pub fn new(cgroup: Option<PathBuf>) -> Limit {
+        let cgroup = cgroup.filter(|cg| cg.join("memory.high").exists());
         Limit { cgroup, mark: Mutex::new(Mark::default()), throttled: AtomicBool::new(false) }
     }
 
@@ -298,6 +299,16 @@ impl Drop for Lifted<'_> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn no_memory_controller_leaves_memory_features_off() {
+        let dir = crate::test_util::TempDir::new("limit-no-memory");
+        let limit = Limit::new(Some(dir.to_path_buf()));
+        limit.start(512, 1024);
+        assert_eq!(limit.admitted(), 0);
+        assert_eq!(limit.used(), None);
+        assert!(!dir.join("memory.high").exists());
+    }
 
     /// A cgroup's memory files in a plain directory.
     fn cgroup(tag: &str) -> (crate::test_util::TempDir, Limit, PathBuf, Host) {

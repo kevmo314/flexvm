@@ -1230,7 +1230,8 @@ fn restore_nofile() -> io::Result<()> {
 
 /// Clears the signal mask of `cmd`'s child, which exec keeps: a spawner that blocks signals to
 /// wait for them itself (`block_signals`) would otherwise pass them on blocked. Its soft open-file
-/// limit is the one this process started with too (`raise_nofile`).
+/// limit is the one this process started with too (`raise_nofile`); terminal stop signals
+/// ignored by a VM process get their default dispositions back.
 pub fn unblock_signals_in(cmd: &mut std::process::Command) -> &mut std::process::Command {
     use std::os::unix::process::CommandExt;
     unsafe {
@@ -1238,9 +1239,21 @@ pub fn unblock_signals_in(cmd: &mut std::process::Command) -> &mut std::process:
             let mut none: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut none);
             check(libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()))?;
+            default_stop_signals()?;
             restore_nofile()
         })
     }
+}
+
+/// In a child before exec: SIGTTOU and SIGTTIN, which a VM process ignores (and exec would
+/// keep ignored), back to their defaults.
+fn default_stop_signals() -> io::Result<()> {
+    for sig in [libc::SIGTTOU, libc::SIGTTIN] {
+        if unsafe { libc::signal(sig, libc::SIG_DFL) } == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Runs `cmd` with its output captured, its signals unblocked, polling `stop`: once that fails,
@@ -1517,6 +1530,7 @@ pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(
             };
             // A VM process's raised limit is its own: a flexvm child raises its own if it needs to.
             restore_nofile()?;
+            default_stop_signals()?;
             let (fd4, fd5) = (aside(fd4)?, aside(fd5)?);
             // dup2 onto itself would leave it close-on-exec.
             let moved = if fd3 == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd3, 3) };
@@ -2224,6 +2238,27 @@ mod tests {
         std::fs::write(root.join("vm-7-9/cgroup.procs"), b"").unwrap();
         assert!(!scope(prefix, 7, 9));
         assert_eq!(std::fs::read(root.join("vm-7-9/cgroup.procs")).unwrap(), b"");
+    }
+
+    #[test]
+    fn children_restore_terminal_stop_dispositions() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("grep");
+        cmd.args(["SigIgn", "/proc/self/status"]);
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let out = unblock_signals_in(&mut cmd).output().unwrap();
+        assert!(out.status.success());
+        let ignored = String::from_utf8(out.stdout).unwrap();
+        let mask = u64::from_str_radix(ignored.split_whitespace().nth(1).unwrap(), 16).unwrap();
+        for sig in [libc::SIGTTOU, libc::SIGTTIN] {
+            assert_eq!(mask & (1 << (sig - 1)), 0);
+        }
     }
 
     #[test]

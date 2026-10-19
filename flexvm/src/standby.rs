@@ -763,8 +763,9 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     {
         let s = p.standby.lock().unwrap();
         let fc = s.as_ref().ok_or_else(|| ("standby vm gone".into(), true))?.firecracker();
+        // Before its name is taken: another standby, or a cold start, may still hold the cap.
         match fc.set_cpu_max(&resources.cpu_max()) {
-            Err(e) if resources.cpus.is_some() => return Err((e, false)),
+            Err(e) if resources.cpus.is_some() => return Err((e, true)),
             _ => {}
         }
     }
