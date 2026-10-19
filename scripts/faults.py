@@ -41,7 +41,7 @@ for h in "ab":
     p.add_argument(f"--{h}-listen-log", help=f"host {h.upper()}'s listener log (default: its run directory's listen.log)")
 p.add_argument("--no-listeners", action="store_true", help="use the listeners already running on --a and --b")
 p.add_argument("--bin", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "flexvm"))
-p.add_argument("--state", default="/var/lib/flexvm", help="the state directory whose artifacts and templates the hosts use")
+p.add_argument("--state", default=os.environ.get("FLEXVM_STATE_DIR") or "/var/lib/flexvm", help="the state directory whose artifacts and templates the hosts use")
 p.add_argument("--ckpt-dir", help="where checkpoint scenarios write checkpoints (removed afterwards; default: this run's own, "
                "under /var/tmp)")
 p.add_argument("--no-skips", action="store_true", help="a skipped scenario counts as a failure")

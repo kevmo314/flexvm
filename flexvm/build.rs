@@ -38,6 +38,7 @@ fn state_dir() {
         "FLEXVM_STATE_DIR must be an absolute path without . or .. components, not {dir:?}"
     );
     assert!(!dir.contains(['\n', '\r']), "FLEXVM_STATE_DIR must not contain a newline");
+    assert!(path.components().count() > 1, "FLEXVM_STATE_DIR must not be the root directory");
     println!("cargo:rustc-env=FLEXVM_DEFAULT_STATE={}", dir.trim_end_matches('/'));
 }
 

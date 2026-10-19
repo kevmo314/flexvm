@@ -16,7 +16,7 @@ usage: sudo scripts/test-image.py [--state DIR] [--squashfs FILE] OUT
 import argparse, hashlib, json, os, shutil, subprocess, sys, tempfile
 
 p = argparse.ArgumentParser(usage=__doc__)
-p.add_argument("--state", default="/var/lib/flexvm")
+p.add_argument("--state", default=os.environ.get("FLEXVM_STATE_DIR") or "/var/lib/flexvm")
 p.add_argument("--squashfs", help="default: STATE/artifacts/base.squashfs")
 p.add_argument("out")
 args = p.parse_args()

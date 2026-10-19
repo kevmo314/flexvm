@@ -17,7 +17,13 @@ artifacts (`artifacts/`), templates (`templates/`), pulled images
 binary with another default, set `FLEXVM_STATE_DIR` to an absolute path when
 building (`FLEXVM_STATE_DIR=/srv/flexvm cargo build --release`); `--state`
 still overrides it at run time. This README writes `/var/lib/flexvm` for
-whichever default the binary was built with.
+whichever default the binary was built with. The test and lab scripts
+(`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`) take
+`FLEXVM_STATE_DIR` from the environment too; `fetch.sh` and
+`build-firecracker.sh` take `--state`. `/run/flexvm` is only ever the default
+state's, so to change the default on a host whose old default state is in use,
+move that state to the new path, or stop its VMs and remove its `run.json` so it
+binds a run directory of its own (`/run/flexvm-PREFIX`) under `--state`.
 
 ```sh
 cargo build --release && sudo install target/release/flexvm /usr/local/bin/

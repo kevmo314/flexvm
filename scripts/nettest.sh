@@ -20,7 +20,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=${FLEXVM:-$root/target/release/flexvm}
-state=$(realpath -m "${STATE:-/var/lib/flexvm}")
+state=$(realpath -m "${STATE:-${FLEXVM_STATE_DIR:-/var/lib/flexvm}}")
 # Removes the records (#869) of the states under each DIR as users of STATE's templates: a recorded
 # state that is gone keeps every <none> generation there.
 forget_states() {

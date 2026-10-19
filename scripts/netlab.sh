@@ -6,12 +6,12 @@
 #   fvC  192.168.100.10  a plain client machine
 #
 # usage: netlab.sh up | down | listeners | stop | fv A|B ARGS...
-# The hosts use the artifacts and templates of STATE (default /var/lib/flexvm).
+# The hosts use the artifacts and templates of STATE (default $FLEXVM_STATE_DIR, else /var/lib/flexvm).
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=$root/target/release/flexvm
-state=$(realpath -m "${STATE:-/var/lib/flexvm}")
+state=$(realpath -m "${STATE:-${FLEXVM_STATE_DIR:-/var/lib/flexvm}}")
 # Removes the records (#869) of the states under each DIR as users of STATE's templates: a recorded
 # state that is gone keeps every <none> generation there.
 forget_states() {

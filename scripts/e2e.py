@@ -37,7 +37,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--bin", default=os.path.join(ROOT, "target", "release", "flexvm"))
-p.add_argument("--state", default="/var/lib/flexvm", help="the state directory whose artifacts/ the scripts installed")
+p.add_argument("--state", default=os.environ.get("FLEXVM_STATE_DIR") or "/var/lib/flexvm", help="the state directory whose artifacts/ the scripts installed")
 p.add_argument("--log-dir", default="/tmp/fvci-logs", help="listener, VM and Firecracker logs end up here")
 p.add_argument("--port-a", type=int, default=7140, help="lane 0's host A listens here, its host B on the next port; "
                "each further lane takes the next two")
