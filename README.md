@@ -13,7 +13,18 @@ process and the VM is gone, send it a signal and the VM pauses or suspends.
 
 Everything flexvm keeps lives in its state directory, `/var/lib/flexvm`: the
 artifacts (`artifacts/`), templates (`templates/`), pulled images
-(`images/`), VMs and the host's configuration (`host.json`).
+(`images/`), VMs and the host's configuration (`host.json`). To build a
+binary with another default, set `FLEXVM_STATE_DIR` to an absolute path when
+building (`FLEXVM_STATE_DIR=/srv/flexvm cargo build --release`); `--state`
+still overrides it at run time. This README writes `/var/lib/flexvm` for
+whichever default the binary was built with, except where it says which state
+owns `/run/flexvm`: that is always the literal `/var/lib/flexvm`. The test and lab scripts
+(`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`) take
+`FLEXVM_STATE_DIR` from the environment too; `fetch.sh` and
+`build-firecracker.sh` take `--state`. `/run/flexvm` stays `/var/lib/flexvm`'s whatever the
+built-in default: a binary built with another default runs its state in
+`/run/flexvm-PREFIX`, and an existing `/var/lib/flexvm` keeps working with
+`--state /var/lib/flexvm`, so both can be used side by side.
 
 ```sh
 cargo build --release && sudo install target/release/flexvm /usr/local/bin/
@@ -848,7 +859,7 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 
 | flag | default | what |
 |---|---|---|
-| `--state DIR` | `/var/lib/flexvm` | everything on disk: `host.json` (see Configuration), `artifacts/` (`firecracker`, `vmlinux`; `base.squashfs`, the tests' base rootfs), `templates/` (a link per image name to its current generation in `templates/.gen/`), `images/` (layer blobs and image root filesystems), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), addresses, stopped VMs |
+| `--state DIR` | `/var/lib/flexvm` (or `FLEXVM_STATE_DIR` at build time) | everything on disk: `host.json` (see Configuration), `artifacts/` (`firecracker`, `vmlinux`; `base.squashfs`, the tests' base rootfs), `templates/` (a link per image name to its current generation in `templates/.gen/`), `images/` (layer blobs and image root filesystems), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), addresses, stopped VMs |
 | `--run DIR` | `/run/flexvm` (another `--state`'s: `/run/flexvm-PREFIX`) | registry, sockets, logs, exit statuses (tmpfs) |
 
 `pull` writes the flexvm-init built into flexvm into the image as PID 1 (`--init PATH`
@@ -864,8 +875,8 @@ path in `run.json`, and the run directory records its state in `state.json`; usi
 either with a different partner is refused. Without `--run`, the run directory follows
 from the state's path alone (`/run/flexvm` for `/var/lib/flexvm`, `/run/flexvm-PREFIX` for
 any other), so after a reboot no state defaults into another's; a state bound to any other
-run directory must be given it. `/run/flexvm` belongs to `/var/lib/flexvm` alone: any other state is
-refused it, even with `--run`.
+run directory must be given it. `/run/flexvm` belongs to `/var/lib/flexvm` alone, whatever default the binary was built with: any other
+state is refused it, even with `--run`.
 `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 
