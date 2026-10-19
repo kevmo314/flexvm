@@ -92,6 +92,7 @@ impl<'a> Index<'a> {
 }
 
 /// Every stored checkpoint, oldest first, with its name: staging and removed ones are not.
+/// Listing failures are unreadable entries named for the directory, never checkpoint ids.
 pub fn list(state: &Path) -> Vec<Entry> {
     let mut names: BTreeMap<String, String> = std::fs::read_dir(dir(state).join(NAMES))
         .into_iter()
@@ -100,9 +101,9 @@ pub fn list(state: &Path) -> Vec<Entry> {
         .filter_map(|e| Some((std::fs::read_link(e.path()).ok()?.file_name()?.to_str()?.to_string(), e.file_name().into_string().ok()?)))
         .collect();
     let mut all: Vec<Entry> = managed(state)
-        .filter_map(|(dir, manifest)| {
-            let id = dir.file_name()?.to_str().filter(|id| is_id(id))?.to_string();
-            Some(Entry { name: names.remove(&id), id, dir, manifest })
+        .map(|(dir, manifest)| {
+            let id = dir.file_name().unwrap().to_string_lossy().into_owned();
+            Entry { name: names.remove(&id), id, dir, manifest }
         })
         .collect();
     all.sort_by(|a, b| (a.manifest.as_ref().map_or(0, |m| m.created_unix_ms), &a.id).cmp(&(b.manifest.as_ref().map_or(0, |m| m.created_unix_ms), &b.id)));
@@ -118,10 +119,14 @@ pub fn find<'a>(all: &'a [Entry], what: &str) -> Result<&'a Entry> {
     if let Some(e) = all.iter().find(|e| e.name.as_deref() == Some(what)) {
         return Ok(e);
     }
-    let found: Vec<&Entry> = all.iter().filter(|e| what.len() >= 4 && e.id.starts_with(what)).collect();
+    let found: Vec<&Entry> = all.iter().filter(|e| what.len() >= 4 && is_id(&e.id) && e.id.starts_with(what)).collect();
     match found[..] {
         [e] => Ok(e),
-        [] => bail!("no checkpoint {what:?} (see flexvm checkpoint ls)"),
+        [] => match all.iter().find(|e| !is_id(&e.id)) {
+            // It may be among those the listing missed.
+            Some(e) => bail!("no checkpoint {what:?} found: {}", e.manifest.as_ref().unwrap_err()),
+            None => bail!("no checkpoint {what:?} (see flexvm checkpoint ls)"),
+        },
         _ => bail!("{what:?} is the start of {} checkpoint ids; give more of it", found.len()),
     }
 }
@@ -201,6 +206,9 @@ pub(super) fn pruning(all: &[Entry], before: Option<u64>) -> Result<Vec<usize>> 
 /// An unreadable checkpoint may build on any other: refused while one is kept (only `rm -f` of
 /// it removes it). Nothing is removed, so a passing error (EMFILE) fails only this command.
 fn readable_or_removed(all: &[Entry], doomed: &BTreeSet<usize>, force: bool) -> Result<()> {
+    if let Some(e) = all.iter().find(|e| !is_id(&e.id)) {
+        bail!("nothing removed: {}", e.manifest.as_ref().unwrap_err());
+    }
     let unreadable: Vec<&Entry> = all.iter().enumerate().filter(|(i, e)| e.manifest.is_err() && !(force && doomed.contains(i))).map(|(_, e)| e).collect();
     if unreadable.is_empty() {
         return Ok(());

@@ -287,6 +287,14 @@ fn transient(e: &io::Error) -> bool {
     matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
 }
 
+fn rest(e: &io::Error, resting: &mut Option<Instant>) -> bool {
+    let exhausted = matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM));
+    if exhausted {
+        *resting = Some(Instant::now() + ACCEPT_REST);
+    }
+    exhausted
+}
+
 struct Connection {
     client: TcpStream,
     guest: TcpStream,
@@ -374,7 +382,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
         for (listener, fd) in listeners.iter().zip(&accepting) {
             // Attempts are bounded too: a client whose guest connect fails (EMFILE, say) is dropped,
             // and a flood of them must still let the loop see its stop.
-            if !ready(fd) {
+            if resting.is_some() || !ready(fd) {
                 continue;
             }
             for _ in 0..CONNECTIONS {
@@ -384,14 +392,12 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 let client = match listener.accept() {
                     Ok((client, _)) => client,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)) => {
-                        resting = Some(Instant::now() + ACCEPT_REST);
-                        break;
-                    }
+                    Err(e) if rest(&e, &mut resting) => break,
                     Err(_) => break,
                 };
-                if let Ok(guest) = connect(target) {
-                    if client.set_nonblocking(true).is_ok() {
+                match connect(target) {
+                    Err(e) if rest(&e, &mut resting) => break,
+                    Ok(guest) if client.set_nonblocking(true).is_ok() => {
                         connections.push(Connection {
                             client,
                             guest,
@@ -403,6 +409,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                             incoming: Direction::default(),
                         });
                     }
+                    _ => {}
                 }
             }
         }
@@ -570,6 +577,22 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn socket_exhaustion_rests_accepting() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let mut resting = None;
+            let before = Instant::now();
+            assert!(rest(&io::Error::from_raw_os_error(errno), &mut resting));
+            assert!(resting.unwrap() >= before + ACCEPT_REST);
+            assert!(resting.unwrap() <= Instant::now() + ACCEPT_REST);
+        }
+        for errno in [libc::ECONNREFUSED, libc::EINTR, libc::EAGAIN] {
+            let mut resting = None;
+            assert!(!rest(&io::Error::from_raw_os_error(errno), &mut resting));
+            assert!(resting.is_none());
+        }
+    }
 
     #[test]
     fn udp_admission_preserves_recent_sessions() {
@@ -782,18 +805,20 @@ mod tests {
     }
 
     #[test]
-    fn out_of_descriptors_accepting_rests_and_forwards_go_on() {
+    fn out_of_descriptors_accepting_or_connecting_rests_and_forwards_go_on() {
         const CHILD: &str = "FLEXVM_TEST_ACCEPT_EMFILE";
-        if std::env::var_os(CHILD).is_none() {
+        let Ok(stage) = std::env::var(CHILD) else {
             // Alone in a process: it runs out of descriptors.
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "ports::tests::out_of_descriptors_accepting_rests_and_forwards_go_on"])
-                .env(CHILD, "1")
-                .status()
-                .unwrap();
-            assert!(status.success(), "{status}");
+            for stage in ["accept", "connect"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "ports::tests::out_of_descriptors_accepting_or_connecting_rests_and_forwards_go_on"])
+                    .env(CHILD, stage)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{stage}: {status}");
+            }
             return;
-        }
+        };
         unsafe {
             let mut limit: libc::rlimit = std::mem::zeroed();
             assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
@@ -806,8 +831,11 @@ mod tests {
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
         echo(&mut client, &mut server);
         let mut fillers: Vec<std::fs::File> = std::iter::from_fn(|| std::fs::File::open("/dev/null").ok()).collect();
-        // One free for the pending client, none for the worker to accept it with.
+        // One for the pending client; optionally one to accept it, but none for its guest socket.
         fillers.pop();
+        if stage == "connect" {
+            fillers.pop();
+        }
         let _pending = TcpStream::connect(addr).unwrap();
         let cpu = || unsafe {
             let mut u: libc::rusage = std::mem::zeroed();
@@ -823,6 +851,7 @@ mod tests {
         thread::sleep(Duration::from_secs(1));
         assert!(cpu() - used < Duration::from_millis(500), "spinning: {:?} of CPU", cpu() - used);
         drop(fillers);
+        let _retry = (stage == "connect").then(|| TcpStream::connect(addr).unwrap());
         let _accepted = crate::test_util::accept_tcp(&guest);
         halt(&stop, worker);
     }
