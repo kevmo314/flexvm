@@ -468,12 +468,20 @@ The store's lock (`checkpoints/.locks/store`, a flock) orders the rest:
   leaves whole chains, perhaps one checkpoint unnamed. A checkpoint may have
   several names (`checkpoint load --name`); all go. Names whose `ID` is gone
   (what `rm ID` left before #862) go too: `prune` all, `rm NAME` that one.
+  Removing a name alone works even with an unreadable checkpoint kept.
+  Malformed name entries (not a symlink to `../ID`, or not UTF-8) go with
+  `prune` or `rm -f NAME`; removing a name alone never runs checkpoint deletion.
 
 `store::list` returns a `Listing`: entries, and every error reading the
-store or `names` (unreadable entries stay entries). With any error, `rm`,
-`prune` and an id's start are refused; a name read resolves, and a whole id
-does unless `names/ID` exists (a name before #862 may look like an id; new
-ones may not), or a name and an id are two checkpoints'.
+store or `names` (unreadable entries stay entries), and malformed names
+separately. Malformed names do not make the listing incomplete. With a listing
+error, checkpoint removal by `rm` or `prune` and an id's start are refused;
+a name read resolves, and a whole id does unless `names/ID` exists (a name
+before #862 may look like an id; new ones may not), or a name and an id are
+two checkpoints'. Listing errors
+show their directory and error, as warnings on stderr for text `--format`
+and `-q`. `.Name` is the first name, `.Names` all joined with `, `; `name=`
+filters match any one name exactly.
 
 `rm` refuses a checkpoint that one not removed with it builds on
 (`manifest.parent.id`), unless `-f` adds those too, transitively. `prune`

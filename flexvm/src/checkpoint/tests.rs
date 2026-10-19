@@ -1173,13 +1173,15 @@ fn store_keeps_all_names_and_unlinks_them_by_id() {
     for name in ["a", "z", &id] {
         assert_eq!(store::find(&all, name).unwrap().id, id);
     }
-    assert_eq!(store::rows(&state, &[])[0]["name"], "a, z");
+    let rows = store::rows(&state, &[]);
+    assert_eq!(rows[0]["name"], "a");
+    assert_eq!(rows[0]["names"], json!(["a", "z"]));
     assert_eq!(store::remove(&state, &[id.clone()], false).unwrap(), [json!({"deleted": id, "name": "a, z"})]);
     assert!(fs::read_dir(store::dir(&state).join("names")).unwrap().next().is_none());
 }
 
 #[test]
-fn name_errors_block_prefixes_and_removal_but_allow_exact_lookups() {
+fn name_listing_errors_block_prefixes_and_removal_but_malformed_entries_do_not() {
     use std::os::unix::{ffi::OsStrExt, fs::symlink};
     let state = tmp("name-errors");
     drop(store::lock(&state, libc::LOCK_SH).unwrap());
@@ -1198,29 +1200,49 @@ fn name_errors_block_prefixes_and_removal_but_allow_exact_lookups() {
         }
         let all = store::list(&state);
         assert_eq!(all.entries.len(), 1);
-        assert_eq!(all.errors.len(), 1);
-        let err = store::find(&all, &id[..6]).err().unwrap().to_string();
-        assert!(err.contains("incomplete checkpoint listing") && err.contains("names"), "{err}");
         assert!(store::find(&all, "missing").is_err());
         assert_eq!(store::find(&all, &id).unwrap().id, id);
-        if damage != "directory" {
+        if damage == "directory" {
+            assert_eq!(all.errors.len(), 1);
+            assert!(all.malformed.is_empty());
+            let err = store::find(&all, &id[..6]).err().unwrap().to_string();
+            assert!(err.contains("incomplete checkpoint listing") && err.contains("names"), "{err}");
+            for result in [store::removal(&all, &[id.clone()], true), store::pruning(&all, None)] {
+                assert!(result.unwrap_err().to_string().contains("nothing removed:"));
+            }
+        } else {
+            assert!(all.errors.is_empty());
+            assert_eq!(all.malformed.len(), 1);
+            assert_eq!(store::find(&all, &id[..6]).unwrap().id, id);
             assert_eq!(store::find(&all, "good").unwrap().id, id);
-            assert!(store::remove(&state, &[id.clone()], true).is_err());
-            assert!(store::prune(&state, None).is_err());
+            assert_eq!(store::removal(&all, &[id.clone()], true).unwrap(), [0]);
+            assert_eq!(store::pruning(&all, None).unwrap(), [0]);
         }
-        for result in [store::removal(&all, &[id.clone()], true), store::pruning(&all, None)] {
-            assert!(result.unwrap_err().to_string().contains("nothing removed:"));
-        }
-        assert!(store::rows(&state, &[]).iter().any(|r| r["error"].is_string()));
+        let rows = store::rows(&state, &[]);
+        let error = rows.iter().find(|r| r["error"].is_string()).unwrap();
+        let path = if damage == "directory" { names.clone() } else { all.malformed.keys().next().unwrap().clone() };
+        assert_eq!(error["directory"], path.to_string_lossy().as_ref());
+        assert!(!error["error"].as_str().unwrap().is_empty());
         assert!(store::dir(&state).join(&id).exists());
         match damage {
             "directory" => {
                 fs::remove_file(&names).unwrap();
                 fs::rename(names.with_extension("saved"), &names).unwrap();
             }
-            "utf8" => fs::remove_file(names.join(std::ffi::OsStr::from_bytes(b"bad\xff"))).unwrap(),
-            _ => fs::remove_file(names.join("bad")).unwrap(),
+            "utf8" => {
+                assert_eq!(store::prune(&state, Some(0)).unwrap().len(), 1);
+                assert!(fs::symlink_metadata(path).is_err());
+            }
+            _ => {
+                let err = store::find(&all, "bad").err().unwrap().to_string();
+                assert!(err.contains("rm -f bad"), "{err}");
+                assert!(store::remove(&state, &["bad".into()], false).is_err());
+                assert_eq!(store::remove(&state, &["bad".into()], true).unwrap(), [json!({"deleted": null, "name": "bad"})]);
+                assert!(fs::symlink_metadata(path).is_err());
+            }
         }
+        assert!(store::dir(&state).join(&id).exists());
+        assert_eq!(store::find(&store::list(&state), "good").unwrap().id, id);
     }
 }
 
@@ -1313,9 +1335,12 @@ fn a_bad_name_link_keeps_template_users_exact() {
     drop(store::lock(&host.state, libc::LOCK_SH).unwrap());
     stored(&host.state, None, 1);
     fs::write(store::dir(&host.state).join("names").join("bad"), b"not a link").unwrap();
-    assert!(!store::list(&host.state).errors.is_empty());
+    let all = store::list(&host.state);
+    assert!(all.errors.is_empty());
+    assert_eq!(all.malformed.len(), 1);
     let users = host.template_users();
     assert!(users.iter().all(|u| !u.starts_with(crate::template::KEEP_ALL)), "{users:?}");
+    assert_eq!(users, [all.entries[0].manifest.as_ref().unwrap().template_id.clone()].into());
 }
 
 /// #869: `image prune` in a templates directory other states share reads those states' records too.
