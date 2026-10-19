@@ -517,7 +517,7 @@ impl Proc {
     }
 
     pub(crate) fn release_hold(&self) {
-        drop(self.held_grant.lock().unwrap().take());
+        self.host.release_hold(&self.held_grant);
     }
 
     /// Waits for `vm`'s pull, its hold counting only what is still to come:
@@ -2742,7 +2742,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     if fault("no_evict") {
         return;
     }
-    let rss = |e: &Entry| e.firecracker.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 10;
+    let rss = |e: &Entry| e.firecracker.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 20;
     let mut vms = rank(host.entries(), rss);
     if !pressure {
         vms.retain(|e| e.starved);

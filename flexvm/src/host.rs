@@ -105,7 +105,8 @@ impl Default for Config {
 
 /// The reserve of a host that sets none: a sixteenth of its RAM, from 256 MiB to 4 GiB.
 pub fn default_reserve() -> u64 {
-    reserve_for(crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)
+    static TOTAL: OnceLock<u64> = OnceLock::new();
+    reserve_for(*TOTAL.get_or_init(|| crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20))
 }
 
 fn reserve_for(total_mib: u64) -> u64 {
@@ -1551,6 +1552,14 @@ impl Host {
         Ok(h.resize(mib)?)
     }
 
+    /// Its pages arrived or its VM stopped: neither the hold nor its recent grant counts any longer.
+    pub fn release_hold(&self, hold: &Mutex<Option<Hold>>) {
+        let held = hold.lock().unwrap().take();
+        if let Some(h) = held {
+            self.refund(h.id);
+        }
+    }
+
     /// Per boot by name: RUN need not be a tmpfs. An unreadable boot id still counts grants.
     pub fn grants(&self) -> PathBuf {
         self.run.join(format!("grants-{}", boot_id()))
@@ -1601,9 +1610,8 @@ impl Host {
         deadline: Option<std::time::Instant>,
         available: impl Fn() -> Option<u64>,
     ) -> Result<std::result::Result<(u64, Option<Hold>), Error>> {
-        let l = self.lock_by(deadline)?;
-        let mut grants = match self.room(&l, mib, floor, deadline, available)? {
-            Ok(grants) => grants,
+        let (_l, mut grants) = match self.room(mib, floor, deadline, available)? {
+            Ok(room) => room,
             Err(why) => return Ok(Err(why)),
         };
         let path = self.grants();
@@ -1631,45 +1639,40 @@ impl Host {
         Ok(Ok((id, hold)))
     }
 
-    /// Whether `mib` more fits above `floor` (see `grant_inner`): Ok(Ok(the
-    /// grants of the window, to add to)), or Ok(Err(why)) if refused. Test
-    /// fault `no_admit`: refuses everything.
-    /// Before it refuses, VM processes are asked to release the memory they keep for their next checkpoint
-    /// (`hostmem`), waiting for them up to `deadline`, and MemAvailable is read again.
+    /// Whether `mib` more fits above `floor`, with the host lock kept for the grant.
+    /// Before refusing, asks for kept checkpoint memory back without the lock, then retries once.
     fn room(
         &self,
-        l: &Locked,
         mib: u64,
         floor: Floor,
         deadline: Option<std::time::Instant>,
         available: impl Fn() -> Option<u64>,
-    ) -> Result<std::result::Result<Grants, Error>> {
+    ) -> Result<std::result::Result<(Locked, Grants), Error>> {
         if fault("no_admit") {
             return Ok(Err(format!("not enough memory here for {mib} MiB (injected fault)").into()));
         }
-        let cfg = self.config_now();
-        let (floor, what) = match floor {
-            Floor::Reserve => (cfg.reserve(), "reserve"),
-            // An eviction's arrival: never while this host evicts itself, and it
-            // leaves this host's own mark, so it is not moved straight back.
-            Floor::EvictMark if self.evicting(l) => return Ok(Err("this host is moving vms away itself".into())),
-            Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
-        };
-        let (mut grants, pending, _) = self.pending(l)?;
-        let mut need = floor.saturating_add(pending).saturating_add(mib);
-        let mut avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
-        // Memory VM processes keep for their next checkpoint is not admitted: it goes back rather than refuse (#648),
-        // and what is pending is counted again (#691).
-        if avail < need {
+        let mut released = false;
+        loop {
+            let l = self.lock_by(deadline)?;
+            let cfg = self.config_now();
+            let (mark, what) = match floor {
+                Floor::Reserve => (cfg.reserve(), "reserve"),
+                Floor::EvictMark if self.evicting(&l) => return Ok(Err("this host is moving vms away itself".into())),
+                Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
+            };
+            let (grants, pending, _) = self.pending(&l)?;
+            let need = mark.saturating_add(pending).saturating_add(mib);
+            let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
+            if avail >= need {
+                return Ok(Ok((l, grants)));
+            }
+            if released || floor == Floor::EvictMark {
+                return Ok(Err(format!("not enough memory here for {mib} MiB above the {mark} MiB {what}").into()));
+            }
+            drop(l);
             crate::hostmem::release_kept(self, deadline);
-            let (g, pending, _) = self.pending(l)?;
-            (grants, need) = (g, floor.saturating_add(pending).saturating_add(mib));
-            avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
+            released = true;
         }
-        if avail < need {
-            return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
-        }
-        Ok(Ok(grants))
     }
 
     /// The window's grants, and with the holds and checkpoint memory taken lately (`recent_debits`) what they count
@@ -1684,7 +1687,7 @@ impl Host {
             format!("{e}: memory held for migrations and restores still arriving cannot be counted")
         })?;
         let (debits, taken) = self.recent_debits(l, now);
-        let pending = pending(&grants, &held, now).saturating_add(taken);
+        let pending = pending(&grants, &held).saturating_add(taken);
         Ok((grants, pending, debits))
     }
 
@@ -1810,9 +1813,10 @@ impl Host {
     /// cannot be read.
     pub fn promised(&self) -> Option<u64> {
         let now = boottime_ms();
-        let grants: Grants = load(&self.grants()).ok()?.unwrap_or_default();
+        let mut grants: Grants = load(&self.grants()).ok()?.unwrap_or_default();
+        in_window(&mut grants, now);
         let held = self.live_holds(false).ok()?;
-        Some(pending(&grants, &held, now))
+        Some(pending(&grants, &held))
     }
 
     /// Counts `hold` as `mib` more, admitted above `floor` like a grant
@@ -1837,12 +1841,15 @@ impl Host {
         deadline: Option<std::time::Instant>,
         available: impl Fn() -> Option<u64>,
     ) -> Result<std::result::Result<(), Error>> {
-        let l = self.lock_by(deadline)?;
+        if hold.lock().unwrap().is_none() {
+            return Err("no held grant to grow".into());
+        }
+        let (_l, _) = match self.room(mib, floor, deadline, available)? {
+            Ok(room) => room,
+            Err(why) => return Ok(Err(why)),
+        };
         let mut g = hold.lock().unwrap();
         let h = g.as_mut().ok_or("no held grant to grow")?;
-        if let Err(why) = self.room(&l, mib, floor, deadline, available)? {
-            return Ok(Err(why));
-        }
         h.resize(h.mib.saturating_add(mib))?;
         Ok(Ok(()))
     }
@@ -2264,13 +2271,11 @@ fn in_window(grants: &mut Grants, now: u64) {
     grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
 }
 
-/// What `grants` (of the window, from `now`) and the holds `held` count as used, each once. Saturating: a peer's sizes
+/// What `grants` (already of the window) and the holds `held` count as used, each once. Saturating: a peer's sizes
 /// are not trusted to fit.
-fn pending(grants: &Grants, held: &[(u64, u64)], now: u64) -> u64 {
+fn pending(grants: &Grants, held: &[(u64, u64)]) -> u64 {
     let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
-    let window = GRANT_WINDOW.as_millis() as u64;
-    let live = grants.iter().filter(|&&(t, ..)| t <= now && now - t <= window);
-    live.filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).chain(held.iter().map(|h| h.1)).fold(0, u64::saturating_add)
+    grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).chain(held.iter().map(|h| h.1)).fold(0, u64::saturating_add)
 }
 
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
@@ -7550,10 +7555,15 @@ pub(crate) mod tests {
         // Long enough for the serving thread on a loaded machine; answered sooner, it does not wait.
         crate::hostmem::pin_release(Some(Duration::from_secs(30)), None);
         let kept: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(300)));
-        let run = h.run.clone();
+        let hold = Arc::new(Mutex::new(None));
+        let (other, shrinking) = (h.clone(), hold.clone());
         std::thread::spawn(move || {
             crate::hostmem::pin_release(None, Some(Duration::from_millis(5)));
-            crate::hostmem::serve(&run, || kept.store(0, SeqCst))
+            crate::hostmem::serve(&other.run, || {
+                let _l = other.lock().unwrap();
+                other.shrink_hold(&shrinking, 5).unwrap();
+                kept.store(0, SeqCst);
+            })
         });
         let t = std::time::Instant::now();
         while !crate::hostmem::joined(&h.run) {
@@ -7561,6 +7571,9 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let avail = || Some(AVAIL - kept.load(SeqCst));
+        // Optional refills leave kept memory alone.
+        assert!(h.grant_inner(AVAIL, Floor::EvictMark, false, None, avail).unwrap().is_err());
+        assert_eq!(kept.load(SeqCst), 300);
         // Fits once the kept memory is back.
         assert!(h.grant_inner(AVAIL - 100, Floor::Reserve, false, None, avail).unwrap().is_ok());
         assert_eq!(kept.load(SeqCst), 0, "released on request");
@@ -7576,10 +7589,46 @@ pub(crate) mod tests {
         assert_eq!(kept.load(SeqCst), 80, "not asked");
         // A held grant grows the same way.
         crate::hostmem::forget_release(&h.run);
-        let hold = Mutex::new(Some(h.grant_inner(10, Floor::Reserve, true, None, || Some(AVAIL)).unwrap().unwrap().1.unwrap()));
+        *hold.lock().unwrap() = h.grant_inner(10, Floor::Reserve, true, None, || Some(AVAIL)).unwrap().unwrap().1;
         kept.store(80, SeqCst);
         assert!(h.grow_hold_inner(&hold, 20, Floor::Reserve, None, avail).unwrap().is_ok());
         assert_eq!(kept.load(SeqCst), 0);
+        assert_eq!(hold.lock().unwrap().as_ref().unwrap().mib, 25, "growth uses the hold after the release");
+    }
+
+    #[test]
+    fn admission_retries_once_and_rereads_the_floor_and_grants() {
+        let (_dir, mut h) = host("admit-retry");
+        h.cfg.reserve_mib = Some(0);
+        pin_clock(boottime_ms());
+        let reads = std::cell::Cell::new(0);
+        let mut other = h.clone();
+        let available = || {
+            let n = reads.get();
+            reads.set(n + 1);
+            if n == 0 {
+                let mut changed = other.clone();
+                changed
+                    .configure(|c| {
+                        c.reserve_mib = Some(100);
+                        Ok(())
+                    })
+                    .unwrap();
+                store(&h.grants(), &vec![(boottime_ms(), 200u64, 7u64)], false).unwrap();
+                Some(0)
+            } else {
+                Some(300)
+            }
+        };
+        assert!(h.grant_inner(1, Floor::Reserve, false, None, available).unwrap().is_err());
+        assert_eq!(reads.get(), 2, "one retry, with the new floor and grant counted");
+        other
+            .configure(|c| {
+                c.reserve_mib = Some(0);
+                Ok(())
+            })
+            .unwrap();
+        assert!(h.grant_inner(100, Floor::Reserve, false, None, || Some(300)).unwrap().is_ok());
     }
 
     /// `take_room_inner`, again while another test has the host lock (takes never wait for it).
@@ -7653,13 +7702,16 @@ pub(crate) mod tests {
         pin_clock(boottime_ms());
         let path = h.debits();
         store(&path, &vec![debit(500, boottime_ms(), &Ident::me(), false)], false).unwrap();
-        let run = h.run.clone();
+        let other = h.clone();
         // Long enough for the serving thread on a loaded machine; answered sooner, it does not wait.
         crate::hostmem::pin_release(Some(Duration::from_secs(30)), None);
-        // Stands in for what goes meanwhile: the debit.
+        // Stands in for what goes meanwhile: the debit, settled under the host lock.
         std::thread::spawn(move || {
             crate::hostmem::pin_release(None, Some(Duration::from_millis(5)));
-            crate::hostmem::serve(&run, || store(&path, &Vec::<Debit>::new(), false).unwrap())
+            crate::hostmem::serve(&other.run, || {
+                let _l = other.lock().unwrap();
+                store(&path, &Vec::<Debit>::new(), false).unwrap();
+            })
         });
         let t = std::time::Instant::now();
         while !crate::hostmem::joined(&h.run) {
@@ -7841,6 +7893,22 @@ pub(crate) mod tests {
         drop(hold);
         h.refund(id); // Start failed: refund the recent grant as well as its hold.
         assert!(grant(charge, false).is_ok());
+    }
+
+    #[test]
+    fn releasing_a_hold_refunds_its_grant_within_the_window() {
+        let (_dir, mut h) = host("release-recent-hold");
+        h.cfg.reserve_mib = Some(0);
+        pin_clock(boottime_ms());
+        let (id, hold) = grant_at(&h, 1000, Floor::Reserve, true).unwrap();
+        let hold = Mutex::new(hold);
+        h.shrink_hold(&hold, 100).unwrap();
+        assert_eq!(h.promised(), Some(100));
+        h.release_hold(&hold);
+        assert_eq!(h.promised(), Some(0), "the full recent grant must not return");
+        assert!(load::<Grants>(&h.grants()).unwrap().unwrap().iter().all(|g| g.2 != id));
+        h.release_hold(&hold);
+        assert!(grant_at(&h, AVAIL, Floor::Reserve, false).is_ok());
     }
 
     /// A held grant grows only if the extra is admitted, then counts once,
