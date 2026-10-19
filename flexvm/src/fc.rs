@@ -180,9 +180,7 @@ impl Firecracker {
             Ok(None) => "still running".into(),
             Err(e) => format!("unknown ({e})"),
         };
-        let log = firecracker_log_tail(&self.dir);
-        let lines: Vec<&str> = log.lines().collect();
-        format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
+        format!("firecracker {} {status}; log: {}", self.pid(), post_mortem_lines(&firecracker_log_tail(&self.dir)))
     }
 
     /// The end of its log (up to 64 KiB, the guest's console with it), once it exited: a guest crash's cause comes
@@ -270,6 +268,21 @@ fn spawn_logged(mut cmd: Command, dir: &Path) -> std::io::Result<(Child, std::th
         }
     });
     Ok((child, logging))
+}
+
+/// Lines a guest kernel starts its oops or panic report with: what it hit, before the registers.
+const GUEST_CRASH: [&str; 5] = ["Kernel panic", "BUG:", "Oops", "general protection fault", "Unable to handle"];
+
+/// The log's last 5 lines, after the start of the guest kernel's crash report if it has one
+/// (its first lines say why; the last ones are only its stack and the reboot).
+fn post_mortem_lines(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    let last = lines.len().saturating_sub(5);
+    let report = match lines[..last].iter().position(|l| GUEST_CRASH.iter().any(|c| l.contains(c))) {
+        Some(i) => lines[i..(i + 8).min(last)].iter().copied().chain(if i + 8 < last { Some("...") } else { None }).collect(),
+        None => Vec::new(),
+    };
+    report.into_iter().chain(lines[last..].iter().copied()).collect::<Vec<_>>().join(" | ")
 }
 
 fn firecracker_log_tail(dir: &Path) -> String {
@@ -688,6 +701,19 @@ mod tests {
         }
         assert!(total < 32 << 20, "the flood must have rotated");
         assert!(firecracker_log_tail(&dir).ends_with("stdout final\nstderr final\n"));
+    }
+
+    #[test]
+    fn a_guest_crash_report_keeps_its_first_lines() {
+        assert_eq!(post_mortem_lines("a\nb\nc\n"), "a | b | c");
+        let mut log = vec!["boot".to_string(), "[ 19.1] BUG: unable to handle page fault for address: ffff8880".into()];
+        log.extend((0..20).map(|i| format!("stack {i}")));
+        log.push("[ 19.8] Rebooting in 1 seconds..".into());
+        let got = post_mortem_lines(&log.join("\n"));
+        assert!(got.starts_with("[ 19.1] BUG: unable to handle page fault for address: ffff8880 | stack 0 |"), "{got}");
+        assert!(got.contains("stack 6 | ... | stack 16 |") && got.ends_with("[ 19.8] Rebooting in 1 seconds.."), "{got}");
+        // A report already within the last lines is not repeated.
+        assert_eq!(post_mortem_lines("x\nOops: 0000\ny\nz\nw\n"), "x | Oops: 0000 | y | z | w");
     }
 
     #[test]
