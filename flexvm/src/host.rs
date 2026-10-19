@@ -209,7 +209,7 @@ impl Config {
         IpRange::parse(self.effective_cluster_ips())
     }
 
-    /// What a hand edit must get right: refused on open, and never taken live (`config_now`).
+    /// Strict content validation for writes. Reads ignore an invalid explicit host underlay (`read`).
     /// Content only: checks of current interfaces belong in `warnings`.
     pub fn validate(&self) -> Result<()> {
         if !self.cluster()?.contains_range(&self.range()?) {
@@ -237,6 +237,24 @@ impl Config {
             bail!("announce_dev is empty: name an interface, or \"none\"");
         }
         Ok(())
+    }
+
+    /// Read legacy underlays as unset without changing the file. Warn once per host/address
+    /// in this process, including repeated opens and live reloads.
+    fn read(path: &Path) -> Result<Option<Self>> {
+        let Some(mut cfg) = load::<Self>(path)? else { return Ok(None) };
+        let bad = cfg.underlay.filter(|ip| !is_underlay(ip));
+        if bad.is_some() {
+            cfg.underlay = None;
+        }
+        cfg.validate()?;
+        if let Some(ip) = bad {
+            static WARNED: Mutex<Option<HashSet<(PathBuf, Ipv4Addr)>>> = Mutex::new(None);
+            if WARNED.lock().unwrap().get_or_insert_default().insert((path.to_path_buf(), ip)) {
+                crate::log!("flexvm: warning: {}: underlay {ip} is loopback or not unicast; ignoring it and deriving underlay instead", path.display());
+            }
+        }
+        Ok(Some(cfg))
     }
 
     /// What `flexvm info` and the listener warn of: valid, but likely a mistake.
@@ -567,7 +585,7 @@ impl Host {
     /// and the run directory to that state root (`claim_run`).
     /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
     /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
-    /// A `host.json` that does not validate is refused: fix the file.
+    /// Invalid explicit host underlays are ignored with a warning; other invalid content is refused.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
         let dirs = [("addrs", 0o755), ("standby", 0o755), ("migs", 0o755), ("owed", 0o700), ("withdrawals", 0o700), ("suspended", 0o700)];
         let named = |d: &Path, e: std::io::Error| {
@@ -629,11 +647,12 @@ impl Host {
         }
         let _ = RUN_DIR.set(run.clone());
         let cfg_stamp = stamp(&state.join("host.json"));
-        let mut cfg: Config = load(&state.join("host.json"))?.unwrap_or_default();
+        let mut cfg = Config::read(&state.join("host.json"))
+            .map_err(|e| format!("{}: {e} (see README: Configuration)", state.join("host.json").display()))?
+            .unwrap_or_default();
         cfg.run = Some(run.clone());
         let host = Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)) };
         drop(_held);
-        host.cfg.validate().map_err(|e| format!("{}: {e} (see README: Configuration)", host.state.join("host.json").display()))?;
         Ok(host)
     }
 
@@ -675,7 +694,7 @@ impl Host {
         if let Some((_, cfg)) = last.as_ref().filter(|(t, _)| Some(*t) == now) {
             return cfg.clone();
         }
-        if let Some(mut cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten().filter(|c| c.validate().is_ok())) {
+        if let Some(mut cfg) = now.and_then(|_| Config::read(&path).ok().flatten()) {
             cfg.run = Some(self.run.clone());
             *seen = Some((now.unwrap(), cfg.clone()));
             return cfg;
@@ -4654,28 +4673,85 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn explicit_underlay_content_is_checked_on_open_reload_and_write() {
-        let (_dir, mut h) = host("explicit-underlay-validation");
+    fn invalid_explicit_underlay_is_ignored_on_open_and_reload_with_one_warning() {
+        const CHILD: &str = "FLEXVM_TEST_INVALID_UNDERLAY";
+        const BAD: [&str; 6] = ["0.0.0.0", "255.255.255.255", "224.0.0.1", "239.255.255.255", "127.0.0.1", "127.1.2.3"];
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::tests::invalid_explicit_underlay_is_ignored_on_open_and_reload_with_one_warning", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for ip in BAD {
+                let warning = format!("underlay {ip} is loopback or not unicast; ignoring it and deriving underlay instead");
+                assert_eq!(stderr.matches(&warning).count(), 2, "one warning for open and one for reload on separate hosts: {stderr}");
+            }
+            assert_eq!(stderr.matches("flexvm: warning:").count(), BAD.len() * 2, "{stderr}");
+            return;
+        }
+        for ip in BAD {
+            for reload in [false, true] {
+                let (_dir, mut h) = host("legacy-underlay");
+                h.configure(|c| {
+                    c.underlay = Some("192.0.2.7".parse().unwrap());
+                    Ok(())
+                })
+                .unwrap();
+                let path = h.state.join("host.json");
+                let bad = Config { underlay: Some(ip.parse().unwrap()), reserve_mib: Some(123), ..Config::default() };
+                store(&path, &bad, true).unwrap();
+                let saved = std::fs::read(&path).unwrap();
+                if !reload {
+                    h = Host::open(&h.state, &h.run).unwrap();
+                }
+                for _ in 0..2 {
+                    let cfg = h.config_now();
+                    assert!(cfg.underlay.is_none(), "{ip}");
+                    assert_eq!(cfg.underlay(), Some(Ipv4Addr::LOCALHOST), "derived for no peers: {ip}");
+                    assert_eq!(cfg.reserve_mib, Some(123), "other live edits still apply");
+                    assert!(Host::open(&h.state, &h.run).unwrap().cfg.underlay.is_none());
+                    // A fresh inode forces another read of the same invalid address.
+                    store(&path, &bad, true).unwrap();
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), saved, "reads must not rewrite host.json");
+            }
+        }
+        crate::util::flush_log(crate::util::LOG_FLUSH);
+    }
+
+    #[test]
+    fn explicit_underlay_content_is_checked_on_write() {
+        let (_dir, mut h) = host("explicit-underlay-write");
         let path = h.state.join("host.json");
-        assert!(h.cfg.underlay.is_none());
         for good in ["192.0.2.7", "10.0.0.1"] {
-            store(&path, &Config { underlay: Some(good.parse().unwrap()), ..Config::default() }, true).unwrap();
+            h.configure(|c| {
+                c.underlay = Some(good.parse().unwrap());
+                Ok(())
+            })
+            .unwrap();
             assert_eq!(Host::open(&h.state, &h.run).unwrap().cfg.underlay, Some(good.parse().unwrap()));
-            assert_eq!(h.config_now().underlay, Some(good.parse().unwrap()));
         }
-        // Keep a valid live reload newer than the original (unset) configuration.
-        let good = h.config_now().underlay;
         for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "239.255.255.255", "127.0.0.1", "127.1.2.3"] {
-            let bad = Config { underlay: Some(ip.parse().unwrap()), ..Config::default() };
-            store(&path, &bad, true).unwrap();
-            let e = Host::open(&h.state, &h.run).err().unwrap().to_string();
+            let saved = std::fs::read(&path).unwrap();
+            let e = h
+                .configure(|c| {
+                    c.underlay = Some(ip.parse().unwrap());
+                    Ok(())
+                })
+                .unwrap_err()
+                .to_string();
             assert!(e.contains(&format!("underlay {ip} is loopback or not unicast")), "{e}");
-            assert_eq!(h.config_now().underlay, good, "{ip}");
-            assert!(h.configure(|_| Ok(())).is_err(), "{ip}");
+            assert_eq!(std::fs::read(&path).unwrap(), saved, "invalid writes leave the file unchanged");
+            store(&path, &Config { underlay: Some(ip.parse().unwrap()), ..Config::default() }, true).unwrap();
+            assert!(h.configure(|_| Ok(())).is_err(), "existing invalid underlays must also be refused on write");
+            h.configure(|c| {
+                c.underlay = None;
+                Ok(())
+            })
+            .unwrap();
         }
-        store(&path, &Config::default(), true).unwrap();
-        assert!(Host::open(&h.state, &h.run).unwrap().cfg.underlay.is_none());
-        assert!(h.config_now().underlay.is_none());
     }
 
     #[test]
