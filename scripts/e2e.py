@@ -1012,7 +1012,8 @@ def checkpoint_store():
         rows = ls()
         check("ls: oldest first, with names, parents, VM and template", [(c["name"], c["parent"], c["vm"]) for c in rows] == [("base", None, vm), ("one", "base", vm), (None, "one", vm)]
               and all(c["template_id"] == A.ps()[vm]["template_id"] and c["size"] > 0 for c in rows), rows)
-        check("ls: -q and --filter", A.cli("checkpoint", "ls", "-q", "--filter", "name=on").stdout.split() == [one["id"]] and not ls("--filter", "vm=nope"))
+        q = lambda f: A.cli("checkpoint", "ls", "-q", "--filter", f).stdout.split()
+        check("ls: -q and --filter (a whole name)", q("name=one") == [one["id"]] and not q("name=on") and not ls("--filter", "vm=nope"))
         table = A.cli("checkpoint", "ls").stdout
         check("ls: a table", table.startswith("NAME") and "<none>" in table and two["id"] in table, table)
         # Restored by name and by an id's start, as forks; each has what its checkpoint had.
