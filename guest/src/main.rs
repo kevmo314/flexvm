@@ -109,19 +109,37 @@ fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str
 }
 
 /// Overlayfs takes the merged root's attributes from the upper directory. Xattrs are best-effort:
-/// tmpfs may lack a namespace (user.* before 6.6, ACLs without TMPFS_POSIX_ACL), and overlayfs's
-/// own trusted.overlay.* would change how the upper root is read.
+/// tmpfs may lack a namespace (user.* before 6.6, ACLs without TMPFS_POSIX_ACL, which our kernel
+/// has), and overlayfs's own trusted.overlay.* would change how the upper root is read.
 fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
     let lower = File::open(lower)?;
     let upper = File::open(upper)?;
     let meta = lower.metadata()?;
     let (src, dst) = (lower.as_raw_fd(), upper.as_raw_fd());
+    let mode = |m: u32| upper.set_permissions(std::fs::Permissions::from_mode(m));
+    // With an access ACL, the group bits are its mask: alone they could grant the owning group
+    // what the ACL denied, so a root whose ACL is not copied gets no group access at all.
+    let no_acl = || {
+        log("root ACL not copied: dropping group access to /");
+        mode(meta.mode() & 0o7707)
+    };
     os(unsafe { libc::fchown(dst, meta.uid(), meta.gid()) })?;
-    upper.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
-    let n = os(unsafe { libc::flistxattr(src, std::ptr::null_mut(), 0) })?;
-    let mut names = vec![0u8; n as usize];
-    let n = os(unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) })?;
-    for name in names[..n as usize].split_inclusive(|&b| b == 0) {
+    mode(meta.mode() & 0o7777)?;
+    let names = (|| {
+        let n = os(unsafe { libc::flistxattr(src, std::ptr::null_mut(), 0) })?;
+        let mut names = vec![0u8; n as usize];
+        let n = os(unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) })?;
+        names.truncate(n as usize);
+        Ok::<_, io::Error>(names)
+    })();
+    let names = match names {
+        Ok(names) => names,
+        Err(e) => {
+            log(&format!("root xattrs: {e}"));
+            return no_acl();
+        }
+    };
+    for name in names.split_inclusive(|&b| b == 0) {
         let name = CStr::from_bytes_with_nul(name).map_err(io::Error::other)?;
         if name.to_bytes().starts_with(b"trusted.overlay.") {
             continue;
@@ -134,6 +152,9 @@ fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
         })();
         if let Err(e) = copied {
             log(&format!("root xattr {}: {e}", name.to_string_lossy()));
+            if name == c"system.posix_acl_access" {
+                no_acl()?;
+            }
         }
     }
     Ok(())

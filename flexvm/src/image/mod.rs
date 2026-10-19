@@ -854,7 +854,7 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     if !out.status.success() {
         bail!("mkfs.ext4 failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    // Root xattrs come with -d (from 1.47.1); its mode and mtime are set here, as older mke2fs can't.
+    // Root xattrs come with -d (from 1.45.7); its mode and mtime are set here, as older mke2fs can't.
     for (field, value) in [("mode", format!("0{:o}", libc::S_IFDIR | (meta.mode() & 0o7777))), ("mtime", format!("@{}", meta.mtime()))] {
         let out = run_until(Command::new("debugfs").args(["-w", "-R", &format!("set_inode_field / {field} {value}"), &image_path]), interrupted)?;
         // debugfs also reports command errors on stderr with a successful exit status.
