@@ -1064,17 +1064,21 @@ impl Proc {
     /// Recorded for the peers first (`Host::withdraw_noted`): told now, and on a
     /// later sweep any peer that could not be.
     fn withdraw(&self, a: AddrClaim) {
+        self.withdraw_claim(a, &self.name());
+    }
+
+    pub(crate) fn withdraw_claim(&self, a: AddrClaim, name: &str) {
         let (ip, gen) = (a.ip, a.gen);
         let Ok(l) = self.host.lock() else {
             // Nothing recorded: told at least once, as before.
             return tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": a.rev}));
         };
-        let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
+        let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == name));
         // Recorded before the claim goes: the claim is what a sweep finds it by otherwise.
         match self.host.withdraw_noted(&l, ip, gen) {
             Ok(_) => drop(a.release(&l)),
             Err(e) => {
-                crate::log!("vm {}: withdrawing {ip}: {e}; its claim stays, for a sweep to withdraw once this process is gone", self.name());
+                crate::log!("vm {}: withdrawing {ip}: {e}; its claim stays, for a sweep to withdraw once this process is gone", name);
                 a.keep();
             }
         }

@@ -179,6 +179,7 @@ fn cleanup_locked(host: &Host, lock: Option<Flock>) -> Result<()> {
         if e.file_type().is_ok_and(|t| t.is_dir()) {
             standby_sockets(&e.path());
             orphan_log_locks(&e.path());
+            standby_pool(host, &e.path());
         }
     }
     load_sets(&host.run.join("standby"));
@@ -272,6 +273,49 @@ fn orphan_log_locks(dir: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// An unused pool whose template is gone. The refill lock outlives the directory.
+fn standby_pool(host: &Host, dir: &Path) {
+    let Ok(template) = std::fs::read_to_string(dir.join(".template")) else { return };
+    if crate::host::check_name(&template).is_err() || crate::standby::dir(host, &template) != dir || crate::host::trusted_dir(dir).is_err() {
+        return;
+    }
+    let Ok(_refill) = crate::standby::refill_lock(host, &template).and_then(|f| Ok(Flock::new(f, libc::LOCK_EX | libc::LOCK_NB)?)) else { return };
+    let paths = crate::template::Paths::new(&host.state);
+    let Ok(_templates) = crate::template::templates_lock(&paths, libc::LOCK_SH | libc::LOCK_NB) else { return };
+    if !std::fs::symlink_metadata(paths.templates.join(&template)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        || !crate::standby::live(host, &template).is_empty()
+    {
+        return;
+    }
+    let locks = crate::host::locks(dir);
+    let mut held = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&locks) else { return };
+    for e in entries {
+        let Ok(e) = e else { return };
+        if !matches!(e.file_name().to_str(), Some("publish" | "refill" | "standby.log")) {
+            return;
+        }
+        let Ok(f) = crate::host::lock_path(&e.path(), libc::LOCK_EX | libc::LOCK_NB) else { return };
+        let Ok(f) = Flock::new(f, libc::LOCK_EX | libc::LOCK_NB) else { return };
+        held.push(f);
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files = Vec::new();
+    for e in entries {
+        let Ok(e) = e else { return };
+        match e.file_name().to_str() {
+            Some(".locks") => {}
+            Some(".template" | ".failed" | "standby.log" | "standby.log.1") if e.file_type().is_ok_and(|t| t.is_file()) => files.push(e.path()),
+            _ => return,
+        }
+    }
+    for path in files {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(&locks);
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// `PID.sock`, and in `.locks`, `PID-START.claim` and `PID-START.take` (a claimer's) of standbys
@@ -399,6 +443,51 @@ mod tests {
         flock(&publishing, libc::LOCK_UN).unwrap();
         standby_sockets(&d);
         assert!(!d.join("999999990.sock").exists() && crate::host::locks(&d).join("publish").exists());
+    }
+
+    #[test]
+    fn standby_pools_go_only_when_empty_missing_and_not_refilling() {
+        let root = dir("pools");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let d = crate::standby::dir(&host, "default");
+        let locks = crate::host::locks(&d);
+        crate::host::private_dir(&locks).unwrap();
+        std::fs::write(d.join(".template"), b"default").unwrap();
+        let refill = Flock::new(crate::standby::refill_lock(&host, "default").unwrap(), libc::LOCK_EX).unwrap();
+        standby_pool(&host, &d);
+        assert!(d.exists(), "a refill owns it");
+        drop(refill);
+        std::fs::create_dir_all(host.state.join("templates")).unwrap();
+        let template = host.state.join("templates/default");
+        std::os::unix::fs::symlink(".gen/a", &template).unwrap();
+        standby_pool(&host, &d);
+        assert!(d.exists(), "even a dangling template link keeps its pool");
+        std::fs::remove_file(template).unwrap();
+        let record = locks.join(format!("{}.lock", Ident::me().key()));
+        let live = File::create(&record).unwrap();
+        flock(&live, libc::LOCK_EX).unwrap();
+        std::io::Write::write_all(&mut &live, &serde_json::to_vec(&Ident::me()).unwrap()).unwrap();
+        standby_pool(&host, &d);
+        assert!(d.exists(), "a live standby keeps it");
+        flock(&live, libc::LOCK_UN).unwrap();
+        std::fs::write(d.join("unexpected"), b"").unwrap();
+        standby_pool(&host, &d);
+        assert!(d.join(".template").exists(), "unknown contents stay");
+        std::fs::remove_file(d.join("unexpected")).unwrap();
+        std::fs::write(d.join("standby.log"), b"old failure").unwrap();
+        std::fs::write(d.join(".failed"), b"").unwrap();
+        let log = crate::util::output::log_lock(&d.join("standby.log")).unwrap();
+        let writer = Flock::new(crate::host::private_file(&log).unwrap(), libc::LOCK_EX).unwrap();
+        standby_pool(&host, &d);
+        assert!(d.exists(), "a log writer keeps it");
+        drop(writer);
+        // A waiter opened before removal still uses the same refill lock afterwards.
+        let waiter = crate::standby::refill_lock(&host, "default").unwrap();
+        standby_pool(&host, &d);
+        assert!(!d.exists());
+        let _refill = Flock::new(waiter, libc::LOCK_EX).unwrap();
+        let next = crate::standby::refill_lock(&host, "default").unwrap();
+        assert!(flock(&next, libc::LOCK_EX | libc::LOCK_NB).is_err());
     }
 
     #[test]
