@@ -71,9 +71,7 @@ impl Blob {
                     p if p.exists() => p,
                     _ => registry.blob(digest, *size, blobs)?,
                 };
-                super::private_dir(blobs)?;
-                super::private_dir(path.parent().unwrap())?;
-                let f = super::private_file(&path)?;
+                let f = super::private_file(super::private_blobs(blobs)?.as_ref(), &path)?;
                 let len = f.metadata()?.len();
                 (Box::new(f), len)
             }
@@ -214,7 +212,6 @@ fn diff_ids(config: &[u8], layers: usize) -> Result<Vec<String>> {
 
 /// A cached document: a regular file of exactly `size` bytes (at most `MAX_DOCUMENT`) matching `digest`.
 pub(super) fn read_verified(path: &Path, size: u64, digest: &str) -> Result<Vec<u8>> {
-    super::private_file(path)?;
     let data = Blob::File(path.to_path_buf()).read_document()?;
     if data.len() as u64 != size || sha256_hex(&data) != digest {
         bail!("cached blob {} does not match {digest} ({size} bytes)", path.display());
@@ -270,9 +267,8 @@ fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> 
 
 fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
     let blobs = cache.join("blobs");
-    super::private_dir(cache)?;
-    super::private_dir(&blobs)?;
-    super::private_dir(&blobs.join("sha256"))?;
+    super::private_dir(cache, Path::new(""))?;
+    let private = super::private_blobs(&blobs)?;
     super::registry::sweep_parts(&blobs.join("sha256"));
     let (manifest, digest) = reg.manifest(&reg.r.reference.clone())?;
     let (manifest, digest) = resolve_index(manifest, digest, |d| Ok(reg.manifest(d)?.0))?;
@@ -283,11 +279,13 @@ fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
     if config_size > MAX_DOCUMENT {
         bail!("image config of {config_size} bytes is over the {MAX_DOCUMENT} byte limit");
     }
-    let config = read_verified(&reg.blob(&config_digest, config_size, &blobs)?, config_size, &config_digest)?;
+    let config_path = reg.blob(&config_digest, config_size, &blobs)?;
+    super::private_file(private.as_ref(), &config_path)?;
+    let config = read_verified(&config_path, config_size, &config_digest)?;
     let diff_ids = diff_ids(&config, descs.len())?;
     // A reused root filesystem never opens its layers: older versions' 0644 blobs are made private here.
     for (d, _) in &descs {
-        match super::private_file(&blob_path(&blobs, d)?) {
+        match super::private_file(private.as_ref(), &blob_path(&blobs, d)?) {
             Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
             res => drop(res?),
         }

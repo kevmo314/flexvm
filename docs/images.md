@@ -58,8 +58,10 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   its `.conf`, which holds the `--env` values, and its `.ok` marker) are
   0600, owned by whoever pulled (root, or the user of a state of their
   own). Caches from older versions (0755 and 0644) are repaired as pulls
-  reuse them. Ownership is never changed, and a symlink where a cache
-  directory is expected is left as it is, not followed. A mode is changed
+  reuse them. Ownership is never changed. A symlinked `STATE/images` works
+  (its target is the cache), but below it every directory is reached
+  without following symlinks, and a symlink there is left as it is, with
+  nothing under it touched. A mode is changed
   only when it differs, because template stamps include the root
   filesystem's ctime, so the first reuse of an older cache makes its
   templates rehash that file once. Firecracker runs as root and opens the

@@ -3812,7 +3812,12 @@ pub struct Directory {
 impl Directory {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let fd: OwnedFd = std::os::unix::fs::OpenOptionsExt::custom_flags(File::options().read(true), libc::O_DIRECTORY).open(path)?.into();
-        Ok(Self { path: PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), fd.as_raw_fd())), fd })
+        Ok(Self::from_fd(fd))
+    }
+
+    /// A directory already opened (for reading).
+    pub fn from_fd(fd: OwnedFd) -> Self {
+        Self { path: PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), fd.as_raw_fd())), fd }
     }
 
     pub fn stat(&self) -> std::io::Result<libc::stat> {

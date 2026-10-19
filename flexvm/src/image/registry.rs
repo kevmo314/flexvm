@@ -806,10 +806,9 @@ pub fn download(url: &str, size: u64) -> Result<ureq::Body> {
 fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl FnOnce() -> Result<R>) -> Result<PathBuf> {
     let path = blob_path(blobs, digest)?;
     let dir = path.parent().unwrap().to_path_buf();
-    super::private_dir(blobs)?;
-    super::private_dir(&dir)?;
+    let private = super::private_blobs(blobs)?;
     if path.exists() {
-        let reader = super::private_file(&path)?;
+        let reader = super::private_file(private.as_ref(), &path)?;
         let len = reader.metadata()?.len();
         let mut cached = Hashed::new(reader.take(size.saturating_add(1)));
         std::io::copy(&mut cached, &mut std::io::sink())?;
