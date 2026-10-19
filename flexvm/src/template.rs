@@ -703,7 +703,8 @@ impl Template {
         }
     }
 
-    /// Faults the copy source in before taking the events lock; older kernels get a read-ahead hint.
+    /// Faults up to `n` pages from `page` in, clamped to the whole pages mapped, so a copy from them does not wait on
+    /// disk; without MADV_POPULATE_READ (Linux < 5.14) a read-ahead hint instead. Best effort.
     pub fn prefault(&self, page: usize, n: usize) {
         let n = n.min((self.len / PAGE_SIZE).saturating_sub(page));
         if n > 0 {
