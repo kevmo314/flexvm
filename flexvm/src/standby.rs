@@ -46,12 +46,8 @@ fn create_dir(host: &Host, template: &str) -> Result<PathBuf> {
 
 /// Outside the pool: removing an empty directory must not replace a refill's lock.
 pub(crate) fn refill_lock(host: &Host, template: &str) -> Result<File> {
-    Ok(crate::host::private_file(&refill_lock_path(host, template))?)
-}
-
-fn refill_lock_path(host: &Host, template: &str) -> PathBuf {
     let d = dir(host, template);
-    crate::host::locks(d.parent().unwrap()).join(d.file_name().unwrap())
+    Ok(crate::host::private_file(&crate::host::locks(d.parent().unwrap()).join(d.file_name().unwrap()))?)
 }
 
 /// The lock versions before #850 take for a refill, in the pool (`d`): taken too, after `refill_lock`
@@ -345,7 +341,7 @@ pub fn refill(host: &Host, template: &str) -> Result<usize> {
 
 /// After a pull superseded `template`'s pool, or a failed `rmi` restored its count: standby VMs
 /// started up to its target (pressure's cooldown and the refill floor respected), their loads not
-/// waited for, so the command returns once they are listed. A busy refill takes over its recount.
+/// waited for, so the command returns once they are listed. Skipped if another refill runs.
 pub(crate) fn refill_later(host: &Host, template: &str) -> Result<usize> {
     if target(host, template) == 0 {
         return Ok(0);
@@ -358,40 +354,11 @@ pub(crate) fn refill_later(host: &Host, template: &str) -> Result<usize> {
 /// Only a count set by hand (`set`) starts them regardless. `ready_wait`: their readiness replies
 /// are waited for (else they go on loading on their own, each listed already).
 fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool, ready_wait: bool) -> Result<usize> {
-    refill_with(host, template, wait, |later| refill_once(host, template, cooldown || later, ready_wait))
-}
-
-/// `refill(later)`: `later` for a recount another asked for, which keeps pressure's cooldown
-/// whatever this caller's (a `set` must not start standbys relief just stopped).
-fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnMut(bool) -> Result<usize>) -> Result<usize> {
-    let pending = refill_lock_path(host, template).with_extension("pending");
-    // Publish before trying the lock: its holder either sees this, or we get the lock ourselves.
-    drop(crate::host::private_file(&pending)?);
-    let mut started = 0;
-    // Bound work under repeated pulls; further requests stay pending for the next refill.
-    for round in 0..3 {
-        let how = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
-        let Some(lock) = refill_locked(Flock::new(refill_lock(host, template)?, how), wait)? else { break };
-        let d = create_dir(host, template)?;
-        let Some(legacy) = refill_locked(legacy_refill_lock(&d, how), wait)? else { break };
-        match std::fs::remove_file(&pending) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            r => r?,
-        }
-        started += refill(round > 0)?;
-        drop(legacy);
-        drop(lock);
-        // Check after unlocking too, so a request between the last recount and unlock is not lost.
-        if !pending.try_exists()? {
-            break;
-        }
-        wait = false;
-    }
-    Ok(started)
-}
-
-fn refill_once(host: &Host, template: &str, cooldown: bool, ready_wait: bool) -> Result<usize> {
-    let d = dir(host, template);
+    let lock = refill_lock(host, template)?;
+    let how = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
+    let Some(_lock) = refill_locked(Flock::new(lock, how), wait)? else { return Ok(0) };
+    let d = create_dir(host, template)?;
+    let Some(_legacy) = refill_locked(legacy_refill_lock(&d, how), wait)? else { return Ok(0) };
     let want = target(host, template).saturating_sub(live(host, template).len());
     if want == 0 {
         return Ok(0);
@@ -491,10 +458,7 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
         let args =
             ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--standby".as_ref(), template.as_ref()];
         crate::util::start_reaper()?;
-        // Its grant's id: a standby that leaves within the grant's window gives it back (`serve`).
-        let id = grant.to_string();
-        let env = [("FLEXVM_NOTIFY_FD", "3"), (GRANT_ENV, id.as_str())];
-        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &env)?;
+        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &[("FLEXVM_NOTIFY_FD", "3")])?;
         let by = Instant::now() + LOCKED_TIMEOUT;
         drop(w);
         let mut r = BufReader::new(r);
@@ -511,28 +475,6 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
     drop(stop);
     crate::util::reap_later(child, None);
     Ok(Some(r))
-}
-
-/// The admission grant a refill took for the standby it starts (`start_one`), by id.
-const GRANT_ENV: &str = "FLEXVM_STANDBY_GRANT";
-
-/// This standby's grant (`GRANT_ENV`), taken out of the environment so nothing it starts inherits it.
-fn inherited_grant() -> Option<u64> {
-    let id = std::env::var(GRANT_ENV).ok()?.parse().ok();
-    std::env::remove_var(GRANT_ENV);
-    id
-}
-
-/// A superseded standby leaving: unlisted (`files` removed) and its grant given back, so neither
-/// counts against the refill it then asks for.
-fn refill_departed(host: &Host, template: &str, files: Vec<PathBuf>, grant: Option<u64>) -> Result<usize> {
-    for f in files {
-        let _ = std::fs::remove_file(f);
-    }
-    if let Some(id) = grant {
-        host.refund(id);
-    }
-    refill_later(host, template)
 }
 
 /// Never let relief pass an unlisted live child, including on a partial or invalid reply.
@@ -645,7 +587,6 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // The key of the generation opened, not of whatever the name resolves to now: a
     // rebuild in between would publish this snapshot under the new generation's key.
     let mine = dir_key(&tpl.dir);
-    let grant = inherited_grant();
     let d = create_dir(host, template)?;
     let me = Ident::me();
     let id = me.key();
@@ -720,16 +661,6 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             }
             let low = under_reserve(host, template);
             if let Some(code) = leave_status(died.is_some(), current.as_deref() != Some(&mine) || extra || unreachable || low.is_some()) {
-                if current.as_deref() != Some(&mine) {
-                    // It may have outlived `superseded`'s wait. Unlist and free its VM before
-                    // recounting, even without a listener; a busy refill takes over the request.
-                    drop(p.standby.lock().unwrap().take());
-                    drop(low);
-                    let files = std::mem::take(&mut *p.files.lock().unwrap());
-                    if let Err(e) = refill_departed(host, template, files, grant) {
-                        crate::log!("standby {template}: {e}");
-                    }
-                }
                 p.finish(op, End::NotStarted, code, None);
             }
         }
@@ -1724,106 +1655,6 @@ mod tests {
         assert!(live(&host, "default").is_empty(), "never through a link");
         assert!(victim.try_wait().unwrap().is_none());
         drop(victim);
-    }
-
-    #[test]
-    fn a_skipped_refill_is_recounted_from_the_current_generation() {
-        let (_root, host, paths, _d) = pool("refill-superseded");
-        crate::util::write_file(&host.state.join("standby"), "default", b"2", true).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (resume, resumed) = std::sync::mpsc::channel();
-        let h = host.clone();
-        let p = paths.clone();
-        let holder = std::thread::spawn(move || {
-            let mut rounds = 0;
-            let started = refill_with(&h, "default", true, |_| {
-                rounds += 1;
-                if rounds == 1 {
-                    assert_eq!(key(&p, "default").unwrap(), "a");
-                    tx.send(()).unwrap();
-                    resumed.recv_timeout(Duration::from_secs(5)).unwrap();
-                    Ok(1)
-                } else {
-                    assert_eq!(key(&p, "default").unwrap(), "b");
-                    Ok(target(&h, "default").saturating_sub(live(&h, "default").len()))
-                }
-            })
-            .unwrap();
-            (rounds, started)
-        });
-        rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        std::fs::create_dir(paths.templates.join(".gen/b")).unwrap();
-        std::fs::remove_file(paths.templates.join("default")).unwrap();
-        std::os::unix::fs::symlink(".gen/b", paths.templates.join("default")).unwrap();
-        assert_eq!(refill_later(&host, "default").unwrap(), 0);
-        resume.send(()).unwrap();
-        assert_eq!(holder.join().unwrap(), (2, 3));
-        assert!(!refill_lock_path(&host, "default").with_extension("pending").exists());
-    }
-
-    #[test]
-    fn a_late_superseded_departure_is_unlisted_before_its_recount() {
-        let (_root, host, _paths, d) = pool("refill-late-departure");
-        crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
-        let me = Ident::me();
-        let record = crate::host::locks(&d).join(format!("{}.lock", me.key()));
-        let lock = Flock::new(crate::host::private_file(&record).unwrap(), libc::LOCK_EX).unwrap();
-        crate::host::write_record(&record, &serde_json::to_vec(&me).unwrap()).unwrap();
-        let mut rounds = 0;
-        refill_with(&host, "default", true, |later| {
-            rounds += 1;
-            // A recount on another's behalf keeps pressure's cooldown.
-            assert_eq!(later, rounds > 1);
-            if rounds == 1 {
-                assert_eq!(live(&host, "default"), [me.clone()]);
-                // Like a standby that was still counted when the pull's five-second wait ended.
-                assert_eq!(refill_departed(&host, "default", vec![record.clone()], None).unwrap(), 0);
-            } else {
-                assert!(live(&host, "default").is_empty());
-                assert_eq!(target(&host, "default"), 1);
-            }
-            Ok(0)
-        })
-        .unwrap();
-        assert_eq!(rounds, 2);
-        drop(lock);
-    }
-
-    #[test]
-    fn a_superseded_standbys_grant_no_longer_counts() {
-        let (_root, mut host, _paths, _d) = pool("refill-departed-grant");
-        host.cfg.reserve_mib = Some(0);
-        let grants =
-            |h: &Host| -> Vec<u64> { crate::host::load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default().into_iter().map(|g| g.2).collect() };
-        let mine = host.grant_above(MIN_GRANT_MIB, crate::host::Floor::Reserve, None).unwrap().unwrap();
-        let other = host.grant_above(MIN_GRANT_MIB, crate::host::Floor::Reserve, None).unwrap().unwrap();
-        std::env::set_var(GRANT_ENV, mine.to_string());
-        let grant = inherited_grant();
-        assert_eq!(grant, Some(mine));
-        assert!(std::env::var_os(GRANT_ENV).is_none());
-        // Its count is 0 here: only the grant is under test.
-        assert_eq!(refill_departed(&host, "default", Vec::new(), grant).unwrap(), 0);
-        assert_eq!(grants(&host), [other]);
-    }
-
-    #[test]
-    fn refill_recounts_are_bounded_and_leave_a_pending_request() {
-        let (_root, host, _paths, _d) = pool("refill-bounded");
-        let mut rounds = 0;
-        assert_eq!(
-            refill_with(&host, "default", true, |later| {
-                rounds += 1;
-                assert_eq!(later, rounds > 1);
-                assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
-                Ok(1)
-            })
-            .unwrap(),
-            3
-        );
-        assert_eq!(rounds, 3);
-        assert!(refill_lock_path(&host, "default").with_extension("pending").exists());
-        assert_eq!(refill_with(&host, "default", false, |_| Ok(0)).unwrap(), 0);
-        assert!(!refill_lock_path(&host, "default").with_extension("pending").exists());
     }
 
     #[test]
