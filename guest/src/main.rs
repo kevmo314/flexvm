@@ -619,7 +619,7 @@ fn set_clock(now: libc::timespec) -> Result<i128, String> {
     Ok(off)
 }
 
-/// Counts "crng reseeded due to virtual machine fork" in the whole kmsg ring. The host checks
+/// Counts the kernel's "crng reseeded due to virtual machine fork" records in the whole kmsg ring (one a read). The host checks
 /// for a nonzero count, relying on cold-boot templates having none before their snapshot.
 /// vmgenid sends no uevent; /dev/sysgenid isn't ordered against the reseed.
 fn forks() -> io::Result<usize> {
@@ -637,11 +637,15 @@ fn forks() -> io::Result<usize> {
     }
 }
 
+/// A record ("PRI,SEQ,TS,FLAGS;message\n" then " KEY=value" lines) is the kernel's reseed: facility 0
+/// (userspace's writes get LOG_USER at least), its whole message the one random.c logs.
 fn kernel_fork(record: &[u8]) -> bool {
-    const FORK_MSG: &[u8] = b"crng reseeded due to virtual machine fork";
-    let Some(end) = record.iter().position(|&b| b == b',') else { return false };
-    let pri = std::str::from_utf8(&record[..end]).ok().and_then(|s| s.parse::<u32>().ok());
-    pri.is_some_and(|p| p >> 3 == 0) && record.windows(FORK_MSG.len()).any(|w| w == FORK_MSG)
+    const FORK_MSG: &[u8] = b"random: crng reseeded due to virtual machine fork";
+    let Some(semi) = record.iter().position(|&b| b == b';') else { return false };
+    let (header, msg) = (&record[..semi], &record[semi + 1..]);
+    let msg = msg.split(|&b| b == b'\n').next().unwrap_or_default();
+    let pri = header.split(|&b| b == b',').next().and_then(|p| std::str::from_utf8(p).ok()).and_then(|s| s.parse::<u32>().ok());
+    pri.is_some_and(|p| p >> 3 == 0) && msg == FORK_MSG
 }
 
 fn host_peer(peer: &libc::sockaddr_vm, len: libc::socklen_t) -> bool {
@@ -670,7 +674,10 @@ mod tests {
             "crng reseeded due to virtual machine fork",
             ",42,123,-;crng reseeded due to virtual machine fork\n",
             "bad,42,123,-;crng reseeded due to virtual machine fork\n",
-            "4294967296,42,123,-;crng reseeded due to virtual machine fork\n",
+            "4294967296,42,123,-;random: crng reseeded due to virtual machine fork\n",
+            "6,42,123,-;x: random: crng reseeded due to virtual machine fork\n",
+            "6,42,123,-;random: crng reseeded due to virtual machine fork, says me\n",
+            "6,42,123,-;unrelated\n SUBSYSTEM=random: crng reseeded due to virtual machine fork\n",
         ] {
             assert!(!super::kernel_fork(record.as_bytes()));
         }
