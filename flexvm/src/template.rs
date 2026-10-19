@@ -1335,6 +1335,13 @@ const PUSH_PEER: &str = "push-peer";
 /// A received generation younger than this is not reclaimed under pressure: its arrival may not hold it yet
 /// (or no longer, past `MAX_HELD`) before it opens it.
 const RECLAIM_AFTER: Duration = Duration::from_secs(300);
+/// Made once as a generation is received: its mtime is when (the directory's is when it was last used, `collect`).
+const RECEIVED_AT: &str = "received-at";
+
+/// Whether the generation in `dir` was received within `RECLAIM_AFTER` (one from before `RECEIVED_AT` is not).
+fn fresh(dir: &Path) -> bool {
+    std::fs::metadata(dir.join(RECEIVED_AT)).ok().and_then(|m| m.modified().ok()).is_some_and(|t| t.elapsed().unwrap_or_default() < RECLAIM_AFTER)
+}
 
 /// The budget of spare received generations on a filesystem of `size` bytes, in all and per peer: an eighth
 /// of it, 4 to 128 GiB, and a quarter of that.
@@ -1372,12 +1379,11 @@ impl Push<'_> {
         // What killed receives left, then the spares, oldest first: pressure overrides their idle grace,
         // never a name, a use, a record or an arrival's `RECLAIM_AFTER`.
         sweep_locked(paths)?;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut spares = vec![];
         for id in generations(&paths.templates)? {
             let dir = paths.templates.join(GENERATIONS).join(&id);
             let Ok(m) = std::fs::metadata(&dir) else { continue };
-            if Meta::read(&dir).is_ok_and(|m| m.received) && now.saturating_sub(m.mtime() as u64) >= RECLAIM_AFTER.as_secs() {
+            if Meta::read(&dir).is_ok_and(|m| m.received) && !fresh(&dir) {
                 spares.push((m.mtime(), id));
             }
         }
@@ -1404,7 +1410,7 @@ impl Push<'_> {
     }
 
     /// The blocks spares take (unnamed received generations nothing here or in the states sharing the templates
-    /// uses, held for arrivals or open in no VM process) and other pushes' staging: in all, of this peer's (those
+    /// uses, held for arrivals, received within `RECLAIM_AFTER` or open in no VM process) and other pushes' staging: in all, of this peer's (those
     /// a peer pushed, as `PUSH_PEER` records), and of `own`.
     fn usage(&self, paths: &Paths, own: Option<&Path>) -> Result<(u64, u64, u64)> {
         let named: BTreeSet<String> = names(&paths.templates)?.into_iter().map(|(_, id)| id).collect();
@@ -1417,7 +1423,8 @@ impl Push<'_> {
             }
             let Ok(handle) = File::open(&dir) else { continue };
             let st = crate::util::fstat(handle.as_raw_fd())?;
-            if held.contains(&id) || crate::host::try_lock_at(locks.try_clone()?, &crate::host::use_lock(&st))?.is_some() {
+            // Open but fresh: published, its arrival hold not yet taken (or past `MAX_HELD`).
+            if held.contains(&id) || fresh(&dir) || crate::host::try_lock_at(locks.try_clone()?, &crate::host::use_lock(&st))?.is_some() {
                 dirs.push(dir);
             }
         }
@@ -1615,6 +1622,7 @@ fn receive_inner<R: Read>(
     ready(&meta)?;
     let staging = Staging::new(paths, id)?;
     let paths = &Paths { templates: staging.parent.path.clone(), ..paths.clone() };
+    File::create(staging.dir.join(RECEIVED_AT))?;
     if let Some(push) = push {
         std::fs::write(staging.dir.join(PUSH_PEER), push.peer.to_canonical().to_string())?;
     }
@@ -2700,6 +2708,13 @@ pub(crate) mod tests {
         assert_eq!((hash_file(&dense).unwrap().hash, digest(&dense).unwrap()), (c.hash, sha));
     }
 
+    /// Sets `path`'s times `secs` back.
+    fn aged(path: &Path, secs: i64) {
+        let t = libc::timespec { tv_sec: unsafe { libc::time(std::ptr::null_mut()) } - secs, tv_nsec: 0 };
+        let p = crate::util::cpath(path).unwrap();
+        assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, p.as_ptr(), [t, t].as_ptr(), 0) }, 0);
+    }
+
     fn fs_size(dir: &Path) -> u64 {
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::statvfs(crate::util::cpath(dir).unwrap().as_ptr(), &mut st) }, 0);
@@ -2751,7 +2766,10 @@ pub(crate) mod tests {
         assert_eq!(other.usage(&paths, None).unwrap(), (total, 0, 0));
         let mapped = Push { peer: "::ffff:192.0.2.1".parse().unwrap(), ..push };
         assert_eq!(mapped.usage(&paths, None).unwrap(), (total, total, 0));
-        // Open, not held: a VM process (or a standby, or another state's) runs it.
+        // Open and just received, its hold not yet taken: charged.
+        assert_eq!(Push { held: &none, ..push }.usage(&paths, None).unwrap(), (total, total, 0));
+        // Open, neither held nor fresh: a VM process (or a standby, or another state's) runs it.
+        aged(&got.fixed.join(RECEIVED_AT), RECLAIM_AFTER.as_secs() as i64);
         assert_eq!(Push { held: &none, ..push }.usage(&paths, None).unwrap(), (0, 0, 0));
         let used = || BTreeSet::from([id.clone()]);
         assert_eq!(Push { in_use: &used, ..push }.usage(&paths, None).unwrap(), (0, 0, 0));
@@ -2815,10 +2833,11 @@ pub(crate) mod tests {
             if name != "named" {
                 std::fs::remove_file(f.paths.templates.join(name)).unwrap();
             }
+            // Received long ago, though just used (`collect` stamps the directory): not fresh.
+            let at = f.paths.templates.join(GENERATIONS).join(id).join(RECEIVED_AT);
+            File::create(&at).unwrap();
             if name != "fresh" {
-                let t = libc::timespec { tv_sec: unsafe { libc::time(std::ptr::null_mut()) } - RECLAIM_AFTER.as_secs() as i64, tv_nsec: 0 };
-                let p = crate::util::cpath(&f.paths.templates.join(GENERATIONS).join(id)).unwrap();
-                assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, p.as_ptr(), [t, t].as_ptr(), 0) }, 0);
+                aged(&at, RECLAIM_AFTER.as_secs() as i64);
             }
         }
         let open = Template::open_dir("dddd", f.paths.templates.join(GENERATIONS).join("dddd")).unwrap();
