@@ -742,6 +742,12 @@ impl Proc {
         let drained = Instant::now() + DRAIN_WAIT;
         while vm.pager.remote_left() > 0 && !vm.pager.wait_pulled(Some(Duration::from_millis(100))) {
             cancelled()?;
+            if let Some(why) = vm.pager.failed() {
+                bail!("vm {}: the pager failed: {why}", vm.name);
+            }
+            if vm.pager.stopped() {
+                bail!("vm {}: the pager stopped while pulling its memory", vm.name);
+            }
             if Instant::now() >= drained {
                 bail!("vm {} is still pulling its memory; try again once it has", vm.name);
             }

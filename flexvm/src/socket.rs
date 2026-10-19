@@ -3,7 +3,7 @@
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,7 +32,23 @@ pub fn bind_private(private: &Path, sock: &Path) -> io::Result<std::os::unix::ne
     check(sock)?;
     let (dir, name) = (private.parent().unwrap_or(Path::new(".")), private.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?);
     let dir = fs::File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC).open(dir)?;
-    let short = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
+    let m = dir.metadata()?;
+    if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o022 != 0 {
+        return Err(denied(private, "must be owned by this user and not writable by group or others"));
+    }
+    let opened = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    for entry in fs::read_dir(&opened)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.strip_prefix('.')).and_then(|s| s.strip_suffix(".sock")).and_then(|s| s.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if pid > 0 && entry.file_type()?.is_socket() && unsafe { libc::kill(pid, 0) } < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let short = opened.join(name);
     check(&short)?;
     let _ = fs::remove_file(&short);
     let listener = std::os::unix::net::UnixListener::bind(&short)?;
@@ -184,6 +200,29 @@ mod tests {
         let long = deep.join("c.sock");
         assert_eq!(bind_private(&private, &long).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(!long.exists() && !private.exists());
+    }
+
+    #[test]
+    fn private_bind_checks_directory_and_sweeps_dead_sockets() {
+        let t = fixture();
+        let dir = t.join("private");
+        fs::create_dir(&dir).unwrap();
+        let staging = dir.join(format!(".{}.sock", std::process::id()));
+        let sock = t.join("c.sock");
+        for mode in [0o720, 0o702] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(bind_private(&staging, &sock).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let dead = dir.join(".2147483647.sock");
+        let live = dir.join(format!(".{}.sock", std::process::id()));
+        let plain = dir.join(".2147483646.sock");
+        let _dead = std::os::unix::net::UnixListener::bind(&dead).unwrap();
+        let _live = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        fs::write(&plain, b"keep").unwrap();
+        let _l = bind_private(&dir.join("staging"), &sock).unwrap();
+        assert!(!dead.exists());
+        assert!(live.exists() && plain.exists());
     }
 
     #[test]

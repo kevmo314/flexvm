@@ -1067,7 +1067,7 @@ impl Proc {
         let (ip, gen) = (a.ip, a.gen);
         let Ok(l) = self.host.lock() else {
             // Nothing recorded: told at least once, as before.
-            return tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": self.rev()}));
+            return tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": a.rev}));
         };
         let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
         // Recorded before the claim goes: the claim is what a sweep finds it by otherwise.
@@ -2195,6 +2195,15 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     // Blocked first: every thread from here on (the output relays too) inherits it.
     let signals = crate::util::block_signals(&SIGNALS);
     crate::util::output::guard()?;
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            limit.rlim_cur = limit.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                crate::log!("raising file descriptor limit: {}", std::io::Error::last_os_error());
+            }
+        }
+    }
     let _ = crate::net::ip_forward();
     if let Some(dev) = &host.cfg.announce_dev() {
         let _ = crate::net::proxy_arp(dev);
@@ -3641,6 +3650,35 @@ mod tests {
             p.set_name(p.host.take_name(name, false).unwrap());
         }
         (p, root)
+    }
+
+    #[test]
+    fn withdrawal_fallback_keeps_the_removed_claims_revision() {
+        let (p, _root) = test_proc("withdraw-rev", Some("job"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut host = p.host.clone();
+        host.configure(|cfg| {
+            cfg.peers = vec![listener.local_addr().unwrap().to_string()];
+            Ok(())
+        })
+        .unwrap();
+        let mut claim = p.host.claim_new(&p.host.lock().unwrap(), "job", None).unwrap();
+        claim.rev = 17;
+        p.set_addr(claim);
+        let claim = p.addr.lock().unwrap().take().unwrap();
+        assert_eq!(p.rev(), 0);
+        // A directory in place of the lock file forces the unrecorded fallback.
+        std::fs::remove_file(p.host.lock_file()).unwrap();
+        std::fs::create_dir(p.host.lock_file()).unwrap();
+        let peer = thread::spawn(move || {
+            let (mut c, _) = crate::test_util::accept_tcp(&listener);
+            let req = crate::util::recv_json(&mut BufReader::new(c.try_clone().unwrap())).unwrap().unwrap();
+            writeln!(c, "{}", json!({"ok": true, "result": null})).unwrap();
+            req
+        });
+        p.withdraw(claim);
+        assert_eq!(peer.join_within().unwrap()["rev"], 17);
+        std::fs::remove_dir(p.host.lock_file()).unwrap();
     }
 
     #[test]

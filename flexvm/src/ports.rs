@@ -378,6 +378,10 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 let client = match listener.accept() {
                     Ok((client, _)) => client,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
+                        thread::sleep(Duration::from_millis(100));
+                        break;
+                    }
                     Err(_) => break,
                 };
                 if let Ok(guest) = connect(target) {
@@ -485,6 +489,13 @@ fn send_datagram(socket: &UdpSocket, data: &[u8], peer: SocketAddr, local: Optio
     }
 }
 
+fn udp_idle<T>(clients: &HashMap<T, (UdpSocket, Instant, usize)>, now: Instant) -> Option<T>
+where
+    T: Copy,
+{
+    clients.iter().min_by_key(|(_, (_, at, _))| *at).filter(|(_, (_, at, _))| now.duration_since(*at) >= IDLE / 2).map(|(peer, _)| *peer)
+}
+
 fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
     // A connected guest socket per client preserves reply isolation. Idle sessions expire,
     // and both protocols bound the number of sockets and per-stream queued bytes.
@@ -524,10 +535,17 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
-                if !clients.contains_key(&peer) && clients.len() < CONNECTIONS {
-                    if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
-                        if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
-                            clients.insert(peer, (s, Instant::now(), i));
+                if !clients.contains_key(&peer) {
+                    // Half the expiry protects recent traffic while allowing new clients through.
+                    let oldest = udp_idle(&clients, Instant::now());
+                    if clients.len() < CONNECTIONS || oldest.is_some() {
+                        if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+                            if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
+                                if clients.len() >= CONNECTIONS {
+                                    clients.remove(&oldest.unwrap());
+                                }
+                                clients.insert(peer, (s, Instant::now(), i));
+                            }
                         }
                     }
                 }
@@ -545,6 +563,20 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd) {
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn udp_admission_preserves_recent_sessions() {
+        let now = Instant::now();
+        let mut clients = HashMap::new();
+        for (peer, idle) in [(1, IDLE / 4), (2, IDLE / 2), (3, IDLE * 3 / 4)] {
+            clients.insert(peer, (UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(), now - idle, 0));
+        }
+        assert_eq!(udp_idle(&clients, now), Some(3));
+        clients.remove(&3);
+        assert_eq!(udp_idle(&clients, now), Some(2));
+        clients.remove(&2);
+        assert_eq!(udp_idle(&clients, now), None);
+    }
 
     #[test]
     fn wildcard_udp_replies_from_each_destination() {
