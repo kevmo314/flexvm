@@ -111,29 +111,55 @@ listeners = {}
 REMOVED_LOGS = {}
 
 
-def held_logs(run, a):
-    """`rm [-f] NAME...` deletes the VMs' logs: open now, each is read once the removal is done."""
-    held = {}
-    for n in a[1:] if a[:1] == ("rm",) else ():
-        with suppress(OSError):
-            held[n] = open(os.path.join(run, "vms", f"{n}.log"))
-    return held
+class HeldLogs:
+    """`rm [-f] NAME...` deletes the VMs' logs. Each NAME.log there while it runs is held open (one
+    a rotation made as the VM ended too), so `kept` reads what the removal unlinked, in order."""
 
+    def __init__(self, vms_dir, names):
+        self.paths = {n: os.path.join(vms_dir, f"{n}.log") for n in names}
+        self.held = {n: {} for n in names}
+        self.done = threading.Event()
+        self.look()
+        self.watcher = threading.Thread(target=self.watch, daemon=True)
+        self.watcher.start()
 
-def keep_removed(run, held):
-    for n, f in held.items():
-        with f:
-            if os.fstat(f.fileno()).st_nlink == 0:
-                REMOVED_LOGS[(run, n)] = REMOVED_LOGS.get((run, n), "") + f.read()
+    def look(self):
+        for n, path in self.paths.items():
+            try:
+                f = open(path, errors="replace")
+            except OSError:
+                continue
+            ino = os.fstat(f.fileno()).st_ino
+            if ino in self.held[n]:
+                f.close()
+            else:
+                self.held[n][ino] = f
+
+    def watch(self):
+        while not self.done.wait(0.005):
+            self.look()
+
+    def kept(self):
+        """{name: what its logs held}, of those `rm` unlinked."""
+        self.done.set()
+        self.watcher.join()
+        kept = {}
+        for n, files in self.held.items():
+            for f in files.values():
+                with f:
+                    if os.fstat(f.fileno()).st_nlink == 0:
+                        kept[n] = kept.get(n, "") + f.read()
+        return kept
 
 
 def cli(host, *a, timeout=120):
     """Runs flexvm against `host`; returns (exit code, stdout, stderr)."""
-    held = held_logs(host.run, a)
+    held = HeldLogs(os.path.join(host.run, "vms"), a[1:]) if a[:1] == ("rm",) else None
     try:
         r = subprocess.run([BIN, "--state", host.state, "--run", host.run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
     finally:
-        keep_removed(host.run, held)
+        for n, text in (held.kept() if held else {}).items():
+            REMOVED_LOGS[(host.run, n)] = REMOVED_LOGS.get((host.run, n), "") + text
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 

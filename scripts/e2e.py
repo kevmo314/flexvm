@@ -214,17 +214,12 @@ class Host:
 
     def cli(self, *argv, **kw):
         # `rm` deletes the VMs' logs: what they held is kept for `logs` (and `save_logs`).
-        held = {}
-        for n in argv[1:] if argv[:1] == ("rm",) else ():
-            with contextlib.suppress(OSError):
-                held[n] = open(os.path.join(self.run_dir, "vms", f"{n}.log"), errors="replace")
+        held = HeldLogs(os.path.join(self.run_dir, "vms"), argv[1:]) if argv[:1] == ("rm",) else None
         try:
             return flexvm("--state", self.state_dir, "--run", self.run_dir, *argv, env=ENV, **kw)
         finally:
-            for n, f in held.items():
-                with f:
-                    if os.fstat(f.fileno()).st_nlink == 0:
-                        self.removed_logs[n] = self.removed_logs.get(n, "") + f.read()
+            for n, text in (held.kept() if held else {}).items():
+                self.removed_logs[n] = self.removed_logs.get(n, "") + text
 
     def configure(self, **keys):
         """Sets keys of STATE/host.json (None removes one): read, updated and replaced atomically."""
@@ -406,6 +401,48 @@ class Host:
 
 
 # --- helpers -------------------------------------------------------------------
+
+
+class HeldLogs:
+    """`rm [-f] NAME...` deletes the VMs' logs. Each NAME.log there while it runs is held open (one
+    a rotation made as the VM ended too), so `kept` reads what the removal unlinked, in order."""
+
+    def __init__(self, vms_dir, names):
+        self.paths = {n: os.path.join(vms_dir, f"{n}.log") for n in names}
+        self.held = {n: {} for n in names}
+        self.done = threading.Event()
+        self.look()
+        self.watcher = threading.Thread(target=self.watch, daemon=True)
+        self.watcher.start()
+
+    def look(self):
+        for n, path in self.paths.items():
+            try:
+                f = open(path, errors="replace")
+            except OSError:
+                continue
+            ino = os.fstat(f.fileno()).st_ino
+            if ino in self.held[n]:
+                f.close()
+            else:
+                self.held[n][ino] = f
+
+    def watch(self):
+        while not self.done.wait(0.005):
+            self.look()
+
+    def kept(self):
+        """{name: what its logs held}, of those `rm` unlinked."""
+        self.done.set()
+        self.watcher.join()
+        kept = {}
+        for n, files in self.held.items():
+            for f in files.values():
+                with f:
+                    if os.fstat(f.fileno()).st_nlink == 0:
+                        kept[n] = kept.get(n, "") + f.read()
+        return kept
+
 
 
 def vm_resources(ip):
