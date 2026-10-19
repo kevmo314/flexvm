@@ -218,6 +218,19 @@ fn delete(state: &Path, all: &[Entry], order: Vec<usize>) -> Result<Vec<Value>> 
     Ok(out)
 }
 
+/// Removes checkpoints `ids` (dependants first), which no name links to, under the lock the caller
+/// holds exclusively: what a failed `checkpoint load` published. As `delete` removes one.
+pub(super) fn unpublish(state: &Path, ids: &[String]) -> Result<()> {
+    let store = dir(state);
+    for id in ids {
+        let gone = store.join(format!("{REMOVED}{id}"));
+        std::fs::rename(store.join(id), &gone)?;
+        crate::util::sync_dir(&store)?;
+        std::fs::remove_dir_all(&gone)?;
+    }
+    Ok(())
+}
+
 /// `checkpoint ls`'s rows (as `--format json` prints them): the template is the image name
 /// linking to its generation now (null if none does), the parent its name or id.
 pub fn rows(state: &Path, templates: &[Value]) -> Vec<Value> {

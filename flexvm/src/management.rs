@@ -240,13 +240,15 @@ fn load_checkpoint(host: &crate::host::Host, args: &Args) -> Result<()> {
         Some(dir) if std::path::Path::new(dir).is_dir() => export::load_dir(&host.state, &paths, std::path::Path::new(dir), name, sha256)?,
         Some(file) => {
             let f = std::fs::File::open(file).map_err(|e| format!("{file}: {e}"))?;
-            export::load(&host.state, &paths, &mut std::io::BufReader::with_capacity(1 << 20, f), name, sha256)?
+            export::load(&host.state, &paths, &mut std::io::BufReader::with_capacity(1 << 20, f), name, sha256, &|| host.template_users())?
         }
         None => {
             if std::io::stdin().is_terminal() {
                 bail!("checkpoint load reads a save from stdin, not a terminal (or give -i FILE|DIR)");
             }
-            export::load(&host.state, &paths, &mut std::io::BufReader::with_capacity(1 << 20, std::io::stdin().lock()), name, sha256)?
+            export::load(&host.state, &paths, &mut std::io::BufReader::with_capacity(1 << 20, std::io::stdin().lock()), name, sha256, &|| {
+                host.template_users()
+            })?
         }
     };
     crate::print(loaded)
