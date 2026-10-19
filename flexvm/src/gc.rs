@@ -345,7 +345,12 @@ fn standby_sockets(dir: &Path) {
         let n = e.file_name().to_string_lossy().into_owned();
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
         let tmp = n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock"));
-        let socket_id = n.strip_suffix(".sock").and_then(|s| s.parse().ok()).and_then(Ident::of).map(|id| id.key());
+        // A pid with no /proc entry is gone (its socket's lock key `PID-0` never exists); an
+        // identity that cannot be read otherwise proves nothing and the socket stays.
+        let socket_id = n.strip_suffix(".sock").and_then(|s| s.parse::<u32>().ok()).and_then(|pid| match std::fs::symlink_metadata(format!("/proc/{pid}")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!("{pid}-0")),
+            _ => Ident::of(pid).map(|id| id.key()),
+        });
         let Some(id) = claim.or(tmp).or(socket_id.as_deref()) else {
             continue;
         };
@@ -435,7 +440,7 @@ mod tests {
         standby_sockets(&d);
         let left = |n: &str| d.join(n).exists() || l.join(n).exists();
         assert!(left(&live_sock));
-        assert!(left("999999990.sock"), "an unreadable identity is skipped");
+        assert!(!left("999999990.sock"), "a pid with no process is gone");
         assert!(left("4-1.claim") && left("5-7.claim"), "a claim marker of a standby still here stays");
         assert!(!left("3-1.claim") && !left("5-6.claim"), "one unlocked goes once its lock is gone or names another process");
         assert!(!left("3-1.take") && left("5-7.take"), "a claimer's marker goes with its standby");

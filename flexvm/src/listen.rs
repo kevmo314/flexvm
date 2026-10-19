@@ -739,8 +739,9 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant,
     let file = format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, std::process::id());
     let vms = host.run.join("vms");
     let (log_path, lock_path) = (vms.join(&file), crate::host::locks(&vms).join(&file));
-    let lock = crate::host::private_file(&lock_path)?;
-    crate::host::flock(&lock, libc::LOCK_SH)?;
+    // Retried until the file locked is the path's: a sweep may remove a lock with no log yet
+    // (`gc::orphan_log_locks`) between its creation and the flock.
+    let lock = crate::host::lock_path(&lock_path, libc::LOCK_SH)?;
     let log = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&log_path).inspect_err(|_| drop(std::fs::remove_file(&lock_path)))?
