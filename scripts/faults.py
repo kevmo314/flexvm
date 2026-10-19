@@ -3219,7 +3219,9 @@ def forged_vmstate():
     """#548: a vmstate whose devices are not the template's (an extra block
     device on a host file, an extra net device naming another tap) is refused
     by Firecracker before it opens either, whether the load was prepared or
-    not, and an arrival that sends one is refused with nothing left."""
+    not, and an arrival that sends one is refused with nothing left. #788: a
+    template vmstate (as a peer could push) whose pmem is writable or names any
+    path but `rootfs` is refused, prepared or not, before Firecracker opens it."""
     if not subprocess.run(["sh", "-c", "command -v strace"], capture_output=True).stdout:
         raise Skip("no strace, to see what Firecracker opens")
     fc = os.path.join(A.state, "artifacts", "firecracker")
@@ -3229,25 +3231,35 @@ def forged_vmstate():
     disk, tap = f"{work}/disk", f"fvf{os.getpid() % 100000}"
     with open(disk, "wb") as f:
         f.write(b"\0" * (1 << 20))
+    # What forged pmem devices name: a host file, by its absolute path.
+    pmem = f"{work}/pmem"
+    with open(pmem, "wb") as f:
+        f.write(b"\0" * (2 << 20))
 
     def start_fc(d, *wrap):
         rootfs_link(d, args.template)
         p = subprocess.Popen([*wrap, fc, "--api-sock", f"{d}/api.sock", "--level", "Warn"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=d)
-        wait_for(lambda: os.path.exists(f"{d}/api.sock"), 5)
 
         def api(method, path, body):
             r = subprocess.run(["curl", "-s", "-o", "/dev/stderr", "-w", "%{http_code}", "--unix-socket",
-                                f"{d}/api.sock", "-X", method, f"http://x{path}", "-d", json.dumps(body)],
+                                f"{d}/api.sock", "-X", method, f"http://x{path}", *(["-d", json.dumps(body)] if body is not None else [])],
                                capture_output=True, text=True, timeout=30)
             return int(r.stdout or 0), r.stderr
+        # Answering, not only bound: its socket exists before it serves, more so under strace.
+        assert wait_for(lambda: os.path.exists(f"{d}/api.sock") and api("GET", "/", None)[0] == 200, 20), f"firecracker in {d} never answered"
         return p, api
 
-    def forge(label, extra):
+    def forge(label, extra, scratch_rootfs=False):
         """The vmstate of a VM with a vsock, eth0 and `extra`'s devices, as a peer could send."""
         d = f"{work}/{label}"
         os.makedirs(d)
         p, api = start_fc(d)
+        if scratch_rootfs:
+            # Never the template's own root filesystem, which a writable pmem would map shared.
+            os.unlink(f"{d}/rootfs")
+            with open(f"{d}/rootfs", "wb") as f:
+                f.write(b"\0" * (2 << 20))
         try:
             for path, body in [("/machine-config", {"vcpu_count": 1, "mem_size_mib": 128}),
                                ("/boot-source", {"kernel_image_path": os.path.join(A.state, "artifacts", "vmlinux"),
@@ -3268,10 +3280,15 @@ def forged_vmstate():
     forged = [("block", forge("block", [("/drives/disk", {"drive_id": "disk", "path_on_host": disk, "is_root_device": False,
                                                            "is_read_only": False})]), "block device"),
               ("net", forge("net", [("/network-interfaces/eth1", {"iface_id": "eth1", "host_dev_name": tap})]), "net")]
+    pmem_dev = lambda path, read_only: [("/pmem/root", {"id": "root", "path_on_host": path, "root_device": False, "read_only": read_only})]
+    confined = [("pmem absolute", forge("pmem-absolute", pmem_dev(pmem, True))),
+                ("pmem writable", forge("pmem-writable", pmem_dev("rootfs", False), scratch_rootfs=True)),
+                ("pmem dotted", forge("pmem-dotted", pmem_dev("./rootfs", True)))]
     # Its atime set back, a read would move it (relatime).
-    os.utime(disk, (0, os.stat(disk).st_mtime))
+    for f in (disk, pmem):
+        os.utime(f, (0, os.stat(f).st_mtime))
 
-    def load(label, vmstate, why, prepare):
+    def load(label, vmstate, why, prepare, reference=None):
         d = tempfile.mkdtemp(prefix="fvt", dir="/tmp")
         uffd = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         uffd.bind(f"{d}/u.sock")
@@ -3282,15 +3299,20 @@ def forged_vmstate():
         p, api = start_fc(d, "strace", "--kill-on-exit", "-f", "-qq", "-s", "4096", "-e", "trace=open,openat,openat2,creat", "-o", trace)
         body = lambda path: {"snapshot_path": path, "mem_backend": {"backend_type": "Uffd", "backend_path": f"{d}/u.sock"},
                              "vsock_override": {"uds_path": f"{d}/v.sock"}, "network_overrides": [{"iface_id": "eth0", "host_dev_name": "fvt0"}],
-                             "device_reference_path": tpl}
+                             "device_reference_path": reference or tpl, "confined_pmem": "rootfs"}
         try:
-            if prepare:
-                code, out = api("PUT", "/snapshot/prepare", body(tpl))
-                if code == 400 and "Invalid request" in out:
-                    raise Skip("Firecracker without the prepare patch")
-                check(f"forged vmstate {label}: prepared", code == 204, (code, out))
-            code, out = api("PUT", "/snapshot/load", body(vmstate))
-            check(f"forged vmstate {label}: refused", code == 400 and "not the ones prepared" in out and why in out, (code, out))
+            if reference:
+                # The forged vmstate is the template (received from a peer): it is the reference, and what is prepared.
+                code, out = api("PUT", "/snapshot/prepare" if prepare else "/snapshot/load", body(vmstate))
+                check(f"forged vmstate {label}: refused", code == 400 and 'must be \\"rootfs\\", read only' in out, (code, out))
+            else:
+                if prepare:
+                    code, out = api("PUT", "/snapshot/prepare", body(tpl))
+                    if code == 400 and "Invalid request" in out:
+                        raise Skip("Firecracker without the prepare patch")
+                    check(f"forged vmstate {label}: prepared", code == 204, (code, out))
+                code, out = api("PUT", "/snapshot/load", body(vmstate))
+                check(f"forged vmstate {label}: refused", code == 400 and "not the ones prepared" in out and why in out, (code, out))
         finally:
             p.kill()
             p.wait()
@@ -3299,11 +3321,18 @@ def forged_vmstate():
         check(f"forged vmstate {label}: the load ran traced", f'"{vmstate}"' in opened, opened[-300:])
         check(f"forged vmstate {label}: never opened the host file or a tap", disk not in opened and "/dev/net/tun" not in opened,
               [l for l in opened.splitlines() if disk in l or "/dev/net/tun" in l])
+        if reference:
+            # A prepare of the real template opens its `rootfs`; a refused forged one opens no pmem file.
+            named = [l for l in opened.splitlines() if f'"{pmem}"' in l or '"rootfs"' in l or '"./rootfs"' in l]
+            check(f"forged vmstate {label}: never opened a pmem file", not named, named)
 
     try:
         for kind, vmstate, why in forged:
             load(f"{kind}, prepared", vmstate, why, True)
             load(f"{kind}, not prepared", vmstate, why, False)
+        for kind, vmstate in confined:
+            load(f"{kind}, prepared", vmstate, "", True, reference=vmstate)
+            load(f"{kind}, not prepared", vmstate, "", False, reference=vmstate)
         # Through an arrival: the target's load (and its retry on a fresh Firecracker) refuses it.
         tid = source_vm()
         for kind, vmstate, why in forged:
@@ -3321,7 +3350,8 @@ def forged_vmstate():
             s.close()
             check(f"forged vmstate arrival {kind}: refused", b'"ok":false' in reply and b"not the ones prepared" in reply, reply[:400])
             nothing_left(f"forged vmstate arrival {kind}", n, ip)
-        check("forged vmstate: the host file was never read", os.stat(disk).st_atime == 0, os.stat(disk).st_atime)
+        check("forged vmstate: the host files were never read", os.stat(disk).st_atime == 0 and os.stat(pmem).st_atime == 0,
+              (os.stat(disk).st_atime, os.stat(pmem).st_atime))
         check("forged vmstate: no tap of the forged name", not os.path.exists(f"/sys/class/net/{tap}"))
     finally:
         subprocess.run(["rm", "-rf", work])

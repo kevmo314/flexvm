@@ -211,13 +211,14 @@ impl Firecracker {
     }
 }
 
-/// Common to restore, migration prepare and migration load. Only local v0.1.0 generations
-/// may name an absolute pmem path; a peer's generation must always stay confined.
+/// Common to every load (restore, standby, migration prepare and load): Firecracker opens no pmem
+/// file but the one `template` names (`Template::pmem_path`), read only, whoever sent the vmstate
+/// or the template (`firecracker/0002-*.patch`, #788).
 pub(crate) fn snapshot_load_body(vmstate: &Path, template: &crate::template::Template, tap: &str, vsock: &Path, uffd: &Path) -> Result<Value> {
     Ok(serde_json::json!({
         "snapshot_path": vmstate,
         "device_reference_path": template.vmstate(),
-        "confined_pmem": template.meta.received || !template.names_rootfs_by_path()?,
+        "confined_pmem": template.pmem_path()?,
         "mem_backend": {"backend_type": "Uffd", "backend_path": uffd},
         "vsock_override": {"uds_path": vsock},
         "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],

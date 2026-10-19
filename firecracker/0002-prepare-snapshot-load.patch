@@ -40,7 +40,7 @@
              },
 -            "huge_pages": "2M"
 +            "huge_pages": "2M",
-+            "confined_pmem": true
++            "confined_pmem": "rootfs"
          }"#;
          let expected_config = LoadSnapshotParams {
              snapshot_path: PathBuf::from("foo"),
@@ -49,16 +49,16 @@
              clock_realtime: false,
              huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
 +            device_reference_path: None,
-+            confined_pmem: true,
++            confined_pmem: Some(PathBuf::from("rootfs")),
          };
 +        assert!(matches!(
 +            vmm_action_from_request(
 +                parse_put_snapshot(&Body::new(body), Some("prepare")).unwrap()
 +            ),
 +            VmmAction::PrepareSnapshot(LoadSnapshotParams {
-+                confined_pmem: true,
++                confined_pmem: Some(ref path),
 +                ..
-+            })
++            }) if path.as_os_str() == "rootfs"
 +        ));
 +
          let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -69,7 +69,7 @@
              clock_realtime: false,
              huge_pages: SnapshotLoadHugePageConfig::Snapshot,
 +            device_reference_path: None,
-+            confined_pmem: false,
++            confined_pmem: None,
          };
          let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
          assert!(
@@ -78,7 +78,7 @@
              clock_realtime: false,
              huge_pages: SnapshotLoadHugePageConfig::Snapshot,
 +            device_reference_path: None,
-+            confined_pmem: false,
++            confined_pmem: None,
          };
          let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
          assert!(
@@ -87,7 +87,7 @@
              clock_realtime: false,
              huge_pages: SnapshotLoadHugePageConfig::Snapshot,
 +            device_reference_path: None,
-+            confined_pmem: false,
++            confined_pmem: None,
          };
          let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
          assert!(
@@ -96,7 +96,7 @@
              clock_realtime: false,
              huge_pages: SnapshotLoadHugePageConfig::Snapshot,
 +            device_reference_path: None,
-+            confined_pmem: false,
++            confined_pmem: None,
          };
          let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
          assert_eq!(
@@ -261,6 +261,8 @@
 +    Prepared(String),
 +    /// The snapshot's devices are not the ones prepared: {0}
 +    Devices(String),
++    /// The snapshot's pmem device names a file the load does not allow: {0}
++    ConfinedPmem(String),
 +}
 +
 +/// flexvm: what `PrepareSnapshot` set up: a KVM VM with its vCPUs and memory slots for the layout
@@ -293,7 +295,7 @@
 +        ));
 +    }
 +    let mut state = snapshot_state_from_file(&params.snapshot_path)?;
-+    check_confined_pmem(&state, params.confined_pmem)?;
++    check_confined_pmem(&state, params.confined_pmem.as_deref())?;
 +    snapshot_state_sanity_check(&state)?;
 +    if let (Some(vsock_override), VirtioDevicesState::Mmio(mmio_state)) = (
 +        &params.vsock_override,
@@ -326,29 +328,27 @@
 +    })
 +}
 +
-+/// flexvm: validate before prepare or restore can open any pmem file. Local legacy
-+/// generations may opt out; received generations must never use their absolute host paths.
++/// flexvm: before prepare or restore opens any pmem file, every pmem device must name exactly
++/// `confined` (if set), read only. Unset only for local generations built by flexvm v0.1.0,
++/// whose snapshots name their root filesystem by its absolute path.
 +fn check_confined_pmem(
 +    state: &MicrovmState,
-+    confined: bool,
++    confined: Option<&std::path::Path>,
 +) -> Result<(), RestoreFromSnapshotError> {
-+    if !confined {
++    let Some(confined) = confined else {
 +        return Ok(());
-+    }
++    };
 +    let VirtioDevicesState::Mmio(mmio) = &state.device_states.virtio_state else {
-+        return Err(RestoreFromSnapshotError::Devices(
++        return Err(RestoreFromSnapshotError::ConfinedPmem(
 +            "only the MMIO transport can be confined".into(),
 +        ));
 +    };
 +    for pmem in &mmio.pmem_devices {
 +        let config = &pmem.device_state.config;
-+        let path = std::path::Path::new(&config.path_on_host);
-+        if !config.read_only
-+            || path.is_absolute()
-+            || path.components().any(|c| c == std::path::Component::ParentDir)
-+        {
-+            return Err(RestoreFromSnapshotError::Devices(format!(
-+                "pmem {:?} must be read only with a relative path and no '..' components",
++        // Byte for byte: `Path` equality would take "rootfs/" or "./rootfs" for "rootfs".
++        if !config.read_only || confined.as_os_str() != config.path_on_host.as_str() {
++            return Err(RestoreFromSnapshotError::ConfinedPmem(format!(
++                "pmem {:?} must be {confined:?}, read only",
 +                config.path_on_host
 +            )));
 +        }
@@ -542,7 +542,7 @@
 +    prepared: Option<PreparedRestore>,
  ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
      let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
-+    check_confined_pmem(&microvm_state, params.confined_pmem)?;
++    check_confined_pmem(&microvm_state, params.confined_pmem.as_deref())?;
      for entry in &params.network_overrides {
          // Only the active transport carries virtio device state, so we look at whichever
          // variant this snapshot was saved with. The MMIO and PCI transports wrap their net
@@ -595,7 +595,7 @@
          guest_memory,
          uffd,
          seccomp_filters,
-@@ -794,6 +1099,164 @@
+@@ -794,6 +1099,169 @@
          assert_eq!(restored_mmio, mmio)
      }
  
@@ -633,25 +633,30 @@
 +                rate_limiter_state: crate::rate_limiter::RateLimiter::default().save(),
 +            },
 +        });
++        let rootfs = Some(std::path::Path::new("rootfs"));
 +        for (path, read_only, allowed) in [
 +            ("rootfs", true, true),
-+            ("./rootfs", true, true),
-+            ("dir/rootfs", true, true),
-+            ("rootfs..", true, true),
++            ("rootfs", false, false),
++            ("", true, false),
++            (".", true, false),
++            ("./rootfs", true, false),
++            ("rootfs/", true, false),
++            ("rootfs\0", true, false),
++            ("dir/rootfs", true, false),
++            ("firecracker.log", true, false),
++            ("vmstate.in", true, false),
 +            ("/etc/shadow", true, false),
++            ("/etc/shadow", false, false),
 +            ("../rootfs", true, false),
 +            ("dir/../rootfs", true, false),
-+            ("dir/..", true, false),
-+            ("rootfs", false, false),
-+            ("/etc/shadow", false, false),
 +        ] {
 +            let config = &mut mmio.pmem_devices[0].device_state.config;
 +            config.path_on_host = path.into();
 +            config.read_only = read_only;
 +            state.device_states.virtio_state = VirtioDevicesState::Mmio(mmio.clone());
-+            assert_eq!(check_confined_pmem(&state, true).is_ok(), allowed, "{path}");
-+            // An omitted/false flag preserves local v0.1.0 snapshot loads.
-+            check_confined_pmem(&state, false).unwrap();
++            assert_eq!(check_confined_pmem(&state, rootfs).is_ok(), allowed, "{path:?}");
++            // Unset, as for local v0.1.0 generations: their paths load as before.
++            check_confined_pmem(&state, None).unwrap();
 +        }
 +    }
 +
@@ -696,7 +701,7 @@
 +            clock_realtime: false,
 +            huge_pages: Default::default(),
 +            device_reference_path: None,
-+            confined_pmem: false,
++            confined_pmem: None,
 +        };
 +        let good = params(&[("netif", "tap-flexvm")], true);
 +        let refused =
@@ -848,13 +853,13 @@
                  clock_realtime: false,
                  huge_pages: SnapshotLoadHugePageConfig::Snapshot,
 +                device_reference_path: None,
-+                confined_pmem: false,
++                confined_pmem: None,
              },
          )));
          check_unsupported(runtime_request(VmmAction::SetEntropyDevice(
 --- a/src/vmm/src/vmm_config/snapshot.rs
 +++ b/src/vmm/src/vmm_config/snapshot.rs
-@@ -125,6 +125,12 @@
+@@ -125,6 +125,13 @@
      pub clock_realtime: bool,
      /// Selects the huge-page configuration to use for the restored microVM.
      pub huge_pages: SnapshotLoadHugePageConfig,
@@ -862,12 +867,13 @@
 +    /// files they open taken from it and the overrides (unless the load was prepared, when the
 +    /// prepared snapshot is that reference).
 +    pub device_reference_path: Option<PathBuf>,
-+    /// flexvm: require read-only pmem files with relative paths containing no parent components.
-+    pub confined_pmem: bool,
++    /// flexvm: when set, the only path a pmem device may name, read only: the vmstate (and the
++    /// device reference) may come from a peer, so neither names any other host file.
++    pub confined_pmem: Option<PathBuf>,
  }
  
  /// Stores the configuration for loading a snapshot that is provided by the user.
-@@ -163,6 +169,12 @@
+@@ -163,6 +170,12 @@
      /// Selects the huge-page configuration to use for the restored microVM.
      #[serde(default)]
      pub huge_pages: SnapshotLoadHugePageConfig,
@@ -876,7 +882,7 @@
 +    pub device_reference_path: Option<PathBuf>,
 +    /// flexvm: see `LoadSnapshotParams::confined_pmem`.
 +    #[serde(default)]
-+    pub confined_pmem: bool,
++    pub confined_pmem: Option<PathBuf>,
  }
  
  /// Stores the configuration used for managing snapshot memory.
@@ -1088,7 +1094,7 @@
              clock_realtime: false,
              huge_pages,
 +            device_reference_path: None,
-+            confined_pmem: false,
++            confined_pmem: None,
          }))
          .unwrap();
  
@@ -1097,7 +1103,7 @@
              clock_realtime: false,
              huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
 +            device_reference_path: None,
-+            confined_pmem: false,
++            confined_pmem: None,
          }))
          .unwrap_err();
  
@@ -1106,7 +1112,7 @@
          clock_realtime: false,
          huge_pages: SnapshotLoadHugePageConfig::Snapshot,
 +        device_reference_path: None,
-+        confined_pmem: false,
++        confined_pmem: None,
      });
      let err = preboot_api_controller.handle_preboot_request(req);
      assert!(

@@ -1312,6 +1312,17 @@ addresses or pmem files than the reference's, or with a net device or vsock
 whose tap or socket the load's overrides do not name. flexvm needs the
 patch: stock Firecracker rejects the field.
 
+The reference itself can be a peer's: a migration target may receive the
+template generation from its source (#774). So every load also names, as
+`confined_pmem`, the one file a pmem device may open (#788): `rootfs` in
+Firecracker's directory (linked to the generation's root filesystem), or
+for a generation built by v0.1.0, which names its root filesystem by its
+path, that path (for a received one, `template::receive` found it holding
+that root filesystem here). Before anything is opened, in a prepare and in
+a load, Firecracker refuses a snapshot with a pmem device that is writable
+or names any other path, byte for byte (so not `./rootfs`, `rootfs/` or
+another file in its directory, such as its log).
+
 `firecracker/0003-hold-free-page-reporting.patch`: `PATCH
 /balloon/reporting/hold` and `PATCH /balloon/reporting/release`. While held,
 the balloon leaves free page reports in their virtqueue (it consumes the
