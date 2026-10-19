@@ -820,9 +820,10 @@ impl Host {
                 Err(e) => bail!("{}: {e}", lock.display()),
             }
         };
-        // Locked, so its holder no longer runs it; its Firecrackers are reaped on
-        // proof of death only, and an unreadable lock is an error, never no holder.
-        if let Some(old) = lock_holder(&lock)?.filter(|o| *o != Ident::me()) {
+        // Exclusively held: a partial holder is an earlier owner's interrupted write.
+        // Read errors still fail; Firecrackers are reaped on proof of death only.
+        let bytes = read_record(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+        if let Some(old) = serde_json::from_slice::<Ident>(&bytes).ok().filter(|o| *o != Ident::me()) {
             reap(&self.run, &old)?;
         }
         self.finish_rename(name)?;
@@ -3026,44 +3027,49 @@ impl Host {
         self.run.join(".boot")
     }
 
-    /// Whether the host was recovered in boot `boot` (`mark_recovered`).
+    /// Whether local recovery completed in boot `boot`.
     fn recovered(&self, boot: &str) -> bool {
         !boot.is_empty() && std::fs::read_to_string(self.boot_marker()).is_ok_and(|b| b == boot)
     }
 
-    /// Recovery after a boot is complete: written only once every step of it succeeded
-    /// (`gc::after_boot`), so until then every opener tries again.
+    /// Full boot recovery is complete (`gc::after_boot`); `.boot` records local recovery alone.
     pub fn mark_recovered(&self) -> Result<()> {
-        crate::util::write_file(&self.run, ".boot", boot_id().as_bytes(), false).map_err(|e| format!("{}: {e}", self.boot_marker().display()).into())
+        crate::util::write_file(&self.run, ".boot", boot_id().as_bytes(), false)?;
+        crate::util::write_file(&self.run, ".boot-ready", boot_id().as_bytes(), false).map_err(Into::into)
     }
 
-    /// Until this boot's recovery is complete (`RUN/.boot`), under the host lock, before anything
+    /// Until this boot's recovery is complete (`RUN/.boot-ready`), under the host lock, before anything
     /// else here: what the VMs that ran before the boot left. Each is recorded as lost
     /// (`RUN/vms/NAME.lost`, listed by `ps -a` until `flexvm rm NAME`) before its address is
     /// withdrawn (`withdraw_dead`: a home host's loan ends once the peers are told, an outcome owed
     /// for an interrupted migration is recorded and settled by sweeps), and the routes to peers'
     /// VMs are put back from `STATE/addrs` (kernel routes do not outlive a boot, and peers never
     /// announce again what they delivered, #553). None if recovered already; else whether every
-    /// step succeeded. Idempotent: it runs again on the next open until the recovery is marked.
+    /// step succeeded. Local cleanup is marked in `.boot` before routes are retried; full
+    /// recovery is marked separately in `.boot-ready`.
     pub fn after_boot(&self) -> Result<Option<bool>> {
         self.after_boot_with(boot_id(), crate::net::route_via)
     }
 
     fn after_boot_with(&self, boot: &str, mut route: impl FnMut(Ipv4Addr, Ipv4Addr) -> Result<()>) -> Result<Option<bool>> {
-        if boot.is_empty() || self.recovered(boot) {
+        let ready = || std::fs::read_to_string(self.run.join(".boot-ready")).is_ok_and(|b| b == boot);
+        if boot.is_empty() || ready() {
             return Ok(None);
         }
         let l = self.lock()?;
-        if self.recovered(boot) {
+        if ready() {
             return Ok(None);
         }
-        let mut ok = match self.collect_garbage_with(true) {
-            Ok(_) => true,
-            Err(e) => {
-                crate::log!("after boot: {e}");
-                false
+        let mut ok = true;
+        if !self.recovered(boot) {
+            match self.collect_garbage_with(true) {
+                Ok(_) => crate::util::write_file(&self.run, ".boot", boot.as_bytes(), false)?,
+                Err(e) => {
+                    crate::log!("after boot: {e}");
+                    ok = false;
+                }
             }
-        };
+        }
         let ips = std::fs::read_dir(self.state.join("addrs")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok());
         for ip in ips {
             let a = match self.addr(&l, ip) {
@@ -5919,12 +5925,15 @@ pub(crate) mod tests {
         let dead = dead_owner(&h, 999_999_922, &[]);
         std::fs::create_dir_all(dead.work_dir(&h.run).join("0/fc")).unwrap();
         assert!(reap(&h.run, &dead).is_err());
-        // A name whose lock cannot be read is not free.
+        // A corrupt holder stays unknown until we take its lock exclusively.
         std::fs::write(h.vms("u", "lock").unwrap(), "{").unwrap();
         let l = h.lock().unwrap();
-        assert!(h.take_name("u", false).is_err() && !h.holder_gone("u"));
+        assert!(!h.holder_gone("u"));
         collect_owned(&h.run);
-        assert!(h.vms("u", "lock").unwrap().exists(), "kept by the garbage collector too");
+        assert!(h.vms("u", "lock").unwrap().exists(), "kept without exclusive ownership");
+        let taken = h.take_name("u", false).unwrap();
+        assert_eq!(lock_holder(&h.vms("u", "lock").unwrap()).unwrap(), Some(Ident::me()));
+        drop(taken);
         // An empty lock (created, never written) is no holder.
         std::fs::write(h.vms("e", "lock").unwrap(), "").unwrap();
         assert!(h.take_name("e", false).is_ok());
@@ -5933,6 +5942,7 @@ pub(crate) mod tests {
         let x = h.claim_new(&l, "v", Some(ip("10.9.0.2"))).unwrap();
         for unreadable in ["{", ""] {
             std::fs::write(h.vms("v", "lock").unwrap(), unreadable).unwrap();
+            assert!(h.take_name("v", false).is_err(), "a held corrupt lock cannot be taken over");
             assert_eq!(h.holder(&l, x.ip).unwrap().as_deref(), Some("v"), "{unreadable:?}");
             assert!(h.claim_new(&l, "w", Some(x.ip)).is_err() && h.lend_new(&l, x.ip).is_err());
         }
@@ -5992,7 +6002,7 @@ pub(crate) mod tests {
         down.set(false);
         assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(true), "never marked by the local pass alone");
         assert_eq!(routes.borrow().len(), 2);
-        assert!(!h.boot_marker().exists());
+        assert_eq!(std::fs::read_to_string(h.boot_marker()).unwrap(), "boot-1");
         h.mark_recovered().unwrap();
         assert_eq!(h.after_boot_with(boot_id(), route).unwrap(), None, "once marked, not again in the boot");
         assert_eq!(routes.borrow().len(), 2);
@@ -6029,6 +6039,24 @@ pub(crate) mod tests {
         crate::util::write_file(&h.run, "peers.json", br#"{"names": {"peer.invalid:7070": ["192.0.2.7"]}}"#, false).unwrap();
         assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(true));
         assert_eq!(*routes.borrow(), vec![(peer, via)]);
+    }
+
+    #[test]
+    fn pending_routes_do_not_repeat_local_boot_recovery() {
+        let (_dir, mut h) = host("boot-local-once");
+        h.cfg.cluster_ips = Some("10.9.0.0/16".into());
+        h.cfg.peers = vec!["peer.invalid:7070".into()];
+        h.put_addr(ip("10.9.5.1"), &Addr { seen: 3, via: Some(ip("192.0.2.7")), ..Addr::default() }, true).unwrap();
+        assert_eq!(h.after_boot_with(boot_id(), |_, _| panic!("peer is unknown")).unwrap(), Some(false));
+        assert!(h.recovered(boot_id()));
+        let dead = dead_owner(&h, 999_999_943, &[]);
+        let addr = ip("10.9.5.2");
+        h.put_addr(addr, &Addr { seen: 4, held: 4, holder: Some("later".into()), holder_id: Some(dead), ..Addr::default() }, true).unwrap();
+        assert_eq!(h.after_boot_with(boot_id(), |_, _| panic!("peer is unknown")).unwrap(), Some(false));
+        assert!(h.addr(&h.lock().unwrap(), addr).unwrap().holder.is_some(), "route retries did not run local collection");
+        h.collect_garbage().unwrap();
+        assert!(!h.has_record("later", "lost"), "a later death is not a reboot loss");
+        assert!(h.addr(&h.lock().unwrap(), addr).unwrap().withdrawn);
     }
 
     /// Review of #565: a lost VM is recorded before its address is withdrawn (a crash between

@@ -911,7 +911,7 @@ impl Proc {
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let cmd = self.cmd.lock().unwrap().clone();
         let rec = crate::app::Exited::new(code, vm.template.name.clone(), cmd, vm.resources(), spec, at);
-        if let Err(e) = serde_json::to_vec(&rec).map_err(Error::from).and_then(|b| Ok(crate::host::write_record(&path, &b)?)) {
+        if let Err(e) = crate::host::store(&path, &rec, true) {
             crate::log!("vm {}: its exited record {}: {e}", vm.name, path.display());
         }
     }
@@ -926,7 +926,7 @@ impl Proc {
             (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
             (End::Moved(to), _) => {
                 if let Ok(moved) = self.host.vms(&self.name(), "moved") {
-                    let _ = crate::host::write_record(&moved, to.as_bytes());
+                    let _ = crate::util::write_file(moved.parent().unwrap(), moved.file_name().unwrap().to_str().unwrap(), to.as_bytes(), true);
                 }
                 crate::info!("vm {}: moved to {to}", self.name());
             }
@@ -3810,6 +3810,19 @@ mod tests {
             let ip = std::fs::read_to_string(root.join("ip")).unwrap().parse().unwrap();
             assert_eq!(host.addr(&host.lock().unwrap(), ip).unwrap().withdrawn, gone, "the gone claimer's address is withdrawn");
         }
+    }
+
+    #[test]
+    fn moved_records_replace_the_previous_file_atomically() {
+        use std::os::unix::fs::MetadataExt;
+        let (p, _root) = test_proc("moved-record", Some("moving"));
+        let path = p.host.vms("moving", "moved").unwrap();
+        std::fs::write(&path, b"previous:7070").unwrap();
+        let previous = std::fs::File::open(&path).unwrap();
+        p.end_claim(End::Moved("next:7070".into()), false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "next:7070");
+        assert_ne!(previous.metadata().unwrap().ino(), std::fs::metadata(&path).unwrap().ino());
+        assert_eq!(std::io::read_to_string(previous).unwrap(), "previous:7070");
     }
 
     /// #509: a revision retry holding the host lock and a process ending (its claim's
