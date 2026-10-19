@@ -17,18 +17,18 @@ const BUFFER: usize = 65536;
 /// UDP sessions expire after this; a TCP forward this idle is closed only to admit a client at the cap.
 const IDLE: Duration = Duration::from_secs(60);
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
-/// Once the guest's side fails and all it sent is handed over, how long the client has to finish
-/// (its FIN): closing on it at once would reset what the kernel has yet to deliver.
+/// Once either side fails, how long buffered data and the other side's FIN have to finish:
+/// closing on it at once would reset what the kernel has yet to deliver.
 const LINGER: Duration = Duration::from_secs(10);
 /// The most datagrams taken from one socket per wakeup: a flood on one cannot starve the others.
 const BURST: usize = 1024;
 /// Workers wake for their sockets or `Forwarder::drop`'s eventfd; this only bounds when idle
-/// sessions and stalled connects are noticed.
+/// sessions, stalled connects, and failure deadlines are noticed.
 const TICK: libc::c_int = 1000;
 /// How long accepting rests once out of descriptors (or memory).
 const ACCEPT_REST: Duration = Duration::from_millis(100);
 
-/// Idle time alone can be pinned in a test worker; socket deadlines keep using real time.
+/// Idle and failure time can be pinned in a test worker; connect deadlines keep using real time.
 fn idle_now() -> Instant {
     #[cfg(test)]
     if let Some(now) = tests::CLOCK.with(|c| c.borrow().as_ref().map(|(_, now)| *now)) {
@@ -276,7 +276,7 @@ impl Direction {
         (if !self.eof && self.end < BUFFER { libc::POLLIN } else { 0 }) | (if reverse.start < reverse.end { libc::POLLOUT } else { 0 })
     }
 
-    /// True if it moved anything. Each pass takes at most BUFFER bytes per direction. A read error
+    /// True if it relayed data. Each pass takes at most BUFFER bytes per direction. A read error
     /// still writes what came before it (a reply the guest sent before resetting); a write error
     /// ends only this direction.
     fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> bool {
@@ -284,15 +284,15 @@ impl Direction {
         while !self.eof && self.end < BUFFER && taken < BUFFER {
             self.bytes.resize(BUFFER, 0);
             match from.read(&mut self.bytes[self.end..]) {
-                Ok(0) => (self.eof, moved) = (true, true),
+                Ok(0) => self.eof = true,
                 Ok(n) => {
                     taken += n;
                     // Broken, it reads only to discard: closing a socket with data unread would reset
                     // it, and the peer would lose what the other direction has yet to deliver.
                     if !self.broken {
                         self.end += n;
+                        moved = true;
                     }
-                    moved = true;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -308,7 +308,7 @@ impl Direction {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 _ => {
-                    (self.broken, self.start, self.end, moved) = (true, 0, 0, true);
+                    (self.broken, self.start, self.end) = (true, 0, 0);
                     break;
                 }
             }
@@ -350,8 +350,34 @@ struct Connection {
     /// only for what its directions still want of it, or poll would return at once every pass.
     client_down: i16,
     guest_down: i16,
-    /// Since when the guest's side has failed with all it sent handed over: the client has LINGER to finish.
+    /// Since when either side has failed: drainage and the other side's FIN have LINGER to finish.
     lingering: Option<Instant>,
+}
+
+impl Connection {
+    /// Relays one connected forward, bounding failures even if buffered data cannot drain.
+    fn forward(&mut self, client: i16, guest: i16) -> bool {
+        if self.lingering.is_some_and(|t| idle_now().duration_since(t) > LINGER) {
+            return false;
+        }
+        if client == 0 && guest == 0 {
+            return true;
+        }
+        (self.client_down, self.guest_down) = (self.client_down | client & DOWN, self.guest_down | guest & DOWN);
+        // Both directions: what one socket sent before failing still goes out the other way.
+        let (out, incoming) = (self.out.pump(&self.client, &self.guest), self.incoming.pump(&self.guest, &self.client));
+        if out || incoming {
+            self.active = idle_now();
+        }
+        // A failed socket (an error polled, or found reading or writing it): nothing reaches it any
+        // more. Allow buffered data to drain, but bound that wait even if the sink never reads.
+        let failed = |down: i16, from: &Direction, to: &Direction| down & (libc::POLLERR | libc::POLLNVAL) != 0 || from.failed || to.broken;
+        let client_failed = failed(self.client_down, &self.out, &self.incoming);
+        if client_failed || failed(self.guest_down, &self.incoming, &self.out) {
+            self.lingering.get_or_insert_with(idle_now);
+        }
+        !self.out.done || !self.incoming.done && !client_failed
+    }
 }
 
 const DOWN: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
@@ -423,25 +449,8 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 // It moves nothing until it is admitted below.
                 (c.fresh, c.active) = (true, idle_now());
                 return true;
-            } else if c.lingering.is_some_and(|t| t.elapsed() > LINGER) {
-                return false;
-            } else if client.revents == 0 && guest.revents == 0 {
-                return true;
             }
-            (c.client_down, c.guest_down) = (c.client_down | client.revents & DOWN, c.guest_down | guest.revents & DOWN);
-            // Both directions: what one socket sent before failing still goes out the other way.
-            let (out, incoming) = (c.out.pump(&c.client, &c.guest), c.incoming.pump(&c.guest, &c.client));
-            if out || incoming {
-                c.active = idle_now();
-            }
-            // A failed socket (an error polled, or found reading or writing it): nothing reaches it any
-            // more. A failed client ends the forward once what it sent is with the guest; a failed
-            // guest once what it sent is with the client and the client has finished, or LINGER on.
-            let failed = |down: i16, from: &Direction, to: &Direction| down & (libc::POLLERR | libc::POLLNVAL) != 0 || from.failed || to.broken;
-            if failed(c.guest_down, &c.incoming, &c.out) && c.incoming.done {
-                c.lingering.get_or_insert_with(Instant::now);
-            }
-            !c.out.done || !c.incoming.done && !failed(c.client_down, &c.out, &c.incoming)
+            c.forward(client.revents, guest.revents)
         });
         // Only now: a replacement whose connect fails closes nothing.
         admit(&mut connections, cap, idle);
@@ -1280,6 +1289,79 @@ mod tests {
         let set =
             unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size_of_val(&linger) as _) };
         assert_eq!(set, 0);
+    }
+
+    #[test]
+    fn discarded_requests_cannot_keep_a_failed_guest_with_a_blocked_reply_alive() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (host, _) = crate::test_util::accept_tcp(&listener);
+        let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = crate::test_util::accept_tcp(&listener);
+        client.set_write_timeout(Some(WAIT)).unwrap();
+        host.set_nonblocking(true).unwrap();
+        guest.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        for (socket, name) in [(&host, libc::SO_SNDBUF), (&client, libc::SO_RCVBUF)] {
+            assert_eq!(
+                unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, name, (&size as *const libc::c_int).cast(), size_of_val(&size) as _) },
+                0
+            );
+        }
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        pin_clock(clock.clone());
+        let mut connection = Connection {
+            client: host,
+            guest,
+            connected: true,
+            fresh: false,
+            since: start,
+            active: start,
+            out: Direction::default(),
+            incoming: Direction { bytes: vec![42; BUFFER], end: BUFFER, ..Direction::default() },
+            client_down: 0,
+            guest_down: 0,
+            lingering: None,
+        };
+        // The client never reads: fill its receive queue and the proxy's send queue and buffer.
+        wait_until("the reply to block", || {
+            connection.incoming.start = 0;
+            connection.incoming.end = BUFFER;
+            let moved = connection.incoming.pump(&connection.guest, &connection.client);
+            // Wait for the last ACK too: it must not free send space during the assertions below.
+            let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+            let mut len = size_of_val(&info) as libc::socklen_t;
+            assert_eq!(unsafe { libc::getsockopt(connection.client.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_INFO, (&raw mut info).cast(), &mut len) }, 0);
+            !moved && info.tcpi_unacked == 0
+        });
+        reset(server);
+        let mut fd = poll(&connection.guest, libc::POLLIN);
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
+        assert_ne!(fd.revents & libc::POLLERR, 0);
+        assert!(connection.forward(0, fd.revents));
+        assert_eq!(connection.lingering, Some(start), "failure starts the deadline before the reply drains");
+        // Discover the broken outgoing direction before checking subsequent discarded requests.
+        client.write_all(b"request after reset").unwrap();
+        let mut fd = poll(&connection.client, libc::POLLIN);
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
+        assert!(connection.forward(fd.revents, 0));
+        assert!(connection.out.broken);
+        for elapsed in [Duration::from_secs(1), LINGER / 2, LINGER] {
+            *clock.lock().unwrap() = start + elapsed;
+            tick_clock();
+            client.write_all(b"discarded request").unwrap();
+            let mut fd = poll(&connection.client, libc::POLLIN);
+            assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
+            assert!(connection.forward(fd.revents, 0));
+            assert_eq!(connection.active, start, "discarded bytes are not activity");
+            assert_eq!(connection.lingering, Some(start));
+            assert!(!connection.incoming.done, "the reply must still be blocked");
+        }
+        *clock.lock().unwrap() = start + LINGER + Duration::from_secs(2);
+        tick_clock();
+        assert!(!connection.forward(0, 0), "a blocked reply must not prevent expiry");
+        CLOCK.with(|c| *c.borrow_mut() = None);
     }
 
     #[test]
