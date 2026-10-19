@@ -1181,7 +1181,8 @@ impl Host {
         let mut left = Vec::new();
         for ip in ips {
             let Ok(a) = self.addr(l, ip) else { continue };
-            let (Some(b), Some(gen), None) = (&a.loan, a.lent, a.via) else { continue };
+            // Lent, and not running anywhere known: neither announced elsewhere nor come home.
+            let (Some(b), Some(gen), None, None) = (&a.loan, a.lent, a.via, &a.holder) else { continue };
             if b.until_ms.is_none_or(|until| now < until) {
                 left.push((ip, a));
             } else if let Err(e) = self.observe_and(l, ip, gen, 0, None, |_| ()) {
