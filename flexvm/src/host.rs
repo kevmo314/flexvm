@@ -2519,6 +2519,16 @@ impl AddrClaim {
         }
     }
 
+    /// Withdrawn, with a notice for the peers (`withdraw_noted`, delivered whatever is down), and let go,
+    /// in one write. Should that fail, the claim stays recorded as this process's: the sweep withdraws it
+    /// the same way once the process is gone (`died_holding`).
+    pub fn withdraw(mut self, l: &Locked) -> Result<()> {
+        self.kept = true;
+        self.host.withdraw_noted_and(l, self.ip, self.gen, |r| drop(let_go(r, &self.holder, Some(&self.id))))?;
+        self.host.unpublish(l, self.ip, &self.id);
+        Ok(())
+    }
+
     pub fn release(mut self, l: &Locked) -> Result<()> {
         self.kept = true;
         self.host.release(l, self.ip, &self.holder, Some(&self.id))

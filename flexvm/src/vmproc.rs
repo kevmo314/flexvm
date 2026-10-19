@@ -600,7 +600,11 @@ impl Proc {
                             )
                             .map(|_| ())
                         }) {
-                            drop(c);
+                            // Its start may have been applied (a lost reply): the loan no longer expires, so its
+                            // withdrawal is queued durably for the peers before the claim goes (`AddrClaim::withdraw`).
+                            if let Err(w) = self.host.lock().and_then(|l| c.withdraw(&l)) {
+                                crate::log!("borrow {ip}: withdrawing generation {gen}: {w}; withdrawn once this process is gone");
+                            }
                             let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
                             bail!("cannot claim {ip} borrowed from {peer}: {e}");
                         }
@@ -3316,6 +3320,47 @@ mod tests {
         assert!(attempts >= 3, "{attempts}");
         assert!(p.host.addr(&p.host.lock().unwrap(), ip).unwrap().holder.is_some());
         assert_eq!(home.addr(&home.lock().unwrap(), ip).unwrap().loan.unwrap().until_ms, None, "claimed: it no longer expires");
+    }
+
+    /// A start applied whose reply was lost (the loan no longer expires), then a destroy: the
+    /// withdrawal is queued for the peers before the claim goes, however the lender answers it now.
+    #[test]
+    fn a_borrow_given_up_after_its_start_queues_the_withdrawal() {
+        let root = crate::test_util::TempDir::new("borrow-giveup");
+        let mut host = Host::open(&root.join("borrower-state"), &root.join("borrower-run")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let lender_addr = listener.local_addr().unwrap().to_string();
+        host.cfg.peers = vec![lender_addr.clone()];
+        let p = Proc::new(host, Paths::new(&root)).unwrap();
+        let ip: Ipv4Addr = "10.9.0.1".parse().unwrap();
+        let lender = thread::spawn({
+            let p = p.clone();
+            move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                crate::util::recv_json(&mut BufReader::new(&conn)).unwrap().unwrap();
+                send_json(&mut conn, &json!({"ok": true, "result": {"gen": 7, "lease": true}})).unwrap();
+                let (conn, _) = listener.accept().unwrap();
+                let req = crate::util::recv_json(&mut BufReader::new(&conn)).unwrap().unwrap();
+                assert_eq!(req["start"], true);
+                // Applied; the reply is lost, and a Ctrl-C comes meanwhile.
+                p.early.lock().unwrap().push(libc::SIGINT);
+                let lost = conn;
+                // The one withdrawal sent at once finds the lender busy.
+                let (mut conn, _) = listener.accept().unwrap();
+                let req = crate::util::recv_json(&mut BufReader::new(&conn)).unwrap().unwrap();
+                assert_eq!(req, json!({"op": "route", "ip": "10.9.0.1", "gen": 7}));
+                send_json(&mut conn, &json!({"ok": false, "error": crate::listen::BUSY})).unwrap();
+                drop(lost);
+            }
+        });
+        let Err(e) = p.borrow("restore", ip) else { panic!("borrowed") };
+        assert!(e.to_string().contains("being destroyed"), "{e}");
+        lender.join_within().unwrap();
+        let a = p.host.addr(&p.host.lock().unwrap(), ip).unwrap();
+        assert!(a.withdrawn && a.seen == 7 && a.holder.is_none(), "withdrawn and let go: {a:?}");
+        let notice: Value = serde_json::from_slice(&std::fs::read(p.host.state.join("withdrawals").join("10.9.0.1")).unwrap()).unwrap();
+        assert_eq!(notice["gen"], 7);
+        assert_eq!(notice["peers"][0]["peer"], lender_addr, "the lender is told until it hears: {notice}");
     }
 
     #[test]
