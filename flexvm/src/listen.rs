@@ -893,16 +893,16 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         }
         answer(&Ok(json!({"have": false, "ack": ack})))?;
         asked = true;
-        let bytes = req["bytes"].as_u64();
+        let in_use = || host.template_users();
+        let push = crate::template::Push { peer: conn.peer_addr()?.ip(), bytes: req["bytes"].as_u64(), in_use: &in_use };
         let ready = |_: &crate::template::Meta| {
-            bytes.map_or(Ok(()), |b| crate::template::check_room(&paths, b))?;
             if ack {
                 answer(&Ok(json!({"go": true})))?;
             }
             Ok(())
         };
         let mut r = std::io::BufReader::with_capacity(1 << 20, crate::util::Paced::new(&conn, PUSH_GRACE, PUSH_RATE));
-        crate::template::receive(&paths, &mut r, id, None, ready, |_| Ok(())).map(Some)
+        push.receive(&paths, &mut r, id, ready).map(Some)
     })();
     match got {
         Ok(Some(tpl)) => {
