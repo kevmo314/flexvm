@@ -623,6 +623,11 @@ fn pin(dst: &str) -> io::Result<Pinned> {
         }
         Ok(node) => Some(node),
     };
+    // A trailing slash asks for a directory, as the kernel's lookup of `x/` does: a file (or a link to one) is not
+    // replaced through it.
+    if dst.ends_with('/') && node.as_ref().is_some_and(|n| n.kind() != libc::S_IFDIR) {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
     Ok(Pinned { parent, leaf, node })
 }
 
@@ -1143,6 +1148,18 @@ mod tests {
         unpack_to(&archive(&[("into", b'0', "new")]), Dest::Into(&t.s("dir-link"))).unwrap();
         assert_eq!(std::fs::read(t.s("outside/file")).unwrap(), b"new");
         assert_eq!(std::fs::read(t.s("outside/into")).unwrap(), b"new");
+        // With a trailing slash, its link to a file (or the file itself) is no directory: not replaced.
+        for leaf in ["file-link", "outside/file"] {
+            for suffix in ["/", "//"] {
+                let dst = format!("{}{suffix}", t.s(leaf));
+                let e = unpack_to(&data, Dest::Cp(&dst)).unwrap_err();
+                assert!(e.to_string().contains("Not a directory"), "{dst}: {e}");
+                assert!(unpack_to(&data, Dest::Guest(&dst, &Top::Named(b"file".to_vec()))).is_err(), "{dst}");
+                assert!(unpack_to(&data, Dest::Guest(&dst, &Top::Contents)).is_err(), "{dst}");
+            }
+        }
+        assert!(std::fs::symlink_metadata(t.s("file-link")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(t.s("outside/file")).unwrap(), b"new");
     }
 
     #[test]
