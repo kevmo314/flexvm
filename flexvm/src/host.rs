@@ -3136,7 +3136,7 @@ impl Host {
         for dir in [self.run.join("claims"), self.run.join("vms"), self.state.join("addrs"), self.state.join("standby")] {
             remove_write_debris(&dir, |_| true);
         }
-        remove_write_debris(&self.run, |n| n.starts_with("..gens.next."));
+        remove_write_debris(&self.run, |n| n.starts_with("..gens.next.") || n.starts_with("..boot"));
         let withdrawn = self.withdraw_dead(lost);
         // After the sweep of dead holders, whose claims took their published revisions with them.
         match (withdrawn, self.sweep_live()) {
