@@ -386,17 +386,15 @@ fn read_all(src: &mut Source, len: u64) -> Result<Vec<u8>> {
 /// Allocates `need` bytes for new `file`, refused if that would leave less than `KEEP_FREE` on its
 /// filesystem. Under a host-wide lock: a concurrent load's check sees these blocks gone.
 fn reserve(file: &File, need: u64) -> Result<()> {
-    let _admit = crate::host::lock_at(crate::host::host_locks()?, "checkpoint-load-room", libc::LOCK_EX)?;
+    let _admit = crate::host::lock_at(crate::host::host_locks()?, template::ROOM_LOCK, libc::LOCK_EX)?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     crate::util::check(unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) })?;
     let free = st.f_bavail.saturating_mul(st.f_frsize);
     ensure!(free >= need.saturating_add(KEEP_FREE), "{} MiB of pages would leave less than {} MiB free in the checkpoint store", need >> 20, KEEP_FREE >> 20);
+    // Allocated now, under the lock: a filesystem that cannot (EOPNOTSUPP) takes no loads, as it takes no pushes.
     if need > 0 {
-        match crate::util::check(unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, need as i64) }) {
-            // A filesystem that cannot allocate ahead: checked, not reserved.
-            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {}
-            r => r.map_err(|e| format!("allocating {} MiB for the checkpoint's pages: {e}", need >> 20))?,
-        }
+        crate::util::check(unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, need as i64) })
+            .map_err(|e| format!("allocating {} MiB for the checkpoint's pages: {e}", need >> 20))?;
     }
     Ok(())
 }
@@ -426,6 +424,19 @@ struct Loaded {
     id: String,
     manifest: Manifest,
     staging: Option<Staging>,
+    /// The SHA-256 of each of its files as it is here: what one found under its id must have.
+    files: Vec<(&'static str, Vec<u8>)>,
+}
+
+fn file_sha(path: &Path) -> Result<Vec<u8>> {
+    let mut h = Sha256::new();
+    io::copy(&mut File::open(path)?, &mut h)?;
+    Ok(h.finalize().to_vec())
+}
+
+/// Whether checkpoint directory `dir` has exactly `files` (by SHA-256).
+fn has(dir: &Path, files: &[(&str, Vec<u8>)]) -> bool {
+    files.iter().all(|(name, sha)| file_sha(&dir.join(name)).is_ok_and(|have| have == *sha))
 }
 
 /// Reads checkpoint `id` (`chain[i]`), whose parent the chain says is `parent` (the source's id and
@@ -477,13 +488,16 @@ fn receive(
         // This host has one by its id, which is no cryptographic check: used only if it is the same, byte for byte.
         let differs = || bad(&format!("this host has a checkpoint {here} with other files: remove it (flexvm checkpoint rm {here}) to load this one"));
         ensure!(std::fs::read(local.join("manifest.json")).is_ok_and(|have| have == text), "{}", differs());
+        let mut files = vec![("manifest.json", Sha256::digest(&text).to_vec())];
         for name in ["vmstate", "pagemap", "pages"] {
             let len = src.member(&checkpoint_member(id, name))?;
             let mut sha = Sha256::new();
             ensure!(same(src, len, &local.join(name), &mut sha)?, "{}", differs());
-            digest.file(name, len, &sha.finalize());
+            let sha = sha.finalize();
+            digest.file(name, len, &sha);
+            files.push((name, sha.to_vec()));
         }
-        return Ok(Loaded { id: here, manifest, staging: None });
+        return Ok(Loaded { id: here, manifest, staging: None, files });
     }
     let staging = Staging::import(store_dir)?;
     let want = |name: &str| manifest.files.get(name).cloned().ok_or_else(|| bad(&format!("its manifest lists no {name}")));
@@ -498,9 +512,10 @@ fn receive(
         staging.add_file(name, &bytes)?;
         Ok(bytes)
     };
-    checked("vmstate", MAX_VMSTATE, meta_left)?;
+    let vmstate = checked("vmstate", MAX_VMSTATE, meta_left)?;
     let map_max = manifest.guest_pages * 36 + 24;
     let map = checked("pagemap", map_max, meta_left)?;
+    let mut files = vec![("vmstate", Sha256::digest(&vmstate).to_vec()), ("pagemap", Sha256::digest(&map).to_vec())];
     let (runs, sums) = parse_pagemap(&map, manifest.guest_pages, manifest.parent.is_some(), 0).map_err(|e| bad(&e.to_string()))?;
     let data: u64 = runs.iter().filter(|r| r.2 == DATA).map(|r| r.1).sum();
     let pages_len = data * PAGE_SIZE as u64;
@@ -523,9 +538,11 @@ fn receive(
         d += n as u64;
     }
     file.sync_all()?;
-    digest.file("pages", len, &sha.finalize());
+    let sha = sha.finalize();
+    digest.file("pages", len, &sha);
+    files.extend([("pages", sha.to_vec()), ("manifest.json", Sha256::digest(&text).to_vec())]);
     staging.add_file("manifest.json", &text)?;
-    Ok(Loaded { id: here, manifest, staging: Some(staging) })
+    Ok(Loaded { id: here, manifest, staging: Some(staging), files })
 }
 
 /// `checkpoint load`: a `save`'s tar from `r`, into the store, named `name` (else as it was saved);
@@ -644,14 +661,33 @@ fn import(state: &Path, paths: &Paths, header: Header, src: &mut Source, name: O
     if how != "received" {
         src.end()?;
     }
-    // Exclusive: a checkpoint published here as another load's ancestor stays, as one it found here does,
-    // and none is removed meanwhile (`rm`, `prune`, a publication revoked).
+    // Exclusive: nothing is published (another load's, which may revoke it) or removed (`rm`, `prune`)
+    // meanwhile. Whatever is under an id now, found before or published since, is used only if it has
+    // the very files verified here (by SHA-256), its id being no cryptographic check.
     let _lock = store::lock(state, libc::LOCK_EX)?;
     let mut stored = 0;
     for l in loaded.iter_mut() {
-        match l.staging.take() {
-            Some(s) => stored += s.publish_as(&l.id)? as usize,
-            None => ensure!(read_manifest(&store_dir.join(&l.id)).is_ok(), "checkpoint {} here was removed as this one loaded; load it again", l.id),
+        let dest = store_dir.join(&l.id);
+        match std::fs::symlink_metadata(dest.join("manifest.json")) {
+            Ok(_) => {
+                ensure!(
+                    has(&dest, &l.files),
+                    "checkpoint {} here has other files than the save's: remove it (flexvm checkpoint rm {0}) to load this one",
+                    l.id
+                );
+                drop(l.staging.take());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // A revoked publication's leftover (as `rm` clears it), else nothing.
+                if std::fs::symlink_metadata(&dest).is_ok() {
+                    std::fs::remove_dir_all(&dest)?;
+                    crate::util::sync_dir(&store_dir)?;
+                }
+                let s = l.staging.take().ok_or_else(|| format!("checkpoint {} here was removed as this one loaded; load it again", l.id))?;
+                ensure!(s.publish_as(&l.id)?, "checkpoint {} was published as this one loaded; load it again", l.id);
+                stored += 1;
+            }
+            Err(e) => return Err(io::Error::new(e.kind(), format!("checking checkpoint {}: {e}", dest.display())).into()),
         }
     }
     let id = loaded.last().unwrap().id.clone();
@@ -821,6 +857,12 @@ mod tests {
         let r = load_bytes(&c, &tar, Some("web2")).unwrap();
         assert_eq!(r["name"], "web2");
         assert_eq!(store::find(&store::list(&c.state), "web2").unwrap().id, chain[0]);
+        // A revoked publication's leftover under one of its ids (no manifest) is cleared, as `rm` clears it.
+        let e = fresh(&paths);
+        fs::create_dir_all(store::dir(&e.state).join(&chain[1])).unwrap();
+        fs::write(store::dir(&e.state).join(&chain[1]).join("pages"), b"debris").unwrap();
+        assert_eq!(load_bytes(&e, &tar, None).unwrap()["stored"], 2);
+        Checkpoint::open(&store::dir(&e.state).join(&chain[0])).unwrap().verify_data().unwrap();
         // A stored ancestor is not stored again, and a chain whose base is there loads its head.
         let d = fresh(&paths);
         load_bytes(&d, &tar, None).unwrap();

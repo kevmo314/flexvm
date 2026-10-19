@@ -500,8 +500,9 @@ content id), and a name another checkpoint has is refused then. Each checkpoint
 is verified as `Link::open` and `PageFile::read` would (its manifest's checksum
 is its id, its parent the chain's next, the same template and size, its files'
 lengths and checksums, its page map, each page's CRC32C), and staged in the
-store (`Staging::import`), its pages' blocks allocated first under a host-wide
-lock (`checkpoint-load-room`), so concurrent loads do not both count on the same
+store (`Staging::import`), its pages' blocks allocated first (`fallocate`; a
+filesystem that cannot takes no loads) under the host-wide lock template receipt
+takes too (`template::ROOM_LOCK`), so no two loads or pushes count on the same
 free space. Those checks are not cryptographic (the id is a 64-bit hash), so
 a save also has a SHA-256 (`SaveDigest`: per checkpoint, oldest first, its id
 and each file's name, length and SHA-256), which `save` prints and `load`
@@ -519,9 +520,11 @@ A generation here that was received with other digests is refused
 tags may name other builds. Then, under the store's lock held exclusively (so
 no `rm`, `prune` or another load's publication, which may revoke what it
 published if its fsync fails, runs meanwhile), the chain is published oldest
-first (`publish_as`, `RENAME_NOREPLACE`; one there already is kept), each one
-found here is checked to be there still, and the head is opened as a restore
-would open it and named; the template stays open (its use lock) until then, so no
+first (`publish_as`, `RENAME_NOREPLACE`). Whatever is under an id by then, found
+before or published since by another load, is used only if each of its files has
+the SHA-256 of the one verified here; an `ID` without a manifest (a revoked
+publication's leftover) is cleared first, as `rm` clears it. The head is then
+opened as a restore would open it, and named; the template stays open (its use lock) until then, so no
 prune or `rmi` takes it before a stored checkpoint keeps it. A crash leaves
 staging, which the next staging clears, and perhaps an older part of the chain,
 whole. `load -i DIR` reads the same members from a checkpoint directory and its

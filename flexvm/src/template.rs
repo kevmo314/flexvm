@@ -1243,8 +1243,9 @@ fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
     Ok(out)
 }
 
-/// Taken while a receive checks its filesystem's room and allocates a file's blocks, so the next one's check sees them gone.
-static ADMIT: Mutex<()> = Mutex::new(());
+/// The host-wide lock taken while a receive (or `checkpoint load`) checks its filesystem's room and
+/// allocates a file's blocks, so the next one's check, in whichever process, sees them gone.
+pub(crate) const ROOM_LOCK: &str = "receive-room";
 
 /// One of `send`'s files, written to a new `path` with the same length (one of `lens`) and holes, within
 /// what is left of the generation's `budget` (`MAX_DATA`) and of its filesystem's room, by blocks.
@@ -1259,7 +1260,7 @@ fn receive_file(r: &mut impl Read, path: &Path, lens: std::ops::RangeInclusive<u
     }
     let file = File::options().write(true).create_new(true).open(path)?;
     file.set_len(len)?;
-    let admit = ADMIT.lock().unwrap();
+    let admit = crate::host::lock_at(crate::host::host_locks()?, ROOM_LOCK, libc::LOCK_EX)?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     crate::util::check(unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) })?;
     let block = st.f_frsize.max(PAGE_SIZE as u64);
