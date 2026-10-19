@@ -306,19 +306,28 @@ impl Pager {
         page..page + n
     }
 
+    /// Prepare before wp, without claiming: freeze still sees the old state until the install settles under wp.
+    pub(super) fn prepare_fault_template(&self, page: usize, limit: usize) -> usize {
+        let around = if self.template_next.load(Ordering::Relaxed) == page { FAULT_AROUND } else { 1 };
+        let n = self.pages().base_run(page, around.min(limit), |p| self.base.has_data(p));
+        self.base.prefault(page, n);
+        n
+    }
+
     /// Serves a fault: REMOTE reads go to fetchers, while BASE copies can wait for template disk I/O.
     fn fault(&self, addr: u64, flags: u64, waiting: bool, first: bool) -> io::Result<Served> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
-        let _wp = self.wp.lock().unwrap();
-        if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
-            return self.wp_fault(page, m, first);
-        }
         // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged virtio-mem slots PROT_NONE, which splits the
         // region into VMAs at slot boundaries, and a uffd copy across a VMA end fails (ENOENT).
         let chunk = (2 << 20) / PAGE_SIZE;
         let region_left = (m.span().1 - page).min(chunk - (page - m.span().0) % chunk);
+        let prepared = if flags & UFFD_PAGEFAULT_FLAG_WP == 0 { self.prepare_fault_template(page, region_left) } else { 0 };
+        let _wp = self.wp.lock().unwrap();
+        if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
+            return self.wp_fault(page, m, first);
+        }
         let pages = self.pages();
         match pages.get(page) {
             // Its install already woke this fault; a REMOVE since then would have made it ZERO.
@@ -357,8 +366,9 @@ impl Pager {
                 // BASE or ZERO: serve a run of neighbours with the same source.
                 let from_template = state == BASE && self.base.has_data(page);
                 let same = |p: usize| state == ZERO || self.base.has_data(p) == from_template;
-                let sequential = !from_template || self.template_next.load(Ordering::Relaxed) == page;
-                let around = if sequential { FAULT_AROUND } else { 1 };
+                // Only template pages whose source was faulted in outside wp, or this one page if preparation saw it
+                // in another state (an install that failed since gave it back).
+                let around = if from_template { prepared.max(1) } else { FAULT_AROUND };
                 let n = pages.claim(page, around.min(region_left), state, same);
                 if n == 0 {
                     return Err(os(libc::EAGAIN));

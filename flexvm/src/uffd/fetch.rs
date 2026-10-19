@@ -709,7 +709,7 @@ impl std::fmt::Display for FetchFailure {
 
 impl std::error::Error for FetchFailure {}
 
-fn fetch_failure(e: &io::Error) -> Option<&FetchFailure> {
+pub(super) fn fetch_failure(e: &io::Error) -> Option<&FetchFailure> {
     e.get_ref()?.downcast_ref()
 }
 
@@ -718,7 +718,7 @@ pub(super) fn partial(e: &io::Error) -> bool {
 }
 
 /// Reads guest memory at an offset from wherever REMOTE pages come from, reporting what has arrived as it does (see
-/// `PageClient::fetch`; a file read reports nothing).
+/// `PageClient::fetch`; a file read reports every `STREAM_RUN` pages).
 pub(super) type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> + Send;
 /// `Fetch`, borrowed and not necessarily `Send`.
 type FetchAny<'a> = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> + 'a;
