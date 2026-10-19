@@ -243,11 +243,11 @@ pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)
 /// `APPIN`: feeds the app's stdin until the connection closes, a newer one takes over or the app exits.
 /// `pending`: input that came with the request.
 pub(crate) fn appin(arg: &str, out: &File, pending: &[u8]) -> io::Result<()> {
-    appin_on(&APP, arg, out, pending, || ())
+    appin_on(&APP, arg, out, pending, || (), |text| msg(out, text))
 }
 
 /// `appin` on `apps`; `claimed` runs once its slot is claimed, before its hello (a test's app exits there).
-fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: impl FnOnce()) -> io::Result<()> {
+fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: impl FnOnce(), hello: impl FnOnce(&str) -> io::Result<()>) -> io::Result<()> {
     crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Some(Duration::from_secs(5)));
     let stream = arg.trim().parse::<u64>().map_err(|_| io::Error::other(format!("bad stream {arg:?}")))?;
     // Claimed with no connection, which the app's end (`app_ended`) would shut down with no hello sent: the client
@@ -255,7 +255,9 @@ fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: i
     let (stdin, me) = {
         let mut app = apps.lock().unwrap();
         let Some(stdin) = app.stdin.clone().filter(|_| matches!(app.state, State::Running(_))) else {
-            return msg(out, format!("closed {}", u8::from(app.tty)));
+            let tty = app.tty;
+            drop(app);
+            return msg(out, format!("closed {}", u8::from(tty)));
         };
         app.appins += 1;
         let me = app.appins;
@@ -267,23 +269,26 @@ fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: i
     // Not under APP's lock: the feeder replaced may hold the stdin's while it asks `current` (APP's) once more.
     let taken = stdin.taken(stream);
     claimed();
+    let text = {
+        let app = apps.lock().unwrap();
+        if matches!(app.state, State::Running(_)) {
+            format!("ok {taken} {}", u8::from(stdin.tty()))
+        } else {
+            format!("closed {}", u8::from(app.tty))
+        }
+    };
+    // No connection is registered until the hello is sent: an exit or replacement cannot cut it off.
+    let sent = hello(&text).and_then(|()| out.try_clone());
     {
         let mut app = apps.lock().unwrap();
-        let mine = app.appin.as_ref().is_some_and(|(id, _)| *id == me);
-        if !matches!(app.state, State::Running(_)) {
-            return msg(out, format!("closed {}", u8::from(app.tty)));
+        if app.appin.as_ref().is_none_or(|(id, _)| *id != me) {
+            return sent.map(drop);
         }
-        let hello = msg(out, format!("ok {taken} {}", u8::from(stdin.tty())));
-        // A newer one took over already: told, this one ends as one replaced after its hello does.
-        if !mine {
-            return hello;
-        }
-        let hello = hello.and_then(|()| out.try_clone());
-        match hello {
-            Ok(conn) => app.appin = Some((me, Some(conn))),
-            Err(e) => {
+        match sent {
+            Ok(conn) if matches!(app.state, State::Running(_)) => app.appin = Some((me, Some(conn))),
+            other => {
                 app.appin = None;
-                return Err(e);
+                return other.map(drop);
             }
         }
     }
@@ -292,18 +297,13 @@ fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: i
         let app = apps.lock().unwrap();
         app.appin.as_ref().is_some_and(|(id, _)| *id == me) && matches!(app.state, State::Running(_))
     };
-    let mut ack_error = None;
-    let fed = feed(&mut pending.chain(out.try_clone()?), &stdin, stream, &current, &mut |taken| {
-        if let Err(e) = write_frame(out, FRAME_ACK, &taken.to_le_bytes()) {
-            ack_error.get_or_insert(e);
-        }
-    });
+    let fed = feed(&mut pending.chain(out.try_clone()?), &stdin, stream, &current, &mut |taken| write_frame(out, FRAME_ACK, &taken.to_le_bytes()));
     let mut app = apps.lock().unwrap();
     if app.appin.as_ref().is_some_and(|(id, _)| *id == me) {
         app.appin = None;
     }
     drop(app);
-    ack_error.map_or(fed.map(drop), Err)
+    fed.map(drop)
 }
 
 /// The app's end, once its output is drained: its `APPIN` is shut down (its client then sees it closed).
@@ -1002,13 +1002,50 @@ mod tests {
     }
 
     /// The client's `ok` or `closed` frame (its first), the connection's end.
-    fn hello(peer: &mut std::os::unix::net::UnixStream) -> String {
+    fn hello(peer: &mut impl Read) -> String {
         let mut head = [0; 5];
         peer.read_exact(&mut head).unwrap();
         assert_eq!(head[0], crate::FRAME_MSG);
         let mut m = vec![0; u32::from_le_bytes(head[1..].try_into().unwrap()) as usize];
         peer.read_exact(&mut m).unwrap();
         String::from_utf8(m).unwrap()
+    }
+
+    #[test]
+    fn appin_hello_holds_no_app_lock_and_cannot_be_cut_off() {
+        use std::os::fd::OwnedFd;
+        for newer in [false, true] {
+            let apps = Mutex::new(App {
+                state: State::Running(1),
+                stdin: Some(Arc::new(Stdin::new(File::options().write(true).open("/dev/null").unwrap(), None).unwrap())),
+                ..App::default()
+            });
+            let (mut peer, ours) = std::io::pipe().unwrap();
+            let out = File::from(OwnedFd::from(ours));
+            appin_on(
+                &apps,
+                "7",
+                &out,
+                &[],
+                || (),
+                |text| {
+                    // An exit or takeover while the hello is being written must neither block nor shut it down.
+                    let mut app = apps.try_lock().expect("hello holds APP");
+                    assert!(app.appin.as_ref().is_some_and(|(_, conn)| conn.is_none()));
+                    if newer {
+                        app.appins += 1;
+                        app.appin = Some((app.appins, None));
+                    } else {
+                        app_ended(&mut app, 1, 3);
+                    }
+                    drop(app);
+                    msg(&out, text)
+                },
+            )
+            .unwrap();
+            assert_eq!(hello(&mut peer), "ok 0 0");
+            assert_eq!(apps.lock().unwrap().appin.as_ref().map(|(id, c)| (*id, c.is_some())), newer.then_some((2, false)));
+        }
     }
 
     /// #832: an app that ends between `APPIN` claiming its slot and its hello: its client is told "closed", and
@@ -1029,21 +1066,33 @@ mod tests {
             let out = File::from(std::os::fd::OwnedFd::from(ours));
             let fed = thread::scope(|s| {
                 let fed = s.spawn(|| {
-                    appin_on(&apps, "7", &out, &[], || {
-                        let mut app = apps.lock().unwrap();
-                        if ends {
-                            app_ended(&mut app, 1, 3)
-                        }
-                        if newer {
-                            app.appins += 1;
-                            app.appin = Some((app.appins, None));
-                        }
-                    })
+                    appin_on(
+                        &apps,
+                        "7",
+                        &out,
+                        &[],
+                        || {
+                            let mut app = apps.lock().unwrap();
+                            if ends {
+                                app_ended(&mut app, 1, 3)
+                            }
+                            if newer {
+                                app.appins += 1;
+                                app.appin = Some((app.appins, None));
+                            }
+                        },
+                        |text| msg(&out, text),
+                    )
                 });
                 let said = hello(&mut peer);
                 assert_eq!(said, if ends { "closed 0" } else { "ok 0 0" }, "app ending first: {ends}, a newer one: {newer}");
                 if !ends && !newer {
-                    assert!(apps.lock().unwrap().appin.as_ref().is_some_and(|(_, c)| c.is_some()), "registered once told");
+                    // The peer can read the hello before its sender registers the connection.
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while !apps.lock().unwrap().appin.as_ref().is_some_and(|(_, c)| c.is_some()) {
+                        assert!(Instant::now() < until, "not registered after hello");
+                        thread::yield_now();
+                    }
                     app_ended(&mut apps.lock().unwrap(), 1, 3);
                 }
                 fed.join().unwrap()

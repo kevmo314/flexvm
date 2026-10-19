@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use crate::proto::{IN_DATA, IN_DETACH, IN_EOF, IN_RESIZE, MAX_INPUT, SESSION_DONE};
 
-/// Clients whose offsets are remembered (the app's stdin takes one at a time, newest first).
+/// Clients whose offsets are remembered, least recently used evicted first.
 const STREAMS: usize = 16;
 
 pub(crate) struct Stdin {
@@ -30,8 +30,17 @@ pub(crate) struct Stdin {
 struct State {
     /// None once closed: by EOF, or because the command closed its end (what comes is then dropped).
     fd: Option<File>,
-    /// Bytes taken, by client stream.
+    /// Bytes taken, by client stream, most recently used first.
     streams: VecDeque<(u64, u64)>,
+}
+
+impl State {
+    fn touch(&mut self, stream: u64) -> u64 {
+        let taken = self.streams.iter().position(|(s, _)| *s == stream).and_then(|i| self.streams.remove(i)).map_or(0, |(_, t)| t);
+        self.streams.truncate(STREAMS - 1);
+        self.streams.push_front((stream, taken));
+        taken
+    }
 }
 
 /// Why `feed` returned.
@@ -60,21 +69,13 @@ impl Stdin {
     }
 
     pub(crate) fn taken(&self, stream: u64) -> u64 {
-        self.state.lock().unwrap().streams.iter().find(|(s, _)| *s == stream).map_or(0, |(_, t)| *t)
+        self.state.lock().unwrap().touch(stream)
     }
 
     /// Writes what of `data` (at `offset`) was not taken yet, while `current()`; returns what is taken.
     fn write(&self, stream: u64, offset: u64, data: &[u8], current: &dyn Fn() -> bool) -> io::Result<u64> {
         let mut st = self.state.lock().unwrap();
-        let i = match st.streams.iter().position(|(s, _)| *s == stream) {
-            Some(i) => i,
-            None => {
-                st.streams.truncate(STREAMS - 1);
-                st.streams.push_front((stream, 0));
-                0
-            }
-        };
-        let mut taken = st.streams[i].1;
+        let mut taken = st.touch(stream);
         if offset > taken {
             return Err(io::Error::other(format!("stdin from byte {offset}, but only {taken} were taken")));
         }
@@ -97,7 +98,7 @@ impl Stdin {
             };
             rest = &rest[n..];
             taken += n as u64;
-            st.streams[i].1 = taken;
+            st.streams[0].1 = taken;
             self.last.store(taken, Ordering::Release);
         }
         Ok(taken)
@@ -106,7 +107,7 @@ impl Stdin {
     /// EOF at `offset`: once all before it is taken, a pipe is closed. A pty is not: it has no EOF of its own.
     fn eof(&self, stream: u64, offset: u64) {
         let mut st = self.state.lock().unwrap();
-        let taken = st.streams.iter().find(|(s, _)| *s == stream).map_or(0, |(_, t)| *t);
+        let taken = st.touch(stream);
         if self.pty.is_none() && offset <= taken {
             st.fd = None;
         }
@@ -120,8 +121,14 @@ impl Stdin {
 }
 
 /// Reads input frames from `conn` into `stdin` as client `stream` until it closes, detaches, sends
-/// SESSION_DONE, or `current()` turns false; `taken` is called with the bytes taken after each frame.
-pub(crate) fn feed(conn: &mut impl Read, stdin: &Stdin, stream: u64, current: &dyn Fn() -> bool, taken: &mut dyn FnMut(u64)) -> io::Result<Fed> {
+/// SESSION_DONE, or `current()` turns false; `taken` acknowledges each data frame, stopping on error.
+pub(crate) fn feed(
+    conn: &mut impl Read,
+    stdin: &Stdin,
+    stream: u64,
+    current: &dyn Fn() -> bool,
+    taken: &mut dyn FnMut(u64) -> io::Result<()>,
+) -> io::Result<Fed> {
     loop {
         let mut kind = [0];
         if conn.read(&mut kind)? == 0 || !current() {
@@ -140,9 +147,12 @@ pub(crate) fn feed(conn: &mut impl Read, stdin: &Stdin, stream: u64, current: &d
         conn.read_exact(&mut body)?;
         let offset = || body.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).ok_or_else(|| io::Error::other("short input frame"));
         match kind[0] {
-            IN_DATA => taken(stdin.write(stream, offset()?, &body[8..], current)?),
+            IN_DATA => taken(stdin.write(stream, offset()?, &body[8..], current)?)?,
             IN_EOF => stdin.eof(stream, offset()?),
-            IN_RESIZE if len == 4 => stdin.resize(u16::from_le_bytes([body[0], body[1]]), u16::from_le_bytes([body[2], body[3]])),
+            IN_RESIZE if len == 4 => {
+                stdin.taken(stream);
+                stdin.resize(u16::from_le_bytes([body[0], body[1]]), u16::from_le_bytes([body[2], body[3]]));
+            }
             IN_DETACH => return Ok(Fed::Detach),
             k => return Err(io::Error::other(format!("bad input frame {k}"))),
         }
@@ -226,25 +236,66 @@ mod tests {
     }
 
     #[test]
+    fn streams_are_evicted_by_last_use() {
+        let stdin = Stdin::new(File::options().write(true).open("/dev/null").unwrap(), None).unwrap();
+        for stream in 0..STREAMS as u64 {
+            stdin.write(stream, 0, b"x", &|| true).unwrap();
+        }
+        stdin.write(0, 1, b"y", &|| true).unwrap();
+        assert_eq!(stdin.taken(1), 1);
+        stdin.eof(2, 2); // Touch without closing.
+        stdin.write(STREAMS as u64, 0, b"z", &|| true).unwrap();
+        let st = stdin.state.lock().unwrap();
+        assert_eq!(st.streams.len(), STREAMS);
+        assert!(st.streams.contains(&(0, 2)));
+        assert!(st.streams.contains(&(1, 1)));
+        assert!(st.streams.contains(&(2, 1)));
+        assert!(!st.streams.iter().any(|(s, _)| *s == 3));
+    }
+
+    #[test]
+    fn a_failed_ack_stops_before_the_next_frame() {
+        let (mut r, w) = pipe();
+        let stdin = Stdin::new(w, None).unwrap();
+        let wire = [data(0, b"first"), data(5, b"second")].concat();
+        let mut wire = &wire[..];
+        let e = feed(&mut wire, &stdin, 0, &|| true, &mut |_| Err(io::ErrorKind::BrokenPipe.into())).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(stdin.taken(0), 5);
+        assert_eq!(wire, data(5, b"second"));
+        stdin.eof(0, 5);
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "first");
+    }
+
+    #[test]
     fn resent_input_is_taken_once_and_gaps_are_refused() {
         let (mut r, w) = pipe();
         let stdin = Stdin::new(w, None).unwrap();
         let mut acks = Vec::new();
         // A reattached client resends from what it was told: overlapping, and wholly old, frames.
         let wire = [data(0, b"hello "), data(3, b"lo world"), data(0, b"hel"), frame(IN_EOF, &[&11u64.to_le_bytes()])].concat();
-        assert_eq!(feed(&mut &wire[..], &stdin, 0, &|| true, &mut |t| acks.push(t)).unwrap(), Fed::Gone);
+        assert_eq!(
+            feed(&mut &wire[..], &stdin, 0, &|| true, &mut |t| {
+                acks.push(t);
+                Ok(())
+            })
+            .unwrap(),
+            Fed::Gone
+        );
         assert_eq!(acks, [6, 11, 11]);
         let mut got = String::new();
         r.read_to_string(&mut got).unwrap();
         assert_eq!(got, "hello world", "EOF closed the pipe");
-        assert!(feed(&mut &data(20, b"x")[..], &stdin, 0, &|| true, &mut |_| ()).is_err(), "a gap");
+        assert!(feed(&mut &data(20, b"x")[..], &stdin, 0, &|| true, &mut |_| Ok(())).is_err(), "a gap");
         // Another client's stream starts at 0; after EOF its bytes are dropped but counted.
         assert_eq!(stdin.taken(7), 0);
-        feed(&mut &data(0, b"abc")[..], &stdin, 7, &|| true, &mut |_| ()).unwrap();
+        feed(&mut &data(0, b"abc")[..], &stdin, 7, &|| true, &mut |_| Ok(())).unwrap();
         assert_eq!((stdin.taken(7), stdin.taken(0), stdin.last()), (3, 11, 3));
-        assert_eq!(feed(&mut &[SESSION_DONE][..], &stdin, 0, &|| true, &mut |_| ()).unwrap(), Fed::Done);
-        assert_eq!(feed(&mut &frame(IN_DETACH, &[])[..], &stdin, 0, &|| true, &mut |_| ()).unwrap(), Fed::Detach);
-        assert!(feed(&mut &frame(9, &[])[..], &stdin, 0, &|| true, &mut |_| ()).is_err());
+        assert_eq!(feed(&mut &[SESSION_DONE][..], &stdin, 0, &|| true, &mut |_| Ok(())).unwrap(), Fed::Done);
+        assert_eq!(feed(&mut &frame(IN_DETACH, &[])[..], &stdin, 0, &|| true, &mut |_| Ok(())).unwrap(), Fed::Detach);
+        assert!(feed(&mut &frame(9, &[])[..], &stdin, 0, &|| true, &mut |_| Ok(())).is_err());
     }
 
     #[test]
@@ -257,7 +308,14 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
         let current = || std::time::Instant::now() < deadline;
         let mut last = 0;
-        assert_eq!(feed(&mut &wire[..], &stdin, 0, &current, &mut |t| last = t).unwrap(), Fed::Gone);
+        assert_eq!(
+            feed(&mut &wire[..], &stdin, 0, &current, &mut |t| {
+                last = t;
+                Ok(())
+            })
+            .unwrap(),
+            Fed::Gone
+        );
         // However much the pipe holds (a page or two, past a user's pipe limit).
         assert!(last > 0 && last < 8 * MAX_INPUT as u64 && stdin.taken(0) == last && stdin.last() == last, "{last}");
     }
@@ -271,7 +329,7 @@ mod tests {
         let mut child = cmd.spawn().unwrap();
         drop((cmd, slave));
         let stdin = Stdin::new(master.try_clone().unwrap(), Some(master.try_clone().unwrap())).unwrap();
-        feed(&mut &data(0, b"typed\n")[..], &stdin, 0, &|| true, &mut |_| ()).unwrap();
+        feed(&mut &data(0, b"typed\n")[..], &stdin, 0, &|| true, &mut |_| Ok(())).unwrap();
         let mut out = Vec::new();
         let mut buf = [0; 4096];
         // EIO once the child (the slave's only holder) is gone.

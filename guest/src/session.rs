@@ -563,6 +563,17 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
         Request::Start { id, len, argv } => {
             let command = body.get(..len).ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
             let fingerprint = fingerprint(command);
+            // Reads passwd and prepares the command without blocking other sessions or the reaper.
+            // A retry still attaches even if its directory or user can no longer be resolved.
+            let prepared = (|| {
+                let command = std::str::from_utf8(command).map_err(io::Error::other)?;
+                let spec = argv.then(|| crate::proto::Exec::decode(command).map_err(io::Error::other)).transpose()?;
+                let (cmd, exec) = match &spec {
+                    Some(spec) => crate::app::exec_command(spec).map(|(cmd, c)| (cmd, Some(c)))?,
+                    None => (shell_command(command)?, None),
+                };
+                Ok::<_, io::Error>((spec, cmd, exec))
+            })();
             // Lookup and spawn under one lock: a retried creation cannot spawn twice.
             let mut table = sessions.lock().unwrap();
             if table.ended(id) {
@@ -575,12 +586,7 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 return Ok(Some((id, 0, attach(&entry.output, 0, conn))));
             }
             table.admit(statuses)?;
-            let command = std::str::from_utf8(command).map_err(io::Error::other)?;
-            let spec = argv.then(|| crate::proto::Exec::decode(command).map_err(io::Error::other)).transpose()?;
-            let (mut cmd, exec) = match &spec {
-                Some(spec) => crate::app::exec_command(spec).map(|(cmd, c)| (cmd, Some(c)))?,
-                None => (shell_command(command)?, None),
-            };
+            let (spec, mut cmd, exec) = prepared?;
             let detached = spec.as_ref().is_some_and(|s| s.detach);
             let (stdin, tty) = spec.as_ref().map_or((false, false), |s| (s.stdin, s.tty));
             let pty = tty.then(|| crate::input::openpty(spec.as_ref().and_then(|s| s.size))).transpose()?;
@@ -697,7 +703,10 @@ fn take_input(conn: &mut io::Chain<&[u8], File>, output: &Session, input: &Stdin
         let ring = output.0.lock().unwrap();
         !ring.closed && ring.attached.as_ref().is_some_and(|a| a.id == me)
     };
-    let fed = feed(conn, input, 0, &current, &mut |_| output.1.notify_all());
+    let fed = feed(conn, input, 0, &current, &mut |_| {
+        output.1.notify_all();
+        Ok(())
+    });
     let mut ring = output.0.lock().unwrap();
     if ring.attached.as_ref().is_some_and(|a| a.id == me) {
         match fed {
