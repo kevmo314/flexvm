@@ -285,6 +285,10 @@ impl Args {
             };
             match valued.or_else(|| option.strip_prefix("--")) {
                 Some("") if attached.is_none() => {
+                    // Before the command, the words after it would be taken as one.
+                    if cmd.is_none() {
+                        bail!("-- must follow the command");
+                    }
                     if matches!(cmd, Some("run" | "exec")) {
                         a.rest.extend(it.by_ref());
                         a.child_args.extend(a.rest.iter().cloned());
@@ -552,9 +556,6 @@ fn check_applies(args: &Args) -> Result<()> {
     if let Some(empty) = args.names().iter().find(|n| n.is_empty()) {
         bail!("{cmd} takes no empty word {empty:?}");
     }
-    if !args.rest.is_empty() && cmd != "run" && cmd != "exec" {
-        bail!("{cmd} takes no -- CMD");
-    }
     let interactive = args.has("interactive") || args.has("tty");
     if cmd == "run" && args.has("keep") && !args.rest.is_empty() && !interactive {
         bail!("--keep applies to the image's app: with CMD, the vm ends with CMD");
@@ -655,7 +656,7 @@ fn real_main(args: &Args) -> Result<()> {
             let host = open_host(args)?;
             each(args.names(), |n| match resume(&host, n)? {
                 true => output(format_args!("{n}\n")),
-                false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?, false)?),
+                false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", "--", n]), &log_file(&host, n)?, false)?),
             })
         }
         Some("ps") => ps(&open_host(args)?, args),
@@ -698,7 +699,7 @@ fn real_main(args: &Args) -> Result<()> {
                 }
                 match resume(&host, n)? {
                     true => output(format_args!("{n}\n")),
-                    false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?, false)?),
+                    false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", "--", n]), &log_file(&host, n)?, false)?),
                 }
             })
         }
@@ -1539,16 +1540,21 @@ fn only_standby(args: &Args) -> bool {
     args.flags.iter().all(|(f, _)| GLOBAL.contains(&f.as_str()) || matches!(f.as_str(), "standby" | "tag"))
 }
 
+/// `--max` is the host's memory unless given (at most what a peer takes, and never below `--mem`:
+/// then there is no hotplug); either given past what a peer takes is refused, as is `--max` below `--mem`.
 fn pull_size(args: &Args) -> Result<template::Size> {
-    let max = args.parse_or("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
-    if max > template::MAX_MEM_MIB {
-        bail!("--max must be at most {} MiB", template::MAX_MEM_MIB);
-    }
+    let ram = (proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20).min(template::MAX_MEM_MIB);
+    let max = args.parse_or("max", ram)?;
     let (mem, plug) = (args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
-    if max < mem {
+    for (flag, mib) in [("max", max), ("mem", mem)] {
+        if mib > template::MAX_MEM_MIB {
+            bail!("--{flag} must be at most {} MiB", template::MAX_MEM_MIB);
+        }
+    }
+    if max < mem && args.has("max") {
         bail!("--max must be at least --mem ({mem} MiB)");
     }
-    Ok(template::Size { vcpus: template_vcpus(args)?, mem_mib: mem, max_mib: max, plug_mib: plug })
+    Ok(template::Size { vcpus: template_vcpus(args)?, mem_mib: mem, max_mib: max.max(mem), plug_mib: plug })
 }
 
 /// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date;
@@ -2191,6 +2197,33 @@ mod exec_tests {
             assert!(!args.has("force"));
         }
         host::check_new_name("vm-1").unwrap();
+        // start's VM process, re-run as `start --attach -- NAME`, takes such a name too.
+        let child = parse(&["start", "--attach", "--", "-f"]);
+        check_applies(&child).unwrap();
+        assert!(child.has("attach") && child.names() == ["-f"]);
+    }
+
+    #[test]
+    fn a_bare_dashdash_must_follow_the_command() {
+        for argv in [&["--", "run", "img", "sh"][..], &["--", "rm", "x"], &["--state", "/s", "--"]] {
+            let (_, error) = Args::parse_partly(argv.iter().map(|a| a.to_string()));
+            assert_eq!(error.unwrap().to_string(), "-- must follow the command", "{argv:?}");
+        }
+        assert_eq!(parse(&["run", "img", "--", "sh", "--", "-x"]).rest, ["sh", "--", "-x"]);
+        assert_eq!(parse(&["exec", "web", "--", "-x"]).rest, ["-x"]);
+        let cp = parse(&["cp", "--", "-", "web:/x"]);
+        check_applies(&cp).unwrap();
+        assert_eq!(cp.names(), ["-", "web:/x"]);
+        assert!(cp.rest.is_empty());
+    }
+
+    #[test]
+    fn pull_max_defaults_to_the_host_and_never_below_mem() {
+        let size = pull_size(&parse(&["pull", "busybox"])).unwrap();
+        assert!(size.max_mib <= template::MAX_MEM_MIB && size.mem_mib <= size.max_mib);
+        let size = pull_size(&parse(&["pull", "busybox", "--mem", "2097152"])).unwrap();
+        assert_eq!((size.mem_mib, size.max_mib), (2097152, 2097152), "--mem past the host's memory: no hotplug");
+        assert_eq!(pull_size(&parse(&["pull", "busybox", "--mem", "2097153"])).unwrap_err().to_string(), "--mem must be at most 2097152 MiB");
     }
 
     #[test]
