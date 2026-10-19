@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use libc::{
     c_int, IFA_ADDRESS, IFA_LOCAL, IFLA_ADDRESS, IFLA_IFALIAS, NDA_DST, NDA_LLADDR, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST,
     NUD_PERMANENT, RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTPROT_STATIC,
-    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
+    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
 };
 
 use crate::bail;
@@ -682,12 +682,13 @@ pub fn route_dev(add: bool, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
     netlink(kind, flags, &route)
 }
 
-/// Tap routes go with their links; only remove a route through the recorded gateway.
-pub fn unroute(ip: Ipv4Addr, via: Option<Ipv4Addr>) {
-    let Some(via) = via else { return };
-    let mut route = rtmsg(RT_SCOPE_NOWHERE);
+/// Removes `ip`'s route through a gateway (`route_via`'s, whichever peer it names: a migration's
+/// switch to its target is never recorded, and a record can name a newer peer than the route):
+/// universe scope only, so never a tap's or the hold device's (`route_dev`, link scope), which
+/// hosts sharing a network namespace each keep for their own VMs.
+pub fn unroute(ip: Ipv4Addr) {
+    let mut route = rtmsg(RT_SCOPE_UNIVERSE);
     attr(&mut route, RTA_DST, &ip.octets());
-    attr(&mut route, RTA_GATEWAY, &via.octets());
     let _ = netlink(RTM_DELROUTE, 0, &route);
 }
 
@@ -1275,7 +1276,7 @@ mod tests {
     /// Needs CAP_SYS_ADMIN and CAP_NET_ADMIN, and iproute2; no VM. Routes stay in a private netns.
     #[test]
     #[ignore]
-    fn withdrawals_remove_only_the_recorded_gateway() {
+    fn withdrawals_remove_only_gateway_routes() {
         std::thread::spawn(|| {
             assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0, "{}", std::io::Error::last_os_error());
             let ip = |args: &[&str]| {
@@ -1288,18 +1289,13 @@ mod tests {
             ip(&["link", "set", "peer0", "up"]);
             let index = ifindex("peer0").unwrap();
             let target = Ipv4Addr::new(198, 51, 100, 7);
-            let (a, b) = (Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2));
             let route = || ip(&["-4", "route", "show", "198.51.100.7/32"]);
             route_dev(true, target, index).unwrap();
-            for via in [None, Some(a), Some(b)] {
-                unroute(target, via);
-                assert!(route().contains("dev peer0"), "a tap route survives a peer's withdrawal");
-            }
-            route_via(target, b).unwrap();
-            unroute(target, Some(a));
-            assert!(route().contains("via 192.0.2.2"), "another gateway's route survives");
-            unroute(target, Some(b));
-            assert!(route().is_empty(), "the recorded gateway's route goes");
+            unroute(target);
+            assert!(route().contains("dev peer0"), "a tap route survives a withdrawal");
+            route_via(target, Ipv4Addr::new(192, 0, 2, 2)).unwrap();
+            unroute(target);
+            assert!(route().is_empty(), "a route via any peer goes");
         })
         .join()
         .unwrap();

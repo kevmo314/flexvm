@@ -985,7 +985,7 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
     }
     let answer = (|| {
         let l = host_lock(host)?;
-        let old_via = if via.is_none() {
+        if via.is_none() {
             let a = host.addr(&l, ip)?;
             // A recorded generation remains withdrawable after the allowlist narrows, including retries.
             if a.seen == 0 {
@@ -996,10 +996,7 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
             if let Some(owner) = a.via.filter(|&o| gen == a.seen && !a.withdrawn && withdrawn_rev <= a.rev && !is_peer(sender, IpAddr::V4(o))) {
                 bail!("{ip} generation {gen} is routed via {owner} at revision {}, not via the asking peer: only that peer, or one with a newer revision, withdraws it", a.rev);
             }
-            a.via
-        } else {
-            None
-        };
+        }
         if !host.observe(&l, ip, gen, rev, via)? {
             return Ok(json!({"ip": ip.to_string(), "stale": true}));
         }
@@ -1007,7 +1004,7 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
         if !local {
             match via {
                 Some(via) => crate::net::route_via(ip, via)?,
-                None => crate::net::unroute(ip, old_via),
+                None => crate::net::unroute(ip),
             }
         }
         Ok(json!({"ip": ip.to_string(), "local": local}))

@@ -1074,7 +1074,6 @@ impl Proc {
             return tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": a.rev}));
         };
         let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == name));
-        let via = self.host.addr(&l, ip).ok().and_then(|a| a.via);
         // Recorded before the claim goes: the claim is what a sweep finds it by otherwise.
         match self.host.withdraw_noted(&l, ip, gen) {
             Ok(_) => drop(a.release(&l)),
@@ -1084,7 +1083,7 @@ impl Proc {
             }
         }
         if ours && !self.host.reinstall(&l, ip, None).unwrap_or(false) {
-            crate::net::unroute(ip, via);
+            crate::net::unroute(ip);
         }
         drop(l);
         self.host.deliver_withdrawals();
