@@ -220,19 +220,25 @@ fn udev_event(msg: &[u8]) -> Option<(&[u8], u32)> {
 fn keep_mac_from_udev(udev: &OwnedFd, index: u32, name: &str, recheck: std::time::Duration) {
     // A network device's event is a few hundred bytes; a longer one, truncated, is another's.
     let mut buf = [0u8; 8192];
+    // By the clock, not each poll's timeout: other devices' events, however many, hold no recheck up.
+    let mut next = std::time::Instant::now() + recheck;
     loop {
-        let mut pfd = libc::pollfd { fd: udev.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let ms = recheck.as_millis().clamp(1, i32::MAX as u128) as c_int;
-        let ready = crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, ms) });
-        if ready.is_err() {
-            restore_mac(index, name);
-            return;
-        }
-        if ready.is_ok_and(|n| n == 0) {
+        let now = std::time::Instant::now();
+        if now >= next {
             if !restore_mac(index, name) {
                 return;
             }
-            continue;
+            next = now + recheck;
+        }
+        let mut pfd = libc::pollfd { fd: udev.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let ms = next.saturating_duration_since(now).as_millis().clamp(1, i32::MAX as u128) as c_int;
+        match crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, ms) }) {
+            Err(_) => {
+                restore_mac(index, name);
+                return;
+            }
+            Ok(0) => continue,
+            Ok(_) => {}
         }
         let n = unsafe { libc::recv(udev.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
         match (n > 0).then(|| udev_event(&buf[..n as usize])).flatten() {
@@ -1131,35 +1137,46 @@ mod tests {
             assert!(send_to(&sender, &udev_message(props), &to) > 0, "{}", std::io::Error::last_os_error());
         };
         let (on, other) = (format!("IFINDEX={index}"), format!("IFINDEX={}", index + 1000));
-        set_mac(index, &ours).unwrap();
-        let start = Instant::now();
-        std::thread::scope(|s| {
-            let w = s.spawn(|| keep_mac_from_udev(&udev, index, &tap, Duration::from_secs(60)));
-            send(&["ACTION=add", "SUBSYSTEM=net", &other]);
-            send(&["ACTION=change", "SUBSYSTEM=net", &on]);
-            std::thread::sleep(Duration::from_millis(300));
-            assert!(!w.is_finished() && mac() == ours, "another device's event, or a change, is not udev done with this tap");
-            send(&["ACTION=add", "SUBSYSTEM=net", &format!("INTERFACE={tap}"), &on]);
-            w.join().unwrap();
-        });
-        assert!(mac() == GATEWAY_MAC && start.elapsed() < Duration::from_secs(10), "by the event, not a recheck: {:?}", start.elapsed());
-        // With no event, a recheck puts it back, and the watcher goes on until udev's remove.
-        set_mac(index, &ours).unwrap();
-        std::thread::scope(|s| {
-            let w = s.spawn(|| keep_mac_from_udev(&udev, index, &tap, Duration::from_millis(50)));
-            let back = Instant::now() + Duration::from_secs(5);
-            while mac() != GATEWAY_MAC && Instant::now() < back {
+        // Detached, so a failed assertion leaves it behind rather than joining a watcher that never ends.
+        let udev = std::sync::Arc::new(udev);
+        let watch = |recheck| {
+            let (udev, tap) = (udev.clone(), tap.clone());
+            std::thread::spawn(move || keep_mac_from_udev(&udev, index, &tap, recheck))
+        };
+        let ends = |w: &std::thread::JoinHandle<()>| {
+            let by = Instant::now() + Duration::from_secs(10);
+            while !w.is_finished() && Instant::now() < by {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(mac(), GATEWAY_MAC);
-            assert!(!w.is_finished());
-            send(&["ACTION=remove", "SUBSYSTEM=net", &on]);
-            w.join().unwrap();
-        });
+            w.is_finished()
+        };
+        set_mac(index, &ours).unwrap();
+        let start = Instant::now();
+        let w = watch(Duration::from_secs(60));
+        send(&["ACTION=add", "SUBSYSTEM=net", &other]);
+        send(&["ACTION=change", "SUBSYSTEM=net", &on]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!w.is_finished() && mac() == ours, "another device's event, or a change, is not udev done with this tap");
+        send(&["ACTION=add", "SUBSYSTEM=net", &format!("INTERFACE={tap}"), &on]);
+        assert!(ends(&w) && mac() == GATEWAY_MAC && start.elapsed() < Duration::from_secs(10), "by the event, not a recheck: {:?}", start.elapsed());
+        // With no event, a recheck puts it back, however busy udev is with other devices, and the
+        // watcher goes on until udev's remove.
+        set_mac(index, &ours).unwrap();
+        let w = watch(Duration::from_millis(200));
+        let back = Instant::now() + Duration::from_secs(5);
+        while mac() != GATEWAY_MAC && Instant::now() < back {
+            send(&["ACTION=change", "SUBSYSTEM=net", &other]);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(mac(), GATEWAY_MAC);
+        assert!(!w.is_finished());
+        send(&["ACTION=remove", "SUBSYSTEM=net", &on]);
+        assert!(ends(&w));
         // A tap gone ends its watcher at the next recheck, touching no other device.
         assert!(!restore_mac(index, "flexvm-none0"));
+        let w = watch(Duration::from_millis(50));
         delete_tap(&tap);
-        keep_mac_from_udev(&udev, index, &tap, Duration::from_millis(50));
+        assert!(ends(&w));
     }
 
     /// `source_filter`'s verdict on `frame` (with a VLAN tag stripped or not), by a classic BPF
