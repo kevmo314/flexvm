@@ -52,6 +52,8 @@ pub enum Floor {
     Reserve,
     /// The eviction mark (`Config::evict_at`): an arrival moved here by eviction.
     EvictMark,
+    /// The eviction mark for an optional standby refill: refused rather than ask VM processes for kept memory.
+    Refill,
 }
 
 /// `STATE/host.json`, edited by hand (README: Configuration) and read again live
@@ -1657,8 +1659,9 @@ impl Host {
             let cfg = self.config_now();
             let (mark, what) = match floor {
                 Floor::Reserve => (cfg.reserve(), "reserve"),
-                Floor::EvictMark if self.evicting(&l) => return Ok(Err("this host is moving vms away itself".into())),
-                Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
+                // Never while this host evicts itself, and it leaves this host's own mark, so it is not moved straight back.
+                Floor::EvictMark | Floor::Refill if self.evicting(&l) => return Ok(Err("this host is moving vms away itself".into())),
+                Floor::EvictMark | Floor::Refill => (cfg.evict_at(), "eviction mark"),
             };
             let (grants, pending, _) = self.pending(&l)?;
             let need = mark.saturating_add(pending).saturating_add(mib);
@@ -1666,7 +1669,7 @@ impl Host {
             if avail >= need {
                 return Ok(Ok((l, grants)));
             }
-            if released || floor == Floor::EvictMark {
+            if released || floor == Floor::Refill {
                 return Ok(Err(format!("not enough memory here for {mib} MiB above the {mark} MiB {what}").into()));
             }
             drop(l);
@@ -7572,8 +7575,13 @@ pub(crate) mod tests {
         }
         let avail = || Some(AVAIL - kept.load(SeqCst));
         // Optional refills leave kept memory alone.
-        assert!(h.grant_inner(AVAIL, Floor::EvictMark, false, None, avail).unwrap().is_err());
+        assert!(h.grant_inner(AVAIL, Floor::Refill, false, None, avail).unwrap().is_err());
         assert_eq!(kept.load(SeqCst), 300);
+        // An arrival by eviction still asks.
+        assert!(h.grant_inner(AVAIL, Floor::EvictMark, false, None, avail).unwrap().is_err());
+        assert_eq!(kept.load(SeqCst), 0, "asked for an eviction's arrival");
+        crate::hostmem::forget_release(&h.run);
+        kept.store(300, SeqCst);
         // Fits once the kept memory is back.
         assert!(h.grant_inner(AVAIL - 100, Floor::Reserve, false, None, avail).unwrap().is_ok());
         assert_eq!(kept.load(SeqCst), 0, "released on request");
@@ -7594,6 +7602,55 @@ pub(crate) mod tests {
         assert!(h.grow_hold_inner(&hold, 20, Floor::Reserve, None, avail).unwrap().is_ok());
         assert_eq!(kept.load(SeqCst), 0);
         assert_eq!(hold.lock().unwrap().as_ref().unwrap().mib, 25, "growth uses the hold after the release");
+    }
+
+    /// Two growers refused together and retried once the kept memory is back: the retry counts what the other was
+    /// admitted meanwhile, so only one fits (the host lock is not held across the wait).
+    #[test]
+    fn growers_retried_after_a_release_are_not_both_admitted() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let (_h_dir, mut h) = host("kept-race");
+        h.cfg.reserve_mib = Some(0);
+        let kept: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(9000)));
+        let reads: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        let other = h.clone();
+        std::thread::spawn(move || {
+            crate::hostmem::pin_release(None, Some(Duration::from_millis(5)));
+            crate::hostmem::serve(&other.run, || {
+                // Both have been refused before anything goes back.
+                let t = std::time::Instant::now();
+                while reads.load(SeqCst) < 2 && t.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                kept.store(0, SeqCst);
+            })
+        });
+        let t = std::time::Instant::now();
+        while !crate::hostmem::joined(&h.run) {
+            assert!(t.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let started = std::time::Instant::now();
+        let growers: Vec<_> = (0..2)
+            .map(|_| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    crate::hostmem::pin_release(Some(Duration::from_secs(30)), None);
+                    let avail = || {
+                        reads.fetch_add(1, SeqCst);
+                        Some(AVAIL - kept.load(SeqCst))
+                    };
+                    h.grant_inner(6000, Floor::Reserve, false, None, avail).unwrap().map(|g| g.0)
+                })
+            })
+            .collect();
+        let admitted: Vec<_> = growers.into_iter().map(|g| g.join().unwrap()).collect();
+        assert!(started.elapsed() < Duration::from_secs(8), "one waited for the release under the host lock: {:?}", started.elapsed());
+        assert_eq!(kept.load(SeqCst), 0, "released on request");
+        assert!(reads.load(SeqCst) >= 4, "each was refused, then retried");
+        assert_eq!(admitted.iter().filter(|r| r.is_ok()).count(), 1, "{admitted:?}");
+        let grants: Grants = load(&h.grants()).unwrap().unwrap();
+        assert_eq!(grants.iter().map(|g| g.1).sum::<u64>(), 6000);
     }
 
     #[test]
