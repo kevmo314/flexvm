@@ -2129,8 +2129,8 @@ def same_host_late_handover():
 def same_host_qdisc_backlog():
     """#817: a sender that looked the route up just before the source's hold hands its packet
     to the tap's qdisc, not yet to the tap, when the tap goes down after the pause
-    (`tap_qdisc_backlog`: the tap's qdisc holds what reaches it from 3 ms before the hold
-    until after the pause).
+    (`tap_qdisc_backlog`: waits up to 5 s for a packet to queue before the hold,
+    keeping it until after the pause).
     The link-down's qdisc reset would free it uncounted: the source lets the qdisc empty into
     the tap's queue first, which it takes with the rest, so nothing is lost. Each source but
     the first has our released plug at the root of its tap (the first, a default qdisc,
@@ -4949,12 +4949,28 @@ def collapse_report(host, name):
     return r.get("result", {}).get("collapse") if r.get("ok") else None
 
 
+def require_huge_pages(blocks):
+    """Skips unless the host has `blocks` free 2 MiB blocks (counting what a higher-order buddy block splits into),
+    compacting its memory first if short: the collapse takes whole huge pages, and a fragmented host has none to give
+    (#896). Under --no-skips (CI) a skip still fails the run."""
+    def free():
+        with open("/proc/buddyinfo") as f:
+            return sum(int(n) << (order - 9) for line in f for order, n in enumerate(line.split()[4:]) if order >= 9)
+    if free() < blocks:
+        with suppress(OSError), open("/proc/sys/vm/compact_memory", "w") as f:
+            f.write("1")
+    if (have := free()) < blocks:
+        raise Skip(f"only {have} free order>=9 blocks in /proc/buddyinfo, after compacting; need {blocks}; "
+                   "try /proc/sys/vm/drop_caches")
+
+
 def cow_collapsed():
     """Memory a migration paged in is collapsed into huge pages once the pull is done (#141), and keeps what 4 KiB
     pages guarantee: with the guest rewriting it, a keep-running checkpoint and a delta each hold exactly the memory at
     their pause, the restored copy (collapsed in turn) is intact, and free page reporting still returns memory."""
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
+    require_huge_pages(200)
     n, paths = "ft-huge", [ckpt_path("ft-huge0"), ckpt_path("ft-huge1")]
     ok(run(A, n))
     code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 iflag=fullblock 2>/dev/null && wc -c </tmp/f && md5sum /tmp/f")
@@ -5005,6 +5021,7 @@ def collapse_abort():
     again, and the pass goes on to the end instead of leaving the VM on 4 KiB pages for good."""
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
+    require_huge_pages(200)
     n = "ft-collapse-abort"
     m = setup(n, mib=600)
     # Parked mid-way at `collapse_hold` (after a call) until the migration back quiesces it: unheld it can be over in
@@ -5038,6 +5055,7 @@ def collapse_ckpt_fail():
     runs on and the pass starts again and goes on to the end, as after an aborted migration."""
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
+    require_huge_pages(200)
     n, path = "ft-collapse-ckpt", ckpt_path("ft-collapse-ckpt")
     rm_ckpt(path)
     m = setup(n, mib=600)
@@ -5130,6 +5148,7 @@ def unplug_collapsed():
     gone, and the guest's memory stays intact. Deterministic: the guest offlines the hotplugged blocks that hold the
     most huge pages, and virtio-mem unplugs offline blocks first. PLUG_TEMPLATE picks a template with at least
     1.5 GiB of unplugged hotplug room."""
+    require_huge_pages(100)
     n = "ft-huge-unplug"
     m = setup(n, template=os.environ.get("PLUG_TEMPLATE"))
     v = vms(A)[n]
@@ -5664,34 +5683,55 @@ def ckpt_packet_hold():
     guest0 = guest_tcp_counters(A, n)
     conn = socket.create_connection((ip, 7000), timeout=10)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    stop, sent, echoes, slowest = threading.Event(), [0], [True], [0.0]
+    stop, sent, slowest = threading.Event(), [0], [0.0]
+    errors, echoes, phase = [], [0] * 5, [0]
+    progress = threading.Lock()
 
     def stream():
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        while not stop.is_set():
-            s.sendto(b"%08d\n" % sent[0], (ip, 9000))
-            sent[0] += 1
-            time.sleep(0.001)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                while not stop.is_set():
+                    s.sendto(b"%08d\n" % sent[0], (ip, 9000))
+                    sent[0] += 1
+                    time.sleep(0.001)
+        except Exception as e:
+            errors.append(("stream", repr(e)))
 
     def pingpong():
-        while not stop.is_set() and echoes[0]:
-            t = time.monotonic()
-            echoes[0] = echo(conn, b"x" * 32)
-            slowest[0] = max(slowest[0], time.monotonic() - t)
-            time.sleep(0.002)
+        try:
+            while not stop.is_set():
+                t = time.monotonic()
+                if not echo(conn, b"x" * 32):
+                    raise RuntimeError("incomplete or incorrect echo")
+                slowest[0] = max(slowest[0], time.monotonic() - t)
+                with progress:
+                    echoes[phase[0]] += 1
+                time.sleep(0.002)
+        except Exception as e:
+            errors.append(("pingpong", repr(e)))
 
     threads = [threading.Thread(target=stream, daemon=True), threading.Thread(target=pingpong, daemon=True)]
     for t in threads:
         t.start()
-    time.sleep(0.5)
     paths, results = [], []
-    for i in range(3):
-        paths.append(ckpt_path(f"{n}-{i}"))
-        results.append(checkpoint(A, n, paths[-1]))
+    try:
+        wait_for(lambda: echoes[0] > 0 or errors, 15)
         time.sleep(0.5)
-    stop.set()
-    for t in threads:
-        t.join(10)
+        for i in range(3):
+            with progress:
+                phase[0] = i + 1
+            paths.append(ckpt_path(f"{n}-{i}"))
+            results.append(checkpoint(A, n, paths[-1]))
+            wait_for(lambda: echoes[i + 1] > 0 or errors, 15)
+            time.sleep(0.5)
+        with progress:
+            phase[0] = 4
+        wait_for(lambda: echoes[4] > 0 or errors, 15)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(15)
+    check("ckpt packet hold: workers exited without errors", not any(t.is_alive() for t in threads) and not errors, errors)
     retrans, dsacks = tcp_retrans(conn)
     conn.close()
     check("ckpt packet hold: checkpoints taken, vm running", all(r["ok"] for r in results) and where(n) == {A: "running"},
@@ -5709,8 +5749,8 @@ def ckpt_packet_hold():
     guest = [b - a for a, b in zip(guest0, guest_tcp_counters(A, n))]
     pauses = [(r.get("result") or {}).get("paused_ms") for r in results]
     check("ckpt packet hold: tcp echoed throughout, no segment lost (any retransmit a duplicate)",
-          echoes[0] and retrans <= dsacks and guest[0] <= guest[1],
-          f"retransmits {retrans} (duplicates {dsacks}), the guest's {guest[0]} (duplicates {guest[1]}); "
+          all(echoes) and not errors and retrans <= dsacks and guest[0] <= guest[1],
+          f"completed echoes before, after each checkpoint and at the end {echoes}; retransmits {retrans} (duplicates {dsacks}), the guest's {guest[0]} (duplicates {guest[1]}); "
           f"slowest echo {slowest[0] * 1e3:.0f} ms, pauses {pauses} ms")
     cleanup(n)
     for p in paths:
