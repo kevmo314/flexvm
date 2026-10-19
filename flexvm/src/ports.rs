@@ -1,6 +1,6 @@
 //! Host-local proxies. Bound sockets are the reservation and the only external resource:
 //! even SIGKILL releases them, so gc has no kernel rules or port files to sweep.
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -17,6 +17,9 @@ const BUFFER: usize = 65536;
 /// UDP sessions expire after this; a TCP forward this idle is closed only to admit a client at the cap.
 const IDLE: Duration = Duration::from_secs(60);
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
+/// Once the guest's side fails and all it sent is handed over, how long the client has to finish
+/// (its FIN): closing on it at once would reset what the kernel has yet to deliver.
+const LINGER: Duration = Duration::from_secs(10);
 /// The most datagrams taken from one socket per wakeup: a flood on one cannot starve the others.
 const BURST: usize = 1024;
 /// Workers wake for their sockets or `Forwarder::drop`'s eventfd; this only bounds when idle
@@ -63,6 +66,17 @@ impl std::str::FromStr for Port {
             },
         };
         Ok(Self { ip, host_port, vm_port: port(vm)?, protocol })
+    }
+}
+
+impl Port {
+    /// Whether both would bind one address and port (no IP: both wildcards; a wildcard takes its family's).
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let ips = |p: &Self| p.ip.map_or_else(|| vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()], |ip| vec![ip]);
+        let covers = |a: IpAddr, b: IpAddr| a == b || (a.is_unspecified() && a.is_ipv4() == b.is_ipv4());
+        self.protocol == other.protocol
+            && self.host_port == other.host_port
+            && ips(self).into_iter().any(|a| ips(other).into_iter().any(|b| covers(a, b) || covers(b, a)))
     }
 }
 
@@ -159,11 +173,6 @@ fn wait(fds: &mut Vec<libc::pollfd>, stop: BorrowedFd, until: Option<Instant>) -
     fds.pop().is_some_and(|s| s.revents == 0)
 }
 
-/// Whether the socket has something for us (data, room, or an error or hangup to find out by trying).
-fn ready(fd: &libc::pollfd) -> bool {
-    fd.revents != 0
-}
-
 fn poll(fd: &impl AsRawFd, events: i16) -> libc::pollfd {
     libc::pollfd { fd: if events == 0 { -1 } else { fd.as_raw_fd() }, events, revents: 0 }
 }
@@ -222,6 +231,7 @@ fn connect(target: SocketAddrV4) -> io::Result<TcpStream> {
         return Err(io::Error::last_os_error());
     }
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    stream.set_nodelay(true)?;
     let addr = libc::sockaddr_in {
         sin_family: libc::AF_INET as _,
         sin_port: target.port().to_be(),
@@ -239,52 +249,73 @@ fn connect(target: SocketAddrV4) -> io::Result<TcpStream> {
 
 #[derive(Default)]
 struct Direction {
-    bytes: VecDeque<u8>,
+    bytes: Vec<u8>,
+    start: usize,
+    end: usize,
     eof: bool,
-    shut: bool,
+    /// Its source failed (a reset, say): it ends once what was read before is written.
+    failed: bool,
+    /// Its sink failed: what it held is dropped, and what its source still sends is read and dropped.
+    broken: bool,
+    /// It has ended: its source finished (a FIN, or a failure once what came before is written) and
+    /// that end was passed on as a FIN, or its sink failed and its source has finished since.
+    done: bool,
 }
 
 impl Direction {
     fn events(&self, reverse: &Self) -> i16 {
-        (if !self.eof && self.bytes.len() < BUFFER { libc::POLLIN } else { 0 }) | (if !reverse.bytes.is_empty() { libc::POLLOUT } else { 0 })
+        (if !self.eof && self.end < BUFFER { libc::POLLIN } else { 0 }) | (if reverse.start < reverse.end { libc::POLLOUT } else { 0 })
     }
 
-    /// True if it moved anything.
-    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> io::Result<bool> {
-        let (mut buf, mut moved) = ([0; 16384], false);
-        let room = (BUFFER - self.bytes.len()).min(buf.len());
-        if !self.eof && room > 0 {
-            match from.read(&mut buf[..room]) {
+    /// True if it moved anything. Each pass takes at most BUFFER bytes per direction. A read error
+    /// still writes what came before it (a reply the guest sent before resetting); a write error
+    /// ends only this direction.
+    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> bool {
+        let (mut moved, mut taken) = (false, 0);
+        while !self.eof && self.end < BUFFER && taken < BUFFER {
+            self.bytes.resize(BUFFER, 0);
+            match from.read(&mut self.bytes[self.end..]) {
                 Ok(0) => (self.eof, moved) = (true, true),
                 Ok(n) => {
-                    self.bytes.extend(&buf[..n]);
+                    taken += n;
+                    // Broken, it reads only to discard: closing a socket with data unread would reset
+                    // it, and the peer would lose what the other direction has yet to deliver.
+                    if !self.broken {
+                        self.end += n;
+                    }
                     moved = true;
                 }
-                Err(e) if transient(&e) => {}
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => (self.eof, self.failed) = (true, true),
             }
         }
-        if !self.bytes.is_empty() {
-            match to.write(self.bytes.make_contiguous()) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => {
-                    self.bytes.drain(..n);
+        while self.start < self.end {
+            match to.write(&self.bytes[self.start..self.end]) {
+                Ok(n) if n > 0 => {
+                    self.start += n;
                     moved = true;
                 }
-                Err(e) if transient(&e) => {}
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                _ => {
+                    (self.broken, self.start, self.end, moved) = (true, 0, 0, true);
+                    break;
+                }
             }
         }
-        if self.eof && self.bytes.is_empty() && !self.shut {
-            to.shutdown(Shutdown::Write)?;
-            self.shut = true;
+        if self.start == self.end {
+            (self.start, self.end) = (0, 0);
+            // A failed source ends as a FIN too: the sink gets all that came before, cleanly.
+            if self.eof && !self.done {
+                if !self.broken {
+                    let _ = to.shutdown(Shutdown::Write);
+                }
+                self.done = true;
+            }
         }
-        Ok(moved)
+        moved
     }
-}
-
-fn transient(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
 }
 
 fn rest(e: &io::Error, resting: &mut Option<Instant>) -> bool {
@@ -306,7 +337,15 @@ struct Connection {
     active: Instant,
     out: Direction,
     incoming: Direction,
+    /// The error and hangup bits each socket has reported (they stay set): such a socket is polled
+    /// only for what its directions still want of it, or poll would return at once every pass.
+    client_down: i16,
+    guest_down: i16,
+    /// Since when the guest's side has failed with all it sent handed over: the client has LINGER to finish.
+    lingering: Option<Instant>,
 }
+
+const DOWN: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
 
 /// The connected forward idle longest, if for at least `idle`: the one to close for a new client at the cap.
 fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
@@ -335,25 +374,32 @@ fn admit(connections: &mut Vec<Connection>, cap: usize, idle: Duration) {
 /// connected, or is closed if none is idle by then.
 fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap: usize, idle: Duration) {
     let mut connections: Vec<Connection> = Vec::new();
+    let mut fds = Vec::new();
     // Out of descriptors, accepting rests a while (the forwards go on): a pending client would wake it at once.
     let mut resting: Option<Instant> = None;
     loop {
         resting = resting.filter(|&r| r > Instant::now());
         // Idle forwards cannot hold the cap: at it, a waiting client replaces the idlest once it connects.
         let room = if resting.is_none() && connections.len() < cap + spare(&connections, idle) { libc::POLLIN } else { 0 };
-        let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, room)).collect();
+        fds.clear();
+        fds.extend(listeners.iter().map(|l| poll(l, room)));
         for c in &connections {
-            fds.push(poll(&c.client, if c.connected { c.out.events(&c.incoming) } else { 0 }));
-            fds.push(poll(&c.guest, if c.connected { c.incoming.events(&c.out) } else { libc::POLLOUT }));
+            // Connected sockets stay polled for errors and hangups after read EOF (a half-closed
+            // client that resets), until they report one.
+            let (client, guest) = if c.connected { (c.out.events(&c.incoming), c.incoming.events(&c.out)) } else { (0, libc::POLLOUT) };
+            let fd = |s: &TcpStream, events: i16, down: i16| if down != 0 && events == 0 { -1 } else { s.as_raw_fd() };
+            fds.push(libc::pollfd { fd: if c.connected { fd(&c.client, client, c.client_down) } else { -1 }, events: client, revents: 0 });
+            fds.push(libc::pollfd { fd: fd(&c.guest, guest, c.guest_down), events: guest, revents: 0 });
         }
         if !wait(&mut fds, stop, resting) {
             return;
         }
-        let (accepting, mut each) = (fds[..listeners.len()].to_vec(), fds[listeners.len()..].chunks(2));
+        let (accepting, forwarding) = fds.split_at(listeners.len());
+        let mut each = forwarding.chunks(2);
         connections.retain_mut(|c| {
             let [client, guest] = each.next().unwrap() else { unreachable!() };
             if !c.connected {
-                if !ready(guest) {
+                if guest.revents == 0 {
                     return c.since.elapsed() <= CONNECT_WAIT;
                 }
                 if c.guest.take_error().ok().flatten().is_some() {
@@ -366,23 +412,33 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 // It moves nothing until it is admitted below.
                 (c.fresh, c.active) = (true, Instant::now());
                 return true;
-            } else if !ready(client) && !ready(guest) {
+            } else if c.lingering.is_some_and(|t| t.elapsed() > LINGER) {
+                return false;
+            } else if client.revents == 0 && guest.revents == 0 {
                 return true;
             }
-            let Ok(out) = c.out.pump(&c.client, &c.guest) else { return false };
-            let Ok(incoming) = c.incoming.pump(&c.guest, &c.client) else { return false };
+            (c.client_down, c.guest_down) = (c.client_down | client.revents & DOWN, c.guest_down | guest.revents & DOWN);
+            // Both directions: what one socket sent before failing still goes out the other way.
+            let (out, incoming) = (c.out.pump(&c.client, &c.guest), c.incoming.pump(&c.guest, &c.client));
             if out || incoming {
                 c.active = Instant::now();
             }
-            !(c.out.shut && c.incoming.shut)
+            // A failed socket (an error polled, or found reading or writing it): nothing reaches it any
+            // more. A failed client ends the forward once what it sent is with the guest; a failed
+            // guest once what it sent is with the client and the client has finished, or LINGER on.
+            let failed = |down: i16, from: &Direction, to: &Direction| down & (libc::POLLERR | libc::POLLNVAL) != 0 || from.failed || to.broken;
+            if failed(c.guest_down, &c.incoming, &c.out) && c.incoming.done {
+                c.lingering.get_or_insert_with(Instant::now);
+            }
+            !c.out.done || !c.incoming.done && !failed(c.client_down, &c.out, &c.incoming)
         });
         // Only now: a replacement whose connect fails closes nothing.
         admit(&mut connections, cap, idle);
         let spare = spare(&connections, idle);
-        for (listener, fd) in listeners.iter().zip(&accepting) {
+        for (listener, fd) in listeners.iter().zip(accepting) {
             // Attempts are bounded too: a client whose guest connect fails (EMFILE, say) is dropped,
             // and a flood of them must still let the loop see its stop.
-            if resting.is_some() || !ready(fd) {
+            if resting.is_some() || fd.revents == 0 {
                 continue;
             }
             for _ in 0..CONNECTIONS {
@@ -397,7 +453,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 };
                 match connect(target) {
                     Err(e) if rest(&e, &mut resting) => break,
-                    Ok(guest) if client.set_nonblocking(true).is_ok() => {
+                    Ok(guest) if client.set_nonblocking(true).is_ok() && client.set_nodelay(true).is_ok() => {
                         connections.push(Connection {
                             client,
                             guest,
@@ -407,6 +463,9 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                             active: Instant::now(),
                             out: Direction::default(),
                             incoming: Direction::default(),
+                            client_down: 0,
+                            guest_down: 0,
+                            lingering: None,
                         });
                     }
                     _ => {}
@@ -525,7 +584,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
         }
         // Replies first: the sessions polled are those in `peers`, before any is added below.
         for (peer, fd) in peers.iter().zip(&fds[listeners.len()..]) {
-            let Some((s, at, i)) = clients.get_mut(peer).filter(|_| ready(fd)) else { continue };
+            let Some((s, at, i)) = clients.get_mut(peer).filter(|_| fd.revents != 0) else { continue };
             for _ in 0..BURST {
                 match s.recv(&mut buf) {
                     Ok(n) => {
@@ -539,7 +598,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
             }
         }
         for ((i, listener), fd) in listeners.iter().enumerate().zip(&fds) {
-            if !ready(fd) {
+            if fd.revents == 0 {
                 continue;
             }
             for _ in 0..BURST {
@@ -577,6 +636,10 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    fn transient(e: &io::Error) -> bool {
+        matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
+    }
 
     #[test]
     fn socket_exhaustion_rests_accepting() {
@@ -706,7 +769,19 @@ mod tests {
         let connection = |connected, active| {
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            Connection { client, guest, connected, fresh: false, since: active, active, out: Direction::default(), incoming: Direction::default() }
+            Connection {
+                client,
+                guest,
+                connected,
+                fresh: false,
+                since: active,
+                active,
+                out: Direction::default(),
+                incoming: Direction::default(),
+                client_down: 0,
+                guest_down: 0,
+                lingering: None,
+            }
         };
         let mut connections = vec![connection(true, ago(IDLE / 2)), connection(false, ago(IDLE * 3))];
         assert_eq!(idlest(&connections, IDLE), None, "a busy forward and a pending connect stay");
@@ -722,7 +797,19 @@ mod tests {
         let connection = |since, fresh| {
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            Connection { client, guest, connected: true, fresh, since, active: Instant::now(), out: Direction::default(), incoming: Direction::default() }
+            Connection {
+                client,
+                guest,
+                connected: true,
+                fresh,
+                since,
+                active: Instant::now(),
+                out: Direction::default(),
+                incoming: Direction::default(),
+                client_down: 0,
+                guest_down: 0,
+                lingering: None,
+            }
         };
         // Replacements a and then b were accepted for two idle forwards; b connected first and replaced
         // one, the other is busy again, and now a connects.
@@ -1056,6 +1143,174 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn duplicate_port_specs_are_rejected_before_binding() {
+        let specs = |a: &str, b: &str| {
+            let args = crate::Args::parse(["run", "-p", a, "-p", b, "image"].map(String::from)).unwrap();
+            crate::port_specs(&args)
+        };
+        for (a, b) in [
+            ("8080:80", "8080:80/tcp"),
+            ("127.0.0.1:8080:80", "127.0.0.1:8080:81"),
+            ("[::1]:8080:80", "[0:0:0:0:0:0:0:1]:8080:80"),
+            // A wildcard overlaps its family's addresses: the second bind would fail.
+            ("8080:80", "127.0.0.1:8080:80"),
+            ("[::]:8080:80", "8080:80"),
+            ("0.0.0.0:8080:80/udp", "127.0.0.1:8080:9/udp"),
+        ] {
+            assert!(specs(a, b).unwrap_err().to_string().contains("duplicate port mapping"));
+        }
+        for (a, b) in [
+            ("8080:80", "8080:80/udp"),
+            ("127.0.0.1:8080:80", "127.0.0.2:8080:80"),
+            ("8080:80", "8081:80"),
+            ("0.0.0.0:8080:80", "[::1]:8080:80"),
+            ("[::]:8080:80", "127.0.0.1:8080:80"),
+        ] {
+            assert_eq!(specs(a, b).unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn pump_drains_more_than_one_read_and_reuses_its_buffer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut source = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (from, _) = listener.accept().unwrap();
+        let to = connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port())).unwrap();
+        assert!(to.nodelay().unwrap());
+        let (mut sink, _) = crate::test_util::accept_tcp(&listener);
+        from.set_nonblocking(true).unwrap();
+        sink.set_read_timeout(Some(WAIT)).unwrap();
+        let mut direction = Direction::default();
+        for byte in [42, 17] {
+            let data = vec![byte; BUFFER];
+            source.write_all(&data).unwrap();
+            wait_until("the source bytes to arrive", || {
+                let mut available: libc::c_int = 0;
+                assert_eq!(unsafe { libc::ioctl(from.as_raw_fd(), libc::FIONREAD, &mut available) }, 0);
+                available as usize == BUFFER
+            });
+            assert!(direction.pump(&from, &to));
+            assert_eq!((direction.start, direction.end), (0, 0));
+            let mut received = vec![0; BUFFER];
+            sink.read_exact(&mut received).unwrap();
+            assert_eq!(received, data);
+        }
+    }
+
+    #[test]
+    fn a_reset_after_client_half_close_releases_the_slot_without_guest_writes() {
+        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        server.set_read_timeout(Some(WAIT)).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(server.read(&mut [0]).unwrap(), 0);
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size_of_val(&linger) as _)
+            },
+            0
+        );
+        drop(client);
+        let mut replacement = TcpStream::connect(addr).unwrap();
+        replacement.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut accepted, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut replacement, &mut accepted);
+        halt(&stop, worker);
+    }
+
+    fn reset(s: TcpStream) {
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        let set =
+            unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size_of_val(&linger) as _) };
+        assert_eq!(set, 0);
+    }
+
+    #[test]
+    fn what_arrives_before_a_reset_is_still_relayed_both_ways() {
+        let (addr, guest, stop, worker) = worker(4, IDLE);
+        let reply: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        for _ in 0..20 {
+            // The guest replies and resets at once: the proxy finds the data and the error together.
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            server.set_read_timeout(Some(WAIT)).unwrap();
+            echo(&mut client, &mut server);
+            server.write_all(&reply).unwrap();
+            reset(server);
+            let mut got = Vec::new();
+            let _ = client.read_to_end(&mut got);
+            assert_eq!(got.len(), reply.len());
+            // And a client's last request before its reset reaches the guest.
+            let mut client = TcpStream::connect(addr).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            server.set_read_timeout(Some(WAIT)).unwrap();
+            client.write_all(&reply).unwrap();
+            reset(client);
+            let mut got = Vec::new();
+            let _ = server.read_to_end(&mut got);
+            assert_eq!(got.len(), reply.len());
+        }
+        halt(&stop, worker);
+    }
+
+    #[test]
+    fn a_reply_held_for_a_slow_client_survives_the_guest_resetting() {
+        let (addr, guest, stop, worker) = worker(4, IDLE);
+        // Small enough for the proxy to hand all of it to the kernel at once (and be done with the
+        // guest before the client's next request comes), and too big for that.
+        for len in [10_000u32, 100_000] {
+            // A small receive window: most of the reply waits in the proxy.
+            let client = unsafe { OwnedFd::from_raw_fd(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)) };
+            let size: libc::c_int = 4096;
+            let set = unsafe {
+                libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&size as *const libc::c_int).cast(), size_of_val(&size) as _)
+            };
+            assert_eq!(set, 0);
+            let SocketAddr::V4(at) = addr else { unreachable!() };
+            let sa = libc::sockaddr_in {
+                sin_family: libc::AF_INET as _,
+                sin_port: at.port().to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from(*at.ip()).to_be() },
+                sin_zero: [0; 8],
+            };
+            assert_eq!(unsafe { libc::connect(client.as_raw_fd(), (&sa as *const libc::sockaddr_in).cast(), size_of_val(&sa) as _) }, 0);
+            let mut client = TcpStream::from(client);
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            echo(&mut client, &mut server);
+            let reply: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            server.write_all(&reply).unwrap();
+            wait_until("the proxy to take the whole reply", || {
+                let mut queued: libc::c_int = 0;
+                assert_eq!(unsafe { libc::ioctl(server.as_raw_fd(), libc::TIOCOUTQ, &mut queued) }, 0);
+                queued == 0
+            });
+            reset(server);
+            thread::sleep(Duration::from_millis(50));
+            // A request the reset guest cannot take: that direction ends, the reply still goes out.
+            client.write_all(b"next request").unwrap();
+            thread::sleep(Duration::from_millis(50));
+            // Slowly: the proxy writes the last of the reply long before it is read.
+            let (mut got, mut chunk) = (Vec::new(), [0; 2048]);
+            loop {
+                match client.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&chunk[..n]),
+                    // A reset: the proxy closed with the request unread, or before it came.
+                    Err(e) => panic!("after {} of the {len}-byte reply: {e}", got.len()),
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(got.len(), reply.len());
+            assert!(got == reply);
+        }
+        halt(&stop, worker);
     }
 
     #[test]
