@@ -50,6 +50,13 @@ pub(crate) fn refill_lock(host: &Host, template: &str) -> Result<File> {
     Ok(crate::host::private_file(&crate::host::locks(d.parent().unwrap()).join(d.file_name().unwrap()))?)
 }
 
+/// The lock versions before #850 take for a refill, in the pool (`d`): taken too, after `refill_lock`
+/// (under which the pool cannot be removed, `gc::standby_pool`), so a refill here never overlaps
+/// one by an older listener or VM process still running. Kept until no running version takes it alone.
+pub(crate) fn legacy_refill_lock(d: &std::path::Path, how: i32) -> std::io::Result<Flock> {
+    Flock::new(crate::host::private_file(&crate::host::locks(d).join("refill"))?, how)
+}
+
 fn key(paths: &Paths, template: &str) -> Result<String> {
     Ok(dir_key(&Template::resolve(paths, template)?))
 }
@@ -155,6 +162,7 @@ pub(crate) fn removing<T>(host: &Host, paths: &Paths, template: &str, remove: im
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = Paths { templates: parent.path.clone(), ..paths.clone() };
     let _refill = Flock::new(refill_lock(host, template)?, libc::LOCK_EX)?;
+    let _legacy = legacy_refill_lock(&create_dir(host, template)?, libc::LOCK_EX)?;
     let counts = host.state.join("standby");
     let count = counts.join(template);
     let read = || match std::fs::read(&count) {
@@ -342,6 +350,11 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<
         Err(e) => return Err(e.into()),
     };
     let d = create_dir(host, template)?;
+    let _legacy = match legacy_refill_lock(&d, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
+        Ok(lock) => lock,
+        Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
     let want = target(host, template).saturating_sub(live(host, template).len());
     if want == 0 {
         return Ok(0);
@@ -1533,6 +1546,25 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_refill_lock_holds_off_a_refill() {
+        let root = crate::test_util::TempDir::new("refill-legacy");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let d = create_dir(&host, "default").unwrap();
+        // As a listener or VM process from before #850 holds it while it refills.
+        let legacy = legacy_refill_lock(&d, libc::LOCK_EX).unwrap();
+        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = host.clone();
+        let refill = std::thread::spawn(move || tx.send(refill_by(&waiting, "default", true, true).map_err(|e| e.to_string())).unwrap());
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "a waiting refill waits for it");
+        // Nor does it let an older refill in meanwhile: it holds the new lock first.
+        assert!(Flock::new(refill_lock(&host, "default").unwrap(), libc::LOCK_EX | libc::LOCK_NB).is_err());
+        drop(legacy);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(0));
+        refill.join().unwrap();
+    }
+
+    #[test]
     fn recovery_finds_persistent_targets_and_respects_refill_lock_and_reserve() {
         let root = crate::test_util::TempDir::new("refill");
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
@@ -1545,6 +1577,10 @@ mod tests {
         let lock = Flock::new(lock, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         drop(lock);
+        // Nor while an older version's refill holds the pool's own lock.
+        let legacy = legacy_refill_lock(&d, libc::LOCK_EX).unwrap();
+        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        drop(legacy);
         // Nor while relief stops standby VMs.
         let stop = stop_lock(&host).unwrap();
         let stop = Flock::new(stop, libc::LOCK_EX).unwrap();

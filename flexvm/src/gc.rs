@@ -482,6 +482,11 @@ mod tests {
         standby_pool(&host, &d);
         assert!(d.exists(), "a log writer keeps it");
         drop(writer);
+        // An older version's refill (#850: its lock is in the pool) keeps it.
+        let legacy = crate::standby::legacy_refill_lock(&d, libc::LOCK_EX).unwrap();
+        standby_pool(&host, &d);
+        assert!(d.exists(), "an older refill keeps it");
+        drop(legacy);
         // A waiter opened before removal still uses the same refill lock afterwards.
         let waiter = crate::standby::refill_lock(&host, "default").unwrap();
         standby_pool(&host, &d);
