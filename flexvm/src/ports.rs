@@ -250,9 +250,13 @@ struct Direction {
     start: usize,
     end: usize,
     eof: bool,
-    /// Its source failed (a reset, say): once what was read before is written, the connection ends.
+    /// Its source failed (a reset, say): it ends once what was read before is written.
     failed: bool,
-    shut: bool,
+    /// Its sink failed: what it held is dropped.
+    broken: bool,
+    /// It has ended: its source's FIN passed on, its source failed and drained, or its sink failed.
+    /// The other direction goes on until it ends too, unless it has no one left to deliver to.
+    done: bool,
 }
 
 impl Direction {
@@ -260,13 +264,10 @@ impl Direction {
         (if !self.eof && self.end < BUFFER { libc::POLLIN } else { 0 }) | (if reverse.start < reverse.end { libc::POLLOUT } else { 0 })
     }
 
-    fn drained(&self) -> bool {
-        self.start == self.end
-    }
-
     /// True if it moved anything. Each pass takes at most BUFFER bytes per direction. A read error
-    /// still writes what came before it (a reply the guest sent before resetting): only then is it returned.
-    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> io::Result<bool> {
+    /// still writes what came before it (a reply the guest sent before resetting); a write error
+    /// ends only this direction.
+    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> bool {
         let mut moved = false;
         while !self.eof && self.end < BUFFER {
             self.bytes.resize(BUFFER, 0);
@@ -283,27 +284,35 @@ impl Direction {
         }
         while self.start < self.end {
             match to.write(&self.bytes[self.start..self.end]) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => {
+                Ok(n) if n > 0 => {
                     self.start += n;
                     moved = true;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
+                _ => {
+                    self.broken();
+                    return true;
+                }
             }
         }
         if self.start == self.end {
             (self.start, self.end) = (0, 0);
             if self.failed {
-                return Err(io::ErrorKind::ConnectionReset.into());
-            }
-            if self.eof && !self.shut {
-                to.shutdown(Shutdown::Write)?;
-                self.shut = true;
+                self.done = true;
+            } else if self.eof && !self.done {
+                if to.shutdown(Shutdown::Write).is_err() {
+                    self.broken();
+                }
+                self.done = true;
             }
         }
-        Ok(moved)
+        moved
+    }
+
+    /// Its sink failed: nothing more is read for it, and what it held cannot be delivered.
+    fn broken(&mut self) {
+        (self.eof, self.broken, self.done, self.start, self.end) = (true, true, true, 0, 0);
     }
 }
 
@@ -403,15 +412,17 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 return true;
             }
             (c.client_down, c.guest_down) = (c.client_down | client.revents & DOWN, c.guest_down | guest.revents & DOWN);
-            // Both directions first: what one socket sent before failing still goes out the other way.
+            // Both directions: what one socket sent before failing still goes out the other way.
             let (out, incoming) = (c.out.pump(&c.client, &c.guest), c.incoming.pump(&c.guest, &c.client));
-            let (Ok(out), Ok(incoming)) = (out, incoming) else { return false };
             if out || incoming {
                 c.active = Instant::now();
             }
-            // A failed socket with nothing left to read from or write to it: nothing more can cross.
-            let dead = |down: i16, from: &Direction, to: &Direction| down & (libc::POLLERR | libc::POLLNVAL) != 0 && from.eof && from.drained() && to.drained();
-            !(c.out.shut && c.incoming.shut || dead(c.client_down, &c.out, &c.incoming) || dead(c.guest_down, &c.incoming, &c.out))
+            // A failed socket (an error polled, or found reading or writing it) ends the connection
+            // once what it sent is delivered: nothing can reach it any more.
+            let failed = |down: i16, from: &Direction, to: &Direction| down & (libc::POLLERR | libc::POLLNVAL) != 0 || from.failed || to.broken;
+            let client = failed(c.client_down, &c.out, &c.incoming) && c.out.done;
+            let guest = failed(c.guest_down, &c.incoming, &c.out) && c.incoming.done;
+            !(c.out.done && c.incoming.done || client || guest)
         });
         // Only now: a replacement whose connect fails closes nothing.
         admit(&mut connections, cap, idle);
@@ -1170,7 +1181,7 @@ mod tests {
                 assert_eq!(unsafe { libc::ioctl(from.as_raw_fd(), libc::FIONREAD, &mut available) }, 0);
                 available as usize == BUFFER
             });
-            assert!(direction.pump(&from, &to).unwrap());
+            assert!(direction.pump(&from, &to));
             assert_eq!((direction.start, direction.end), (0, 0));
             let mut received = vec![0; BUFFER];
             sink.read_exact(&mut received).unwrap();
@@ -1234,6 +1245,49 @@ mod tests {
             let _ = server.read_to_end(&mut got);
             assert_eq!(got.len(), reply.len());
         }
+        halt(&stop, worker);
+    }
+
+    #[test]
+    fn a_reply_held_for_a_slow_client_survives_the_guest_resetting() {
+        let (addr, guest, stop, worker) = worker(4, IDLE);
+        // A small receive window: most of the reply waits in the proxy.
+        let client = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let client = unsafe { OwnedFd::from_raw_fd(client) };
+        let size: libc::c_int = 4096;
+        assert_eq!(
+            unsafe { libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&size as *const libc::c_int).cast(), size_of_val(&size) as _) },
+            0
+        );
+        let SocketAddr::V4(at) = addr else { unreachable!() };
+        let sa = libc::sockaddr_in {
+            sin_family: libc::AF_INET as _,
+            sin_port: at.port().to_be(),
+            sin_addr: libc::in_addr { s_addr: u32::from(*at.ip()).to_be() },
+            sin_zero: [0; 8],
+        };
+        assert_eq!(unsafe { libc::connect(client.as_raw_fd(), (&sa as *const libc::sockaddr_in).cast(), size_of_val(&sa) as _) }, 0);
+        let mut client = TcpStream::from(client);
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        server.set_read_timeout(Some(WAIT)).unwrap();
+        echo(&mut client, &mut server);
+        let reply: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        server.write_all(&reply).unwrap();
+        wait_until("the proxy to take the whole reply", || {
+            let mut queued: libc::c_int = 0;
+            assert_eq!(unsafe { libc::ioctl(server.as_raw_fd(), libc::TIOCOUTQ, &mut queued) }, 0);
+            queued == 0
+        });
+        reset(server);
+        thread::sleep(Duration::from_millis(50));
+        // A request the reset guest cannot take: that direction ends, the reply still goes out.
+        client.write_all(b"next request").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let mut got = Vec::new();
+        let _ = client.read_to_end(&mut got);
+        assert_eq!(got.len(), reply.len());
+        assert!(got == reply);
         halt(&stop, worker);
     }
 
