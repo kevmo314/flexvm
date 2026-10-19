@@ -2033,6 +2033,14 @@ def commit_fail_routed():
             os.rmdir(c)
         for h in ns.values():
             subprocess.run(["ip", "netns", "del", h], capture_output=True)
+        # Their records as users of the shared templates (#869): a state that is gone keeps every <none> generation.
+        records = os.path.join(A.state, "templates", ".states")
+        for f in os.listdir(records) if os.path.isdir(records) else []:
+            with suppress(OSError):
+                with open(os.path.join(records, f), "rb") as r:
+                    gone = r.read().startswith(os.path.realpath(root).encode() + b"/")
+                if gone:
+                    os.remove(os.path.join(records, f))
         subprocess.run(["rm", "-rf", root])
 
 

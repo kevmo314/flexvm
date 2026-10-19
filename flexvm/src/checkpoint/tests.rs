@@ -1377,14 +1377,48 @@ fn image_prune_keeps_what_states_sharing_the_templates_use() {
     let err = crate::template::remove(&Paths::new(&a.state), None, "aaaa1111", &|| a.template_users()).unwrap_err().to_string();
     assert!(err.contains("a state that shares these templates"), "{err}");
     assert_eq!(left(), ["aaaa1111", "cccc3333"]);
-    // A state that is gone loses its record, and keeps nothing.
+    // A state that is gone (removed, or moved with its records) keeps every generation, until
+    // --force-shared forgets it.
     fs::remove_dir_all(root.join("b")).unwrap();
-    assert_eq!(prune(&a, false), [json!({"deleted": "aaaa1111", "rootfs": null})]);
+    assert!(prune(&a, false).is_empty() && left() == ["aaaa1111", "cccc3333"]);
+    assert_eq!(fs::read_dir(a.state.join("templates/.states")).unwrap().count(), 2);
+    assert_eq!(prune(&a, true), [json!({"deleted": "aaaa1111", "rootfs": null})]);
     assert_eq!(fs::read_dir(a.state.join("templates/.states")).unwrap().count(), 1);
 }
 
-/// #869: `rmi ID` in a directory marked shared before states were recorded counts the recorded ones
-/// only (it counted none before), and leaves the marker as it was.
+/// #869 review: a stopped VM renamed while its state's records are read (a listing then may show neither name)
+/// is seen under one name or the other: renames hold `host::suspended_moves` exclusively.
+#[test]
+fn recorded_users_follow_a_stopped_vm_renamed_meanwhile() {
+    let root = tmp("shared-rename");
+    let state = root.join("state");
+    for (name, id) in [("a", "aaaa1111"), ("b", "bbbb2222")] {
+        link(&state.join("suspended").join(name), None, |m| m.template_id = id.into());
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mover = {
+        let (state, stop) = (state.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let (from, to) = if i % 2 == 0 { ("b", "c") } else { ("c", "b") };
+                let _moves = crate::host::suspended_moves(&state, libc::LOCK_EX).unwrap();
+                fs::rename(state.join("suspended").join(from), state.join("suspended").join(to)).unwrap();
+                i += 1;
+            }
+        })
+    };
+    for _ in 0..200 {
+        let users = crate::host::recorded_template_users(&state, "here");
+        let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222"].map(String::from).into();
+        assert_eq!(users, want);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mover.join().unwrap();
+}
+
+/// #869: `rmi ID` in a directory marked shared before states were recorded keeps it, as `image prune`
+/// does, until `image prune --force-shared` brings the marker up to date; then it counts the recorded states.
 #[test]
 fn rmi_by_id_counts_recorded_states_of_an_old_shared_marker() {
     let root = tmp("shared-rmi");
@@ -1398,7 +1432,12 @@ fn rmi_by_id_counts_recorded_states_of_an_old_shared_marker() {
     fs::write(a.state.join("templates/.shared"), b"").unwrap();
     link(&b.suspended("x").unwrap(), None, |m| m.template_id = "aaaa1111".into());
     let rmi = |id: &str| crate::template::remove(&Paths::new(&a.state), None, id, &|| a.template_users());
+    let err = rmi("bbbb2222").unwrap_err().to_string();
+    assert!(err.contains("since before flexvm recorded") && err.contains("--force-shared"), "{err}");
+    assert_eq!(fs::read(a.state.join("templates/.shared")).unwrap(), b"");
+    assert_eq!(crate::template::prune(&Paths::new(&a.state), None, &|| a.template_users(), true).unwrap().len(), 1);
+    assert_eq!(fs::read(a.state.join("templates/.shared")).unwrap(), b"states\n");
+    fs::create_dir_all(a.state.join("templates/.gen/bbbb2222")).unwrap();
     assert!(rmi("aaaa1111").unwrap_err().to_string().contains("a state that shares these templates"));
     assert_eq!(rmi("bbbb2222").unwrap()["deleted"], "bbbb2222");
-    assert_eq!(fs::read(a.state.join("templates/.shared")).unwrap(), b"");
 }

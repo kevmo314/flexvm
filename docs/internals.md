@@ -951,15 +951,18 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   path), so `image prune` and `rmi ID` (`template::shared_users`, under the
   exclusive templates lock) read those states' suspended VMs and stored
   checkpoints (`host::recorded_template_users`); their running VMs hold the
-  use lock, which is per host. One that cannot be read keeps every generation;
-  one whose `templates` is another directory now counts for none (its record
-  stays), and one that is gone loses its record. A
-  `.shared` without `states` (an older flexvm's) may have unrecorded states:
-  `image prune` keeps everything until `--force-shared`, which marks it
-  recorded; `rmi ID` counts the recorded states only. `image prune` reads the
-  names, then takes each candidate's use lock, then reads the users once (a
-  VM that suspended before its lock was ours published its checkpoint first),
-  then the remaining generations' root filesystems once. An incoming migration uses the generation with the source's
+  use lock, which is per host. One that cannot be read, or is gone (moved
+  with its records, or not mounted), keeps every generation; one whose
+  `templates` is another directory now counts for none (its record stays). A
+  `.shared` without `states` (an older flexvm's) may have unrecorded states,
+  and keeps everything too. `image prune --force-shared` takes the record as
+  right: it forgets gone states and marks the directory recorded. A stopped
+  VM's rename holds `STATE/.locks/suspended-moves` exclusively around its
+  directory's move and readers of the records hold it shared (a listing
+  during a rename may show neither name). `image
+  prune` reads the names, then, 64 at a time, takes each candidate's use lock
+  and reads the users (a VM that suspended before its lock was ours published
+  its checkpoint first), then the remaining generations' root filesystems once. An incoming migration uses the generation with the source's
   content id, which the source sends first if the host does not have it
   (step 0 above). `flexvm rmi` removes a name and the
   generation and root filesystem nothing uses any more: see below.

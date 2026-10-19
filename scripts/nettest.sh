@@ -21,6 +21,17 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=${FLEXVM:-$root/target/release/flexvm}
 state=$(realpath -m "${STATE:-/var/lib/flexvm}")
+# Removes the records (#869) of the states under each DIR as users of STATE's templates: a recorded
+# state that is gone keeps every <none> generation there.
+forget_states() {
+  local f d
+  for f in "$state"/templates/.states/*; do
+    [[ -f $f ]] || continue
+    for d in "$@"; do
+      [[ $(cat "$f" 2>/dev/null) == "$(realpath -m "$d")"/* ]] && rm -f "$f"
+    done
+  done
+}
 P=${P:-fv5}
 NET=${NET:-192.168.155}
 ROUNDS=${ROUNDS:-3}
@@ -89,6 +100,7 @@ teardown() {
     mkdir -p "$work/log/"{A,B}
     cp "$dir_A"/run/vms/*.log "$work/log/A/" 2>/dev/null
     cp "$dir_B"/run/vms/*.log "$work/log/B/" 2>/dev/null
+    forget_states "$dir_A" "$dir_B"
     rm -rf "$dir_A" "$dir_B"
     if (( failed )); then say "logs kept in $work/log/A and $work/log/B"; else rm -rf "$work"; fi
 }

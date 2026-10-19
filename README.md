@@ -785,11 +785,12 @@ directory other states share, `image prune` and `rmi ID` also keep what their
 stopped VMs and stored checkpoints use (each state that uses the directory is
 recorded in `templates/.states/` when opened; running VMs of any state are seen
 on this host anyway), and every `<none>` generation while one of those states
-cannot be read. One marked shared by an older flexvm (an empty
-`templates/.shared`) may have states linked to it that were never recorded:
-`image prune` keeps every `<none>` generation there until, once each such state
-has run a flexvm command, `image prune --force-shared` prunes and marks it up
-to date. `system prune` also removes failed and lost VM records and the layer
+cannot be read or is gone (moved or removed). One marked shared by an older
+flexvm (an empty `templates/.shared`) may have states linked to it that were
+never recorded: both keep every `<none>` generation there. Once each such state
+has run a flexvm command, or after removing a state that used the directory,
+`image prune --force-shared` takes the record as right: it forgets states that
+are gone, marks the directory up to date and prunes. `system prune` also removes failed and lost VM records and the layer
 blob cache (left alone while a pull runs). Both list what they remove and the
 bytes reclaimed, and ask first on a terminal; without one they need `-f`.
 `system df` reports allocated bytes for image root filesystems, templates,

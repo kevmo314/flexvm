@@ -1126,17 +1126,6 @@ const RECORDED: &[u8] = b"states\n";
 /// hash of the state's canonical path, which it holds.
 const STATES: &str = ".states";
 
-/// What `shared_users` makes of a directory marked shared before states were recorded (`RECORDED`).
-#[derive(Clone, Copy, PartialEq)]
-enum Unrecorded {
-    /// Every generation stays: other states may use them (`image prune`).
-    Keep,
-    /// Only the recorded states count (`rmi ID`, which before #869 counted none).
-    Ignore,
-    /// The recorded states are all (`image prune --force-shared`): the marker is brought up to date.
-    Upgrade,
-}
-
 fn state_key(state: &Path) -> String {
     use sha2::Digest;
     use std::os::unix::ffi::OsStrExt;
@@ -1181,10 +1170,11 @@ pub fn note_shared(paths: &Paths, state: &Path) -> std::io::Result<()> {
 /// What the other states that use a shared templates directory use of it (pinned, under its lock held
 /// exclusively): the content ids their suspended VMs and stored checkpoints name (`host::recorded_template_users`;
 /// their running VMs hold a generation's use lock, on this host whichever state they are of). A `KEEP_ALL` entry
-/// while one is recorded but cannot be read, or the directory was marked shared before states were recorded
-/// (`RECORDED`), as `unrecorded` says. A recorded state whose `templates` is not this directory now uses
-/// none; one that is gone loses its record.
-fn shared_users(paths: &Paths, unrecorded: Unrecorded) -> BTreeSet<String> {
+/// while one is recorded but cannot be read or is gone (moved, or on a filesystem not mounted now), or the
+/// directory was marked shared before states were recorded (`RECORDED`), unless `force` (`--force-shared`):
+/// then the record is taken as right, gone states are forgotten and the marker is brought up to date. A
+/// recorded state whose `templates` is another directory now uses none (its record stays).
+fn shared_users(paths: &Paths, force: bool) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let keep = |ids: &mut BTreeSet<String>, why: String| {
         ids.insert(format!("{KEEP_ALL}{why}"));
@@ -1193,15 +1183,14 @@ fn shared_users(paths: &Paths, unrecorded: Unrecorded) -> BTreeSet<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ids,
         Err(e) => keep(&mut ids, format!("{} cannot be read ({e})", paths.templates.join(SHARED).display())),
         Ok(m) if m == RECORDED => {}
-        Ok(_) if unrecorded == Unrecorded::Ignore => {}
-        Ok(_) if unrecorded == Unrecorded::Upgrade => {
+        Ok(_) if force => {
             if let Err(e) = crate::util::write_file(&paths.templates, SHARED, RECORDED, true) {
                 keep(&mut ids, format!("{} cannot be updated ({e})", paths.templates.join(SHARED).display()));
             }
         }
         Ok(_) => keep(
             &mut ids,
-            "other states have linked to these templates since before flexvm recorded which (once each has run a flexvm command, --force-shared prunes them)"
+            "other states have linked to these templates since before flexvm recorded which (once each has run a flexvm command, image prune --force-shared trusts the record)"
                 .into(),
         ),
     }
@@ -1240,12 +1229,19 @@ fn shared_users(paths: &Paths, unrecorded: Unrecorded) -> BTreeSet<String> {
             }
         };
         match std::fs::metadata(&state).and_then(|_| std::fs::metadata(state.join("templates"))) {
-            // Gone: its record goes (a state made there again records itself when opened).
+            // Gone: removed, or moved (its records with it) or not mounted now. Only `force` forgets it.
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(&state).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
             {
-                crate::log!("flexvm: {} is gone: its record as a user of these templates goes", state.display());
-                let _ = std::fs::remove_file(entry.path());
+                if force {
+                    crate::log!("flexvm: {} is gone: its record as a user of these templates goes", state.display());
+                    let _ = std::fs::remove_file(entry.path());
+                } else {
+                    keep(
+                        &mut ids,
+                        format!("{}, recorded as using these templates, is gone (if it was removed, image prune --force-shared forgets it)", state.display()),
+                    );
+                }
             }
             // Its templates are elsewhere now (or none): it uses none of these, while that lasts.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1842,10 +1838,10 @@ pub fn tag(paths: &Paths, src: &str, dst: &str) -> Result<Value> {
 
 /// `image prune`: each unnamed generation (or only `only`, which a pull moved its name off, unless
 /// other states share the templates directory: `SHARED`), as `rmi ID` would remove it; those still
-/// used stay, here or in the states that share the directory (`shared_users`; `force_shared`: even
-/// if it was marked shared before they were recorded). One pass: the names, then each candidate's
-/// use lock, then what uses them (read once, after every lock is ours: a VM that suspended since
-/// has published its checkpoint), then the root filesystems the rest use.
+/// used stay, here or in the states that share the directory (`shared_users`; `force_shared`: take
+/// its record of them as right). One pass: the names, then, a batch at a time (`PRUNE_BATCH`), each
+/// candidate's use lock and then what uses them (read after the batch's locks are ours: a VM that
+/// suspended since has published its checkpoint), then the root filesystems the rest use.
 pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<String>, force_shared: bool) -> Result<Vec<Value>> {
     if !paths.templates.exists() {
         return Ok(vec![]);
@@ -1861,29 +1857,33 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
     sweep_locked(paths)?;
     let named: BTreeSet<String> = names(&paths.templates)?.into_iter().map(|(_, id)| id).collect();
     let (gens, locks) = (paths.templates.join(GENERATIONS), crate::host::host_locks()?);
-    let mut unused = vec![];
-    for id in generations(&paths.templates)?.into_iter().filter(|id| only.is_none_or(|o| o == id) && !named.contains(id)) {
-        // Kept while a VM process has it open (one starting has no registry entry yet).
-        let st = crate::util::fstat(File::open(gens.join(&id))?.as_raw_fd())?;
-        if let Some(held) = crate::host::try_lock_at(locks.try_clone()?, &crate::host::use_lock(&st))? {
-            unused.push((id, held));
-        }
-    }
-    if unused.is_empty() {
-        return Ok(vec![]);
-    }
-    let users = users(paths, in_use, force_shared);
-    if let Some(why) = users.iter().find_map(|u| u.strip_prefix(KEEP_ALL)) {
-        crate::log!("flexvm: {}{KEPT_ALL}{why}", only.map_or("image prune: unused generations are ".into(), |id| format!("generation {id} is ")));
-        return Ok(vec![]);
-    }
+    let candidates: Vec<String> = generations(&paths.templates)?.into_iter().filter(|id| only.is_none_or(|o| o == id) && !named.contains(id)).collect();
     let mut tombstones = vec![];
-    for (id, _held) in unused.iter().filter(|(id, _)| !users.contains(id)) {
-        let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
-        std::fs::rename(gens.join(id), &tombstone)?;
-        tombstones.push((id.clone(), tombstone));
+    // In batches, each holding a bounded number of use locks (two descriptors each).
+    for batch in candidates.chunks(PRUNE_BATCH) {
+        let mut unused = vec![];
+        for id in batch {
+            // Kept while a VM process has it open (one starting has no registry entry yet).
+            let st = crate::util::fstat(File::open(gens.join(id))?.as_raw_fd())?;
+            if let Some(held) = crate::host::try_lock_at(locks.try_clone()?, &crate::host::use_lock(&st))? {
+                unused.push((id, held));
+            }
+        }
+        if unused.is_empty() {
+            continue;
+        }
+        let users = users(paths, in_use, force_shared);
+        if let Some(why) = users.iter().find_map(|u| u.strip_prefix(KEEP_ALL)) {
+            crate::log!("flexvm: {}{KEPT_ALL}{why}", only.map_or("image prune: unused generations are ".into(), |id| format!("generation {id} is ")));
+            break;
+        }
+        for (id, _held) in unused.iter().filter(|(id, _)| !users.contains(*id)) {
+            let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
+            std::fs::rename(gens.join(id), &tombstone)?;
+            tombstones.push((id.to_string(), tombstone));
+        }
+        crate::util::sync_dir(&gens)?;
     }
-    crate::util::sync_dir(&gens)?;
     let rootfs_used = rootfs_users(paths)?;
     let mut removed = vec![];
     for (id, tombstone) in tombstones {
@@ -1892,11 +1892,14 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
     Ok(removed)
 }
 
+/// How many generations `prune` holds the use locks of at once, reading what uses them once per batch.
+const PRUNE_BATCH: usize = 64;
+
 /// What uses generations: `in_use` (this state's records) and the other states' that share the
 /// templates directory (`shared_users`).
 fn users(paths: &Paths, in_use: &dyn Fn() -> BTreeSet<String>, force_shared: bool) -> BTreeSet<String> {
     let mut users = in_use();
-    users.extend(shared_users(paths, if force_shared { Unrecorded::Upgrade } else { Unrecorded::Keep }));
+    users.extend(shared_users(paths, force_shared));
     users
 }
 
@@ -2001,7 +2004,7 @@ fn delete_unused(paths: &Paths, id: &str, in_use: &dyn Fn() -> BTreeSet<String>)
     let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else {
         return Ok(Err(("open in a VM process here".into(), format!("image {id} is open in a VM process here"))));
     };
-    let (here, shared) = (in_use(), shared_users(paths, Unrecorded::Ignore));
+    let (here, shared) = (in_use(), shared_users(paths, false));
     if let Some(why) = here.iter().chain(&shared).find_map(|u| u.strip_prefix(KEEP_ALL)) {
         return Ok(Err((format!("{KEPT_ALL}{why}"), format!("image {id} is {KEPT_ALL}{why}"))));
     }

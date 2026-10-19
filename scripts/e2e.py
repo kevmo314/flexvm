@@ -2286,6 +2286,20 @@ TEMPLATES = args.templates or tempfile.mkdtemp(prefix=args.tag + "-",
                                             dir="/dev/shm" if not args.selftest and os.path.isdir("/dev/shm") else WORK)
 
 
+def forget_states(templates, root):
+    """Removes the records (#869) of the states under `root` as users of `templates`, before `root` goes: a
+    recorded state that is gone keeps every <none> generation there, for the other lanes that share them."""
+    records = os.path.join(templates, ".states")
+    prefix = os.path.realpath(root).encode() + b"/"
+    for f in os.listdir(records) if os.path.isdir(records) else []:
+        try:
+            with open(os.path.join(records, f), "rb") as r:
+                if r.read().startswith(prefix):
+                    os.remove(os.path.join(records, f))
+        except OSError:
+            pass
+
+
 def shared_state(state):
     """A state directory whose artifacts and templates are this run's."""
     os.makedirs(state, exist_ok=True)
@@ -2672,6 +2686,7 @@ if __name__ == "__main__":
     try:
         code = main()
     finally:
+        forget_states(TEMPLATES, WORK)
         shutil.rmtree(WORK, ignore_errors=True)
         shutil.rmtree(RUN, ignore_errors=True)
         if not args.templates:
