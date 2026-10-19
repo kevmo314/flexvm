@@ -211,8 +211,6 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
         }
     };
     let mut gone_since: Option<Instant> = None;
-    let holder = || host.name_holder(name).ok().flatten();
-    let mut last = holder();
     loop {
         std::thread::sleep(FOLLOW_EVERY);
         if let Some(f) = cur.as_mut() {
@@ -224,12 +222,9 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
                 f.rewind()?;
             }
         }
-        // Removed (`rm`) since the name's holder was last seen with it linked: a later VM of the
-        // name (or the `rm` itself) holds it now, and that VM's log is not this one's.
-        match cur.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.nlink()) {
-            Some(0) if holder() != last => return Ok(()),
-            Some(0) | None => {}
-            Some(_) => last = holder(),
+        // Removed with its VM (`rm`): whatever is at its path now is a later VM's.
+        if cur.as_ref().is_some_and(|f| removed(f, &prev)) {
+            return Ok(());
         }
         // Rotated (or removed and made again): what was written before the rename is drained, then the new one.
         let now = std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
@@ -258,6 +253,18 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
             (false, Some(_)) => {}
         }
     }
+}
+
+/// Whether `cur` was unlinked by `rm`, not a second rotation. A rotation unlinks it only by
+/// renaming over it the log made after it, which is `prev` (born before) from then on; `rm`
+/// removes `prev` too, so any `prev` there now was made after (a later VM's). Unknown: removed.
+fn removed(cur: &std::fs::File, prev: &Path) -> bool {
+    let Ok(m) = cur.metadata() else { return false };
+    if m.nlink() > 0 {
+        return false;
+    }
+    let unlinked = std::time::UNIX_EPOCH + Duration::new(m.ctime().max(0) as u64, m.ctime_nsec().clamp(0, 999_999_999) as u32);
+    std::fs::metadata(prev).and_then(|p| p.created()).map_or(true, |born| born >= unlinked)
 }
 
 /// `inspect NAME...`: an array of one object per VM, as docker prints: what `ps --json` says
@@ -813,9 +820,6 @@ mod tests {
         let root = TempDir::new("logs-removed");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let name = host.take_name("job", false).unwrap();
-        // Held by the old VM's process, not this one's (the new VM's, below).
-        let old = Ident { pid: 1, start: 1, boot: host::boot_id().into() };
-        std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&old).unwrap()).unwrap();
         std::fs::write(host.vms("job", "log").unwrap(), b"old\n").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let follower = host.clone();
@@ -827,6 +831,30 @@ mod tests {
         let _again = host.take_name("job", false).unwrap();
         std::fs::write(host.vms("job", "log").unwrap(), b"new\n").unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "logs -f of a removed vm ends");
+    }
+
+    #[test]
+    fn logs_follow_reads_on_across_two_rotations_and_a_new_holder() {
+        let root = TempDir::new("logs-rotated-twice");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let (log, prev) = (host.vms("job", "log").unwrap(), host.vms("job", "log.1").unwrap());
+        let name = host.take_name("job", false).unwrap();
+        std::fs::write(&log, b"first\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follower = host.clone();
+        std::thread::spawn(move || tx.send(logs(&follower, "job", true, Some(1)).is_ok()));
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        // Rotated twice (the follower may see either), and the name passes to a resume's process.
+        std::fs::rename(&log, &prev).unwrap();
+        std::fs::write(&log, b"between\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::rename(&log, &prev).unwrap();
+        std::fs::write(&log, b"third\n").unwrap();
+        let other = Ident { pid: 1, start: 1, boot: host::boot_id().into() };
+        std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&other).unwrap()).unwrap();
+        assert!(rx.recv_timeout(FOLLOW_EVERY * 4).is_err(), "a rotated log is followed on, not taken for a removed one");
+        drop(name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "and ends with its vm");
     }
 
     #[test]
