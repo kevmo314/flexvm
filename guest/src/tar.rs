@@ -3,6 +3,7 @@
 //! fit; reads ustar, PAX and GNU long names. Unpacking trusts no name in the archive: everything below the
 //! target directory is reached one component at a time from directory fds, never through a symlink.
 
+use std::collections::hash_map::Entry;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -21,6 +22,12 @@ macro_rules! warn {
 
 /// The most a PAX or GNU long-name record may hold.
 const MAX_RECORD: u64 = 64 << 10;
+/// What `extract` keeps of the directories it puts metadata on at the end: their names' bytes, and `DIR_COST` each.
+#[cfg(not(test))]
+const MAX_DIRS: usize = 128 << 20;
+#[cfg(test)]
+const MAX_DIRS: usize = 64 << 10;
+const DIR_COST: usize = 128;
 
 #[derive(Clone, Default)]
 struct Header {
@@ -632,8 +639,10 @@ pub fn extract(input: &mut dyn Read, dest: Dest, owner: Option<(u32, u32)>) -> i
         }
         Ok(comps)
     };
-    // Each directory's last entry, in the order they first came: their metadata goes on at the end, deepest last first.
-    let (mut dirs, mut order) = (std::collections::HashMap::new(), Vec::new());
+    // Each directory by its path as unpacked (its components joined by `/`, kept once), with the order it first
+    // came in and its last entry's metadata: that goes on at the end, deepest (last come) first. Bounded: a guest's
+    // archive must not make the host keep more than `MAX_DIRS`.
+    let (mut dirs, mut kept) = (std::collections::HashMap::<Vec<u8>, (usize, Header)>::new(), 0);
     let mut next = Some(first);
     while let Some(e) = next.take() {
         let comps = rename(&e.path)?;
@@ -641,18 +650,27 @@ pub fn extract(input: &mut dyn Read, dest: Dest, owner: Option<(u32, u32)>) -> i
             let link = if e.kind == b'1' { rename(&e.link)? } else { Vec::new() };
             unpack(&base, parent, leaf, &link, &e, &mut rd, owner).map_err(|err| with(String::from_utf8_lossy(&e.path), err))?;
             if e.kind == b'5' {
-                if !dirs.contains_key(&comps) {
-                    order.push(comps.clone());
+                let (n, meta) = (dirs.len(), Header { path: Vec::new(), link: Vec::new(), ..e });
+                match dirs.entry(comps.join(&b'/')) {
+                    Entry::Occupied(mut o) => o.get_mut().1 = meta,
+                    Entry::Vacant(v) => {
+                        kept += v.key().len() + DIR_COST;
+                        if kept > MAX_DIRS {
+                            return Err(invalid(format!("more directories than cp keeps ({} MiB of names)", MAX_DIRS >> 20)));
+                        }
+                        v.insert((n, meta));
+                    }
                 }
-                dirs.insert(comps, e);
             }
         }
         next = rd.next()?;
     }
-    for comps in order.iter().rev() {
-        let e = &dirs[comps];
-        let fd = walk_dir(&base, comps, None).map_err(|err| with(String::from_utf8_lossy(&e.path), err))?;
-        finish(fd.as_raw_fd(), e, owner)?;
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort_unstable_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    for (path, (_, e)) in dirs {
+        let comps: Vec<Vec<u8>> = path.split(|&b| b == b'/').map(<[u8]>::to_vec).collect();
+        let fd = walk_dir(&base, &comps, None).map_err(|err| with(String::from_utf8_lossy(&path), err))?;
+        finish(fd.as_raw_fd(), &e, owner)?;
     }
     Ok(())
 }
@@ -901,6 +919,27 @@ mod tests {
         set_mtime(&format!("{src}/a"), 1_100_000_000);
         std::fs::set_permissions(format!("{src}/ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
         src
+    }
+
+    /// #868: what is kept of the directories is bounded (each one's components once), the archive then refused.
+    #[test]
+    fn too_many_directories_are_refused() {
+        let t = Tmp::new("many-dirs");
+        let src = t.s("src");
+        for i in 0..MAX_DIRS / DIR_COST + 1 {
+            std::fs::create_dir_all(format!("{src}/{i}")).unwrap();
+        }
+        std::fs::create_dir(t.s("dst")).unwrap();
+        let e = extract(&mut &tar_of(&src)[..], Dest::Cp(&t.s("dst")), None).unwrap_err();
+        assert!(e.to_string().contains("more directories than cp keeps"), "{e}");
+        // Fewer, they are all unpacked.
+        std::fs::remove_dir(format!("{src}/0")).unwrap();
+        for i in MAX_DIRS / DIR_COST / 2..MAX_DIRS / DIR_COST + 1 {
+            std::fs::remove_dir(format!("{src}/{i}")).unwrap();
+        }
+        std::fs::create_dir(t.s("dst2")).unwrap();
+        extract(&mut &tar_of(&src)[..], Dest::Cp(&t.s("dst2")), None).unwrap();
+        assert_eq!(std::fs::read_dir(t.s("dst2/src")).unwrap().count(), MAX_DIRS / DIR_COST / 2 - 1);
     }
 
     #[test]

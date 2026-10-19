@@ -17,6 +17,10 @@ use crate::proto::{IN_DATA, IN_DETACH, IN_EOF, IN_RESIZE, MAX_INPUT, SESSION_DON
 
 /// Clients whose offsets are remembered, least recently used evicted first.
 const STREAMS: usize = 16;
+/// Evicted clients remembered as such (8 bytes each): one coming back is refused, never taken for a new client
+/// starting from 0 (its input would be written twice, as when no ack of its reached it before the eviction). One
+/// away for more evictions than that is taken for new again: its host catches that only once an ack reached it.
+const FORGOTTEN: usize = 1024;
 
 pub(crate) struct Stdin {
     /// Held while writing, so that one feeder writes at a time, in offset order.
@@ -25,6 +29,9 @@ pub(crate) struct Stdin {
     pty: Option<File>,
     /// What the last write left taken, of whichever stream (a session has only stream 0).
     last: AtomicU64,
+    /// Streams evicted from `State::streams`, the latest first. A lock of its own (taken after `state`'s, if both):
+    /// `forgot` never waits for a write that blocks while its app does not read.
+    forgotten: Mutex<VecDeque<u64>>,
 }
 
 struct State {
@@ -35,12 +42,26 @@ struct State {
 }
 
 impl State {
-    fn touch(&mut self, stream: u64) -> u64 {
-        let taken = self.streams.iter().position(|(s, _)| *s == stream).and_then(|i| self.streams.remove(i)).map_or(0, |(_, t)| t);
-        self.streams.truncate(STREAMS - 1);
+    /// `stream` made the most recently used (a new one from 0): what it has taken. None: it was evicted.
+    fn touch(&mut self, forgotten: &Mutex<VecDeque<u64>>, stream: u64) -> Option<u64> {
+        let taken = match self.streams.iter().position(|(s, _)| *s == stream) {
+            Some(i) => self.streams.remove(i).map_or(0, |(_, t)| t),
+            None if forgotten.lock().unwrap().contains(&stream) => return None,
+            None => 0,
+        };
+        while self.streams.len() >= STREAMS {
+            let (old, _) = self.streams.pop_back().unwrap();
+            let mut forgotten = forgotten.lock().unwrap();
+            forgotten.truncate(FORGOTTEN - 1);
+            forgotten.push_front(old);
+        }
         self.streams.push_front((stream, taken));
-        taken
+        Some(taken)
     }
+}
+
+fn forgotten(stream: u64) -> io::Error {
+    io::Error::other(format!("stdin stream {stream:x} was forgotten: {STREAMS} newer attach clients took stdin since"))
 }
 
 /// Why `feed` returned.
@@ -57,7 +78,8 @@ impl Stdin {
     /// `fd`: the command's stdin (a pipe's end, or the pty's master, `pty`, again).
     pub(crate) fn new(fd: File, pty: Option<File>) -> io::Result<Stdin> {
         nonblocking(&fd)?;
-        Ok(Stdin { state: Mutex::new(State { fd: Some(fd), streams: VecDeque::new() }), pty, last: AtomicU64::new(0) })
+        let state = Mutex::new(State { fd: Some(fd), streams: VecDeque::new() });
+        Ok(Stdin { state, pty, last: AtomicU64::new(0), forgotten: Mutex::default() })
     }
 
     pub(crate) fn tty(&self) -> bool {
@@ -68,14 +90,28 @@ impl Stdin {
         self.last.load(Ordering::Acquire)
     }
 
-    pub(crate) fn taken(&self, stream: u64) -> u64 {
-        self.state.lock().unwrap().touch(stream)
+    /// What `stream` has taken, made the most recently used; an evicted one's an error. Waits for a write under way.
+    pub(crate) fn taken(&self, stream: u64) -> io::Result<u64> {
+        self.state.lock().unwrap().touch(&self.forgotten, stream).ok_or_else(|| forgotten(stream))
+    }
+
+    /// Whether `stream` was evicted, without waiting for a write under way (`APPIN`'s, before it takes over).
+    pub(crate) fn forgot(&self, stream: u64) -> io::Result<()> {
+        match self.forgotten.lock().unwrap().contains(&stream) {
+            true => Err(forgotten(stream)),
+            false => Ok(()),
+        }
+    }
+
+    /// A use of `stream` (a resize's): it is evicted last.
+    fn touch(&self, stream: u64) {
+        self.state.lock().unwrap().touch(&self.forgotten, stream);
     }
 
     /// Writes what of `data` (at `offset`) was not taken yet, while `current()`; returns what is taken.
     fn write(&self, stream: u64, offset: u64, data: &[u8], current: &dyn Fn() -> bool) -> io::Result<u64> {
         let mut st = self.state.lock().unwrap();
-        let mut taken = st.touch(stream);
+        let mut taken = st.touch(&self.forgotten, stream).ok_or_else(|| forgotten(stream))?;
         if offset > taken {
             return Err(io::Error::other(format!("stdin from byte {offset}, but only {taken} were taken")));
         }
@@ -107,8 +143,8 @@ impl Stdin {
     /// EOF at `offset`: once all before it is taken, a pipe is closed. A pty is not: it has no EOF of its own.
     fn eof(&self, stream: u64, offset: u64) {
         let mut st = self.state.lock().unwrap();
-        let taken = st.touch(stream);
-        if self.pty.is_none() && offset <= taken {
+        let taken = st.touch(&self.forgotten, stream);
+        if self.pty.is_none() && taken.is_some_and(|t| offset <= t) {
             st.fd = None;
         }
     }
@@ -150,7 +186,7 @@ pub(crate) fn feed(
             IN_DATA => taken(stdin.write(stream, offset()?, &body[8..], current)?)?,
             IN_EOF => stdin.eof(stream, offset()?),
             IN_RESIZE if len == 4 => {
-                stdin.taken(stream);
+                stdin.touch(stream);
                 stdin.resize(u16::from_le_bytes([body[0], body[1]]), u16::from_le_bytes([body[2], body[3]]));
             }
             IN_DETACH => return Ok(Fed::Detach),
@@ -242,7 +278,7 @@ mod tests {
             stdin.write(stream, 0, b"x", &|| true).unwrap();
         }
         stdin.write(0, 1, b"y", &|| true).unwrap();
-        assert_eq!(stdin.taken(1), 1);
+        assert_eq!(stdin.taken(1).unwrap(), 1);
         stdin.eof(2, 2); // Touch without closing.
         stdin.write(STREAMS as u64, 0, b"z", &|| true).unwrap();
         let st = stdin.state.lock().unwrap();
@@ -251,6 +287,35 @@ mod tests {
         assert!(st.streams.contains(&(1, 1)));
         assert!(st.streams.contains(&(2, 1)));
         assert!(!st.streams.iter().any(|(s, _)| *s == 3));
+        assert_eq!(*stdin.forgotten.lock().unwrap(), [3]);
+    }
+
+    /// #868: an evicted client coming back is refused, its first ack lost or not, never fed again from 0.
+    #[test]
+    fn an_evicted_stream_is_refused_not_restarted() {
+        let (mut r, w) = pipe();
+        let stdin = Stdin::new(w, None).unwrap();
+        // Its input taken, its ack lost: the client still has 0 acknowledged.
+        stdin.write(100, 0, b"once", &|| true).unwrap();
+        for other in 0..STREAMS as u64 {
+            stdin.taken(other).unwrap();
+        }
+        assert!(stdin.taken(100).unwrap_err().to_string().contains("forgotten"));
+        assert!(stdin.write(100, 0, b"once", &|| true).is_err(), "resent from 0");
+        stdin.touch(100);
+        stdin.eof(100, 4);
+        assert!(stdin.taken(100).is_err(), "neither a resize nor an EOF brings it back");
+        // The remembered evictions are bounded too: the oldest is forgotten for good.
+        for other in 1000..1000 + (FORGOTTEN + STREAMS) as u64 {
+            stdin.taken(other).unwrap();
+        }
+        assert_eq!(stdin.forgotten.lock().unwrap().len(), FORGOTTEN);
+        // Away for more evictions than are remembered, it is taken for a new client (documented at FORGOTTEN).
+        assert_eq!(stdin.taken(100).unwrap(), 0);
+        drop(stdin);
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "once");
     }
 
     #[test]
@@ -261,7 +326,7 @@ mod tests {
         let mut wire = &wire[..];
         let e = feed(&mut wire, &stdin, 0, &|| true, &mut |_| Err(io::ErrorKind::BrokenPipe.into())).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(stdin.taken(0), 5);
+        assert_eq!(stdin.taken(0).unwrap(), 5);
         assert_eq!(wire, data(5, b"second"));
         stdin.eof(0, 5);
         let mut got = String::new();
@@ -290,9 +355,9 @@ mod tests {
         assert_eq!(got, "hello world", "EOF closed the pipe");
         assert!(feed(&mut &data(20, b"x")[..], &stdin, 0, &|| true, &mut |_| Ok(())).is_err(), "a gap");
         // Another client's stream starts at 0; after EOF its bytes are dropped but counted.
-        assert_eq!(stdin.taken(7), 0);
+        assert_eq!(stdin.taken(7).unwrap(), 0);
         feed(&mut &data(0, b"abc")[..], &stdin, 7, &|| true, &mut |_| Ok(())).unwrap();
-        assert_eq!((stdin.taken(7), stdin.taken(0), stdin.last()), (3, 11, 3));
+        assert_eq!((stdin.taken(7).unwrap(), stdin.taken(0).unwrap(), stdin.last()), (3, 11, 3));
         assert_eq!(feed(&mut &[SESSION_DONE][..], &stdin, 0, &|| true, &mut |_| Ok(())).unwrap(), Fed::Done);
         assert_eq!(feed(&mut &frame(IN_DETACH, &[])[..], &stdin, 0, &|| true, &mut |_| Ok(())).unwrap(), Fed::Detach);
         assert!(feed(&mut &frame(9, &[])[..], &stdin, 0, &|| true, &mut |_| Ok(())).is_err());
@@ -317,7 +382,7 @@ mod tests {
             Fed::Gone
         );
         // However much the pipe holds (a page or two, past a user's pipe limit).
-        assert!(last > 0 && last < 8 * MAX_INPUT as u64 && stdin.taken(0) == last && stdin.last() == last, "{last}");
+        assert!(last > 0 && last < 8 * MAX_INPUT as u64 && stdin.taken(0).unwrap() == last && stdin.last() == last, "{last}");
     }
 
     #[test]
