@@ -1515,13 +1515,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopped = stop.clone();
         let reader = thread::spawn(move || {
             let mut buf = [0; 4096];
             let mut drained = 0;
             peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            while !stopped.load(Ordering::SeqCst) {
+            // Drain to EOF so the reader never closes with unread data and resets the connection.
+            loop {
                 let n = peer.read(&mut buf).unwrap();
                 if n == 0 {
                     break;
@@ -1537,7 +1536,6 @@ mod tests {
         let budget = Duration::from_millis(200);
         let result = send_paused(&conn, &header, &[0], &data, start + budget, &mut Phases::new());
         let elapsed = start.elapsed();
-        stop.store(true, Ordering::SeqCst);
         drop(conn);
         let drained = reader.join().unwrap();
         assert_eq!(result.unwrap_err().downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
@@ -1553,7 +1551,8 @@ mod tests {
         // Takes everything at once, then never answers.
         let reader = thread::spawn(move || std::io::copy(&mut peer, &mut std::io::sink()).unwrap());
         let header = Header { runs: &[], vmstate_len: 1, preload: &[], paused: false, app_log: 0 };
-        let data = vec![7; 1 << 20];
+        // Fit in the socket buffers so the deadline tests the reply, even if the reader is delayed.
+        let data = vec![7; 32 << 10];
         let start = Instant::now();
         let budget = Duration::from_millis(300);
         let result = send_paused(&conn, &header, &[0], &data, start + budget, &mut Phases::new());
