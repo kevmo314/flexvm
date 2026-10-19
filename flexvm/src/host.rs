@@ -759,12 +759,13 @@ impl Host {
     /// takes the lock before it marks the checkpoint STARTED, so one of the two shows every such VM.
     pub fn template_users(&self) -> std::collections::BTreeSet<String> {
         let mut ids: std::collections::BTreeSet<String> = self.entries().into_iter().map(|e| e.template_id).filter(|id| !id.is_empty()).collect();
-        let suspended = std::fs::read_dir(self.state.join("suspended")).into_iter().flatten().flatten();
-        let suspended = suspended
-            .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
-            .map(|e| e.path())
-            .filter(|d| !d.join("STARTED").exists() && !d.join("DISCARDED").exists())
-            .filter_map(|d| crate::checkpoint::record(&d));
+        let suspended = crate::checkpoint::entries(&self.state.join("suspended")).filter_map(|entry| match entry {
+            Ok(d) if !d.file_name()?.as_encoded_bytes().starts_with(b".") && !d.join("STARTED").exists() && !d.join("DISCARDED").exists() => {
+                crate::checkpoint::record(&d)
+            }
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        });
         let mut unreadable = vec![];
         for manifest in suspended.chain(crate::checkpoint::managed(&self.state).map(|(_, m)| m)) {
             match manifest {

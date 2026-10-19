@@ -169,7 +169,8 @@ struct Hashing {
     fnv: Hash,
     sha: sha2::Sha256,
     /// The page bytes are being written into, by index: hashed once one past it is written to, or at the end.
-    page: Option<(u64, Box<[u8; PAGE_SIZE]>)>,
+    page: Option<u64>,
+    buf: Box<[u8; PAGE_SIZE]>,
 }
 
 impl Hashing {
@@ -178,17 +179,21 @@ impl Hashing {
         let (mut fnv, mut sha) = (Hash::new(), sha2::Sha256::new());
         fnv.word(len);
         sha.update(len.to_le_bytes());
-        Hashing { fnv, sha, page: None }
+        Hashing { fnv, sha, page: None, buf: Box::new([0; PAGE_SIZE]) }
     }
 
     /// Whole page `n`, as `nonzero_pages` gives it.
     fn page(&mut self, n: u64, p: &[u8]) {
+        Self::hash_page(&mut self.fnv, &mut self.sha, n, p);
+    }
+
+    fn hash_page(fnv: &mut Hash, sha: &mut sha2::Sha256, n: u64, p: &[u8]) {
         use sha2::Digest;
         if !zero(p) {
-            self.fnv.word(n);
-            self.fnv.update(p);
-            self.sha.update(n.to_le_bytes());
-            self.sha.update(p);
+            fnv.word(n);
+            fnv.update(p);
+            sha.update(n.to_le_bytes());
+            sha.update(p);
         }
     }
 
@@ -197,19 +202,20 @@ impl Hashing {
         let size = PAGE_SIZE as u64;
         while !bytes.is_empty() {
             let (n, at) = (off / size, (off % size) as usize);
-            if self.page.as_ref().is_none_or(|(i, _)| *i != n) {
+            if self.page != Some(n) {
                 self.flush();
-                self.page = Some((n, Box::new([0; PAGE_SIZE])));
+                self.page = Some(n);
             }
             let take = (PAGE_SIZE - at).min(bytes.len());
-            self.page.as_mut().unwrap().1[at..at + take].copy_from_slice(&bytes[..take]);
+            self.buf[at..at + take].copy_from_slice(&bytes[..take]);
             (off, bytes) = (off + take as u64, &bytes[take..]);
         }
     }
 
     fn flush(&mut self) {
-        if let Some((n, p)) = self.page.take() {
-            self.page(n, &p[..]);
+        if let Some(n) = self.page.take() {
+            Self::hash_page(&mut self.fnv, &mut self.sha, n, &self.buf[..]);
+            self.buf.fill(0);
         }
     }
 
@@ -1875,6 +1881,26 @@ fn finish_remove(paths: &Paths, tombstone: &Path) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_hash_reuses_its_page_and_clears_holes() {
+        let len = 5 * PAGE_SIZE + 37;
+        let mut bytes = vec![0; len];
+        let mut hash = Hashing::new(len as u64);
+        let buf = hash.buf.as_ptr();
+        for (off, data) in [(3, vec![7; PAGE_SIZE + 19]), (2 * PAGE_SIZE + 9, vec![0; PAGE_SIZE]), (5 * PAGE_SIZE + 31, vec![9; 6])] {
+            bytes[off..off + data.len()].copy_from_slice(&data);
+            hash.write(off as u64, &data);
+            assert_eq!(hash.buf.as_ptr(), buf);
+        }
+        let mut want = Hashing::new(len as u64);
+        for (n, bytes) in bytes.chunks(PAGE_SIZE).enumerate() {
+            let mut page = [0; PAGE_SIZE];
+            page[..bytes.len()].copy_from_slice(bytes);
+            want.page(n as u64, &page);
+        }
+        assert_eq!(hash.finish(), want.finish());
+    }
 
     #[test]
     fn working_set_mib_is_read_without_opening_the_template() {

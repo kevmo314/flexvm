@@ -28,16 +28,43 @@ pub(crate) use write::{Buf, GuestPages};
 /// The checkpoints flexvm keeps itself (`STATE/checkpoints/ID`, #775): their generations stay
 /// (`Host::template_users`). None while the directory is missing. One that cannot be read, or
 /// whose manifest is not its `ID`'s (renamed by hand), is an error: it is still there.
+/// A listing failure is an error at the directory path, even after some entries were read.
 pub fn managed(state: &std::path::Path) -> impl Iterator<Item = (std::path::PathBuf, crate::util::Result<Manifest>)> {
-    std::fs::read_dir(state.join("checkpoints")).into_iter().flatten().flatten().filter_map(|e| {
-        let id = e.file_name().into_string().ok().filter(|n| store::is_id(n))?;
-        let dir = e.path();
-        let read = chain::read_manifest_id(&dir).and_then(|(found, m)| {
-            ensure!(found == id, "checkpoint {} is invalid: its manifest's id is {found}", dir.display());
+    let dir = state.join("checkpoints");
+    managed_entries(dir.clone(), entries(&dir))
+}
+
+fn managed_entries(
+    dir: std::path::PathBuf,
+    entries: impl Iterator<Item = crate::util::Result<std::path::PathBuf>>,
+) -> impl Iterator<Item = (std::path::PathBuf, crate::util::Result<Manifest>)> {
+    entries.filter_map(move |entry| {
+        let path = match entry {
+            Ok(path) => path,
+            Err(e) => return Some((dir.clone(), Err(e))),
+        };
+        let id = path.file_name()?.to_str().filter(|n| store::is_id(n))?;
+        let read = chain::read_manifest_id(&path).and_then(|(found, m)| {
+            ensure!(found == id, "checkpoint {} is invalid: its manifest's id is {found}", path.display());
             Ok(m)
         });
-        present(&dir, read).map(|m| (dir, m))
+        present(&path, read).map(|m| (path, m))
     })
+}
+
+/// Only a missing directory is empty; even a partial listing must report its errors.
+pub(crate) fn entries(dir: &std::path::Path) -> impl Iterator<Item = crate::util::Result<std::path::PathBuf>> {
+    let path = dir.to_path_buf();
+    listing(std::fs::read_dir(dir)).map(move |e| e.map(|e| e.path()).map_err(|e| format!("{}: {e}", path.display()).into()))
+}
+
+fn listing<T>(read: io::Result<impl Iterator<Item = io::Result<T>>>) -> impl Iterator<Item = io::Result<T>> {
+    let (entries, error) = match read {
+        Ok(entries) => (Some(entries), None),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => (None, None),
+        Err(e) => (None, Some(Err(e))),
+    };
+    entries.into_iter().flatten().chain(error)
 }
 
 /// The manifest of the checkpoint record `dir` (a suspended VM's): None if it has none, a revoked

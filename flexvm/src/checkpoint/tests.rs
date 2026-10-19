@@ -1091,3 +1091,60 @@ fn store_dependency_index_matches_the_scan_on_every_small_graph() {
     }
     assert_eq!(graphs, 3 + 16 + 125 + 1296 + 2401);
 }
+
+#[test]
+fn listing_errors_are_never_empty_or_complete() {
+    let missing: io::Result<std::vec::IntoIter<io::Result<()>>> = Err(io::Error::from_raw_os_error(libc::ENOENT));
+    assert_eq!(listing(missing).count(), 0);
+    for errno in [libc::EIO, libc::EMFILE, libc::EACCES] {
+        let failed: io::Result<std::vec::IntoIter<io::Result<()>>> = Err(io::Error::from_raw_os_error(errno));
+        let results: Vec<_> = listing(failed).collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap_err().raw_os_error(), Some(errno));
+        // ENOENT on an entry is an error too: only opening a missing directory is empty.
+        for entry_error in [errno, libc::ENOENT] {
+            let results: Vec<_> = listing(Ok(vec![Ok(1), Err(io::Error::from_raw_os_error(entry_error)), Ok(2)].into_iter())).collect();
+            assert_eq!(results[0].as_ref().unwrap(), &1);
+            assert_eq!(results[1].as_ref().unwrap_err().raw_os_error(), Some(entry_error));
+            assert_eq!(results[2].as_ref().unwrap(), &2);
+        }
+        let dir = Path::new("/state/checkpoints");
+        let entries = std::iter::once(Err(io::Error::from_raw_os_error(errno).into()));
+        let results: Vec<_> = managed_entries(dir.into(), entries).collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, dir);
+        assert!(results[0].1.is_err());
+    }
+}
+
+#[test]
+fn failed_checkpoint_listings_keep_templates_and_refuse_removal() {
+    let root = tmp("listing-failure");
+    let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+    assert!(host.template_users().is_empty());
+    assert_eq!(managed(&host.state).count(), 0);
+    for name in ["suspended", "checkpoints"] {
+        let dir = host.state.join(name);
+        // ENOTDIR regardless of uid, including root.
+        if dir.is_dir() {
+            fs::remove_dir(&dir).unwrap();
+        }
+        fs::write(&dir, b"not a directory").unwrap();
+        let users = host.template_users();
+        assert!(users.iter().any(|u| u.starts_with(crate::template::KEEP_ALL) && u.contains(&dir.display().to_string())), "{users:?}");
+        if name == "checkpoints" {
+            let mut all = store::list(&host.state);
+            assert_eq!(all.len(), 1);
+            assert!(all[0].manifest.is_err());
+            let id = "aaaaaaaaaaaaaaaa";
+            all.push(store::Entry { id: id.into(), name: None, dir: dir.join(id), manifest: Ok(manifest(1, None, json!({}))) });
+            for result in [store::removal(&all, &[id.into()], false), store::removal(&all, &[id.into()], true), store::pruning(&all, None)] {
+                let err = result.unwrap_err().to_string();
+                assert!(err.starts_with("nothing removed:") && err.contains(&dir.display().to_string()), "{err}");
+            }
+            assert!(store::removal(&all, &["checkpoints".into()], true).is_err());
+        }
+        fs::remove_file(dir).unwrap();
+        assert!(host.template_users().is_empty());
+    }
+}
