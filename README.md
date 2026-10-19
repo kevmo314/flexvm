@@ -675,9 +675,10 @@ keeps running under `stty tostop`: its VM process ignores SIGTTOU and SIGTTIN.
 Hosts in different PID namespaces must not share `/sys/fs/cgroup/flexvm`.
 Cgroup owners are recorded by PID and start time in the creator's PID namespace;
 garbage collection cannot distinguish a foreign namespace's owner and may kill
-its Firecrackers. Give each PID namespace a cgroup namespace (or cgroup2 mount)
-of its own. Separate state and run directories alone do not isolate cgroup
-collection.
+its Firecrackers. Give each PID namespace its own cgroup subtree, mounted so
+that its `/sys/fs/cgroup` is rooted there; a new cgroup namespace or a second
+cgroup2 mount alone still sees the shared hierarchy. Separate state and run
+directories alone do not isolate cgroup collection.
 
 ## Fast starts
 
