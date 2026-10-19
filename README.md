@@ -22,8 +22,10 @@ whichever default the binary was built with. The test and lab scripts
 `FLEXVM_STATE_DIR` from the environment too; `fetch.sh` and
 `build-firecracker.sh` take `--state`. `/run/flexvm` is only ever the default
 state's, so to change the default on a host whose old default state is in use,
-move that state to the new path, or stop its VMs and remove its `run.json` so it
-binds a run directory of its own (`/run/flexvm-PREFIX`) under `--state`.
+first stop its VMs and its listener, and remove `/run/flexvm/state.json` (it names
+the old state; a reboot clears it too). Then either move the old state to the new
+path, or remove its `run.json` and keep using it with `--state`, where it binds a
+run directory of its own (`/run/flexvm-PREFIX`).
 
 ```sh
 cargo build --release && sudo install target/release/flexvm /usr/local/bin/
