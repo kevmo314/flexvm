@@ -619,23 +619,33 @@ fn set_clock(now: libc::timespec) -> Result<i128, String> {
     Ok(off)
 }
 
-/// Counts "crng reseeded due to virtual machine fork" in the whole kmsg ring. The host checks
+/// Counts the kernel's "crng reseeded due to virtual machine fork" records in the whole kmsg ring (one a read). The host checks
 /// for a nonzero count, relying on cold-boot templates having none before their snapshot.
 /// vmgenid sends no uevent; /dev/sysgenid isn't ordered against the reseed.
 fn forks() -> io::Result<usize> {
-    const FORK_MSG: &[u8] = b"crng reseeded due to virtual machine fork";
     let mut kmsg = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open("/dev/kmsg")?;
     let (mut buf, mut n) = (vec![0u8; 8192], 0);
     loop {
         match kmsg.read(&mut buf) {
             Ok(0) => return Ok(n),
-            Ok(r) => n += buf[..r].windows(FORK_MSG.len()).any(|w| w == FORK_MSG) as usize,
+            Ok(r) => n += kernel_fork(&buf[..r]) as usize,
             // Records overwritten while reading; carry on with the next.
             Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(n),
             Err(e) => return Err(e),
         }
     }
+}
+
+/// A record ("PRI,SEQ,TS,FLAGS;message\n" then " KEY=value" lines) is the kernel's reseed: facility 0
+/// (userspace's writes get LOG_USER at least), its whole message the one random.c logs.
+fn kernel_fork(record: &[u8]) -> bool {
+    const FORK_MSG: &[u8] = b"random: crng reseeded due to virtual machine fork";
+    let Some(semi) = record.iter().position(|&b| b == b';') else { return false };
+    let (header, msg) = (&record[..semi], &record[semi + 1..]);
+    let msg = msg.split(|&b| b == b'\n').next().unwrap_or_default();
+    let pri = header.split(|&b| b == b',').next().and_then(|p| std::str::from_utf8(p).ok()).and_then(|s| s.parse::<u32>().ok());
+    pri.is_some_and(|p| p >> 3 == 0) && msg == FORK_MSG
 }
 
 fn host_peer(peer: &libc::sockaddr_vm, len: libc::socklen_t) -> bool {
@@ -653,6 +663,26 @@ fn request_line(r: &mut impl BufRead) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_messages_must_come_from_the_kernel() {
+        for pri in 0..24 {
+            let record = format!("{pri},42,123,-;random: crng reseeded due to virtual machine fork\n");
+            assert_eq!(super::kernel_fork(record.as_bytes()), pri < 8);
+        }
+        for record in [
+            "6,42,123,-;unrelated message\n",
+            "crng reseeded due to virtual machine fork",
+            ",42,123,-;crng reseeded due to virtual machine fork\n",
+            "bad,42,123,-;crng reseeded due to virtual machine fork\n",
+            "4294967296,42,123,-;random: crng reseeded due to virtual machine fork\n",
+            "6,42,123,-;x: random: crng reseeded due to virtual machine fork\n",
+            "6,42,123,-;random: crng reseeded due to virtual machine fork, says me\n",
+            "6,42,123,-;unrelated\n SUBSYSTEM=random: crng reseeded due to virtual machine fork\n",
+        ] {
+            assert!(!super::kernel_fork(record.as_bytes()));
+        }
+    }
+
     #[test]
     fn hosts_name_the_vm_once() {
         let image = "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tflexvm\n";

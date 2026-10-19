@@ -1532,8 +1532,8 @@ impl Proc {
         };
         let _ = (|| -> Result<()> {
             if req["action"] == "close" {
-                g.get_ref().set_read_timeout(Some(Duration::from_secs(2)))?;
-                let reply = guest::read_frame(&mut g)?.map(|(_, m)| String::from_utf8_lossy(&m).into_owned());
+                let reply = guest::read_frame(&mut crate::util::By { s: &mut g, at: Instant::now() + Duration::from_secs(2) })?
+                    .map(|(_, m)| String::from_utf8_lossy(&m).into_owned());
                 return Ok(send_json(
                     &mut w,
                     &match reply.as_deref() {
