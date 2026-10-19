@@ -463,14 +463,16 @@ impl Drop for Firecracker {
         let _ = self.child.wait();
         self.join_log();
         if !self.tap.is_empty() {
-            release(&self.tap, self.cgroup.get_mut().as_deref(), &self.dir);
+            release(Some(&self.tap), self.cgroup.get_mut().as_deref(), &self.dir);
         }
     }
 }
 
 /// Its Firecracker must be gone.
-fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
-    crate::net::delete_tap(tap);
+fn release(tap: Option<&str>, cgroup: Option<&Path>, dir: &Path) {
+    if let Some(tap) = tap {
+        crate::net::delete_tap(tap);
+    }
     if let Some(cg) = cgroup {
         let _ = remove_cgroup(cg);
     }
@@ -562,8 +564,9 @@ impl Spawner {
         };
         let fc = crate::host::host_dir(&dir, 0o700).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
         let made = made.join().unwrap_or_else(|_| Err("tap thread panicked".into()));
+        let owned_tap = made.as_ref().ok().map(|()| tap.as_str());
         // A Firecracker without its tap is dropped (killed) here, before `release`.
-        let fc = fc.and_then(|fc| made.map(|()| fc)).inspect_err(|_| release(&tap, cgroup.as_deref(), &dir));
+        let fc = fc.and_then(|fc| made.map(|()| fc)).inspect_err(|_| release(owned_tap, cgroup.as_deref(), &dir));
         // Made (sysfs has it now) or released: no longer kept from other takes.
         self.making.lock().unwrap().remove(&tap);
         let mut fc = fc?;

@@ -2064,12 +2064,13 @@ impl Host {
                 }
                 Ok("aborted") => {
                     let freed = self.lock().and_then(|l| {
+                        let via = self.addr(&l, o.ip)?.via;
                         let current = self.withdraw_noted(&l, o.ip, o.gen)?;
                         self.unlend(&l, o.ip, o.gen)?;
                         self.retire_leaving(&l, &o, id)?;
                         // A newer generation here keeps its route.
                         if current && self.holder(&l, o.ip)?.is_none() && !self.reinstall(&l, o.ip, None)? {
-                            crate::net::unroute(o.ip);
+                            crate::net::unroute(o.ip, via);
                         }
                         Ok(())
                     });
@@ -2132,7 +2133,7 @@ impl Host {
             }
         }
         if current && !self.reinstall(&l, ip, None)? {
-            crate::net::unroute(ip);
+            crate::net::unroute(ip, a.via);
         }
         for (_, path, _) in &owed {
             crate::util::unlink_durably(path)?;
@@ -3238,7 +3239,7 @@ impl Host {
                 self.unpublish(&l, ip, id);
             }
             crate::info!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
-            crate::net::unroute(ip);
+            crate::net::unroute(ip, a.via);
             withdrawn.push((name.to_string(), ip, gen));
         }
         // Failed writes and busy names keep boot recovery incomplete. Write failures first:
