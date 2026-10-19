@@ -39,12 +39,22 @@ const MAX_ARRIVALS: usize = 8;
 const MAX_ARRIVALS_FROM: usize = MAX_ARRIVALS / 2;
 static ARRIVALS: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ARRIVALS, MAX_ARRIVALS_FROM));
 /// Templates being received (`template`) at once, in all and from any one peer; more are refused as
-/// busy. Two arrivals of one template take turns at one (`template::turn`): the second sends nothing.
+/// busy. Two arrivals of one template take turns (`template::turn`), the second without a slot while it
+/// waits, and sends nothing: it finds the first's generation.
 const MAX_PUSHES: usize = 4;
 const MAX_PUSHES_FROM: usize = 2;
 static PUSHES: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_PUSHES, MAX_PUSHES_FROM));
-/// A push is answered within this of its request, its turn and all its bytes (`template::MAX_DATA`) included.
-pub const PUSH_WAIT: Duration = Duration::from_secs(600);
+/// Pushes waiting for their turn or receiving, in all and from any one peer; more are refused as busy, so
+/// arrivals of one template waiting on a long receive keep no more of the listener's `MAX_ACTIVE` than this.
+static PUSHERS: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(2 * MAX_PUSHES, 2 * MAX_PUSHES_FROM));
+/// How long a push waits for another arrival of its template to have received it (`template::turn`).
+pub const TURN_WAIT: Duration = Duration::from_secs(600);
+/// The pace a push's bytes keep (`util::Paced`), either way: `PUSH_GRACE`, then a second for every `PUSH_RATE`
+/// bytes, so a 64 GiB template over 1 GbE fits as one that stalls does not hold its slot for long.
+pub const PUSH_GRACE: Duration = Duration::from_secs(60);
+pub const PUSH_RATE: u64 = 8 << 20;
+/// Each of a push's answers is written within this.
+pub const ANSWER_WAIT: Duration = Duration::from_secs(30);
 /// How long the generation stays open after the answer: until the arrival, whose request follows at once,
 /// has opened it itself (`open_id`) or been refused.
 const PUSH_HOLD: Duration = Duration::from_secs(REQUEST_DEADLINE.as_secs() + PREPARE_WAIT.as_secs());
@@ -182,10 +192,16 @@ pub fn main(host: Host, listeners: Vec<TcpListener>, validated: Cached) -> Resul
     // A sweep and a refill now, not after the first period: a listener started at boot is
     // what recovers a quiet host (#555).
     let first = host.clone();
-    std::thread::spawn(move || match crate::gc::after_boot(&first, true) {
-        Ok(false) => crate::gc::recover(&first),
-        Err(e) => crate::log!("flexvm: recovering after boot: {e}"),
-        Ok(true) => {}
+    std::thread::spawn(move || {
+        // What receives killed with an earlier listener left (#823): its fallocated blocks count against the next push's room.
+        if let Err(e) = crate::template::sweep_leftovers(&crate::template::Paths::new(&first.state)) {
+            crate::log!("flexvm: sweeping the templates directory: {e}");
+        }
+        match crate::gc::after_boot(&first, true) {
+            Ok(false) => crate::gc::recover(&first),
+            Err(e) => crate::log!("flexvm: recovering after boot: {e}"),
+            Ok(true) => {}
+        }
     });
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
@@ -808,36 +824,75 @@ fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
 /// `template`: whether this host has generation `id` (by content id only: no name here counts), answered
 /// `have`; if not, receiving it (`template::receive`), answered again once published. Both before the
 /// source pauses anything. Either way it stays open for `PUSH_HOLD`, so nothing removes it before the arrival opens it.
+/// One held already is answered at once, without a turn or a slot. With `have` set, only asked, and answered
+/// `have` false if it is not here (a source's last check before its prepare, which refreshes the hold, #824). With
+/// `ack` set, its metadata is answered too (`go`, or a refusal: room for its `bytes`, the limits, Firecracker)
+/// before its source sends its data.
 fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
-    let at = Instant::now() + PUSH_WAIT;
-    let answer = |r: &Result<Value>| send_json(&mut crate::util::By { s: &conn, at }, &crate::util::reply(r));
+    let answer = |r: &Result<Value>| send_json(&mut crate::util::By { s: &conn, at: Instant::now() + ANSWER_WAIT }, &crate::util::reply(r));
     let (paths, id) = (crate::template::Paths::new(&host.state), req["id"].as_str().unwrap_or(""));
-    let mut asked = false;
-    let got = PUSHES.take(conn.peer_addr()?.ip()).ok_or(BUSY.into()).and_then(|_slot| {
-        let _turn = crate::template::turn(&paths, id, at)?;
-        let held = HELD.lock().unwrap().get(id).map(|h| h.0.clone());
-        if let Some(tpl) = held.map(Ok).or_else(|| crate::template::Template::generation(&paths, id).map(|dir| crate::template::Template::open_dir(id, dir))) {
-            // A received one's digests, for the source to compare: its content id is no proof of its files.
-            return tpl.inspect(|t| drop(answer(&Ok(json!({"have": true, "digests": t.meta.received.then_some(&t.meta.digests)})))));
-        }
-        answer(&Ok(json!({"have": false})))?;
-        asked = true;
-        crate::template::receive(&paths, &mut std::io::BufReader::new(crate::util::By { s: &conn, at }), id, None, |_| Ok(()))
-    });
-    match got {
-        Ok(tpl) => {
-            if asked {
-                answer(&Ok(json!({"received": true, "digests": tpl.meta.digests})))?;
+    let (only_ask, ack) = (req["have"] == true, req["ack"] == true);
+    let held = || HELD.lock().unwrap().get(id).map(|h| h.0.clone());
+    // A received one's digests, for the source to compare: its content id is no proof of its files.
+    let have = |t: &crate::template::Template| json!({"have": true, "digests": t.meta.received.then_some(&t.meta.digests)});
+    if let Some(tpl) = held() {
+        answer(&Ok(have(&tpl)))?;
+        hold(tpl);
+        return Ok(());
+    }
+    // Held to the end, through the drain after a refusal too: what a source sends is read off only within it.
+    let (mut asked, mut waiting) = (false, None);
+    let got = (|| -> Result<Option<Arc<crate::template::Template>>> {
+        let _turn = match only_ask {
+            true => None,
+            false => {
+                waiting = Some(PUSHERS.take(conn.peer_addr()?.ip()).ok_or(BUSY)?);
+                Some(crate::template::turn(&paths, id, Instant::now() + TURN_WAIT)?)
             }
+        };
+        if let Some(tpl) = held() {
+            return Ok(Some(tpl));
+        }
+        let _slot = PUSHES.take(conn.peer_addr()?.ip()).ok_or(BUSY)?;
+        if let Some(dir) = crate::template::Template::generation(&paths, id) {
+            return crate::template::Template::open_dir(id, dir).map(Some);
+        }
+        if only_ask {
+            return Ok(None);
+        }
+        answer(&Ok(json!({"have": false, "ack": ack})))?;
+        asked = true;
+        let bytes = req["bytes"].as_u64();
+        let ready = |_: &crate::template::Meta| {
+            bytes.map_or(Ok(()), |b| crate::template::check_room(&paths, b))?;
+            if ack {
+                answer(&Ok(json!({"go": true})))?;
+            }
+            Ok(())
+        };
+        let mut r = std::io::BufReader::with_capacity(1 << 20, crate::util::Paced::new(&conn, PUSH_GRACE, PUSH_RATE));
+        crate::template::receive(&paths, &mut r, id, None, ready, |_| Ok(())).map(Some)
+    })();
+    match got {
+        Ok(Some(tpl)) => {
+            answer(&Ok(match asked {
+                true => json!({"received": true, "digests": tpl.meta.digests}),
+                false => have(&tpl),
+            }))?;
             hold(tpl);
         }
+        Ok(None) => answer(&Ok(json!({"have": false})))?,
         Err(e) => {
             answer(&Err(e))?;
-            // What the source still sends, so it reads the answer instead of a reset.
-            let _ = conn.shutdown(std::net::Shutdown::Write);
-            let _ = std::io::copy(&mut crate::util::By { s: &conn, at: Instant::now() + Duration::from_secs(30) }, &mut std::io::sink());
+            // What the source still sends, so it reads the answer instead of a reset: only once it was asked for
+            // data, and within its place among `PUSHERS`. One refused before sent nothing more.
+            if asked && waiting.is_some() {
+                let _ = conn.shutdown(std::net::Shutdown::Write);
+                let _ = std::io::copy(&mut crate::util::By { s: &conn, at: Instant::now() + Duration::from_secs(30) }, &mut std::io::sink());
+            }
         }
     }
+    drop(waiting);
     Ok(())
 }
 
@@ -1071,6 +1126,68 @@ fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gatewa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A push refused once its metadata is read, before its data; answered from the hold without a slot or turn;
+    /// asked again (`have`) as a source does right before its prepare (#824).
+    #[test]
+    fn pushes_are_refused_before_their_data_and_answered_from_the_hold() {
+        let (_src, src_paths, tpl) = crate::template::tests::sendable();
+        let id = tpl.meta.id.clone();
+        let root = crate::test_util::TempDir::new("push");
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        // The source's Firecracker (`template::Paths::new`), as every host must have.
+        std::os::unix::fs::symlink(src_paths.firecracker.parent().unwrap(), state.join("artifacts")).unwrap();
+        let host = Host::open(&state, &root.join("run")).unwrap();
+        let paths = crate::template::Paths::new(&state);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let conn = conn.unwrap();
+                let req: Value = serde_json::from_slice(&read_line_by(&conn, Instant::now() + REQUEST_DEADLINE).unwrap()).unwrap();
+                let host = host.clone();
+                std::thread::spawn(move || push(&host, &req, conn).unwrap());
+            }
+        });
+        let ask = |req: Value| {
+            let (conn, reply) = crate::util::rpc(&addr, Duration::from_secs(2), Instant::now() + Duration::from_secs(10), &req).unwrap();
+            (conn, reply)
+        };
+        let read = |conn: &TcpStream| crate::util::recv_json(&mut std::io::BufReader::new(conn)).unwrap().unwrap();
+        // No room for what it says it sends: refused right after its metadata, and the source reads why.
+        let (mut conn, reply) = ask(json!({"op": "template", "id": id, "ack": true, "bytes": 1u64 << 50}));
+        assert_eq!(reply, json!({"have": false, "ack": true}));
+        crate::template::Sending::new(&tpl).unwrap().write_meta(&mut conn).unwrap();
+        let refused = read(&conn);
+        assert!(refused["ok"] == false && refused["error"].as_str().unwrap().contains("past"), "{refused}");
+        assert!(crate::template::Template::generation(&paths, &id).is_none());
+        // Asked only: not here, and nothing is received.
+        let e = crate::migrate::push_template(&addr, &tpl, true).err().unwrap().to_string();
+        assert!(e.contains("no longer has"), "{e}");
+        assert!(crate::template::Template::generation(&paths, &id).is_none());
+        // Sent: its metadata acknowledged, then its data.
+        let (got, digests) = crate::migrate::push_template(&addr, &tpl, false).unwrap().unwrap();
+        assert!(got["ms"].is_number() && digests == json!(tpl.digests().unwrap()), "{got}");
+        assert!(crate::template::Template::generation(&paths, &id).is_some() && HELD.lock().unwrap().contains_key(&id));
+        // Held: answered though every slot of this peer is taken and another arrival of it has its turn.
+        let _slots = [PUSHES.take("127.0.0.1".parse().unwrap()), PUSHES.take("127.0.0.1".parse().unwrap())];
+        let _turn = crate::template::turn(&paths, &id, Instant::now()).unwrap();
+        assert!(crate::migrate::push_template(&addr, &tpl, false).unwrap().is_some());
+        assert!(crate::migrate::push_template(&addr, &tpl, true).unwrap().is_some());
+        // As an old source (no `ack`) asks.
+        assert_eq!(ask(json!({"op": "template", "id": id})).1["have"], true);
+        // Waiting for a turn takes a place of its own, so waiters are bounded too: one for another template is busy.
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let _waiters: Vec<_> = (0..2 * MAX_PUSHES_FROM).map(|_| PUSHERS.take(ip)).collect();
+        let other = "0".repeat(16);
+        let busy = crate::util::rpc(&addr, Duration::from_secs(2), Instant::now() + Duration::from_secs(10), &json!({"op": "template", "id": other}));
+        assert!(busy.err().unwrap().to_string().contains(BUSY));
+        drop(_waiters);
+        // No such generation, asked only: not here, by any id.
+        drop((_slots, _turn));
+        assert_eq!(ask(json!({"op": "template", "id": "../x", "have": true})).1, json!({"have": false}));
+    }
 
     #[test]
     fn next_hops_are_known_peers_and_unicast() {
