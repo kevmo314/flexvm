@@ -44,6 +44,9 @@ static ARRIVALS: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Wait
 const MAX_PUSHES: usize = 4;
 const MAX_PUSHES_FROM: usize = 2;
 static PUSHES: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_PUSHES, MAX_PUSHES_FROM));
+/// Pushes waiting for their turn or receiving, in all and from any one peer; more are refused as busy, so
+/// arrivals of one template waiting on a long receive keep no more of the listener's `MAX_ACTIVE` than this.
+static PUSHERS: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(2 * MAX_PUSHES, 2 * MAX_PUSHES_FROM));
 /// How long a push waits for another arrival of its template to have received it (`template::turn`).
 pub const TURN_WAIT: Duration = Duration::from_secs(600);
 /// The pace a push's bytes keep (`util::Paced`), either way: `PUSH_GRACE`, then a second for every `PUSH_RATE`
@@ -841,7 +844,10 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let got = (|| -> Result<Option<Arc<crate::template::Template>>> {
         let _turn = match only_ask {
             true => None,
-            false => Some(crate::template::turn(&paths, id, Instant::now() + TURN_WAIT)?),
+            false => {
+                let waiting = PUSHERS.take(conn.peer_addr()?.ip()).ok_or(BUSY)?;
+                Some((waiting, crate::template::turn(&paths, id, Instant::now() + TURN_WAIT)?))
+            }
         };
         if let Some(tpl) = held() {
             return Ok(Some(tpl));
@@ -1166,6 +1172,13 @@ mod tests {
         assert!(crate::migrate::push_template(&addr, &tpl, true).unwrap().is_some());
         // As an old source (no `ack`) asks.
         assert_eq!(ask(json!({"op": "template", "id": id})).1["have"], true);
+        // Waiting for a turn takes a place of its own, so waiters are bounded too: one for another template is busy.
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let _waiters: Vec<_> = (0..2 * MAX_PUSHES_FROM).map(|_| PUSHERS.take(ip)).collect();
+        let other = "0".repeat(16);
+        let busy = crate::util::rpc(&addr, Duration::from_secs(2), Instant::now() + Duration::from_secs(10), &json!({"op": "template", "id": other}));
+        assert!(busy.err().unwrap().to_string().contains(BUSY));
+        drop(_waiters);
         // No such generation, asked only: not here, by any id.
         drop((_slots, _turn));
         assert_eq!(ask(json!({"op": "template", "id": "../x", "have": true})).1, json!({"have": false}));

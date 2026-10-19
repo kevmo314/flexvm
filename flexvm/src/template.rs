@@ -1314,6 +1314,11 @@ pub fn receive<R: Read>(
                 let have = open_cached_rootfs(paths, &meta.rootfs)?;
                 let st = crate::util::fstat(have.as_raw_fd())?;
                 let held = crate::host::shared_at(&crate::host::host_locks()?, &crate::host::use_lock(&st))?;
+                // Still what its path names, now that no `rmi` removes it: one unlinked before the lock was taken is not.
+                let now = crate::util::fstat(open_cached_rootfs(paths, &meta.rootfs)?.as_raw_fd())?;
+                if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) {
+                    bail!("replaced as it was opened");
+                }
                 let (c, sha) = hash_and_digest(&have, &meta.rootfs)?;
                 Ok((c.hash == meta.components["rootfs"].hash).then_some((c, sha, held)))
             })()
