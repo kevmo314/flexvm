@@ -471,11 +471,7 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     use std::os::unix::fs::OpenOptionsExt;
     // In the directory the publication lock is keyed by, whatever its path names meanwhile.
     let pinned = crate::host::Directory::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-    File::open(&pinned.path)?.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     let path = pinned.path.join(path.file_name().ok_or("no file name")?);
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
-        private_file(&path)?;
-    }
     let tmp = path.with_extension(format!("part{}", random_hex(8)?));
     let dir = publish_lock(&pinned)?;
     // Every lock is let go explicitly (`Flock`), not by close: a child another thread forks
@@ -503,20 +499,37 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     res
 }
 
-/// Cache permissions also cover entries made by older versions, without changing ownership.
+/// The cache is private (directories 0700, files 0600), entries made by older versions (0755 and 0644)
+/// included, without changing ownership and never through a symlink: one where a cache directory is
+/// expected is left as it is. Modes change only if they differ: a chmod moves the ctime that template
+/// stamps include, and every template using a root filesystem would rehash it.
 fn private_dir(path: &Path) -> Result<()> {
     crate::util::create_dir_durably(path, 0o700)?;
-    Ok(File::open(path)?.set_permissions(std::fs::Permissions::from_mode(0o700))?)
+    let fd = match crate::util::openat(libc::AT_FDCWD, &cpath(path)?, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
+        // A symlink (to the directory `create_dir_durably` found).
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => return Ok(()),
+        res => res.map_err(|e| format!("{}: {e}", path.display()))?,
+    };
+    Ok(make_private(&fd, 0o700).map_err(|e| format!("{}: {e}", path.display()))?)
 }
 
+/// A cache file opened for reading, made private as `private_dir` says.
 fn private_file(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
+    // Never blocking on a FIFO, nor through a symlink.
     let f = File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
     if !f.metadata()?.is_file() {
         bail!("{} is not a regular file", path.display());
     }
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    make_private(&f, 0o600).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(f)
+}
+
+fn make_private(fd: &impl AsRawFd, mode: u32) -> std::io::Result<()> {
+    if crate::util::fstat(fd.as_raw_fd())?.st_mode & 0o7777 != mode {
+        crate::util::check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })?;
+    }
+    Ok(())
 }
 
 fn bytes(data: &[u8]) -> impl FnOnce(&mut File) -> Result<()> + '_ {
@@ -1042,11 +1055,31 @@ mod tests {
                 assert_eq!((m.mode() & 0o777, m.uid()), (0o600, owner));
             }
         }
-        let blob = cache.join("blob");
-        publish(&blob, bytes(b"private")).unwrap();
-        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(!publish(&blob, bytes(b"replacement")).unwrap());
-        assert_eq!(std::fs::metadata(blob).unwrap().mode() & 0o777, 0o600);
+        // Already private: reuse leaves the ctime that template stamps include.
+        let stamp = |p: &Path| std::fs::metadata(p).map(|m| (m.ctime(), m.ctime_nsec())).unwrap();
+        let before = stamp(&cached);
+        std::thread::sleep(Duration::from_millis(20));
+        private_dir(&cache).unwrap();
+        cached_rootfs(&cached, never, sync_dir).unwrap();
+        assert_eq!(stamp(&cached), before);
+    }
+
+    #[test]
+    fn cache_permissions_never_follow_symlinks() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmpdir("cache-private-links");
+        let target = d.join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = d.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, d.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink(&file, d.join("file-link")).unwrap();
+        private_dir(&d.join("dir-link")).unwrap();
+        assert!(private_file(&d.join("file-link")).is_err());
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o644);
     }
 
     #[test]

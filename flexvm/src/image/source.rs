@@ -285,6 +285,13 @@ fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
     }
     let config = read_verified(&reg.blob(&config_digest, config_size, &blobs)?, config_size, &config_digest)?;
     let diff_ids = diff_ids(&config, descs.len())?;
+    // A reused root filesystem never opens its layers: older versions' 0644 blobs are made private here.
+    for (d, _) in &descs {
+        match super::private_file(&blob_path(&blobs, d)?) {
+            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+            res => drop(res?),
+        }
+    }
     let reg = Arc::new(reg);
     let layers = descs
         .into_iter()
