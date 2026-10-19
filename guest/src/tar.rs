@@ -55,8 +55,9 @@ fn cstr(b: &[u8]) -> io::Result<CString> {
     CString::new(b).map_err(|_| invalid("a name contains a nul byte"))
 }
 
-fn padded(n: u64) -> u64 {
-    n.div_ceil(BLOCK as u64) * BLOCK as u64
+/// `n` rounded up to whole blocks; refused (a size an archive gave) when that does not fit a u64.
+fn padded(n: u64) -> io::Result<u64> {
+    n.checked_next_multiple_of(BLOCK as u64).ok_or_else(|| invalid(format!("an entry of {n} bytes")))
 }
 
 fn zeros(out: &mut dyn Write, mut n: u64) -> io::Result<()> {
@@ -116,7 +117,7 @@ fn write_header(out: &mut dyn Write, h: &Header) -> io::Result<()> {
     if !pax.is_empty() {
         write_header(out, &Header { path: b"././@PaxHeader".to_vec(), kind: b'x', mode: 0o644, size: pax.len() as u64, ..Default::default() })?;
         out.write_all(&pax)?;
-        zeros(out, padded(pax.len() as u64) - pax.len() as u64)?;
+        zeros(out, padded(pax.len() as u64)? - pax.len() as u64)?;
     }
     b[148..156].fill(b' ');
     let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
@@ -286,7 +287,7 @@ fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>, dev: libc::
             write_header(out, &h)?;
             let n = io::copy(&mut (&mut f).take(h.size), out).map_err(|e| with(path.display(), e))?;
             // A file that shrank meanwhile is padded to the size its header says.
-            zeros(out, padded(h.size) - n)
+            zeros(out, padded(h.size)? - n)
         }
         kind => {
             let mut h = header(&node.st, name);
@@ -358,7 +359,7 @@ impl Reader<'_> {
         if io::copy(&mut (&mut *self.r).take(size), out)? < size {
             return Err(invalid("the archive ends inside an entry"));
         }
-        self.left -= size;
+        self.left = self.left.checked_sub(size).ok_or_else(|| invalid("an entry's data past its end"))?;
         Ok(())
     }
 
@@ -367,7 +368,7 @@ impl Reader<'_> {
             return Err(invalid(format!("an extended header of {size} bytes")));
         }
         let mut v = Vec::new();
-        self.left = padded(size);
+        self.left = padded(size)?;
         self.data(size, &mut v)?;
         self.skip()?;
         Ok(v)
@@ -377,7 +378,7 @@ impl Reader<'_> {
         self.skip()?;
         let (mut path, mut link, mut pax) = (None, None, Vec::new());
         // What an entry's extended headers hold, in all: each one is `MAX_RECORD` at most, and so are they all.
-        let mut extended = 0;
+        let mut extended = 0u64;
         loop {
             let mut b = Vec::with_capacity(BLOCK);
             (&mut *self.r).take(BLOCK as u64).read_to_end(&mut b)?;
@@ -397,7 +398,7 @@ impl Reader<'_> {
             }
             let size = num(&b[124..136])?;
             if matches!(b[156], b'x' | b'g' | b'L' | b'K') {
-                extended += size;
+                extended = extended.saturating_add(size);
                 if extended > MAX_RECORD {
                     return Err(invalid(format!("extended headers of more than {MAX_RECORD} bytes for one entry")));
                 }
@@ -417,7 +418,7 @@ impl Reader<'_> {
                     continue;
                 }
                 b'g' => {
-                    self.left = padded(size);
+                    self.left = padded(size)?;
                     self.skip()?;
                     continue;
                 }
@@ -445,26 +446,71 @@ impl Reader<'_> {
             h.path = path.unwrap_or(h.path);
             h.link = link.unwrap_or(h.link);
             for (k, v) in pax {
-                let n = || String::from_utf8_lossy(&v).split('.').next().unwrap_or("").parse::<i64>().map_err(|_| invalid(format!("bad PAX {k}")));
+                let bad = || invalid(format!("bad PAX {k}"));
+                let n = || String::from_utf8_lossy(&v).split('.').next().unwrap_or("").parse::<i64>().map_err(|_| bad());
+                // Never negative: -1 is not taken as u64::MAX.
+                let u = || n().and_then(|n| u64::try_from(n).map_err(|_| bad()));
                 match k.as_str() {
                     "path" => h.path = v.clone(),
                     "linkpath" => h.link = v.clone(),
-                    "size" => h.size = n()? as u64,
-                    "uid" => h.uid = n()? as u64,
-                    "gid" => h.gid = n()? as u64,
+                    "size" => h.size = u()?,
+                    "uid" => h.uid = u()?,
+                    "gid" => h.gid = u()?,
                     "mtime" => h.mtime = n()?,
                     _ => {}
                 }
             }
-            self.left = padded(h.size);
+            self.left = padded(h.size)?;
             return Ok(Some(h));
         }
     }
 }
 
+/// What `cp NAME:PATH DST` asked for, known on the host without asking the guest: the top entry `create` names
+/// `basename(PATH)`, or the directory's contents (PATH ending in `/.`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Top {
+    Named(Vec<u8>),
+    Contents,
+}
+
+/// The top `create(src)` makes, from `src` alone. A last component of `..` (which `create` resolves in its filesystem) is
+/// taken lexically from `/`, where a guest path starts, to a name: a guest that resolves it otherwise has its archive
+/// refused. One that comes to `/` lexically is refused here: through a link (`/bin/..`, with `/bin -> usr/bin`) it is
+/// `usr` in the guest, and taken as contents, it would let the guest name anything below DST.
+#[allow(dead_code)] // Only the host checks a guest's archive.
+pub fn top_of(src: &str) -> io::Result<Top> {
+    if src == "." || src.ends_with("/.") {
+        return Ok(Top::Contents);
+    }
+    let trimmed = src.trim_end_matches('/');
+    let named = |c: &str| if c.is_empty() || c == "." { Top::Contents } else { Top::Named(c.as_bytes().to_vec()) };
+    match trimmed.rsplit('/').next().unwrap_or("") {
+        ".." => {
+            let mut comps = Vec::new();
+            for c in trimmed.split('/') {
+                match c {
+                    "" | "." => {}
+                    ".." => drop(comps.pop()),
+                    c => comps.push(c),
+                }
+            }
+            match comps.last() {
+                Some(c) => Ok(named(c)),
+                None => Err(io::Error::other(format!("{src}: a path whose .. comes to /; give /. for its contents"))),
+            }
+        }
+        c => Ok(named(c)),
+    }
+}
+
 pub enum Dest<'a> {
-    /// docker cp's DST rules, applied to the archive's top entry (see below).
+    /// docker cp's DST rules, applied to the archive's top entry (see below), whatever that is named: an archive the user made.
     Cp(&'a str),
+    /// docker cp's DST rules for a guest's archive (`cp NAME:PATH DST`): its entries must be all below the top asked for
+    /// (`top_of(PATH)`), or for `Top::Contents`, anything below DST. The guest never chooses what is written outside that.
+    #[allow(dead_code)] // Only the host unpacks a guest's archive.
+    Guest(&'a str, &'a Top),
     /// `cp - NAME:DIR`: an existing directory the archive is unpacked into as it is.
     #[allow(dead_code)] // Only the guest unpacks a user's archive.
     Into(&'a str),
@@ -521,16 +567,19 @@ fn walk_dir(base: &OwnedFd, comps: &[Vec<u8>], make: Option<Option<(u32, u32)>>)
 /// (None: the contents go into the directory).
 type Target = (OwnedFd, Option<(Vec<u8>, Vec<u8>)>);
 
+/// DST for a directory's contents: made if missing.
+fn contents(dst: &str) -> io::Result<Target> {
+    match std::fs::metadata(dst) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Err(with(dst, io::Error::from_raw_os_error(libc::ENOTDIR))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(dst).map_err(|e| with(dst, e))?,
+        Err(e) => return Err(with(dst, e)),
+    }
+    Ok((open_dir(dst)?, None))
+}
+
 fn target(dst: &str, comps: &[Vec<u8>], first: &Header) -> io::Result<Target> {
-    let Some(root) = comps.first() else {
-        match std::fs::metadata(dst) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => return Err(with(dst, io::Error::from_raw_os_error(libc::ENOTDIR))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(dst).map_err(|e| with(dst, e))?,
-            Err(e) => return Err(with(dst, e)),
-        }
-        return Ok((open_dir(dst)?, None));
-    };
+    let Some(root) = comps.first() else { return contents(dst) };
     let is_dir = comps.len() > 1 || first.kind == b'5';
     match std::fs::metadata(dst) {
         Ok(m) if m.is_dir() => return Ok((open_dir(dst)?, Some((root.clone(), root.clone())))),
@@ -560,6 +609,18 @@ pub fn extract(input: &mut dyn Read, dest: Dest, owner: Option<(u32, u32)>) -> i
     let (base, top) = match dest {
         Dest::Into(dir) => (open_dir(dir)?, None),
         Dest::Cp(dst) => target(dst, &components(&first.path, false)?, &first)?,
+        Dest::Guest(dst, Top::Contents) => {
+            components(&first.path, false)?;
+            contents(dst)?
+        }
+        Dest::Guest(dst, Top::Named(want)) => {
+            let comps = components(&first.path, false)?;
+            if comps.first() != Some(want) {
+                let (got, want) = (String::from_utf8_lossy(&first.path), String::from_utf8_lossy(want));
+                return Err(invalid(format!("the vm's archive starts with {got:?}, not {want:?}, the name asked for")));
+            }
+            target(dst, &comps, &first)?
+        }
     };
     let rename = |path: &[u8]| -> io::Result<Vec<Vec<u8>>> {
         let mut comps = components(path, into)?;
@@ -785,7 +846,7 @@ mod tests {
             let h = Header { path: name.into(), link, kind, mode: if kind == b'5' { 0o755 } else { 0o644 }, size: data.len() as u64, ..Default::default() };
             write_header(&mut v, &h).unwrap();
             v.extend_from_slice(data);
-            v.resize(padded(v.len() as u64) as usize, 0);
+            v.resize(padded(v.len() as u64).unwrap() as usize, 0);
         }
         v.extend_from_slice(&[0; BLOCK * 2]);
         v
@@ -1041,6 +1102,189 @@ mod tests {
         let hl = archive(&[("k/", b'5', ""), ("k/l", b'2', &outside), ("k/b", b'1', "k/l/secret")]);
         assert!(unpack_to(&hl, Dest::Cp(&dst)).is_err());
         assert!(!t.0.join("dst/k/b").exists());
+    }
+
+    /// Every node below `root` with its contents, to show that nothing there changed.
+    fn snapshot(root: &Path) -> Vec<(String, u32, i64, Vec<u8>)> {
+        listing(root)
+    }
+
+    #[test]
+    fn the_top_asked_for_is_the_top_create_makes() {
+        let t = Tmp::new("topof");
+        std::fs::create_dir_all(t.0.join("d/sub")).unwrap();
+        std::fs::write(t.0.join("d/f"), "f").unwrap();
+        let first = |src: &str| {
+            let tar = tar_of(src);
+            let mut r = &tar[..];
+            let h = Reader { r: &mut r, left: 0 }.next().unwrap().unwrap();
+            match components(&h.path, false).unwrap().first() {
+                Some(c) => Top::Named(c.clone()),
+                None => Top::Contents,
+            }
+        };
+        let d = t.s("d");
+        for src in
+            [d.clone(), format!("{d}/"), format!("{d}//"), format!("{d}/."), format!("{d}/./"), format!("{d}/f"), format!("{d}/sub/.."), format!("{d}/sub/../")]
+        {
+            assert_eq!(top_of(&src).unwrap(), first(&src), "{src}");
+        }
+        assert_eq!(top_of(&format!("{d}/sub/..")).unwrap(), Top::Named(b"d".to_vec()));
+        for src in ["/", "//", "/.", ".", "./", "a/./"] {
+            assert_eq!(top_of(src).unwrap(), Top::Contents, "{src}");
+        }
+        // A `..` that comes to / lexically may be a name in the guest (`/bin/..` through `/bin -> usr/bin`): never contents.
+        for src in ["..", "../", "/..", "/bin/..", "/bin/../", "a/../..", "/a/./.."] {
+            assert!(top_of(src).is_err(), "{src}");
+        }
+        assert_eq!(top_of("/etc/hostname").unwrap(), Top::Named(b"hostname".to_vec()));
+        assert_eq!(top_of("etc/ssh/").unwrap(), Top::Named(b"ssh".to_vec()));
+        assert_eq!(top_of("/a/b/../c/..").unwrap(), Top::Named(b"a".to_vec()));
+        assert_eq!(top_of("/usr/bin/..").unwrap(), Top::Named(b"usr".to_vec()));
+    }
+
+    #[test]
+    fn a_guest_archive_lands_where_it_was_asked_for() {
+        let t = Tmp::new("guestok");
+        std::fs::create_dir_all(t.0.join("etc/sub")).unwrap();
+        std::fs::write(t.0.join("etc/hostname"), "vm\n").unwrap();
+        std::fs::write(t.0.join("etc/sub/x"), "x").unwrap();
+        std::fs::create_dir(t.0.join("dst")).unwrap();
+        let get = |src: String, dst: String| unpack_to(&tar_of(&src), Dest::Guest(&dst, &top_of(&src).unwrap()));
+        get(t.s("etc/hostname"), t.s("dst")).unwrap();
+        assert_eq!(std::fs::read(t.0.join("dst/hostname")).unwrap(), b"vm\n");
+        get(t.s("etc/hostname"), t.s("renamed")).unwrap();
+        assert_eq!(std::fs::read(t.0.join("renamed")).unwrap(), b"vm\n");
+        get(t.s("etc"), t.s("dst")).unwrap();
+        assert_eq!(std::fs::read(t.0.join("dst/etc/sub/x")).unwrap(), b"x");
+        get(format!("{}/.", t.s("etc")), t.s("contents")).unwrap();
+        assert_eq!(std::fs::read(t.0.join("contents/sub/x")).unwrap(), b"x");
+        assert_eq!(std::fs::read(t.0.join("contents/hostname")).unwrap(), b"vm\n");
+    }
+
+    /// `cp vm:/var/log/app.log home` (and `vm:/srv/. home`) from a guest that answers with something else: refused,
+    /// and nothing in home, or beside it, changes.
+    #[test]
+    fn a_guest_never_chooses_what_is_written() {
+        let t = Tmp::new("guestbad");
+        let (home, outside) = (t.0.join("home"), t.0.join("outside"));
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".bashrc"), "mine").unwrap();
+        std::fs::write(home.join(".ssh/authorized_keys"), "my key").unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        let (h, o) = (home.to_str().unwrap().to_string(), outside.to_str().unwrap().to_string());
+        let named = Top::Named(b"app.log".to_vec());
+        let before = (snapshot(&home), snapshot(&outside));
+        let refused = |bad: &[u8], top: &Top, why: &str| {
+            let e = unpack_to(bad, Dest::Guest(&h, top)).unwrap_err().to_string();
+            assert!(e.contains(why), "{why}: {e}");
+            // What was asked for may have been written before the entry refused; nothing else.
+            let _ = std::fs::remove_file(home.join("app.log")).or_else(|_| std::fs::remove_dir_all(home.join("app.log")));
+            assert_eq!((snapshot(&home), snapshot(&outside)), before, "{why}: {e}");
+        };
+        let cases: Vec<(Vec<u8>, &Top, &str)> = vec![
+            // The name the guest picks, rather than the one asked for.
+            (archive(&[("./.bashrc", b'0', "pwned")]), &named, "not \"app.log\""),
+            (archive(&[("./", b'5', ""), ("./.bashrc", b'0', "pwned")]), &named, "not \"app.log\""),
+            (archive(&[(".bashrc", b'0', "pwned")]), &named, "not \"app.log\""),
+            (archive(&[(".ssh/", b'5', ""), (".ssh/authorized_keys", b'0', "evil key")]), &named, "not \"app.log\""),
+            (archive(&[("app.log", b'0', "log"), (".bashrc", b'0', "pwned")]), &named, "outside the archive's top"),
+            (archive(&[("app.log/", b'5', ""), ("./.bashrc", b'0', "pwned")]), &named, "outside the archive's top"),
+            // Up and out, or absolute, either way.
+            (archive(&[("app.log/../.bashrc", b'0', "pwned")]), &named, ".."),
+            (archive(&[("app.log/", b'5', ""), ("app.log/../.bashrc", b'0', "pwned")]), &named, ".."),
+            (archive(&[("../outside/secret", b'0', "pwned")]), &Top::Contents, ".."),
+            (archive(&[("./", b'5', ""), ("x/../../outside/y", b'0', "pwned")]), &Top::Contents, ".."),
+            (archive(&[("/app.log", b'0', "pwned")]), &named, "absolute"),
+            (archive(&[("./", b'5', ""), (&format!("{h}/.bashrc"), b'0', "pwned")]), &Top::Contents, "absolute"),
+            // Hard links to what is outside: by .., absolute, or outside the top.
+            (archive(&[("app.log", b'1', "app.log/../outside/secret")]), &named, ".."),
+            (archive(&[("app.log", b'1', &format!("{o}/secret"))]), &named, "absolute"),
+            (archive(&[("app.log", b'1', ".bashrc")]), &named, "outside the archive's top"),
+            (archive(&[("./", b'5', ""), ("l", b'1', "../outside/secret")]), &Top::Contents, ".."),
+            (archive(&[("./", b'5', ""), ("l", b'1', &format!("{o}/secret"))]), &Top::Contents, "absolute"),
+        ];
+        for (bad, top, why) in &cases {
+            refused(bad, top, why);
+        }
+        // A symlink the archive made, then an entry below it, or a hard link through it: refused, nothing written through it.
+        for (bad, top) in [
+            (archive(&[("app.log/", b'5', ""), ("app.log/l", b'2', &o), ("app.log/l/pwned", b'0', "x")]), &named),
+            (archive(&[("app.log/", b'5', ""), ("app.log/l", b'2', &o), ("app.log/b", b'1', "app.log/l/secret")]), &named),
+            (archive(&[("./", b'5', ""), ("l", b'2', &o), ("l/pwned", b'0', "x")]), &Top::Contents),
+            (archive(&[("./", b'5', ""), ("l", b'2', &o), ("b", b'1', "l/secret")]), &Top::Contents),
+            (archive(&[("./", b'5', ""), ("ssh", b'2', &format!("{h}/.ssh")), ("ssh/authorized_keys", b'0', "evil key")]), &Top::Contents),
+        ] {
+            assert!(unpack_to(&bad, Dest::Guest(&h, top)).is_err());
+            assert_eq!(snapshot(&outside), before.1);
+            assert_eq!(std::fs::read(home.join(".ssh/authorized_keys")).unwrap(), b"my key");
+            assert_eq!(std::fs::read(home.join(".bashrc")).unwrap(), b"mine");
+            assert!(!home.join("app.log/b").exists() && !home.join("b").exists());
+            let _ = std::fs::remove_dir_all(home.join("app.log"));
+        }
+        // A directory entry where the archive made a link: the link is replaced by the directory, inside DST.
+        let replaced = archive(&[("app.log/", b'5', ""), ("app.log/l", b'2', &o), ("app.log/l/", b'5', ""), ("app.log/l/f", b'0', "x")]);
+        unpack_to(&replaced, Dest::Guest(&h, &named)).unwrap();
+        assert!(std::fs::symlink_metadata(home.join("app.log/l")).unwrap().is_dir());
+        assert_eq!(std::fs::read(home.join("app.log/l/f")).unwrap(), b"x");
+        assert_eq!(snapshot(&outside), before.1);
+        // A link the host already had below DST is never followed either.
+        std::os::unix::fs::symlink(&outside, home.join("tolink")).unwrap();
+        assert!(unpack_to(&archive(&[("./", b'5', ""), ("tolink/pwned", b'0', "x")]), Dest::Guest(&h, &Top::Contents)).is_err());
+        assert_eq!(snapshot(&outside), before.1);
+    }
+
+    /// One header block of `kind` named `name`, its size field given as is, checksummed.
+    fn raw_header(name: &str, kind: u8, size: &[u8; 12]) -> Vec<u8> {
+        let mut v = Vec::new();
+        write_header(&mut v, &Header { path: name.into(), kind, mode: 0o644, ..Default::default() }).unwrap();
+        v[124..136].copy_from_slice(size);
+        v[148..156].fill(b' ');
+        let sum: u32 = v.iter().map(|&x| u32::from(x)).sum();
+        v[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        v
+    }
+
+    #[test]
+    fn sizes_that_overflow_are_refused() {
+        let t = Tmp::new("oversize");
+        let dst = t.s("dst");
+        std::fs::create_dir(&dst).unwrap();
+        let top = Top::Named(b"f".to_vec());
+        let mut cases = Vec::new();
+        for size in ["-1", "18446744073709551615", "18446744073709551200", "99999999999999999999999", "-9223372036854775808"] {
+            let mut pax = Vec::new();
+            pax_record(&mut pax, "size", size.as_bytes());
+            let mut v = Vec::new();
+            write_header(&mut v, &Header { path: b"PaxHeader".to_vec(), kind: b'x', mode: 0o644, size: pax.len() as u64, ..Default::default() }).unwrap();
+            v.extend_from_slice(&pax);
+            v.resize(v.len().div_ceil(BLOCK) * BLOCK, 0);
+            v.extend(raw_header("f", b'0', b"00000000000\0"));
+            v.extend_from_slice(&[0; BLOCK * 2]);
+            cases.push(v);
+        }
+        // Base-256: u64::MAX, and just below it.
+        for last in [0xff, 0x01] {
+            let mut size = [0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, last];
+            let mut v = raw_header("f", b'0', &size);
+            v.extend_from_slice(&[0; BLOCK * 2]);
+            cases.push(v);
+            // And as a PAX header's own size, and a global one's.
+            for kind in [b'x', b'g', b'L'] {
+                size[11] = last;
+                let mut v = raw_header("PaxHeader", kind, &size);
+                v.extend_from_slice(&[0; BLOCK * 2]);
+                cases.push(v);
+            }
+        }
+        for bad in &cases {
+            assert!(unpack_to(bad, Dest::Guest(&dst, &top)).is_err());
+            assert!(unpack_to(bad, Dest::Cp(&dst)).is_err());
+        }
+        assert_eq!(std::fs::read_dir(&dst).unwrap().filter_map(|e| std::fs::read(e.unwrap().path()).ok()).filter(|d| !d.is_empty()).count(), 0);
+        assert!(padded(u64::MAX).is_err() && padded(u64::MAX - 510).is_err());
+        assert_eq!(padded(u64::MAX - 511).unwrap(), u64::MAX - 511);
     }
 
     #[test]

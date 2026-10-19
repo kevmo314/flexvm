@@ -617,9 +617,11 @@ pub fn cp(host: &Host, src: &str, dst: &str) -> Result<i32> {
             }
             let (r, mut w) = std::io::pipe()?;
             let dst = dst.to_string();
+            // What is written is what was asked for (docker cp's basename(PATH), or PATH/.'s contents), never what the guest names.
+            let top = tar::top_of(&path)?;
             let unpacked = std::thread::spawn(move || {
                 let mut r = BufReader::new(r);
-                let res = tar::extract(&mut r, tar::Dest::Cp(&dst), None);
+                let res = tar::extract(&mut r, tar::Dest::Guest(&dst, &top), None);
                 // The rest is read all the same, so that the exec writing it ends.
                 let _ = std::io::copy(&mut r, &mut std::io::sink());
                 res
