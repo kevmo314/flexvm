@@ -49,8 +49,8 @@ p.add_argument("--lanes", help="the lanes' ports and address ranges, as PORT:NET
                "--net-a, --net-b and --jobs)")
 p.add_argument("--tag", default="fvci", help="prefix of this run's own directories under /run and /var/tmp")
 p.add_argument("--template", default="ci", help="name of the template the cases pull (from the test image) and use")
-p.add_argument("--test-image", help="the test image's OCI layout: made there (scripts/test-image.py) unless it holds the "
-               "image of the state's base.squashfs already (default: in the run's own directory)")
+p.add_argument("--test-image", default="/var/lib/flexvm-test-image", help="the test image's OCI layout: made there (scripts/test-image.py) unless it holds the "
+               "image of the state's base.squashfs already (default: /var/lib/flexvm-test-image)")
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
 p.add_argument("--no-image", action="store_true", help="skip the image-template case (needs registry access)")
@@ -2369,7 +2369,7 @@ def shared_state(state):
 # Where templates are built (and images pulled, unpacked in its staging/).
 BUILD = os.path.join(WORK, "build")
 # The OCI layout the cases' templates are pulled from.
-TEST_IMAGE = os.path.abspath(args.test_image) if args.test_image else os.path.join(WORK, "test-image")
+TEST_IMAGE = os.path.abspath(args.test_image)
 shared_state(BUILD)
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"

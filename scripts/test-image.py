@@ -5,11 +5,12 @@ iproute2, procps), as an OCI image layout directory. It has no command, so its V
 told what to run, and the same squashfs always makes the same image (one uncompressed layer
 with fixed times and numeric owners, and no creation date), so flexvm's image cache keeps it.
 
-    sudo scripts/test-image.py /var/tmp/test-image
-    sudo flexvm pull /var/tmp/test-image --tag small --vcpus 2 --max 2048
+    sudo scripts/test-image.py /var/lib/flexvm-test-image
+    sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --max 2048
 
 scripts/e2e.py makes and pulls it for its templates. A directory that already holds the image
-of the same squashfs is left as it is.
+of the same squashfs is left as it is. OUT must be missing, empty, or an existing
+test image (oci-layout and source.sha256). Use a root-owned location for OUT.
 
 usage: sudo scripts/test-image.py [--state DIR] [--squashfs FILE] OUT
 """
@@ -33,6 +34,17 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def check_out():
+    if not os.path.lexists(out):
+        return
+    if os.path.islink(out) or not os.path.isdir(out):
+        sys.exit(f"refusing {out}: OUT must be a directory, not a symlink")
+    if os.listdir(out) and not all(os.path.isfile(os.path.join(out, name))
+                                   for name in ("oci-layout", "source.sha256")):
+        sys.exit(f"refusing {out}: non-empty OUT is not a test image (needs oci-layout and source.sha256)")
+
+
+check_out()
 source = sha256_file(squashfs)
 stamp = os.path.join(out, "source.sha256")
 if os.path.exists(os.path.join(out, "index.json")) and os.path.exists(stamp) and open(stamp).read().strip() == source:
@@ -79,13 +91,21 @@ try:
         json.dump({"imageLayoutVersion": "1.0.0"}, f)
     with open(os.path.join(layout, "source.sha256"), "w") as f:
         f.write(source + "\n")
-    shutil.rmtree(out, ignore_errors=True)
-    os.rename(layout, out)
     # Readable by whoever pulls it (the blobs are checked against their digests anyway).
-    for d, _, files in os.walk(out):
+    for d, _, files in os.walk(layout):
         os.chmod(d, 0o755)
         for name in files:
             os.chmod(os.path.join(d, name), 0o644)
+    check_out()
+    old = os.path.join(work, "old")
+    if os.path.lexists(out):
+        os.rename(out, old)
+    try:
+        os.rename(layout, out)
+    except OSError:
+        if os.path.exists(old):
+            os.rename(old, out)
+        raise
     print(f"{out}: test image {manifest_desc['digest']} ({layer_desc['size'] >> 20} MiB layer) from {squashfs}")
 finally:
     shutil.rmtree(work, ignore_errors=True)

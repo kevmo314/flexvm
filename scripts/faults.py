@@ -15,8 +15,8 @@ directories of this run's own.
 
 --template names a template of the test image, whose guests have what the
 scenarios run (python3, socat, iproute2):
-    sudo scripts/test-image.py /var/tmp/test-image
-    sudo flexvm pull /var/tmp/test-image --tag small --vcpus 2 --max 2048
+    sudo scripts/test-image.py /var/lib/flexvm-test-image
+    sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --max 2048
 (scripts/e2e.py's heavy shard builds it with --max 10240: scenarios that set
 up 1500 MiB or more, such as pages_dead, need that.)
 

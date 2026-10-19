@@ -919,9 +919,14 @@ iproute2 the guests run) as an OCI layout with no command. `scripts/faults.py`,
 `bench` example above does):
 
 ```sh
-sudo scripts/test-image.py /var/tmp/test-image
-sudo flexvm pull /var/tmp/test-image --tag small --vcpus 2 --max 2048
+sudo scripts/test-image.py /var/lib/flexvm-test-image
+sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --max 2048
 ```
+This root-owned location is also `e2e.py`'s default. Keep custom test image
+paths under a root-owned directory so another user cannot supply the image.
+`test-image.py` refuses non-empty output directories unless they contain both
+`oci-layout` and `source.sha256`; it builds beside the output before replacing it.
+
 `scripts/nettest.sh` migrates a VM back and forth under TCP and UDP traffic
 between network namespaces and fails on a lost datagram or a long stall.
 
