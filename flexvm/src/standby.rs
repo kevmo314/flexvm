@@ -44,6 +44,19 @@ fn create_dir(host: &Host, template: &str) -> Result<PathBuf> {
     Ok(d)
 }
 
+/// Outside the pool: removing an empty directory must not replace a refill's lock.
+pub(crate) fn refill_lock(host: &Host, template: &str) -> Result<File> {
+    let d = dir(host, template);
+    Ok(crate::host::private_file(&crate::host::locks(d.parent().unwrap()).join(d.file_name().unwrap()))?)
+}
+
+/// The lock versions before #850 take for a refill, in the pool (`d`): taken too, after `refill_lock`
+/// (under which the pool cannot be removed, `gc::standby_pool`), so a refill here never overlaps
+/// one by an older listener or VM process still running. Kept until no running version takes it alone.
+pub(crate) fn legacy_refill_lock(d: &std::path::Path, how: i32) -> std::io::Result<Flock> {
+    Flock::new(crate::host::private_file(&crate::host::locks(d).join("refill"))?, how)
+}
+
 fn key(paths: &Paths, template: &str) -> Result<String> {
     Ok(dir_key(&Template::resolve(paths, template)?))
 }
@@ -148,8 +161,8 @@ pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
 pub(crate) fn removing<T>(host: &Host, paths: &Paths, template: &str, remove: impl FnOnce(&Paths) -> Result<T>) -> Result<T> {
     let parent = crate::host::Directory::open(&paths.templates)?;
     let paths = Paths { templates: parent.path.clone(), ..paths.clone() };
-    let d = create_dir(host, template)?;
-    let _refill = Flock::new(crate::host::private_file(&crate::host::locks(&d).join("refill"))?, libc::LOCK_EX)?;
+    let _refill = Flock::new(refill_lock(host, template)?, libc::LOCK_EX)?;
+    let _legacy = legacy_refill_lock(&create_dir(host, template)?, libc::LOCK_EX)?;
     let counts = host.state.join("standby");
     let count = counts.join(template);
     let read = || match std::fs::read(&count) {
@@ -330,9 +343,14 @@ pub fn refill(host: &Host, template: &str) -> Result<usize> {
 /// lock, so a refill that waited behind another while relief stopped standbys starts none.
 /// Only a count set by hand (`set`) starts them regardless.
 fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<usize> {
-    let d = create_dir(host, template)?;
-    let lock = crate::host::private_file(&crate::host::locks(&d).join("refill"))?;
+    let lock = refill_lock(host, template)?;
     let _lock = match Flock::new(lock, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
+        Ok(lock) => lock,
+        Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let d = create_dir(host, template)?;
+    let _legacy = match legacy_refill_lock(&d, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
         Ok(lock) => lock,
         Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(0),
         Err(e) => return Err(e.into()),
@@ -565,16 +583,14 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     if let Some(mut f) = notify.take() {
         let _ = send_json(&mut f, &json!({"ok": true, "result": {"pid": me.pid, "template": template}}));
     }
-    let mut checked = Instant::now();
+    // Every pass, whether or not a connection came: a busy standby still leaves when it should.
+    let mut checked: Option<Instant> = None;
     loop {
-        if !crate::util::readable(&listener, Duration::from_millis(100)).unwrap_or(false) {
-            if let Some(code) = p.stop_requested() {
-                p.finish(op, End::NotStarted, code, None);
-            }
-            if checked.elapsed() < Duration::from_secs(1) {
-                continue;
-            }
-            checked = Instant::now();
+        if let Some(code) = p.stop_requested() {
+            p.finish(op, End::NotStarted, code, None);
+        }
+        if checked.is_none_or(|c| c.elapsed() >= CHECK_EVERY) {
+            checked = Some(Instant::now());
             let current = key(&p.paths, template).ok();
             let extra = live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
             let died = p.standby.lock().unwrap().as_ref().map_or(Some("it was given up".to_string()), |s| {
@@ -588,6 +604,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             if let Some(code) = leave_status(died.is_some(), current.as_deref() != Some(&mine) || extra || unreachable || low) {
                 p.finish(op, End::NotStarted, code, None);
             }
+        }
+        if !crate::util::readable(&listener, Duration::from_millis(100)).unwrap_or(false) {
             continue;
         }
         let Ok((c, _)) = listener.accept() else { continue };
@@ -621,7 +639,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
         // The claim's app settings are applied as it starts the app (`start_guest`), its ports as it claims.
         *p.spec.lock().unwrap() = spec;
-        crate::util::set_verbose(req["verbose"] == json!(true));
+        // Only this thread sets it once the process runs: a failed claim puts back the standby's own.
+        let verbose = crate::util::set_verbose(req["verbose"] == json!(true));
         p.tty.store(req["tty"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         p.attached.store(req["attached"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         p.attacher.store(req["attacher"] == json!(true), std::sync::atomic::Ordering::SeqCst);
@@ -685,6 +704,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 return Ok(Value::Null);
             }
             Err((e, retry)) => {
+                crate::util::set_verbose(verbose);
                 // Its VM ran, then its Firecracker died (#730): it ends as a death, its claimer told so.
                 if p.died_starting() {
                     crate::log!("standby {template}: claimed as {}: {e}", req["name"].as_str().unwrap_or(""));
@@ -747,6 +767,8 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     };
     p.bind_ports().map_err(|e| not_run(e, false))?;
     let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| not_run(e, false))?;
+    let mut failed = FailedClaim { p, name: Some(lock), claim: Some(claim), holder: name };
+    let claim = failed.claim.as_ref().unwrap();
     p.serve_ports(claim.ip).map_err(|e| not_run(e, false))?;
     t.mark("claim_ip");
     // Prepare the paused tap outside the host lock; a withdrawal can still win before fence.
@@ -770,12 +792,29 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         }
     })?;
     drop(still);
-    p.set_name(lock);
-    p.set_addr(claim);
+    p.set_name(failed.name.take().unwrap());
+    p.set_addr(failed.claim.take().unwrap());
     p.set_vm(vm);
     let mut v = p.start_guest(&mut t).map_err(|e| (e, false))?;
     v["standby"] = json!(true);
     Ok(v)
+}
+
+/// Roll back as a cold start's `finish(NotStarted)` does, even after installing a route.
+/// Its fields drop after `drop`: the name is held until the address is withdrawn.
+struct FailedClaim<'a> {
+    p: &'a Proc,
+    name: Option<crate::host::NameLock>,
+    claim: Option<crate::host::AddrClaim>,
+    holder: &'a str,
+}
+
+impl Drop for FailedClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            self.p.withdraw_claim(claim, self.holder);
+        }
+    }
 }
 
 /// Validate before acknowledging a claim; only v0.1.0 sends an unmarked generation without a spec.
@@ -907,6 +946,10 @@ pub fn publish_lock(sock: &std::path::Path) -> PathBuf {
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often an unclaimed standby checks its generation, the pool's target, its Firecracker and the
+/// host's memory, connections arriving or not (#850).
+const CHECK_EVERY: Duration = Duration::from_millis(100);
 /// What a refill grants a standby at least (`grant_mib`).
 const MIN_GRANT_MIB: u64 = 256;
 /// How long a refill holds relief off for each standby it starts: its grant, then its lock file.
@@ -1503,6 +1546,25 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_refill_lock_holds_off_a_refill() {
+        let root = crate::test_util::TempDir::new("refill-legacy");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let d = create_dir(&host, "default").unwrap();
+        // As a listener or VM process from before #850 holds it while it refills.
+        let legacy = legacy_refill_lock(&d, libc::LOCK_EX).unwrap();
+        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = host.clone();
+        let refill = std::thread::spawn(move || tx.send(refill_by(&waiting, "default", true, true).map_err(|e| e.to_string())).unwrap());
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "a waiting refill waits for it");
+        // Nor does it let an older refill in meanwhile: it holds the new lock first.
+        assert!(Flock::new(refill_lock(&host, "default").unwrap(), libc::LOCK_EX | libc::LOCK_NB).is_err());
+        drop(legacy);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(0));
+        refill.join().unwrap();
+    }
+
+    #[test]
     fn recovery_finds_persistent_targets_and_respects_refill_lock_and_reserve() {
         let root = crate::test_util::TempDir::new("refill");
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
@@ -1511,10 +1573,14 @@ mod tests {
         assert_eq!(templates(&host), vec!["default"]);
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
-        let lock = crate::host::private_file(&crate::host::locks(&d).join("refill")).unwrap();
+        let lock = refill_lock(&host, "default").unwrap();
         let lock = Flock::new(lock, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         drop(lock);
+        // Nor while an older version's refill holds the pool's own lock.
+        let legacy = legacy_refill_lock(&d, libc::LOCK_EX).unwrap();
+        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
+        drop(legacy);
         // Nor while relief stops standby VMs.
         let stop = stop_lock(&host).unwrap();
         let stop = Flock::new(stop, libc::LOCK_EX).unwrap();
