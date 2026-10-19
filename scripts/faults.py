@@ -10091,7 +10091,9 @@ def reboot():
         r = subprocess.run([BIN, "--state", B.state, "ps"], capture_output=True, text=True, timeout=60, env=ENV)
         check("reboot: B's state, bound elsewhere, is refused without its --run, never defaulted", r.returncode != 0
               and f"give --run {os.path.realpath(B.run)}" in r.stderr and not os.path.exists(os.path.join(B.run, "state.json")), r.stderr)
+        t0 = time.time()
         r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "ps", "-a", "--json"], capture_output=True, text=True, timeout=180, env=ENV)
+        took = time.time() - t0
         check("reboot: B's state takes its run directory back", r.returncode == 0
               and json.load(open(os.path.join(B.run, "state.json"))) == os.path.realpath(B.state), r.stderr)
         check("reboot: its recovery is marked complete", open(os.path.join(B.run, ".boot")).read() == open("/proc/sys/kernel/random/boot_id").read().strip())
@@ -10103,7 +10105,14 @@ def reboot():
         check("reboot: A takes back its loan", wait_for(lambda: not lent(ip_moved) and addr(A, ip_moved).get("withdrawn") is True, 15), addr(A, ip_moved))
         check("reboot: the route to the peer's vm is back", f"via {gw}" in peer_route(ip_peer), peer_route(ip_peer))
         third_listed.close()
-        check("reboot: the standby vm is refilled", wait_for(lambda: len(standby_pids(B, t)) == 1, 60), standby_pids(B, t))
+        def pool():
+            d = standby_dir(B.run, t)
+            ls = {e: round(time.time() - os.stat(os.path.join(d, e)).st_mtime, 1) for e in sorted(os.listdir(d))} if os.path.isdir(d) else None
+            log = open(os.path.join(d, "standby.log"), errors="replace").read()[-4000:] if os.path.exists(os.path.join(d, "standby.log")) else None
+            locks = os.path.join(os.path.dirname(d), ".locks")
+            return {"ps_s": round(took, 2), "pids": standby_pids(B, t), "pool": ls, "locks": sorted(os.listdir(locks)) if os.path.isdir(locks) else None,
+                    "log": log}
+        check("reboot: the standby vm is refilled", wait_for(lambda: len(standby_pids(B, t)) == 1, 60), pool())
         start_listener(B)
         ok(cli_json(B, "rm", local))
         check("reboot: rm clears a lost record", local not in vms(B) and moved in vms(B), vms(B))
