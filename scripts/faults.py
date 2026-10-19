@@ -702,7 +702,7 @@ def basic(swept=False):
     check("basic: md5 intact after round trip", md5(A, n) == m)
     # A target forgets a migration only once its source said it is done
     # with it (it never asks again); until then it says released.
-    migs = lambda h: os.listdir(os.path.join(h.state, "migs"))
+    migs = lambda h: undone_migs(os.path.join(h.state, "migs"))
     swept_ok = lambda: not swept or all(cli(h, "debug", "gc")[0] == 0 for h in (A, B))
     check("basic: records go once their sources are done", wait_for(lambda: swept_ok() and not migs(A) and not migs(B), 10),
           (migs(A), migs(B)))
@@ -1735,6 +1735,16 @@ def arrivals(host):
 
 def migs_of(host):
     return set(os.listdir(os.path.join(host.state, "migs")))
+
+
+def undone_migs(d):
+    """The migration records in directory `d` but those whose source said done (kept a day as their outcome, #914)."""
+    def done(f):
+        try:
+            return json.load(open(os.path.join(d, f))).get("done_until_ms") is not None
+        except (OSError, ValueError):
+            return False
+    return sorted(f for f in os.listdir(d) if not f.startswith(".") and not done(f)) if os.path.isdir(d) else []
 
 
 def boundary(host):
@@ -2931,7 +2941,7 @@ def reconcile_kill():
         fault(B, "status", 0)
         check(f"{what}: gc settles it as B's", wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), owed(A))
         migs = os.path.join(B.state, "migs")
-        check(f"{what}: B's record gone", mig is not None and wait_for(lambda: mig not in os.listdir(migs), 10), (mig, os.listdir(migs)))
+        check(f"{what}: B's record gone", mig is not None and wait_for(lambda: mig not in undone_migs(migs), 10), (mig, os.listdir(migs)))
 
         def b_since():
             with open(b_log, errors="replace") as f:
@@ -9228,7 +9238,7 @@ def source_unpublished():
     n = "ft-unpublished"
     m = setup(n, mib=200)
     # Atomic record rewrites briefly expose .ID.PID.tmp alongside the record.
-    migs = lambda: sorted(name for name in os.listdir(os.path.join(B.state, "migs")) if not name.startswith("."))
+    migs = lambda: undone_migs(os.path.join(B.state, "migs"))
     with armed_fault(A, "publish", 60000):
         fault(B, "status", 60000)
         ok(migrate(A, n, B))
