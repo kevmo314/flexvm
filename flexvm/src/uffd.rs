@@ -432,11 +432,9 @@ impl Pager {
             self.remote_left.store(remote, Ordering::SeqCst);
             match origin {
                 Origin::Peer(source) => {
-                    // Connect now: the restore itself faults on remote pages.
+                    // Fetchers connect alongside `serve`; faults queue until their links are ready.
                     if remote > 0 {
-                        let mut link = Link::new(source);
-                        link.client = link.connect().ok();
-                        *self.remote.lock().unwrap() = Some(link);
+                        *self.remote.lock().unwrap() = Some(Link::new(source));
                     }
                 }
                 Origin::File(file) => {

@@ -32,7 +32,7 @@ impl Pager {
         if !self.pulling() {
             return;
         }
-        // The connection made for the snapshot load goes to a fault fetcher.
+        // The handshake's link goes to a fault fetcher; each worker connects on its own thread.
         let mut link = self.remote.lock().unwrap().take();
         let source = link.as_ref().map(|l| l.source.clone());
         for i in 0..FAULT_FETCHERS + PULL_THREADS {
