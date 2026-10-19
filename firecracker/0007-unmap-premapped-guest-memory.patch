@@ -1,5 +1,5 @@
 diff --git a/src/vmm/src/persist.rs b/src/vmm/src/persist.rs
-index 9e3e81e..bb61612 100644
+index 9e3e81e..05b46b7 100644
 --- a/src/vmm/src/persist.rs
 +++ b/src/vmm/src/persist.rs
 @@ -19,6 +19,7 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
@@ -10,7 +10,7 @@ index 9e3e81e..bb61612 100644
  use crate::builder::{self, BuildMicrovmFromSnapshotError};
  use crate::cpu_config::templates::StaticCpuTemplate;
  #[cfg(target_arch = "x86_64")]
-@@ -859,6 +860,48 @@ pub enum GuestMemoryFromUffdError {
+@@ -859,6 +860,52 @@ pub enum GuestMemoryFromUffdError {
      Connect(#[from] std::io::Error),
      /// Failed to sends file descriptor: {0}
      Send(#[from] vmm_sys_util::errno::Error),
@@ -30,7 +30,8 @@ index 9e3e81e..bb61612 100644
 +fn unmap_premapped(uffd: &Uffd, addr: *mut u8, len: usize) -> Result<(), GuestMemoryFromUffdError> {
 +    let page = host_page_size();
 +    let mut resident = vec![0u8; len.div_ceil(page)];
-+    for _ in 0..PREMAPPED_TRIES {
++    // Checked once more after the last drop, then given up.
++    for tries in 0..=PREMAPPED_TRIES {
 +        // SAFETY: the range is one mapping of ours and `resident` has a byte for each of its pages.
 +        if unsafe { libc::mincore(addr.cast(), len, resident.as_mut_ptr()) } != 0 {
 +            return Err(GuestMemoryFromUffdError::Premapped(io::Error::last_os_error()));
@@ -38,6 +39,9 @@ index 9e3e81e..bb61612 100644
 +        let Some(first) = resident.iter().position(|&r| r & 1 != 0) else {
 +            return Ok(());
 +        };
++        if tries == PREMAPPED_TRIES {
++            break;
++        }
 +        let last = resident.iter().rposition(|&r| r & 1 != 0).unwrap();
 +        warn!(
 +            "guest memory at {:#x}..{:#x} was mapped before its userfaultfd covered it; dropping it",
@@ -54,12 +58,12 @@ index 9e3e81e..bb61612 100644
 +            .map_err(GuestMemoryFromUffdError::Register)?;
 +    }
 +    Err(GuestMemoryFromUffdError::Premapped(io::Error::other(format!(
-+        "still mapped after {PREMAPPED_TRIES} tries"
++        "still mapped after dropping it {PREMAPPED_TRIES} times"
 +    ))))
  }
  
  fn guest_memory_from_uffd(
-@@ -888,6 +931,8 @@ fn guest_memory_from_uffd(
+@@ -888,6 +935,8 @@ fn guest_memory_from_uffd(
      for mem_region in guest_memory.iter() {
          uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
              .map_err(GuestMemoryFromUffdError::Register)?;
@@ -68,7 +72,7 @@ index 9e3e81e..bb61612 100644
      }
  
      send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
-@@ -979,6 +1024,57 @@ mod tests {
+@@ -979,6 +1028,57 @@ mod tests {
  
      use super::*;
      use crate::Vmm;

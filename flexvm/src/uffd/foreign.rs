@@ -12,10 +12,11 @@
 //! userfaultfd), or turn up as EEXIST when it installs them (`Pages::preset`). `Pager::foreign_pages` looks for both
 //! once a load is done and before the guest first runs, so the load can be retried on a fresh Firecracker.
 
-use super::{Pager, BASE, PAGE_SIZE, REMOTE};
+use super::{Pager, BASE, INFLIGHT, PAGE_SIZE, REMOTE};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 /// `PAGEMAP_SCAN` (`_IOWR('f', 16, struct pm_scan_arg)`, Linux 6.7) and its page categories.
 const PAGEMAP_SCAN: libc::c_ulong = 0xC060_6610;
@@ -27,6 +28,8 @@ const PM_SWAP: u64 = 1 << 62;
 /// Regions per `PAGEMAP_SCAN` call, and pages per pagemap read where it is missing.
 const SCAN_REGIONS: usize = 512;
 const READ_PAGES: usize = 64 << 10;
+/// How long `foreign_pages` waits for claimed pages it finds mapped to settle.
+const INFLIGHT_WAIT: Duration = Duration::from_secs(2);
 
 #[repr(C)]
 #[derive(Default)]
@@ -135,12 +138,28 @@ impl Pager {
             found += 1;
             first_found = first_found.or(Some(p));
         };
+        // Mapped while claimed: by the claimant's own copy (it settles at once), or before the claim (its copy
+        // gets EEXIST, noted in `preset`). Either way, known once it settles.
+        let mut inflight = Vec::new();
         for m in self.mappings() {
             let first = m.span().0;
             for (a, b) in mapped_runs(pagemap, m.base_host_virt_addr, m.size as u64)? {
-                (first + a..first + b).filter(|&p| p < pages.len() && foreign(pages.get(p), self.base.has_data(p))).for_each(&mut note);
+                for p in (first + a..first + b).filter(|&p| p < pages.len()) {
+                    match pages.get(p) {
+                        INFLIGHT => inflight.push(p),
+                        s if foreign(s, self.base.has_data(p)) => note(p),
+                        _ => {}
+                    }
+                }
             }
         }
+        let deadline = Instant::now() + INFLIGHT_WAIT;
+        while !inflight.is_empty() && Instant::now() < deadline {
+            inflight.retain(|&p| pages.get(p) == INFLIGHT);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Still claimed: no copy of ours mapped it, as a copy settles right after.
+        inflight.iter().filter(|&&p| pages.get(p) == INFLIGHT).for_each(|&p| note(p));
         // Settled PRESENT since, by an install that hit EEXIST.
         pages.preset.lock().unwrap().iter().filter(|&&(p, from)| foreign(from, self.base.has_data(p))).for_each(|&(p, _)| note(p));
         Ok((found + pages.preset_more.load(Ordering::Relaxed), first_found))
@@ -239,5 +258,12 @@ mod tests {
         assert_eq!(pages.claim(6, 1, ZERO, |_| true), 1);
         let _ = pages.install(6, 1, ZERO, None, |_, _| eexist());
         assert_eq!(*pages.preset.lock().unwrap(), vec![(1, BASE), (4, REMOTE), (5, REMOTE)]);
+        // A template hole found mapped is zero either way: not noted, nor counted past the kept ones.
+        let _ = pages.base_data.set(Box::new(|p| p != 2));
+        pages.fill(2, 2, BASE);
+        assert_eq!(pages.claim(2, 2, BASE, |_| true), 2);
+        let _ = pages.install(2, 2, BASE, None, |_, _| eexist());
+        assert_eq!(*pages.preset.lock().unwrap(), vec![(1, BASE), (4, REMOTE), (5, REMOTE), (3, BASE)]);
+        assert_eq!(pages.preset_more.load(Ordering::Relaxed), 0);
     }
 }

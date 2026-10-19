@@ -409,6 +409,8 @@ impl Pager {
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
         let mut pages = Pages::new(total);
+        let base = self.base.clone();
+        let _ = pages.base_data.set(Box::new(move |p| base.has_data(p)));
         let initial = {
             // No deadline of its own: the migration's protocol deadline drops the prepared VM, which stops the pager.
             let mut initial = self.initial.lock().unwrap();

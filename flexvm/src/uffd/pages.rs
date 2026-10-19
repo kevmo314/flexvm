@@ -120,6 +120,8 @@ pub struct Pages {
     /// (at most `PRESET_KEPT`; `preset_more` counts the rest): see `Pager::foreign_pages`.
     pub(super) preset: Mutex<Vec<(usize, u8)>>,
     pub(super) preset_more: AtomicUsize,
+    /// Whether a BASE page has template data (unset: all do). A hole found mapped is zero either way: not noted.
+    pub(super) base_data: OnceLock<Box<dyn Fn(usize) -> bool + Send + Sync>>,
 }
 
 /// How many `Pages::preset` pages are kept.
@@ -379,6 +381,9 @@ impl Pages {
 
     /// Claimed `page` (from `from`) turned out to be mapped already: no install of ours put it there.
     fn note_preset(&self, page: usize, from: u8) {
+        if from == BASE && self.base_data.get().is_some_and(|data| !data(page)) {
+            return;
+        }
         let mut preset = self.preset.lock().unwrap();
         // The first few of a VM's: enough to show the mechanism (#949) when it recurs (not the unit tests' fakes).
         if !cfg!(test) && preset.len() < PRESET_LOGGED {

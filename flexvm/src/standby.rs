@@ -1052,13 +1052,13 @@ fn load(idle: Firecracker, template: Arc<Template>, stopping: impl Fn() -> bool)
     p.pager.learn_load_set();
     let fc = p.firecracker();
     fc.load_snapshot(&p.template().vmstate(), &p.template(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
-    // Before the guest runs: memory mapped behind the pager's back would read as zeroes (#949).
-    p.pager.check_foreign()?;
     check_stop()?;
     // Only an API pause stops the devices writing guest memory.
     fc.pause(API_TIMEOUT)?;
     check_stop()?;
     p.pager.wait_ready(Duration::from_secs(5))?;
+    // With the pager's view in place, before the guest runs: memory mapped behind its back would read as zeroes (#949).
+    p.pager.check_foreign()?;
     check_stop()?;
     let resumed = fc.resume(API_TIMEOUT);
     p.pager.loaded();

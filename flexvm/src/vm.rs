@@ -1325,8 +1325,6 @@ impl Prepared {
             let neighbour = self.neighbour.then(|| std::thread::spawn(move || crate::net::neighbour(ip, &tap)));
             // Before `left` is read: the deadline covers it too.
             let loaded = fc.join_cgroup().and_then(|()| fc.load_snapshot(&path, &self.template, &fc.tap, Some(clock_realtime), left(API_TIMEOUT)));
-            // Before the guest runs: memory mapped behind the pager's back would read as zeroes (#949).
-            let loaded = loaded.and_then(|r| self.pager.check_foreign().map(|()| r));
             if matches!(vmstate, Snapshot::Bytes(_)) {
                 let _ = std::fs::remove_file(&path);
             }
@@ -1342,7 +1340,10 @@ impl Prepared {
                     fc.pause(left(API_TIMEOUT))?;
                     t.mark("hold_paused");
                 }
-                self.pager.wait_ready(left(Duration::from_secs(5)))
+                self.pager.wait_ready(left(Duration::from_secs(5)))?;
+                // With the pager's view in place, before the guest runs: memory mapped behind its back would read
+                // as zeroes (#949).
+                self.pager.check_foreign().inspect_err(|e| load_failed = Some(e.to_string()))
             });
             let readied = neighbour.map(|r| r.join()).transpose().map_err(|_| "neighbour thread panicked")?;
             held?;
