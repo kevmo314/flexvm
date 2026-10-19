@@ -1855,6 +1855,10 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
         return Ok(vec![]);
     }
     sweep_locked(paths)?;
+    // `--force-shared` brings the record up to date (the marker, gone states) whether or not anything is pruned.
+    if force_shared {
+        drop(shared_users(paths, true));
+    }
     let named: BTreeSet<String> = names(&paths.templates)?.into_iter().map(|(_, id)| id).collect();
     let (gens, locks) = (paths.templates.join(GENERATIONS), crate::host::host_locks()?);
     let candidates: Vec<String> = generations(&paths.templates)?.into_iter().filter(|id| only.is_none_or(|o| o == id) && !named.contains(id)).collect();

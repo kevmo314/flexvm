@@ -19,9 +19,12 @@ forget_states() {
   for f in "$state"/templates/.states/*; do
     [[ -f $f ]] || continue
     for d in "$@"; do
-      [[ $(cat "$f" 2>/dev/null) == "$(realpath -m "$d")"/* ]] && rm -f "$f"
+      if [[ $(cat "$f" 2>/dev/null) == "$(realpath -m "$d")"/* ]]; then
+        rm -f "$f"
+      fi
     done
   done
+  return 0
 }
 
 up() (

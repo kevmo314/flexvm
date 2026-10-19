@@ -1358,7 +1358,11 @@ fn image_prune_keeps_what_states_sharing_the_templates_use() {
     fs::remove_file(&suspended).unwrap();
     fs::rename(b.state.join("suspended.moved"), &suspended).unwrap();
     assert_eq!(prune(&a, false), [json!({"deleted": "eeee5555", "rootfs": null})]);
-    // Marked shared before states were recorded: all stay, unless --force-shared.
+    // Marked shared before states were recorded: all stay, unless --force-shared, which brings the
+    // marker up to date even with nothing to prune.
+    fs::write(a.state.join("templates/.shared"), b"").unwrap();
+    assert!(prune(&a, true).is_empty());
+    assert_eq!(fs::read(a.state.join("templates/.shared")).unwrap(), b"states\n");
     make(&["eeee5555"]);
     fs::write(a.state.join("templates/.shared"), b"").unwrap();
     assert!(prune(&a, false).is_empty() && prune(&b, false).is_empty());
@@ -1382,8 +1386,15 @@ fn image_prune_keeps_what_states_sharing_the_templates_use() {
     fs::remove_dir_all(root.join("b")).unwrap();
     assert!(prune(&a, false).is_empty() && left() == ["aaaa1111", "cccc3333"]);
     assert_eq!(fs::read_dir(a.state.join("templates/.states")).unwrap().count(), 2);
-    assert_eq!(prune(&a, true), [json!({"deleted": "aaaa1111", "rootfs": null})]);
+    // With nothing it could prune (every generation named), --force-shared still forgets the gone state.
+    for id in ["aaaa1111", "cccc3333"] {
+        std::os::unix::fs::symlink(Path::new(".gen").join(id), a.state.join("templates").join(format!("n-{id}"))).unwrap();
+    }
+    assert!(prune(&a, true).is_empty());
     assert_eq!(fs::read_dir(a.state.join("templates/.states")).unwrap().count(), 1);
+    fs::remove_file(a.state.join("templates/n-aaaa1111")).unwrap();
+    fs::remove_file(a.state.join("templates/n-cccc3333")).unwrap();
+    assert_eq!(prune(&a, false), [json!({"deleted": "aaaa1111", "rootfs": null})]);
 }
 
 /// #869 review: a stopped VM renamed while its state's records are read (a listing then may show neither name)
