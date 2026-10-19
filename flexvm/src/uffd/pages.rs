@@ -380,8 +380,8 @@ impl Pages {
     /// Claimed `page` (from `from`) turned out to be mapped already: no install of ours put it there.
     fn note_preset(&self, page: usize, from: u8) {
         let mut preset = self.preset.lock().unwrap();
-        // The first few of a VM's: enough to show the mechanism (#949) when it recurs.
-        if preset.len() < PRESET_LOGGED {
+        // The first few of a VM's: enough to show the mechanism (#949) when it recurs (not the unit tests' fakes).
+        if !cfg!(test) && preset.len() < PRESET_LOGGED {
             crate::log!(
                 "uffd: page {page:#x} (guest memory offset {:#x}, claimed {}) was already mapped in firecracker: not installed by the pager",
                 page * crate::util::PAGE_SIZE,
