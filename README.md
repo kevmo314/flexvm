@@ -445,11 +445,13 @@ must be here.
 self-contained tar, to stdout (never a terminal) or with `-o FILE` to that file once
 it is whole. The tar holds the checkpoint, the chain it builds on, and the template
 generation it was taken on: its memory file's data (holes stay holes), metadata and
-root filesystem. Stored checkpoints themselves stay lean, sharing the template.
+root filesystem; and the run settings each was taken with (`--keep`, `--rm`, `-e`,
+`--entrypoint`), which a restore on the other host keeps. Stored checkpoints themselves stay lean, sharing the template.
 `checkpoint load` reads a save from stdin, or `-i FILE`, and stores it under the
 same ids and name (`--name NAME` gives another; a name another checkpoint has is
 refused before anything is read). Everything is verified before anything is
-published, so a damaged or truncated save stores nothing: each checkpoint by its
+published, so a damaged or truncated save stores nothing (nor does a load that fails
+as it publishes): each checkpoint by its
 id and checksums, and the template by its content id and the SHA-256 digests the
 checkpoint records. Those ids and checksums catch damage, not forgery: `save` prints
 the save's SHA-256 (of every checkpoint file; on stderr when the tar goes to stdout)

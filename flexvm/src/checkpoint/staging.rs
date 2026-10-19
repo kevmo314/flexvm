@@ -7,7 +7,6 @@ use super::{
     FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL,
 };
 use crate::{
-    bail,
     uffd::Runs,
     util::{Error, Phases, Result, PAGE_SIZE},
     vm::Vm,
@@ -142,8 +141,11 @@ impl Staging {
 
     /// Publishes what was added as the store's entry `id` (its manifest's checksum), never over
     /// one: false if one is there already (identical, by its id), and this staging goes.
-    pub fn publish_as(mut self, id: &str) -> Result<bool> {
-        ensure!(self.by_id, "publish_as is for the store's staging");
+    /// `Uncertain`: published, and maybe not durably unpublished again (its manifest may stay).
+    pub fn publish_as(mut self, id: &str) -> std::result::Result<bool, CommitError> {
+        if !self.by_id {
+            return Err(CommitError::Failed("publish_as is for the store's staging".into()));
+        }
         check(unsafe { libc::fsync(self.ck.as_raw_fd()) })?;
         (self.base, self.dest) = (cname(id), self.dest.with_file_name(id));
         crate::util::sync_ancestors_fd(self.parent.as_raw_fd())?;
@@ -153,10 +155,16 @@ impl Staging {
             r => r.map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?,
         }
         self.published = true;
-        if let Err(e) = check(unsafe { libc::fsync(parent) }) {
-            // Not durably there: none is better than one a crash may tear (a missing manifest revokes it).
-            let revoked = self.revoke();
-            bail!("making checkpoint {} durable: {e} (revoking it: {revoked:?})", self.dest.display());
+        let synced = crate::fault_result!(crate::host::fault("import_fsync") => Err(io::Error::other("injected fault: fsync failed"));
+            check(unsafe { libc::fsync(parent) }));
+        if let Err(e) = synced {
+            // Not durably there: none is better than one a crash may tear (a missing manifest revokes it;
+            // a directory left without one is debris, which the next removal or load clears).
+            let e = format!("making checkpoint {} durable: {e}", self.dest.display());
+            return Err(match self.revoke() {
+                Ok(_) => CommitError::Failed(format!("{e} (revoked it)").into()),
+                Err(r) => CommitError::Uncertain(format!("{e}; revoking it failed too: {r}").into()),
+            });
         }
         Ok(true)
     }

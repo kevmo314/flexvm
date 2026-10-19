@@ -1122,14 +1122,16 @@ def checkpoint_save_load():
 @case
 def checkpoint_load_other_build():
     """checkpoint load onto a host with another build under the same tag (#775): its tag stays on its build.
-    The restore runs the checkpoint's generation, by content id."""
+    The restore runs the checkpoint's generation, by content id, with the run settings it was taken with (#825)."""
     vm, want = "e2e-load-other", template_id(A, args.template)
     with b_unpulled() as templates:
         try:
             B.cli("pull", TEST_IMAGE, "--tag", args.template, "--vcpus", "2", "--max", TEMPLATE_MAX, timeout=600)
             theirs = template_id(B, args.template)
             check("B: its own build, another content id", theirs and theirs != want, (theirs, want))
-            A.run(vm)
+            # An app that ends once told to, under --keep: the VM stays up after it, on B too.
+            app = ["--entrypoint", json.dumps(["sh", "-c", "while [ ! -e /tmp/go ]; do sleep 0.2; done; exit 4"])]
+            A.run_json(vm, extra=["--keep", "-e", "E2E_SPEC=kept", *app])
             m, proc = fill(A, vm), marker(A, vm)
             ck = A.checkpoint(vm, name="other", stop=True)
             code, out, err, saved = relay(A, "other", B)
@@ -1140,6 +1142,14 @@ def checkpoint_load_other_build():
             B.restore("other")
             check("B: restored onto the source's generation", md5(B, vm) == m and marker_id(B, vm) == proc
                   and want in B.cli("inspect", vm).stdout and theirs not in B.cli("inspect", vm).stdout)
+            run = json.loads(B.cli("inspect", vm).stdout)[0].get("config", {}).get("run", {})
+            check("B: the restore has the run settings of A's (--keep, -e, --entrypoint)", run.get("keep") is True
+                  and run.get("env") == ["E2E_SPEC=kept"] and "/tmp/go" in json.dumps(run.get("entrypoint")), run)
+            B.exec(vm, "touch /tmp/go")
+            check("B: its app exits", wait_for(lambda: "exited with status 4" in B.logs(vm), 30), B.logs(vm)[-2000:])
+            time.sleep(1)
+            check("B: --keep: the VM stays up once its app exited", B.ps(all=False).get(vm, {}).get("state") == "running"
+                  and B.exec(vm, "echo up")[1] == "up\n", B.ps())
             B.kill(vm)
         finally:
             A.kill(vm, check=False)

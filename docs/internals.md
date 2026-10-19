@@ -479,8 +479,11 @@ of one (4+ digits); an argument with a `/` is a directory, restored as is
 `checkpoint save` writes a tar (`checkpoint::export`, GNU headers, regular files
 only) whose members are, in order: `flexvm-checkpoint.json` (the `Header`:
 the head's id, its name, the chain's ids head first, the template's content id,
-whether the template follows); per checkpoint of the chain, oldest first,
-`checkpoints/ID/manifest.json`, `vmstate`, `pagemap` and `pages`; then
+whether the template follows, and in `specs` the checkpoints whose run settings
+follow, left out when none do); per checkpoint of the chain, oldest first,
+`checkpoints/ID/manifest.json`, its run settings `SPEC` if it has them (what a
+restore reads for `--keep`, `--rm`, `-e` and `--entrypoint`; not in the manifest,
+so not in the id), `vmstate`, `pagemap` and `pages`; then
 `template/TEMPLATE_ID`, the generation as a migration pushes it
 (`template::Sending`: its metadata, then vmstate, root filesystem and memory
 as length, data extents and their bytes; its length is known before it is
@@ -491,10 +494,17 @@ template whose digests are not the checkpoint's, and leaves out one whose
 checkpoint records none (v0.1.0's), with a warning.
 
 `checkpoint load` reads the members by the names expected next, each within its
-limit (header 64 KiB, manifest 1 MiB, vmstate as `MAX_VMSTATE`, a page map 36
-bytes per guest page, metadata of the chain within `chain_meta_budget`, pages
-within the store's free space less 1 GiB, the template within
-`template::receive`'s): it takes no path from the archive. The header's ids are
+limit (header 64 KiB, manifest and run settings 1 MiB each, vmstate as
+`MAX_VMSTATE`, a page map 36 bytes per guest page, pages within the store's free
+space less 1 GiB, the template within `template::receive`'s): it takes no path
+from the archive. It holds one checkpoint's metadata at a time, so it applies no
+budget of the chain's: `chain_meta_budget` scales with the loading host's memory,
+and would refuse a save from a larger host. A restore applies it (and the load
+warns when the chain is over it here). Each member is held whole while checked,
+so none may be over it (one that is could not be restored here either): a forged
+length exhausts no memory. A publication that fails is undone, except where a
+manifest or name may stay (its revocation or removal failed): then the chain it
+builds on is kept whole, for `rm` to remove. The header's ids are
 checked first (16 hex digits, distinct, at most `MAX_CHAIN`; the template's a
 content id), and a name another checkpoint has is refused then. Each checkpoint
 is verified as `Link::open` and `PageFile::read` would (its manifest's checksum
@@ -505,10 +515,13 @@ filesystem that cannot takes no loads) under the host-wide lock template receipt
 takes too (`template::ROOM_LOCK`), so no two loads or pushes count on the same
 free space. Those checks are not cryptographic (the id is a 64-bit hash), so
 a save also has a SHA-256 (`SaveDigest`: per checkpoint, oldest first, its id
-and each file's name, length and SHA-256), which `save` prints and `load`
+and each file's name, length and SHA-256, `SPEC` among them when it has one, so
+a save with none has the SHA-256 it had before they were saved), which `save` prints and `load`
 computes from what it read; `--sha256` refuses another before the template is
 read. What was sent is verified so even where the store has a checkpoint under
-its id; that one is then compared byte for byte with it, and refused if it differs. A parent is
+its id; that one is then compared byte for byte with it (its run settings too, or
+their absence), and refused if it differs. The compare holds each of its files
+open (`Pinned`), so no inode compared is another file's later. A parent is
 named `../ID` here: a manifest that names it otherwise (a v0.1.0 directory's) is
 rewritten, so it and its descendants get new ids. The template is taken only if
 no generation of that content id is here: received by `template::receive` with
@@ -521,10 +534,14 @@ tags may name other builds. Then, under the store's lock held exclusively (so
 no `rm`, `prune` or another load's publication, which may revoke what it
 published if its fsync fails, runs meanwhile), the chain is published oldest
 first (`publish_as`, `RENAME_NOREPLACE`). Whatever is under an id by then, found
-before or published since by another load, is used only if each of its files has
-the SHA-256 of the one verified here; an `ID` without a manifest (a revoked
-publication's leftover) is cleared first, as `rm` clears it. The head is then
-opened as a restore would open it, and named; the template stays open (its use lock) until then, so no
+before or published since by another load, is used only if its names still lead
+to the inodes compared, else only if each of its files has the SHA-256 of the one
+verified here (hashed under the lock only then, so a load of a stored checkpoint
+holds up no create or restore for a hash of its pages); an `ID` without a manifest (a revoked
+publication's leftover) is cleared first, as `rm` clears it. The head's chain is then
+opened by its manifests, as a restore finds it, and named; if any of this fails,
+what it published is removed again (dependants first), and so is the template it
+received, unless something here uses it by then (`template::prune`); the template stays open (its use lock) until then, so no
 prune or `rmi` takes it before a stored checkpoint keeps it. A crash leaves
 staging, which the next staging clears, and perhaps an older part of the chain,
 whole. `load -i DIR` reads the same members from a checkpoint directory and its

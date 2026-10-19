@@ -2,7 +2,8 @@
 //! its chain and its template generation, and its import, all verified before it is published.
 //!
 //! Members, in this order: `flexvm-checkpoint.json` (the `Header`); for each checkpoint of the
-//! chain, oldest first, `checkpoints/ID/manifest.json`, `vmstate`, `pagemap` and `pages`; then,
+//! chain, oldest first, `checkpoints/ID/manifest.json`, its run settings `SPEC` if it has them (and
+//! the header lists it in `specs`), `vmstate`, `pagemap` and `pages`; then,
 //! unless the head's manifest records no template digests (v0.1.0's), `template/TEMPLATE_ID`: the
 //! generation as `template::send` writes it (its files' data extents, so holes stay holes).
 //!
@@ -14,9 +15,9 @@
 //! a template is read, taken or moved: the source's tags may name other builds than this host's.
 use super::{
     bail,
-    chain::{chain_meta_budget, read_at},
+    chain::{chain_ids, chain_meta_budget, read_at},
     format::{parse_pagemap, sum, DATA, MAX_VMSTATE},
-    open_at, open_dir_at, read_manifest, store, Checkpoint, Manifest, Parent, Staging, FORMAT, FORMAT_INCREMENTAL, MAX_CHAIN,
+    open_at, open_dir_at, read_manifest, store, Checkpoint, CommitError, Manifest, Parent, Staging, FORMAT, FORMAT_INCREMENTAL, MAX_CHAIN,
 };
 use crate::{
     template::{self, Paths, Template},
@@ -50,6 +51,12 @@ const KEEP_FREE: u64 = 1 << 30;
 /// How long a load waits for another arrival of its template (a migration's push) to finish.
 const TURN_WAIT: Duration = Duration::from_secs(600);
 const BLOCK: usize = 512;
+/// A checkpoint's run settings (`SPEC`, `app::RunSpec`), at most.
+const MAX_SPEC: u64 = 1 << 20;
+/// What a load or save copies of a pages file at a time.
+const CHUNK: usize = 1 << 20;
+/// A stored checkpoint's run settings: not in its manifest, so not in its id.
+const SPEC: &str = "SPEC";
 
 /// The first member: what follows, by id.
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +70,9 @@ pub struct Header {
     pub template_id: String,
     /// Whether `template/TEMPLATE_ID` follows the checkpoints.
     pub template: bool,
+    /// The checkpoints of the chain whose `SPEC` follows their manifest (none in a save from before them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs: Vec<String>,
 }
 
 fn warn(what: std::fmt::Arguments) {
@@ -78,7 +88,8 @@ pub fn template_member(id: &str) -> String {
 }
 
 /// A save's SHA-256, which `save` and `load` print and `load --sha256` requires: of each checkpoint of
-/// the chain, oldest first, its id and its files as saved (name, length, SHA-256). The checkpoints'
+/// the chain, oldest first, its id and its files as saved (name, length, SHA-256), `SPEC` among them
+/// if it has one (so a save without any has the SHA-256 it had before they were saved). The checkpoints'
 /// own ids and checksums are no cryptographic check; the head's manifest, so this, covers the
 /// template's digests.
 #[derive(Default)]
@@ -97,20 +108,6 @@ impl SaveDigest {
 
     fn finish(self) -> String {
         format!("{:x}", self.0.finalize())
-    }
-}
-
-/// Hashes what is read through it.
-struct Hashing<R> {
-    r: R,
-    h: Sha256,
-}
-
-impl<R: Read> Read for Hashing<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.r.read(buf)?;
-        self.h.update(&buf[..n]);
-        Ok(n)
     }
 }
 
@@ -180,6 +177,12 @@ fn truncated(e: io::Error) -> crate::util::Error {
     }
 }
 
+/// Whether `block` is a tar header, by its checksum.
+fn header_ok(block: &[u8]) -> bool {
+    let sum: u64 = block.iter().enumerate().map(|(i, &b)| if (148..156).contains(&i) { 32 } else { b as u64 }).sum();
+    tar::Header::from_byte_slice(block).cksum().ok().map(u64::from) == Some(sum)
+}
+
 impl Read for TarIn<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = buf.len().min(self.left.min(usize::MAX as u64) as usize);
@@ -211,8 +214,7 @@ impl TarIn<'_> {
         self.r.read_exact(&mut block).map_err(truncated)?;
         ensure!(block.iter().any(|&b| b != 0), "the archive ends before {want}");
         let h = tar::Header::from_byte_slice(&block);
-        let sum: u64 = block.iter().enumerate().map(|(i, &b)| if (148..156).contains(&i) { 32 } else { b as u64 }).sum();
-        ensure!(h.cksum().ok().map(u64::from) == Some(sum), "bad tar header before {want}: not a flexvm checkpoint save");
+        ensure!(header_ok(&block), "bad tar header before {want}: not a flexvm checkpoint save");
         ensure!(h.path_bytes().as_ref() == want.as_bytes(), "{want} expected, found {:?}", String::from_utf8_lossy(&h.path_bytes()));
         ensure!(h.entry_type() == tar::EntryType::Regular, "{want} is not a regular file");
         let size = h.size().map_err(|e| format!("{want}: bad size: {e}"))?;
@@ -226,25 +228,62 @@ impl TarIn<'_> {
         self.skip()?;
         let mut block = [0u8; 2 * BLOCK];
         self.r.read_exact(&mut block[..BLOCK]).map_err(truncated)?;
-        ensure!(block.iter().all(|&b| b == 0), "the archive has more than one checkpoint save");
+        if block.iter().any(|&b| b != 0) {
+            match header_ok(&block[..BLOCK]) {
+                true => bail!(
+                    "the archive has a member after the save's last: {:?} (one save is loaded at a time)",
+                    String::from_utf8_lossy(&tar::Header::from_byte_slice(&block[..BLOCK]).path_bytes())
+                ),
+                false => bail!("the archive has bytes after the save's last member, where its end should be"),
+            }
+        }
         self.r.read_exact(&mut block[BLOCK..]).map_err(truncated)?;
         let mut tail = vec![];
         (&mut *self.r).take(MAX_TAIL + 1).read_to_end(&mut tail)?;
-        ensure!(block.iter().chain(&tail).all(|&b| b == 0) && tail.len() as u64 <= MAX_TAIL, "the archive has more than one checkpoint save");
+        ensure!(
+            block.iter().chain(&tail).all(|&b| b == 0) && tail.len() as u64 <= MAX_TAIL,
+            "the archive goes on past its end (more than {} KiB of zeros, or other bytes)",
+            MAX_TAIL >> 10
+        );
         Ok(())
     }
 }
 
 // --- save -------------------------------------------------------------------------------------
 
-/// A chain member's files, read and checked under the store's lock: its pages stay readable once open.
+/// A chain member's files, opened under the store's lock: they stay readable once open. Its
+/// manifest and run settings (1 MiB each at most) are read then; its VM state and page map are
+/// read and checked as they are written, one checkpoint's at a time, so a chain's metadata is never
+/// all in memory at once.
 struct Saved {
     id: String,
-    manifest: Vec<u8>,
-    vmstate: Vec<u8>,
-    pagemap: Vec<u8>,
+    manifest: Manifest,
+    text: Vec<u8>,
+    spec: Option<Vec<u8>>,
+    vmstate: File,
+    pagemap: File,
     pages: File,
     pages_len: u64,
+}
+
+impl Saved {
+    /// Its file `name` (`vmstate` or `pagemap`), checked against its manifest.
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        let bad = |why: &str| format!("checkpoint {}: {name} {why}", self.id);
+        let want = self.manifest.files.get(name).ok_or_else(|| bad("is not in its manifest"))?;
+        let f = if name == "vmstate" { &self.vmstate } else { &self.pagemap };
+        let mut bytes = Vec::with_capacity(want.len.min(1 << 26) as usize);
+        f.take(want.len + 1).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 == want.len && sum(&bytes) == want.hash, "{}", bad("does not match its checksum"));
+        Ok(bytes)
+    }
+}
+
+/// Its run settings, as a restore reads them: refused here if a load would refuse them.
+fn check_spec(bytes: &[u8]) -> Result<()> {
+    ensure!(bytes.len() as u64 <= MAX_SPEC, "its run settings ({SPEC}) are over {} KiB", MAX_SPEC >> 10);
+    serde_json::from_slice::<crate::app::RunSpec>(bytes).map_err(|e| format!("its run settings ({SPEC}): {e}"))?;
+    Ok(())
 }
 
 fn read_member(dir: &Path, id: &str) -> Result<Saved> {
@@ -254,17 +293,25 @@ fn read_member(dir: &Path, id: &str) -> Result<Saved> {
     let (sum_line, body) = text.split_at(text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("manifest has no checksum".into()))?);
     ensure!(sum_line == id.as_bytes() && sum(&body[1..]) == id, "{}", bad("it changed as it was saved".into()));
     let manifest: Manifest = serde_json::from_slice(&body[1..])?;
-    let read = |name: &str| -> Result<Vec<u8>> {
+    let open = |name: &str| -> Result<File> {
         let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
-        let (_, bytes) = read_at(dfd.as_raw_fd(), name, want.len + 1).map_err(|e| bad(format!("{name}: {e}")))?;
-        ensure!(bytes.len() as u64 == want.len && sum(&bytes) == want.hash, "{}", bad(format!("{name} does not match its checksum")));
-        Ok(bytes)
+        let (f, _) = read_at(dfd.as_raw_fd(), name, 0).map_err(|e| bad(format!("{name}: {e}")))?;
+        ensure!(f.metadata()?.len() == want.len, "{}", bad(format!("{name} has the wrong length")));
+        Ok(f)
     };
-    let (vmstate, pagemap) = (read("vmstate")?, read("pagemap")?);
+    let spec = match read_at(dfd.as_raw_fd(), SPEC, MAX_SPEC + 1) {
+        Ok((_, bytes)) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => bail!("{}", bad(format!("{SPEC}: {e}"))),
+    };
+    if let Some(spec) = &spec {
+        check_spec(spec).map_err(|e| bad(e.to_string()))?;
+    }
+    let (vmstate, pagemap) = (open("vmstate")?, open("pagemap")?);
     let (pages, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
     let pages_len = pages.metadata()?.len();
     ensure!(Some(pages_len) == manifest.files.get("pages").map(|f| f.len), "{}", bad("pages has the wrong length".into()));
-    Ok(Saved { id: id.into(), manifest: text, vmstate, pagemap, pages, pages_len })
+    Ok(Saved { id: id.into(), manifest, text, spec, vmstate, pagemap, pages, pages_len })
 }
 
 /// `checkpoint save`: stored checkpoint `what`, its chain and its template generation, as one tar
@@ -275,23 +322,24 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
     let lock = store::lock(state, libc::LOCK_SH)?;
     let all = store::list(state);
     let entry = store::find(&all, what)?;
-    let ck = Checkpoint::open(&entry.dir)?;
-    let dirs: Vec<(PathBuf, String)> =
-        std::iter::once((ck.dir.clone(), ck.id.clone())).chain(ck.chain.iter().cloned().zip(ck.chain_ids.iter().cloned())).collect();
-    let mut members = dirs.iter().map(|(dir, id)| read_member(dir, id)).collect::<Result<Vec<_>>>()?;
+    // The chain by its manifests; `read_member` verifies each against its id. In the store, each is named by its id.
+    let chain = chain_ids(&entry.dir)?;
+    let store_dir = store::dir(state);
+    let mut members = chain.iter().map(|id| read_member(&store_dir.join(id), id)).collect::<Result<Vec<_>>>()?;
     members.reverse();
-    let (tid, digests) = (&ck.manifest.template_id, ck.manifest.template_digests.as_ref());
-    let tpl = Template::generation(paths, tid)
-        .map(|dir| Template::open_dir(tid, dir))
+    let head = &members.last().unwrap().manifest;
+    let (tid, digests) = (head.template_id.clone(), head.template_digests.clone());
+    let tpl = Template::generation(paths, &tid)
+        .map(|dir| Template::open_dir(&tid, dir))
         .transpose()?
         .ok_or_else(|| format!("checkpoint {what}: its template generation {tid} is not here"))?;
     drop(lock);
     // What a loader would refuse: refused here, before anything is written.
-    if let (Some(want), Some(have)) = (digests, tpl.meta.digests.as_ref()) {
+    if let (Some(want), Some(have)) = (&digests, tpl.meta.digests.as_ref()) {
         ensure!(want == have, "checkpoint {what}: template {tid} here does not match the SHA-256 digests the checkpoint records");
     }
-    tpl.check_vouched(digests, "the checkpoint")?;
-    let sending = digests.map(|_| template::Sending::new(&tpl)).transpose()?;
+    tpl.check_vouched(digests.as_ref(), "the checkpoint")?;
+    let sending = digests.as_ref().map(|_| template::Sending::new(&tpl)).transpose()?;
     if sending.is_none() {
         warn(format_args!(
             "checkpoint {what} records no SHA-256 digests of its template (taken by v0.1.0, or on a template it built): saved without template {tid}, which the loading host must have"
@@ -299,34 +347,44 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
     }
     let header = Header {
         format: EXPORT_FORMAT,
-        id: ck.id.clone(),
+        id: entry.id.clone(),
         name: entry.name.clone(),
-        chain: dirs.iter().map(|(_, id)| id.clone()).collect(),
+        chain,
         template_id: tid.clone(),
         template: sending.is_some(),
+        specs: members.iter().filter(|m| m.spec.is_some()).map(|m| m.id.clone()).collect(),
     };
     let mut out = TarOut { w, n: 0 };
     out.bytes(HEADER, &serde_json::to_vec_pretty(&header)?)?;
     let mut digest = SaveDigest::default();
+    let mut buf = vec![0u8; CHUNK];
     for m in members {
         digest.checkpoint(&m.id);
-        for (name, bytes) in [("manifest.json", &m.manifest), ("vmstate", &m.vmstate), ("pagemap", &m.pagemap)] {
+        let (vmstate, pagemap) = (m.read("vmstate")?, m.read("pagemap")?);
+        let files = [("manifest.json", Some(&m.text)), (SPEC, m.spec.as_ref()), ("vmstate", Some(&vmstate)), ("pagemap", Some(&pagemap))];
+        for (name, bytes) in files.into_iter().filter_map(|(n, b)| Some((n, b?))) {
             out.bytes(&checkpoint_member(&m.id, name), bytes)?;
             digest.file(name, bytes.len() as u64, &Sha256::digest(bytes));
         }
-        let mut pages = Hashing { r: (&m.pages).take(m.pages_len), h: Sha256::new() };
+        let mut sha = Sha256::new();
         out.member(&checkpoint_member(&m.id, "pages"), m.pages_len, |w| {
-            let copied = io::copy(&mut pages, w)?;
-            ensure!(copied == m.pages_len, "checkpoint {}: its pages file is shorter than its manifest says", m.id);
+            let mut left = m.pages_len;
+            while left > 0 {
+                let chunk = &mut buf[..left.min(CHUNK as u64) as usize];
+                (&m.pages).read_exact(chunk).map_err(|_| format!("checkpoint {}: its pages file is shorter than its manifest says", m.id))?;
+                sha.update(&*chunk);
+                w.write_all(chunk)?;
+                left -= chunk.len() as u64;
+            }
             Ok(())
         })?;
-        digest.file("pages", m.pages_len, &pages.h.finalize());
+        digest.file("pages", m.pages_len, &sha.finalize());
     }
     if let Some(s) = sending {
-        out.member(&template_member(tid), s.len(), |w| s.write(w).map(drop))?;
+        out.member(&template_member(&tid), s.len(), |w| s.write(w).map(drop))?;
     }
     let bytes = out.finish()?;
-    Ok(json!({"saved": ck.id, "name": entry.name, "chain": header.chain.len(), "template_id": tid, "template": header.template, "bytes": bytes,
+    Ok(json!({"saved": entry.id, "name": entry.name, "chain": header.chain.len(), "template_id": tid, "template": header.template, "bytes": bytes,
               "sha256": digest.finish()}))
 }
 
@@ -399,23 +457,79 @@ fn reserve(file: &File, need: u64) -> Result<()> {
     Ok(())
 }
 
+/// A checkpoint this host has under the id of one being loaded, compared with it before the store's
+/// lock is taken: each file compared is held open (`None`: absent, as it must be), so its inode is
+/// never another's meanwhile. Under the lock, then, its names leading to these inodes still is
+/// enough; only if they do not are its files hashed again (`has`).
+struct Pinned {
+    dir: OwnedFd,
+    files: Vec<(&'static str, Option<File>)>,
+    equal: bool,
+}
+
+fn regular(f: &File) -> bool {
+    crate::util::fstat(f.as_raw_fd()).is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG)
+}
+
+impl Pinned {
+    fn open(dir: &Path) -> Option<Pinned> {
+        let dir = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes()).ok()?).ok()?;
+        Some(Pinned { dir, files: vec![], equal: true })
+    }
+
+    /// Compares its `name` with `want` (`None`: it has none).
+    fn compare(&mut self, name: &'static str, want: Option<&[u8]>) {
+        match (open_at(self.dir.as_raw_fd(), name), want) {
+            (Ok(f), Some(want)) => {
+                let mut have = vec![];
+                self.equal &= regular(&f) && (&f).take(want.len() as u64 + 1).read_to_end(&mut have).is_ok() && have == want;
+                self.files.push((name, Some(f)));
+            }
+            (Err(e), None) if e.kind() == io::ErrorKind::NotFound => self.files.push((name, None)),
+            _ => self.equal = false,
+        }
+    }
+
+    /// Its pages, if as long as `len`, to compare as they are read.
+    fn pages(&mut self, len: u64) -> Option<File> {
+        let f = open_at(self.dir.as_raw_fd(), "pages").ok().filter(|f| regular(f) && f.metadata().is_ok_and(|m| m.len() == len));
+        match f.as_ref().and_then(|f| f.try_clone().ok()) {
+            Some(pin) => self.files.push(("pages", Some(pin))),
+            None => self.equal = false,
+        }
+        f
+    }
+
+    /// Whether `dest`'s files are still the ones compared.
+    fn still(&self, dest: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.files.iter().all(|(name, f)| match (std::fs::symlink_metadata(dest.join(name)), f) {
+            (Ok(m), Some(f)) => crate::util::fstat(f.as_raw_fd()).is_ok_and(|st| (st.st_dev, st.st_ino) == (m.dev(), m.ino())),
+            (Err(e), None) => e.kind() == io::ErrorKind::NotFound,
+            _ => false,
+        })
+    }
+}
+
 /// Where a verified checkpoint's files go: staged, or compared with the one this host has under its id.
 enum Sink {
     Stage(Staging),
-    Same { dir: PathBuf, equal: bool },
+    Same(Pinned),
 }
 
 /// A checkpoint's pages, as `Sink::pages` takes them.
 enum Pages {
     Stage(File),
-    Same { have: Option<File>, equal: bool },
+    Same { have: Option<File>, buf: Vec<u8> },
 }
 
 impl Sink {
-    fn small(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
-        match self {
-            Sink::Stage(s) => drop(s.add_file(name, bytes)?),
-            Sink::Same { dir, equal } => *equal &= read_at_most(&dir.join(name), bytes.len() as u64).is_ok_and(|have| have == bytes),
+    /// File `name`'s `bytes` (`None`: it has none).
+    fn small(&mut self, name: &'static str, bytes: Option<&[u8]>) -> Result<()> {
+        match (self, bytes) {
+            (Sink::Stage(s), Some(bytes)) => drop(s.add_file(name, bytes)?),
+            (Sink::Stage(_), None) => {}
+            (Sink::Same(p), bytes) => p.compare(name, bytes),
         }
         Ok(())
     }
@@ -427,10 +541,7 @@ impl Sink {
                 reserve(&file, len)?;
                 Pages::Stage(file)
             }
-            Sink::Same { dir, equal } => {
-                let have = File::open(dir.join("pages")).ok().filter(|f| f.metadata().is_ok_and(|m| m.len() == len));
-                Pages::Same { equal: *equal && have.is_some(), have }
-            }
+            Sink::Same(p) => Pages::Same { have: p.pages(len), buf: vec![] },
         })
     }
 }
@@ -439,11 +550,13 @@ impl Pages {
     fn put(&mut self, chunk: &[u8]) -> Result<()> {
         match self {
             Pages::Stage(f) => f.write_all(chunk)?,
-            Pages::Same { have: Some(f), equal } if *equal => {
-                let mut b = vec![0u8; chunk.len()];
-                *equal = f.read_exact(&mut b).is_ok() && b == chunk;
+            Pages::Same { have: Some(f), buf } => {
+                buf.resize(chunk.len(), 0);
+                if f.read_exact(buf).is_err() || buf != chunk {
+                    *self = Pages::Same { have: None, buf: vec![] };
+                }
             }
-            Pages::Same { .. } => {}
+            Pages::Same { have: None, .. } => {}
         }
         Ok(())
     }
@@ -455,16 +568,9 @@ impl Pages {
                 f.sync_all()?;
                 Ok(true)
             }
-            Pages::Same { equal, .. } => Ok(equal),
+            Pages::Same { have, .. } => Ok(have.is_some()),
         }
     }
-}
-
-/// `path`'s bytes, if it has at most `max`.
-fn read_at_most(path: &Path, max: u64) -> io::Result<Vec<u8>> {
-    let mut bytes = vec![];
-    File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 /// One checkpoint of the chain, read and verified: staged, or already in the store.
@@ -473,43 +579,55 @@ struct Loaded {
     id: String,
     manifest: Manifest,
     staging: Option<Staging>,
-    /// The SHA-256 of each of its files as it is here: what one found under its id must have.
-    files: Vec<(&'static str, Vec<u8>)>,
+    /// The one here under its id, compared with it.
+    pinned: Option<Pinned>,
+    /// The SHA-256 of each of its files as it is here (`None`: it has none): what one found under its id must have.
+    files: Vec<(&'static str, Option<Vec<u8>>)>,
+    /// Its metadata, as a restore counts it (`chain_meta_budget`).
+    meta: u64,
 }
 
-fn file_sha(path: &Path) -> Result<Vec<u8>> {
+fn file_sha(path: &Path) -> io::Result<Vec<u8>> {
     let mut h = Sha256::new();
     io::copy(&mut File::open(path)?, &mut h)?;
     Ok(h.finalize().to_vec())
 }
 
-/// Whether checkpoint directory `dir` has exactly `files` (by SHA-256).
-fn has(dir: &Path, files: &[(&str, Vec<u8>)]) -> bool {
-    files.iter().all(|(name, sha)| file_sha(&dir.join(name)).is_ok_and(|have| have == *sha))
+/// Whether checkpoint directory `dir` has exactly `files` (by SHA-256; `None`: none of that name).
+fn has(dir: &Path, files: &[(&str, Option<Vec<u8>>)]) -> bool {
+    files.iter().all(|(name, sha)| match (file_sha(&dir.join(name)), sha) {
+        (Ok(have), Some(sha)) => have == *sha,
+        (Err(e), None) => e.kind() == io::ErrorKind::NotFound,
+        _ => false,
+    })
 }
 
 /// Reads checkpoint `id` (`chain[i]`), whose parent the chain says is `parent` (the source's id and
-/// the one it has here), verifying it as `Link::open` and `PageFile::read` do: within `meta_left`,
-/// its pages against their checksums. Its parent is named `../ID` here, the store's way.
-#[allow(clippy::too_many_arguments)]
+/// the one it has here), and its run settings if `spec`, verifying it as `Link::open` and
+/// `PageFile::read` do: each file within its limit, its pages against their checksums. Its parent
+/// is named `../ID` here, the store's way. One checkpoint's metadata is held at a time, so the
+/// chain's is not limited here (a restore applies its host's budget), only each file's.
 fn receive(
     src: &mut Source,
     store_dir: &Path,
     id: &str,
     parent: Option<(&str, &str)>,
     template_id: &str,
-    meta_left: &mut u64,
+    spec: bool,
     digest: &mut SaveDigest,
 ) -> Result<Loaded> {
     let bad = |why: &str| format!("checkpoint {id}: {why}");
     digest.checkpoint(id);
-    let take = |len: u64, max: u64, what: &str, meta_left: &mut u64| -> Result<()> {
+    // Each member is held whole in memory as it is checked: none past what a restore here reads of a
+    // whole chain, so a forged length exhausts no memory (and none a restore here could not open is lost).
+    let room = chain_meta_budget();
+    let take = |len: u64, max: u64, what: &str| -> Result<()> {
         ensure!(len <= max, "{}", bad(&format!("its {what} is too long")));
-        *meta_left = meta_left.checked_sub(len).ok_or_else(|| bad(&format!("its chain has more than {} bytes of metadata", chain_meta_budget())))?;
+        ensure!(len <= room, "{}", bad(&format!("its {what} has more than the {} MiB of metadata a restore here reads", room >> 20)));
         Ok(())
     };
     let len = src.member(&checkpoint_member(id, "manifest.json"))?;
-    take(len, MAX_MANIFEST, "manifest", meta_left)?;
+    take(len, MAX_MANIFEST, "manifest")?;
     let mut text = read_all(src, len)?;
     digest.file("manifest.json", len, &Sha256::digest(&text));
     let split = text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("its manifest has no checksum"))?;
@@ -535,37 +653,60 @@ fn receive(
     // This host may have one by its id, which is no cryptographic check: what was sent is verified all
     // the same, then either staged or, for one here, compared byte for byte with it (and used only if equal).
     let local = store_dir.join(&here);
-    let mut sink = match read_manifest(&local) {
-        Ok(_) => Sink::Same { dir: local, equal: std::fs::read(store_dir.join(&here).join("manifest.json")).is_ok_and(|have| have == text) },
-        Err(_) => Sink::Stage(Staging::import(store_dir)?),
+    let mut sink = match read_manifest(&local).ok().and_then(|_| Pinned::open(&local)) {
+        Some(mut p) => {
+            p.compare("manifest.json", Some(&text));
+            Sink::Same(p)
+        }
+        None => Sink::Stage(Staging::import(store_dir)?),
     };
+    let spec = match spec {
+        true => {
+            let len = src.member(&checkpoint_member(id, SPEC))?;
+            take(len, MAX_SPEC, "run settings")?;
+            let bytes = read_all(src, len)?;
+            check_spec(&bytes).map_err(|e| bad(&e.to_string()))?;
+            digest.file(SPEC, len, &Sha256::digest(&bytes));
+            Some(bytes)
+        }
+        false => None,
+    };
+    sink.small(SPEC, spec.as_deref())?;
     let want = |name: &str| manifest.files.get(name).cloned().ok_or_else(|| bad(&format!("its manifest lists no {name}")));
-    let mut checked = |name: &str, max: u64, meta_left: &mut u64, sink: &mut Sink| -> Result<Vec<u8>> {
+    let mut checked = |name: &'static str, max: u64, sink: &mut Sink| -> Result<Vec<u8>> {
         let want = want(name)?;
         let len = src.member(&checkpoint_member(id, name))?;
         ensure!(len == want.len, "{}", bad(&format!("its {name} is not as long as its manifest says")));
-        take(len, max, name, meta_left)?;
+        take(len, max, name)?;
         let bytes = read_all(src, len)?;
         ensure!(sum(&bytes) == want.hash, "{}", bad(&format!("its {name} does not match its checksum")));
         digest.file(name, len, &Sha256::digest(&bytes));
-        sink.small(name, &bytes)?;
+        sink.small(name, Some(&bytes))?;
         Ok(bytes)
     };
-    let vmstate = checked("vmstate", MAX_VMSTATE, meta_left, &mut sink)?;
+    let vmstate = checked("vmstate", MAX_VMSTATE, &mut sink)?;
     let map_max = manifest.guest_pages * 36 + 24;
-    let map = checked("pagemap", map_max, meta_left, &mut sink)?;
-    let mut files = vec![("vmstate", Sha256::digest(&vmstate).to_vec()), ("pagemap", Sha256::digest(&map).to_vec())];
+    let map = checked("pagemap", map_max, &mut sink)?;
+    let meta = (text.len() + vmstate.len() + map.len()) as u64;
+    let mut files = vec![
+        (SPEC, spec.as_ref().map(|b| Sha256::digest(b).to_vec())),
+        ("vmstate", Some(Sha256::digest(&vmstate).to_vec())),
+        ("pagemap", Some(Sha256::digest(&map).to_vec())),
+    ];
+    drop(vmstate);
     let (runs, sums) = parse_pagemap(&map, manifest.guest_pages, manifest.parent.is_some(), 0).map_err(|e| bad(&e.to_string()))?;
+    drop(map);
     let data: u64 = runs.iter().filter(|r| r.2 == DATA).map(|r| r.1).sum();
     let pages_len = data * PAGE_SIZE as u64;
     ensure!(data == manifest.data_pages && want("pages")?.len == pages_len, "{}", bad("its page counts do not add up"));
     let len = src.member(&checkpoint_member(id, "pages"))?;
     ensure!(len == pages_len, "{}", bad("its pages are not as long as its manifest says"));
     let mut out = sink.pages(len)?;
-    let (mut buf, mut sha) = (vec![0u8; 256 * PAGE_SIZE], Sha256::new());
+    let per = CHUNK / PAGE_SIZE;
+    let (mut buf, mut sha) = (vec![0u8; CHUNK], Sha256::new());
     let mut d = 0;
     while d < data {
-        let n = ((data - d) as usize).min(256);
+        let n = ((data - d) as usize).min(per);
         let chunk = &mut buf[..n * PAGE_SIZE];
         src.reader().read_exact(chunk).map_err(truncated)?;
         sha.update(&*chunk);
@@ -578,37 +719,39 @@ fn receive(
     let equal = out.finish()?;
     let sha = sha.finalize();
     digest.file("pages", len, &sha);
-    files.extend([("pages", sha.to_vec()), ("manifest.json", Sha256::digest(&text).to_vec())]);
-    let staging = match sink {
+    files.extend([("pages", Some(sha.to_vec())), ("manifest.json", Some(Sha256::digest(&text).to_vec()))]);
+    let (staging, pinned) = match sink {
         Sink::Stage(staging) => {
             staging.add_file("manifest.json", &text)?;
-            Some(staging)
+            (Some(staging), None)
         }
-        Sink::Same { equal: same, .. } => {
+        Sink::Same(p) => {
             ensure!(
-                same && equal,
+                p.equal && equal,
                 "{}",
                 bad(&format!("this host has a checkpoint {here} with other files: remove it (flexvm checkpoint rm {here}) to load this one"))
             );
-            None
+            (None, Some(p))
         }
     };
-    Ok(Loaded { id: here, manifest, staging, files })
+    Ok(Loaded { id: here, manifest, staging, pinned, files, meta })
 }
 
 /// `checkpoint load`: a `save`'s tar from `r`, into the store, named `name` (else as it was saved);
-/// with `sha256`, only if that is the save's (`SaveDigest`).
-pub fn load(state: &Path, paths: &Paths, r: &mut dyn Read, name: Option<&str>, sha256: Option<&str>) -> Result<Value> {
+/// with `sha256`, only if that is the save's (`SaveDigest`). `in_use`: the template ids VMs here use
+/// (`Host::template_users`), so a template it received stays if the load fails after all but one uses it.
+pub fn load(state: &Path, paths: &Paths, r: &mut dyn Read, name: Option<&str>, sha256: Option<&str>, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Value> {
     let mut tar = TarIn { r, left: 0, pad: 0 };
     let len = tar.member(HEADER).map_err(|e| format!("not a flexvm checkpoint save: {e}"))?;
     ensure!(len <= MAX_HEADER, "its {HEADER} is too long");
     let mut src = Source::Tar(tar);
     let header: Header = serde_json::from_slice(&read_all(&mut src, len)?).map_err(|e| format!("its {HEADER}: {e}"))?;
-    import(state, paths, header, &mut src, name, sha256)
+    import(state, paths, header, &mut src, name, sha256, in_use)
 }
 
 /// `checkpoint load -i DIR`: checkpoint directory `dir` (v0.1.0's, or a copy of a stored one) and its
-/// chain, into the store; its template is not in it, so this host needs its generation to restore it.
+/// chain, with their run settings, into the store; its template is not in it, so this host needs its
+/// generation to restore it.
 pub fn load_dir(state: &Path, paths: &Paths, dir: &Path, name: Option<&str>, sha256: Option<&str>) -> Result<Value> {
     let ck = Checkpoint::open(dir)?;
     let chain: Vec<String> = std::iter::once(ck.id.clone()).chain(ck.chain_ids.iter().cloned()).collect();
@@ -616,8 +759,9 @@ pub fn load_dir(state: &Path, paths: &Paths, dir: &Path, name: Option<&str>, sha
     for (d, id) in std::iter::once(&ck.dir).chain(&ck.chain).zip(&chain) {
         dirs.insert(id.clone(), open_dir_at(libc::AT_FDCWD, &CString::new(d.as_os_str().as_bytes())?)?);
     }
-    let header = Header { format: EXPORT_FORMAT, id: ck.id.clone(), name: None, chain, template_id: ck.manifest.template_id.clone(), template: false };
-    import(state, paths, header, &mut Source::Dir { dirs, file: None }, name, sha256)
+    let specs = chain.iter().filter(|id| crate::util::stat_at(dirs[*id].as_raw_fd(), &CString::new(SPEC).unwrap()).is_some()).cloned().collect();
+    let header = Header { format: EXPORT_FORMAT, id: ck.id.clone(), name: None, chain, template_id: ck.manifest.template_id.clone(), template: false, specs };
+    import(state, paths, header, &mut Source::Dir { dirs, file: None }, name, sha256, &BTreeSet::new)
 }
 
 /// The checkpoint name `names/NAME` links to, if any.
@@ -626,7 +770,33 @@ fn named(state: &Path, name: &str) -> Option<String> {
     Some(target.file_name()?.to_string_lossy().into_owned())
 }
 
-fn import(state: &Path, paths: &Paths, header: Header, src: &mut Source, name: Option<&str>, sha256: Option<&str>) -> Result<Value> {
+/// How a load has the chain's template generation.
+#[derive(Clone, Copy, PartialEq)]
+enum How {
+    Present,
+    Received,
+    Missing,
+}
+
+impl How {
+    fn as_str(self) -> &'static str {
+        match self {
+            How::Present => "present",
+            How::Received => "received",
+            How::Missing => "missing",
+        }
+    }
+}
+
+fn import(
+    state: &Path,
+    paths: &Paths,
+    header: Header,
+    src: &mut Source,
+    name: Option<&str>,
+    sha256: Option<&str>,
+    in_use: &dyn Fn() -> BTreeSet<String>,
+) -> Result<Value> {
     let chain = &header.chain;
     ensure!(header.format == EXPORT_FORMAT, "a checkpoint save of format {}; this flexvm reads format {EXPORT_FORMAT}", header.format);
     ensure!(
@@ -637,6 +807,8 @@ fn import(state: &Path, paths: &Paths, header: Header, src: &mut Source, name: O
             && chain.iter().collect::<BTreeSet<_>>().len() == chain.len(),
         "its {HEADER} names no chain of checkpoint ids (of at most {MAX_CHAIN})"
     );
+    let specs: BTreeSet<&String> = header.specs.iter().collect();
+    ensure!(specs.len() == header.specs.len() && specs.iter().all(|id| chain.contains(id)), "its {HEADER} names run settings of no checkpoint of its chain");
     ensure!(template::valid_id(&header.template_id) && header.template_id.len() <= 64, "its {HEADER} names no template id");
     let name = name.map(str::to_string).or(header.name.clone());
     if let Some(n) = &name {
@@ -648,11 +820,10 @@ fn import(state: &Path, paths: &Paths, header: Header, src: &mut Source, name: O
     }
     drop(store::lock(state, libc::LOCK_SH)?);
     let store_dir = store::dir(state);
-    let mut meta_left = chain_meta_budget();
     let (mut loaded, mut digest): (Vec<Loaded>, _) = (vec![], SaveDigest::default());
     for (i, id) in chain.iter().enumerate().rev() {
         let parent = loaded.last().map(|p: &Loaded| (chain[i + 1].as_str(), p.id.as_str()));
-        let l = receive(src, &store_dir, id, parent, &header.template_id, &mut meta_left, &mut digest)?;
+        let l = receive(src, &store_dir, id, parent, &header.template_id, specs.contains(id), &mut digest)?;
         if let Some(p) = loaded.last() {
             ensure!(p.manifest.guest_pages == l.manifest.guest_pages, "checkpoint {id}: its parent is of another size");
         }
@@ -669,10 +840,9 @@ fn import(state: &Path, paths: &Paths, header: Header, src: &mut Source, name: O
         "the chain's checkpoints record other digests of their template"
     );
     let tid = &header.template_id;
-    let by = "the checkpoint";
     let open = |dir: PathBuf| -> Result<Arc<Template>> {
         let tpl = Template::open_dir(tid, dir)?;
-        tpl.check_vouched(digests.as_ref(), by)?;
+        tpl.check_vouched(digests.as_ref(), "the checkpoint")?;
         Ok(tpl)
     };
     // Held until the checkpoint that uses it is published: no prune or `rmi` removes it meanwhile.
@@ -682,7 +852,7 @@ fn import(state: &Path, paths: &Paths, header: Header, src: &mut Source, name: O
                 src.member(&template_member(tid))?;
                 src.skip()?;
             }
-            (Some(open(dir)?), "present")
+            (Some(open(dir)?), How::Present)
         }
         None if header.template => {
             let vouched = digests.as_ref().ok_or("the checkpoint records no SHA-256 digests of its template, which cannot be verified")?;
@@ -692,7 +862,7 @@ fn import(state: &Path, paths: &Paths, header: Header, src: &mut Source, name: O
                 // Another arrival brought it meanwhile.
                 Some(dir) => {
                     src.skip()?;
-                    (Some(open(dir)?), "present")
+                    (Some(open(dir)?), How::Present)
                 }
                 None => {
                     let Source::Tar(tar) = src else { bail!("a checkpoint directory has no template") };
@@ -701,66 +871,150 @@ fn import(state: &Path, paths: &Paths, header: Header, src: &mut Source, name: O
                         ensure!(t.left == 0, "template {tid}: the archive has more of it than it is");
                         t.end()
                     };
-                    let tpl = template::receive(paths, tar, tid, Some(vouched), finish)?;
-                    tpl.check_vouched(Some(vouched), by)?;
-                    (Some(tpl), "received")
+                    // Refused unless its digests are `vouched`, as `check_vouched` would.
+                    (Some(template::receive(paths, tar, tid, Some(vouched), finish)?), How::Received)
                 }
             }
         }
-        None => (None, "missing"),
+        None => (None, How::Missing),
     };
-    if how != "received" {
+    if how != How::Received {
         src.end()?;
     }
-    // Exclusive: nothing is published (another load's, which may revoke it) or removed (`rm`, `prune`)
-    // meanwhile. Whatever is under an id now, found before or published since, is used only if it has
-    // the very files verified here (by SHA-256), its id being no cryptographic check.
-    let _lock = store::lock(state, libc::LOCK_EX)?;
-    let mut stored = 0;
-    for l in loaded.iter_mut() {
-        let dest = store_dir.join(&l.id);
-        match std::fs::symlink_metadata(dest.join("manifest.json")) {
-            Ok(_) => {
-                ensure!(
-                    has(&dest, &l.files),
-                    "checkpoint {} here has other files than the save's: remove it (flexvm checkpoint rm {0}) to load this one",
-                    l.id
-                );
-                drop(l.staging.take());
+    let (id, stored) = match publish(state, &mut loaded, name.as_deref()) {
+        Ok(done) => done,
+        // Nothing of it stays: not the template it brought either, unless something here uses it by now.
+        Err(Abort::Undo(e)) => {
+            drop(tpl);
+            if how == How::Received {
+                let _ = template::prune(paths, Some(tid), in_use);
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // A revoked publication's leftover (as `rm` clears it), else nothing.
-                if std::fs::symlink_metadata(&dest).is_ok() {
-                    std::fs::remove_dir_all(&dest)?;
-                    crate::util::sync_dir(&store_dir)?;
-                }
-                let s = l.staging.take().ok_or_else(|| format!("checkpoint {} here was removed as this one loaded; load it again", l.id))?;
-                ensure!(s.publish_as(&l.id)?, "checkpoint {} was published as this one loaded; load it again", l.id);
-                stored += 1;
-            }
-            Err(e) => return Err(io::Error::new(e.kind(), format!("checking checkpoint {}: {e}", dest.display())).into()),
+            return Err(e);
         }
-    }
-    let id = loaded.last().unwrap().id.clone();
-    // As a restore opens it.
-    Checkpoint::open(&store_dir.join(&id)).map_err(|e| format!("the loaded checkpoint {id} does not open: {e}"))?;
-    if let Some(n) = &name {
-        if named(state, n).as_deref() != Some(id.as_str()) {
-            store::link(state, n, &id).map_err(|e| format!("loaded checkpoint {id}, but {e}"))?;
-        }
-    }
+        // A checkpoint of it may stay (or come back after a crash), which `in_use` may not see: so does its template.
+        Err(Abort::Keep(e)) => return Err(e),
+    };
     drop(tpl);
-    if how == "missing" {
+    let meta: u64 = loaded.iter().map(|l| l.meta).sum();
+    if meta > chain_meta_budget() {
+        warn(format_args!(
+            "loaded checkpoint {id}, but its chain has {} MiB of metadata, more than a restore here reads ({} MiB): restore it on a host with more memory",
+            meta >> 20,
+            chain_meta_budget() >> 20
+        ));
+    }
+    if how == How::Missing {
         warn(format_args!("loaded checkpoint {id}, but template generation {tid} is not here: restoring it needs it (pull its image, or load a save of it)"));
     }
-    Ok(json!({"loaded": id, "name": name, "chain": loaded.len(), "stored": stored, "template_id": tid, "template": how, "sha256": sha}))
+    Ok(json!({"loaded": id, "name": name, "chain": loaded.len(), "stored": stored, "template_id": tid, "template": how.as_str(), "sha256": sha}))
+}
+
+/// Why `publish` failed: undoing what it published, or keeping it (`Keep`), as it may be in use.
+enum Abort {
+    Undo(crate::util::Error),
+    /// A checkpoint or name may stay (not durably removed): what it needs stays too.
+    Keep(crate::util::Error),
+}
+
+impl<E: Into<crate::util::Error>> From<E> for Abort {
+    fn from(e: E) -> Self {
+        Abort::Undo(e.into())
+    }
+}
+
+/// Publishes the chain `loaded` (oldest first) and names its head `name`: its id, and how many of it
+/// were stored. Under the store's lock, exclusive: nothing is published (another load's, which may
+/// revoke it) or removed (`rm`, `prune`) meanwhile. Whatever is under an id now, found before or
+/// published since, is used only if it has the very files verified here, its id being no
+/// cryptographic check. On failure, what it published goes again.
+fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> std::result::Result<(String, usize), Abort> {
+    let _lock = store::lock(state, libc::LOCK_EX)?;
+    let store_dir = store::dir(state);
+    let mut published = vec![];
+    let done = (|| -> std::result::Result<String, Abort> {
+        for l in loaded.iter_mut() {
+            let dest = store_dir.join(&l.id);
+            match std::fs::symlink_metadata(dest.join("manifest.json")) {
+                Ok(_) => ensure!(
+                    l.pinned.as_ref().is_some_and(|p| p.still(&dest)) || has(&dest, &l.files),
+                    "checkpoint {} here has other files than the save's: remove it (flexvm checkpoint rm {0}) to load this one",
+                    l.id
+                ),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // A revoked publication's leftover (as `rm` clears it), else nothing.
+                    if std::fs::symlink_metadata(&dest).is_ok() {
+                        std::fs::remove_dir_all(&dest)?;
+                        crate::util::sync_dir(&store_dir)?;
+                    }
+                    let s = l.staging.take().ok_or_else(|| format!("checkpoint {} here was removed as this one loaded; load it again", l.id))?;
+                    match s.publish_as(&l.id) {
+                        Ok(true) => published.push(l.id.clone()),
+                        Ok(false) => bail!("checkpoint {} was published as this one loaded; load it again", l.id),
+                        Err(CommitError::Failed(e)) => return Err(e.into()),
+                        // Its manifest may stay: what it builds on stays too, whole.
+                        Err(CommitError::Uncertain(e)) => return Err(Abort::Keep(e)),
+                    }
+                }
+                Err(e) => return Err(io::Error::new(e.kind(), format!("checking checkpoint {}: {e}", dest.display())).into()),
+            }
+        }
+        let id = loaded.last().unwrap().id.clone();
+        // Its chain, by its manifests, as a restore finds it (its other files were verified as they came).
+        chain_ids(&store_dir.join(&id)).map_err(|e| format!("the loaded checkpoint {id} does not open: {e}"))?;
+        #[cfg(test)]
+        ensure!(!tests::FAIL_NAMING.get(), "injected: naming it failed");
+        if let Some(n) = name {
+            if named(state, n).as_deref() != Some(id.as_str()) {
+                if let Err(e) = store::link(state, n, &id) {
+                    // Perhaps linked, not durably: it goes before what it names, or that stays (also
+                    // when whether it is there is not known).
+                    let link = store::dir(state).join("names").join(n);
+                    match std::fs::read_link(&link) {
+                        Ok(to) if to.file_name() == Some(id.as_ref()) => {
+                            if let Err(u) = crate::util::unlink_durably(&link) {
+                                return Err(Abort::Keep(format!("{e}; removing the name failed too: {u}").into()));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(r) if r.kind() == io::ErrorKind::NotFound => {}
+                        Err(r) => return Err(Abort::Keep(format!("{e}; and whether the name is there is not known: {r}").into())),
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(id)
+    })();
+    match done {
+        Ok(id) => Ok((id, published.len())),
+        Err(Abort::Keep(e)) if published.is_empty() => Err(Abort::Keep(e)),
+        Err(Abort::Keep(e)) => Err(Abort::Keep(format!("{e} (the checkpoints it published are kept, whole: flexvm checkpoint rm removes them)").into())),
+        Err(Abort::Undo(e)) => {
+            published.reverse();
+            match store::unpublish(state, &published) {
+                Ok(()) => Err(Abort::Undo(e)),
+                Err(u) => Err(Abort::Keep(format!("{e} (removing the checkpoints it published: {u}; flexvm checkpoint rm removes them)").into())),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::checkpoint::format::MAGIC;
-    use std::fs;
+    use std::{cell::Cell, fs};
+
+    thread_local! {
+        /// Fails `publish` once the chain is published, before it is named.
+        pub(super) static FAIL_NAMING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The run settings of the head of `saved`'s chain.
+    fn spec() -> Vec<u8> {
+        serde_json::to_vec(&crate::app::RunSpec { keep: true, env: vec!["A=1".into()], entrypoint: Some(vec!["/bin/app".into()]), ..Default::default() })
+            .unwrap()
+    }
 
     /// A checkpoint of `tpl` with `seeds.len()` data pages (one run from page `at`) in store `state`,
     /// a delta on `parent` if given, its manifest changed by `edit`; returns its id.
@@ -830,7 +1084,7 @@ mod tests {
     }
 
     fn load_bytes(h: &Host, tar: &[u8], name: Option<&str>) -> Result<Value> {
-        load(&h.state, &h.paths, &mut &tar[..], name, None)
+        load(&h.state, &h.paths, &mut &tar[..], name, None, &BTreeSet::new)
     }
 
     /// A store with a named chain of two (a full checkpoint and a delta) and its save.
@@ -840,6 +1094,7 @@ mod tests {
         let base = stored(&state, &tpl, None, 0, &[1, 2, 3], |_| {});
         let head = stored(&state, &tpl, Some(&base), 10, &[4], |_| {});
         store::link(&state, "web", &head).unwrap();
+        fs::write(store::dir(&state).join(&head).join(SPEC), spec()).unwrap();
         let mut tar = vec![];
         let r = save(&state, &paths, "web", &mut tar).unwrap();
         assert_eq!(
@@ -856,7 +1111,9 @@ mod tests {
         let names: Vec<String> = tar::Archive::new(&tar[..]).entries().unwrap().map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned()).collect();
         let mut want = vec![HEADER.to_string()];
         for id in chain.iter().rev() {
-            want.extend(["manifest.json", "vmstate", "pagemap", "pages"].map(|f| checkpoint_member(id, f)));
+            let files: &[&str] =
+                if id == &chain[0] { &["manifest.json", SPEC, "vmstate", "pagemap", "pages"] } else { &["manifest.json", "vmstate", "pagemap", "pages"] };
+            want.extend(files.iter().map(|f| checkpoint_member(id, f)));
         }
         want.push(template_member(&tpl.meta.id));
         assert_eq!(names, want);
@@ -866,9 +1123,9 @@ mod tests {
         std::os::unix::fs::symlink(".gen/0123456789abcdef", b.paths.templates.join("t")).unwrap();
         // `--sha256`: only the save whose SHA-256 `save` printed.
         let sha = save(&state, &paths, "web", &mut vec![]).unwrap()["sha256"].as_str().unwrap().to_string();
-        let e = load(&b.state, &b.paths, &mut &tar[..], None, Some(&"0".repeat(64))).err().unwrap().to_string();
+        let e = load(&b.state, &b.paths, &mut &tar[..], None, Some(&"0".repeat(64)), &BTreeSet::new).err().unwrap().to_string();
         assert!(e.contains(&format!("SHA-256 is {sha}")) && nothing(&b), "{e}");
-        let r = load(&b.state, &b.paths, &mut &tar[..], None, Some(&sha.to_uppercase())).unwrap();
+        let r = load(&b.state, &b.paths, &mut &tar[..], None, Some(&sha.to_uppercase()), &BTreeSet::new).unwrap();
         assert_eq!(
             (r["loaded"].as_str(), r["name"].as_str(), r["stored"].as_u64(), r["template"].as_str()),
             (Some(&chain[0][..]), Some("web"), Some(2), Some("received"))
@@ -887,9 +1144,28 @@ mod tests {
                 assert_eq!(fs::read(store::dir(&b.state).join(id).join(f)).unwrap(), fs::read(store::dir(&state).join(id).join(f)).unwrap());
             }
         }
+        // Its run settings came with it; its base has none.
+        assert_eq!(fs::read(store::dir(&b.state).join(&chain[0]).join(SPEC)).unwrap(), spec());
+        assert!(!store::dir(&b.state).join(&chain[1]).join(SPEC).exists());
+        assert_eq!(crate::lifecycle::read_spec(&store::dir(&b.state).join(&chain[0])).unwrap().env, ["A=1"]);
         // Again: nothing new, and its own name is no conflict.
         let r = load_bytes(&b, &tar, None).unwrap();
         assert_eq!((r["stored"].as_u64(), r["template"].as_str(), r["sha256"].as_str()), (Some(0), Some("present"), Some(&sha[..])));
+        // One here with other run settings, or none, or some where the save has none, is not the save's.
+        let here = store::dir(&b.state).join(&chain[0]).join(SPEC);
+        for (at, bytes) in [(&here, Some(&b"{}"[..])), (&here, None), (&store::dir(&b.state).join(&chain[1]).join(SPEC), Some(&b"{}"[..]))] {
+            match bytes {
+                Some(bytes) => fs::write(at, bytes).unwrap(),
+                None => fs::remove_file(at).unwrap(),
+            }
+            let e = load_bytes(&b, &tar, None).err().unwrap().to_string();
+            assert!(e.contains("with other files"), "{e}");
+            match at == &here {
+                true => fs::write(at, spec()).unwrap(),
+                false => fs::remove_file(at).unwrap(),
+            }
+        }
+        assert_eq!(load_bytes(&b, &tar, None).unwrap()["stored"], 0);
         // A checkpoint here under one of its ids but with other bytes is never taken for it.
         let pages = store::dir(&b.state).join(&chain[1]).join("pages");
         let mut changed = fs::read(&pages).unwrap();
@@ -946,8 +1222,14 @@ mod tests {
         let b = fresh(&paths);
         let mut more = tar[..tar.len() - 2 * BLOCK].to_vec();
         more.extend_from_slice(&tar[..BLOCK]);
-        assert!(load_bytes(&b, &more, None).err().unwrap().to_string().contains("more than one"));
+        let e = load_bytes(&b, &more, None).err().unwrap().to_string();
+        assert!(e.contains(&format!("a member after the save's last: {HEADER:?}")), "{e}");
         assert!(nothing(&b), "not even its template");
+        let mut more = tar[..tar.len() - 2 * BLOCK].to_vec();
+        more.extend_from_slice(&[7u8; 2 * BLOCK]);
+        let e = load_bytes(&b, &more, None).err().unwrap().to_string();
+        assert!(e.contains("bytes after the save's last member"), "{e}");
+        assert!(nothing(&b));
         // Anything but zeros after the end, or zeros past `MAX_TAIL`; zeros (a tar record's padding) are taken.
         for (tail, ok) in [(vec![0u8; 9 * BLOCK], true), ([vec![0u8; BLOCK], vec![1]].concat(), false), (vec![0u8; MAX_TAIL as usize + 1], false)] {
             let b = fresh(&paths);
@@ -968,7 +1250,7 @@ mod tests {
         fs::write(&pages, &damaged).unwrap();
         let mut tar = vec![];
         save(&state, &paths, "web", &mut tar).unwrap();
-        let e = load(&state, &paths, &mut &tar[..], None, None).err().unwrap().to_string();
+        let e = load(&state, &paths, &mut &tar[..], None, None, &BTreeSet::new).err().unwrap().to_string();
         assert!(e.contains("data page 1 does not match its checksum"), "{e}");
         assert_eq!(ids(&state).len(), 2);
     }
@@ -1105,5 +1387,122 @@ mod tests {
         let c = fresh(&paths);
         assert!(load_dir(&c.state, &c.paths, &elsewhere.join("newer"), None, None).is_err());
         assert!(nothing(&c));
+    }
+
+    #[test]
+    fn run_settings_are_in_the_saves_sha256_and_a_save_without_them_is_as_before() {
+        let (_dir, paths, _tpl, state, chain, tar) = saved();
+        // The base has none: its save's header names none (as a save before them), and its SHA-256 has none.
+        let base = |tar: &[u8]| -> Value {
+            let mut a = tar::Archive::new(tar);
+            let mut first = a.entries().unwrap().next().unwrap().unwrap();
+            serde_json::from_reader(&mut first).unwrap()
+        };
+        let mut plain = vec![];
+        let without = save(&state, &paths, &chain[1], &mut plain).unwrap()["sha256"].as_str().unwrap().to_string();
+        assert!(base(&plain).get("specs").is_none(), "{}", base(&plain));
+        assert_eq!(base(&tar)["specs"], json!([chain[0]]));
+        fs::write(store::dir(&state).join(&chain[1]).join(SPEC), spec()).unwrap();
+        let with = save(&state, &paths, &chain[1], &mut vec![]).unwrap()["sha256"].as_str().unwrap().to_string();
+        assert_ne!(with, without, "the SHA-256 covers them");
+        // A save from before them (none named) loads, with none.
+        let b = fresh(&paths);
+        let r = load(&b.state, &b.paths, &mut &plain[..], None, Some(&without), &BTreeSet::new).unwrap();
+        assert_eq!(r["loaded"], chain[1].as_str());
+        assert!(!store::dir(&b.state).join(&chain[1]).join(SPEC).exists());
+        // Settings no restore could read are refused, saving and loading.
+        fs::write(store::dir(&state).join(&chain[1]).join(SPEC), b"{\"keep\": 3}").unwrap();
+        assert!(save(&state, &paths, &chain[1], &mut vec![]).err().unwrap().to_string().contains("run settings"));
+        let header = |specs: &[&str]| {
+            serde_json::to_vec(&json!({"format": 1, "id": chain[1], "name": null, "chain": [chain[1]], "template_id": "0", "template": false, "specs": specs}))
+                .unwrap()
+        };
+        for specs in [&[&chain[0][..]][..], &[&chain[1], &chain[1]]] {
+            let c = fresh(&paths);
+            let e = load_bytes(&c, &forged(&[(HEADER, header(specs))]), None).err().unwrap().to_string();
+            assert!(e.contains("run settings of no checkpoint"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_load_that_fails_as_it_publishes_leaves_nothing() {
+        let (_dir, paths, _tpl, _state, chain, tar) = saved();
+        let b = fresh(&paths);
+        FAIL_NAMING.set(true);
+        let e = load_bytes(&b, &tar, None).err().unwrap().to_string();
+        FAIL_NAMING.set(false);
+        assert!(e.contains("injected"), "{e}");
+        // Neither the chain, published by then, nor the template it brought.
+        assert!(nothing(&b), "{:?} {:?}", ids(&b.state), gens(&b.paths));
+        let left: Vec<String> = fs::read_dir(store::dir(&b.state)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.iter().all(|n| n == "names" || n.starts_with('.') && !n.starts_with(".removed-")), "{left:?}");
+        // A template that was here stays, and so does a checkpoint of the chain that was.
+        load_bytes(&b, &tar, None).unwrap();
+        store::remove(&b.state, &[chain[0].clone()], false).unwrap();
+        FAIL_NAMING.set(true);
+        assert!(load_bytes(&b, &tar, Some("other")).is_err());
+        FAIL_NAMING.set(false);
+        assert_eq!(ids(&b.state), [chain[1].clone()]);
+        assert_eq!(gens(&b.paths).len(), 1);
+    }
+
+    #[test]
+    fn a_checkpoint_compared_is_checked_again_by_its_inodes_and_hashed_only_if_they_changed() {
+        let (_dir, _paths, _tpl, state, chain, _) = saved();
+        let dir = store::dir(&state).join(&chain[0]);
+        let mut p = Pinned::open(&dir).unwrap();
+        let files: Vec<(&str, Option<Vec<u8>>)> = ["manifest.json", "vmstate", "pagemap"]
+            .into_iter()
+            .map(|n| {
+                let bytes = fs::read(dir.join(n)).unwrap();
+                p.compare(n, Some(&bytes));
+                (n, Some(Sha256::digest(&bytes).to_vec()))
+            })
+            .chain([("gone", None)])
+            .collect();
+        p.compare("gone", None);
+        assert!(p.equal && p.still(&dir) && has(&dir, &files));
+        // The same bytes in another inode: no longer pinned, but hashed, still the same.
+        let vmstate = fs::read(dir.join("vmstate")).unwrap();
+        fs::remove_file(dir.join("vmstate")).unwrap();
+        fs::write(dir.join("vmstate"), &vmstate).unwrap();
+        assert!(!p.still(&dir) && has(&dir, &files));
+        fs::write(dir.join("vmstate"), b"other").unwrap();
+        assert!(!has(&dir, &files));
+        // One that should be absent, there.
+        fs::write(dir.join("gone"), b"").unwrap();
+        let mut q = Pinned::open(&dir).unwrap();
+        q.compare("gone", None);
+        assert!(!q.equal);
+    }
+
+    #[test]
+    fn a_member_past_what_a_restore_here_reads_is_refused_before_it_is_read() {
+        let (_dir, paths, tpl, _state, _, _) = saved();
+        let scratch = fresh(&paths);
+        let room = chain_meta_budget();
+        // A manifest whose page map is as long as its (forged) guest memory allows, and longer than that.
+        let id = stored(&scratch.state, &tpl, None, 0, &[1], |m| {
+            m.guest_pages = MAX_GUEST_PAGES;
+            m.files.get_mut("pagemap").unwrap().len = room + 1;
+        });
+        let dir = store::dir(&scratch.state).join(&id);
+        let header = serde_json::to_vec(&json!({"format": 1, "id": id, "name": null, "chain": [id], "template_id": tpl.meta.id, "template": false})).unwrap();
+        let mut tar = forged(&[
+            (HEADER, header),
+            (&checkpoint_member(&id, "manifest.json"), fs::read(dir.join("manifest.json")).unwrap()),
+            (&checkpoint_member(&id, "vmstate"), b"state".to_vec()),
+        ]);
+        // Its header alone: its bytes are never sent, nor needed.
+        tar.truncate(tar.len() - 2 * BLOCK);
+        let mut h = tar::Header::new_gnu();
+        h.set_path(checkpoint_member(&id, "pagemap")).unwrap();
+        h.set_size(room + 1);
+        h.set_cksum();
+        tar.extend_from_slice(h.as_bytes());
+        let b = fresh(&paths);
+        let e = load_bytes(&b, &tar, None).err().unwrap().to_string();
+        assert!(e.contains("a restore here reads"), "{e}");
+        assert!(nothing(&b));
     }
 }
