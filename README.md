@@ -948,10 +948,11 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
 - The peer protocol is plain TCP, served to the peers' addresses only, without
   authentication: trusted networks only. A listed peer can claim any VM
   address and reserve this host's addresses and disk.
-- Unstarted restore loans are limited to 16 per peer and expire after five
-  minutes. A claimed loan stays lent if the restore's host dies before it
-  starts the VM (a leak, never a collision). Older borrowers' loans cannot
-  expire safely and stay lent until announced or withdrawn.
+- An address lent to a restore elsewhere expires if the restore does not
+  claim it within five minutes; a peer can hold at most 64 loans whose VMs are
+  not running yet. A claimed loan (or one to a host older than this release,
+  which cannot claim) stays lent if the restore's host dies before it starts
+  the VM: a leak, never a collision, and it counts against that limit.
 - `exec` reaches VMs on this host; one that migrates away ends its exec
   saying where it went and exits 125 (the command keeps running there).
 - Templates must be identical on every host (checked by content id), as

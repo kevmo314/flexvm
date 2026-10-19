@@ -583,10 +583,14 @@ impl Proc {
             return match self.host.lock().and_then(|l| self.host.claim_incoming(&l, name, ip, gen, None)) {
                 Ok(mut c) => {
                     c.fresh = true;
-                    // Claim before the lease can expire; older lenders ignore these extra fields
-                    // and refuse a second loan, so only require this when they advertise leases.
+                    // Claimed before its lease is up (only a lender that leases: an older one would take
+                    // this for another loan). Refused, it may have expired: given back, never run.
                     if lease {
-                        peer_call(&peer, json!({"op": "lend", "ip": ip.to_string(), "gen": gen, "start": true}))?;
+                        if let Err(e) = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string(), "gen": gen, "start": true})) {
+                            drop(c);
+                            let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+                            bail!("cannot claim {ip} borrowed from {peer}: {e}");
+                        }
                     }
                     Ok(c)
                 }
@@ -3229,12 +3233,17 @@ mod tests {
                 let (mut conn, _) = listener.accept().unwrap();
                 let req = crate::util::recv_json(&mut std::io::BufReader::new(&conn)).unwrap().unwrap();
                 assert_eq!(req["lease"], true);
-                send_json(&mut conn, &json!({"ok": true, "gen": 7, "lease": lease})).unwrap();
+                send_json(&mut conn, &json!({"ok": true, "result": {"gen": 7, "lease": lease}})).unwrap();
                 if lease {
                     let (mut conn, _) = listener.accept().unwrap();
                     let req = crate::util::recv_json(&mut std::io::BufReader::new(&conn)).unwrap().unwrap();
                     assert_eq!(req, json!({"op": "lend", "ip": "10.9.0.1", "gen": 7, "start": true}));
-                    send_json(&mut conn, &json!({"ok": accepted, "error": "expired"})).unwrap();
+                    send_json(&mut conn, &json!({"ok": accepted, "result": {}, "error": "expired"})).unwrap();
+                    if !accepted {
+                        let (conn, _) = listener.accept().unwrap();
+                        let req = crate::util::recv_json(&mut std::io::BufReader::new(&conn)).unwrap().unwrap();
+                        assert_eq!(req, json!({"op": "route", "ip": "10.9.0.1", "gen": 7}), "a refused claim gives the loan back");
+                    }
                 }
             });
             let claim = p.borrow("restore", "10.9.0.1".parse().unwrap());

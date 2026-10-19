@@ -449,6 +449,7 @@ impl Peers {
         out
     }
 
+    /// The configured peer `from` is one of (`sender`), else `from` itself: who a loan is to.
     fn borrower(&self, cfg: &crate::host::Config, from: IpAddr) -> String {
         let sender = self.sender(cfg, from);
         cfg.peers
@@ -654,11 +655,13 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
             }
             let cfg = host.config_now();
             let from = conn.peer_addr()?.ip();
-            peers.all_addrs(&cfg.peers, Instant::now() + ADMIT_WAIT)?;
-            let sender = peers.sender(&cfg, from);
-            let borrower = peers.borrower(&cfg, from);
+            // Names resolved first; one still being looked up only leaves its addresses out.
+            let _ = peers.all_addrs(&cfg.peers, Instant::now() + ADMIT_WAIT);
+            let (sender, name) = (peers.sender(&cfg, from), peers.borrower(&cfg, from));
+            // The peer it came from by any of its addresses (a record from before they were kept has
+            // none), or the one its source named itself as: it may have resolved elsewhere since.
             migration(host, &req, |source, peer| {
-                peer.map_or_else(|| source == borrower || source.parse::<SocketAddr>().is_ok_and(|a| is_peer(&sender, a.ip())), |p| is_peer(&sender, p))
+                peer.is_some_and(|p| is_peer(&sender, p)) || source == name || source.parse::<SocketAddr>().is_ok_and(|a| is_peer(&sender, a.ip()))
             })
         })(),
         // Its peers by address, those configured by name too, and the one asking.
@@ -1326,11 +1329,16 @@ mod tests {
             let mut r = host.mig_begin(id, "192.0.2.1:7070", None, None).unwrap().with_peer("192.0.2.1".parse().unwrap());
             r.commit(&host.lock().unwrap()).unwrap();
             r.release(None, None).unwrap();
-            let req = json!({"mig": id, "done": true});
-            let other = peers.sender(&host.cfg, "192.0.2.2".parse().unwrap());
-            assert!(migration(&host, &req, |_, p| p.is_some_and(|p| is_peer(&other, p))).is_err());
-            let sender = peers.sender(&host.cfg, from.parse::<SocketAddr>().unwrap().ip());
-            assert!(migration(&host, &req, |_, p| p.is_some_and(|p| is_peer(&sender, p))).is_ok());
+            // The host lock is shared by this process's threads: a parallel test's may make it busy.
+            let ask = |from: &[IpAddr]| loop {
+                match migration(&host, &json!({"mig": id, "done": true}), |_, p| p.is_some_and(|p| is_peer(from, p))) {
+                    Err(e) if e.to_string() == BUSY => continue,
+                    r => break r,
+                }
+            };
+            let e = ask(&peers.sender(&host.cfg, "192.0.2.2".parse().unwrap())).unwrap_err();
+            assert!(e.to_string().contains("only accepted from its source"), "{e}");
+            ask(&peers.sender(&host.cfg, from.parse::<SocketAddr>().unwrap().ip())).unwrap();
             assert_eq!(host.mig_status(id).unwrap(), "released");
             assert_eq!(peers.borrower(&host.cfg, from.parse::<SocketAddr>().unwrap().ip()), "192.0.2.1:7070");
         }
