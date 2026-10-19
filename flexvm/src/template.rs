@@ -1328,20 +1328,30 @@ pub const MAX_MEM_MIB: u64 = 2 << 20;
 pub const MAX_DATA: u64 = 64 << 30;
 /// Room a received generation leaves on its filesystem.
 const KEEP_FREE: u64 = 1 << 30;
-/// Pushes leave another GiB for local checkpoints and suspends. Checkpoint imports keep
-/// using `KEEP_FREE`; received templates from a local import are not peer pushes.
+/// Pushes leave another GiB for local checkpoints and suspends (checkpoint imports keep `KEEP_FREE`).
 const PUSH_FREE: u64 = KEEP_FREE + (1 << 30);
-/// Allocated bytes of unnamed received generations, including arrival holds and uploads
-/// in progress: 32 GiB total, 8 GiB per peer. Named generations and VM/checkpoint records
-/// are exempt. Peer provenance is local, never taken from the sender's metadata.
-const RECEIVED_BUDGET: u64 = 32 << 30;
-const PEER_BUDGET: u64 = RECEIVED_BUDGET / 4;
+/// Where a pushed generation (and its staging) records the peer that pushed it, as this host saw it.
 const PUSH_PEER: &str = "push-peer";
+/// A received generation younger than this is not reclaimed under pressure: its arrival may not hold it yet
+/// (or no longer, past `MAX_HELD`) before it opens it.
+const RECLAIM_AFTER: Duration = Duration::from_secs(300);
 
+/// The budget of spare received generations on a filesystem of `size` bytes, in all and per peer: an eighth
+/// of it, 4 to 128 GiB, and a quarter of that.
+fn received_budget(size: u64) -> (u64, u64) {
+    let total = (size / 8).clamp(4 << 30, 128 << 30);
+    (total, total / 4)
+}
+
+/// A peer's push (`listen`): admitted only within the room `PUSH_FREE` leaves and the budget of spare received
+/// generations (`received_budget`), reclaiming the oldest spares first, within their idle grace too.
 pub struct Push<'a> {
     pub peer: std::net::IpAddr,
+    /// What its source says it sends (`Sending::len`), checked before its data.
     pub bytes: Option<u64>,
     pub in_use: &'a dyn Fn() -> BTreeSet<String>,
+    /// The generations the listener holds for arrivals (open, yet charged).
+    pub held: &'a dyn Fn() -> BTreeSet<String>,
 }
 
 impl Push<'_> {
@@ -1349,38 +1359,65 @@ impl Push<'_> {
         receive_inner(paths, r, id, None, Some(self), ready, |_| Ok(()))
     }
 
-    /// Under both the room and templates locks, through allocation. An upload's staging
-    /// moves to `.gen` under the templates lock too, so it is always charged exactly once.
-    fn check(&self, paths: &Paths, bytes: u64) -> Result<crate::host::Flock> {
+    /// Admits `bytes` more of the push staged in `own` (None before it is), under the room lock (the caller's)
+    /// and the templates lock, returned: held through allocation, so concurrent pushes are charged each other's.
+    fn check(&self, paths: &Paths, bytes: u64, own: Option<&Path>) -> Result<crate::host::Flock> {
+        if bytes > MAX_DATA + MAX_VMSTATE + MAX_META {
+            bail!("{} MiB is past the {} MiB a template may be", bytes >> 20, MAX_DATA >> 20);
+        }
         let lock = templates_lock(paths, libc::LOCK_EX)?;
-        if self.room(paths, bytes).is_ok() {
+        if self.room(paths, bytes, own).is_ok() {
             return Ok(lock);
         }
-        // A killed upload must not keep the budget full before `Staging::new` can sweep it.
+        // What killed receives left, then the spares, oldest first: pressure overrides their idle grace,
+        // never a name, a use, a record or an arrival's `RECLAIM_AFTER`.
         sweep_locked(paths)?;
-        // Pressure overrides the idle grace, but never names, use locks or records.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut spares = vec![];
         for id in generations(&paths.templates)? {
-            if Meta::read(&paths.templates.join(GENERATIONS).join(&id)).is_ok_and(|m| m.received) {
-                let _ = delete_unused(paths, &id, self.in_use)?;
+            let dir = paths.templates.join(GENERATIONS).join(&id);
+            let Ok(m) = std::fs::metadata(&dir) else { continue };
+            if Meta::read(&dir).is_ok_and(|m| m.received) && now.saturating_sub(m.mtime() as u64) >= RECLAIM_AFTER.as_secs() {
+                spares.push((m.mtime(), id));
             }
         }
-        self.room(paths, bytes)?;
+        spares.sort();
+        for (_, id) in spares {
+            if delete_unused(paths, &id, self.in_use)?.is_ok() {
+                crate::log!("template: removed received generation {id} for a push from {}", self.peer);
+                if self.room(paths, bytes, own).is_ok() {
+                    return Ok(lock);
+                }
+            }
+        }
+        self.room(paths, bytes, own)?;
         Ok(lock)
     }
 
-    fn room(&self, paths: &Paths, bytes: u64) -> Result<()> {
-        let (total, peer) = self.usage(paths)?;
-        check_received_budget(total, peer, bytes)?;
-        check_room_with(paths, bytes, PUSH_FREE)
+    fn room(&self, paths: &Paths, bytes: u64, own: Option<&Path>) -> Result<()> {
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        crate::util::check(unsafe { libc::statvfs(crate::util::cpath(&paths.templates)?.as_ptr(), &mut st) })?;
+        let (total, peer) = received_budget(st.f_blocks.saturating_mul(st.f_frsize));
+        let (others, ours, mine) = self.usage(paths, own)?;
+        check_budget(others, ours, mine.saturating_add(bytes), total, peer)?;
+        check_free(st.f_bavail.saturating_mul(st.f_frsize), bytes, PUSH_FREE)
     }
 
-    fn usage(&self, paths: &Paths) -> Result<(u64, u64)> {
+    /// The blocks spares take (unnamed received generations nothing here or in the states sharing the templates
+    /// uses, held for arrivals or open in no VM process) and other pushes' staging: in all, of this peer's (those
+    /// a peer pushed, as `PUSH_PEER` records), and of `own`.
+    fn usage(&self, paths: &Paths, own: Option<&Path>) -> Result<(u64, u64, u64)> {
         let named: BTreeSet<String> = names(&paths.templates)?.into_iter().map(|(_, id)| id).collect();
-        let users = users(paths, self.in_use, false);
+        let (users, held, locks) = (users(paths, self.in_use, false), (self.held)(), crate::host::host_locks()?);
         let mut dirs = vec![];
         for id in generations(&paths.templates)? {
             let dir = paths.templates.join(GENERATIONS).join(&id);
-            if !named.contains(&id) && !users.contains(&id) && Meta::read(&dir).is_ok_and(|m| m.received) {
+            if named.contains(&id) || users.contains(&id) || !Meta::read(&dir).is_ok_and(|m| m.received) {
+                continue;
+            }
+            let Ok(handle) = File::open(&dir) else { continue };
+            let st = crate::util::fstat(handle.as_raw_fd())?;
+            if held.contains(&id) || crate::host::try_lock_at(locks.try_clone()?, &crate::host::use_lock(&st))?.is_some() {
                 dirs.push(dir);
             }
         }
@@ -1390,40 +1427,49 @@ impl Push<'_> {
                 dirs.push(entry.path());
             }
         }
-        let (mut total, mut peer) = (0u64, 0u64);
+        let (mut others, mut ours, mut mine) = (0u64, 0u64, 0u64);
         for dir in dirs {
-            // Older received generations have no provenance: conservatively charge every peer.
+            let size = allocated(&dir)?;
+            if own.is_some_and(|o| o.file_name() == dir.file_name()) {
+                mine = mine.saturating_add(size);
+                continue;
+            }
+            others = others.saturating_add(size);
+            // Only a total for those no peer pushed (a checkpoint's import, or from before `PUSH_PEER`).
             let owner = std::fs::read_to_string(dir.join(PUSH_PEER)).ok().and_then(|p| p.trim().parse::<std::net::IpAddr>().ok());
-            let ours = owner.is_none_or(|p| p.to_canonical() == self.peer.to_canonical());
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            for entry in entries {
-                let entry = entry?;
-                let m = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e.into()),
-                };
-                let size = m.blocks().saturating_mul(512);
-                total = total.saturating_add(size);
-                if ours {
-                    peer = peer.saturating_add(size);
-                }
+            if owner.is_some_and(|p| p.to_canonical() == self.peer.to_canonical()) {
+                ours = ours.saturating_add(size);
             }
         }
-        Ok((total, peer))
+        Ok((others, ours, mine))
     }
 }
 
-fn check_received_budget(total: u64, peer: u64, bytes: u64) -> Result<()> {
-    if total.saturating_add(bytes) > RECEIVED_BUDGET {
-        bail!("unused received template budget exceeded ({} MiB total)", RECEIVED_BUDGET >> 20);
+/// The blocks allocated to the files in `dir` (holes take none), 0 once it is gone.
+fn allocated(dir: &Path) -> Result<u64> {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        r => r?,
+    };
+    let mut size = 0u64;
+    for entry in entries {
+        match entry?.metadata() {
+            Ok(m) => size = size.saturating_add(m.blocks().saturating_mul(512)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    if peer.saturating_add(bytes) > PEER_BUDGET {
-        bail!("unused received template per-peer budget exceeded ({} MiB per peer)", PEER_BUDGET >> 20);
+    Ok(size)
+}
+
+/// A push of `need` bytes, given the spares `others` of which `ours` its peer's, within `total` and `peer`
+/// budgets. One alone (nothing else charged) may be larger: the room it leaves bounds it.
+fn check_budget(others: u64, ours: u64, need: u64, total: u64, peer: u64) -> Result<()> {
+    if others > 0 && others.saturating_add(need) > total {
+        bail!("no room for its {} MiB: received templates not in use take {} MiB of the {} MiB they may", need >> 20, others >> 20, total >> 20);
+    }
+    if ours > 0 && ours.saturating_add(need) > peer {
+        bail!("no room for its {} MiB: templates this peer sent take {} MiB of the {} MiB one peer's may", need >> 20, ours >> 20, peer >> 20);
     }
     Ok(())
 }
@@ -1560,10 +1606,11 @@ fn receive_inner<R: Read>(
     if firecracker.hash != meta.components["firecracker"].hash {
         bail!("template {id} was built with another Firecracker than {}: copy one Firecracker binary to every host", paths.firecracker.display());
     }
-    crate::util::create_dir_durably(&paths.templates, 0o777)?;
     if let Some(push) = push {
+        crate::util::create_dir_durably(&paths.templates, 0o777)?;
+        let parent = crate::host::Directory::open(&paths.templates)?;
         let _room = crate::host::lock_at(crate::host::host_locks()?, ROOM_LOCK, libc::LOCK_EX)?;
-        let _templates = push.check(paths, push.bytes.unwrap_or(0))?;
+        let _templates = push.check(&Paths { templates: parent.path.clone(), ..paths.clone() }, push.bytes.unwrap_or(0), None)?;
     }
     ready(&meta)?;
     let staging = Staging::new(paths, id)?;
@@ -1631,29 +1678,11 @@ fn receive_inner<R: Read>(
     }
     meta.kernel = paths.kernel.clone();
     std::fs::write(staging.dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
-    if let Some(push) = push {
-        // Include the final metadata and provenance blocks before publishing too.
-        let _room = crate::host::lock_at(crate::host::host_locks()?, ROOM_LOCK, libc::LOCK_EX)?;
-        let _templates = push.check(paths, 0)?;
-    }
     finish(r)?;
     let (_, _l) = publish_generation(paths, &staging.dir, libc::LOCK_SH, || Ok(()))?;
     let tpl = Template::open_dir(id, paths.templates.join(GENERATIONS).join(id))?;
     tpl.verify(paths)?;
     Ok(tpl)
-}
-
-/// Whether the templates filesystem has room for a push of `bytes` (what its source says it sends, `Sending::len`),
-/// so one that cannot fit is refused before its data is sent. Each file's blocks are checked again as they are
-/// allocated (`receive_file`).
-fn check_room_with(paths: &Paths, bytes: u64, keep_free: u64) -> Result<()> {
-    if bytes > MAX_DATA + MAX_VMSTATE + MAX_META {
-        bail!("{} MiB is past the {} MiB a template may be", bytes >> 20, MAX_DATA >> 20);
-    }
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    let dir = crate::util::cpath(&paths.templates)?;
-    crate::util::check(unsafe { libc::statvfs(dir.as_ptr(), &mut st) })?;
-    check_free(st.f_bavail.saturating_mul(st.f_frsize), bytes, keep_free)
 }
 
 fn check_free(free: u64, bytes: u64, keep_free: u64) -> Result<()> {
@@ -1704,7 +1733,7 @@ fn receive_file(
     if blocks > *budget {
         bail!("{blocks} bytes of blocks are past the limit");
     }
-    let templates = push.map(|(paths, push)| push.check(paths, blocks)).transpose()?;
+    let templates = push.map(|(paths, push)| push.check(paths, blocks, path.parent())).transpose()?;
     if push.is_none() && st.f_bavail.saturating_mul(st.f_frsize) < blocks + KEEP_FREE {
         bail!("{blocks} bytes of blocks would leave less than {} MiB free", KEEP_FREE >> 20);
     }
@@ -2671,105 +2700,145 @@ pub(crate) mod tests {
         assert_eq!((hash_file(&dense).unwrap().hash, digest(&dense).unwrap()), (c.hash, sha));
     }
 
-    #[test]
-    fn room_is_checked_before_a_push_sends_its_data() {
-        let f = Fixture::new();
-        check_room_with(&f.paths, 1 << 20, PUSH_FREE).unwrap();
-        assert!(check_room_with(&f.paths, MAX_DATA * 2, PUSH_FREE).err().unwrap().to_string().contains("past"));
-        assert!(check_room_with(&f.paths, (1 << 50) - 1, PUSH_FREE).is_err());
+    fn fs_size(dir: &Path) -> u64 {
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::statvfs(crate::util::cpath(dir).unwrap().as_ptr(), &mut st) }, 0);
+        st.f_blocks * st.f_frsize
     }
 
     #[test]
-    fn received_budget_boundaries_and_local_reserve() {
-        assert!(check_received_budget(RECEIVED_BUDGET - 1, PEER_BUDGET - 1, 1).is_ok());
-        assert!(check_received_budget(RECEIVED_BUDGET, 0, 1).unwrap_err().to_string().contains("budget exceeded"));
-        assert!(check_received_budget(PEER_BUDGET, PEER_BUDGET, 1).unwrap_err().to_string().contains("per-peer"));
-        assert!(check_received_budget(u64::MAX, u64::MAX, u64::MAX).is_err());
+    fn push_budgets_and_the_local_reserve() {
+        assert_eq!(received_budget(16 << 30), (4 << 30, 1 << 30));
+        assert_eq!(received_budget(512 << 30), (64 << 30, 16 << 30));
+        assert_eq!(received_budget(64 << 40), (128 << 30, 32 << 30));
+        let (t, p) = (8 << 30, 2 << 30);
+        assert!(check_budget(t - p, p - 1, 1, t, p).is_ok());
+        assert!(check_budget(t, 0, 1, t, p).unwrap_err().to_string().contains("not in use"));
+        assert!(check_budget(p, p, 1, t, p).unwrap_err().to_string().contains("one peer's"));
+        assert!(check_budget(u64::MAX, u64::MAX, u64::MAX, t, p).is_err());
+        // One alone may be larger than either: the room it leaves bounds it.
+        assert!(check_budget(0, 0, 4 * t, t, p).is_ok());
+        assert!(check_budget(1, 0, t, t, p).is_err());
         assert!(check_free(PUSH_FREE + 4096, 4096, PUSH_FREE).is_ok());
         assert!(check_free(PUSH_FREE + 4095, 4096, PUSH_FREE).is_err());
         // Local imports can use the extra GiB reserved from pushes.
         assert!(check_free(PUSH_FREE, 4096, KEEP_FREE).is_ok());
         assert!(check_free(PUSH_FREE, 4096, PUSH_FREE).unwrap_err().to_string().contains("2048 MiB free"));
+        // Past any template: refused before anything is reclaimed.
+        let f = Fixture::new();
+        let none = BTreeSet::new;
+        let push = Push { peer: "192.0.2.1".parse().unwrap(), bytes: None, in_use: &none, held: &none };
+        assert!(push.check(&f.paths, 1 << 50, None).err().unwrap().to_string().contains("past"));
     }
 
     #[test]
-    fn push_usage_counts_peer_blocks_and_active_uploads() {
+    fn push_usage_counts_allocated_blocks_of_spares_holds_and_uploads() {
         let mut f = Fixture::new();
         let (tpl, buf) = sent(&mut f, ROOTFS);
+        let id = tpl.meta.id.clone();
         let (_dir, paths) = elsewhere(&f);
         let peer = "192.0.2.1".parse().unwrap();
         let none = BTreeSet::new;
-        let push = Push { peer, bytes: Some(buf.len() as u64), in_use: &none };
-        let got = push.receive(&paths, &mut &buf[..], &tpl.meta.id, |_| Ok(())).unwrap();
+        let held = || BTreeSet::from([id.clone()]);
+        let push = Push { peer, bytes: Some(buf.len() as u64), in_use: &none, held: &held };
+        let got = push.receive(&paths, &mut &buf[..], &id, |_| Ok(())).unwrap();
         assert_eq!(std::fs::read_to_string(got.fixed.join(PUSH_PEER)).unwrap(), peer.to_string());
-        let (total, ours) = push.usage(&paths).unwrap();
+        let (total, ours, _) = push.usage(&paths, None).unwrap();
         assert!(total > 0 && total == ours, "arrival holds are charged");
+        // Its memory file is 64 MiB long, two pages of it written: blocks, not lengths.
+        assert!(total < 1 << 20, "{total}");
         let other = Push { peer: "192.0.2.2".parse().unwrap(), ..push };
-        assert_eq!(other.usage(&paths).unwrap(), (total, 0));
+        assert_eq!(other.usage(&paths, None).unwrap(), (total, 0, 0));
         let mapped = Push { peer: "::ffff:192.0.2.1".parse().unwrap(), ..push };
-        assert_eq!(mapped.usage(&paths).unwrap(), (total, total));
-        let used = || BTreeSet::from([tpl.meta.id.clone()]);
-        assert_eq!(Push { in_use: &used, ..push }.usage(&paths).unwrap(), (0, 0));
-        std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&tpl.meta.id), paths.templates.join("named")).unwrap();
-        assert_eq!(push.usage(&paths).unwrap(), (0, 0));
+        assert_eq!(mapped.usage(&paths, None).unwrap(), (total, total, 0));
+        // Open, not held: a VM process (or a standby, or another state's) runs it.
+        assert_eq!(Push { held: &none, ..push }.usage(&paths, None).unwrap(), (0, 0, 0));
+        let used = || BTreeSet::from([id.clone()]);
+        assert_eq!(Push { in_use: &used, ..push }.usage(&paths, None).unwrap(), (0, 0, 0));
+        std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&id), paths.templates.join("named")).unwrap();
+        assert_eq!(push.usage(&paths, None).unwrap(), (0, 0, 0));
         std::fs::remove_file(paths.templates.join("named")).unwrap();
+        drop(got);
+        let unheld = Push { held: &none, ..push };
+        assert_eq!(unheld.usage(&paths, None).unwrap(), (total, total, 0), "a spare");
         let staging = Staging::new(&paths, "abcd").unwrap();
         std::fs::write(staging.dir.join(PUSH_PEER), peer.to_string()).unwrap();
         let sparse = File::create(staging.dir.join("mem")).unwrap();
         sparse.set_len(1 << 40).unwrap();
         sparse.write_all_at(&[1; PAGE_SIZE], 0).unwrap();
-        let (active, _) = push.usage(&paths).unwrap();
-        assert!(active > total && active < 1 << 20, "allocated blocks, including concurrent staging, not sparse length");
+        let (active, _, _) = push.usage(&paths, None).unwrap();
+        assert!(active > total && active < 1 << 20, "allocated blocks of an upload, not its length");
+        assert_eq!(push.usage(&paths, Some(&staging.dir)).unwrap().0, total, "its own apart");
         drop(staging);
-        assert_eq!(push.usage(&paths).unwrap(), (total, total));
-        // Legacy receipts remain charged after a listener restart too.
-        std::fs::remove_file(got.fixed.join(PUSH_PEER)).unwrap();
-        let (legacy, _) = push.usage(&paths).unwrap();
-        assert_eq!(other.usage(&paths).unwrap(), (legacy, legacy));
+        assert_eq!(push.usage(&paths, None).unwrap(), (total, total, 0));
+        // No peer pushed it (a checkpoint's, or from before provenance): charged in all only.
+        std::fs::remove_file(paths.templates.join(GENERATIONS).join(&id).join(PUSH_PEER)).unwrap();
+        let (legacy, ours, _) = push.usage(&paths, None).unwrap();
+        assert!(legacy > 0 && ours == 0);
     }
 
     #[test]
     fn understated_or_missing_push_bytes_cannot_bypass_the_peer_budget() {
         let f = Fixture::new();
         let none = BTreeSet::new;
+        let (_, per_peer) = received_budget(fs_size(&f.paths.templates));
         for bytes in [Some(0), None] {
-            let push = Push { peer: "192.0.2.1".parse().unwrap(), bytes, in_use: &none };
+            let push = Push { peer: "192.0.2.1".parse().unwrap(), bytes, in_use: &none, held: &none };
+            // Another upload of this peer's, under way.
+            let other = Staging::new(&f.paths, "abcd").unwrap();
+            std::fs::write(other.dir.join(PUSH_PEER), push.peer.to_string()).unwrap();
             let staging = Staging::new(&f.paths, "abcd").unwrap();
             std::fs::write(staging.dir.join(PUSH_PEER), push.peer.to_string()).unwrap();
-            let len = PEER_BUDGET + PAGE_SIZE as u64;
+            let len = per_peer;
             // Only extent headers: refused before reading or allocating any of the data.
             let stream: Vec<u8> = [len, 1, 0, len].into_iter().flat_map(u64::to_le_bytes).collect();
             let path = staging.dir.join("rootfs");
             let error = receive_file(&mut &stream[..], &path, 0..=MAX_FILE, &mut MAX_DATA.clone(), Some((&f.paths, &push))).unwrap_err();
-            assert!(error.to_string().contains("per-peer"), "{error}");
+            assert!(error.to_string().contains("one peer's"), "{error}");
             assert_eq!(std::fs::metadata(path).unwrap().blocks(), 0);
         }
     }
 
     #[test]
-    fn push_pressure_reclaims_fresh_receipts_but_keeps_names_records_and_open_ones() {
+    fn push_pressure_reclaims_spares_but_keeps_names_records_open_and_fresh_ones() {
         let f = Fixture::new();
-        for (name, id, received) in [("idle", "aaaa", true), ("named", "bbbb", true), ("used", "cccc", true), ("open", "dddd", true), ("built", "eeee", false)]
-        {
+        let ids = [
+            ("idle", "aaaa", true),
+            ("named", "bbbb", true),
+            ("used", "cccc", true),
+            ("open", "dddd", true),
+            ("built", "eeee", false),
+            ("fresh", "ffff", true),
+        ];
+        for (name, id, received) in ids {
             publish_as(&f, name, &Meta { id: id.into(), received, ..f.meta.clone() });
             if name != "named" {
                 std::fs::remove_file(f.paths.templates.join(name)).unwrap();
             }
+            if name != "fresh" {
+                let t = libc::timespec { tv_sec: unsafe { libc::time(std::ptr::null_mut()) } - RECLAIM_AFTER.as_secs() as i64, tv_nsec: 0 };
+                let p = crate::util::cpath(&f.paths.templates.join(GENERATIONS).join(id)).unwrap();
+                assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, p.as_ptr(), [t, t].as_ptr(), 0) }, 0);
+            }
         }
         let open = Template::open_dir("dddd", f.paths.templates.join(GENERATIONS).join("dddd")).unwrap();
         let used = || BTreeSet::from(["cccc".into()]);
-        let push = Push { peer: "192.0.2.1".parse().unwrap(), bytes: None, in_use: &used };
+        let none = BTreeSet::new;
+        let push = Push { peer: "192.0.2.1".parse().unwrap(), bytes: None, in_use: &used, held: &none };
         assert!(collect(&f.paths, RECEIVED_IDLE, &used).unwrap().is_empty());
         let abandoned = f.paths.templates.join(format!(".ffff.new-{}", crate::util::random_hex(8).unwrap()));
         std::fs::create_dir(&abandoned).unwrap();
         std::fs::write(abandoned.join(PUSH_PEER), push.peer.to_string()).unwrap();
-        // A request one byte beyond its share forces reclamation, then gets a clear refusal.
-        assert!(push.check(&f.paths, PEER_BUDGET + 1).err().unwrap().to_string().contains("per-peer"));
-        assert_eq!(generations(&f.paths.templates).unwrap(), ["bbbb", "cccc", "dddd", "eeee"]);
+        // Past what the spares that may go leave: reclaimed, then refused.
+        let (total, _) = received_budget(fs_size(&f.paths.templates));
+        assert!(push.check(&f.paths, total, None).err().unwrap().to_string().contains("not in use"));
+        assert_eq!(generations(&f.paths.templates).unwrap(), ["bbbb", "cccc", "dddd", "eeee", "ffff"]);
         assert!(!abandoned.exists(), "a killed upload's staging is reclaimed too");
+        // What fits is admitted.
+        drop(push.check(&f.paths, 1 << 20, None).unwrap());
         drop(open);
         let unknown = || BTreeSet::from([format!("{KEEP_ALL}unreadable checkpoint")]);
-        assert!(Push { in_use: &unknown, ..push }.check(&f.paths, PEER_BUDGET + 1).is_err());
+        assert!(Push { in_use: &unknown, ..push }.check(&f.paths, total, None).is_err());
         assert!(Template::generation(&f.paths, "dddd").is_some());
     }
 

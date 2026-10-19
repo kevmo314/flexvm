@@ -893,8 +893,8 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         }
         answer(&Ok(json!({"have": false, "ack": ack})))?;
         asked = true;
-        let in_use = || host.template_users();
-        let push = crate::template::Push { peer: conn.peer_addr()?.ip(), bytes: req["bytes"].as_u64(), in_use: &in_use };
+        let (in_use, held) = (|| host.template_users(), || HELD.lock().unwrap().keys().cloned().collect());
+        let push = crate::template::Push { peer: conn.peer_addr()?.ip(), bytes: req["bytes"].as_u64(), in_use: &in_use, held: &held };
         let ready = |_: &crate::template::Meta| {
             if ack {
                 answer(&Ok(json!({"go": true})))?;
