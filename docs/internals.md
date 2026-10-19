@@ -500,7 +500,11 @@ space less 1 GiB, the template within `template::receive`'s): it takes no path
 from the archive. It holds one checkpoint's metadata at a time, so it applies no
 budget of the chain's: `chain_meta_budget` scales with the loading host's memory,
 and would refuse a save from a larger host. A restore applies it (and the load
-warns when the chain is over it here). The header's ids are
+warns when the chain is over it here). Each member is held whole while checked,
+so none may be over it (one that is could not be restored here either): a forged
+length exhausts no memory. A publication that fails is undone, except where a
+manifest or name may stay (its revocation or removal failed): then the chain it
+builds on is kept whole, for `rm` to remove. The header's ids are
 checked first (16 hex digits, distinct, at most `MAX_CHAIN`; the template's a
 content id), and a name another checkpoint has is refused then. Each checkpoint
 is verified as `Link::open` and `PageFile::read` would (its manifest's checksum

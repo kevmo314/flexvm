@@ -17,7 +17,7 @@ use super::{
     bail,
     chain::{chain_ids, chain_meta_budget, read_at},
     format::{parse_pagemap, sum, DATA, MAX_VMSTATE},
-    open_at, open_dir_at, read_manifest, store, Checkpoint, Manifest, Parent, Staging, FORMAT, FORMAT_INCREMENTAL, MAX_CHAIN,
+    open_at, open_dir_at, read_manifest, store, Checkpoint, CommitError, Manifest, Parent, Staging, FORMAT, FORMAT_INCREMENTAL, MAX_CHAIN,
 };
 use crate::{
     template::{self, Paths, Template},
@@ -588,8 +588,8 @@ fn has(dir: &Path, files: &[(&str, Option<Vec<u8>>)]) -> bool {
 /// Reads checkpoint `id` (`chain[i]`), whose parent the chain says is `parent` (the source's id and
 /// the one it has here), and its run settings if `spec`, verifying it as `Link::open` and
 /// `PageFile::read` do: each file within its limit, its pages against their checksums. Its parent
-/// is named `../ID` here, the store's way. One checkpoint's metadata is held at a time, so no
-/// budget of the chain's is needed here (a restore applies its host's).
+/// is named `../ID` here, the store's way. One checkpoint's metadata is held at a time, so the
+/// chain's is not limited here (a restore applies its host's budget), only each file's.
 fn receive(
     src: &mut Source,
     store_dir: &Path,
@@ -601,8 +601,12 @@ fn receive(
 ) -> Result<Loaded> {
     let bad = |why: &str| format!("checkpoint {id}: {why}");
     digest.checkpoint(id);
+    // Each member is held whole in memory as it is checked: none past what a restore here reads of a
+    // whole chain, so a forged length exhausts no memory (and none a restore here could not open is lost).
+    let room = chain_meta_budget();
     let take = |len: u64, max: u64, what: &str| -> Result<()> {
         ensure!(len <= max, "{}", bad(&format!("its {what} is too long")));
+        ensure!(len <= room, "{}", bad(&format!("its {what} has more than the {} MiB of metadata a restore here reads", room >> 20)));
         Ok(())
     };
     let len = src.member(&checkpoint_member(id, "manifest.json"))?;
@@ -886,6 +890,19 @@ fn import(
     Ok(json!({"loaded": id, "name": name, "chain": loaded.len(), "stored": stored, "template_id": tid, "template": how.as_str(), "sha256": sha}))
 }
 
+/// Why `publish` failed: undoing what it published, or keeping it (`Keep`), as it may be in use.
+enum Abort {
+    Undo(crate::util::Error),
+    /// A checkpoint or name may stay (not durably removed): what it needs stays too.
+    Keep(crate::util::Error),
+}
+
+impl<E: Into<crate::util::Error>> From<E> for Abort {
+    fn from(e: E) -> Self {
+        Abort::Undo(e.into())
+    }
+}
+
 /// Publishes the chain `loaded` (oldest first) and names its head `name`: its id, and how many of it
 /// were stored. Under the store's lock, exclusive: nothing is published (another load's, which may
 /// revoke it) or removed (`rm`, `prune`) meanwhile. Whatever is under an id now, found before or
@@ -895,7 +912,7 @@ fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> Result<(S
     let _lock = store::lock(state, libc::LOCK_EX)?;
     let store_dir = store::dir(state);
     let mut published = vec![];
-    let done = (|| -> Result<String> {
+    let done = (|| -> std::result::Result<String, Abort> {
         for l in loaded.iter_mut() {
             let dest = store_dir.join(&l.id);
             match std::fs::symlink_metadata(dest.join("manifest.json")) {
@@ -911,8 +928,13 @@ fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> Result<(S
                         crate::util::sync_dir(&store_dir)?;
                     }
                     let s = l.staging.take().ok_or_else(|| format!("checkpoint {} here was removed as this one loaded; load it again", l.id))?;
-                    ensure!(s.publish_as(&l.id)?, "checkpoint {} was published as this one loaded; load it again", l.id);
-                    published.push(l.id.clone());
+                    match s.publish_as(&l.id) {
+                        Ok(true) => published.push(l.id.clone()),
+                        Ok(false) => bail!("checkpoint {} was published as this one loaded; load it again", l.id),
+                        Err(CommitError::Failed(e)) => return Err(e.into()),
+                        // Its manifest may stay: what it builds on stays too, whole.
+                        Err(CommitError::Uncertain(e)) => return Err(Abort::Keep(e)),
+                    }
                 }
                 Err(e) => return Err(io::Error::new(e.kind(), format!("checking checkpoint {}: {e}", dest.display())).into()),
             }
@@ -924,14 +946,24 @@ fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> Result<(S
         ensure!(!tests::FAIL_NAMING.get(), "injected: naming it failed");
         if let Some(n) = name {
             if named(state, n).as_deref() != Some(id.as_str()) {
-                store::link(state, n, &id)?;
+                if let Err(e) = store::link(state, n, &id) {
+                    // Perhaps linked, not durably: it goes before what it names, or that stays.
+                    if named(state, n).as_deref() == Some(id.as_str()) {
+                        if let Err(u) = crate::util::unlink_durably(&store::dir(state).join("names").join(n)) {
+                            return Err(Abort::Keep(format!("{e}; removing the name failed too: {u}").into()));
+                        }
+                    }
+                    return Err(e.into());
+                }
             }
         }
         Ok(id)
     })();
     match done {
         Ok(id) => Ok((id, published.len())),
-        Err(e) => {
+        Err(Abort::Keep(e)) if published.is_empty() => Err(e),
+        Err(Abort::Keep(e)) => Err(format!("{e} (the checkpoints it published are kept, whole: flexvm checkpoint rm removes them)").into()),
+        Err(Abort::Undo(e)) => {
             published.reverse();
             match store::unpublish(state, &published) {
                 Ok(()) => Err(e),
@@ -1416,5 +1448,35 @@ mod tests {
         let mut q = Pinned::open(&dir).unwrap();
         q.compare("gone", None);
         assert!(!q.equal);
+    }
+
+    #[test]
+    fn a_member_past_what_a_restore_here_reads_is_refused_before_it_is_read() {
+        let (_dir, paths, tpl, _state, _, _) = saved();
+        let scratch = fresh(&paths);
+        let room = chain_meta_budget();
+        // A manifest whose page map is as long as its (forged) guest memory allows, and longer than that.
+        let id = stored(&scratch.state, &tpl, None, 0, &[1], |m| {
+            m.guest_pages = MAX_GUEST_PAGES;
+            m.files.get_mut("pagemap").unwrap().len = room + 1;
+        });
+        let dir = store::dir(&scratch.state).join(&id);
+        let header = serde_json::to_vec(&json!({"format": 1, "id": id, "name": null, "chain": [id], "template_id": tpl.meta.id, "template": false})).unwrap();
+        let mut tar = forged(&[
+            (HEADER, header),
+            (&checkpoint_member(&id, "manifest.json"), fs::read(dir.join("manifest.json")).unwrap()),
+            (&checkpoint_member(&id, "vmstate"), b"state".to_vec()),
+        ]);
+        // Its header alone: its bytes are never sent, nor needed.
+        tar.truncate(tar.len() - 2 * BLOCK);
+        let mut h = tar::Header::new_gnu();
+        h.set_path(checkpoint_member(&id, "pagemap")).unwrap();
+        h.set_size(room + 1);
+        h.set_cksum();
+        tar.extend_from_slice(h.as_bytes());
+        let b = fresh(&paths);
+        let e = load_bytes(&b, &tar, None).err().unwrap().to_string();
+        assert!(e.contains("a restore here reads"), "{e}");
+        assert!(nothing(&b));
     }
 }
