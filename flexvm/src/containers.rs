@@ -222,6 +222,11 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
                 f.rewind()?;
             }
         }
+        // Removed with its VM (`rm`): a later VM of the name has a log of its own.
+        let removed = cur.as_ref().is_some_and(|f| f.metadata().is_ok_and(|m| m.nlink() == 0));
+        if removed && !host.alive(name) && !host.is_suspended(name) {
+            return Ok(());
+        }
         // Rotated (or removed and made again): what was written before the rename is drained, then the new one.
         let now = std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
         if now.is_some() && now != cur.as_ref().and_then(ino) {
@@ -797,6 +802,25 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || tx.send(logs(&host, "job", true, Some(1)).is_ok()));
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "logs -f of an exited vm ends");
+    }
+
+    #[test]
+    fn logs_follow_of_a_removed_vm_ends_before_its_name_runs_again() {
+        let root = TempDir::new("logs-removed");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        std::fs::write(host.vms("job", "log").unwrap(), b"old\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follower = host.clone();
+        std::thread::spawn(move || tx.send(logs(&follower, "job", true, Some(1)).is_ok()));
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        // `rm -f`: the VM ends, its logs go; a new VM of the name starts a fresh log soon after.
+        drop(name);
+        std::fs::remove_file(host.vms("job", "log").unwrap()).unwrap();
+        std::thread::sleep(FOLLOW_EVERY * 3);
+        let _again = host.take_name("job", false).unwrap();
+        std::fs::write(host.vms("job", "log").unwrap(), b"new\n").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "logs -f of a removed vm ends");
     }
 
     #[test]

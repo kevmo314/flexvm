@@ -1355,7 +1355,8 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     if host.entry(name).is_ok_and(|e| e.state == "source") {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
     }
-    if let Ok(vm) = host.signal(name, libc::SIGINT) {
+    let killed = host.signal(name, libc::SIGINT).ok();
+    if let Some(vm) = &killed {
         if !vm.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
         }
@@ -1363,18 +1364,14 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
             return Err(format!("vm {name} moved to {to} before the kill took; kill it there").into());
         }
-        // `rm -f` also removes logs and any exit or suspend record that won the race,
-        // holding the name until all are gone.
-        if stopped {
-            return remove_stopped(host, name, true).and_then(|()| done());
-        }
-        // A suspend that finished first is undone: the kill wins.
-        if !host.suspended(name)?.exists() {
-            return done();
-        }
     }
+    // `rm -f` also removes logs and any exit or suspend record that won the race, under the name.
     if stopped {
-        return remove_stopped(host, name, records()?).and_then(|()| done());
+        return remove_stopped(host, name, killed.is_some() || records()?).and_then(|()| done());
+    }
+    // A suspend that finished first is undone: the kill wins.
+    if killed.is_some() && !host.suspended(name)?.exists() {
+        return done();
     }
     if host.suspended(name)?.exists() {
         let _lock = host.take_name(name, true)?;
