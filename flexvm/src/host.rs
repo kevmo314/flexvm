@@ -1698,7 +1698,8 @@ impl Host {
             format!("{e}: memory held for migrations and restores still arriving cannot be counted")
         })?;
         let (debits, taken) = self.recent_debits(l, now);
-        if debits.is_none() {
+        // An unreadable ledger unwritten for its window has expired (0 taken): admission and `take_room`'s rewrite go on.
+        if debits.is_none() && taken == u64::MAX {
             bail!("debits unreadable: {}: checkpoint memory still arriving cannot be counted", self.debits().display());
         }
         let pending = pending(&grants, &held).saturating_add(taken);
@@ -7580,6 +7581,12 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("debits unreadable"));
         assert!(load::<Grants>(&h.grants()).unwrap().unwrap_or_default().is_empty());
         assert!(!locks(&h.run).join(format!("release-{}", boot_id())).exists(), "no release request for an unreadable ledger");
+        // Unwritten for its window, the unreadable ledger has expired: admission goes on, and a take rewrites it.
+        let stale = SystemTime::now() - Duration::from_millis(debit_window_ms() + 1000);
+        std::fs::File::options().write(true).open(h.debits()).unwrap().set_modified(stale).unwrap();
+        assert!(h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
+        assert!(h.take_room_inner(1, || Some(AVAIL), || ()).1.is_some());
+        assert!(load::<Debits>(&h.debits()).is_ok(), "the take rewrote the ledger");
         std::fs::remove_file(h.debits()).unwrap();
         assert!(h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).unwrap().is_ok());
     }

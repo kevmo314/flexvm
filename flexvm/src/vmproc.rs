@@ -2471,16 +2471,25 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
             "tick"
         };
         crate::info!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
+        // Restored and refunded only if the plug provably did not happen: never sent, or answered with an error and
+        // Firecracker still reports the old request (a send that got no answer may yet be acted on).
+        let mut undone = false;
         let result = vm.fc(|fc| {
             let patch = || fc.patch("/hotplug/memory", json!({"requested_size_mib": new}));
+            let unapplied = |e: &crate::util::Error| {
+                undone = crate::fc::not_sent(e)
+                    || (e.downcast_ref::<std::io::Error>().is_none()
+                        && fc.get("/hotplug/memory").ok().and_then(|hp| hp["requested_size_mib"].as_u64()) == Some(requested));
+                undone
+            };
             if new > requested {
-                vm.limit.plug_with(meta.mem_mib + new, if refused { 0 } else { plan.charge }, patch)
+                vm.limit.plug_with(meta.mem_mib + new, if refused { 0 } else { plan.charge }, patch, unapplied)
             } else {
                 patch()
             }
         });
         if let Err(e) = result {
-            if let Some(id) = grant {
+            if let Some(id) = grant.filter(|_| undone) {
                 host.refund(id);
             }
             return Err(e);

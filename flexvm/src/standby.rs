@@ -511,14 +511,23 @@ pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
 /// refilled: a host with no running VM has no controller to stop it (#600). A running
 /// VM's controller stops them first (`vmproc::relieve`), holding eviction off meanwhile.
 /// Keep the stop lock through cleanup: the next standby reads MemAvailable after this one's memory goes back.
-fn under_reserve(host: &Host, template: &str) -> Option<Flock> {
+fn under_reserve(host: &Host, template: &str) -> Option<Option<Flock>> {
     under_reserve_with(host, template, crate::vmproc::host_available_mib)
 }
 
-fn under_reserve_with(host: &Host, template: &str, available: impl Fn() -> Option<u64>) -> Option<Flock> {
-    let lock = Flock::new(stop_lock(host).ok()?, libc::LOCK_EX | libc::LOCK_NB).ok()?;
-    let mut avail = available()?;
+/// Some (the stop lock, if it could be opened) when it leaves. Above the reserve the lock is not taken, so ticks do
+/// not hold off refills or relief; an unopenable lock leaves unserialized rather than not at all.
+fn under_reserve_with(host: &Host, template: &str, available: impl Fn() -> Option<u64>) -> Option<Option<Flock>> {
     let reserve = host.config_now().reserve();
+    if available()? >= reserve {
+        return None;
+    }
+    let lock = match stop_lock(host) {
+        Ok(f) => Some(Flock::new(f, libc::LOCK_EX | libc::LOCK_NB).ok()?),
+        Err(_) => None,
+    };
+    // Read again under the lock: another standby may have left meanwhile.
+    let mut avail = available()?;
     // Memory VM processes keep for their next checkpoint goes back first (#648).
     if avail < reserve {
         crate::hostmem::release_kept(host, None);
@@ -1306,8 +1315,17 @@ mod tests {
     fn standbys_leave_one_at_a_time_and_read_room_again() {
         let (_dir, mut host) = crate::host::tests::host("standby-reserve");
         host.cfg.reserve_mib = Some(100);
-        let first = under_reserve_with(&host, "first", || Some(99)).unwrap();
-        assert!(under_reserve_with(&host, "second", || panic!("the first standby is still stopping")).is_none());
+        assert!(under_reserve_with(&host, "above", || Some(100)).is_none());
+        let above = Flock::new(stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        drop(above);
+        let first = under_reserve_with(&host, "first", || Some(99)).unwrap().unwrap();
+        let reads = std::cell::Cell::new(0);
+        let second = || {
+            reads.set(reads.get() + 1);
+            assert_eq!(reads.get(), 1, "the first standby is still stopping");
+            Some(99)
+        };
+        assert!(under_reserve_with(&host, "second", second).is_none());
         drop(first);
         assert!(under_reserve_with(&host, "second", || Some(101)).is_none(), "the first freed enough memory");
         assert!(under_reserve_with(&host, "second", || Some(99)).is_some(), "still short: another leaves");
