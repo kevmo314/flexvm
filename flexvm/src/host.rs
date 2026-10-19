@@ -825,8 +825,9 @@ impl Host {
         if !resuming && self.has_record(name, "exited") {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
+        // A new VM of a failed or lost one's name starts a fresh log; a resume (`start`) keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
-        if ["failed", "lost"].iter().any(|ext| self.has_record(name, ext)) {
+        if !resuming && ["failed", "lost"].iter().any(|ext| self.has_record(name, ext)) {
             for ext in ["log", "log.1"] {
                 let _ = std::fs::remove_file(self.vms(name, ext)?);
             }
@@ -5057,7 +5058,9 @@ pub(crate) mod tests {
             }
         }
         std::fs::write(h.vms("web", "log").unwrap(), "resume").unwrap();
+        std::fs::write(h.vms("web", "failed").unwrap(), "died resuming").unwrap();
         let _name = h.take_name("web", true).unwrap();
+        assert!(!h.has_record("web", "failed"));
         assert_eq!(std::fs::read_to_string(h.vms("web", "log").unwrap()).unwrap(), "resume");
     }
 
