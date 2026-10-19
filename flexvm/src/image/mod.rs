@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -177,9 +177,9 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
         Some(init) => std::fs::read(init).map_err(|e| format!("flexvm-init at {init:?}: {e}"))?,
         None => crate::artifacts::INIT.to_vec(),
     };
-    // Rebuild older cached images with Docker's explicit-group semantics and protected app config.
+    // Rebuild older cached images that lost the image root's metadata.
     let key = json!({
-        "v": 3, "config": img.config_digest, "diff_ids": img.diff_ids,
+        "v": 4, "config": img.config_digest, "diff_ids": img.diff_ids,
         "init": sha256_hex(&init_bytes), "options": o,
     });
     let key = sha256_hex(key.to_string().as_bytes());
@@ -712,6 +712,7 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
             let mut root = Root::from_fd(work, *limits);
             unpack_layers(&mut root, img)?;
             let conf = inject(&mut root, app, init)?;
+            root.restore_root_metadata()?;
             interrupted()?;
             mkfs(&path, root.entries, dest)?;
             Ok(conf)
@@ -842,12 +843,25 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
     let image = create_new(dest)?;
     image.set_len(mib << 20)?;
+    let meta = std::fs::metadata(dir)?;
+    // root_owner is in every mke2fs we support; root_perms only since e2fsprogs 1.47.1.
+    let root = format!("root_owner={}:{}", meta.uid(), meta.gid());
+    let image_path = format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd());
     let mut cmd = Command::new("mkfs.ext4");
     cmd.args(["-q", "-F", "-b", "4096", "-I", "256", "-L", "flexroot", "-N", &inodes.to_string(), "-d"]);
-    cmd.arg(dir).arg(format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd()));
+    cmd.arg(dir).args(["-E", &root]).arg(&image_path);
     let out = run_until(&mut cmd, interrupted).map_err(|e| format!("mkfs.ext4: {e}"))?;
     if !out.status.success() {
         bail!("mkfs.ext4 failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    // Root xattrs come with -d (from 1.45.7); its mode and mtime are set here, as older mke2fs can't.
+    for (field, value) in [("mode", format!("0{:o}", libc::S_IFDIR | (meta.mode() & 0o7777))), ("mtime", format!("@{}", meta.mtime()))] {
+        let out = run_until(Command::new("debugfs").args(["-w", "-R", &format!("set_inode_field / {field} {value}"), &image_path]), interrupted)?;
+        // debugfs also reports command errors on stderr with a successful exit status.
+        let errors = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() || errors.lines().any(|line| !line.starts_with("debugfs ")) {
+            bail!("debugfs setting root {field} failed: {}", errors.trim());
+        }
     }
     crate::log!("image: root filesystem built ({mib} MiB, {entries} entries)");
     Ok(())
@@ -1051,6 +1065,77 @@ mod tests {
         }
         // 24 bytes for dot entries, 264 per long name, doubled for headroom.
         assert_eq!(ext4_extra_kib(&dir).unwrap(), 52);
+    }
+
+    #[test]
+    fn layer_root_metadata_survives_ext4_build() {
+        let dir = tmpdir("root-metadata");
+        let staging = dir.join("root");
+        std::fs::create_dir(&staging).unwrap();
+        let mut root = Root::open(&staging, Limits::default()).unwrap();
+        // Exercise 1000:1000 as root or the usual developer user; other users use their own IDs.
+        let uid = if unsafe { libc::geteuid() } == 0 { 1000 } else { unsafe { libc::geteuid() } };
+        let gid = if unsafe { libc::geteuid() } == 0 { 1000 } else { unsafe { libc::getegid() } };
+        for (path, mode, mtime, note) in [("./", 0o750, 1234567890, "first"), (".", 0o770, 1234567891, "middle"), ("/", 0o700, 1234567892, "last")] {
+            let mut layer = tar::Builder::new(Vec::new());
+            let acl = |mask| {
+                let mut acl = 2u32.to_le_bytes().to_vec();
+                for (tag, perm, id) in [(1u16, 7u16, u32::MAX), (2, 5, uid), (4, 5, u32::MAX), (16, mask, u32::MAX), (32, 0, u32::MAX)] {
+                    acl.extend_from_slice(&tag.to_le_bytes());
+                    acl.extend_from_slice(&perm.to_le_bytes());
+                    acl.extend_from_slice(&id.to_le_bytes());
+                }
+                acl
+            };
+            let (access, default) = (acl((mode >> 3) as u16 & 7), acl(5));
+            layer
+                .append_pax_extensions([
+                    ("SCHILY.xattr.user.note", note.as_bytes()),
+                    ("SCHILY.xattr.system.posix_acl_access", access.as_slice()),
+                    ("SCHILY.xattr.system.posix_acl_default", default.as_slice()),
+                ])
+                .unwrap();
+            let mut h = tar::Header::new_ustar();
+            // The tar builder refuses absolute paths, so spell the root header verbatim.
+            h.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_mode(mode);
+            h.set_uid(uid as u64);
+            h.set_gid(gid as u64);
+            h.set_mtime(mtime);
+            h.set_size(0);
+            h.set_cksum();
+            layer.get_mut().extend_from_slice(h.as_bytes());
+            layer.get_mut().extend_from_slice(&unpack::tests::layer(&[("child", 'f', "data")]));
+            root.apply_layer(layer.into_inner().unwrap().as_slice()).unwrap();
+            let expected = (uid, gid, mode, mtime as i64);
+            let metadata = || {
+                let meta = std::fs::metadata(&staging).unwrap();
+                (meta.uid(), meta.gid(), meta.mode() & 0o7777, meta.mtime())
+            };
+            assert_eq!(metadata(), expected);
+            // A layer without a root entry keeps the previous layer's root metadata.
+            root.apply_layer(unpack::tests::layer(&[("later", 'f', "data")]).as_slice()).unwrap();
+            assert_eq!(metadata(), expected);
+            // Injection must not change the final root timestamp either.
+            root.write_file("injected", b"init", 0o755).unwrap();
+            root.restore_root_metadata().unwrap();
+            assert_eq!(metadata(), expected);
+            let dest = dir.join(format!("{note}.ext4"));
+            mkfs(&staging, root.entries, &dest).unwrap();
+            // debugfs's root edits keep the inode checksum valid.
+            let fsck = Command::new("e2fsck").arg("-fn").arg(&dest).output().unwrap();
+            assert!(fsck.status.success(), "{}", String::from_utf8_lossy(&fsck.stdout));
+            let out = Command::new("debugfs").args(["-R", "stat /"]).arg(&dest).output().unwrap();
+            assert!(out.status.success());
+            let stat = String::from_utf8(out.stdout).unwrap();
+            assert!(stat.contains(&format!("Mode:  {mode:04o}")), "{stat}");
+            assert!(stat.contains(&format!("User: {uid:5}   Group: {gid:5}")), "{stat}");
+            assert!(stat.contains(&format!("mtime: 0x{mtime:08x}")), "{stat}");
+            assert!(stat.contains("system.posix_acl_default"), "{stat}");
+            assert!(stat.contains("system.posix_acl_access"), "{stat}");
+            assert!(stat.contains(&format!("user.note ({}) = \"{note}\"", note.len())), "{stat}");
+        }
     }
 
     #[test]
@@ -1752,7 +1837,7 @@ mod tests {
         std::fs::write(&init, b"init").unwrap();
         let o = Options { image, ..Options::default() };
         let config_value: Value = serde_json::from_str(&config).unwrap();
-        let key = json!({"v": 3, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
+        let key = json!({"v": 4, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();
