@@ -72,8 +72,11 @@ in_history() {
 # Not pinned yet. Stale if the tag exists at a commit with other inputs (its release is, or will be, built from
 # them); else pending, for how long since ARTIFACTS_TAG came to name it on this branch (its first-parent history:
 # when a pull request merged, not when its commit was written).
-pending() {
-  local ours=$1 tagged status=0 since age tree theirs
+pending() (
+  local ours=$1 tagged status=0 since age tree= theirs
+  trap 'rm -rf -- "$tree"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   tagged=$(tag_commit) || status=$?
   if [ "$status" = 1 ]; then return 1; fi
   if [ "$status" = 0 ]; then
@@ -82,10 +85,8 @@ pending() {
     if ! { git -C "$root" archive "$tagged" .github scripts firecracker | tar -x -C "$tree"; } ||
       ! theirs=$("$tree/scripts/pin-artifacts.sh" --inputs); then
       echo "cannot tell what $ARTIFACTS_TAG at $tagged is built from" >&2
-      rm -rf -- "$tree"
       return 1
     fi
-    rm -rf -- "$tree"
     if [ "$theirs" != "$ours" ]; then
       echo "$ARTIFACTS_TAG is tagged at $tagged, whose inputs differ from this checkout's: bump ARTIFACTS_TAG in scripts/versions.sh (RELEASING in README.md)" >&2
       diff <(printf '%s\n' "$theirs") <(printf '%s\n' "$ours") >&2 || true
@@ -104,7 +105,7 @@ pending() {
   echo "pending for ${age} h (the window is ${RELEASE_WINDOW_HOURS} h)" >&2
   if [ "$age" -ge "$RELEASE_WINDOW_HOURS" ]; then return 4; fi
   return 3
-}
+)
 
 case "${1:-}" in
   --inputs)

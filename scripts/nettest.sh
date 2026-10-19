@@ -76,7 +76,8 @@ teardown() {
     pids=$(our_processes)
     # PID-START, read before the kill: the cgroups are named after the instance.
     for pid in $pids; do ids+=" $pid-$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f20)"; done
-    for pid in $pids; do kill -9 "$pid" 2>/dev/null; done
+    for pid in "${listener_pids[@]}" $pids; do kill -9 "$pid" 2>/dev/null; done
+    for pid in "${listener_pids[@]}"; do wait "$pid" 2>/dev/null; done
     sleep 1
     for ns in "${P}A" "${P}B" "${P}C" "${P}lan"; do ip netns del "$ns" 2>/dev/null; done
     # Each VM process's Firecracker had a cgroup named after the process (`idle-PID-START-N`).
@@ -120,8 +121,9 @@ start_listener() {
     printf '{"peers": ["%s"], "vm_ips": "%s", "cluster_ips": "%s"}\n' "$peer" "$ips" "$NET.128-$NET.250" > "$dir/state/host.json.tmp"
     chmod 644 "$dir/state/host.json.tmp"
     mv -f "$dir/state/host.json.tmp" "$dir/state/host.json"
-    cli "$ns" "$dir" listen "$listen" > "$work/listen-$ns.log" 2>&1 &
-    listener_pids+=($!)
+    ip netns exec "$ns" sh -c 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"' sh \
+        "$flexvm" --state "$dir/state" --run "$dir/run" listen "$listen" > "$work/listen-$ns.log" 2>&1 &
+    listener_pids+=("$!")
 }
 start_listener "${P}A" "$dir_A" "$host_A" "$host_B" "$NET.128-$NET.191"
 start_listener "${P}B" "$dir_B" "$host_B" "$host_A" "$NET.192-$NET.250"
