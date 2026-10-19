@@ -76,7 +76,7 @@ pub struct Holder {
 
 #[derive(Default)]
 struct Stragglers {
-    packets: VecDeque<(Ipv4Addr, Instant, Vec<u8>)>,
+    packets: VecDeque<(Ipv4Addr, Gone, Vec<u8>)>,
     draining: bool,
 }
 
@@ -613,30 +613,50 @@ impl Holder {
         }
         p[8] -= 1;
         let mut q = self.stragglers.lock().unwrap();
-        q.packets.push_back((ip, g.at, p.to_vec()));
+        q.packets.push_back((ip, Gone { resent: 1, dropped: 0, ..*g }, p.to_vec()));
         !std::mem::replace(&mut q.draining, true)
     }
 
     fn drain_stragglers(&self, mut send: impl FnMut(Ipv4Addr, &[u8]) -> bool) {
+        // Counts whose record went meanwhile, one report per run of a record's packets.
+        let mut orphaned: Option<(Ipv4Addr, Gone)> = None;
         loop {
-            let (ip, at, p) = {
+            let next = {
                 let mut q = self.stragglers.lock().unwrap();
-                match q.packets.pop_front() {
-                    Some(p) => p,
-                    None => {
-                        q.draining = false;
-                        return;
+                let next = q.packets.pop_front();
+                q.draining = next.is_some();
+                next
+            };
+            let Some((ip, count, p)) = next else { break };
+            let sent = send(ip, &p);
+            let Some(c) = self.count_straggler(ip, count, sent) else { continue };
+            match &mut orphaned {
+                Some((o, g)) if *o == ip && g.at == c.at => (g.resent, g.dropped) = (g.resent + c.resent, g.dropped + c.dropped),
+                _ => {
+                    if let Some((o, g)) = orphaned.replace((ip, c)) {
+                        report(o, &self.dev, &g);
                     }
                 }
-            };
-            let sent = send(ip, &p);
-            // A new hold or release may have replaced this address while sending.
-            if let Some(g) = self.gone.lock().unwrap().get_mut(&ip).filter(|g| g.at == at) {
-                match sent {
-                    true => g.resent += 1,
-                    false => g.dropped += 1,
-                }
             }
+        }
+        if let Some((ip, g)) = orphaned {
+            report(ip, &self.dev, &g);
+        }
+    }
+
+    /// Returns counts to report here if a new hold or expiry removed the original record.
+    fn count_straggler(&self, ip: Ipv4Addr, mut count: Gone, sent: bool) -> Option<Gone> {
+        if !sent {
+            (count.resent, count.dropped) = (0, 1);
+        }
+        let mut gone = self.gone.lock().unwrap();
+        match gone.get_mut(&ip).filter(|g| g.at == count.at) {
+            Some(g) => {
+                g.resent += count.resent;
+                g.dropped += count.dropped;
+                None
+            }
+            None => Some(count),
         }
     }
 
@@ -1141,6 +1161,37 @@ mod tests {
         }
         h.drain_stragglers(|_, _| false);
         assert_eq!(h.gone.lock().unwrap()[&ip].dropped, 1);
+    }
+
+    #[test]
+    fn queued_stragglers_keep_their_counts_after_rehold_or_expiry() {
+        let (mut h, _w) = paired();
+        h.resend = Some(h.tun.try_clone().unwrap());
+        let ip = Ipv4Addr::new(10, 9, 0, 3);
+        for replaced in [false, true] {
+            for sent in [false, true] {
+                let old = Gone { at: Instant::now() - Duration::from_secs(1), ..Gone::new(true) };
+                h.gone.lock().unwrap().insert(ip, old);
+                assert!(h.straggler(ip, &mut udp_to(ip)));
+                let (_, count, _) = h.stragglers.lock().unwrap().packets.pop_front().unwrap();
+                assert_eq!((count.resent, count.dropped), (1, 0), "queued packet carries its count");
+                if replaced {
+                    h.gone.lock().unwrap().insert(ip, Gone::new(true));
+                } else {
+                    h.gone.lock().unwrap().get_mut(&ip).unwrap().at -= GONE_FOR;
+                    h.report_stragglers();
+                    assert!(!h.gone.lock().unwrap().contains_key(&ip));
+                }
+                let report = h.count_straggler(ip, count, sent).expect("the removed record's count must still be reported");
+                assert_eq!((report.resent, report.dropped), (u64::from(sent), u64::from(!sent)));
+                assert_eq!(report.at, old.at);
+                if replaced {
+                    let g = h.gone.lock().unwrap()[&ip];
+                    assert_eq!((g.resent, g.dropped), (0, 0), "a new release has its own counts");
+                }
+                h.drain_stragglers(|_, _| panic!("already drained"));
+            }
+        }
     }
 
     #[test]

@@ -65,24 +65,28 @@ pub fn wait(host: &Host, name: &str) -> Result<i32> {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         };
-        if let Some(fd) = host::PidFd::open(&id)? {
-            while !fd.wait(Duration::from_secs(1)) {}
-        }
-        // Written before it let the name go, under the name it had then (a rename moves it on).
-        if let Some(e) = exit_of(host, name, &id) {
-            return Ok(e.code);
-        }
-        // Without one, what held the name was not a VM's process (an `rm` deciding), or it died
-        // unrecorded. Only the one waited on is waited for: never a later one under the name.
-        let unrecorded = || format!("vm {name}'s process ended without an exit status (killed with SIGKILL, or it crashed)");
-        if host.name_locked(name) == Some(true) && host.name_holder(name)?.is_some_and(|h| h != id) {
-            bail!("{}; another process holds the name now", unrecorded());
-        }
-        if exit_record(host, name).map(|e| e.ident) != before {
-            bail!("{}; another vm has run under the name since", unrecorded());
-        }
-        return ended(host, name);
+        return wait_for(host, name, &id, before);
     }
+}
+
+fn wait_for(host: &Host, name: &str, id: &Ident, before: Option<Ident>) -> Result<i32> {
+    if let Some(fd) = host::PidFd::open(id)? {
+        while !fd.wait(Duration::from_secs(1)) {}
+    }
+    // Written before it let the name go, under the name it had then (a rename moves it on).
+    if let Some(e) = exit_of(host, name, id) {
+        return Ok(e.code);
+    }
+    // Without one, what held the name was not a VM's process (an `rm` deciding), or it died
+    // unrecorded. Only the one waited on is waited for: never a later one under the name.
+    let unrecorded = || format!("vm {name}'s process ended without an exit status (killed with SIGKILL, or it crashed)");
+    if host.name_locked(name) == Some(true) && host.name_holder(name)?.is_some_and(|h| h != *id) {
+        bail!("{}; another process holds the name now", unrecorded());
+    }
+    if exit_record(host, name).map(|e| e.ident) != before {
+        bail!("{}; another vm has run under the name since", unrecorded());
+    }
+    ended(host, name)
 }
 
 /// `id`'s exit record: under `name`, else under whatever name it had last (`rename`).
@@ -892,46 +896,58 @@ mod tests {
     }
 
     #[test]
+    fn wait_finds_a_renamed_record_when_the_holder_is_already_gone() {
+        let (_d, host) = host("wait-renamed-gone");
+        let _lock = host.take_name("job", false).unwrap();
+        let id = Ident { pid: 1, start: 1, boot: "another boot".into() };
+        std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&id).unwrap()).unwrap();
+        record_exit(&host, "job-new", &id, 143);
+        assert_eq!(wait(&host, "job").unwrap(), 143);
+    }
+
+    #[test]
     fn wait_never_takes_a_later_holder_or_its_status() {
         let (_d, host) = host("wait-later");
         let lock = host.take_name("job", false).unwrap();
         let path = host.vms("job", "lock").unwrap();
-        let spawn = |secs: &str| {
-            let c = std::process::Command::new("sleep").arg(secs).spawn().unwrap();
+        let spawn = || {
+            let c = std::process::Command::new("sleep").arg("30").spawn().unwrap();
             let id = Ident::of(c.id()).unwrap();
             (c, id)
         };
+        // Select the holder before spawning the waiter; scheduling cannot select a later one.
+        let waiter = || {
+            let (h, id, before) = (host.clone(), host.name_holder("job").unwrap().unwrap(), exit_record(&host, "job").map(|e| e.ident));
+            std::thread::spawn(move || wait_for(&h, "job", &id, before))
+        };
         // Its holder dies unrecorded and another holds the name by then: an error, not a wait on it.
-        let ((mut first, id), (mut later, later_id)) = (spawn("0.3"), spawn("30"));
+        let ((mut first, id), (mut later, later_id)) = (spawn(), spawn());
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
-        let h = host.clone();
-        let waiter = std::thread::spawn(move || wait(&h, "job"));
-        std::thread::sleep(Duration::from_millis(100));
+        let waiting = waiter();
         std::fs::write(&path, serde_json::to_vec(&later_id).unwrap()).unwrap();
+        first.kill().unwrap();
         first.wait().unwrap();
-        let e = waiter.join().unwrap().unwrap_err().to_string();
+        let e = waiting.join().unwrap().unwrap_err().to_string();
         assert!(e.contains("without an exit status") && e.contains("holds the name now"), "{e}");
         later.kill().unwrap();
         later.wait().unwrap();
         // A later instance's record (it ran and ended meanwhile) is not the one waited on.
-        let (mut again, id) = spawn("0.3");
+        let (mut again, id) = spawn();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
-        let h = host.clone();
-        let waiter = std::thread::spawn(move || wait(&h, "job"));
-        std::thread::sleep(Duration::from_millis(100));
+        let waiting = waiter();
         record_exit(&host, "job", &later_id, 0);
+        again.kill().unwrap();
         again.wait().unwrap();
-        let e = waiter.join().unwrap().unwrap_err().to_string();
+        let e = waiting.join().unwrap().unwrap_err().to_string();
         assert!(e.contains("another vm has run under the name since"), "{e}");
         // Renamed while waited on: its record is found under its new name.
-        let (mut renamed, id) = spawn("0.3");
+        let (mut renamed, id) = spawn();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
-        let h = host.clone();
-        let waiter = std::thread::spawn(move || wait(&h, "job"));
-        std::thread::sleep(Duration::from_millis(100));
+        let waiting = waiter();
         record_exit(&host, "job-new", &id, 143);
+        renamed.kill().unwrap();
         renamed.wait().unwrap();
-        assert_eq!(waiter.join().unwrap().unwrap(), 143);
+        assert_eq!(waiting.join().unwrap().unwrap(), 143);
         drop(lock);
     }
 
