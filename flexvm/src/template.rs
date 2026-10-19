@@ -3687,9 +3687,12 @@ pub(crate) mod tests {
         f.verify(&f.meta, &mut cache).unwrap();
         let file = File::options().write(true).open(&f.meta.rootfs).unwrap();
         let before = file.metadata().unwrap();
-        std::thread::sleep(Duration::from_millis(10));
-        file.write_all_at(b"ROOTFS", 0).unwrap();
-        set_mtime(&file, before.mtime(), before.mtime_nsec());
+        // Older kernels may keep ctime unchanged for writes within the same tick.
+        crate::test_util::wait_until("rootfs rewrite to change its stamp", || {
+            file.write_all_at(b"ROOTFS", 0).unwrap();
+            set_mtime(&file, before.mtime(), before.mtime_nsec());
+            Stamp::of(&file.metadata().unwrap()) != Stamp::of(&before)
+        });
         let error = f.verify(&f.meta, &mut cache).unwrap_err().to_string();
         assert!(error.contains("does not match"), "{error}");
     }
@@ -3845,8 +3848,14 @@ pub(crate) mod tests {
         assert_eq!(unsafe { libc::lseek(file.as_raw_fd(), 17, libc::SEEK_SET) }, 17);
         assert_eq!(memory_bitmap(&file, len, &f.dir).unwrap(), original);
         assert_eq!(unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) }, 17);
-        file.write_all_at(&[2; PAGE_SIZE], (5 * PAGE_SIZE) as u64).unwrap();
-        file.sync_all().unwrap();
+        let before = Stamp::of(&file.metadata().unwrap());
+        // Keep the cached stamp in place: this must exercise invalidation, even on
+        // kernels whose ctime only advances once per tick.
+        crate::test_util::wait_until("memory rewrite to change its stamp", || {
+            file.write_all_at(&[2; PAGE_SIZE], (5 * PAGE_SIZE) as u64).unwrap();
+            file.sync_all().unwrap();
+            Stamp::of(&file.metadata().unwrap()) != before
+        });
         let changed = memory_bitmap(&file, len, &f.dir).unwrap();
         assert_eq!(changed, vec![2 | 32]);
         std::fs::write(f.dir.join("extents.json"), b"broken").unwrap();
