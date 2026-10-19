@@ -2933,27 +2933,31 @@ mod exec_tests {
         assert!(listener_addresses("host:7070", vec![]).is_err());
         assert!(listener_addresses("host:0", vec!["127.0.0.1:0".parse().unwrap()]).is_err());
         // Every address gets its own socket, taking connections; one that cannot be bound fails them all.
-        // A port free a moment ago may be a parallel test's by now: another one then.
-        let (port, two, bound) = (0..10)
-            .find_map(|_| {
-                let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-                let two: Vec<std::net::SocketAddr> = [[127, 0, 0, 1], [127, 0, 0, 2]].map(|ip| (ip, port).into()).to_vec();
-                bind_each("host", &two).ok().map(|bound| (port, two, bound))
-            })
-            .expect("no free port for both addresses");
-        assert_eq!(bound.iter().map(|l| l.local_addr().unwrap()).collect::<Vec<_>>(), two);
+        let second: std::net::SocketAddr = "127.0.0.2:7070".parse().unwrap();
+        let mut two = listener_addresses("host", vec![v4, mapped, second]).unwrap();
+        assert_eq!(two, [v4, second]);
+        // Let the kernel allocate ports at bind time, with no probe/drop/rebind gap.
+        // Resolution rejects port 0 above; bind_each itself can use it for this test.
+        for a in &mut two {
+            a.set_port(0);
+        }
+        let bound = bind_each("host", &two).unwrap();
+        assert_eq!(bound.len(), 2);
+        for (l, a) in bound.iter().zip(&mut two) {
+            let local = l.local_addr().unwrap();
+            assert_eq!(local.ip(), a.ip());
+            assert_ne!(local.port(), 0);
+            *a = local;
+        }
         for (l, a) in bound.iter().zip(&two) {
             let _c = std::net::TcpStream::connect(a).unwrap();
             l.accept().unwrap();
         }
-        let mapped: std::net::SocketAddr = format!("[::ffff:127.0.0.1]:{port}").parse().unwrap();
-        let once = listener_addresses("host", vec![two[0], mapped]).unwrap();
-        drop(bound);
-        let bound = bind_each("host", &[once, vec![two[1]]].concat()).unwrap();
-        assert_eq!(bound.len(), 2);
         let held = bound.into_iter().nth(1).unwrap();
+        // Only the held second address may fail; the first gets a fresh port.
+        two[0].set_port(0);
         let e = bind_each("host", &two).unwrap_err().to_string();
-        assert!(e.starts_with(&format!("listen on host (127.0.0.2:{port}): ")), "{e}");
+        assert!(e.starts_with(&format!("listen on host ({}): ", two[1])), "{e}");
         drop(held);
     }
 
