@@ -1183,7 +1183,9 @@ impl Host {
             bail!("{ip} is in use");
         }
         let gen = self.next_gen(a.seen)?;
-        let addrs = addrs.iter().map(|a| a.to_canonical()).collect();
+        let mut addrs: Vec<_> = addrs.iter().map(|a| a.to_canonical()).collect();
+        addrs.sort();
+        addrs.dedup();
         let loan = Loan { peer: borrower.into(), until_ms: lease.then_some(now + LOAN_WAIT_MS), addrs };
         self.put_addr(ip, &Addr { seen: gen, lent: Some(gen), loan: Some(loan), ..Addr::default() }, true)?;
         Ok(gen)

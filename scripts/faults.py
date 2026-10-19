@@ -7427,6 +7427,33 @@ def restore_ip_peer():
     rm_ckpt(path2)
 
 
+def loan_start_retry():
+    """#944: a restore borrowing a peer's address retries its claim (lend start) while
+    the lender answers busy, or applied it but the reply was lost; the restore runs,
+    the loan claimed (no longer expiring). Given back as the VM ends."""
+    n, path = "ft-lsr", ckpt_path("ft-lsr")
+    ok(run(A, n))
+    ok(checkpoint(A, n, path))
+    lo, hi = B.ips.split("-")
+    ip = str(ipaddress.ip_address(hi) - 3)
+    check("loan start: the peer's address is free", not addr(B, ip).get("holder") and not addr(B, ip).get("lent"), addr(B, ip))
+    for f, ms in (("lend_start_busy", 1500), ("lend_start_lose", 1000)):
+        name = f"ft-lsr-{f.rsplit('_', 1)[1]}"
+        clear_gate(B, f)
+        with armed_fault(B, f, ms):
+            start = time.time()
+            r = restore(A, path, name=name, ip=ip)
+        check(f"{f}: the restore borrowed {ip} and runs", r["ok"] and r["result"]["ip"] == ip, r)
+        check(f"{f}: the fault was hit, and retried past", reached(B, f) and time.time() - start >= ms / 1000, (reached(B, f), time.time() - start))
+        loan = addr(B, ip).get("loan") or {}
+        check(f"{f}: the loan is claimed, no longer expiring", addr(B, ip).get("lent") and loan and loan.get("until_ms") is None, addr(B, ip))
+        check(f"{f}: the guest answers", r["ok"] and sh(A, name, "true")[0] == 0)
+        cleanup(name)
+        check(f"{f}: given back as the VM ends", wait_for(lambda: not addr(B, ip).get("lent"), 30), addr(B, ip))
+    cleanup(n)
+    rm_ckpt(path)
+
+
 def spoof_filter():
     """#362: what a guest sends leaves its tap only from its own address. A datagram from
     another VM's address (or from one no VM has) is dropped at the tap, while the guest's own
@@ -10338,7 +10365,7 @@ SCENARIOS = dict(
     fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
-    forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
+    forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, loan_start_retry=loan_start_retry, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, rmi_suspend=rmi_suspend,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died, fc_died_starting=fc_died_starting,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,

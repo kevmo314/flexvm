@@ -986,13 +986,22 @@ fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> 
 }
 
 /// `borrower`: who asks (`Peers::borrower`), from `from`.
+/// Test faults on a loan's start (#944): `lend_start_busy` answers it busy, as a held host lock
+/// would; `lend_start_lose` applies it, then answers only after the borrower's call gave up.
 fn lend(host: &Host, req: &Value, peers: &[IpAddr], (borrower, addrs): &(String, Vec<IpAddr>), from: IpAddr) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
     routable(ip, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
+    if req["start"] == true && crate::host::tripped("lend_start_busy") {
+        return Err(BUSY.into());
+    }
     let l = host_lock(host)?;
     if req["start"] == true {
         let gen = req["gen"].as_u64().ok_or("missing gen")?;
         host.start_loan(&l, ip, gen, borrower, Some(from))?;
+        drop(l);
+        if crate::host::tripped("lend_start_lose") {
+            std::thread::sleep(Duration::from_secs(3));
+        }
         return Ok(json!({"ip": ip.to_string(), "gen": gen}));
     }
     let gen = host.lend_to(&l, ip, borrower, addrs, req["lease"] == true)?;
