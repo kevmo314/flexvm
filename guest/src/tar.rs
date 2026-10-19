@@ -1144,8 +1144,14 @@ mod tests {
     }
 
     /// Every node below `root` with its contents, to show that nothing there changed.
+    /// `listing`, but the root's own mtime left out: a test removing what it allowed in the root
+    /// changes that (by a second, across a second's boundary) without the root's contents changing.
     fn snapshot(root: &Path) -> Vec<(String, u32, i64, Vec<u8>)> {
-        listing(root)
+        let mut l = listing(root);
+        if let Some(top) = l.iter_mut().find(|e| e.0.is_empty()) {
+            top.2 = 0;
+        }
+        l
     }
 
     #[test]
