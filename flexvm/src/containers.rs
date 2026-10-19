@@ -183,6 +183,8 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
     host::check_name(name)?;
     let (path, prev) = (host.vms(name, "log")?, host.vms(name, "log.1")?);
     let open = || std::fs::File::open(&path).ok();
+    // Who held the name as it was first read (`removed`, where there is no birth time).
+    let holder = host.name_holder(name).ok().flatten();
     // The current log first: one rotated meanwhile is then the previous one read below.
     let mut cur = open();
     let ino = |f: &std::fs::File| f.metadata().ok().map(|m| (m.dev(), m.ino()));
@@ -223,7 +225,7 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
             }
         }
         // Removed with its VM (`rm`): whatever is at its path now is a later VM's.
-        if cur.as_ref().is_some_and(|f| removed(f, &prev)) {
+        if cur.as_ref().is_some_and(|f| removed(f, &prev, || host.name_holder(name).ok().flatten() != holder)) {
             return Ok(());
         }
         // Rotated (or removed and made again): what was written before the rename is drained, then the new one.
@@ -257,14 +259,23 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
 
 /// Whether `cur` was unlinked by `rm`, not a second rotation. A rotation unlinks it only by
 /// renaming over it the log made after it, which is `prev` (born before) from then on; `rm`
-/// removes `prev` too, so any `prev` there now was made after (a later VM's). Unknown: removed.
-fn removed(cur: &std::fs::File, prev: &Path) -> bool {
+/// removes `prev` too, so any `prev` there now was made after (a later VM's). Where the file
+/// system keeps no birth time: removed once the name has another holder than it had (`moved_on`).
+fn removed(cur: &std::fs::File, prev: &Path, moved_on: impl FnOnce() -> bool) -> bool {
     let Ok(m) = cur.metadata() else { return false };
     if m.nlink() > 0 {
         return false;
     }
     let unlinked = std::time::UNIX_EPOCH + Duration::new(m.ctime().max(0) as u64, m.ctime_nsec().clamp(0, 999_999_999) as u32);
-    std::fs::metadata(prev).and_then(|p| p.created()).map_or(true, |born| born >= unlinked)
+    by_rm(unlinked, std::fs::metadata(prev).map(|p| p.created()), moved_on)
+}
+
+/// `removed`'s decision, given when the log was unlinked and `prev`'s birth time (if it is there).
+fn by_rm(unlinked: std::time::SystemTime, prev_born: std::io::Result<std::io::Result<std::time::SystemTime>>, moved_on: impl FnOnce() -> bool) -> bool {
+    match prev_born {
+        Err(_) => true,
+        Ok(born) => born.map_or_else(|_| moved_on(), |born| born >= unlinked),
+    }
 }
 
 /// `inspect NAME...`: an array of one object per VM, as docker prints: what `ps --json` says
@@ -855,6 +866,20 @@ mod tests {
         assert!(rx.recv_timeout(FOLLOW_EVERY * 4).is_err(), "a rotated log is followed on, not taken for a removed one");
         drop(name);
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "and ends with its vm");
+    }
+
+    #[test]
+    fn a_removed_log_is_told_from_a_rotated_one() {
+        let at = std::time::SystemTime::now();
+        let (before, after) = (at - Duration::from_millis(5), at + Duration::from_millis(5));
+        let unsupported = || std::io::Error::from(std::io::ErrorKind::Unsupported);
+        assert!(by_rm(at, Err(std::io::ErrorKind::NotFound.into()), || false), "no log.1: rm took it");
+        assert!(!by_rm(at, Ok(Ok(before)), || true), "log.1 born before: a second rotation");
+        assert!(by_rm(at, Ok(Ok(after)), || false), "log.1 born after: a later vm's");
+        assert!(by_rm(at, Ok(Ok(at)), || false), "born then: a later vm's");
+        // No birth time: the name's holder decides.
+        assert!(!by_rm(at, Ok(Err(unsupported())), || false), "the same holder: a rotation");
+        assert!(by_rm(at, Ok(Err(unsupported())), || true), "another holder: removed");
     }
 
     #[test]
