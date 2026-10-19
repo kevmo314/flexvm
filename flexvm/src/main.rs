@@ -790,7 +790,7 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
             Some(l) => {
                 let local = l.local_addr()?;
                 match addr {
-                    Some(a) => activated_at(a, local, listen::v6only(&l))?,
+                    Some(a) => activated_at(a, local)?,
                     None => c.listen = Some(local.to_string()),
                 }
                 l
@@ -798,8 +798,8 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
             None => {
                 let addr = c.listen.as_deref().ok_or("listen needs an address (flexvm listen ADDR)")?;
                 // Under the host lock: a hostname's lookup is bounded, as `activated_at`'s.
-                let resolved = util::resolve(addr, Instant::now() + Duration::from_secs(2)).map_err(|e| format!("listen address {addr}: {e}"))?;
-                std::net::TcpListener::bind(&resolved[..]).map_err(|e| format!("listen on {addr}: {e}"))?
+                let resolved = resolve_listener(addr)?;
+                std::net::TcpListener::bind(resolved).map_err(|e| format!("listen on {addr}: {e}"))?
             }
         };
         let validated = listen::validate(&bound, c)?;
@@ -814,24 +814,28 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
 
 /// An ADDR given with an activated socket is what peers are told (they fetch a
 /// migration's memory from it): one the socket does not listen on is refused.
-fn activated_at(addr: &str, local: std::net::SocketAddr, v6only: bool) -> Result<()> {
-    let at = |a: &std::net::SocketAddr| a.port() == local.port() && takes(local, v6only, a.ip());
-    let resolved = util::resolve(addr, Instant::now() + Duration::from_secs(2)).map_err(|e| format!("listen address {addr}: {e}"))?;
-    if !resolved.iter().any(at) {
+fn activated_at(addr: &str, local: std::net::SocketAddr) -> Result<()> {
+    if resolve_listener(addr)? != local {
         bail!("the activated socket listens on {local}, not {addr}: run flexvm listen without ADDR, or give the socket's address");
     }
     Ok(())
 }
 
-/// Whether a socket bound at `local` takes connections to `ip`: its own address, or for a
-/// wildcard one any of its family (an IPv6 one IPv4 too, unless IPV6_V6ONLY).
-fn takes(local: std::net::SocketAddr, v6only: bool, ip: std::net::IpAddr) -> bool {
-    let (ip, bound) = (ip.to_canonical(), local.ip().to_canonical());
-    match (bound.is_unspecified(), local.ip()) {
-        (false, _) => ip == bound,
-        (true, std::net::IpAddr::V4(_)) => ip.is_ipv4(),
-        (true, std::net::IpAddr::V6(_)) => ip.is_ipv6() || !v6only,
+fn resolve_listener(addr: &str) -> Result<std::net::SocketAddr> {
+    let resolved = util::resolve(addr, Instant::now() + Duration::from_secs(2)).map_err(|e| format!("listen address {addr}: {e}"))?;
+    listener_address(addr, resolved)
+}
+
+/// Peers may choose any address for a name, so one socket must cover them all.
+fn listener_address(addr: &str, resolved: Vec<std::net::SocketAddr>) -> Result<std::net::SocketAddr> {
+    let Some(&one) = resolved.first() else { bail!("listen address {addr}: no addresses") };
+    if one.port() == 0 {
+        bail!("listening on {addr}: give a port; peers are told it");
     }
+    if resolved.iter().any(|a| *a != one) {
+        bail!("listen address {addr} resolves to more than one distinct address: give an IP literal or a name with one address");
+    }
+    Ok(one)
 }
 
 /// `--cpus` and `--memory`.
@@ -2691,6 +2695,33 @@ mod exec_tests {
     }
 
     #[test]
+    fn listener_names_need_one_distinct_address() {
+        let v4 = "127.0.0.1:7070".parse().unwrap();
+        let v6 = "[::1]:7070".parse().unwrap();
+        for resolved in [vec![v4], vec![v6], vec![v4, v4]] {
+            assert_eq!(listener_address("host:7070", resolved.clone()).unwrap(), resolved[0]);
+        }
+        for resolved in [vec![v6, v4], vec![v4, v6], vec![v4, "127.0.0.2:7070".parse().unwrap()]] {
+            let e = listener_address("host:7070", resolved).unwrap_err().to_string();
+            assert!(e.contains("more than one distinct address") && e.contains("IP literal or a name with one address"), "{e}");
+        }
+        assert!(listener_address("host:7070", vec![]).is_err());
+        assert!(listener_address("host:0", vec!["127.0.0.1:0".parse().unwrap()]).is_err());
+    }
+
+    #[test]
+    fn activated_listener_needs_exact_address() {
+        // ADDR must match the bound address exactly, even for a wildcard socket.
+        for local in ["0.0.0.0:7070", "[::]:7070", "10.1.2.3:7070"] {
+            let bound = local.parse().unwrap();
+            assert!(activated_at(local, bound).is_ok());
+            for other in ["127.0.0.1:7070", "[::1]:7070", "10.1.2.3:7071", "[::ffff:10.1.2.3]:7070"] {
+                assert!(activated_at(other, bound).is_err(), "{local}: {other}");
+            }
+        }
+    }
+
+    #[test]
     fn listener_configuration_is_published_only_after_binding_and_validation() {
         use std::net::TcpListener;
         let root = crate::test_util::TempDir::new("listen-config");
@@ -2739,24 +2770,16 @@ mod exec_tests {
         let own = activated.local_addr().unwrap().to_string();
         drop(configure_listener(&mut host, Some(&own), Some(activated)).unwrap());
         assert_eq!(host.cfg.listen.as_deref(), Some(own.as_str()));
-        // A wildcard socket listens on every address with its port.
-        let wildcard = std::net::SocketAddr::from(([0, 0, 0, 0], 7070));
-        assert!(activated_at("10.1.2.3:7070", wildcard, false).is_ok());
-        assert!(activated_at("10.1.2.3:7071", wildcard, false).is_err());
-        assert!(activated_at("127.0.0.1:7070", std::net::SocketAddr::from(([10, 1, 2, 3], 7070)), false).is_err());
-        // An IPv4 wildcard takes no IPv6 connections; an IPv6 one IPv4 ones only without IPV6_V6ONLY.
-        assert!(activated_at("[::1]:7070", wildcard, false).is_err());
-        let v6 = "[::]:7070".parse().unwrap();
-        assert!(activated_at("[::1]:7070", v6, true).is_ok());
-        assert!(activated_at("10.1.2.3:7070", v6, false).is_ok());
-        assert!(activated_at("10.1.2.3:7070", v6, true).is_err());
-        assert!(activated_at("[::ffff:10.1.2.3]:7070", wildcard, false).is_ok());
         // An IPv6 listener needs no IPv4 underlay.
         if let Ok(v6) = TcpListener::bind("[::1]:0") {
             drop(configure_listener(&mut host, None, Some(v6)).unwrap());
         }
         // Port 0 binds, but peers could not be told the port.
-        assert!(configure_listener(&mut host, Some("127.0.0.1:0"), None).is_err());
+        for addr in ["127.0.0.1:0", "localhost:0"] {
+            let before = std::fs::read(host.state.join("host.json")).unwrap();
+            assert!(configure_listener(&mut host, Some(addr), None).is_err());
+            assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        }
         // A hostname is looked up within a bound, and one with no address saves nothing.
         let before = std::fs::read(host.state.join("host.json")).unwrap();
         let e = configure_listener(&mut host, Some("flexvm-no-such-host.invalid:7070"), None).unwrap_err().to_string();
