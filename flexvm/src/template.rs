@@ -1235,7 +1235,7 @@ fn shared_users(paths: &Paths, force: bool) -> BTreeSet<String> {
             {
                 if force {
                     crate::log!("flexvm: {} is gone: its record as a user of these templates goes", state.display());
-                    if let Err(e) = std::fs::remove_file(entry.path()) {
+                    if let Err(e) = std::fs::remove_file(entry.path()).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }) {
                         keep(&mut ids, format!("{} cannot be removed ({e})", entry.path().display()));
                     }
                 } else {
@@ -1485,7 +1485,7 @@ pub fn receive<R: Read>(
     let (rootfs, rootfs_use) = match local {
         Some((have, held)) => {
             // Read the stream before hashing the cached copy: a slow disk must not stall the paced sender.
-            let (c, sha) = hash_and_digest(&have, &meta.rootfs)?;
+            let (c, sha) = hash_and_digest(&have, &meta.rootfs).map_err(|e| format!("template {id}: its root filesystem {}: {e}", meta.rootfs.display()))?;
             if c.hash != meta.components["rootfs"].hash {
                 bail!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display());
             }
