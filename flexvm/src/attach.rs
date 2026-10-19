@@ -455,6 +455,23 @@ fn stdin_hello(mut open: impl FnMut() -> Result<BufReader<UnixStream>>, name: &s
     }
 }
 
+/// A resumed stream must still remember everything this client was told it took.
+fn stdin_resume(feed: &Feed, hello: &[u8]) -> Result<bool> {
+    let text = String::from_utf8_lossy(hello);
+    let words: Vec<_> = text.split_whitespace().collect();
+    match words.as_slice() {
+        ["ok", taken, _] => {
+            let taken: u64 = taken.parse()?;
+            if taken < feed.st.lock().unwrap().acked {
+                bail!("stdin stream is gone from the guest; attach again to send more input");
+            }
+            Ok(true)
+        }
+        ["closed", _] => Ok(false),
+        _ => bail!("{}", guest::refusal(hello)),
+    }
+}
+
 /// `attach NAME`, and a foreground `run -i`/`-t` (from 0): the app's output from `from` (None: from now on),
 /// and stdin to it if it was run with `-i`, until it exits (its status) or the client detaches.
 pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
@@ -511,10 +528,20 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
                 conn = match open(&vm, &stdin_req) {
                     // Another VM under the name: what this one did not take is never sent to it.
                     Err(e) if replaced(&e) => return,
-                    r => r.ok().and_then(|mut r| match guest::read_frame(&mut r) {
-                        Ok(Some((FRAME_MSG, m))) if m.starts_with(b"ok ") => Some(r),
+                    Ok(mut r) => match guest::read_frame(&mut r) {
+                        Ok(Some((FRAME_MSG, m))) => match stdin_resume(&feed, &m) {
+                            Ok(true) => Some(r),
+                            result => {
+                                if let Err(e) = result {
+                                    crate::log!("flexvm: {}: {e}", vm.name());
+                                }
+                                feed.cancel();
+                                return;
+                            }
+                        },
                         _ => None,
-                    }),
+                    },
+                    Err(_) => None,
                 };
             }
         })?;
@@ -734,6 +761,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(shared.lock().unwrap().pin.process, Some(process(3)));
+    }
+
+    #[test]
+    fn a_forgotten_stdin_stream_is_not_retried() {
+        let feed = Feed::start(None, false, false, || ()).unwrap();
+        feed.st.lock().unwrap().acked = 12;
+        assert!(stdin_resume(&feed, b"ok 12 0").unwrap());
+        assert!(stdin_resume(&feed, b"ok 15 0").unwrap(), "an ack may have been lost");
+        assert!(stdin_resume(&feed, b"ok 0 0").unwrap_err().to_string().contains("stdin stream is gone"));
+        assert!(!stdin_resume(&feed, b"closed 0").unwrap());
+        assert!(stdin_resume(&feed, b"bad reply").is_err());
     }
 
     #[test]
