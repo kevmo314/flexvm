@@ -345,10 +345,15 @@ fn standby_sockets(dir: &Path) {
         let n = e.file_name().to_string_lossy().into_owned();
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
         let tmp = n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock"));
-        // A pid with no /proc entry is gone (its socket's lock key `PID-0` never exists); an
-        // identity that cannot be read otherwise proves nothing and the socket stays.
+        // A pid with no /proc entry here may still run in another pid namespace sharing this
+        // run directory: its socket goes only once no `PID-START.lock` is held (`unheld_pid_locks`).
+        // An identity that cannot be read otherwise proves nothing and the socket stays.
+        let mut no_proc = false;
         let socket_id = n.strip_suffix(".sock").and_then(|s| s.parse::<u32>().ok()).and_then(|pid| match std::fs::symlink_metadata(format!("/proc/{pid}")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!("{pid}-0")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                no_proc = true;
+                Some(format!("{pid}-0"))
+            }
             _ => Ident::of(pid).map(|id| id.key()),
         });
         let Some(id) = claim.or(tmp).or(socket_id.as_deref()) else {
@@ -361,12 +366,28 @@ fn standby_sockets(dir: &Path) {
         let free = match (tmp, pid.parse(), start.parse()) {
             (Some(_), Ok(pid), Ok(start)) => Ident { pid, start, boot: boot_id().into() }.liveness() == Liveness::Gone,
             (Some(_), ..) => false,
+            _ if no_proc => unheld_pid_locks(&locks, pid),
             _ => lock_free(&locks.join(format!("{id}.lock")), libc::LOCK_SH),
         };
         if free && (claim.is_none() || locked(&e.path(), libc::LOCK_EX) == Some(false)) {
             let _ = std::fs::remove_file(e.path());
         }
     }
+}
+
+/// Whether no standby lock of `pid` (`PID-START.lock`, any start) in `locks` is held; one that
+/// cannot be listed or probed counts as held.
+fn unheld_pid_locks(locks: &Path, pid: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(locks) else { return false };
+    for e in entries {
+        let Ok(e) = e else { return false };
+        let n = e.file_name();
+        let Some(start) = n.to_str().and_then(|n| n.strip_prefix(pid)?.strip_prefix('-')?.strip_suffix(".lock")) else { continue };
+        if !start.is_empty() && start.bytes().all(|b| b.is_ascii_digit()) && !lock_free(&e.path(), libc::LOCK_SH) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -450,6 +471,22 @@ mod tests {
 
     /// A sweep skips the dir while a standby replaces its socket under its `.locks/publish` (one stopped there stalls no
     /// sweep), sweeps it once free, and keeps that lock file.
+    #[test]
+    fn a_standby_in_another_pid_namespace_keeps_its_socket() {
+        let d = dir("pidns");
+        let l = crate::host::locks(&d);
+        crate::host::private_dir(&l).unwrap();
+        // No /proc entry here, as for a standby in another pid namespace sharing the run directory.
+        File::create(d.join("999999991.sock")).unwrap();
+        let held = File::create(l.join("999999991-77.lock")).unwrap();
+        flock(&held, libc::LOCK_EX).unwrap();
+        standby_sockets(&d);
+        assert!(d.join("999999991.sock").exists(), "its lock is held");
+        drop(held);
+        standby_sockets(&d);
+        assert!(!d.join("999999991.sock").exists(), "gone once no lock of its pid is held");
+    }
+
     #[test]
     fn socket_sweep_skips_a_standby_publishing() {
         let d = dir("publish");
