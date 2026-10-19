@@ -1,6 +1,6 @@
 //! Host-local proxies. Bound sockets are the reservation and the only external resource:
 //! even SIGKILL releases them, so gc has no kernel rules or port files to sweep.
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -159,11 +159,6 @@ fn wait(fds: &mut Vec<libc::pollfd>, stop: BorrowedFd, until: Option<Instant>) -
     fds.pop().is_some_and(|s| s.revents == 0)
 }
 
-/// Whether the socket has something for us (data, room, or an error or hangup to find out by trying).
-fn ready(fd: &libc::pollfd) -> bool {
-    fd.revents != 0
-}
-
 fn poll(fd: &impl AsRawFd, events: i16) -> libc::pollfd {
     libc::pollfd { fd: if events == 0 { -1 } else { fd.as_raw_fd() }, events, revents: 0 }
 }
@@ -222,6 +217,7 @@ fn connect(target: SocketAddrV4) -> io::Result<TcpStream> {
         return Err(io::Error::last_os_error());
     }
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    stream.set_nodelay(true)?;
     let addr = libc::sockaddr_in {
         sin_family: libc::AF_INET as _,
         sin_port: target.port().to_be(),
@@ -239,52 +235,55 @@ fn connect(target: SocketAddrV4) -> io::Result<TcpStream> {
 
 #[derive(Default)]
 struct Direction {
-    bytes: VecDeque<u8>,
+    bytes: Vec<u8>,
+    start: usize,
+    end: usize,
     eof: bool,
     shut: bool,
 }
 
 impl Direction {
     fn events(&self, reverse: &Self) -> i16 {
-        (if !self.eof && self.bytes.len() < BUFFER { libc::POLLIN } else { 0 }) | (if !reverse.bytes.is_empty() { libc::POLLOUT } else { 0 })
+        (if !self.eof && self.end < BUFFER { libc::POLLIN } else { 0 }) | (if reverse.start < reverse.end { libc::POLLOUT } else { 0 })
     }
 
-    /// True if it moved anything.
+    /// True if it moved anything. Each pass takes at most BUFFER bytes per direction.
     fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> io::Result<bool> {
-        let (mut buf, mut moved) = ([0; 16384], false);
-        let room = (BUFFER - self.bytes.len()).min(buf.len());
-        if !self.eof && room > 0 {
-            match from.read(&mut buf[..room]) {
+        let mut moved = false;
+        while !self.eof && self.end < BUFFER {
+            self.bytes.resize(BUFFER, 0);
+            match from.read(&mut self.bytes[self.end..]) {
                 Ok(0) => (self.eof, moved) = (true, true),
                 Ok(n) => {
-                    self.bytes.extend(&buf[..n]);
+                    self.end += n;
                     moved = true;
                 }
-                Err(e) if transient(&e) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
         }
-        if !self.bytes.is_empty() {
-            match to.write(self.bytes.make_contiguous()) {
+        while self.start < self.end {
+            match to.write(&self.bytes[self.start..self.end]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => {
-                    self.bytes.drain(..n);
+                    self.start += n;
                     moved = true;
                 }
-                Err(e) if transient(&e) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
         }
-        if self.eof && self.bytes.is_empty() && !self.shut {
-            to.shutdown(Shutdown::Write)?;
-            self.shut = true;
+        if self.start == self.end {
+            (self.start, self.end) = (0, 0);
+            if self.eof && !self.shut {
+                to.shutdown(Shutdown::Write)?;
+                self.shut = true;
+            }
         }
         Ok(moved)
     }
-}
-
-fn transient(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
 }
 
 fn rest(e: &io::Error, resting: &mut Option<Instant>) -> bool {
@@ -335,25 +334,29 @@ fn admit(connections: &mut Vec<Connection>, cap: usize, idle: Duration) {
 /// connected, or is closed if none is idle by then.
 fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap: usize, idle: Duration) {
     let mut connections: Vec<Connection> = Vec::new();
+    let mut fds = Vec::new();
     // Out of descriptors, accepting rests a while (the forwards go on): a pending client would wake it at once.
     let mut resting: Option<Instant> = None;
     loop {
         resting = resting.filter(|&r| r > Instant::now());
         // Idle forwards cannot hold the cap: at it, a waiting client replaces the idlest once it connects.
         let room = if resting.is_none() && connections.len() < cap + spare(&connections, idle) { libc::POLLIN } else { 0 };
-        let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, room)).collect();
+        fds.clear();
+        fds.extend(listeners.iter().map(|l| poll(l, room)));
         for c in &connections {
-            fds.push(poll(&c.client, if c.connected { c.out.events(&c.incoming) } else { 0 }));
-            fds.push(poll(&c.guest, if c.connected { c.incoming.events(&c.out) } else { libc::POLLOUT }));
+            // Keep connected sockets polled for errors and hangups even after read EOF.
+            fds.push(libc::pollfd { fd: if c.connected { c.client.as_raw_fd() } else { -1 }, events: c.out.events(&c.incoming), revents: 0 });
+            fds.push(libc::pollfd { fd: c.guest.as_raw_fd(), events: if c.connected { c.incoming.events(&c.out) } else { libc::POLLOUT }, revents: 0 });
         }
         if !wait(&mut fds, stop, resting) {
             return;
         }
-        let (accepting, mut each) = (fds[..listeners.len()].to_vec(), fds[listeners.len()..].chunks(2));
+        let (accepting, forwarding) = fds.split_at(listeners.len());
+        let mut each = forwarding.chunks(2);
         connections.retain_mut(|c| {
             let [client, guest] = each.next().unwrap() else { unreachable!() };
             if !c.connected {
-                if !ready(guest) {
+                if guest.revents == 0 {
                     return c.since.elapsed() <= CONNECT_WAIT;
                 }
                 if c.guest.take_error().ok().flatten().is_some() {
@@ -366,8 +369,11 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 // It moves nothing until it is admitted below.
                 (c.fresh, c.active) = (true, Instant::now());
                 return true;
-            } else if !ready(client) && !ready(guest) {
+            } else if client.revents == 0 && guest.revents == 0 {
                 return true;
+            }
+            if (client.revents | guest.revents) & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return false;
             }
             let Ok(out) = c.out.pump(&c.client, &c.guest) else { return false };
             let Ok(incoming) = c.incoming.pump(&c.guest, &c.client) else { return false };
@@ -379,10 +385,10 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
         // Only now: a replacement whose connect fails closes nothing.
         admit(&mut connections, cap, idle);
         let spare = spare(&connections, idle);
-        for (listener, fd) in listeners.iter().zip(&accepting) {
+        for (listener, fd) in listeners.iter().zip(accepting) {
             // Attempts are bounded too: a client whose guest connect fails (EMFILE, say) is dropped,
             // and a flood of them must still let the loop see its stop.
-            if resting.is_some() || !ready(fd) {
+            if resting.is_some() || fd.revents == 0 {
                 continue;
             }
             for _ in 0..CONNECTIONS {
@@ -397,7 +403,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 };
                 match connect(target) {
                     Err(e) if rest(&e, &mut resting) => break,
-                    Ok(guest) if client.set_nonblocking(true).is_ok() => {
+                    Ok(guest) if client.set_nonblocking(true).is_ok() && client.set_nodelay(true).is_ok() => {
                         connections.push(Connection {
                             client,
                             guest,
@@ -525,7 +531,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
         }
         // Replies first: the sessions polled are those in `peers`, before any is added below.
         for (peer, fd) in peers.iter().zip(&fds[listeners.len()..]) {
-            let Some((s, at, i)) = clients.get_mut(peer).filter(|_| ready(fd)) else { continue };
+            let Some((s, at, i)) = clients.get_mut(peer).filter(|_| fd.revents != 0) else { continue };
             for _ in 0..BURST {
                 match s.recv(&mut buf) {
                     Ok(n) => {
@@ -539,7 +545,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
             }
         }
         for ((i, listener), fd) in listeners.iter().enumerate().zip(&fds) {
-            if !ready(fd) {
+            if fd.revents == 0 {
                 continue;
             }
             for _ in 0..BURST {
@@ -577,6 +583,10 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    fn transient(e: &io::Error) -> bool {
+        matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
+    }
 
     #[test]
     fn socket_exhaustion_rests_accepting() {
@@ -1056,6 +1066,70 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn duplicate_port_specs_are_rejected_before_binding() {
+        let specs = |a: &str, b: &str| {
+            let args = crate::Args::parse(["run", "-p", a, "-p", b, "image"].map(String::from)).unwrap();
+            crate::port_specs(&args)
+        };
+        for (a, b) in [("8080:80", "8080:80/tcp"), ("127.0.0.1:8080:80", "127.0.0.1:8080:81"), ("[::1]:8080:80", "[0:0:0:0:0:0:0:1]:8080:80")] {
+            assert!(specs(a, b).unwrap_err().to_string().contains("duplicate port mapping"));
+        }
+        for (a, b) in [("8080:80", "8080:80/udp"), ("127.0.0.1:8080:80", "127.0.0.2:8080:80"), ("8080:80", "8081:80")] {
+            assert_eq!(specs(a, b).unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn pump_drains_more_than_one_read_and_reuses_its_buffer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut source = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (from, _) = listener.accept().unwrap();
+        let to = connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port())).unwrap();
+        assert!(to.nodelay().unwrap());
+        let (mut sink, _) = crate::test_util::accept_tcp(&listener);
+        from.set_nonblocking(true).unwrap();
+        sink.set_read_timeout(Some(WAIT)).unwrap();
+        let mut direction = Direction::default();
+        for byte in [42, 17] {
+            let data = vec![byte; BUFFER];
+            source.write_all(&data).unwrap();
+            wait_until("the source bytes to arrive", || {
+                let mut available: libc::c_int = 0;
+                assert_eq!(unsafe { libc::ioctl(from.as_raw_fd(), libc::FIONREAD, &mut available) }, 0);
+                available as usize == BUFFER
+            });
+            assert!(direction.pump(&from, &to).unwrap());
+            assert_eq!((direction.start, direction.end), (0, 0));
+            let mut received = vec![0; BUFFER];
+            sink.read_exact(&mut received).unwrap();
+            assert_eq!(received, data);
+        }
+    }
+
+    #[test]
+    fn a_reset_after_client_half_close_releases_the_slot_without_guest_writes() {
+        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        server.set_read_timeout(Some(WAIT)).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(server.read(&mut [0]).unwrap(), 0);
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size_of_val(&linger) as _)
+            },
+            0
+        );
+        drop(client);
+        let mut replacement = TcpStream::connect(addr).unwrap();
+        replacement.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut accepted, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut replacement, &mut accepted);
+        halt(&stop, worker);
     }
 
     #[test]

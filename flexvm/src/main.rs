@@ -1073,7 +1073,15 @@ fn run_attached(host: &Host, name: &str, keep: bool) -> Result<()> {
 }
 
 fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
-    args.all("publish").iter().map(|s| s.parse()).collect()
+    let mut ports = Vec::new();
+    for s in args.all("publish") {
+        let p: ports::Port = s.parse()?;
+        if ports.iter().any(|old: &ports::Port| old.ip == p.ip && old.host_port == p.host_port && old.protocol == p.protocol) {
+            crate::bail!("duplicate port mapping {p}: host address and port already published for this protocol");
+        }
+        ports.push(p);
+    }
+    Ok(ports)
 }
 
 /// `-e`, `--env-file`, `--entrypoint`, `--keep`, `--rm`, `-p` (and the `--ip` asked for, for a rerun).
