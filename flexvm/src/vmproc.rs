@@ -3683,17 +3683,20 @@ mod tests {
 
     #[test]
     fn dropping_the_forwards_keeps_the_ports_for_the_vms_records() {
+        use std::os::fd::AsRawFd;
         let (p, _root) = test_proc("drop-ports", None);
-        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
-        let ports: Vec<crate::ports::Port> = vec![format!("127.0.0.1:{port}:80").parse().unwrap()];
+        let ports = vec![crate::ports::Port { ip: Some(Ipv4Addr::LOCALHOST.into()), host_port: 0, vm_port: 80, protocol: crate::ports::Protocol::Tcp }];
         p.spec.lock().unwrap().ports = ports.clone();
         p.bind_ports().unwrap();
+        let fd = format!("/proc/self/fd/{}", p.forwards.lock().unwrap().as_ref().unwrap().bound_socket().as_raw_fd());
+        let socket = std::fs::read_link(&fd).unwrap();
         p.serve_ports(Ipv4Addr::LOCALHOST).unwrap();
         assert_eq!(p.bound_ports(), ports);
         // As `finish` does, before `record_exit` reads the spec.
         p.drop_ports();
         assert!(p.bound_ports().is_empty());
-        assert!(std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok(), "released");
+        // The fd number may already belong to another test, but not this socket.
+        assert_ne!(std::fs::read_link(&fd).ok(), Some(socket), "released");
         assert_eq!(p.spec.lock().unwrap().ports, ports, "an exited record keeps them, for start");
     }
 
