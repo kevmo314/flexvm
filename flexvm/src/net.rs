@@ -337,7 +337,7 @@ fn remove_plug(ifindex: u32) -> Result<()> {
 /// route, so nothing is routed to the tap yet then.
 pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
     let Ok(ifindex) = ifindex(tap) else { return (0, Err(format!("no tap {tap}").into())) };
-    let stats = || qdisc_stats(ifindex, PLUG).unwrap_or_default();
+    let stats = || qdisc_stats(ifindex, PLUG, STATS_WAIT).unwrap_or_default();
     let Err(e) = retry3(|| netlink(libc::RTM_NEWQDISC, 0, &plug_msg(ifindex, TCQ_PLUG_RELEASE_INDEFINITE))) else { return (stats().0, Ok(())) };
     let (drops, queued) = stats();
     let remove = move || remove_plug(ifindex);
@@ -353,7 +353,7 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
             if crate::net::ifindex(&tap).ok() != Some(ifindex) {
                 return;
             }
-            latest = qdisc_stats(ifindex, PLUG).unwrap_or(latest);
+            latest = qdisc_stats(ifindex, PLUG, STATS_WAIT).unwrap_or(latest);
             if remove().is_ok() {
                 return crate::log!("tap {tap}: plug removed, {} extra drops, {} queued packets discarded", latest.0.saturating_sub(drops), latest.1);
             }
@@ -370,8 +370,10 @@ pub fn drain_qdisc(tap: &str, wait: std::time::Duration) -> u64 {
     let Ok(ifindex) = ifindex(tap) else { return 0 };
     let end = std::time::Instant::now() + wait;
     loop {
-        // Whatever the root qdisc is (a default one, or our plug).
-        let queued = qdisc_stats(ifindex, 0).map_or(0, |(_, queued)| queued);
+        // Whatever the root qdisc is (a default one, or our plug); the answer waited for only
+        // within `wait` (at least a millisecond), so an unanswered query never holds it longer.
+        let left = end.saturating_duration_since(std::time::Instant::now()).max(std::time::Duration::from_millis(1));
+        let queued = qdisc_stats(ifindex, 0, left).map_or(0, |(_, queued)| queued);
         if queued == 0 || std::time::Instant::now() >= end {
             return queued;
         }
@@ -396,16 +398,21 @@ const PLUG: u32 = 0x1_0000;
 
 /// Whether our plug is `tap`'s root qdisc (released or not).
 pub fn plug_is_root(tap: &str) -> bool {
-    ifindex(tap).is_ok_and(|i| qdisc_stats(i, PLUG).is_some())
+    ifindex(tap).is_ok_and(|i| qdisc_stats(i, PLUG, STATS_WAIT).is_some())
 }
+
+/// How long `qdisc_stats` waits for its answer, unless told otherwise.
+const STATS_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The root qdisc's (drops, queued packets), if its handle is `handle` (0: whatever it is), from
 /// RTM_GETQDISC on a socket of its own: the qdisc echoed back (NLM_F_ECHO; a get without it
-/// answers nothing), no ACK, waited for up to a second.
-fn qdisc_stats(ifindex: u32, handle: u32) -> Option<(u64, u64)> {
+/// answers nothing), no ACK, waited for up to `wait`.
+fn qdisc_stats(ifindex: u32, handle: u32, wait: std::time::Duration) -> Option<(u64, u64)> {
     const NLM_F_ECHO: c_int = 8;
     let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket").ok()?;
-    let timeout = libc::timeval { tv_sec: 1, tv_usec: 0 };
+    // A zero timeval would mean no timeout at all.
+    let wait = wait.max(std::time::Duration::from_micros(1));
+    let timeout = libc::timeval { tv_sec: wait.as_secs() as libc::time_t, tv_usec: wait.subsec_micros() as libc::suseconds_t };
     let size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
     if unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), size) } != 0 {
         return None;

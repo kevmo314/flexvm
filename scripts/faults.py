@@ -2112,15 +2112,17 @@ def same_host_late_handover():
 def same_host_qdisc_backlog():
     """#817: a sender that looked the route up just before the source's hold hands its packet
     to the tap's qdisc, not yet to the tap, when the tap goes down after the pause
-    (`tap_qdisc_backlog`: the tap's qdisc holds what reaches it until 10 ms after the hold).
+    (`tap_qdisc_backlog`: the tap's qdisc holds what reaches it from 3 ms before the hold
+    until after the pause).
     The link-down's qdisc reset would free it uncounted: the source lets the qdisc empty into
     the tap's queue first, which it takes with the rest, so nothing is lost. Each source but
     the first has our released plug at the root of its tap (the first, a default qdisc,
     which the fault leaves alone)."""
     logs = udp_across_migrations("same host qdisc backlog", "ft-qdisc-backlog", source_fault="tap_qdisc_backlog")
-    # Each source's log once (the last, B's, is the final target's): the second and third sources engage it.
-    engaged = [l for t in logs[:-1] for l in t.splitlines() if "its tap's qdisc holds what reaches it" in l]
-    check("same host qdisc backlog: the fault held each later source's qdisc", len(engaged) == 2, engaged)
+    # Each source's log once (the last, B's, is the final target's): the second and third sources engage it,
+    # each holding packets past its pause.
+    held = [int(m) for t in logs[:-1] for m in re.findall(r"its tap's qdisc held (\d+) packets after the pause", t)]
+    check("same host qdisc backlog: each later source's qdisc held packets past the pause", len(held) == 2 and all(held), held)
 
 
 def same_host_hold_route_fail():

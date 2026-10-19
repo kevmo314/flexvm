@@ -331,24 +331,17 @@ impl Vm {
             }
         };
         // Test fault `tap_qdisc_backlog`: what is routed to the tap in the 3 ms before the hold
-        // waits in its qdisc (our released plug, plugged again) until 10 ms after it, past the
-        // pause, as a late sender's packet would (#817).
-        let backlog = crate::host::fault("tap_qdisc_backlog") && crate::net::plug_is_root(&self.tap) && crate::net::plug_tap(&self.tap).1.is_ok();
-        if backlog {
+        // waits in its qdisc (our released plug, plugged again) until the link-down thread lets
+        // it go, after the pause, as a late sender's packet would (#817).
+        let qdisc_fault = crate::host::fault("tap_qdisc_backlog") && crate::net::plug_is_root(&self.tap) && crate::net::plug_tap(&self.tap).1.is_ok();
+        if qdisc_fault {
             std::thread::sleep(Duration::from_millis(3));
         }
         let held = unroute();
-        if backlog {
-            crate::log!("vm {}: injected fault: its tap's qdisc holds what reaches it until 10 ms after the hold", self.name);
-            let tap = self.tap.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(10));
-                let _ = crate::net::unplug_tap(&tap);
-            });
-        }
         // Read while its Firecracker is still stopped, so a guest that empties the queue before
         // `drain_tap` first looks is still seen to have had one (#294).
         let backlog = stopped.is_some() && watch.as_ref().is_some_and(|fd| crate::net::tap_queued(fd).unwrap_or(false));
+        let watch_after = watch.clone();
         if !stuck {
             go_on();
         }
@@ -370,9 +363,24 @@ impl Vm {
         // Before it, what the tap's qdisc still holds (from a sender that looked the route up
         // before the hold) goes on to the tap's queue, where `take_tap_queue` takes it: the
         // link-down's qdisc reset would free it uncounted (#817). What is left is counted.
-        let tap = self.tap.clone();
+        let (tap, name) = (self.tap.clone(), self.name.get());
         let down = std::thread::spawn(move || {
-            let left = crate::net::drain_qdisc(&tap, QDISC_DRAIN_WAIT);
+            // The fault lets go of its plug 5 ms into the wait (which it makes long enough for a
+            // busy host): without the wait, the link would be down by then.
+            let wait = match qdisc_fault {
+                true => {
+                    let held = crate::net::drain_qdisc(&tap, Duration::ZERO);
+                    crate::log!("vm {name}: injected fault: its tap's qdisc held {held} packets after the pause; letting them go in 5 ms");
+                    let tap = tap.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(5));
+                        let _ = crate::net::unplug_tap(&tap);
+                    });
+                    Duration::from_secs(1)
+                }
+                false => QDISC_DRAIN_WAIT,
+            };
+            let left = crate::net::drain_qdisc(&tap, wait);
             (left, crate::net::set_link_up(&tap, false))
         });
         // Test fault `snapshot_fail`: Firecracker's snapshot fails, the VM paused.
@@ -386,7 +394,12 @@ impl Vm {
         t.mark("snapshot_create");
         let (left, down) = down.join().unwrap_or_else(|_| (0, Err("link-down thread panicked".into())));
         if left > 0 {
-            crate::log!("vm {}: dropped {left} packets still in its tap's qdisc {} ms after the pause", self.name, QDISC_DRAIN_WAIT.as_millis());
+            crate::log!("vm {}: dropped {left} packets still in its tap's qdisc as it went down", self.name);
+        }
+        // What the qdisc let go of meanwhile is on the tap now, after `drain_tap` looked: kept
+        // for `take_tap_queue`, or counted by `kill` if nothing takes it (#817).
+        if held && watch_after.as_ref().is_some_and(|fd| crate::net::tap_queued(fd).unwrap_or(false)) {
+            self.tap_stuck.store(true, Ordering::SeqCst);
         }
         t.mark("link_down");
         saved?;
