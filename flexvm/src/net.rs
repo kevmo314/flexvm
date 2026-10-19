@@ -105,6 +105,12 @@ pub const TAP_QUEUE: u32 = 4096;
 /// tap's alias (`host::tap_alias`), set before the tap is made persistent: a tap left
 /// behind always names its owner, and garbage collection goes by that, never by the name.
 pub fn create_tap(name: &str, owner: &str) -> Result<()> {
+    // Subscribed before the tap exists: udev's event for it cannot come before.
+    make_tap(name, owner, udev_monitor())
+}
+
+/// `create_tap`, with `udev` (if any) handed to the tap's watcher (`keep_mac_from_udev`).
+fn make_tap(name: &str, owner: &str, udev: Option<OwnedFd>) -> Result<()> {
     if owner.len() >= 256 {
         bail!("tap {name}: owner {owner:?} is over 255 bytes (a shorter run directory)");
     }
@@ -141,10 +147,126 @@ pub fn create_tap(name: &str, owner: &str) -> Result<()> {
         guard(index, None).map_err(|e| format!("tap {name}: {e}"))?;
         set_link_up(name, true)
     })();
-    if made.is_err() {
-        delete_tap(name);
+    match (&made, udev) {
+        (Err(_), _) => delete_tap(name),
+        (Ok(()), Some(udev)) => {
+            if let Ok(index) = ifindex(name) {
+                let tap = name.to_string();
+                // Not fatal: neighbour still checks the MAC when the tap is handed to a VM.
+                if let Err(e) = std::thread::Builder::new().name("udev-mac".into()).spawn(move || keep_mac_from_udev(&udev, index, &tap, UDEV_RECHECK)) {
+                    crate::log!("tap {name}: not watching for udev replacing its MAC: {e}");
+                }
+            }
+        }
+        (Ok(()), None) => {}
     }
     made
+}
+
+/// How often a tap's watcher checks its MAC, and that it is still there, between udev's events.
+const UDEV_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+const NETLINK_KOBJECT_UEVENT: c_int = 15;
+/// The uevent socket's group udev (re)broadcasts each event on once it has handled it (1 is the kernel's).
+const UDEV_GROUP: u32 = 2;
+
+/// A socket on udev's monitor group, when udevd runs and sees this network namespace's devices:
+/// none without it (nothing to wait for), nor in another namespace than init's (`ip netns exec`
+/// keeps /run/udev, but uevents of its devices never reach udev), whose taps udev never touches.
+fn udev_monitor() -> Option<OwnedFd> {
+    use std::os::unix::fs::MetadataExt;
+    let ns = |pid: &str| std::fs::metadata(format!("/proc/{pid}/ns/net")).map(|m| (m.dev(), m.ino())).ok();
+    let watched = std::path::Path::new("/run/udev/control").exists() && ns("self").is_some_and(|me| ns("1") == Some(me));
+    watched.then(|| uevent_socket(UDEV_GROUP)).flatten()
+}
+
+fn uevent_socket(groups: u32) -> Option<OwnedFd> {
+    let fd = socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT, "uevent socket").ok()?;
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    (addr.nl_family, addr.nl_groups) = (libc::AF_NETLINK as u16, groups);
+    let bound = unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_nl).cast(), std::mem::size_of_val(&addr) as libc::socklen_t) };
+    (bound == 0).then_some(fd)
+}
+
+/// udev's `ACTION` and `IFINDEX` of a message on its monitor group: a `struct monitor_netlink_header`
+/// ("libudev", magic 0xfeedcafe big-endian, then native header size, properties offset and length)
+/// and `KEY=value` properties, each NUL-terminated. None for anything else.
+fn udev_event(msg: &[u8]) -> Option<(&[u8], u32)> {
+    let word = |at: usize| Some(u32::from_ne_bytes(msg.get(at..at + 4)?.try_into().ok()?) as usize);
+    if msg.get(..8)? != b"libudev\0" || msg.get(8..12)? != 0xfeedcafe_u32.to_be_bytes() {
+        return None;
+    }
+    let (off, len) = (word(16)?, word(20)?);
+    let props = msg.get(off..off.checked_add(len)?)?;
+    let (mut action, mut index) = (None, None);
+    for p in props.split(|&b| b == 0) {
+        if let Some(a) = p.strip_prefix(b"ACTION=") {
+            action = Some(a);
+        } else if let Some(i) = p.strip_prefix(b"IFINDEX=") {
+            index = std::str::from_utf8(i).ok()?.parse().ok();
+        }
+    }
+    Some((action?, index?))
+}
+
+/// udev (systemd's default `MACAddressPolicy=persistent`) gives a new tap a MAC of its own if it
+/// reads the tap's address as the kernel's random one, which it can in the millisecond or so
+/// before `create_tap` sets the gateway's; its write then lands whenever its worker gets to it,
+/// on a loaded host after `neighbour` checked the MAC and the VM runs: the host drops all the
+/// guest sends (to the gateway MAC), so no SYN it is sent is answered (#841). udev broadcasts its
+/// event for the tap only once it applied its link settings, so the gateway MAC goes back then.
+/// udev may take minutes (its event timeout is 3, and events queue before), or the event may be
+/// lost to an overrun: until it comes the MAC is checked every `recheck`, as long as the tap is
+/// there (a watcher lives no longer than its tap).
+fn keep_mac_from_udev(udev: &OwnedFd, index: u32, name: &str, recheck: std::time::Duration) {
+    // A network device's event is a few hundred bytes; a longer one, truncated, is another's.
+    let mut buf = [0u8; 8192];
+    // By the clock, not each poll's timeout: other devices' events, however many, hold no recheck up.
+    let mut next = std::time::Instant::now() + recheck;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= next {
+            if !restore_mac(index, name) {
+                return;
+            }
+            next = now + recheck;
+        }
+        let mut pfd = libc::pollfd { fd: udev.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let ms = next.saturating_duration_since(now).as_millis().clamp(1, i32::MAX as u128) as c_int;
+        match crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, ms) }) {
+            Err(_) => {
+                restore_mac(index, name);
+                return;
+            }
+            Ok(0) => continue,
+            Ok(_) => {}
+        }
+        let n = unsafe { libc::recv(udev.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+        match (n > 0).then(|| udev_event(&buf[..n as usize])).flatten() {
+            Some((b"add", i)) if i == index => {
+                restore_mac(index, name);
+                return;
+            }
+            Some((b"remove", i)) if i == index => return,
+            _ => {}
+        }
+    }
+}
+
+/// Puts the gateway MAC back on tap `name` at `index` if something replaced it, while the
+/// index still has that name (as `delete_link`): never another device's. Whether it still has.
+fn restore_mac(index: u32, name: &str) -> bool {
+    let mut now = [0 as libc::c_char; libc::IFNAMSIZ];
+    let named = unsafe { libc::if_indextoname(index, now.as_mut_ptr()) };
+    if named.is_null() || unsafe { std::ffi::CStr::from_ptr(named) }.to_bytes() != name.as_bytes() {
+        return false;
+    }
+    let mac = std::fs::read_to_string(format!("/sys/class/net/{name}/address")).ok().and_then(|s| parse_mac(&s).ok());
+    if mac.is_some_and(|m| m != GATEWAY_MAC) {
+        if let Err(e) = set_mac(index, &GATEWAY_MAC) {
+            crate::log!("tap {name}: udev replaced its MAC, and putting the gateway's back failed: {e}");
+        }
+    }
+    true
 }
 
 pub fn delete_tap(name: &str) {
@@ -960,6 +1082,101 @@ mod tests {
             let f = filters();
             assert!(f.matches("direct-action").count() == 1 && f.contains(&format!(" {},", u32::from(ip))), "{f}");
         }
+    }
+
+    /// A message as udev broadcasts it on its monitor group (`udev_event`).
+    fn udev_message(props: &[&str]) -> Vec<u8> {
+        let props: Vec<u8> = props.iter().flat_map(|p| [p.as_bytes(), b"\0"].concat()).collect();
+        let words = [40u32, 40, props.len() as u32, 0, 0, 0, 0].map(u32::to_ne_bytes).concat();
+        [&b"libudev\0"[..], &0xfeedcafe_u32.to_be_bytes(), &words, &props].concat()
+    }
+
+    #[test]
+    fn udev_events_name_their_action_and_interface() {
+        let msg = udev_message(&["ACTION=add", "DEVPATH=/devices/virtual/net/fx0t0", "SUBSYSTEM=net", "INTERFACE=fx0t0", "IFINDEX=4242", "SEQNUM=9"]);
+        assert_eq!(udev_event(&msg), Some((&b"add"[..], 4242)));
+        assert_eq!(udev_event(&udev_message(&["ACTION=remove", "IFINDEX=7"])), Some((&b"remove"[..], 7)));
+        // Not a network device's, the kernel's own format, a bad magic, properties past the end.
+        assert_eq!(udev_event(&udev_message(&["ACTION=add", "DEVNAME=/dev/kvm"])), None);
+        assert_eq!(udev_event(b"add@/devices/virtual/net/fx0t0\0ACTION=add\0IFINDEX=4242\0"), None);
+        let mut bad = msg.clone();
+        bad[8] ^= 1;
+        assert_eq!(udev_event(&bad), None);
+        assert_eq!(udev_event(&msg[..msg.len() - 3]), None);
+        assert_eq!(udev_event(&msg[..20]), None);
+    }
+
+    /// Needs root: `sudo cargo test -- --ignored`. udev's late write of a MAC of its own (#841) is
+    /// undone once udev says it is done with the tap, not before, and not for another device's
+    /// event; the MAC is checked meanwhile, and the watcher ends with its tap.
+    #[test]
+    #[ignore]
+    fn udevs_late_mac_is_undone_once_udev_is_done() {
+        use std::time::{Duration, Instant};
+        let _root = crate::test_util::root_net_lock();
+        let tap = format!("tw4u{:x}", std::process::id());
+        struct TapGuard<'a>(&'a str);
+        impl Drop for TapGuard<'_> {
+            fn drop(&mut self) {
+                delete_tap(self.0);
+            }
+        }
+        // Made with no watcher of its own; a udevd here is done with it before the test goes on.
+        make_tap(&tap, "test", None).unwrap();
+        let _tap = TapGuard(&tap);
+        let _ = std::process::Command::new("udevadm").args(["settle", "--timeout=10"]).status();
+        let index = ifindex(&tap).unwrap();
+        set_mac(index, &GATEWAY_MAC).unwrap();
+        let mac = || parse_mac(&std::fs::read_to_string(format!("/sys/class/net/{tap}/address")).unwrap()).unwrap();
+        let udev = uevent_socket(UDEV_GROUP).expect("a socket on udev's group");
+        let ours = [0x72, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let sender = socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_KOBJECT_UEVENT, "uevent socket").unwrap();
+        let send = |props: &[&str]| {
+            let mut to: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            (to.nl_family, to.nl_groups) = (libc::AF_NETLINK as u16, UDEV_GROUP);
+            assert!(send_to(&sender, &udev_message(props), &to) > 0, "{}", std::io::Error::last_os_error());
+        };
+        let (on, other) = (format!("IFINDEX={index}"), format!("IFINDEX={}", index + 1000));
+        // Detached, so a failed assertion leaves it behind rather than joining a watcher that never ends.
+        let udev = std::sync::Arc::new(udev);
+        let watch = |recheck| {
+            let (udev, tap) = (udev.clone(), tap.clone());
+            std::thread::spawn(move || keep_mac_from_udev(&udev, index, &tap, recheck))
+        };
+        let ends = |w: &std::thread::JoinHandle<()>| {
+            let by = Instant::now() + Duration::from_secs(10);
+            while !w.is_finished() && Instant::now() < by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            w.is_finished()
+        };
+        set_mac(index, &ours).unwrap();
+        let start = Instant::now();
+        let w = watch(Duration::from_secs(60));
+        send(&["ACTION=add", "SUBSYSTEM=net", &other]);
+        send(&["ACTION=change", "SUBSYSTEM=net", &on]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!w.is_finished() && mac() == ours, "another device's event, or a change, is not udev done with this tap");
+        send(&["ACTION=add", "SUBSYSTEM=net", &format!("INTERFACE={tap}"), &on]);
+        assert!(ends(&w) && mac() == GATEWAY_MAC && start.elapsed() < Duration::from_secs(10), "by the event, not a recheck: {:?}", start.elapsed());
+        // With no event, a recheck puts it back, however busy udev is with other devices, and the
+        // watcher goes on until udev's remove.
+        set_mac(index, &ours).unwrap();
+        let w = watch(Duration::from_millis(200));
+        let back = Instant::now() + Duration::from_secs(5);
+        while mac() != GATEWAY_MAC && Instant::now() < back {
+            send(&["ACTION=change", "SUBSYSTEM=net", &other]);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(mac(), GATEWAY_MAC);
+        assert!(!w.is_finished());
+        send(&["ACTION=remove", "SUBSYSTEM=net", &on]);
+        assert!(ends(&w));
+        // A tap gone ends its watcher at the next recheck, touching no other device.
+        assert!(!restore_mac(index, "flexvm-none0"));
+        let w = watch(Duration::from_millis(50));
+        delete_tap(&tap);
+        assert!(ends(&w));
     }
 
     /// `source_filter`'s verdict on `frame` (with a VLAN tag stripped or not), by a classic BPF
