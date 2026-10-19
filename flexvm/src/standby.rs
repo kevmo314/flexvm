@@ -524,6 +524,7 @@ fn under_reserve_with(host: &Host, template: &str, available: impl Fn() -> Optio
     }
     let lock = match stop_lock(host) {
         Ok(f) => Some(Flock::new(f, libc::LOCK_EX | libc::LOCK_NB).ok()?),
+        // Trade-off: unserialized, every standby may leave at once and drain the pool, but none stays under the reserve.
         Err(_) => None,
     };
     // Read again under the lock: another standby may have left meanwhile.
