@@ -7607,7 +7607,13 @@ pub(crate) mod tests {
     fn admission_fails_early_when_debits_cannot_be_read() {
         let (_dir, mut h) = host("debits-unreadable");
         h.cfg.reserve_mib = Some(0);
+        // The take's short lock timeout must not race other tests holding the thread mutex.
+        let _l = h.lock().unwrap();
+        pin_clock(boottime_ms());
         std::fs::write(h.debits(), b"{").unwrap();
+        // A future mtime has no known age: the malformed ledger cannot expire while we wait.
+        let future = SystemTime::now() + Duration::from_secs(365 * 24 * 3600);
+        std::fs::File::options().write(true).open(h.debits()).unwrap().set_modified(future).unwrap();
         let err = h.grant_inner(1, Floor::Reserve, false, None, || panic!("debits must be readable before checking room")).err().unwrap();
         assert!(err.to_string().contains("debits unreadable"));
         assert!(load::<Grants>(&h.grants()).unwrap().unwrap_or_default().is_empty());

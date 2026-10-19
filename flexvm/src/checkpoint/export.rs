@@ -361,6 +361,9 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
     for m in members {
         digest.checkpoint(&m.id);
         let (vmstate, pagemap) = (m.read("vmstate")?, m.read("pagemap")?);
+        let (runs, sums) = parse_pagemap(&pagemap, m.manifest.guest_pages, m.manifest.parent.is_some(), 0)?;
+        let data: u64 = runs.iter().filter(|r| r.2 == DATA).map(|r| r.1).sum();
+        ensure!(data == m.manifest.data_pages && m.pages_len == data * PAGE_SIZE as u64, "checkpoint {}: its page counts do not add up", m.id);
         let files = [("manifest.json", Some(&m.text)), (SPEC, m.spec.as_ref()), ("vmstate", Some(&vmstate)), ("pagemap", Some(&pagemap))];
         for (name, bytes) in files.into_iter().filter_map(|(n, b)| Some((n, b?))) {
             out.bytes(&checkpoint_member(&m.id, name), bytes)?;
@@ -372,6 +375,7 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
             while left > 0 {
                 let chunk = &mut buf[..left.min(CHUNK as u64) as usize];
                 (&m.pages).read_exact(chunk).map_err(|_| format!("checkpoint {}: its pages file is shorter than its manifest says", m.id))?;
+                check_pages(chunk, &sums, ((m.pages_len - left) / PAGE_SIZE as u64) as usize).map_err(|e| format!("checkpoint {}: {e}", m.id))?;
                 sha.update(&*chunk);
                 w.write_all(chunk)?;
                 left -= chunk.len() as u64;
@@ -389,6 +393,13 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
 }
 
 // --- load -------------------------------------------------------------------------------------
+
+fn check_pages(chunk: &[u8], sums: &[u32], offset: usize) -> Result<()> {
+    for (i, page) in chunk.chunks(PAGE_SIZE).enumerate() {
+        ensure!(crate::crc32c::page(page).0 == sums[offset + i], "its data page {} does not match its checksum", offset + i);
+    }
+    Ok(())
+}
 
 /// Where `import` reads members from: a tar (`load`) or checkpoint directories (`load_dir`).
 enum Source<'a> {
@@ -710,9 +721,7 @@ fn receive(
         let chunk = &mut buf[..n * PAGE_SIZE];
         src.reader().read_exact(chunk).map_err(truncated)?;
         sha.update(&*chunk);
-        for (i, page) in chunk.chunks(PAGE_SIZE).enumerate() {
-            ensure!(crate::crc32c::page(page).0 == sums[d as usize + i], "{}", bad(&format!("its data page {} does not match its checksum", d as usize + i)));
-        }
+        check_pages(chunk, &sums, d as usize).map_err(|e| bad(&e.to_string()))?;
         out.put(chunk)?;
         d += n as u64;
     }
@@ -1260,18 +1269,34 @@ mod tests {
 
     #[test]
     fn a_damaged_checkpoint_here_is_refused_even_as_its_own_save() {
-        let (_dir, paths, _tpl, state, chain, _) = saved();
-        // Damaged where it is stored: its save carries the damage (save reads pages unchecked), and
-        // loading it back where it came from verifies the pages as for any other host.
+        let (_dir, paths, _tpl, state, chain, tar) = saved();
         let pages = store::dir(&state).join(&chain[1]).join("pages");
         let mut damaged = fs::read(&pages).unwrap();
         damaged[PAGE_SIZE + 9] ^= 1;
         fs::write(&pages, &damaged).unwrap();
-        let mut tar = vec![];
-        save(&state, &paths, "web", &mut tar).unwrap();
-        let e = load(&state, &paths, &mut &tar[..], None, None, &BTreeSet::new).err().unwrap().to_string();
+        let e = save(&state, &paths, "web", &mut vec![]).err().unwrap().to_string();
         assert!(e.contains("data page 1 does not match its checksum"), "{e}");
+        let e = load(&state, &paths, &mut &tar[..], None, None, &BTreeSet::new).err().unwrap().to_string();
+        assert!(e.contains("with other files"), "{e}");
         assert_eq!(ids(&state).len(), 2);
+    }
+
+    #[test]
+    fn save_checks_pages_past_the_first_chunk() {
+        let (_dir, paths, tpl) = template::tests::sendable();
+        let state = crate::test_util::TempDir::new("ckpt-save-crc");
+        let id = stored(&state, &tpl, None, 0, &vec![1; CHUNK / PAGE_SIZE + 1], |m| {
+            m.guest_pages = 512;
+            m.mem_mib = 2;
+            m.max_mib = 2;
+        });
+        save(&state, &paths, &id, &mut io::sink()).unwrap();
+        let pages = store::dir(&state).join(&id).join("pages");
+        let mut damaged = fs::read(&pages).unwrap();
+        damaged[CHUNK + 9] ^= 1;
+        fs::write(pages, damaged).unwrap();
+        let e = save(&state, &paths, &id, &mut io::sink()).err().unwrap().to_string();
+        assert!(e.contains("data page 256 does not match its checksum"), "{e}");
     }
 
     /// `tar` with member `i`'s header (and, if given, its bytes) replaced; sizes as given.

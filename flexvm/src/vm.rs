@@ -330,12 +330,15 @@ impl Vm {
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
             }
         };
-        // Test fault `tap_qdisc_backlog`: what is routed to the tap in the 3 ms before the hold
+        // Test fault `tap_qdisc_backlog`: wait up to 5 s for a packet before the hold; it
         // waits in its qdisc (our released plug, plugged again) until the link-down thread lets
         // it go, after the pause, as a late sender's packet would (#817).
         let qdisc_fault = crate::host::fault("tap_qdisc_backlog") && crate::net::plug_is_root(&self.tap) && crate::net::plug_tap(&self.tap).1.is_ok();
         if qdisc_fault {
-            std::thread::sleep(Duration::from_millis(3));
+            let until = Instant::now() + Duration::from_secs(5);
+            while crate::net::drain_qdisc(&self.tap, Duration::ZERO) == 0 && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         let held = unroute();
         // Read while its Firecracker is still stopped, so a guest that empties the queue before
