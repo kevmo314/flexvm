@@ -148,9 +148,7 @@ options: --state DIR (",
     ": artifacts, templates, images, VMs, host.json), --run DIR
          (/run/flexvm, or /run/flexvm-PREFIX for another --state), --version, --verbose/-v
 Each state directory is bound to its first run directory; a different --run is refused (and so is
-none, if it is bound to another than its default); /run/flexvm is ",
-    env!("FLEXVM_DEFAULT_STATE"),
-    "'s alone.
+none, if it is bound to another than its default); /run/flexvm is /var/lib/flexvm's alone.
 run and start -a exit with the VM's command's (or else its app's) status, 128+signal, 125 when
 flexvm fails, 124 when the VM dies; exec returns the command's status, 127 when it is not found,
 126 when it cannot run, or 125 when flexvm fails

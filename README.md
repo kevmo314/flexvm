@@ -20,12 +20,10 @@ still overrides it at run time. This README writes `/var/lib/flexvm` for
 whichever default the binary was built with. The test and lab scripts
 (`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`) take
 `FLEXVM_STATE_DIR` from the environment too; `fetch.sh` and
-`build-firecracker.sh` take `--state`. `/run/flexvm` is only ever the default
-state's, so to change the default on a host whose old default state is in use,
-first stop its VMs and its listener, and remove `/run/flexvm/state.json` (it names
-the old state; a reboot clears it too). Then either move the old state to the new
-path, or remove its `run.json` and keep using it with `--state`, where it binds a
-run directory of its own (`/run/flexvm-PREFIX`).
+`build-firecracker.sh` take `--state`. `/run/flexvm` stays `/var/lib/flexvm`'s whatever the
+built-in default: a binary built with another default runs its state in
+`/run/flexvm-PREFIX`, and an existing `/var/lib/flexvm` keeps working with
+`--state /var/lib/flexvm`, so both can be used side by side.
 
 ```sh
 cargo build --release && sudo install target/release/flexvm /usr/local/bin/
@@ -869,10 +867,10 @@ after upgrading to this release, run a command with each such state (`flexvm --s
 ps`) before pulling, or a stopped VM there may lose its generation. On first open, each state directory permanently records its canonical run
 path in `run.json`, and the run directory records its state in `state.json`; using
 either with a different partner is refused. Without `--run`, the run directory follows
-from the state's path alone (`/run/flexvm` for the default state, `/run/flexvm-PREFIX` for
+from the state's path alone (`/run/flexvm` for `/var/lib/flexvm`, `/run/flexvm-PREFIX` for
 any other), so after a reboot no state defaults into another's; a state bound to any other
-run directory must be given it. `/run/flexvm` belongs to the default state alone: any other state is
-refused it, even with `--run`.
+run directory must be given it. `/run/flexvm` belongs to `/var/lib/flexvm` alone, whatever default the binary was built with: any other
+state is refused it, even with `--run`.
 `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 

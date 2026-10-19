@@ -616,7 +616,7 @@ impl Host {
         }
         let (state, run) = (state.to_path_buf(), run.to_path_buf());
         let binding = state.join("run.json");
-        reserved_run(&state, &run, Path::new(DEFAULT_STATE), Path::new(DEFAULT_RUN))?;
+        reserved_run(&state, &run, Path::new(RUN_STATE), Path::new(DEFAULT_RUN))?;
         let bound = verify_binding(&state, "run", &run)?;
         let claimed = claim_run(&state, &run)?;
         // A user who cannot write the state root (a non-root `flexvm ps` of an unbound one) leaves it unbound,
@@ -3057,6 +3057,9 @@ fn quarantined_now(dir: &Path) -> bool {
 /// `--state` when none is given: `FLEXVM_STATE_DIR` at build time, else `/var/lib/flexvm` (build.rs).
 pub const DEFAULT_STATE: &str = env!("FLEXVM_DEFAULT_STATE");
 pub const DEFAULT_RUN: &str = "/run/flexvm";
+/// The state `/run/flexvm` belongs to, whatever `DEFAULT_STATE` a build has: a host keeps its run
+/// directory when its binary is built with another default (any other state hashes its own).
+pub const RUN_STATE: &str = "/var/lib/flexvm";
 
 /// The run directory of `state` when no `--run` is given, by its path alone: `/run/flexvm` for
 /// the default state, `/run/flexvm-PREFIX` (its taps' prefix) for any other. No state defaults to
@@ -3097,7 +3100,7 @@ fn reserved_run(state: &Path, run: &Path, default_state: &Path, default_run: &Pa
 }
 
 fn default_run_of(state: &Path) -> PathBuf {
-    let default = Path::new(DEFAULT_STATE);
+    let default = Path::new(RUN_STATE);
     if state == default || default.canonicalize().is_ok_and(|d| d == state) {
         DEFAULT_RUN.into()
     } else {
@@ -6558,7 +6561,7 @@ pub(crate) mod tests {
         let ra = default_run(&a).unwrap();
         assert_eq!(ra, PathBuf::from(format!("/run/flexvm-{}", tap_prefix(&a.canonicalize().unwrap()))));
         assert_ne!(ra, default_run(&b).unwrap());
-        assert_eq!(default_run_of(Path::new(DEFAULT_STATE)), PathBuf::from(DEFAULT_RUN));
+        assert_eq!(default_run_of(Path::new(RUN_STATE)), PathBuf::from(DEFAULT_RUN));
         // Bound to the old default (or any other): its --run is needed, never defaulted into.
         let run = base.join("run");
         Host::open(&a, &run).unwrap();
