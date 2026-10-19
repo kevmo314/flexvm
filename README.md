@@ -257,6 +257,9 @@ or on the target). `attach NAME` shows the app's output from then on; with `-i`
 it is also the app's stdin. `cp` streams a tar through flexvm-init (images need
 no `tar`): guest paths are resolved in the guest, files land there as root, and
 what comes out is unpacked without following its links, setuid bits or devices.
+A DST that is itself a link is followed only if root or the user unpacking (on
+the host, the user flexvm runs as) made it, as a merged /usr's /bin: one someone
+else planted is refused; give its target instead.
 A copy stays on its source's filesystem: `cp web:/ -` has /proc, /sys and /dev
 as empty directories.
 

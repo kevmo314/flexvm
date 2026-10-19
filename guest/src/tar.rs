@@ -578,32 +578,50 @@ fn walk_dir(base: &OwnedFd, comps: &[Vec<u8>], make: Option<Option<(u32, u32)>>)
 /// (None: the contents go into the directory).
 type Target = (OwnedFd, Option<(Vec<u8>, Vec<u8>)>);
 
-/// Inspect the leaf itself even with a trailing slash; destinations may not be symlinks.
-fn destination_metadata(dst: &str) -> io::Result<std::fs::Metadata> {
+#[cfg(test)]
+thread_local! {
+    /// Who `extract` follows DST links of, in place of its euid.
+    static AS_UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// DST's metadata, and whether DST is opened without following a link (it is no link). A link at DST itself (with a
+/// trailing slash too) is followed only if root or whoever unpacks made it (merged /usr's /bin, /var/run): one that
+/// someone else planted in a directory they may write does not redirect the copy.
+fn destination(dst: &str) -> io::Result<(std::fs::Metadata, bool)> {
+    use std::os::unix::fs::MetadataExt;
     let leaf = dst.trim_end_matches('/');
     let m = std::fs::symlink_metadata(if leaf.is_empty() && dst.starts_with('/') { "/" } else { leaf })?;
-    if m.file_type().is_symlink() {
-        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+    if !m.file_type().is_symlink() {
+        return Ok((m, true));
     }
-    Ok(m)
+    let me = unsafe { libc::geteuid() };
+    #[cfg(test)]
+    let me = AS_UID.with(|u| u.get()).unwrap_or(me);
+    if m.uid() != 0 && m.uid() != me {
+        return Err(io::Error::other(format!("a link that uid {} made, not followed: give its target", m.uid())));
+    }
+    Ok((std::fs::metadata(dst)?, false))
 }
 
 /// DST for a directory's contents: made if missing.
 fn contents(dst: &str) -> io::Result<Target> {
-    match destination_metadata(dst) {
-        Ok(m) if m.is_dir() => {}
+    let nofollow = match destination(dst) {
+        Ok((m, nofollow)) if m.is_dir() => nofollow,
         Ok(_) => return Err(with(dst, io::Error::from_raw_os_error(libc::ENOTDIR))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(dst).map_err(|e| with(dst, e))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir(dst).map_err(|e| with(dst, e))?;
+            true
+        }
         Err(e) => return Err(with(dst, e)),
-    }
-    Ok((open_dir(dst, true)?, None))
+    };
+    Ok((open_dir(dst, nofollow)?, None))
 }
 
 fn target(dst: &str, comps: &[Vec<u8>], first: &Header) -> io::Result<Target> {
     let Some(root) = comps.first() else { return contents(dst) };
     let is_dir = comps.len() > 1 || first.kind == b'5';
-    match destination_metadata(dst) {
-        Ok(m) if m.is_dir() => return Ok((open_dir(dst, true)?, Some((root.clone(), root.clone())))),
+    match destination(dst) {
+        Ok((m, nofollow)) if m.is_dir() => return Ok((open_dir(dst, nofollow)?, Some((root.clone(), root.clone())))),
         Ok(_) if is_dir => return Err(io::Error::other(format!("cannot copy a directory onto a file: {dst}"))),
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(with(dst, e)),
         Err(_) if dst.ends_with('/') && !is_dir => return Err(io::Error::other(format!("no such directory: {dst}"))),
@@ -628,7 +646,7 @@ pub fn extract(input: &mut dyn Read, dest: Dest, owner: Option<(u32, u32)>) -> i
     let Some(first) = rd.next()? else { return Ok(()) };
     let into = matches!(dest, Dest::Into(_));
     let (base, top) = match dest {
-        Dest::Into(dir) => (open_dir(dir, true)?, None),
+        Dest::Into(dir) => (open_dir(dir, destination(dir).map_err(|e| with(dir, e))?.1)?, None),
         Dest::Cp(dst) => target(dst, &components(&first.path, false)?, &first)?,
         Dest::Guest(dst, Top::Contents) => {
             components(&first.path, false)?;
@@ -1052,17 +1070,26 @@ mod tests {
     }
 
     #[test]
-    fn copy_refuses_symlinked_destinations() {
+    fn copy_follows_only_its_own_or_roots_destination_links() {
         let t = Tmp::new("destination-symlinks");
         std::fs::create_dir(t.s("outside")).unwrap();
         std::fs::write(t.s("outside/file"), b"original").unwrap();
+        // As root, the links are someone's: root's would be followed.
+        let owner = match unsafe { libc::geteuid() } {
+            0 => 65534,
+            me => me,
+        };
+        // Someone else's links: refused.
+        AS_UID.with(|u| u.set(Some(owner ^ 1)));
         for (leaf, to) in [("dir-link", "outside"), ("file-link", "outside/file"), ("dangling", "missing")] {
             symlink(to, t.s(leaf)).unwrap();
+            std::os::unix::fs::lchown(t.s(leaf), Some(owner), None).unwrap();
             for suffix in ["", "/", "///"] {
                 let dst = format!("{}{suffix}", t.s(leaf));
                 for entries in [vec![("file", b'0', "replacement")], vec![("dir", b'5', ""), ("dir/new", b'0', "new")]] {
                     let data = archive(&entries);
-                    assert!(unpack_to(&data, Dest::Cp(&dst)).is_err(), "{dst}");
+                    let e = unpack_to(&data, Dest::Cp(&dst)).unwrap_err();
+                    assert!(e.to_string().contains("not followed"), "{dst}: {e}");
                     let top = Top::Named(entries[0].0.as_bytes().to_vec());
                     assert!(unpack_to(&data, Dest::Guest(&dst, &top)).is_err(), "{dst}");
                     assert!(unpack_to(&data, Dest::Guest(&dst, &Top::Contents)).is_err(), "{dst}");
@@ -1073,6 +1100,14 @@ mod tests {
         assert_eq!(std::fs::read(t.s("outside/file")).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(t.s("outside")).unwrap().count(), 1);
         assert!(!t.0.join("missing").exists());
+        // Its own (or root's, as /bin of a merged /usr): followed, as docker cp does.
+        AS_UID.with(|u| u.set(Some(owner)));
+        let data = archive(&[("file", b'0', "new")]);
+        unpack_to(&data, Dest::Cp(&t.s("dir-link"))).unwrap();
+        unpack_to(&data, Dest::Guest(&format!("{}/", t.s("dir-link")), &Top::Contents)).unwrap();
+        unpack_to(&archive(&[("into", b'0', "new")]), Dest::Into(&t.s("dir-link"))).unwrap();
+        assert_eq!(std::fs::read(t.s("outside/file")).unwrap(), b"new");
+        assert_eq!(std::fs::read(t.s("outside/into")).unwrap(), b"new");
     }
 
     #[test]
