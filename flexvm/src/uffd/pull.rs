@@ -41,8 +41,9 @@ impl Pager {
             // over a source connection of its own.
             let mut fetch: Box<Fetch> = match (file.clone(), &source) {
                 (Some(file), _) => Box::new(move |off, buf, stop, progress| {
-                    read_file(off, buf, stop, progress, |page, buf| file.read(page, buf, puller))
-                        .map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e)))
+                    read_file(off, buf, stop, progress, |page, buf| {
+                        file.read(page, buf, puller).map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e)))
+                    })
                 }),
                 (None, Some(source)) => {
                     let mut link = link.take().filter(|_| !puller).unwrap_or_else(|| Link::new(source.clone()));
@@ -192,7 +193,8 @@ impl Pager {
     }
 }
 
-/// Publish each disk chunk through the same progress callback as a streamed reply.
+/// Publish each disk chunk through the same progress callback as a streamed reply. A stop between chunks is
+/// `FetchFailure::Cancelled`, as for a source, not a (fatal) checkpoint error.
 fn read_file(
     off: u64,
     buf: &mut [u8],
@@ -203,13 +205,13 @@ fn read_file(
     let mut done = 0;
     while done < buf.len() {
         if stop.load(Ordering::SeqCst) {
-            return Err(os(libc::ECANCELED));
+            return Err(io::Error::other(FetchFailure::Cancelled));
         }
         let end = (done + STREAM_RUN * PAGE_SIZE).min(buf.len());
         read((off as usize + done) / PAGE_SIZE, &mut buf[done..end])?;
         done = end;
         if !progress(&buf[..done]) {
-            return Err(os(libc::ECANCELED));
+            return Err(io::Error::other(FetchFailure::Cancelled));
         }
     }
     Ok(())
@@ -267,7 +269,9 @@ mod tests {
                 reads += 1;
                 Ok(())
             });
-            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+            let e = result.unwrap_err();
+            assert!(matches!(super::super::fetch::fetch_failure(&e), Some(FetchFailure::Cancelled)));
+            assert!(!super::super::fetch::fatal(&e));
             assert_eq!(reads, usize::from(!stop_before));
         }
     }
