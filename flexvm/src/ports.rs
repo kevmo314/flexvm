@@ -1327,21 +1327,12 @@ mod tests {
             guest_down: 0,
             lingering: None,
         };
-        // The client never reads: fill its receive queue and the proxy's send queue and buffer.
-        // Then wait out ACKs still due (with its queue full, the client drops what is in flight
-        // rather than ACK it): none may free send space during the assertions below.
-        let mut settled = (u32::MAX, Instant::now());
+        // The client never reads: fill its receive queue and the proxy's send queue and buffer. ACKs
+        // still due may free a little more later: the deadline is checked against relays as seen.
         wait_until("the reply to block", || {
             connection.incoming.start = 0;
             connection.incoming.end = BUFFER;
-            let moved = connection.incoming.pump(&connection.guest, &connection.client);
-            let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
-            let mut len = size_of_val(&info) as libc::socklen_t;
-            assert_eq!(unsafe { libc::getsockopt(connection.client.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_INFO, (&raw mut info).cast(), &mut len) }, 0);
-            if moved || info.tcpi_unacked != settled.0 {
-                settled = (info.tcpi_unacked, Instant::now());
-            }
-            settled.1.elapsed() > Duration::from_millis(200)
+            !connection.incoming.pump(&connection.guest, &connection.client)
         });
         reset(server);
         let mut fd = poll(&connection.guest, libc::POLLIN);
@@ -1355,32 +1346,41 @@ mod tests {
         assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
         assert!(connection.forward(fd.revents, 0));
         assert!(connection.out.broken);
-        for elapsed in [Duration::from_secs(1), LINGER / 2, LINGER] {
-            *clock.lock().unwrap() = start + elapsed;
+        // Only the reply can relay now (to the client): note when it does, and hold the deadline to that.
+        let step = Duration::from_secs(1);
+        let reply = |c: &Connection| (c.incoming.start, c.incoming.end, c.incoming.done);
+        let (mut seen, mut relayed, mut now) = (reply(&connection), start, start);
+        let mut taken = [0; 4096];
+        let closed = loop {
+            now += step;
+            assert!(now < start + 100 * LINGER, "the forward never closed");
+            *clock.lock().unwrap() = now;
             tick_clock();
+            if now == start + LINGER {
+                // A client that reads a little is still being delivered to: its deadline restarts.
+                client.set_nonblocking(true).unwrap();
+                wait_until("the reply to move again", || {
+                    let _ = client.read(&mut taken);
+                    assert!(connection.forward(libc::POLLOUT, 0));
+                    reply(&connection) != seen
+                });
+                client.set_nonblocking(false).unwrap();
+            }
             client.write_all(b"discarded request").unwrap();
             let mut fd = poll(&connection.client, libc::POLLIN);
             assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
-            assert!(connection.forward(fd.revents, 0));
-            assert_eq!(connection.active, start, "discarded bytes are not activity");
-            assert_eq!(connection.lingering, Some(start));
-            assert!(!connection.incoming.done, "the reply must still be blocked");
-        }
-        // A client that reads a little is still being delivered to: its deadline restarts.
-        client.set_nonblocking(true).unwrap();
-        let mut taken = [0; 4096];
-        wait_until("the reply to move again", || {
-            let _ = client.read(&mut taken);
-            connection.forward(libc::POLLOUT, 0) && connection.lingering == Some(start + LINGER)
-        });
-        assert_eq!(connection.active, start + LINGER);
-        *clock.lock().unwrap() = start + LINGER + Duration::from_secs(2);
-        tick_clock();
-        assert!(connection.forward(0, 0), "progress restarts the deadline");
-        assert!(!connection.incoming.done, "the reply must still be blocked");
-        *clock.lock().unwrap() = start + 2 * LINGER + Duration::from_secs(2);
-        tick_clock();
-        assert!(!connection.forward(0, 0), "a blocked reply must not prevent expiry");
+            if !connection.forward(fd.revents, 0) {
+                break now;
+            }
+            if reply(&connection) != seen {
+                (seen, relayed) = (reply(&connection), now);
+            }
+            assert_eq!(connection.active, relayed, "discarded bytes are not activity");
+            assert_eq!(connection.lingering, Some(relayed), "only relays move the deadline");
+        };
+        assert!(relayed >= start + LINGER, "reading restarted the deadline");
+        assert!(closed > relayed + LINGER, "closed before LINGER past the last relay");
+        assert!(closed <= relayed + LINGER + step, "a blocked reply must not prevent expiry");
         CLOCK.with(|c| *c.borrow_mut() = None);
     }
 
