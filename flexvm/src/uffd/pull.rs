@@ -1,5 +1,5 @@
 use super::event::PULL;
-use super::fetch::{Failed, Fetch, FetchFailure, Lane, Link};
+use super::fetch::{connect_ahead, Failed, Fetch, FetchFailure, Lane, Link};
 use super::{os, Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, PULL_THREADS, REMOTE};
 use crate::checkpoint::{Buf, PageFile};
 use std::io;
@@ -29,6 +29,9 @@ impl Pager {
                 p.collapse();
             }
         });
+        if !self.pulling() {
+            return;
+        }
         // The connection made for the snapshot load goes to a fault fetcher.
         let mut link = self.remote.lock().unwrap().take();
         let source = link.as_ref().map(|l| l.source.clone());
@@ -43,7 +46,9 @@ impl Pager {
                 (None, Some(source)) => {
                     let mut link = link.take().filter(|_| !puller).unwrap_or_else(|| Link::new(source.clone()));
                     let p = self.clone();
-                    Box::new(move |off, buf, stop, progress| link.fetch_with(Some(&p.lanes[i]), off, buf, stop, progress))
+                    Box::new(move |off, buf, stop, progress| {
+                        link.fetch_with(Some(&p.lanes[i]), off, buf, &|| stop.load(Ordering::SeqCst) || p.remote_left() == 0, progress)
+                    })
                 }
                 (None, None) => return self.fail("remote pages but nowhere to pull them from".into()),
             };
@@ -77,7 +82,7 @@ impl Pager {
         let buf = storage.bytes();
         // Connects ahead (nothing to read), so each run's request goes out as it is queued; a failure shows again later.
         if file.is_none() {
-            let _ = fetch(0, &mut [], &self.stop, &mut |_| true);
+            let _ = connect_ahead(fetch, &self.stop, || self.pulling());
         }
         let mut ok = true;
         for (i, end) in first.chain(all) {
@@ -101,7 +106,7 @@ impl Pager {
         }
     }
 
-    fn pulling(&self) -> bool {
+    pub(super) fn pulling(&self) -> bool {
         !self.stop.load(Ordering::SeqCst) && self.remote_left() > 0
     }
 

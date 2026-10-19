@@ -86,9 +86,11 @@ teardown() {
             [[ -d $cg ]] && rmdir "$cg" 2>/dev/null
         done
     done
-    cp "$dir_A"/run/vms/*.log "$dir_B"/run/vms/*.log "$work"/ 2>/dev/null
+    mkdir -p "$work/log/"{A,B}
+    cp "$dir_A"/run/vms/*.log "$work/log/A/" 2>/dev/null
+    cp "$dir_B"/run/vms/*.log "$work/log/B/" 2>/dev/null
     rm -rf "$dir_A" "$dir_B"
-    if (( failed )); then say "logs kept in $work"; else rm -rf "$work"; fi
+    if (( failed )); then say "logs kept in $work/log/A and $work/log/B"; else rm -rf "$work"; fi
 }
 
 [[ $EUID == 0 ]] || die 'run as root'
