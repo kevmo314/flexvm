@@ -211,6 +211,8 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
         }
     };
     let mut gone_since: Option<Instant> = None;
+    let holder = || host.name_holder(name).ok().flatten();
+    let mut last = holder();
     loop {
         std::thread::sleep(FOLLOW_EVERY);
         if let Some(f) = cur.as_mut() {
@@ -222,10 +224,12 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
                 f.rewind()?;
             }
         }
-        // Removed with its VM (`rm`): a later VM of the name has a log of its own.
-        let removed = cur.as_ref().is_some_and(|f| f.metadata().is_ok_and(|m| m.nlink() == 0));
-        if removed && !host.alive(name) && !host.is_suspended(name) {
-            return Ok(());
+        // Removed (`rm`) since the name's holder was last seen with it linked: a later VM of the
+        // name (or the `rm` itself) holds it now, and that VM's log is not this one's.
+        match cur.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.nlink()) {
+            Some(0) if holder() != last => return Ok(()),
+            Some(0) | None => {}
+            Some(_) => last = holder(),
         }
         // Rotated (or removed and made again): what was written before the rename is drained, then the new one.
         let now = std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
@@ -809,6 +813,9 @@ mod tests {
         let root = TempDir::new("logs-removed");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let name = host.take_name("job", false).unwrap();
+        // Held by the old VM's process, not this one's (the new VM's, below).
+        let old = Ident { pid: 1, start: 1, boot: host::boot_id().into() };
+        std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&old).unwrap()).unwrap();
         std::fs::write(host.vms("job", "log").unwrap(), b"old\n").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let follower = host.clone();
@@ -817,7 +824,6 @@ mod tests {
         // `rm -f`: the VM ends, its logs go; a new VM of the name starts a fresh log soon after.
         drop(name);
         std::fs::remove_file(host.vms("job", "log").unwrap()).unwrap();
-        std::thread::sleep(FOLLOW_EVERY * 3);
         let _again = host.take_name("job", false).unwrap();
         std::fs::write(host.vms("job", "log").unwrap(), b"new\n").unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "logs -f of a removed vm ends");
