@@ -74,6 +74,12 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest> {
     Ok(Link::open(dir, 0, None)?.manifest)
 }
 
+/// `read_manifest`, with the manifest's id (its checksum, which names a store entry).
+pub(super) fn read_manifest_id(dir: &Path) -> Result<(String, Manifest)> {
+    let link = Link::open(dir, 0, None)?;
+    Ok((link.id, link.manifest))
+}
+
 impl Link {
     /// With `meta_left`, also reads and checks the rest within that budget (debited) and opens `pages`.
     pub(super) fn open(dir: &Path, ck: usize, meta_left: Option<&mut u64>) -> Result<Link> {

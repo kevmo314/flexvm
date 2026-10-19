@@ -745,7 +745,9 @@ fn template_users_count_every_suspended_vm() {
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222"].map(String::from).into();
     assert_eq!(host.template_users(), want);
     // flexvm's own checkpoints (#775) keep theirs; a directory there without one is no checkpoint.
-    link(&host.state.join("checkpoints/0123456789abcdef"), None, |m| m.template_id = "dddd4444".into());
+    let new = host.state.join("checkpoints/.new");
+    let id = link(&new, None, |m| m.template_id = "dddd4444".into());
+    fs::rename(&new, host.state.join("checkpoints").join(id)).unwrap();
     fs::create_dir_all(host.state.join("checkpoints/.staging")).unwrap();
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222", "dddd4444"].map(String::from).into();
     assert_eq!(host.template_users(), want);
@@ -867,48 +869,64 @@ fn store_unreadable_children_block_removal_and_prune() {
             assert!(err.contains(&dir.display().to_string()), "{err}");
         }
         assert!([&a, &b, &c, &unrelated].iter().all(|id| store::dir(&state).join(id).exists()));
-        store::remove(&state, &["broken".into(), b.clone()], true).unwrap();
-        assert!(!dir.exists() && !store::dir(&state).join(b).exists());
-        assert_eq!(store::prune(&state, None).unwrap().len(), 2);
+        // Its parent is not known: only it goes.
+        assert_eq!(store::remove(&state, &["broken".into()], true).unwrap(), [json!({"deleted": c, "name": "broken"})]);
+        assert!(!dir.exists() && [&a, &b, &unrelated].iter().all(|id| store::dir(&state).join(id).exists()));
+        assert_eq!(store::prune(&state, None).unwrap().len(), 3);
     }
 }
 
 #[test]
-fn store_cycles_refuse_before_deleting_anything() {
-    let state = tmp("store-cycle");
+fn store_entries_renamed_by_hand_are_unreadable_until_removed_with_force() {
+    let state = tmp("store-renamed");
     drop(store::lock(&state, libc::LOCK_SH).unwrap());
     let a = stored(&state, None, 1);
     let b = stored(&state, Some(&a), 2);
     let unrelated = stored(&state, None, 3);
+    // a's manifest now builds on b: not a's id, so no cycle, and a builds on nothing.
     link(&store::dir(&state).join(&a), Some(Parent { path: format!("../{b}").into(), id: b.clone() }), |_| {});
-    for result in [store::remove(&state, &[a.clone(), unrelated.clone()], true), store::prune(&state, None)] {
-        assert!(result.unwrap_err().to_string().contains("dependency cycle"));
-        assert!([&a, &b, &unrelated].iter().all(|id| store::dir(&state).join(id).exists()));
+    let exists = |id: &&String| store::dir(&state).join(id).exists();
+    for result in [store::remove(&state, std::slice::from_ref(&unrelated), true), store::prune(&state, None)] {
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("its manifest's id is") && err.contains(&format!("checkpoint rm -f {a}")), "{err}");
+        assert!([&a, &b, &unrelated].iter().all(exists));
     }
+    let gone: Vec<serde_json::Value> = [&b, &a].iter().map(|id| json!({"deleted": id, "name": null})).collect();
+    assert_eq!(store::remove(&state, std::slice::from_ref(&a), true).unwrap(), gone, "b built on a as it was");
     assert_eq!(store::remove(&state, &[unrelated], false).unwrap().len(), 1);
 }
 
 #[test]
-fn host_template_users_keep_all_generations_for_unreadable_records() {
+fn store_cycles_refuse_before_deleting_anything() {
+    let (a, b, c) = ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc");
+    let entry = |id: &str, parent: Option<&str>| {
+        let m = manifest(1, parent.map(|p| Parent { path: format!("../{p}").into(), id: p.into() }), json!({}));
+        store::Entry { id: id.into(), name: None, dir: format!("/nonexistent/{id}").into(), manifest: Ok(m) }
+    };
+    let all = [entry(a, Some(b)), entry(b, Some(a)), entry(c, None)];
+    for result in [store::removal(&all, &[a.into()], true), store::pruning(&all, None)] {
+        let err = result.unwrap_err().to_string();
+        assert_eq!(err, format!("nothing removed: checkpoints {a}, {b} build on each other in a cycle"));
+    }
+    assert_eq!(store::removal(&all, &[c.into()], false).unwrap(), [2]);
+}
+
+#[test]
+fn host_template_users_keep_every_generation_for_unreadable_records() {
     let root = tmp("host-unreadable");
     let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
-    let generations = host.state.join("templates").join(crate::template::GENERATIONS);
-    for id in ["aaaa1111", "bbbb2222"] {
-        fs::create_dir_all(generations.join(id)).unwrap();
-    }
-    let want = ["aaaa1111", "bbbb2222"].map(String::from).into();
+    let keep_all = |why: &str| {
+        let users = host.template_users();
+        let all: Vec<&str> = users.iter().filter_map(|u| u.strip_prefix(crate::template::KEEP_ALL)).collect();
+        assert!(all.len() == 1 && all[0].starts_with("a checkpoint here cannot be read") && all[0].contains(why), "{users:?} for {why:?}");
+    };
     for dir in [host.suspended("bad").unwrap(), host.state.join("checkpoints/0123456789abcdef")] {
         fs::create_dir_all(&dir).unwrap();
         assert!(host.template_users().is_empty(), "a missing manifest is revoked");
         fs::write(dir.join("manifest.json"), b"bad checksum\n{}").unwrap();
-        assert_eq!(host.template_users(), want);
-        fs::rename(&generations, generations.with_extension("saved")).unwrap();
-        fs::write(&generations, b"not a directory").unwrap();
-        assert!(host.template_users().contains(crate::template::ALL_GENERATIONS));
-        fs::remove_file(&generations).unwrap();
-        fs::rename(generations.with_extension("saved"), &generations).unwrap();
+        keep_all("manifest checksum mismatch");
         link(&dir, None, |m| m.format = 999);
-        assert_eq!(host.template_users(), want, "newer formats count too");
+        keep_all("format 999");
         for marker in ["STARTED", "DISCARDED"] {
             if dir.starts_with(host.state.join("suspended")) {
                 fs::write(dir.join(marker), b"").unwrap();
@@ -918,9 +936,13 @@ fn host_template_users_keep_all_generations_for_unreadable_records() {
         }
         fs::remove_file(dir.join("manifest.json")).unwrap();
         fs::create_dir(dir.join("manifest.json")).unwrap();
-        assert_eq!(host.template_users(), want, "I/O failures count too");
-        fs::remove_dir_all(dir).unwrap();
+        keep_all("manifest.json");
+        fs::remove_dir_all(&dir).unwrap();
     }
+    // A store entry is its manifest's id: one under another id is no checkpoint of its own.
+    let dir = host.state.join("checkpoints/0123456789abcdef");
+    link(&dir, None, |m| m.template_id = "aaaa1111".into());
+    keep_all("its manifest's id is");
 }
 
 #[test]
@@ -1020,7 +1042,8 @@ mod scan {
             out.push(e.id.clone());
         }
         if !doomed.is_empty() {
-            bail!("checkpoint dependency cycle; nothing removed");
+            let stuck: Vec<&str> = all.iter().filter(|e| doomed.contains(e.id.as_str())).map(label).collect();
+            bail!("nothing removed: checkpoints {} build on each other in a cycle", stuck.join(", "));
         }
         Ok(out)
     }

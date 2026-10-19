@@ -164,6 +164,7 @@ const CHECKPOINT_FIELDS: crate::containers::Fields = &[
     ("Parent", "parent"),
     ("Size", "size"),
     ("Created", "created"),
+    ("Error", "error"),
 ];
 
 /// `checkpoint ls|rm|prune` (`checkpoint create` is the VM's).
@@ -284,6 +285,12 @@ fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {
         let template = format!("{image} ({})", &s(v, "template_id")[..s(v, "template_id").len().min(8)]);
         let size = (v["size"].as_u64().unwrap_or(0) >> 20).to_string();
         let name = v["name"].as_str().unwrap_or("<none>");
+        // Kept, and blocking rm and prune until removed (`store::readable_or_removed`).
+        if let Some(error) = v["error"].as_str() {
+            row([name, &s(v, "id"), "<unreadable>", "", "", "", ""])?;
+            output(format_args!("  {error}\n"))?;
+            continue;
+        }
         row([name, &s(v, "id"), &s(v, "vm"), &template, &s(v, "parent"), &size, &crate::ago(v["created"].as_u64())])?;
     }
     Ok(())

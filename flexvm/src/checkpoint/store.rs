@@ -48,6 +48,7 @@ impl Entry {
 
 /// Dependency links by position in `list`, so leaf selection keeps its ordering.
 struct Index<'a> {
+    all: &'a [Entry],
     ids: BTreeMap<&'a str, usize>,
     parents: Vec<Option<usize>>,
     children: Vec<Vec<usize>>,
@@ -64,7 +65,7 @@ impl<'a> Index<'a> {
                 children[*p].push(i);
             }
         }
-        Self { ids, parents, children }
+        Self { all, ids, parents, children }
     }
 
     /// `doomed`, each after every doomed checkpoint built on it; among those ready, first in `list`.
@@ -81,7 +82,11 @@ impl<'a> Index<'a> {
                 }
             }
         }
-        ensure!(order.len() == doomed.len(), "checkpoint dependency cycle; nothing removed");
+        if order.len() < doomed.len() {
+            // Only a manifest's id names its entry (`managed`), so this takes a hash collision.
+            let stuck: Vec<&str> = doomed.iter().filter(|i| !order.contains(i)).map(|i| self.all[*i].label()).collect();
+            bail!("nothing removed: checkpoints {} build on each other in a cycle", stuck.join(", "));
+        }
         Ok(order)
     }
 }
@@ -193,12 +198,20 @@ pub(super) fn pruning(all: &[Entry], before: Option<u64>) -> Result<Vec<usize>> 
     index.leaf_first(&doomed)
 }
 
-/// An unreadable checkpoint could build on any other: only explicit forced removal is safe.
+/// An unreadable checkpoint may build on any other: refused while one is kept (only `rm -f` of
+/// it removes it). Nothing is removed, so a passing error (EMFILE) fails only this command.
 fn readable_or_removed(all: &[Entry], doomed: &BTreeSet<usize>, force: bool) -> Result<()> {
-    let unreadable: Vec<String> =
-        all.iter().enumerate().filter(|(i, e)| e.manifest.is_err() && !(force && doomed.contains(i))).map(|(_, e)| e.dir.display().to_string()).collect();
-    ensure!(unreadable.is_empty(), "unreadable checkpoints ({}): remove them explicitly with -f first", unreadable.join(", "));
-    Ok(())
+    let unreadable: Vec<&Entry> = all.iter().enumerate().filter(|(i, e)| e.manifest.is_err() && !(force && doomed.contains(i))).map(|(_, e)| e).collect();
+    if unreadable.is_empty() {
+        return Ok(());
+    }
+    let errors: Vec<String> = unreadable.iter().filter_map(|e| e.manifest.as_ref().err()).map(|e| e.to_string()).collect();
+    let labels: Vec<&str> = unreadable.iter().map(|e| e.label()).collect();
+    bail!(
+        "nothing removed: unreadable checkpoints may build on what this would remove ({}); if that persists, remove them first: flexvm checkpoint rm -f {}",
+        errors.join("; "),
+        labels.join(" ")
+    )
 }
 
 /// Leaf-first, under the lock: a crash midway leaves whole chains.
@@ -206,13 +219,9 @@ fn delete(state: &Path, all: &[Entry], order: Vec<usize>) -> Result<Vec<Value>> 
     let store = dir(state);
     for e in std::fs::read_dir(&store)?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        // Only a missing manifest is a revoked publication: any other error keeps it, and stops.
-        let revoked = is_id(&name)
-            && match std::fs::symlink_metadata(e.path().join("manifest.json")) {
-                Ok(_) => false,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-                Err(err) => return Err(std::io::Error::new(err.kind(), format!("checking checkpoint {}: {err}", e.path().display())).into()),
-            };
+        // Only a missing manifest is a revoked publication: any other error keeps it (`list` showed
+        // it unreadable, and only its own `rm -f` gets here then).
+        let revoked = is_id(&name) && std::fs::symlink_metadata(e.path().join("manifest.json")).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
         if name.starts_with(REMOVED) || revoked {
             std::fs::remove_dir_all(e.path())?;
         }

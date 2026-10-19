@@ -747,7 +747,8 @@ impl Host {
 
     /// The template content ids VMs here use as far as their records say: registered VMs, every
     /// suspended (or quarantined) one, even one a live process holds the name of (a resume that has
-    /// not opened its template yet), and flexvm's own checkpoints (`checkpoint::managed`). `rmi` reads it again under a generation's exclusive
+    /// not opened its template yet), and flexvm's own checkpoints (`checkpoint::managed`); while any of
+    /// those records cannot be read, a `template::KEEP_ALL` entry. `rmi` reads it again under a generation's exclusive
     /// use lock: a suspend publishes its checkpoint before its process lets the lock go, and a resume
     /// takes the lock before it marks the checkpoint STARTED, so one of the two shows every such VM.
     pub fn template_users(&self) -> std::collections::BTreeSet<String> {
@@ -757,28 +758,17 @@ impl Host {
             .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
             .map(|e| e.path())
             .filter(|d| !d.join("STARTED").exists() && !d.join("DISCARDED").exists())
-            .filter_map(|d| crate::checkpoint::record(&d).map(|m| (d, m)));
-        let mut unreadable = false;
-        for (dir, manifest) in suspended.chain(crate::checkpoint::managed(&self.state)) {
+            .filter_map(|d| crate::checkpoint::record(&d));
+        let mut unreadable = vec![];
+        for manifest in suspended.chain(crate::checkpoint::managed(&self.state).map(|(_, m)| m)) {
             match manifest {
-                Ok(m) => {
-                    ids.insert(m.template_id);
-                }
-                Err(err) => {
-                    crate::log!("flexvm: warning: unreadable checkpoint {}: {err}; keeping every template generation", dir.display());
-                    unreadable = true;
-                }
+                Ok(m) => drop(ids.insert(m.template_id)),
+                Err(err) => unreadable.push(err.to_string()),
             }
         }
-        if unreadable {
-            match std::fs::read_dir(self.state.join("templates").join(crate::template::GENERATIONS))
-                .and_then(|entries| entries.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned())).collect::<std::io::Result<Vec<_>>>())
-            {
-                Ok(all) => ids.extend(all),
-                Err(_) => {
-                    ids.insert(crate::template::ALL_GENERATIONS.into());
-                }
-            }
+        // It may use any generation: all stay, and `rmi` or `image prune` says why.
+        if !unreadable.is_empty() {
+            ids.insert(format!("{}a checkpoint here cannot be read ({})", crate::template::KEEP_ALL, unreadable.join("; ")));
         }
         ids
     }
