@@ -1000,6 +1000,7 @@ mod tests {
         let root = crate::test_util::TempDir::new("claim-peer");
         let (private, sock) = (root.join("private"), root.join("claim.sock"));
         std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
         let listener = crate::socket::bind_private(&private.join(".1.sock"), &sock).unwrap();
         assert_eq!(std::fs::metadata(&sock).unwrap().mode() & 0o777, 0o600);
         assert!(!private.join(".1.sock").exists(), "moved, not linked");

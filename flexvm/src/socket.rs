@@ -31,11 +31,15 @@ pub fn bind_private(private: &Path, sock: &Path) -> io::Result<std::os::unix::ne
     use std::os::fd::AsRawFd;
     check(sock)?;
     let (dir, name) = (private.parent().unwrap_or(Path::new(".")), private.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?);
-    let dir = fs::File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC).open(dir)?;
+    let dir = fs::File::options().read(true).custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC).open(dir)?;
     let m = dir.metadata()?;
-    if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o022 != 0 {
-        return Err(denied(private, "must be owned by this user and not writable by group or others"));
+    if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
+        return Err(denied(private, "must be owned by this user and closed to group and others"));
     }
+    // Held from the sweep until the socket is moved out: a `.PID.sock` seen under it is no bind's in
+    // progress (a process reusing a dead one's pid waits here), only one a bind left behind. One whose
+    // pid runs stays all the same: it may be a bind by a flexvm from before this lock.
+    let _bind = crate::host::Flock::new(dir.try_clone()?, libc::LOCK_EX)?;
     let opened = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
     for entry in fs::read_dir(&opened)? {
         let entry = entry?;
@@ -209,7 +213,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let staging = dir.join(format!(".{}.sock", std::process::id()));
         let sock = t.join("c.sock");
-        for mode in [0o720, 0o702] {
+        for mode in [0o720, 0o702, 0o750, 0o705] {
             fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
             assert_eq!(bind_private(&staging, &sock).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         }
@@ -223,6 +227,23 @@ mod tests {
         let _l = bind_private(&dir.join("staging"), &sock).unwrap();
         assert!(!dead.exists());
         assert!(live.exists() && plain.exists());
+    }
+
+    #[test]
+    fn private_binds_wait_for_one_in_progress() {
+        use crate::test_util::JoinWithin;
+        let t = fixture();
+        let dir = t.join("private");
+        DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        // As a bind in progress holds it: a sweep then must not see its socket, nor a bind start.
+        let held = crate::host::Flock::new(fs::File::open(&dir).unwrap(), libc::LOCK_EX).unwrap();
+        let (staging, sock) = (dir.join(".1.sock"), t.join("c.sock"));
+        let bind = std::thread::spawn(move || bind_private(&staging, &sock).map(drop));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!bind.is_finished() && !t.join("c.sock").exists(), "bound with the directory locked");
+        drop(held);
+        bind.join_within().unwrap().unwrap();
+        assert!(t.join("c.sock").exists());
     }
 
     #[test]
