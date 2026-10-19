@@ -83,6 +83,15 @@ pub(crate) fn disk_usage(path: &Path, seen: &mut BTreeSet<(u64, u64)>) -> Result
     Ok(size)
 }
 
+/// `disk_usage` of a directory `system df` or prune reports on, followed if it is a link
+/// (`templates` or `images` linked to another state's).
+fn root_usage(path: &Path, seen: &mut BTreeSet<(u64, u64)>) -> Result<u64> {
+    match std::fs::canonicalize(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        r => disk_usage(&r?, seen),
+    }
+}
+
 #[cfg(test)]
 fn usage(path: &Path) -> Result<u64> {
     disk_usage(path, &mut BTreeSet::new())
@@ -125,14 +134,14 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
             ("VMs", vec![host.run.join("vms")]),
             ("Checkpoints", vec![crate::checkpoint::store::dir(&host.state), host.state.join("suspended")]),
         ] {
-            let bytes = dirs.iter().map(|d| disk_usage(d, &mut seen)).sum::<Result<u64>>()?;
+            let bytes = dirs.iter().map(|d| root_usage(d, &mut seen)).sum::<Result<u64>>()?;
             output(format_args!("{kind:<16} {bytes:>16}\n"))?;
         }
         return Ok(());
     }
     let total = || -> Result<u64> {
         let mut seen = BTreeSet::new();
-        Ok(disk_usage(&paths.images, &mut seen)? + disk_usage(&paths.templates, &mut seen)? + disk_usage(&host.run.join("vms"), &mut seen)?)
+        Ok(root_usage(&paths.images, &mut seen)? + root_usage(&paths.templates, &mut seen)? + root_usage(&host.run.join("vms"), &mut seen)?)
     };
     let before = total()?;
     if system {
@@ -145,7 +154,7 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
             }
         }
     }
-    for removed in crate::template::prune(&paths, None, &|| host.template_users())? {
+    for removed in crate::template::prune(&paths, None, &|| host.template_users(), args.has("force-shared"))? {
         crate::print(removed)?;
     }
     if system {
@@ -459,5 +468,10 @@ mod tests {
         let expected = dir.symlink_metadata().unwrap().blocks() * 512 + dir.join("a").metadata().unwrap().blocks() * 512;
         assert_eq!(usage(&dir).unwrap(), expected);
         assert_eq!(usage(&dir.join("absent")).unwrap(), 0);
+        // A linked root (`templates` linked to another state's) is followed; links under it are not.
+        let state = crate::test_util::TempDir::new("df-linked");
+        std::os::unix::fs::symlink(&*dir, state.join("templates")).unwrap();
+        assert_eq!(root_usage(&state.join("templates"), &mut BTreeSet::new()).unwrap(), expected);
+        assert_eq!(root_usage(&state.join("absent"), &mut BTreeSet::new()).unwrap(), 0);
     }
 }

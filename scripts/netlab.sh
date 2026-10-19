@@ -12,6 +12,20 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=$root/target/release/flexvm
 state=$(realpath -m "${STATE:-/var/lib/flexvm}")
+# Removes the records (#869) of the states under each DIR as users of STATE's templates: a recorded
+# state that is gone keeps every <none> generation there.
+forget_states() {
+  local f d
+  for f in "$state"/templates/.states/*; do
+    [[ -f $f ]] || continue
+    for d in "$@"; do
+      if [[ $(cat "$f" 2>/dev/null) == "$(realpath -m "$d")"/* ]]; then
+        rm -f "$f"
+      fi
+    done
+  done
+  return 0
+}
 
 up() (
   created=()
@@ -86,6 +100,7 @@ stop() {
       [[ -d $cg ]] && rmdir "$cg" 2>/dev/null || true
     done
   done
+  forget_states /run/flexvm-lab-A /run/flexvm-lab-B
   rm -rf /run/flexvm-lab-A /run/flexvm-lab-B
 }
 

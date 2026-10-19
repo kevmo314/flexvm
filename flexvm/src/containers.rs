@@ -365,6 +365,8 @@ fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
         // A crash past the move (before the claim follows) leaves the journal: the claim stays
         // held by the directory at `to`, and the next to take `to` moves it (`Host::finish_rename`).
         let (journal, parent) = (host.rename_journal(to)?, host.state.join("suspended"));
+        // Readers of the stopped VMs' records (`host::recorded_template_users`) see it at one name or the other.
+        let _moves = host::suspended_moves(&host.state, libc::LOCK_EX)?;
         crate::util::write_file(&parent, &journal.file_name().unwrap_or_default().to_string_lossy(), from.as_bytes(), true)?;
         let moved = std::fs::rename(&dir, &dest).map_err(|e| format!("renaming {} to {}: {e}", dir.display(), dest.display()));
         if let Err(e) = moved.and_then(|()| crate::util::sync_dir(&parent).map_err(|e| format!("syncing {}: {e}", parent.display()))) {

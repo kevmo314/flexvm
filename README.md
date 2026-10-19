@@ -780,7 +780,17 @@ are a download cache and stay until `system prune`.
 `image prune` removes each `<none>` generation as `rmi ID` would: those a
 VM here (running, paused, standby or stopped) or a checkpoint in
 `STATE/checkpoints` uses stay, and, as with `rmi`, checkpoints elsewhere that
-pin a pruned generation cannot be restored here any more. `system prune` also removes failed and lost VM records and the layer
+pin a pruned generation cannot be restored here any more. In a templates
+directory other states share, `image prune` and `rmi ID` also keep what their
+stopped VMs and stored checkpoints use (each state that uses the directory is
+recorded in `templates/.states/` when opened; running VMs of any state are seen
+on this host anyway), and every `<none>` generation while one of those states
+cannot be read or is gone (moved or removed). One marked shared by an older
+flexvm (an empty `templates/.shared`) may have states linked to it that were
+never recorded: both keep every `<none>` generation there. Once each such state
+has run a flexvm command, or after removing a state that used the directory,
+`image prune --force-shared` takes the record as right: it forgets states that
+are gone, marks the directory up to date and prunes. `system prune` also removes failed and lost VM records and the layer
 blob cache (left alone while a pull runs). Both list what they remove and the
 bytes reclaimed, and ask first on a terminal; without one they need `-f`.
 `system df` reports allocated bytes for image root filesystems, templates,
@@ -834,7 +844,9 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
 host's. A state whose `templates` is a link marks its target shared when opened, and
-pulls through a shared one leave old generations to `image prune` (see Images);
+records itself (and the state the directory belongs to) in it, so `image prune`
+there can read each one's stopped VMs and checkpoints; pulls through a shared
+one leave old generations to `image prune` (see Images);
 after upgrading to this release, run a command with each such state (`flexvm --state S
 ps`) before pulling, or a stopped VM there may lose its generation. On first open, each state directory permanently records its canonical run
 path in `run.json`, and the run directory records its state in `state.json`; using

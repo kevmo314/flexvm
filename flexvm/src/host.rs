@@ -595,7 +595,7 @@ impl Host {
         }
         // Name locks (`vms`): made by root, so a non-root reader leaves it be.
         let _ = private_dir(&locks(&run.join("vms")));
-        match crate::template::note_shared(&crate::template::Paths::new(state)) {
+        match crate::template::note_shared(&crate::template::Paths::new(state), state) {
             Err(e) if !unwritable(&e) => Err(root(e))?,
             _ => {}
         }
@@ -762,26 +762,7 @@ impl Host {
     /// takes the lock before it marks the checkpoint STARTED, so one of the two shows every such VM.
     pub fn template_users(&self) -> std::collections::BTreeSet<String> {
         let mut ids: std::collections::BTreeSet<String> = self.entries().into_iter().map(|e| e.template_id).filter(|id| !id.is_empty()).collect();
-        let suspended = crate::checkpoint::entries(&self.state.join("suspended")).filter_map(|entry| match entry {
-            Ok(d) if !d.file_name()?.as_encoded_bytes().starts_with(b".") && !d.join("STARTED").exists() && !d.join("DISCARDED").exists() => {
-                crate::checkpoint::record(&d)
-            }
-            Ok(_) => None,
-            Err(e) => Some(Err(e)),
-        });
-        let mut unreadable = vec![];
-        // Names cannot hide a checkpoint's template: their listing does not matter here.
-        let stored = crate::checkpoint::managed(&self.state).map(|c| c.and_then(|(_, m)| m));
-        for manifest in suspended.chain(stored) {
-            match manifest {
-                Ok(m) => drop(ids.insert(m.template_id)),
-                Err(err) => unreadable.push(err.to_string()),
-            }
-        }
-        // It may use any generation: all stay, and `rmi` or `image prune` says why.
-        if !unreadable.is_empty() {
-            ids.insert(format!("{}a checkpoint here cannot be read ({})", crate::template::KEEP_ALL, unreadable.join("; ")));
-        }
+        ids.extend(recorded_template_users(&self.state, "here"));
         ids
     }
 
@@ -3699,6 +3680,50 @@ pub fn check_name(name: &str) -> Result<()> {
 /// Linux grants an exclusive flock through a read-only descriptor, so a lock any
 /// user can open is one any user can hold. Readable files and directories are
 /// never flocked themselves.
+/// The template content ids `state`'s suspended (or quarantined) VMs and stored checkpoints
+/// (`checkpoint::managed`) name, with a `template::KEEP_ALL` entry while any of those records cannot be read
+/// (a checkpoint `where` cannot be read): `Host::template_users`, and another state's that shares the
+/// templates directory (`template::prune`), whose running VMs hold their generation's use lock instead.
+/// `STATE/.locks/SUSPENDED_MOVES`: held exclusively while a stopped VM's directory moves (`containers::rename`),
+/// shared while `recorded_template_users` lists them. Its holders take no other lock under it.
+pub fn suspended_moves(state: &Path, how: i32) -> std::io::Result<Flock> {
+    Flock::new(private_file(&locks(state).join(SUSPENDED_MOVES))?, how)
+}
+
+const SUSPENDED_MOVES: &str = "suspended-moves";
+
+pub fn recorded_template_users(state: &Path, place: &str) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut unreadable = vec![];
+    // A listing taken while a stopped VM is renamed may show it under neither name.
+    let _moves = suspended_moves(state, libc::LOCK_SH).map_err(|e| unreadable.push(format!("{}: {e}", locks(state).join(SUSPENDED_MOVES).display())));
+    for entry in crate::checkpoint::entries(&state.join("suspended")) {
+        match entry {
+            Ok(d) if !d.file_name().is_some_and(|n| n.as_encoded_bytes().starts_with(b".")) && !d.join("STARTED").exists() && !d.join("DISCARDED").exists() => {
+                match crate::checkpoint::record(&d) {
+                    Some(Ok(m)) => drop(ids.insert(m.template_id)),
+                    Some(Err(err)) => unreadable.push(err.to_string()),
+                    None => {}
+                }
+            }
+            Ok(_) => {}
+            Err(err) => unreadable.push(err.to_string()),
+        }
+    }
+    // Names cannot hide a checkpoint's template: their listing does not matter here.
+    for manifest in crate::checkpoint::managed(state).map(|c| c.and_then(|(_, m)| m)) {
+        match manifest {
+            Ok(m) => drop(ids.insert(m.template_id)),
+            Err(err) => unreadable.push(err.to_string()),
+        }
+    }
+    // It may use any generation: all stay, and `rmi` or `image prune` says why.
+    if !unreadable.is_empty() {
+        ids.insert(format!("{}a checkpoint {place} cannot be read ({})", crate::template::KEEP_ALL, unreadable.join("; ")));
+    }
+    ids
+}
+
 pub fn locks(dir: &Path) -> PathBuf {
     dir.join(LOCKS)
 }
