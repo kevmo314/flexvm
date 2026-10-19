@@ -492,7 +492,7 @@ warnings about likely mistakes.
 | `announce_dev` | derived | where the host answers ARP for its VMs and announces arrivals; `"none"`: off |
 | `reserve_mib` | a sixteenth of RAM, 256 MiB to 4 GiB | memory kept free |
 | `evict_mib` | the reserve plus the reserve or 512 | below this much available, VMs move to peers |
-| `listen` | none | this host's listen address; `flexvm listen ADDR` saves it |
+| `listen` | none | this host's listen address, `HOST:PORT` with a nonzero port; `flexvm listen ADDR` saves it. A name is listened on at each address it resolves to (peers may pick any), and an activated socket given with ADDR must take them all |
 
 Every command checks the file as it loads it (`Config::validate`): a key it
 does not know, a malformed address or range, a `peers` entry that is not

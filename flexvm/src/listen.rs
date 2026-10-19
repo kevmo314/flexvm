@@ -124,8 +124,8 @@ impl Drop for Wait {
     }
 }
 
-pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<Cached> {
-    let local = listener.local_addr()?;
+/// Each of `listeners` (a name's addresses each have one) must be reachable as advertised.
+pub fn validate(listeners: &[TcpListener], cfg: &crate::host::Config) -> Result<Cached> {
     // Bounded: this runs under the host lock. Seeds `PEER_CACHE` before the advertised
     // address is derived from it (a wildcard listener's underlay): at a first start or
     // after a boot, nothing else has looked the peers up yet.
@@ -146,13 +146,17 @@ pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<Cac
         c.write(&run.join(PEER_CACHE));
     }
     // Under the host lock: from what was just seeded, never a lookup.
-    if let Some(e) = unreachable_at(local, v6only(listener), cfg.advertise_by(false)?.as_deref()) {
-        bail!("{e}");
-    }
+    let advertised = cfg.advertise_by(false)?;
     let toward =
         || crate::host::toward(&found.iter().map(|a| a.clone().unwrap_or_default()).collect::<Vec<_>>(), |a| crate::net::is_local_addr(a).unwrap_or(false));
-    if let Some(e) = loopback_with_remote(local, toward) {
-        bail!("{e}");
+    for listener in listeners {
+        let local = listener.local_addr()?;
+        if let Some(e) = unreachable_at(local, v6only(listener), advertised.as_deref()) {
+            bail!("{e}");
+        }
+        if let Some(e) = loopback_with_remote(local, toward) {
+            bail!("{e}");
+        }
     }
     Ok(Cached { names: cfg.peers.iter().cloned().zip(found).filter_map(|(n, a)| a.map(|a| (n, a))).collect() })
 }
@@ -166,14 +170,15 @@ fn loopback_with_remote(local: SocketAddr, toward: impl FnOnce() -> crate::host:
     Some(format!("{local} is loopback, but peer {peer} is elsewhere and cannot reach it; listen on 0.0.0.0 or this host's address toward it"))
 }
 
-pub fn main(host: Host, listener: TcpListener, validated: Cached) -> Result<()> {
+pub fn main(host: Host, listeners: Vec<TcpListener>, validated: Cached) -> Result<()> {
     crate::net::ip_forward()?;
     let dev = host.cfg.announce_dev();
     if let Some(dev) = &dev {
         let _ = crate::net::proxy_arp(dev);
     }
     let underlay = host.cfg.underlay().map_or("none".into(), |u| u.to_string());
-    crate::info!("flexvm listening on {} (underlay {underlay}, announce device {})", listener.local_addr()?, dev.as_deref().unwrap_or("none"));
+    let at = listeners.iter().map(|l| l.local_addr().map(|a| a.to_string())).collect::<std::io::Result<Vec<_>>>()?.join(", ");
+    crate::info!("flexvm listening on {at} (underlay {underlay}, announce device {})", dev.as_deref().unwrap_or("none"));
     // A sweep and a refill now, not after the first period: a listener started at boot is
     // what recovers a quiet host (#555).
     let first = host.clone();
@@ -187,6 +192,18 @@ pub fn main(host: Host, listener: TcpListener, validated: Cached) -> Result<()> 
     let peers = Peers::watch(host.clone(), validated);
     let (waits, moved) = (Waiting::new(MAX_WAITING, MAX_WAITING_FROM), Waiting::new(MAX_MOVED, MAX_MOVED_FROM));
     let host = std::sync::Arc::new(host);
+    let mut listeners = listeners.into_iter();
+    let first = listeners.next().ok_or("no listening socket")?;
+    // A name's other addresses: the same admission, slots and waits as the first.
+    for l in listeners {
+        let (host, peers, waits, moved) = (host.clone(), peers.clone(), waits.clone(), moved.clone());
+        std::thread::Builder::new().name("accept".into()).spawn(move || accept(&l, &host, &peers, &waits, &moved))?;
+    }
+    accept(&first, &host, &peers, &waits, &moved);
+    Ok(())
+}
+
+fn accept(listener: &TcpListener, host: &Arc<Host>, peers: &Peers, waits: &Waiting, moved: &Waiting) {
     for conn in listener.incoming() {
         // Everything a request does before it is read, checking its peer
         // included, counts against its deadline.
@@ -206,7 +223,7 @@ pub fn main(host: Host, listener: TcpListener, validated: Cached) -> Result<()> 
         let waiting = match peers.check(&host.config_now().peers, from) {
             Admission::Peer => {
                 let Some(slot) = ACTIVE.take(from) else { continue };
-                let (host, peers) = (host.clone(), peers.clone());
+                let (host, peers) = (Arc::clone(host), peers.clone());
                 spawn_request(std::thread::Builder::new(), move || serve(&host, &peers, conn, slot, deadline));
                 continue;
             }
@@ -218,7 +235,7 @@ pub fn main(host: Host, listener: TcpListener, validated: Cached) -> Result<()> 
             not_a_peer(conn, from);
             continue;
         };
-        let (host, peers) = (host.clone(), peers.clone());
+        let (host, peers) = (Arc::clone(host), peers.clone());
         spawn_request(std::thread::Builder::new(), move || {
             let admitted = peers.admit_by(&host, from, Instant::now() + ADMIT_WAIT);
             drop(waiting);
@@ -229,7 +246,6 @@ pub fn main(host: Host, listener: TcpListener, validated: Cached) -> Result<()> 
             }
         });
     }
-    Ok(())
 }
 
 fn spawn_request(builder: std::thread::Builder, work: impl FnOnce() + Send + 'static) {
@@ -1275,7 +1291,7 @@ mod tests {
         host.configure(|cfg| {
             cfg.listen = Some("0.0.0.0:7106".into());
             cfg.peers = vec!["localhost:7107".into()];
-            validate(&listener, cfg)?;
+            validate(std::slice::from_ref(&listener), cfg)?;
             assert_eq!(cfg.advertise()?.as_deref(), Some("127.0.0.1:7106"));
             Ok(())
         })
@@ -1283,7 +1299,7 @@ mod tests {
         // Seeded even when refused: a name that does not resolve gets an empty entry, the others keep theirs.
         let e = host.configure(|cfg| {
             cfg.peers = vec!["localhost:7107".into(), "never.invalid:7107".into(), "10.98.0.1:7107".into()];
-            validate(&listener, cfg).map(|_| ())
+            validate(std::slice::from_ref(&listener), cfg).map(|_| ())
         });
         assert!(e.is_err(), "a loopback listener with a peer elsewhere");
         let peers = ["localhost:7107".to_string(), "never.invalid:7107".into()];
@@ -1311,7 +1327,7 @@ mod tests {
         host.configure(|cfg| {
             cfg.listen = Some(listener.local_addr()?.to_string());
             cfg.peers = vec!["localhost:7107".into()];
-            validated = validate(&listener, cfg)?;
+            validated = validate(std::slice::from_ref(&listener), cfg)?;
             cfg.peers.push("old.invalid:1".into());
             Ok(())
         })

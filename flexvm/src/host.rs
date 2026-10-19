@@ -205,6 +205,9 @@ impl Config {
         if !self.cluster()?.contains_range(&self.range()?) {
             bail!("vm_ips {} is not inside cluster_ips {}", self.vm_ips, self.effective_cluster_ips());
         }
+        if let Some(a) = self.listen.as_deref().filter(|a| !is_endpoint(a)) {
+            bail!("bad listen address {a:?}: give HOST:PORT with a nonzero port; peers are told it");
+        }
         if let Some(p) = self.peers.iter().find(|p| !is_endpoint(p)) {
             bail!("bad peer {p:?}: give HOST:PORT, a peer's flexvm listen address");
         }
@@ -381,10 +384,10 @@ impl Config {
     /// `advertise`, with `look` false starting no lookup (`underlay_known`).
     pub fn advertise_by(&self, look: bool) -> Result<Option<String>> {
         let Some(listen) = self.listen.as_deref() else { return Ok(None) };
-        let Ok(addr) = listen.parse::<SocketAddr>() else { return Ok(Some(listen.into())) };
-        if addr.port() == 0 {
-            bail!("listening on {listen}: give a port; peers are told it");
+        if !is_endpoint(listen) {
+            bail!("bad listen address {listen:?}: give HOST:PORT with a nonzero port; peers are told it");
         }
+        let Ok(addr) = listen.parse::<SocketAddr>() else { return Ok(Some(listen.into())) };
         let ip = addr.ip().to_canonical();
         let local_only = match ip {
             IpAddr::V4(v4) => v4.is_unspecified(),
@@ -404,6 +407,9 @@ impl Config {
 
 /// HOST:PORT, an IPv6 address in brackets; a name is resolved only when used.
 fn is_endpoint(s: &str) -> bool {
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return a.port() > 0;
+    }
     let Some((h, port)) = s.rsplit_once(':') else { return false };
     let host = match h.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
         Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
@@ -4319,11 +4325,13 @@ pub(crate) mod tests {
 
     #[test]
     fn peer_endpoints_are_validated() {
-        for good in ["10.0.0.2:7070", "host-b:7070", "[2001:db8::2]:7070"] {
+        for good in ["10.0.0.2:7070", "host-b:7070", "[2001:db8::2]:7070", "[fe80::1%3]:7070"] {
             assert!(is_endpoint(good), "{good}");
+            assert!(Config { listen: Some(good.into()), ..Config::default() }.validate().is_ok(), "{good}");
         }
-        for bad in ["10.0.0.2", "notahost", "10.0.0.2:0", "2001:db8::2", "[foo]:1", ":7070", "a:b"] {
+        for bad in ["10.0.0.2", "notahost", "10.0.0.2:0", "localhost:0", "2001:db8::2", "[foo]:1", ":7070", "a:b"] {
             assert!(!is_endpoint(bad), "{bad}");
+            assert!(Config { listen: Some(bad.into()), ..Config::default() }.validate().is_err(), "{bad}");
         }
     }
 
@@ -4904,8 +4912,10 @@ pub(crate) mod tests {
         }
         assert_eq!(cfg(Some("[2001:db8::1]:7070"), None).advertise().unwrap().as_deref(), Some("[2001:db8::1]:7070"));
         // Port 0 would be advertised as such.
-        for p0 in ["10.1.0.1:0", "0.0.0.0:0", "[::]:0"] {
-            assert!(cfg(Some(p0), Some("10.1.0.2")).advertise().is_err(), "{p0}");
+        for p0 in ["10.1.0.1:0", "0.0.0.0:0", "[::]:0", "localhost:0"] {
+            let c = cfg(Some(p0), Some("10.1.0.2"));
+            assert!(c.advertise().is_err(), "{p0}");
+            assert!(c.validate().is_err(), "{p0}");
         }
     }
 
