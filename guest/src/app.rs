@@ -273,11 +273,12 @@ fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: i
         if !matches!(app.state, State::Running(_)) {
             return msg(out, format!("closed {}", u8::from(app.tty)));
         }
-        // A newer one took over already: this one ends as though it was shut down.
+        let hello = msg(out, format!("ok {taken} {}", u8::from(stdin.tty())));
+        // A newer one took over already: told, this one ends as one replaced after its hello does.
         if !mine {
-            return Ok(());
+            return hello;
         }
-        let hello = msg(out, format!("ok {taken} {}", u8::from(stdin.tty()))).and_then(|()| out.try_clone());
+        let hello = hello.and_then(|()| out.try_clone());
         match hello {
             Ok(conn) => app.appin = Some((me, Some(conn))),
             Err(e) => {
@@ -1015,7 +1016,8 @@ mod tests {
     #[test]
     fn an_appin_whose_app_ends_before_its_hello_says_closed() {
         use std::os::unix::net::UnixStream;
-        for ends in [true, false] {
+        // The app ending, a newer APPIN claiming the slot, or neither, before the hello.
+        for (ends, newer) in [(true, false), (false, true), (false, false)] {
             let (r, w) = std::io::pipe().unwrap();
             let apps = Mutex::new(App {
                 state: State::Running(1),
@@ -1028,14 +1030,19 @@ mod tests {
             let fed = thread::scope(|s| {
                 let fed = s.spawn(|| {
                     appin_on(&apps, "7", &out, &[], || {
+                        let mut app = apps.lock().unwrap();
                         if ends {
-                            app_ended(&mut apps.lock().unwrap(), 1, 3)
+                            app_ended(&mut app, 1, 3)
+                        }
+                        if newer {
+                            app.appins += 1;
+                            app.appin = Some((app.appins, None));
                         }
                     })
                 });
                 let said = hello(&mut peer);
-                assert_eq!(said, if ends { "closed 0" } else { "ok 0 0" }, "app ending first: {ends}");
-                if !ends {
+                assert_eq!(said, if ends { "closed 0" } else { "ok 0 0" }, "app ending first: {ends}, a newer one: {newer}");
+                if !ends && !newer {
                     assert!(apps.lock().unwrap().appin.as_ref().is_some_and(|(_, c)| c.is_some()), "registered once told");
                     app_ended(&mut apps.lock().unwrap(), 1, 3);
                 }
@@ -1046,7 +1053,8 @@ mod tests {
             let mut rest = Vec::new();
             peer.read_to_end(&mut rest).unwrap();
             assert!(rest.is_empty(), "nothing after: {rest:?}");
-            assert!(apps.lock().unwrap().appin.is_none());
+            // The newer one's claim is its own still: never cleared by the one it replaced.
+            assert_eq!(apps.lock().unwrap().appin.as_ref().map(|(id, c)| (*id, c.is_some())), newer.then_some((2, false)));
             drop(r);
         }
     }
