@@ -4281,6 +4281,17 @@ mod tests {
         assert_eq!(early, [libc::SIGINT, libc::SIGTSTP, libc::SIGTERM, libc::SIGCONT]);
     }
 
+    #[test]
+    fn a_standby_loading_keeps_stops_for_the_next_phase() {
+        let (p, _root) = test_proc("standby-loading-stop", None);
+        assert!(p.vm.get().is_none());
+        assert_eq!(p.stop_requested(), None);
+        p.signal(libc::SIGUSR1);
+        assert_eq!(p.stop_requested(), Some(0));
+        p.signal(libc::SIGTERM);
+        assert_eq!(p.stop_requested(), Some(128 + libc::SIGTERM));
+    }
+
     /// Only the pool's own stop leaves an unclaimed standby with 0; a signal sent to it gives 128 + it.
     #[test]
     fn standby_stops_exit_with_their_signal() {

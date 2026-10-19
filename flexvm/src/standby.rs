@@ -342,19 +342,12 @@ pub fn refill(host: &Host, template: &str) -> Result<usize> {
 /// `cooldown`: none while `.pressure` is recent, checked for each standby under the stop
 /// lock, so a refill that waited behind another while relief stopped standbys starts none.
 /// Only a count set by hand (`set`) starts them regardless.
-fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<usize> {
+pub(crate) fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<usize> {
     let lock = refill_lock(host, template)?;
-    let _lock = match Flock::new(lock, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
-        Ok(lock) => lock,
-        Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(0),
-        Err(e) => return Err(e.into()),
-    };
+    let how = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
+    let Some(_lock) = refill_locked(Flock::new(lock, how), wait)? else { return Ok(0) };
     let d = create_dir(host, template)?;
-    let _legacy = match legacy_refill_lock(&d, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
-        Ok(lock) => lock,
-        Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(0),
-        Err(e) => return Err(e.into()),
-    };
+    let Some(_legacy) = refill_locked(legacy_refill_lock(&d, how), wait)? else { return Ok(0) };
     let want = target(host, template).saturating_sub(live(host, template).len());
     if want == 0 {
         return Ok(0);
@@ -389,6 +382,14 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<
     }
 }
 
+fn refill_locked(lock: std::io::Result<Flock>, wait: bool) -> Result<Option<Flock>> {
+    match lock {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// A started standby's readiness reply, within `timeout` of now: counted from when it is
 /// read, not from its start, as replies are read only once every start in the round is done.
 fn wait_ready(r: BufReader<UnixStream>, timeout: Duration) -> Result<()> {
@@ -413,8 +414,8 @@ fn grant_mib(host: &Host, template: &str) -> u64 {
 fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) -> Result<Option<BufReader<UnixStream>>> {
     // Shared from the grant until its lock file exists (`locked`), not through its load:
     // relief either lists it or ran before the grant. None while relief stops them, and
-    // held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant; a child that
-    // has not acknowledged its lock by then is killed and reaped).
+    // each wait gets `LOCKED_TIMEOUT` (a stuck host lock fails the grant; a child that
+    // has not acknowledged its lock by its deadline is killed and reaped).
     let stop = stop_lock(host)?;
     let by = Instant::now() + LOCKED_TIMEOUT;
     let Ok(stop) = Flock::new(stop, libc::LOCK_SH | libc::LOCK_NB) else { return Ok(None) };
@@ -444,6 +445,7 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
             ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--standby".as_ref(), template.as_ref()];
         crate::util::start_reaper()?;
         let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &[("FLEXVM_NOTIFY_FD", "3")])?;
+        let by = Instant::now() + LOCKED_TIMEOUT;
         drop(w);
         let mut r = BufReader::new(r);
         wait_locked(&mut r, &mut child, by)?;
@@ -594,7 +596,14 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     }
     let claim_path = l.join(format!("{id}.claim"));
     p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone(), l.join(format!("{id}.take"))]);
-    let ready = load(p.spawner.take(None)?, tpl.clone())?;
+    let check_stop = || {
+        if let Some(code) = p.stop_requested() {
+            p.finish(op, End::NotStarted, code, None);
+        }
+    };
+    check_stop();
+    let idle = p.spawner.take(None)?;
+    let ready = load(idle, tpl.clone(), check_stop)?;
     // Taken now, so a claim does not scan memory or ask Firecracker.
     *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
     *p.standby.lock().unwrap() = Some(ready);
@@ -994,22 +1003,32 @@ const RESEED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs the restored VM once (the slow first resume, off the request path)
 /// until the guest reseeds, then pauses it.
-fn load(idle: Firecracker, template: Arc<Template>) -> Result<Prepared> {
+fn load(idle: Firecracker, template: Arc<Template>, check_stop: impl Fn()) -> Result<Prepared> {
+    check_stop();
     let p = Vm::prepare(idle, template, &mut Phases::new())?;
+    check_stop();
     p.pager.learn_load_set();
     let fc = p.firecracker();
     fc.load_snapshot(&p.template().vmstate(), &p.template(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
+    check_stop();
     // Only an API pause stops the devices writing guest memory.
     fc.pause(API_TIMEOUT)?;
+    check_stop();
     p.pager.wait_ready(Duration::from_secs(5))?;
+    check_stop();
     let resumed = fc.resume(API_TIMEOUT);
     p.pager.loaded();
     resumed?;
+    check_stop();
     wait_for_reseed(&fc.sockets.vsock)?;
+    check_stop();
     // Set the clock now so START at the claim can skip clock_settime (slow in big guests).
     let _ = guest::clock(&fc.sockets.vsock, guest::TIMEOUT);
+    check_stop();
     std::thread::sleep(SETTLE);
+    check_stop();
     fc.pause(API_TIMEOUT)?;
+    check_stop();
     Ok(p)
 }
 
@@ -1611,6 +1630,19 @@ mod tests {
         assert!(live(&host, "default").is_empty(), "never through a link");
         assert!(victim.try_wait().unwrap().is_none());
         drop(victim);
+    }
+
+    #[test]
+    fn refill_lock_contention_is_skipped_only_when_not_waiting() {
+        let root = crate::test_util::TempDir::new("refill-lock-result");
+        let path = root.join("lock");
+        let lock = || Flock::new(crate::host::private_file(&path).unwrap(), libc::LOCK_EX | libc::LOCK_NB);
+        let held = refill_locked(lock(), false).unwrap().unwrap();
+        assert!(refill_locked(lock(), false).unwrap().is_none());
+        assert!(refill_locked(lock(), true).is_err());
+        assert!(refill_locked(Err(std::io::Error::from_raw_os_error(libc::EACCES)), false).is_err());
+        drop(held);
+        assert!(refill_locked(lock(), true).unwrap().is_some());
     }
 
     #[test]

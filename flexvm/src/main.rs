@@ -1640,6 +1640,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     match standby {
         // Kept per image (`STATE/standby/NAME`): refilled now, and by every listener and VM process.
         Some(n) => print(standby::set(&host, &name, n)?),
+        None if standby::target(&host, &name) > 0 => standby::refill_by(&host, &name, true, true).map(|_| ()),
         None => Ok(()),
     }
 }
@@ -1702,7 +1703,13 @@ fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
         bail!("image {} is used by {}: remove them first (flexvm rm -f)", template::image_of(&name), users.join(", "));
     }
     let id = std::fs::read_link(paths.templates.join(&name))?.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    print(standby::removing(host, paths, &name, |paths| template::remove_locked(paths, Some(&name), &id, &in_use))?)
+    let result = standby::removing(host, paths, &name, |paths| template::remove_locked(paths, Some(&name), &id, &in_use));
+    if standby::target(host, &name) > 0 {
+        if let Err(e) = standby::refill_by(host, &name, true, true) {
+            crate::log!("flexvm: rmi {name}: standby refill: {e}");
+        }
+    }
+    print(result?)
 }
 
 fn image_options(args: &Args, src: &str) -> Result<image::Options> {
