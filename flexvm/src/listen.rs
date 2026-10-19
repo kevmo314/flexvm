@@ -867,8 +867,8 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     // A received one's digests, for the source to compare: its content id is no proof of its files.
     let have = |t: &crate::template::Template| json!({"have": true, "digests": t.meta.received.then_some(&t.meta.digests)});
     if let Some(tpl) = held() {
+        hold(tpl.clone());
         answer(&Ok(have(&tpl)))?;
-        hold(tpl);
         return Ok(());
     }
     // Held to the end, through the drain after a refusal too: what a source sends is read off only within it.
@@ -893,24 +893,25 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         }
         answer(&Ok(json!({"have": false, "ack": ack})))?;
         asked = true;
-        let bytes = req["bytes"].as_u64();
+        let (in_use, held) = (|| host.template_users(), || HELD.lock().unwrap().keys().cloned().collect());
+        let push = crate::template::Push { peer: conn.peer_addr()?.ip(), bytes: req["bytes"].as_u64(), in_use: &in_use, held: &held };
         let ready = |_: &crate::template::Meta| {
-            bytes.map_or(Ok(()), |b| crate::template::check_room(&paths, b))?;
             if ack {
                 answer(&Ok(json!({"go": true})))?;
             }
             Ok(())
         };
         let mut r = std::io::BufReader::with_capacity(1 << 20, crate::util::Paced::new(&conn, PUSH_GRACE, PUSH_RATE));
-        crate::template::receive(&paths, &mut r, id, None, ready, |_| Ok(())).map(Some)
+        push.receive(&paths, &mut r, id, ready).map(Some)
     })();
     match got {
         Ok(Some(tpl)) => {
+            // Held (and so charged to its peer's budget, `template::Push`) before the source hears it is here.
+            hold(tpl.clone());
             answer(&Ok(match asked {
                 true => json!({"received": true, "digests": tpl.meta.digests}),
                 false => have(&tpl),
             }))?;
-            hold(tpl);
         }
         Ok(None) => answer(&Ok(json!({"have": false})))?,
         Err(e) => {
@@ -1203,7 +1204,7 @@ mod tests {
         let e = crate::migrate::push_template(&addr, &tpl, true).err().unwrap().to_string();
         assert!(e.contains("no longer has"), "{e}");
         assert!(crate::template::Template::generation(&paths, &id).is_none());
-        // Sent: its metadata acknowledged, then its data.
+        // Sent: its metadata acknowledged, then its data; held before the source is answered (charged to its peer).
         let (got, digests) = crate::migrate::push_template(&addr, &tpl, false).unwrap().unwrap();
         assert!(got["ms"].is_number() && digests == json!(tpl.digests().unwrap()), "{got}");
         assert!(crate::template::Template::generation(&paths, &id).is_some() && HELD.lock().unwrap().contains_key(&id));
