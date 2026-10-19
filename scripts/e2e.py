@@ -2167,13 +2167,14 @@ def image_template():
 
 @case
 def pull_gc():
-    """pull: a rebuild deletes the generation it superseded, unless a stopped VM or a checkpoint here still uses it."""
+    """pull: a rebuild deletes the generation it superseded, unless a stopped VM or a checkpoint here (or a stopped VM of a state sharing the templates) still uses it."""
     # A host of its own (no listener), with its own templates: A's and B's are shared, which keeps them all.
     h = Host("gc", args.port_a, args.port_a + 1, args.net_a)
     os.makedirs(h.run_dir)
     os.makedirs(h.state_dir)
     os.symlink(ARTIFACTS, os.path.join(h.state_dir, "artifacts"))
     h.configure(vm_ips=f"{args.net_a}.200-{args.net_a}.220", reserve_mib=256)
+    peer = Host("gc-peer", args.port_a, args.port_a + 1, args.net_a)
     name, vm = "e2e-gc", "e2e-gc"
 
     def pull(n):
@@ -2218,11 +2219,34 @@ def pull_gc():
         h.cli("checkpoint", "rm", ck["id"])
         out = prune()
         check("prune: collected once its checkpoint is gone", third in out and third not in images(), (third, out))
+        # #869: another state whose templates link to these; its stopped VM keeps its generation through this
+        # state's pull and image prune, which see none of its VMs but read its records.
+        os.makedirs(peer.run_dir)
+        os.makedirs(peer.state_dir)
+        os.symlink(ARTIFACTS, os.path.join(peer.state_dir, "artifacts"))
+        os.symlink(os.path.join(h.state_dir, "templates"), os.path.join(peer.state_dir, "templates"))
+        peer.configure(vm_ips=f"{args.net_a}.221-{args.net_a}.240", reserve_mib=256)
+        fourth = current()
+        peer.run(vm, template=name)
+        peer.suspend(vm)
+        deleted = pull(5)
+        check("rebuild: shared templates leave the superseded generation to prune", deleted == [] and images().get(fourth, "missing") is None,
+              (fourth, deleted, images()))
+        out = prune()
+        check("prune: a stopped VM of a state sharing the templates keeps its generation", fourth not in out and images().get(fourth, "missing") is None,
+              (fourth, out))
+        peer.resume(vm)
+        check("resume: the other state's VM, on a superseded generation", peer.ps().get(vm, {}).get("state") == "running", peer.ps())
+        peer.rm(vm, force=True)
+        out = prune()
+        check("prune: collected once the other state's VM is gone", fourth in out and fourth not in images(), (fourth, out))
         h.cli("rmi", name)
         check("rmi: nothing left", not images(), images())
     finally:
-        for v in h.ps():
-            h.rm(v, force=True, check=False)
+        for host in (h, peer):
+            if os.path.isdir(host.state_dir):
+                for v in host.ps():
+                    host.rm(v, force=True, check=False)
 
 
 @case

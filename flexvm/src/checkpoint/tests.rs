@@ -1317,3 +1317,88 @@ fn a_bad_name_link_keeps_template_users_exact() {
     let users = host.template_users();
     assert!(users.iter().all(|u| !u.starts_with(crate::template::KEEP_ALL)), "{users:?}");
 }
+
+/// #869: `image prune` in a templates directory other states share reads those states' records too.
+/// B's templates link to A's; generations B's suspended VM and stored checkpoint use, and A's, stay
+/// whichever state prunes; a linked state that cannot be read keeps all of them; one that no longer
+/// links goes from the record; a directory marked shared before states were recorded keeps all
+/// unless --force-shared.
+#[test]
+fn image_prune_keeps_what_states_sharing_the_templates_use() {
+    let root = tmp("shared-prune");
+    let a = crate::host::Host::open(&root.join("a/state"), &root.join("a/run")).unwrap();
+    let gens = a.state.join("templates/.gen");
+    let make = |ids: &[&str]| ids.iter().for_each(|id| fs::create_dir_all(gens.join(id)).unwrap());
+    let left = || crate::template::tests::generation_ids(&a.state.join("templates"));
+    make(&["aaaa1111", "bbbb2222", "cccc3333", "dddd4444"]);
+    fs::create_dir_all(root.join("b/state")).unwrap();
+    std::os::unix::fs::symlink(a.state.join("templates"), root.join("b/state/templates")).unwrap();
+    let b = crate::host::Host::open(&root.join("b/state"), &root.join("b/run")).unwrap();
+    assert_eq!(fs::read(a.state.join("templates/.shared")).unwrap(), b"states\n", "a linked state marks it, recorded");
+    assert_eq!(fs::read_dir(a.state.join("templates/.states")).unwrap().count(), 2, "B, and A whose templates they are");
+    // B's suspended VM and stored checkpoint, and A's suspended VM.
+    link(&b.suspended("x").unwrap(), None, |m| m.template_id = "aaaa1111".into());
+    let new = b.state.join("checkpoints/.new");
+    let id = link(&new, None, |m| m.template_id = "bbbb2222".into());
+    fs::rename(&new, b.state.join("checkpoints").join(id)).unwrap();
+    link(&a.suspended("y").unwrap(), None, |m| m.template_id = "cccc3333".into());
+    let prune = |host: &crate::host::Host, force| crate::template::prune(&Paths::new(&host.state), None, &|| host.template_users(), force).unwrap();
+    assert_eq!(prune(&a, false), [json!({"deleted": "dddd4444", "rootfs": null})], "A's prune keeps B's");
+    make(&["dddd4444"]);
+    assert_eq!(prune(&b, false), [json!({"deleted": "dddd4444", "rootfs": null})], "B's prune keeps A's");
+    assert_eq!(left(), ["aaaa1111", "bbbb2222", "cccc3333"]);
+    // A linked state that cannot be read keeps every generation.
+    make(&["eeee5555"]);
+    let suspended = b.state.join("suspended");
+    fs::rename(&suspended, b.state.join("suspended.moved")).unwrap();
+    fs::write(&suspended, b"not a directory").unwrap();
+    let users = b.template_users();
+    assert!(users.iter().any(|u| u.starts_with(crate::template::KEEP_ALL)), "{users:?}");
+    assert!(prune(&a, false).is_empty() && left().contains(&"eeee5555".to_string()));
+    fs::remove_file(&suspended).unwrap();
+    fs::rename(b.state.join("suspended.moved"), &suspended).unwrap();
+    assert_eq!(prune(&a, false), [json!({"deleted": "eeee5555", "rootfs": null})]);
+    // Marked shared before states were recorded: all stay, unless --force-shared.
+    make(&["eeee5555"]);
+    fs::write(a.state.join("templates/.shared"), b"").unwrap();
+    assert!(prune(&a, false).is_empty() && prune(&b, false).is_empty());
+    assert_eq!(prune(&a, true), [json!({"deleted": "eeee5555", "rootfs": null})], "still keeps what the recorded states use");
+    assert_eq!(fs::read(a.state.join("templates/.shared")).unwrap(), b"states\n", "--force-shared brings the marker up to date");
+    // B's templates are elsewhere for now: what only it used goes, and its record stays.
+    fs::remove_file(b.state.join("templates")).unwrap();
+    std::os::unix::fs::symlink(root.join("elsewhere"), b.state.join("templates")).unwrap();
+    assert_eq!(prune(&a, false).len(), 2);
+    assert_eq!(left(), ["cccc3333"]);
+    assert_eq!(fs::read_dir(a.state.join("templates/.states")).unwrap().count(), 2);
+    // Linked again (not opened since), `rmi ID` reads it too.
+    fs::remove_file(b.state.join("templates")).unwrap();
+    std::os::unix::fs::symlink(a.state.join("templates"), b.state.join("templates")).unwrap();
+    make(&["aaaa1111"]);
+    let err = crate::template::remove(&Paths::new(&a.state), None, "aaaa1111", &|| a.template_users()).unwrap_err().to_string();
+    assert!(err.contains("a state that shares these templates"), "{err}");
+    assert_eq!(left(), ["aaaa1111", "cccc3333"]);
+    // A state that is gone loses its record, and keeps nothing.
+    fs::remove_dir_all(root.join("b")).unwrap();
+    assert_eq!(prune(&a, false), [json!({"deleted": "aaaa1111", "rootfs": null})]);
+    assert_eq!(fs::read_dir(a.state.join("templates/.states")).unwrap().count(), 1);
+}
+
+/// #869: `rmi ID` in a directory marked shared before states were recorded counts the recorded ones
+/// only (it counted none before), and leaves the marker as it was.
+#[test]
+fn rmi_by_id_counts_recorded_states_of_an_old_shared_marker() {
+    let root = tmp("shared-rmi");
+    let a = crate::host::Host::open(&root.join("a/state"), &root.join("a/run")).unwrap();
+    for id in ["aaaa1111", "bbbb2222"] {
+        fs::create_dir_all(a.state.join("templates/.gen").join(id)).unwrap();
+    }
+    fs::create_dir_all(root.join("b/state")).unwrap();
+    std::os::unix::fs::symlink(a.state.join("templates"), root.join("b/state/templates")).unwrap();
+    let b = crate::host::Host::open(&root.join("b/state"), &root.join("b/run")).unwrap();
+    fs::write(a.state.join("templates/.shared"), b"").unwrap();
+    link(&b.suspended("x").unwrap(), None, |m| m.template_id = "aaaa1111".into());
+    let rmi = |id: &str| crate::template::remove(&Paths::new(&a.state), None, id, &|| a.template_users());
+    assert!(rmi("aaaa1111").unwrap_err().to_string().contains("a state that shares these templates"));
+    assert_eq!(rmi("bbbb2222").unwrap()["deleted"], "bbbb2222");
+    assert_eq!(fs::read(a.state.join("templates/.shared")).unwrap(), b"");
+}

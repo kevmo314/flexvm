@@ -887,7 +887,7 @@ fn import(
         Err(Abort::Undo(e)) => {
             drop(tpl);
             if how == How::Received {
-                let _ = template::prune(paths, Some(tid), in_use);
+                let _ = template::prune(paths, Some(tid), in_use, false);
             }
             return Err(e);
         }

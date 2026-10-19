@@ -123,8 +123,12 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm images [-q] [--json] [--filter reference=PATTERN|dangling=true|false]
                                      list pulled images (-q: unique generation IDs)
   flexvm tag SRC DST                 name a pulled generation again, without rebuilding
-  flexvm image prune [-f]            remove <none> generations no VM here uses (-f: without asking)
-  flexvm system prune [-f]           also failed and lost VM records and the layer blob cache
+  flexvm image prune [-f] [--force-shared]
+                                     remove <none> generations no VM here, or in a state sharing
+                                     the templates, uses (-f: without asking; --force-shared: also
+                                     when they were shared before flexvm recorded which states link them)
+  flexvm system prune [-f] [--force-shared]
+                                     also failed and lost VM records and the layer blob cache
   flexvm system df                   disk space by images, templates, blobs, VMs and checkpoints
   flexvm version                     version, commit and artifact information
   flexvm login [REGISTRY] [--username USER] [--password-stdin]
@@ -150,6 +154,7 @@ flexvm fails, 124 when the VM dies; exec returns the command's status, 127 when 
 /// Flags that take no value (`-a`, `-f` and `--standby` depend on the command: `takes_value`).
 const SWITCHES: &[&str] = &[
     "warm",
+    "force-shared",
     "stop",
     "paused",
     "incremental",
@@ -470,8 +475,8 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("pull", 2, &["tag", "vcpus", "mem", "max", "plug", "standby"]),
     ("images", 1, &["json", "quiet", "filter"]),
     ("tag", 3, &[]),
-    ("image", 2, &["force"]),
-    ("system", 2, &["force"]),
+    ("image", 2, &["force", "force-shared"]),
+    ("system", 2, &["force", "force-shared"]),
     ("version", 1, &[]),
     ("login", 2, &["username", "password-stdin"]),
     ("logout", 2, &[]),
@@ -518,6 +523,7 @@ fn check_applies(args: &Args) -> Result<()> {
         "image" if first.map(String::as_str) != Some("prune") => bail!("image needs prune"),
         "system" if !matches!(first.map(String::as_str), Some("prune" | "df")) => bail!("system needs prune or df"),
         "system" if first.map(String::as_str) == Some("df") && args.has("force") => bail!("system df takes no -f"),
+        "system" if first.map(String::as_str) == Some("df") && args.has("force-shared") => bail!("system df takes no --force-shared"),
         "images" if args.has("quiet") && args.has("json") => bail!("images takes -q or --json, not both"),
         "debug" => {
             let op = first.ok_or("debug fault|ckhash|gc|VM ...")?;
@@ -1622,7 +1628,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     if let Some(old) = res? {
         standby::superseded(&host, &name);
         // Published already: a failed prune leaves the old generation to `image prune`.
-        match template::prune(&paths, Some(&old), &|| host.template_users()) {
+        match template::prune(&paths, Some(&old), &|| host.template_users(), false) {
             Ok(removed) => {
                 for removed in removed {
                     output(format_args!("{removed}\n"))?;
