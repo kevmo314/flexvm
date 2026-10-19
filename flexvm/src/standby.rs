@@ -537,6 +537,16 @@ fn leave_status(died: bool, left_pool: bool) -> Option<i32> {
     }
 }
 
+/// Rank at most once a second, spread by pid; extras leave within 2s plus a check.
+fn rank_due(checked: &mut Instant, now: Instant, pid: u32) -> bool {
+    let every = Duration::from_millis(1000 + u64::from(pid) * 137 % 1000);
+    if now.duration_since(*checked) < every {
+        return false;
+    }
+    *checked = now;
+    true
+}
+
 /// `run --standby`: returns once claimed; ends the process if stopped,
 /// out of date, extra, or its VM died.
 pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) -> Result<Value> {
@@ -585,6 +595,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     }
     // Every pass, whether or not a connection came: a busy standby still leaves when it should.
     let mut checked: Option<Instant> = None;
+    let mut ranked = Instant::now();
     loop {
         if let Some(code) = p.stop_requested() {
             p.finish(op, End::NotStarted, code, None);
@@ -592,7 +603,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         if checked.is_none_or(|c| c.elapsed() >= CHECK_EVERY) {
             checked = Some(Instant::now());
             let current = key(&p.paths, template).ok();
-            let extra = live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
+            let extra = rank_due(&mut ranked, Instant::now(), me.pid)
+                && live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
             let died = p.standby.lock().unwrap().as_ref().map_or(Some("it was given up".to_string()), |s| {
                 s.pager.failed().map(String::from).or((!s.firecracker().alive()).then(|| "its firecracker exited".into()))
             });
@@ -947,7 +959,7 @@ pub fn publish_lock(sock: &std::path::Path) -> PathBuf {
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often an unclaimed standby checks its generation, the pool's target, its Firecracker and the
+/// How often an unclaimed standby checks its generation, socket, Firecracker and the
 /// host's memory, connections arriving or not (#850).
 const CHECK_EVERY: Duration = Duration::from_millis(100);
 /// What a refill grants a standby at least (`grant_mib`).
@@ -1262,6 +1274,25 @@ mod tests {
         assert!(worker.join().unwrap().is_err());
         setter.join().unwrap().unwrap();
         assert_eq!(std::fs::read(host.state.join("standby/default")).unwrap(), b"0", "the count set meanwhile is kept");
+    }
+
+    #[test]
+    fn ranking_is_throttled_jittered_and_bounded() {
+        let start = Instant::now();
+        let mut first = Vec::new();
+        for pid in [1000, 1001, 1002, u32::MAX] {
+            let mut checked = start;
+            let scans: Vec<_> = (0..=60).filter(|tick| rank_due(&mut checked, start + CHECK_EVERY * *tick, pid)).collect();
+            assert!((10..=20).contains(&scans[0]));
+            assert!(scans.windows(2).all(|s| (10..=20).contains(&(s[1] - s[0]))));
+            first.push(scans[0]);
+            // A delayed check runs once, without catching up missed scans.
+            let later = start + Duration::from_secs(30);
+            assert!(rank_due(&mut checked, later, pid));
+            assert!(!rank_due(&mut checked, later, pid));
+        }
+        assert_ne!(first[0], first[1]);
+        assert_ne!(first[1], first[2]);
     }
 
     #[test]
