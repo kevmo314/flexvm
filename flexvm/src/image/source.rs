@@ -71,7 +71,9 @@ impl Blob {
                     p if p.exists() => p,
                     _ => registry.blob(digest, *size, blobs)?,
                 };
-                return Blob::File(path).open();
+                let f = super::private_file(super::private_blobs(blobs)?.as_ref(), &path)?;
+                let len = f.metadata()?.len();
+                (Box::new(f), len)
             }
             Blob::File(p) => {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -209,8 +211,14 @@ fn diff_ids(config: &[u8], layers: usize) -> Result<Vec<String>> {
 }
 
 /// A cached document: a regular file of exactly `size` bytes (at most `MAX_DOCUMENT`) matching `digest`.
-pub(super) fn read_verified(path: &Path, size: u64, digest: &str) -> Result<Vec<u8>> {
-    let data = Blob::File(path.to_path_buf()).read_document()?;
+/// Read from `f` as opened (`path` names it in messages), never reopened by its path.
+pub(super) fn read_verified(path: &Path, f: File, size: u64, digest: &str) -> Result<Vec<u8>> {
+    let len = f.metadata()?.len();
+    if len > MAX_DOCUMENT {
+        bail!("document of {len} bytes is over the {MAX_DOCUMENT} byte limit");
+    }
+    let mut data = Vec::with_capacity(len as usize);
+    f.take(MAX_DOCUMENT).read_to_end(&mut data)?;
     if data.len() as u64 != size || sha256_hex(&data) != digest {
         bail!("cached blob {} does not match {digest} ({size} bytes)", path.display());
     }
@@ -265,7 +273,8 @@ fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> 
 
 fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
     let blobs = cache.join("blobs");
-    crate::util::create_dir_durably(&blobs.join("sha256"), 0o777)?;
+    super::private_dir(cache, Path::new(""))?;
+    let private = super::private_blobs(&blobs)?;
     super::registry::sweep_parts(&blobs.join("sha256"));
     let (manifest, digest) = reg.manifest(&reg.r.reference.clone())?;
     let (manifest, digest) = resolve_index(manifest, digest, |d| Ok(reg.manifest(d)?.0))?;
@@ -276,8 +285,18 @@ fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
     if config_size > MAX_DOCUMENT {
         bail!("image config of {config_size} bytes is over the {MAX_DOCUMENT} byte limit");
     }
-    let config = read_verified(&reg.blob(&config_digest, config_size, &blobs)?, config_size, &config_digest)?;
+    let config_path = reg.blob(&config_digest, config_size, &blobs)?;
+    // Read through the descriptor made private, never reopened by its path.
+    let f = super::private_file(private.as_ref(), &config_path)?;
+    let config = read_verified(&config_path, f, config_size, &config_digest)?;
     let diff_ids = diff_ids(&config, descs.len())?;
+    // A reused root filesystem never opens its layers: older versions' 0644 blobs are made private here.
+    for (d, _) in &descs {
+        match super::private_file(private.as_ref(), &blob_path(&blobs, d)?) {
+            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+            res => drop(res?),
+        }
+    }
     let reg = Arc::new(reg);
     let layers = descs
         .into_iter()
@@ -438,6 +457,29 @@ mod tests {
         assert_eq!(resolved, digest);
         let nested = serde_json::json!({"manifests": [{"digest": digest}]});
         assert!(resolve_index(nested, String::new(), |_| Ok(serde_json::json!({"manifests": [{"digest": "latest"}]}))).is_err());
+    }
+
+    #[test]
+    fn cached_layer_permissions_are_repaired_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = super::super::unpack::tests::tmpdir("blob-open-private");
+        let blobs = dir.join("blobs");
+        let digest = sha256_hex(b"private");
+        let path = blob_path(&blobs, &digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"private").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Local image inputs keep their permissions; only cache entries are tightened.
+        Blob::File(path.clone()).open().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        let registry = Arc::new(Registry::new(Reference::parse("localhost/test").unwrap()));
+        let (mut reader, len) = Blob::Cached { blobs: blobs.clone(), registry, digest, size: 7 }.open().unwrap();
+        let mut data = String::new();
+        reader.read_to_string(&mut data).unwrap();
+        assert_eq!((data.as_str(), len), ("private", 7));
+        for (p, mode) in [(blobs.as_path(), 0o700), (path.parent().unwrap(), 0o700), (&path, 0o600)] {
+            assert_eq!(std::fs::metadata(p).unwrap().permissions().mode() & 0o777, mode);
+        }
     }
 
     #[test]

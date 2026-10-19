@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -150,7 +151,7 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 /// `init` is flexvm-init's path, or the one built into flexvm (`artifacts::INIT`) for `None`.
 /// The root filesystem comes reserved (`Cached::reserved`): hold it until the template is published.
 pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBuf, ImageMeta, Flock, crate::host::HeldLock)> {
-    crate::util::create_dir_durably(cache, 0o755)?;
+    private_dir(cache, Path::new(""))?;
     let cache_dir = crate::host::Directory::open(cache)?;
     let key = crate::host::keyed("image-cache", &cache_dir.stat()?, "");
     let _cache_lock = crate::host::lock_at(crate::host::host_locks()?, &key, libc::LOCK_SH)?;
@@ -291,9 +292,12 @@ pub struct Cached {
 fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<Cached> {
     let dir = cached.parent().unwrap();
     // Entries handed out must survive a crash right after the first build, whoever made the directories.
-    crate::util::create_dir_durably(dir, 0o777)?;
-    // All work is in the directory as opened here, which the locks are keyed by.
-    let pinned = crate::host::Directory::open(dir)?;
+    // All work is in the directory as opened here, which the locks are keyed by: made private as reached
+    // through no symlink, or else as it is.
+    let (pinned, private) = match private_dir(dir.parent().unwrap_or(Path::new("")), Path::new(dir.file_name().ok_or("no image cache directory name")?))? {
+        Some(fd) => (crate::host::Directory::from_fd(fd), true),
+        None => (crate::host::Directory::open(dir)?, false),
+    };
     let (original, cached) = (cached, pinned.path.join(cached.file_name().unwrap()));
     let (cached, dir) = (cached.as_path(), pinned.path.as_path());
     sweep_temporaries(&pinned)?;
@@ -306,6 +310,9 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         res => res.map(|_| true)?,
     };
     if entry_complete(cached) {
+        for ext in ["ext4", "conf", "ok"] {
+            private_file(private.then_some(&pinned.fd), &cached.with_extension(ext))?;
+        }
         // A previous publisher may have failed its fsync after renaming .ok.
         sync(dir)?;
         crate::log!("image: root filesystem cached at {}", original.display());
@@ -436,7 +443,10 @@ fn remove_leftovers(cached: &Path) -> Result<()> {
 /// Publishes immutable files, the completion marker last, never replacing one: the caller's
 /// per-key lock leaves no competing publisher, so anything already there is a stray.
 fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<()> {
-    File::open(tmp)?.sync_all()?;
+    // This build's own new file (the builder may have made it with the umask's mode).
+    let f = std::os::unix::fs::OpenOptionsExt::custom_flags(File::options().read(true), libc::O_NOFOLLOW).open(tmp)?;
+    make_private(&f, 0o600)?;
+    f.sync_all()?;
     let dir = cached.parent().unwrap();
     let published = rename_noreplace(tmp, cached)? && publish(&cached.with_extension("conf"), bytes(conf.as_bytes()))? && {
         sync(dir)?;
@@ -484,6 +494,7 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
         (f, part)
     };
     let res = (|| {
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         write(&mut f)?;
         f.sync_all()?;
         Ok(rename(&tmp, &path)?)
@@ -491,12 +502,85 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     // The name is ours alone: gone if renamed, else a failed write's.
     let _ = std::fs::remove_file(&tmp);
     drop(part);
-    if res.is_ok() {
-        // Published data remains readable; only temporary parts are ever flocked.
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-    }
     res
+}
+
+/// The cache is private (directories 0700, files 0600), entries made by older versions (0755 and 0644)
+/// included, without changing ownership. `cache` (`STATE/images`) is canonicalized, so a symlink there
+/// still works; below it, every component is reached through a descriptor that follows no symlink, and a
+/// symlink there is left as it is, its contents never touched. Modes change only if they differ: a chmod
+/// moves the ctime that template stamps include, and every template using a root filesystem would rehash it.
+///
+/// Makes `rel` below `cache` (created if missing) and each directory on the way private: `cache` itself
+/// only for an empty `rel`. The directory, or None if a symlink was on the way.
+fn private_dir(cache: &Path, rel: &Path) -> Result<Option<OwnedFd>> {
+    let named = |e: std::io::Error| format!("{}: {e}", cache.join(rel).display());
+    let cache = if cache.as_os_str().is_empty() { Path::new(".") } else { cache };
+    crate::util::create_dir_durably(cache, 0o700)?;
+    let root = std::fs::canonicalize(cache).map_err(named)?;
+    let mut fd = crate::util::openat(libc::AT_FDCWD, &cpath(&root)?, libc::O_RDONLY | libc::O_DIRECTORY).map_err(named)?;
+    if rel.as_os_str().is_empty() {
+        make_private(&fd, 0o700).map_err(named)?;
+    }
+    for c in rel.components() {
+        let std::path::Component::Normal(name) = c else { bail!("{}: not a path below the image cache", rel.display()) };
+        let name = cpath(Path::new(name))?;
+        let open = |dir: &OwnedFd| crate::util::openat(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        let mut res = open(&fd);
+        if res.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            // Made in the directory as reached; a concurrent pull may make it first.
+            match crate::util::check(unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o700) }) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(named(e).into()),
+                _ => res = open(&fd),
+            }
+        }
+        fd = match res {
+            // A symlink: nothing is made under it, and what is there already is synced as found.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                let path = cache.join(rel);
+                if path.is_dir() {
+                    crate::util::create_dir_durably(&path, 0o700)?;
+                }
+                return Ok(None);
+            }
+            res => res.map_err(named)?,
+        };
+        make_private(&fd, 0o700).map_err(named)?;
+    }
+    // Entries handed out must survive a crash, whoever made the directories.
+    crate::util::sync_ancestors_fd(fd.as_raw_fd()).map_err(named)?;
+    Ok(Some(fd))
+}
+
+/// `blobs/sha256` (for `blobs`) and the directories above it, as `private_dir` makes them.
+fn private_blobs(blobs: &Path) -> Result<Option<OwnedFd>> {
+    let name = blobs.file_name().ok_or("no blob directory name")?;
+    private_dir(blobs.parent().unwrap_or(Path::new("")), &Path::new(name).join("sha256"))
+}
+
+/// The cache file `path` opened for reading, never through a symlink nor blocking on a FIFO: made private
+/// through `dir`, its directory as `private_dir` returned it, or left as it is for None.
+fn private_file(dir: Option<&OwnedFd>, path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let f = match dir {
+        Some(dir) => File::from(crate::util::openat(dir.as_raw_fd(), &cpath(Path::new(path.file_name().ok_or("no file name")?))?, flags)?),
+        None => File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?,
+    };
+    if !f.metadata()?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    if dir.is_some() {
+        make_private(&f, 0o600).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(f)
+}
+
+fn make_private(fd: &impl AsRawFd, mode: u32) -> std::io::Result<()> {
+    if crate::util::fstat(fd.as_raw_fd())?.st_mode & 0o7777 != mode {
+        crate::util::check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })?;
+    }
+    Ok(())
 }
 
 fn bytes(data: &[u8]) -> impl FnOnce(&mut File) -> Result<()> + '_ {
@@ -507,7 +591,7 @@ fn bytes(data: &[u8]) -> impl FnOnce(&mut File) -> Result<()> + '_ {
 fn create_new(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let _ = std::fs::remove_file(path);
-    Ok(std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)?)
+    Ok(std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?)
 }
 
 /// Only root may change what `path` names (sticky directories excepted).
@@ -643,12 +727,22 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
     // Cached blobs are read once, as they are unpacked: one found corrupt is
     // evicted, and the unpack starts over with it downloaded (and checked)
     // again; at most once per layer, however many turn out corrupt.
-    let mut tries = img.layers.len();
+    retry_evicted(&img.layers, attempt)
+}
+
+fn retry_evicted<T>(layers: &[source::Layer], mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut retried = vec![false; layers.len()];
     loop {
         match attempt() {
-            Err(e) if tries > 0 && img.layers.iter().any(|l| l.src.evicted()) && interrupted().is_ok() => {
+            Err(e) if interrupted().is_ok() => {
+                let evicted: Vec<_> = layers.iter().enumerate().filter(|(_, l)| l.src.evicted()).map(|(i, _)| i).collect();
+                if evicted.is_empty() || evicted.iter().any(|&i| retried[i]) {
+                    return Err(e);
+                }
+                for i in evicted {
+                    retried[i] = true;
+                }
                 crate::log!("image: {e}; downloading it again");
-                tries -= 1;
             }
             res => return res,
         }
@@ -981,6 +1075,158 @@ mod tests {
     fn temporaries(dir: &Path) -> Vec<String> {
         let names = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
         names.filter(|n| n.contains(".tmp") || n.contains(".part")).collect()
+    }
+
+    #[test]
+    fn cache_permissions_are_private_on_publish_and_reuse() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmpdir("cache-private");
+        let cache = d.join("images");
+        private_dir(&cache, Path::new("")).unwrap();
+        let cached = cache.join("rootfs/key.ext4");
+        cached_rootfs(&cached, build("private"), sync_dir).unwrap();
+        let owner = std::fs::metadata(&cached).unwrap().uid();
+        for legacy in [false, true] {
+            if legacy {
+                for dir in [&cache, cached.parent().unwrap()] {
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                for ext in ["ext4", "conf", "ok"] {
+                    std::fs::set_permissions(cached.with_extension(ext), std::fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                private_dir(&cache, Path::new("")).unwrap();
+                cached_rootfs(&cached, never, sync_dir).unwrap();
+            }
+            for dir in [&cache, cached.parent().unwrap()] {
+                let m = std::fs::metadata(dir).unwrap();
+                assert_eq!((m.mode() & 0o777, m.uid()), (0o700, owner));
+            }
+            for ext in ["ext4", "conf", "ok"] {
+                let m = std::fs::metadata(cached.with_extension(ext)).unwrap();
+                assert_eq!((m.mode() & 0o777, m.uid()), (0o600, owner));
+            }
+        }
+        // Already private: reuse leaves the ctime that template stamps include.
+        let stamp = |p: &Path| std::fs::metadata(p).map(|m| (m.ctime(), m.ctime_nsec())).unwrap();
+        let before = stamp(&cached);
+        std::thread::sleep(Duration::from_millis(20));
+        private_dir(&cache, Path::new("")).unwrap();
+        cached_rootfs(&cached, never, sync_dir).unwrap();
+        assert_eq!(stamp(&cached), before);
+    }
+
+    #[test]
+    fn cache_permissions_never_follow_symlinks() {
+        use std::os::unix::fs::MetadataExt;
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o777;
+        let d = tmpdir("cache-private-links");
+        // STATE/images may be a symlink: its target is the cache, made private.
+        let real = d.join("real-images");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = d.join("images");
+        std::os::unix::fs::symlink(&real, &cache).unwrap();
+        // Below it, a symlinked component is left alone, and so is everything under it.
+        let outside = d.join("outside");
+        std::fs::create_dir_all(outside.join("sha256")).unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("blobs")).unwrap();
+        let digest = sha256_hex(b"blob");
+        let blob = registry::blob_path(&cache.join("blobs"), &digest).unwrap();
+        std::fs::write(&blob, b"blob").unwrap();
+        let rootfs = d.join("outside-rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        std::os::unix::fs::symlink(&rootfs, real.join("rootfs")).unwrap();
+        let cached = cache.join("rootfs/key.ext4");
+        cached_rootfs(&cached, build("linked"), sync_dir).unwrap();
+        for p in [&outside, &outside.join("sha256"), &rootfs] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for p in [blob.clone(), rootfs.join("key.ext4"), rootfs.join("key.conf"), rootfs.join("key.ok")] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        private_dir(&cache, Path::new("")).unwrap();
+        let registry = std::sync::Arc::new(registry::Registry::new(Reference::parse("localhost/test").unwrap()));
+        let (mut reader, _) = source::Blob::Cached { blobs: cache.join("blobs"), registry, digest, size: 4 }.open().unwrap();
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"blob");
+        cached_rootfs(&cached, never, sync_dir).unwrap();
+
+        assert_eq!(mode(&real), 0o700);
+        for p in [&outside, &outside.join("sha256"), &rootfs] {
+            assert_eq!(mode(p), 0o755, "{}", p.display());
+        }
+        for p in [blob, rootfs.join("key.ext4"), rootfs.join("key.conf"), rootfs.join("key.ok")] {
+            assert_eq!(mode(&p), 0o644, "{}", p.display());
+        }
+        // Nothing is made under a symlink: a linked blob directory without `sha256` stays without one.
+        let empty = d.join("outside-empty");
+        std::fs::create_dir(&empty).unwrap();
+        let other = d.join("other-images");
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&empty, other.join("blobs")).unwrap();
+        assert!(private_blobs(&other.join("blobs")).unwrap().is_none());
+        assert!(!empty.join("sha256").exists());
+        // Missing directories are made private, through the walk.
+        let fresh = d.join("fresh");
+        assert!(private_blobs(&fresh.join("blobs")).unwrap().is_some());
+        for p in [fresh.join("blobs"), fresh.join("blobs/sha256")] {
+            assert_eq!(mode(&p), 0o700, "{}", p.display());
+        }
+        // A symlinked file is refused, its target untouched.
+        let file = d.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&file, real.join("file-link")).unwrap();
+        let dir = private_dir(&cache, Path::new("")).unwrap();
+        assert!(private_file(dir.as_ref(), &cache.join("file-link")).is_err());
+        assert!(private_file(None, &cache.join("file-link")).is_err());
+        assert_eq!(mode(&file), 0o644);
+    }
+
+    #[test]
+    fn each_evicted_layer_gets_one_retry() {
+        let d = tmpdir("layer-retry");
+        let layers: Vec<_> = (0..3)
+            .map(|i| {
+                let digest = sha256_hex(&[i]);
+                let path = registry::blob_path(&d, &digest).unwrap();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, [i]).unwrap();
+                source::Layer {
+                    src: source::Blob::Cached {
+                        blobs: d.to_path_buf(),
+                        registry: std::sync::Arc::new(registry::Registry::new(Reference::parse("localhost/test").unwrap())),
+                        digest: digest.clone(),
+                        size: 1,
+                    },
+                    digest: Some(digest),
+                    size: Some(1),
+                }
+            })
+            .collect();
+        let mut calls = 0;
+        let result: Result<()> = retry_evicted(&layers, || {
+            calls += 1;
+            if calls <= layers.len() {
+                if calls > 1 {
+                    std::fs::write(registry::blob_path(&d, layers[calls - 2].digest.as_ref().unwrap())?, b"fixed")?;
+                }
+                std::fs::remove_file(registry::blob_path(&d, layers[calls - 1].digest.as_ref().unwrap())?)?;
+                bail!("corrupt layer");
+            }
+            bail!("download failed");
+        });
+        assert_eq!(calls, layers.len() + 1);
+        assert!(result.unwrap_err().to_string().contains("download failed"));
+        let mut calls = 0;
+        let result: Result<()> = retry_evicted(&layers, || {
+            calls += 1;
+            bail!("download failed");
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2, "a missing blob must not consume other layers' retries");
     }
 
     #[test]
@@ -1403,13 +1649,18 @@ mod tests {
         let p = d.join("config");
         let digest = sha256_hex(b"{}");
         std::fs::write(&p, b"{}").unwrap();
-        assert!(source::read_verified(&p, 2, &digest).is_ok());
-        assert!(source::read_verified(&p, 3, &digest).is_err());
+        assert!(source::read_verified(&p, File::open(&p).unwrap(), 2, &digest).is_ok());
+        assert!(source::read_verified(&p, File::open(&p).unwrap(), 3, &digest).is_err());
+        // Read as opened: what the path names afterwards is never read.
+        let opened = File::open(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
         std::fs::write(&p, b"[]").unwrap();
-        assert!(source::read_verified(&p, 2, &digest).is_err());
+        assert_eq!(source::read_verified(&p, opened, 2, &digest).unwrap(), b"{}");
+        std::fs::write(&p, b"[]").unwrap();
+        assert!(source::read_verified(&p, File::open(&p).unwrap(), 2, &digest).is_err());
         let max = unpack::MAX_DOCUMENT + 1;
         std::fs::write(&p, vec![b' '; max as usize]).unwrap();
-        assert!(source::read_verified(&p, max, &digest).is_err());
+        assert!(source::read_verified(&p, File::open(&p).unwrap(), max, &digest).is_err());
     }
 
     #[test]

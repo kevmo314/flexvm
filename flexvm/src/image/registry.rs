@@ -400,15 +400,24 @@ impl<T: Transport> Transport for Deadlined<T> {
     }
 }
 
+/// URLs in diagnostics must not expose signed queries or userinfo.
+fn log_url(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or("");
+    let Some((scheme, rest)) = url.split_once("://") else { return "<invalid URL>".into() };
+    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+    let host = authority.rsplit('@').next().unwrap_or("");
+    format!("{scheme}://{host}/{path}")
+}
+
 /// Where redirect `redirects` (0 for the first) from `url` to `loc` goes: refused from an HTTPS `base` to anything
 /// else, and past the fifth.
 fn next_hop(base: &str, url: &str, loc: &str, redirects: usize) -> Result<String> {
     let next = resolve_location(url, loc)?;
     if base.starts_with("https://") && !next.starts_with("https://") {
-        bail!("refusing a redirect from HTTPS to {next}");
+        bail!("refusing a redirect from HTTPS to {}", log_url(&next));
     }
     if redirects >= 5 {
-        bail!("too many redirects from {base}");
+        bail!("too many redirects from {}", log_url(base));
     }
     Ok(next)
 }
@@ -449,7 +458,7 @@ fn resolve_location(base: &str, loc: &str) -> Result<String> {
         }
         format!("/{}", out.join("/"))
     }
-    let (Some(scheme), Some(auth), path, query) = split(base) else { bail!("redirect from a relative URL {base:?}") };
+    let (Some(scheme), Some(auth), path, query) = split(base) else { bail!("redirect from a relative URL {}", log_url(base)) };
     let (s, a, p, q) = split(loc);
     let (scheme, auth, path, query) = match (s, a) {
         (Some(s), _) => (s, a.unwrap_or(""), remove_dots(p), q),
@@ -461,7 +470,7 @@ fn resolve_location(base: &str, loc: &str) -> Result<String> {
     let scheme = scheme.to_ascii_lowercase();
     let host = auth.rsplit_once('@').map_or(auth, |(_, host)| host);
     if !matches!(scheme.as_str(), "http" | "https") || host.is_empty() {
-        bail!("unsupported redirect to {loc:?}");
+        bail!("unsupported redirect to {}", log_url(loc));
     }
     Ok(format!("{scheme}://{host}{path}{}", query.map(|q| format!("?{q}")).unwrap_or_default()))
 }
@@ -604,7 +613,8 @@ impl Registry {
     fn trusted(&self, url: &str) -> bool {
         let Some(rest) = url.strip_prefix("https://") else { return false };
         let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-        host == self.r.registry || (self.r.registry == "registry-1.docker.io" && host == "auth.docker.io")
+        host == self.r.registry
+            || matches!((self.r.registry.as_str(), host), ("registry-1.docker.io", "auth.docker.io") | ("registry.gitlab.com", "gitlab.com"))
     }
 
     /// The time left before `deadline`, for the next request: ureq's own limit for it, under `Deadlined`'s.
@@ -632,7 +642,8 @@ impl Registry {
         loop {
             let auth = if redirects == 0 { self.auth.lock().unwrap().clone() } else { None };
             let client = if redirects == 0 { &registry } else { hops.get_or_insert_with(|| agent(deadline, !local, Peer::default())) };
-            let resp = call(&format!("GET {url}"), deadline, |left| {
+            let shown = log_url(&url);
+            let resp = call(&format!("GET {shown}"), deadline, |left| {
                 let mut req = client.get(&url).config().timeout_global(Some(left)).build();
                 if redirects == 0 {
                     req = req.header("Accept", accept);
@@ -657,10 +668,10 @@ impl Registry {
                         bail!("registry login endpoint redirected; credentials were not verified");
                     }
                     let loc = match resp.headers().get("location") {
-                        None => bail!("GET {url}: redirect without a location"),
+                        None => bail!("GET {shown}: redirect without a location"),
                         Some(v) => match v.to_str() {
                             Ok(loc) => loc,
-                            Err(_) => bail!("GET {url}: redirect to a location that is not ASCII: {:?}", String::from_utf8_lossy(v.as_bytes())),
+                            Err(_) => bail!("GET {shown}: redirect to a location that is not ASCII"),
                         },
                     };
                     url = next_hop(&base, &url, loc, redirects)?;
@@ -679,12 +690,12 @@ impl Registry {
                     authenticated = true;
                 }
                 401 if redirects == 0 => {
-                    bail!("GET {url}: unauthorized{}", if self.basic.is_none() { " (no credentials in docker config)" } else { "" })
+                    bail!("GET {shown}: unauthorized{}", if self.basic.is_none() { " (no credentials in docker config)" } else { "" })
                 }
                 code => {
                     let mut body = Vec::new();
                     let _ = resp.into_body().into_reader().take(300).read_to_end(&mut body);
-                    bail!("GET {url}: HTTP {code}: {}", String::from_utf8_lossy(&body).trim())
+                    bail!("GET {shown}: HTTP {code}: {}", String::from_utf8_lossy(&body).trim())
                 }
             }
         }
@@ -711,22 +722,23 @@ impl Registry {
         }
         let param = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
         let realm = param("realm").ok_or("auth challenge has no realm")?;
+        let shown = log_url(&realm);
         // The registry names where to fetch: never down from HTTPS, nor into this host's own networks (its loopback
         // or metadata services) unless the registry is there itself.
         if (self.base.starts_with("https://") || !local) && !realm.starts_with("https://") {
-            bail!("{}: refusing token realm {realm}: not HTTPS", self.r.registry);
+            bail!("{}: refusing token realm {shown}: not HTTPS", self.r.registry);
         }
         let agent = agent(deadline, !local, Peer::default());
         let creds = match &self.basic {
             Some(b) if self.trusted(&realm) => Some(format!("Basic {b}")),
             // Anywhere else gets an anonymous token request.
             Some(_) => {
-                crate::log!("image: not sending credentials to untrusted token realm {realm}");
+                crate::log!("image: not sending credentials to untrusted token realm {shown}");
                 None
             }
             None => None,
         };
-        let resp = call(&format!("token from {realm}"), deadline, |left| {
+        let resp = call(&format!("token from {shown}"), deadline, |left| {
             let mut req = agent.get(&realm).config().timeout_global(Some(left)).build();
             if let Some(service) = param("service") {
                 req = req.query("service", &service);
@@ -741,7 +753,7 @@ impl Registry {
         })?;
         let body: Value = match resp.status().as_u16() {
             200 => serde_json::from_reader(resp.into_body().into_reader().take(1 << 20))?,
-            code => bail!("token from {realm}: HTTP {code}"),
+            code => bail!("token from {shown}: HTTP {code}"),
         };
         let token = body["token"].as_str().or(body["access_token"].as_str()).ok_or("token response has no token")?;
         *self.auth.lock().unwrap() = Some(format!("Bearer {token}").into());
@@ -776,15 +788,16 @@ pub fn download(url: &str, size: u64) -> Result<ureq::Body> {
     let mut next = url.to_string();
     for redirects in 0.. {
         let client = agent(deadline, false, Peer::default());
-        let resp = call(&format!("GET {next}"), deadline, |left| client.get(&next).config().timeout_global(Some(left)).build())?;
+        let shown = log_url(&next);
+        let resp = call(&format!("GET {shown}"), deadline, |left| client.get(&next).config().timeout_global(Some(left)).build())?;
         match resp.status().as_u16() {
             300..=399 => {
                 let loc =
-                    resp.headers().get("location").and_then(|v| v.to_str().ok()).ok_or_else(|| format!("GET {next}: redirect without an ASCII location"))?;
+                    resp.headers().get("location").and_then(|v| v.to_str().ok()).ok_or_else(|| format!("GET {shown}: redirect without an ASCII location"))?;
                 next = next_hop(url, &next, loc, redirects)?;
             }
             200..=299 => return Ok(resp.into_body()),
-            code => bail!("GET {next}: HTTP {code}"),
+            code => bail!("GET {shown}: HTTP {code}"),
         }
     }
     unreachable!()
@@ -793,9 +806,10 @@ pub fn download(url: &str, size: u64) -> Result<ureq::Body> {
 fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl FnOnce() -> Result<R>) -> Result<PathBuf> {
     let path = blob_path(blobs, digest)?;
     let dir = path.parent().unwrap().to_path_buf();
-    // `pull` synced the directory chain; each blob syncs only its own entry.
+    let private = super::private_blobs(blobs)?;
     if path.exists() {
-        let (reader, len) = super::source::Blob::File(path.clone()).open()?;
+        let reader = super::private_file(private.as_ref(), &path)?;
+        let len = reader.metadata()?.len();
         let mut cached = Hashed::new(reader.take(size.saturating_add(1)));
         std::io::copy(&mut cached, &mut std::io::sink())?;
         if len == size && cached.n == size && cached.digest() == digest {
@@ -1110,10 +1124,10 @@ pub(super) mod tests {
     /// A redirect to a location that is not ASCII says so.
     #[test]
     fn non_ascii_locations_are_reported() {
-        let (addr, _) = counting_server("127.0.0.1", |_, _| format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: /caf\u{e9}\r\n{CLOSE}"));
+        let (addr, _) = counting_server("127.0.0.1", |_, _| format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: /caf\u{e9}?signature=secret\r\n{CLOSE}"));
         let reg = registry(&addr);
         let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
-        assert!(err.contains("not ASCII") && err.contains("caf"), "{err}");
+        assert!(err.contains("not ASCII") && !err.contains("secret"), "{err}");
     }
 
     #[test]
@@ -1793,6 +1807,41 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn cached_blob_permissions_are_private_on_publish_and_reuse() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = super::super::unpack::tests::tmpdir("blob-private");
+        let blobs = dir.join("blobs");
+        let digest = sha256_hex(b"private");
+        let path = cached_blob(&digest, 7, &blobs, || Ok(&b"private"[..])).unwrap();
+        let owner = std::fs::metadata(&path).unwrap().uid();
+        for legacy in [false, true] {
+            if legacy {
+                for (p, mode) in [(blobs.as_path(), 0o755), (path.parent().unwrap(), 0o755), (&path, 0o644)] {
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+                }
+                cached_blob::<&[u8]>(&digest, 7, &blobs, || panic!("must reuse cached blob")).unwrap();
+            }
+            for (p, mode) in [(blobs.as_path(), 0o700), (path.parent().unwrap(), 0o700), (&path, 0o600)] {
+                let m = std::fs::metadata(p).unwrap();
+                assert_eq!((m.mode() & 0o777, m.uid()), (mode, owner));
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_urls_omit_secrets() {
+        for url in ["https://cdn.example/blob?signature=secret#fragment", "https://user:secret@cdn.example/blob?signature=secret", "https://cdn.example/blob"] {
+            assert_eq!(log_url(url), "https://cdn.example/blob");
+        }
+        assert_eq!(log_url("https://cdn.example?secret"), "https://cdn.example/");
+        assert_eq!(log_url("http://[::1]:5000/blob?secret"), "http://[::1]:5000/blob");
+        let err = next_hop("https://reg.example/blob?secret", "https://reg.example/blob?secret", "/blob", 5).unwrap_err().to_string();
+        assert!(!err.contains("secret"));
+        let err = next_hop("https://reg.example/blob", "https://reg.example/blob", "http://cdn.example/blob?secret", 0).unwrap_err().to_string();
+        assert!(!err.contains("secret"));
+    }
+
+    #[test]
     fn credentials_only_go_to_trusted_realms() {
         let hub = Registry::new(Reference::parse("nginx").unwrap());
         assert!(hub.trusted("https://auth.docker.io/token"));
@@ -1803,6 +1852,20 @@ pub(super) mod tests {
         let ghcr = Registry::new(Reference::parse("ghcr.io/o/a").unwrap());
         assert!(ghcr.trusted("https://ghcr.io/token"));
         assert!(!ghcr.trusted("https://auth.docker.io/token"));
+        let gitlab = Registry::new(Reference::parse("registry.gitlab.com/org/app").unwrap());
+        assert!(gitlab.trusted("https://gitlab.com/jwt/auth"));
+        assert!(gitlab.trusted("https://registry.gitlab.com/token"));
+        for realm in [
+            "http://gitlab.com/jwt/auth",
+            "https://gitlab.com.evil.com/jwt/auth",
+            "https://evilgitlab.com/jwt/auth",
+            "https://evil.com/jwt/auth?gitlab.com",
+            "https://gitlab.com@evil.com/jwt/auth",
+            "https://auth.docker.io/token",
+        ] {
+            assert!(!gitlab.trusted(realm), "{realm}");
+        }
+        assert!(!ghcr.trusted("https://gitlab.com/jwt/auth"));
         assert!(Registry::new(Reference::parse("localhost:5000/a").unwrap()).basic.is_none());
     }
 }

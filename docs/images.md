@@ -43,9 +43,30 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   are streamed to `STATE/images/blobs/sha256/` and checked against their
   digests; gzip, zstd and uncompressed layers are supported. Archives are read
   in place (layers are located inside the tarball, not extracted). Registry
-  credentials go only over HTTPS to the registry itself or a token service on
-  the same host (including its port); Docker Hub also allows auth.docker.io.
-  Other token services get anonymous requests; redirects to blob storage carry none.
+  credentials go only over HTTPS, to the registry's own host (port included)
+  or to a token service on a fixed list: auth.docker.io for Docker Hub
+  (registry-1.docker.io) and gitlab.com for registry.gitlab.com. The list is
+  keyed by the registry being pulled from, never by the realm its
+  `WWW-Authenticate` names, so a registry cannot redirect credentials to
+  another host. Other token services, including a self-hosted GitLab's,
+  get anonymous requests, and redirects to blob storage carry none.
+  Logged and reported URLs omit query strings and userinfo, so signed
+  redirect URLs never appear in logs. A layer whose cached blob is found
+  corrupt is evicted and downloaded again, at most once per layer.
+- **Cache permissions.** `STATE/images` and the directories in it are mode
+  0700, and their files (layer blobs, and each root filesystem's `.ext4`,
+  its `.conf`, which holds the `--env` values, and its `.ok` marker) are
+  0600, owned by whoever pulled (root, or the user of a state of their
+  own). Caches from older versions (0755 and 0644) are repaired as pulls
+  reuse them. Ownership is never changed. A symlinked `STATE/images` works
+  (its target is the cache), but below it every directory is reached
+  without following symlinks, and a symlink there is left as it is, with
+  nothing under it touched. A mode is changed
+  only when it differs, because template stamps include the root
+  filesystem's ctime, so the first reuse of an older cache makes its
+  templates rehash that file once. Firecracker runs as root and opens the
+  root filesystem in place. Staging (`STATE/staging`) was already
+  root-only.
 - **Root filesystem.** Layers are applied in order as root, with whiteouts and
   opaque directories, ownership, modes, xattrs, device nodes, symlinks and
   hard links. A file capability or POSIX ACL that cannot be set fails the pull;
