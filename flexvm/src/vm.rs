@@ -339,6 +339,9 @@ impl Vm {
             while crate::net::drain_qdisc(&self.tap, Duration::ZERO) == 0 && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            if Instant::now() >= until {
+                crate::log!("vm {}: injected fault: no packet reached its tap's qdisc in 5 s before the hold", self.name);
+            }
         }
         let held = unroute();
         // Read while its Firecracker is still stopped, so a guest that empties the queue before

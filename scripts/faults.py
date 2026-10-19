@@ -4950,21 +4950,27 @@ def collapse_report(host, name):
 
 
 def require_huge_pages(blocks):
-    """Free 2 MiB blocks, including those a higher-order buddy block can split into."""
-    with open("/proc/buddyinfo") as f:
-        free = sum(int(n) << (order - 9) for line in f for order, n in enumerate(line.split()[4:]) if order >= 9)
-    if free < blocks:
-        raise Skip(f"only {free} free order>=9 blocks in /proc/buddyinfo; need {blocks}; "
-                   "try /proc/sys/vm/drop_caches and /proc/sys/vm/compact_memory")
+    """Skips unless the host has `blocks` free 2 MiB blocks (counting what a higher-order buddy block splits into),
+    compacting its memory first if short: the collapse takes whole huge pages, and a fragmented host has none to give
+    (#896). Under --no-skips (CI) a skip still fails the run."""
+    def free():
+        with open("/proc/buddyinfo") as f:
+            return sum(int(n) << (order - 9) for line in f for order, n in enumerate(line.split()[4:]) if order >= 9)
+    if free() < blocks:
+        with suppress(OSError), open("/proc/sys/vm/compact_memory", "w") as f:
+            f.write("1")
+    if (have := free()) < blocks:
+        raise Skip(f"only {have} free order>=9 blocks in /proc/buddyinfo, after compacting; need {blocks}; "
+                   "try /proc/sys/vm/drop_caches")
 
 
 def cow_collapsed():
     """Memory a migration paged in is collapsed into huge pages once the pull is done (#141), and keeps what 4 KiB
     pages guarantee: with the guest rewriting it, a keep-running checkpoint and a delta each hold exactly the memory at
     their pause, the restored copy (collapsed in turn) is intact, and free page reporting still returns memory."""
-    require_huge_pages(200)
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
+    require_huge_pages(200)
     n, paths = "ft-huge", [ckpt_path("ft-huge0"), ckpt_path("ft-huge1")]
     ok(run(A, n))
     code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 iflag=fullblock 2>/dev/null && wc -c </tmp/f && md5sum /tmp/f")
@@ -5013,9 +5019,9 @@ def cow_collapsed():
 def collapse_abort():
     """A migration that aborts after its source paused, its collapse pass mid-way (#191): the source runs its copy
     again, and the pass goes on to the end instead of leaving the VM on 4 KiB pages for good."""
-    require_huge_pages(200)
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
+    require_huge_pages(200)
     n = "ft-collapse-abort"
     m = setup(n, mib=600)
     # Parked mid-way at `collapse_hold` (after a call) until the migration back quiesces it: unheld it can be over in
@@ -5049,6 +5055,7 @@ def collapse_ckpt_fail():
     runs on and the pass starts again and goes on to the end, as after an aborted migration."""
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
+    require_huge_pages(200)
     n, path = "ft-collapse-ckpt", ckpt_path("ft-collapse-ckpt")
     rm_ckpt(path)
     m = setup(n, mib=600)
@@ -5743,7 +5750,7 @@ def ckpt_packet_hold():
     pauses = [(r.get("result") or {}).get("paused_ms") for r in results]
     check("ckpt packet hold: tcp echoed throughout, no segment lost (any retransmit a duplicate)",
           all(echoes) and not errors and retrans <= dsacks and guest[0] <= guest[1],
-          f"completed echoes before/during/after {echoes}; retransmits {retrans} (duplicates {dsacks}), the guest's {guest[0]} (duplicates {guest[1]}); "
+          f"completed echoes before, after each checkpoint and at the end {echoes}; retransmits {retrans} (duplicates {dsacks}), the guest's {guest[0]} (duplicates {guest[1]}); "
           f"slowest echo {slowest[0] * 1e3:.0f} ms, pauses {pauses} ms")
     cleanup(n)
     for p in paths:
