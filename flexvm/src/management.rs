@@ -166,6 +166,8 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
 /// Their `--format` fields.
 const CHECKPOINT_FIELDS: crate::containers::Fields = &[
     ("Name", "name"),
+    ("Names", "names"),
+    ("Directory", "directory"),
     ("ID", "id"),
     ("VM", "vm"),
     ("Template", "template"),
@@ -264,18 +266,39 @@ fn load_checkpoint(host: &crate::host::Host, args: &Args) -> Result<()> {
     crate::print(loaded)
 }
 
+fn checkpoint_name_matches(row: &Value, want: &str) -> bool {
+    row["names"].as_array().is_some_and(|names| names.iter().any(|name| name.as_str() == Some(want)))
+}
+
+fn checkpoint_names(row: &Value) -> String {
+    row["names"].as_array().map(|names| names.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+}
+
+fn format_checkpoints(format: &crate::containers::Format, mut rows: Vec<Value>) -> Result<String> {
+    if !matches!(format, crate::containers::Format::Json) {
+        for v in rows.iter().filter(|v| v["id"].is_null()) {
+            drop(writeln!(std::io::stderr(), "flexvm: warning: {}: {}", v["directory"].as_str().unwrap_or_default(), v["error"].as_str().unwrap_or_default()));
+        }
+        rows.retain(|v| !v["id"].is_null());
+        for v in &mut rows {
+            v["names"] = checkpoint_names(v).into();
+        }
+    }
+    format.render(&rows)
+}
+
 fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {
     let format = args.get("format").filter(|f| f.trim() != "table").map(|f| crate::containers::Format::parse_with(f, CHECKPOINT_FIELDS)).transpose()?;
     let mut filters = vec![];
     for f in args.all("filter") {
         match f.split_once('=') {
             Some((k @ ("name" | "vm" | "template"), v)) if !v.is_empty() => filters.push((k.to_string(), v.to_string())),
-            _ => bail!("bad checkpoint filter {f:?}: use name=PART, vm=NAME or template=IMAGE|ID"),
+            _ => bail!("bad checkpoint filter {f:?}: use name=NAME, vm=NAME or template=IMAGE|ID"),
         }
     }
     let s = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
     let matches = |v: &Value, k: &str, want: &str| match k {
-        "name" => s(v, "name").contains(want),
+        "name" => checkpoint_name_matches(v, want),
         "vm" => s(v, "vm") == want,
         _ => crate::template::name_of(want).is_ok_and(|n| n == s(v, "template")) || (want.len() >= 4 && s(v, "template_id").starts_with(want)),
     };
@@ -287,21 +310,26 @@ fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {
         for v in &rows {
             match v["id"].as_str() {
                 Some(id) => output(format_args!("{id}\n"))?,
-                None => drop(writeln!(std::io::stderr(), "flexvm: warning: {}", s(v, "error"))),
+                None => drop(writeln!(std::io::stderr(), "flexvm: warning: {}: {}", s(v, "directory"), s(v, "error"))),
             }
         }
         return Ok(());
     }
     if let Some(f) = format {
-        return output(format_args!("{}", f.render(&rows)?));
+        return output(format_args!("{}", format_checkpoints(&f, rows)?));
     }
     let row = |c: [&str; 7]| output(format_args!("{:<24} {:<16} {:<24} {:<40} {:<24} {:>8} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6]));
     row(["NAME", "ID", "VM", "TEMPLATE", "PARENT", "SIZE MiB", "CREATED"])?;
     for v in &rows {
+        if v["id"].is_null() {
+            output(format_args!("  {}: {}\n", s(v, "directory"), s(v, "error")))?;
+            continue;
+        }
         let image = v["template"].as_str().map_or("<none>".into(), crate::template::image_of);
         let template = format!("{image} ({})", &s(v, "template_id")[..s(v, "template_id").len().min(8)]);
         let size = (v["size"].as_u64().unwrap_or(0) >> 20).to_string();
-        let name = v["name"].as_str().unwrap_or("<none>");
+        let names = checkpoint_names(v);
+        let name = if names.is_empty() { "<none>" } else { &names };
         // Kept, and blocking rm and prune until removed (`store::readable_or_removed`).
         if let Some(error) = v["error"].as_str() {
             row([name, &s(v, "id"), "<unreadable>", "", "", "", ""])?;
@@ -391,6 +419,23 @@ pub fn version(paths: &Paths) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn checkpoint_name_filters_match_each_whole_name_and_formats_keep_both_fields() {
+        let row = json!({"name": "a", "names": ["a", "web-server"], "id": "0123456789abcdef"});
+        assert!(checkpoint_name_matches(&row, "a"));
+        assert!(checkpoint_name_matches(&row, "web-server"));
+        for name in ["web", "server", "a, web-server", ""] {
+            assert!(!checkpoint_name_matches(&row, name));
+        }
+        let format = crate::containers::Format::parse_with("{{.Name}}|{{.Names}}", CHECKPOINT_FIELDS).unwrap();
+        let error = json!({"directory": "/state/checkpoints/names", "error": "injected listing error"});
+        assert_eq!(format_checkpoints(&format, vec![row.clone(), error.clone()]).unwrap(), "a|a, web-server\n");
+        let json = format_checkpoints(&crate::containers::Format::Json, vec![row.clone(), error.clone()]).unwrap();
+        let parsed: Vec<Value> = json.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(parsed, [row, error]);
+        assert!(!checkpoint_name_matches(&json!({"names": []}), "a"));
+    }
 
     #[test]
     fn filters_validate_and_combine() {

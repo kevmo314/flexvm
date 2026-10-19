@@ -91,11 +91,14 @@ impl<'a> Index<'a> {
     }
 }
 
-/// A partial listing is useful for `ls` and exact lookups, never for removal or prefixes.
+/// A partial listing is useful for `ls` and exact lookups, never for checkpoint removal or prefixes.
 #[derive(Default)]
 pub struct Listing {
     pub entries: Vec<Entry>,
     pub errors: Vec<crate::util::Error>,
+    /// Directories corresponding to `errors`.
+    pub(super) error_dirs: Vec<PathBuf>,
+    pub(super) malformed: BTreeMap<PathBuf, crate::util::Error>,
     /// Names whose checkpoint is not listed: gone (left by a removal before #862), or hidden by an error.
     pub dangling: Vec<String>,
     /// `names`, probed for a name the listing may have missed.
@@ -125,19 +128,33 @@ pub(super) fn listed(
     let mut all = Listing { names: names_dir, ..Listing::default() };
     let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for link in links {
-        let read = (|| -> Result<_> {
-            let path = link?;
-            let target = std::fs::read_link(&path).map_err(|e| format!("reading checkpoint name {}: {e}", path.display()))?;
-            let name = path.file_name().and_then(|n| n.to_str());
-            let id = target.file_name().and_then(|n| n.to_str()).filter(|id| is_id(id));
-            match (name, id) {
-                (Some(name), Some(id)) => Ok((id.to_string(), name.to_string())),
-                _ => bail!("invalid checkpoint name {} -> {}", path.display(), target.display()),
+        let path = match link {
+            Ok(path) => path,
+            Err(e) => {
+                all.error_dirs.push(all.names.clone());
+                all.errors.push(e);
+                continue;
             }
-        })();
-        match read {
-            Ok((id, name)) => names.entry(id).or_default().push(name),
-            Err(e) => all.errors.push(e),
+        };
+        let target = match std::fs::read_link(&path) {
+            Ok(target) => target,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                all.malformed.insert(path.clone(), format!("checkpoint name {} is not a symlink: {e}", path.display()).into());
+                continue;
+            }
+            Err(e) => {
+                all.error_dirs.push(all.names.clone());
+                all.errors.push(format!("reading checkpoint name {}: {e}", path.display()).into());
+                continue;
+            }
+        };
+        let name = path.file_name().and_then(|n| n.to_str());
+        let id = target.file_name().and_then(|n| n.to_str()).filter(|id| is_id(id) && target == Path::new("..").join(id));
+        match (name, id) {
+            (Some(name), Some(id)) => names.entry(id.to_string()).or_default().push(name.to_string()),
+            _ => {
+                all.malformed.insert(path.clone(), format!("invalid checkpoint name {} -> {}", path.display(), target.display()).into());
+            }
         }
     }
     for checkpoint in checkpoints {
@@ -148,7 +165,10 @@ pub(super) fn listed(
                 names.sort();
                 all.entries.push(Entry { names, id, dir, manifest });
             }
-            Err(e) => all.errors.push(e),
+            Err(e) => {
+                all.error_dirs.push(all.names.parent().unwrap_or(Path::new(".")).to_path_buf());
+                all.errors.push(e);
+            }
         }
     }
     all.dangling = names.into_values().flatten().collect();
@@ -167,6 +187,9 @@ pub(crate) fn is_id(name: &str) -> bool {
 /// as is an id while a name the listing missed may be it, or an id-shaped name while a checkpoint
 /// the listing missed may have that id.
 pub fn find<'a>(all: &'a Listing, what: &str) -> Result<&'a Entry> {
+    if let Some(e) = all.malformed.get(&all.names.join(what)) {
+        bail!("{e}; flexvm checkpoint rm -f {what} removes the name entry");
+    }
     let named = all.entries.iter().find(|e| e.names.iter().any(|n| n == what));
     let by_id = all.entries.iter().find(|e| is_id(what) && e.id == what);
     if named.is_none() && all.dangling.iter().any(|n| n == what) {
@@ -231,17 +254,37 @@ pub fn link(state: &Path, name: &str, id: &str) -> Result<()> {
 pub fn remove(state: &Path, whats: &[String], force: bool) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
     let all = list(state);
-    // A name whose checkpoint is gone (`find` resolves it to none) goes on its own.
-    let (names, whats): (Vec<String>, Vec<String>) = whats.iter().cloned().partition(|w| all.dangling.contains(w));
+    // Names removed alone cannot affect a checkpoint's dependants.
+    let (names, whats): (Vec<String>, Vec<String>) =
+        whats.iter().cloned().partition(|w| all.dangling.contains(w) || (force && all.malformed.contains_key(&all.names.join(w))));
+    // A dangling name may be one of a checkpoint the listing missed; a malformed one is no checkpoint's.
+    if names.iter().any(|n| all.dangling.contains(n)) {
+        all.complete().map_err(|e| format!("nothing removed: {e}"))?;
+    }
+    let names: Vec<PathBuf> = names.iter().map(|n| all.names.join(n)).collect();
+    if whats.is_empty() {
+        return unname(&names);
+    }
     let order = removal(&all, &whats, force)?;
-    let mut out = unname(state, &names)?;
+    let mut out = unname(&names)?;
     out.extend(delete(state, &all.entries, order)?);
     Ok(out)
 }
 
-/// Unlinks names whose checkpoint is gone, under the lock, from a complete listing.
-fn unname(state: &Path, names: &[String]) -> Result<Vec<Value>> {
-    names.iter().map(|n| Ok(crate::util::unlink_durably(&dir(state).join(NAMES).join(n)).map(|()| json!({"deleted": null, "name": n}))?)).collect()
+/// Removes name entries alone, under the lock, without following their targets.
+fn unname(names: &[PathBuf]) -> Result<Vec<Value>> {
+    names
+        .iter()
+        .map(|path| {
+            if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                std::fs::remove_dir_all(path)?;
+                crate::util::sync_dir(path.parent().unwrap())?;
+            } else {
+                crate::util::unlink_durably(path)?;
+            }
+            Ok(json!({"deleted": null, "name": path.file_name().unwrap().to_string_lossy()}))
+        })
+        .collect()
 }
 
 /// `checkpoint prune`: every checkpoint created before `before` (Unix ms; all without), unless
@@ -250,7 +293,8 @@ pub fn prune(state: &Path, before: Option<u64>) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
     let all = list(state);
     let order = pruning(&all, before)?;
-    let mut out = unname(state, &all.dangling)?;
+    let names: Vec<PathBuf> = all.dangling.iter().map(|n| all.names.join(n)).chain(all.malformed.keys().cloned()).collect();
+    let mut out = unname(&names)?;
     out.extend(delete(state, &all.entries, order)?);
     Ok(out)
 }
@@ -359,17 +403,122 @@ pub fn rows(state: &Path, templates: &[Value]) -> Vec<Value> {
         .map(|e| {
             let m = match &e.manifest {
                 Ok(m) => m,
-                Err(err) => return json!({"name": display_names(e), "id": e.id, "error": err.to_string()}),
+                Err(err) => return json!({"name": e.names.first(), "names": e.names, "id": e.id, "directory": e.dir.to_string_lossy(), "error": err.to_string()}),
             };
             let parent = m.parent.as_ref().map(|p| all.entries.iter().find(|a| a.id == p.id).map_or(p.id.as_str(), Entry::label));
             let size = crate::management::disk_usage(&e.dir, &mut BTreeSet::new()).unwrap_or(0);
-            json!({"name": display_names(e), "id": e.id, "vm": m.name, "template": image(&m.template_id), "template_id": m.template_id,
+            json!({"name": e.names.first(), "names": e.names, "id": e.id, "directory": e.dir.to_string_lossy(), "vm": m.name, "template": image(&m.template_id), "template_id": m.template_id,
                    "parent": parent, "size": size, "created": m.created_unix_ms / 1000})
         })
-        .chain(all.errors.iter().map(|e| json!({"error": e.to_string()})))
+        .chain(all.errors.iter().enumerate().map(|(i, e)| json!({"directory": all.error_dirs.get(i).map(|p| p.to_string_lossy()), "error": e.to_string()})))
+        .chain(all.malformed.iter().map(|(path, e)| json!({"directory": path.to_string_lossy(), "error": e.to_string()})))
         .collect()
 }
 
 fn display_names(e: &Entry) -> Option<String> {
     (!e.names.is_empty()).then(|| e.names.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::symlink};
+
+    fn unreadable(state: &Path) -> PathBuf {
+        drop(lock(state, libc::LOCK_SH).unwrap());
+        let checkpoint = dir(state).join("0123456789abcdef");
+        fs::create_dir(&checkpoint).unwrap();
+        fs::write(checkpoint.join("manifest.json"), b"invalid").unwrap();
+        checkpoint
+    }
+
+    #[test]
+    fn dangling_names_go_without_touching_unreadable_checkpoints_or_leftovers() {
+        let state = crate::test_util::TempDir::new("dangling-unreadable");
+        let checkpoint = unreadable(&state);
+        let leftover = dir(&state).join(".removed-leftover");
+        fs::create_dir(&leftover).unwrap();
+        for force in [false, true] {
+            let name = dir(&state).join("names/old");
+            symlink("../aaaaaaaaaaaaaaaa", &name).unwrap();
+            assert_eq!(remove(&state, &["old".into()], force).unwrap(), [json!({"deleted": null, "name": "old"})]);
+            assert!(fs::symlink_metadata(name).is_err());
+            assert!(checkpoint.exists());
+            assert!(leftover.exists());
+        }
+    }
+
+    #[test]
+    fn a_name_whose_checkpoint_the_listing_missed_stays() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Root lists a directory without read permission.
+        }
+        let state = crate::test_util::TempDir::new("dangling-hidden");
+        let checkpoint = unreadable(&state);
+        link(&state, "live", "0123456789abcdef").unwrap();
+        let store = dir(&state);
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o300)).unwrap();
+        let all = list(&state);
+        let result = remove(&state, &["live".into()], true);
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!all.errors.is_empty() && all.dangling == ["live"]);
+        assert!(result.unwrap_err().to_string().contains("incomplete checkpoint listing"));
+        assert!(fs::symlink_metadata(store.join("names/live")).is_ok());
+        assert!(checkpoint.exists());
+    }
+
+    #[test]
+    fn malformed_names_can_be_removed_without_following_targets() {
+        let state = crate::test_util::TempDir::new("malformed-names");
+        let checkpoint = unreadable(&state);
+        let names = dir(&state).join(NAMES);
+        for kind in ["file", "directory", "target", "outside"] {
+            let path = names.join("bad");
+            match kind {
+                "file" => fs::write(&path, b"not a link").unwrap(),
+                "directory" => {
+                    fs::create_dir(&path).unwrap();
+                    symlink(&checkpoint, path.join("keep")).unwrap();
+                }
+                "target" => symlink("..", &path).unwrap(),
+                _ => symlink(&checkpoint, &path).unwrap(),
+            }
+            assert_eq!(list(&state).malformed.len(), 1);
+            assert!(remove(&state, &["bad".into()], false).is_err());
+            assert_eq!(remove(&state, &["bad".into()], true).unwrap(), [json!({"deleted": null, "name": "bad"})]);
+            assert!(fs::symlink_metadata(&path).is_err());
+            assert!(checkpoint.join("manifest.json").exists());
+        }
+        // Once there are no unreadable checkpoints, prune clears malformed names too.
+        fs::remove_dir_all(&checkpoint).unwrap();
+        fs::write(names.join("bad"), b"not a link").unwrap();
+        symlink("..", names.join("broken")).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        fs::write(names.join(std::ffi::OsStr::from_bytes(b"bad\xff")), b"not a link").unwrap();
+        assert_eq!(rows(&state, &[]).len(), 3);
+        assert_eq!(prune(&state, Some(0)).unwrap().len(), 3);
+        assert_eq!(fs::read_dir(names).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn rows_keep_individual_names_and_listing_error_directories() {
+        let state = crate::test_util::TempDir::new("checkpoint-rows");
+        let checkpoint = unreadable(&state);
+        for name in ["z", "a"] {
+            link(&state, name, "0123456789abcdef").unwrap();
+        }
+        let row = &rows(&state, &[])[0];
+        assert_eq!(row["name"], "a");
+        assert_eq!(row["names"], json!(["a", "z"]));
+        assert_eq!(row["directory"], checkpoint.to_str().unwrap());
+        assert!(row["error"].is_string());
+        let names = dir(&state).join(NAMES);
+        fs::remove_dir_all(&names).unwrap();
+        fs::write(&names, b"not a directory").unwrap();
+        let rows = rows(&state, &[]);
+        let error = rows.iter().find(|row| row["id"].is_null()).unwrap();
+        assert_eq!(error["directory"], names.to_str().unwrap());
+        assert!(error["error"].as_str().unwrap().contains("listing"));
+    }
 }

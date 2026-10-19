@@ -425,18 +425,24 @@ is refused while a checkpoint not removed with it builds on it; `-f` removes
 those too. `checkpoint prune` removes every checkpoint, or with
 `--older-than AGE` (`90s`, `30m`, `24h`, `7d`) those older, except what a kept one
 builds on; it lists what it removed. A name whose checkpoint is gone resolves to
-none until `rm NAME` or `prune` removes it. While the store cannot be listed
-whole, both are refused, as is an id's start; a name or a whole id still works.
-Both wait for checkpoints being
-written and for restores still opening one. A VM restored from a checkpoint runs
-on after the checkpoint is removed. `ls -q` prints ids; `--filter name=PART`,
-`vm=NAME` and `template=IMAGE|ID` select (a key again: either value); `--format`
-takes `json` or a template of `.Name`, `.ID`, `.VM`, `.Template`, `.TemplateID`,
-`.Parent`, `.Size` (bytes) and `.Created` (Unix seconds), as `ps --format`
-does. The template column is the image that names the checkpoint's template
-generation now, or `<none>`, with the start of the generation's id. A stored
-checkpoint keeps its generation through pulls, `image prune` and `rmi` (see
-Images); `system df` counts stored checkpoints.
+none until `rm NAME` or `prune` removes it. Removing a name alone works even
+while another checkpoint is unreadable. Malformed name entries are removed by
+`rm -f NAME` or `prune`. While the store cannot be listed whole, removal (of a
+name whose checkpoint is gone too) and an id's start are refused; a name or a whole id still works.
+Both wait for checkpoints being written and for restores still opening one. A
+VM restored from a checkpoint runs on after the checkpoint is removed. `ls -q`
+prints ids; `--filter name=NAME` (an exact match of any name), `vm=NAME` and
+`template=IMAGE|ID` select (a key again: either value); `--format` takes `json`
+or a template of `.Name` (the first name, usable with `run --checkpoint`),
+`.Names` (all names joined with `, `), `.ID`, `.VM`, `.Template`,
+`.TemplateID`, `.Parent`, `.Size` (bytes), `.Created` (Unix seconds),
+`.Directory` and `.Error`, as `ps --format` does. JSON keeps `names` as an
+array. Listing failures show the directory and error; with a text format or
+`-q`, they are warnings on stderr instead of empty rows. The template column is
+the image that names the checkpoint's template generation now, or `<none>`,
+with the start of the generation's id. A stored checkpoint keeps its generation
+through pulls, `image prune` and `rmi` (see Images); `system df` counts stored
+checkpoints.
 
 A checkpoint restores on any host with the same template (by content id).
 Restored on another host with its own address, the VM borrows the address
