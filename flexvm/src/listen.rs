@@ -840,13 +840,14 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         hold(tpl);
         return Ok(());
     }
-    let mut asked = false;
+    // Held to the end, through the drain after a refusal too: what a source sends is read off only within it.
+    let (mut asked, mut waiting) = (false, None);
     let got = (|| -> Result<Option<Arc<crate::template::Template>>> {
         let _turn = match only_ask {
             true => None,
             false => {
-                let waiting = PUSHERS.take(conn.peer_addr()?.ip()).ok_or(BUSY)?;
-                Some((waiting, crate::template::turn(&paths, id, Instant::now() + TURN_WAIT)?))
+                waiting = Some(PUSHERS.take(conn.peer_addr()?.ip()).ok_or(BUSY)?);
+                Some(crate::template::turn(&paths, id, Instant::now() + TURN_WAIT)?)
             }
         };
         if let Some(tpl) = held() {
@@ -883,11 +884,15 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         Ok(None) => answer(&Ok(json!({"have": false})))?,
         Err(e) => {
             answer(&Err(e))?;
-            // What the source still sends, so it reads the answer instead of a reset.
-            let _ = conn.shutdown(std::net::Shutdown::Write);
-            let _ = std::io::copy(&mut crate::util::By { s: &conn, at: Instant::now() + Duration::from_secs(30) }, &mut std::io::sink());
+            // What the source still sends, so it reads the answer instead of a reset: only once it was asked for
+            // data, and within its place among `PUSHERS`. One refused before sent nothing more.
+            if asked && waiting.is_some() {
+                let _ = conn.shutdown(std::net::Shutdown::Write);
+                let _ = std::io::copy(&mut crate::util::By { s: &conn, at: Instant::now() + Duration::from_secs(30) }, &mut std::io::sink());
+            }
         }
     }
+    drop(waiting);
     Ok(())
 }
 
