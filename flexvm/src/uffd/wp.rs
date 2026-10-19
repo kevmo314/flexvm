@@ -967,6 +967,33 @@ mod tests {
         pager.base.willneed(0, 16);
         pager.base.willneed(1, 16);
         pager.base.willneed(usize::MAX / PAGE_SIZE, 16);
+        pager.base.prefault(0, 0);
+        pager.base.prefault(0, 16);
+        pager.base.prefault(1, 16);
+        pager.base.prefault(usize::MAX, usize::MAX);
+        assert!(pager.base.pages(0, 1).iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn template_prefault_populates_the_source_mapping() {
+        use std::os::unix::fs::FileExt;
+
+        let (_dir, pager) = test_pager(1);
+        let ptr = pager.base.pages(0, 1).as_ptr() as *mut libc::c_void;
+        // Older kernels only support the asynchronous fallback.
+        if unsafe { libc::madvise(ptr, PAGE_SIZE, libc::MADV_POPULATE_READ) } != 0 {
+            return;
+        }
+        assert_eq!(unsafe { libc::madvise(ptr, PAGE_SIZE, libc::MADV_DONTNEED) }, 0);
+        let map = std::fs::File::open("/proc/self/pagemap").unwrap();
+        let present = || {
+            let mut entry = [0; 8];
+            map.read_exact_at(&mut entry, ptr as u64 / PAGE_SIZE as u64 * 8).unwrap();
+            u64::from_ne_bytes(entry) & PM_PRESENT != 0
+        };
+        assert!(!present());
+        pager.base.prefault(0, 1);
+        assert!(present(), "the copy must not be the first access to the source");
     }
 
     #[test]

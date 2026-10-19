@@ -365,6 +365,7 @@ impl Pager {
                 }
                 if from_template {
                     self.template_next.store(page + n, Ordering::Relaxed);
+                    self.base.prefault(page, n);
                 }
                 let src = |p: usize, c: usize| from_template.then(|| self.base.pages(p, c));
                 pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1.map(|()| Served::Done(LOCAL))

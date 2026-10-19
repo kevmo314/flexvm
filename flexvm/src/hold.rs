@@ -20,7 +20,7 @@ use crate::util::{eintr, By, Result, Slot};
 
 /// Bytes held per address; packets beyond it are dropped.
 pub const CAP: usize = 4 << 20;
-/// Per round of `release`; past it (a flood faster than the sink) packets are dropped.
+/// Per round of `release`, bounding catch-up with a flood faster than the sink.
 const CATCH_UP: Duration = Duration::from_millis(100);
 const MAX_FRAME: usize = 65535;
 /// The least `gso_size` a TSO frame is cut by (TCP_MIN_MSS): a smaller one would make many
@@ -437,14 +437,18 @@ impl Holder {
                 std::thread::yield_now();
                 continue;
             }
-            let mut rest = batch.iter();
+            let mut rest = batch.into_iter();
             for p in rest.by_ref() {
-                stats.give(sink, p);
+                stats.give(sink, &p);
                 if Instant::now() >= end {
                     break;
                 }
             }
-            stats.dropped += rest.len() as u64;
+            let mut q = e.q.lock().unwrap();
+            for p in rest.rev() {
+                q.bytes += p.len();
+                q.packets.push_front(p);
+            }
         }
     }
 
@@ -1001,6 +1005,50 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hand_over_keeps_the_batch_remainder_ahead_of_new_packets() {
+        let (h, _w) = paired();
+        for sent in [1, 128, 256] {
+            let packets: VecDeque<_> = (0..300).map(|i: usize| vec![i as u8; i + 1]).collect();
+            let bytes = packets.iter().map(Vec::len).sum();
+            let e = Entry { mig: 1, q: Mutex::new(Queue { packets: packets.clone(), bytes, ..Queue::default() }) };
+            let (mut stats, mut delivered) = (Stats::default(), Vec::new());
+            h.hand_over(
+                &e,
+                &mut |p| {
+                    delivered.push(p.to_vec());
+                    if delivered.len() == sent {
+                        let mut q = e.q.lock().unwrap();
+                        q.packets.push_back(vec![42]);
+                        q.bytes += 1;
+                        drop(q);
+                        std::thread::sleep(CATCH_UP + Duration::from_millis(10));
+                    }
+                    true
+                },
+                &mut stats,
+            );
+            {
+                let q = e.q.lock().unwrap();
+                let expected: VecDeque<_> = packets.iter().skip(sent).cloned().chain([vec![42]]).collect();
+                assert_eq!(q.packets, expected);
+                assert_eq!(q.bytes, expected.iter().map(Vec::len).sum::<usize>());
+                assert_eq!((stats.packets, stats.dropped, q.dropped), (sent as u64, 0, 0));
+            }
+            h.give_queued(
+                &e,
+                &mut |p| {
+                    delivered.push(p.to_vec());
+                    true
+                },
+                &mut stats,
+            );
+            assert_eq!(delivered, packets.into_iter().chain([vec![42]]).collect::<Vec<_>>());
+            assert_eq!((stats.packets, stats.bytes, stats.dropped), (301, bytes as u64 + 1, 0));
+            assert_eq!(e.q.lock().unwrap().bytes, 0);
+        }
+    }
 
     #[test]
     fn injector_sends_header_and_payload_in_order() {

@@ -484,6 +484,9 @@ impl Pager {
                 let data = self.base.has_data(i);
                 let n = pages.claim(i, end - i, BASE, |p| self.base.has_data(p) == data);
                 if n > 0 {
+                    if data {
+                        self.base.prefault(i, n);
+                    }
                     let src = |p: usize, c: usize| data.then(|| self.base.pages(p, c));
                     let _ = pages.install(i, n, BASE, Some(&|| self.quiesce.load(Ordering::SeqCst)), |p, c| self.populate(p, c, src(p, c)));
                 }

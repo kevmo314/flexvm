@@ -702,6 +702,18 @@ impl Template {
             unsafe { libc::madvise(self.map.add(page * PAGE_SIZE) as *mut libc::c_void, n * PAGE_SIZE, libc::MADV_WILLNEED) };
         }
     }
+
+    /// Faults the copy source in before taking the events lock; older kernels get a read-ahead hint.
+    pub fn prefault(&self, page: usize, n: usize) {
+        let n = n.min((self.len / PAGE_SIZE).saturating_sub(page));
+        if n > 0 {
+            // Page aligned and within the mapping; failure leaves the copy to fault it in.
+            let rc = unsafe { libc::madvise(self.map.add(page * PAGE_SIZE) as *mut libc::c_void, n * PAGE_SIZE, libc::MADV_POPULATE_READ) };
+            if rc != 0 {
+                self.willneed(page, n);
+            }
+        }
+    }
 }
 
 impl Drop for Template {
