@@ -519,6 +519,18 @@ fn check_applies(args: &Args) -> Result<()> {
         "system" if !matches!(first.map(String::as_str), Some("prune" | "df")) => bail!("system needs prune or df"),
         "system" if first.map(String::as_str) == Some("df") && args.has("force") => bail!("system df takes no -f"),
         "images" if args.has("quiet") && args.has("json") => bail!("images takes -q or --json, not both"),
+        "debug" => {
+            let op = first.ok_or("debug fault|ckhash|gc|VM ...")?;
+            let (least, most, words) = match op.as_str() {
+                "gc" => (2, 2, "no arguments"),
+                "fault" => (3, 4, "NAME [MS]"),
+                "ckhash" => (3, 3, "DIR"),
+                _ => (2, 3, "[WHAT]"),
+            };
+            if !(least..=most).contains(&args.positional.len()) {
+                bail!("debug {op} takes {words}");
+            }
+        }
         "checkpoint" => {
             let (op, most, flags): (_, _, &[&str]) = match first.map(String::as_str) {
                 Some(op @ "create") => (op, 4, &["stop", "incremental"]),
@@ -2177,6 +2189,28 @@ mod exec_tests {
             let size = pull_size(&parse(&["pull", "busybox", "--max", max, "--mem", "256"])).unwrap();
             assert_eq!(size.max_mib.to_string(), max);
         }
+    }
+
+    #[test]
+    fn debug_arities() {
+        for (op, least, most, words) in [("gc", 0, 0, "no arguments"), ("fault", 1, 2, "NAME [MS]"), ("ckhash", 1, 1, "DIR"), ("vm", 0, 1, "[WHAT]")] {
+            for count in 0..=4 {
+                for dashdash in [false, true] {
+                    let mut argv = vec!["debug", op];
+                    if dashdash {
+                        argv.push("--");
+                    }
+                    argv.extend(std::iter::repeat_n("stray", count));
+                    let args = parse(&argv);
+                    if (least..=most).contains(&count) {
+                        check_applies(&args).unwrap();
+                    } else {
+                        assert_eq!(real_main(&args).unwrap_err().to_string(), format!("debug {op} takes {words}"), "{argv:?}");
+                    }
+                }
+            }
+        }
+        assert_eq!(check_applies(&parse(&["debug"])).unwrap_err().to_string(), "debug fault|ckhash|gc|VM ...");
     }
 
     #[test]
