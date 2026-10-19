@@ -31,7 +31,7 @@ static LOCKING: AtomicUsize = AtomicUsize::new(0);
 /// (`vmproc::peer_call`), and asks again.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// What a request that took the host lock too long, or found no room, is answered.
-const BUSY: &str = "host busy, try again";
+pub(crate) const BUSY: &str = "host busy, try again";
 /// Arrival processes from their start until they commit or are refused (or end), in all
 /// and from any one peer address; more arrivals are refused at once, before their source
 /// pauses anything.
@@ -449,14 +449,21 @@ impl Peers {
         out
     }
 
-    /// The configured peer `from` is one of (`sender`), else `from` itself: who a loan is to.
-    fn borrower(&self, cfg: &crate::host::Config, from: IpAddr) -> String {
-        let sender = self.sender(cfg, from);
-        cfg.peers
-            .iter()
-            .find(|n| self.addrs(std::slice::from_ref(n)).iter().any(|&a| is_peer(&sender, a)))
-            .cloned()
-            .unwrap_or_else(|| from.to_canonical().to_string())
+    /// The first configured peer `from` is one of, else `from` itself: who a loan is to;
+    /// and the addresses that may claim it (`Host::start_loan`): those of every peer `from`
+    /// is one of (`sender`), as an address two peers share cannot tell them apart.
+    fn borrower(&self, cfg: &crate::host::Config, from: IpAddr) -> (String, Vec<IpAddr>) {
+        let name = {
+            let r = self.0.resolved.read().unwrap();
+            cfg.peers
+                .iter()
+                .find(|n| {
+                    let addrs = n.parse::<SocketAddr>().map_or_else(|_| r.get(*n).cloned().unwrap_or_default(), |a| vec![a.ip()]);
+                    is_peer(&addrs, from) || cfg.underlays_of(n).iter().any(|&u| IpAddr::V4(u) == from.to_canonical())
+                })
+                .cloned()
+        };
+        (name.unwrap_or_else(|| from.to_canonical().to_string()), self.sender(cfg, from))
     }
 
     /// The addresses of `names`; a name not resolved yet is looked up.
@@ -657,7 +664,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
             let from = conn.peer_addr()?.ip();
             // Names resolved first; one still being looked up only leaves its addresses out.
             let _ = peers.all_addrs(&cfg.peers, Instant::now() + ADMIT_WAIT);
-            let (sender, name) = (peers.sender(&cfg, from), peers.borrower(&cfg, from));
+            let (sender, (name, _)) = (peers.sender(&cfg, from), peers.borrower(&cfg, from));
             // The peer it came from by any of its addresses (a record from before they were kept has
             // none), or the one its source named itself as: it may have resolved elsewhere since.
             migration(host, &req, |source, peer| {
@@ -679,7 +686,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
             let from = conn.peer_addr()?.ip();
             let mut all = peers.all_addrs(&cfg.peers, Instant::now() + ADMIT_WAIT)?;
             all.push(from);
-            lend(host, &req, &all, &peers.borrower(&cfg, from))
+            lend(host, &req, &all, &peers.borrower(&cfg, from), from)
         })(),
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
@@ -978,16 +985,26 @@ fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> 
     Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay_known().map(|u| u.to_string())}))
 }
 
-fn lend(host: &Host, req: &Value, peers: &[IpAddr], borrower: &str) -> Result<Value> {
+/// `borrower`: who asks (`Peers::borrower`), from `from`.
+/// Test faults on a loan's start (#944): `lend_start_busy` answers it busy, as a held host lock
+/// would; `lend_start_lose` applies it, then answers only after the borrower's call gave up.
+fn lend(host: &Host, req: &Value, peers: &[IpAddr], (borrower, addrs): &(String, Vec<IpAddr>), from: IpAddr) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
     routable(ip, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
+    if req["start"] == true && crate::host::tripped("lend_start_busy") {
+        return Err(BUSY.into());
+    }
     let l = host_lock(host)?;
     if req["start"] == true {
         let gen = req["gen"].as_u64().ok_or("missing gen")?;
-        host.start_loan(&l, ip, gen, borrower)?;
+        host.start_loan(&l, ip, gen, borrower, Some(from))?;
+        drop(l);
+        if crate::host::tripped("lend_start_lose") {
+            std::thread::sleep(Duration::from_secs(3));
+        }
         return Ok(json!({"ip": ip.to_string(), "gen": gen}));
     }
-    let gen = host.lend_new(&l, ip, borrower, req["lease"] == true)?;
+    let gen = host.lend_to(&l, ip, borrower, addrs, req["lease"] == true)?;
     Ok(json!({"ip": ip.to_string(), "gen": gen, "lease": req["lease"] == true}))
 }
 
@@ -1343,7 +1360,68 @@ mod tests {
             assert!(e.to_string().contains("only accepted from its source"), "{e}");
             ask(&peers.sender(&host.cfg, from.parse::<SocketAddr>().unwrap().ip())).unwrap();
             assert_eq!(host.mig_status(id).unwrap(), "released");
-            assert_eq!(peers.borrower(&host.cfg, from.parse::<SocketAddr>().unwrap().ip()), "192.0.2.1:7070");
+            assert_eq!(peers.borrower(&host.cfg, from.parse::<SocketAddr>().unwrap().ip()).0, "192.0.2.1:7070");
+        }
+    }
+
+    /// #944: a loan may be claimed from any of its borrower's addresses or underlays (one it
+    /// shares with another peer too), never from another peer's own.
+    #[test]
+    fn a_loan_is_claimed_from_any_of_its_borrowers_addresses_only() {
+        let root = crate::test_util::TempDir::new("lend-start");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        host.cfg.vm_ips = "10.9.0.1-10.9.0.100".into();
+        let cfg = crate::host::Config {
+            peers: vec!["other:7070".into(), "borrower:7070".into(), "unresolved:7070".into(), "third:7070".into()],
+            ..Default::default()
+        };
+        let mut cfg = cfg;
+        cfg.peer_underlays.insert("borrower:7070".into(), vec!["198.51.100.1".parse().unwrap()]);
+        cfg.peer_underlays.insert("unresolved:7070".into(), vec!["198.51.100.2".parse().unwrap(), "198.51.100.3".parse().unwrap()]);
+        let peers = Peers::default();
+        peers.0.resolved.write().unwrap().extend([
+            // 192.0.2.9 is both other's and the borrower's.
+            ("other:7070".into(), vec!["192.0.2.9".parse().unwrap()]),
+            ("borrower:7070".into(), vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap(), "192.0.2.9".parse().unwrap()]),
+            ("unresolved:7070".into(), vec![]),
+            ("third:7070".into(), vec!["192.0.2.3".parse().unwrap()]),
+        ]);
+        let ask = |req: Value, from: &str| {
+            let from: IpAddr = from.parse().unwrap();
+            loop {
+                match lend(&host, &req, &[], &peers.borrower(&cfg, from), from) {
+                    Err(e) if e.to_string() == BUSY => continue,
+                    r => break r,
+                }
+            }
+        };
+        let lent = |ip: &str, from: &str| ask(json!({"ip": ip, "lease": true}), from).unwrap()["gen"].as_u64().unwrap();
+        let start = |ip: &str, gen: u64, from: &str| ask(json!({"ip": ip, "gen": gen, "start": true}), from);
+        for (i, (lend_from, start_from)) in [
+            ("192.0.2.1", "192.0.2.2"),
+            ("192.0.2.1", "::ffff:198.51.100.1"),
+            ("198.51.100.1", "192.0.2.9"),
+            // From the address it shares: lent to other, yet the borrower's other addresses may claim it.
+            ("192.0.2.9", "192.0.2.1"),
+            ("198.51.100.2", "198.51.100.3"),
+            ("::ffff:203.0.113.1", "203.0.113.1"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ip = format!("10.9.0.{}", i + 1);
+            let gen = lent(&ip, lend_from);
+            let e = start(&ip, gen, "192.0.2.3").unwrap_err();
+            assert!(e.to_string().contains("lent to another peer"), "{e}");
+            start(&ip, gen, start_from).unwrap_or_else(|e| panic!("{lend_from} then {start_from}: {e}"));
+            // Again, as a retry after a lost reply would.
+            start(&ip, gen, start_from).unwrap();
+        }
+        assert_eq!(peers.borrower(&cfg, "::ffff:203.0.113.1".parse().unwrap()).0, "203.0.113.1");
+        // Neither a peer's address it does not share, nor an unknown one, claims another's loan.
+        let gen = lent("10.9.0.50", "192.0.2.2");
+        for from in ["203.0.113.1", "198.51.100.2"] {
+            assert!(start("10.9.0.50", gen, from).unwrap_err().to_string().contains("lent to another peer"));
         }
     }
 
@@ -1352,7 +1430,7 @@ mod tests {
         let root = crate::test_util::TempDir::new("lend-peer");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let ip = "10.9.0.1";
-        let e = lend(&host, &json!({"ip": ip}), &[ip.parse().unwrap()], "borrower").unwrap_err();
+        let e = lend(&host, &json!({"ip": ip}), &[ip.parse().unwrap()], &("borrower".into(), vec![]), "192.0.2.1".parse().unwrap()).unwrap_err();
         assert!(e.to_string().contains("not a vm's address"));
         assert!(!host.state.join("addrs").join(ip).exists());
     }

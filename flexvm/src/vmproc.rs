@@ -548,6 +548,9 @@ impl Proc {
     /// All peers are asked at once; only the home host lends (should two, the
     /// loan of every one but the first is given back).
     pub fn borrow(&self, name: &str, ip: Ipv4Addr) -> Result<AddrClaim> {
+        // Start before asking: time spent waiting for other lenders or the local claim
+        // must count against the lease too. Leave five seconds before the lender's expiry.
+        let start_by = Instant::now() + Duration::from_millis(crate::host::LOAN_WAIT_MS) - Duration::from_secs(5);
         let asks: Vec<_> = self
             .host
             .config_now()
@@ -586,8 +589,22 @@ impl Proc {
                     // Claimed before its lease is up (only a lender that leases: an older one would take
                     // this for another loan). Refused, it may have expired: given back, never run.
                     if lease {
-                        if let Err(e) = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string(), "gen": gen, "start": true})) {
-                            drop(c);
+                        // A destroy (Ctrl-C, Ctrl-\\) sent meanwhile waits for the VM: it ends the retries.
+                        let destroying = || self.early.lock().unwrap().iter().any(|&s| matches!(s, libc::SIGINT | libc::SIGQUIT));
+                        if let Err(e) = start_borrowed_loan(start_by, destroying, |by| {
+                            crate::util::rpc(
+                                &peer,
+                                Duration::from_millis(500),
+                                by.min(Instant::now() + Duration::from_secs(2)),
+                                &json!({"op": "lend", "ip": ip.to_string(), "gen": gen, "start": true}),
+                            )
+                            .map(|_| ())
+                        }) {
+                            // Its start may have been applied (a lost reply): the loan no longer expires, so its
+                            // withdrawal is queued durably for the peers before the claim goes (`AddrClaim::withdraw`).
+                            if let Err(w) = self.host.lock().and_then(|l| c.withdraw(&l)) {
+                                crate::log!("borrow {ip}: withdrawing generation {gen}: {w}; withdrawn once this process is gone");
+                            }
                             let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
                             bail!("cannot claim {ip} borrowed from {peer}: {e}");
                         }
@@ -2971,6 +2988,33 @@ pub fn peer_call(peer: &str, req: Value) -> Result<Value> {
     Ok(crate::util::rpc(peer, Duration::from_millis(500), Instant::now() + Duration::from_secs(2), &req)?.1)
 }
 
+/// A lost start reply may already have made the loan permanent. Retry the same
+/// generation on BUSY or timeout, keeping both calls and backoff within the lease,
+/// until `stop`. Any other refusal is final.
+fn start_borrowed_loan(by: Instant, stop: impl Fn() -> bool, mut call: impl FnMut(Instant) -> Result<()>) -> Result<()> {
+    loop {
+        if Instant::now() >= by {
+            bail!("loan start deadline passed");
+        }
+        if stop() {
+            bail!("loan start given up: the vm is being destroyed");
+        }
+        match call(by) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let timeout =
+                    e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock));
+                let why = e.to_string();
+                let busy = why == crate::listen::BUSY || why.ends_with(&format!(": {}", crate::listen::BUSY));
+                if (!timeout && !busy) || Instant::now() >= by {
+                    return Err(e);
+                }
+                thread::sleep(Duration::from_millis(100).min(by.saturating_duration_since(Instant::now())));
+            }
+        }
+    }
+}
+
 /// Two calls and the pause between them (`tell`).
 const TELL_WAIT: Duration = Duration::from_secs(5);
 
@@ -3220,6 +3264,177 @@ fn call_checked(host: &Host, name: &str, req: Value, at: Option<Instant>, check:
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn borrowing_retries_busy_and_a_lost_start_reply() {
+        let root = crate::test_util::TempDir::new("borrow-retry");
+        let mut host = Host::open(&root.join("borrower-state"), &root.join("borrower-run")).unwrap();
+        let mut home = Host::open(&root.join("lender-state"), &root.join("lender-run")).unwrap();
+        home.cfg.vm_ips = "10.9.0.1-10.9.0.100".into();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        host.cfg.peers = vec![addr.to_string()];
+        let p = Proc::new(host, Paths::new(&root)).unwrap();
+        let ip = "10.9.0.1".parse().unwrap();
+        // Lent before the borrower asks: its durable write is not raced against the ask's deadline.
+        let gen = home.lend_new(&home.lock().unwrap(), ip, "borrower", true).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let lender = thread::spawn({
+            let done = done.clone();
+            move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                let req = crate::util::recv_json(&mut BufReader::new(&conn)).unwrap().unwrap();
+                assert_eq!(req, json!({"op": "lend", "ip": ip.to_string(), "lease": true}));
+                send_json(&mut conn, &json!({"ok": true, "result": {"gen": gen, "lease": true}})).unwrap();
+                // BUSY; then applied, its reply lost (held open, unanswered); then applied again and answered,
+                // for as long as the borrower asks (a loaded machine may time it out too).
+                let (mut attempts, mut lost_reply) = (0, None);
+                loop {
+                    let (mut conn, _) = listener.accept().unwrap();
+                    if done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let req = crate::util::recv_json(&mut BufReader::new(&conn)).unwrap().unwrap();
+                    assert_eq!(req, json!({"op": "lend", "ip": ip.to_string(), "gen": gen, "start": true}));
+                    attempts += 1;
+                    if attempts == 1 {
+                        send_json(&mut conn, &json!({"ok": false, "error": crate::listen::BUSY})).unwrap();
+                        continue;
+                    }
+                    home.start_loan(&home.lock().unwrap(), ip, gen, "borrower", None).unwrap();
+                    if attempts == 2 {
+                        lost_reply = Some(conn);
+                    } else {
+                        let _ = send_json(&mut conn, &json!({"ok": true, "result": {}}));
+                    }
+                }
+                drop(lost_reply);
+                (home, attempts)
+            }
+        });
+        let claim = p.borrow("restore", ip).unwrap();
+        assert_eq!(claim.gen, gen);
+        done.store(true, Ordering::SeqCst);
+        drop(std::net::TcpStream::connect(addr).unwrap());
+        let (home, attempts) = lender.join_within().unwrap();
+        assert!(attempts >= 3, "{attempts}");
+        assert!(p.host.addr(&p.host.lock().unwrap(), ip).unwrap().holder.is_some());
+        assert_eq!(home.addr(&home.lock().unwrap(), ip).unwrap().loan.unwrap().until_ms, None, "claimed: it no longer expires");
+    }
+
+    /// A start applied whose reply was lost (the loan no longer expires), then a destroy: the
+    /// withdrawal is queued for the peers before the claim goes, however the lender answers it now.
+    #[test]
+    fn a_borrow_given_up_after_its_start_queues_the_withdrawal() {
+        let root = crate::test_util::TempDir::new("borrow-giveup");
+        let mut host = Host::open(&root.join("borrower-state"), &root.join("borrower-run")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let lender_addr = listener.local_addr().unwrap().to_string();
+        host.cfg.peers = vec![lender_addr.clone()];
+        let p = Proc::new(host, Paths::new(&root)).unwrap();
+        let ip: Ipv4Addr = "10.9.0.1".parse().unwrap();
+        let lender = thread::spawn({
+            let p = p.clone();
+            move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                crate::util::recv_json(&mut BufReader::new(&conn)).unwrap().unwrap();
+                send_json(&mut conn, &json!({"ok": true, "result": {"gen": 7, "lease": true}})).unwrap();
+                let (conn, _) = listener.accept().unwrap();
+                let req = crate::util::recv_json(&mut BufReader::new(&conn)).unwrap().unwrap();
+                assert_eq!(req["start"], true);
+                // Applied; the reply is lost, and a Ctrl-C comes meanwhile.
+                p.early.lock().unwrap().push(libc::SIGINT);
+                let lost = conn;
+                // The one withdrawal sent at once finds the lender busy.
+                let (mut conn, _) = listener.accept().unwrap();
+                let req = crate::util::recv_json(&mut BufReader::new(&conn)).unwrap().unwrap();
+                assert_eq!(req, json!({"op": "route", "ip": "10.9.0.1", "gen": 7}));
+                send_json(&mut conn, &json!({"ok": false, "error": crate::listen::BUSY})).unwrap();
+                drop(lost);
+            }
+        });
+        let Err(e) = p.borrow("restore", ip) else { panic!("borrowed") };
+        assert!(e.to_string().contains("being destroyed"), "{e}");
+        lender.join_within().unwrap();
+        let a = p.host.addr(&p.host.lock().unwrap(), ip).unwrap();
+        assert!(a.withdrawn && a.seen == 7 && a.holder.is_none(), "withdrawn and let go: {a:?}");
+        let notice: Value = serde_json::from_slice(&std::fs::read(p.host.state.join("withdrawals").join("10.9.0.1")).unwrap()).unwrap();
+        assert_eq!(notice["gen"], 7);
+        assert_eq!(notice["peers"][0]["peer"], lender_addr, "the lender is told until it hears: {notice}");
+    }
+
+    #[test]
+    fn loan_start_retries_transient_failures_until_success() {
+        let by = Instant::now() + WAIT;
+        let mut calls = 0;
+        start_borrowed_loan(
+            by,
+            || false,
+            |deadline| {
+                assert_eq!(deadline, by);
+                calls += 1;
+                match calls {
+                    1 => Err(format!("lender: {}", crate::listen::BUSY).into()),
+                    2 => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "lost reply").into()),
+                    3 => Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "timed out").into()),
+                    4 => Ok(()),
+                    _ => panic!("already acknowledged"),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn loan_start_retries_stop_at_deadline_or_permanent_refusal() {
+        for timeout in [false, true] {
+            let by = Instant::now() + Duration::from_millis(25);
+            let mut calls = 0;
+            assert!(start_borrowed_loan(
+                by,
+                || false,
+                |deadline| {
+                    assert_eq!(deadline, by);
+                    calls += 1;
+                    if timeout {
+                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "lost reply").into())
+                    } else {
+                        Err(crate::listen::BUSY.into())
+                    }
+                }
+            )
+            .is_err());
+            assert_eq!(calls, 1, "backoff must not start a call past the deadline");
+            assert!(Instant::now() >= by);
+        }
+        let mut calls = 0;
+        let e = start_borrowed_loan(
+            Instant::now() + Duration::from_secs(1),
+            || false,
+            |_| {
+                calls += 1;
+                Err("lent to another peer".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.to_string(), "lent to another peer");
+        assert_eq!(calls, 1);
+        start_borrowed_loan(Instant::now(), || false, |_| panic!("already past the deadline")).unwrap_err();
+        // A destroy sent meanwhile: no more calls.
+        let (mut calls, stop) = (0, std::cell::Cell::new(false));
+        let e = start_borrowed_loan(
+            Instant::now() + WAIT,
+            || stop.get(),
+            |_| {
+                calls += 1;
+                stop.set(true);
+                Err(crate::listen::BUSY.into())
+            },
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("destroyed") && calls == 1, "{e}");
+    }
 
     #[test]
     fn borrowing_acknowledges_leases_and_still_accepts_older_lenders() {

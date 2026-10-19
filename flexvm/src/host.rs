@@ -23,7 +23,7 @@ use crate::util::{Error, Result};
 /// Loans to one peer not yet announced (`Host::lend_new`).
 const MAX_UNANNOUNCED_LOANS: usize = 64;
 /// Until the borrower claims it (`Host::start_loan`).
-const LOAN_WAIT_MS: u64 = 5 * 60 * 1000;
+pub(crate) const LOAN_WAIT_MS: u64 = 5 * 60 * 1000;
 /// How long a done migration's outcome is kept (`Host::mig_done`).
 const MIG_DONE_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -1179,6 +1179,11 @@ impl Host {
 
     /// `lease`: the borrower acknowledges its claim (`start_loan`), so the loan may expire until then.
     pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr, borrower: &str, lease: bool) -> Result<u64> {
+        self.lend_to(l, ip, borrower, &[], lease)
+    }
+
+    /// `lend_new` to `borrower`, which is at `addrs` (`start_loan`).
+    pub fn lend_to(&self, l: &Locked, ip: Ipv4Addr, borrower: &str, addrs: &[std::net::IpAddr], lease: bool) -> Result<u64> {
         let now = wall_ms();
         let loans = self.expire_loans(l, now);
         if loans.iter().filter(|(_, a)| a.loan.as_ref().is_some_and(|b| b.peer == borrower)).count() >= MAX_UNANNOUNCED_LOANS {
@@ -1197,19 +1202,23 @@ impl Host {
             bail!("{ip} is in use");
         }
         let gen = self.next_gen(a.seen)?;
-        let loan = Loan { peer: borrower.into(), until_ms: lease.then_some(now + LOAN_WAIT_MS) };
+        let mut addrs: Vec<_> = addrs.iter().map(|a| a.to_canonical()).collect();
+        addrs.sort();
+        addrs.dedup();
+        let loan = Loan { peer: borrower.into(), until_ms: lease.then_some(now + LOAN_WAIT_MS), addrs };
         self.put_addr(ip, &Addr { seen: gen, lent: Some(gen), loan: Some(loan), ..Addr::default() }, true)?;
         Ok(gen)
     }
 
-    /// The borrower has claimed the loan: it no longer expires. Refused once it has.
-    pub fn start_loan(&self, l: &Locked, ip: Ipv4Addr, gen: u64, borrower: &str) -> Result<()> {
+    /// The borrower has claimed the loan: it no longer expires. Repeated claims are idempotent.
+    /// Claimed by `borrower`, or from one of the addresses the loan's borrower had when lent.
+    pub fn start_loan(&self, l: &Locked, ip: Ipv4Addr, gen: u64, borrower: &str, from: Option<std::net::IpAddr>) -> Result<()> {
         self.expire_loans(l, wall_ms());
         let a = self.addr(l, ip)?;
         if a.lent != Some(gen) || !a.current(gen) {
             bail!("{ip} generation {gen} is no longer lent");
         }
-        if a.loan.as_ref().is_some_and(|b| b.peer != borrower) {
+        if a.loan.as_ref().is_some_and(|b| b.peer != borrower && !from.is_some_and(|f| b.addrs.contains(&f.to_canonical()))) {
             bail!("{ip} is lent to another peer");
         }
         self.update(l, ip, true, |a| a.loan.iter_mut().for_each(|b| b.until_ms = None))
@@ -2469,7 +2478,11 @@ pub struct Addr {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Loan {
     peer: String,
-    until_ms: Option<u64>,
+    pub(crate) until_ms: Option<u64>,
+    /// The borrower's addresses when lent: its claim may come from any of them (#944).
+    /// None recorded (an older lender's loan): only by `peer`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    addrs: Vec<std::net::IpAddr>,
 }
 
 /// Lets go of `holder`'s claim in `a`; with `id`, only that instance's. The instance let go, if any.
@@ -2523,6 +2536,16 @@ impl AddrClaim {
         if let Ok(l) = self.host.lock() {
             self.host.unpublish(&l, self.ip, &self.id);
         }
+    }
+
+    /// Withdrawn, with a notice for the peers (`withdraw_noted`, delivered whatever is down), and let go,
+    /// in one write. Should that fail, the claim stays recorded as this process's: the sweep withdraws it
+    /// the same way once the process is gone (`died_holding`).
+    pub fn withdraw(mut self, l: &Locked) -> Result<()> {
+        self.kept = true;
+        self.host.withdraw_noted_and(l, self.ip, self.gen, |r| drop(let_go(r, &self.holder, Some(&self.id))))?;
+        self.host.unpublish(l, self.ip, &self.id);
+        Ok(())
     }
 
     pub fn release(mut self, l: &Locked) -> Result<()> {
@@ -5453,7 +5476,7 @@ pub(crate) mod tests {
         // Claimed by another peer: refused, unchanged.
         let (first, gen) = (n(2), gens[1]);
         let before = h.addr(&l, first).unwrap();
-        assert!(h.start_loan(&l, first, gen, "b").is_err());
+        assert!(h.start_loan(&l, first, gen, "b", None).is_err());
         assert_eq!(h.addr(&l, first).unwrap(), before);
         // An announced loan no longer counts.
         assert!(h.observe_and(&l, n(1), gens[0], 1, Some(ip("192.0.2.1")), |_| ()).unwrap());
@@ -5462,12 +5485,12 @@ pub(crate) mod tests {
         let until = before.loan.unwrap().until_ms.unwrap();
         h.expire_loans(&l, until - 1);
         assert_eq!(h.addr(&l, first).unwrap().lent, Some(gen));
-        h.start_loan(&l, n(4), gens[3], "a").unwrap();
-        h.start_loan(&l, n(4), gens[3], "a").unwrap();
+        h.start_loan(&l, n(4), gens[3], "a", None).unwrap();
+        h.start_loan(&l, n(4), gens[3], "a", None).unwrap();
         let left = h.expire_loans(&l, u64::MAX);
         let expired = h.addr(&l, first).unwrap();
         assert!(expired.withdrawn && expired.lent.is_none() && expired.loan.is_none(), "{expired:?}");
-        assert!(h.start_loan(&l, first, gen, "a").is_err());
+        assert!(h.start_loan(&l, first, gen, "a", None).is_err());
         assert!(!h.observe_and(&l, first, gen, 1, Some(ip("192.0.2.1")), |_| ()).unwrap());
         assert!(h.lend_new(&l, first, "a", true).unwrap() > gen);
         // What is left: the claimed one, the older borrower's (odd), the announced one not.

@@ -637,12 +637,16 @@ pub fn check_kvm() -> Result<()> {
 pub fn rpc(addr: &str, wait: Duration, at: Instant, req: &serde_json::Value) -> Result<(std::net::TcpStream, serde_json::Value)> {
     (|| -> Result<_> {
         let addrs = resolve(addr, at)?;
-        let s = connect_addrs(&addrs, at.min(Instant::now() + wait)).map_err(peer_connect_error)?;
+        let s = connect_addrs(&addrs, at.min(Instant::now() + wait)).map_err(|e| io::Error::new(e.kind(), peer_connect_error(e)))?;
         send_json(&mut By { s: &s, at }, req)?;
         let reply = recv_json(&mut io::BufReader::new(By { s: &s, at }))?;
         Ok((s, answer(reply, "it", "refused")?))
     })()
-    .map_err(|e| format!("{addr}: {e}").into())
+    .map_err(|e| match e.downcast_ref::<io::Error>() {
+        // Keep timeouts recognizable to callers that can retry idempotent requests.
+        Some(io) => io::Error::new(io.kind(), format!("{addr}: {e}")).into(),
+        None => format!("{addr}: {e}").into(),
+    })
 }
 
 fn peer_connect_error(e: io::Error) -> String {
@@ -2220,6 +2224,7 @@ mod tests {
         let start = Instant::now();
         let e = rpc(&addr, wait, start + Duration::from_millis(200), &serde_json::json!({})).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(5) && e.to_string() == format!("{addr}: deadline passed"), "{e}");
+        assert_eq!(e.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::TimedOut);
         server.join().unwrap();
     }
 
