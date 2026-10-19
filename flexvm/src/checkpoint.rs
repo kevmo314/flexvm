@@ -29,26 +29,25 @@ pub(crate) use write::{Buf, GuestPages};
 /// (`Host::template_users`). None while the directory is missing. One that cannot be read, or
 /// whose manifest is not its `ID`'s (renamed by hand), is an error: it is still there.
 /// A listing failure is an error at the directory path, even after some entries were read.
-pub fn managed(state: &std::path::Path) -> impl Iterator<Item = (std::path::PathBuf, crate::util::Result<Manifest>)> {
+pub fn managed(state: &std::path::Path) -> impl Iterator<Item = crate::util::Result<(std::path::PathBuf, crate::util::Result<Manifest>)>> {
     let dir = state.join("checkpoints");
-    managed_entries(dir.clone(), entries(&dir))
+    managed_entries(entries(&dir))
 }
 
 fn managed_entries(
-    dir: std::path::PathBuf,
     entries: impl Iterator<Item = crate::util::Result<std::path::PathBuf>>,
-) -> impl Iterator<Item = (std::path::PathBuf, crate::util::Result<Manifest>)> {
+) -> impl Iterator<Item = crate::util::Result<(std::path::PathBuf, crate::util::Result<Manifest>)>> {
     entries.filter_map(move |entry| {
         let path = match entry {
             Ok(path) => path,
-            Err(e) => return Some((dir.clone(), Err(e))),
+            Err(e) => return Some(Err(e)),
         };
         let id = path.file_name()?.to_str().filter(|n| store::is_id(n))?;
         let read = chain::read_manifest_id(&path).and_then(|(found, m)| {
             ensure!(found == id, "checkpoint {} is invalid: its manifest's id is {found}", path.display());
             Ok(m)
         });
-        present(&path, read).map(|m| (path, m))
+        present(&path, read).map(|m| Ok((path, m)))
     })
 }
 

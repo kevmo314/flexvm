@@ -751,6 +751,10 @@ fn template_users_count_every_suspended_vm() {
     fs::create_dir_all(host.state.join("checkpoints/.staging")).unwrap();
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222", "dddd4444"].map(String::from).into();
     assert_eq!(host.template_users(), want);
+    let names = host.state.join("checkpoints/names");
+    fs::create_dir(&names).unwrap();
+    fs::write(names.join("bad"), b"not a link").unwrap();
+    assert!(host.template_users().iter().any(|u| u.starts_with(crate::template::KEEP_ALL) && u.contains("reading checkpoint name")));
 }
 
 #[test]
@@ -781,7 +785,7 @@ fn stored(state: &Path, parent: Option<&str>, ms: u64) -> String {
 fn the_store_names_lists_and_removes_dependants_first() {
     let state = tmp("store");
     drop(store::lock(&state, libc::LOCK_SH).unwrap());
-    let ids = || store::list(&state).into_iter().map(|e| e.id).collect::<Vec<_>>();
+    let ids = || store::list(&state).entries.into_iter().map(|e| e.id).collect::<Vec<_>>();
     let gone = |id: &str| json!({"deleted": id, "name": null});
     let (a, d) = (stored(&state, None, 1), stored(&state, None, 4));
     let b = stored(&state, Some(&a), 2);
@@ -797,7 +801,7 @@ fn the_store_names_lists_and_removes_dependants_first() {
     fs::write(revoked.join("vmstate"), b"s").unwrap();
     assert_eq!(ids(), [&a, &b, &c, &d].map(String::clone), "oldest first");
     let all = store::list(&state);
-    assert_eq!((all[0].name.as_deref(), store::find(&all, "base").unwrap().id.as_str()), (Some("base"), a.as_str()));
+    assert_eq!((all.entries[0].names.first().map(String::as_str), store::find(&all, "base").unwrap().id.as_str()), (Some("base"), a.as_str()));
     assert_eq!(store::find(&all, &d[..6]).unwrap().id, d);
     assert!(store::find(&all, "nope").is_err() && store::find(&all, &d[..3]).is_err(), "a prefix has 4 digits or more");
     // A restore of a stored one (by any path to it) holds its store, whichever state's; one elsewhere none.
@@ -855,7 +859,7 @@ fn store_unreadable_children_block_removal_and_prune() {
             }
         }
         store::link(&state, "broken", &c).unwrap();
-        assert!(store::list(&state).iter().find(|e| e.id == c).unwrap().manifest.is_err());
+        assert!(store::list(&state).entries.iter().find(|e| e.id == c).unwrap().manifest.is_err());
         assert!(store::rows(&state, &[]).iter().any(|r| r["id"] == c && r["error"].is_string()));
         for result in [
             store::remove(&state, std::slice::from_ref(&b), false),
@@ -901,9 +905,9 @@ fn store_cycles_refuse_before_deleting_anything() {
     let (a, b, c) = ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc");
     let entry = |id: &str, parent: Option<&str>| {
         let m = manifest(1, parent.map(|p| Parent { path: format!("../{p}").into(), id: p.into() }), json!({}));
-        store::Entry { id: id.into(), name: None, dir: format!("/nonexistent/{id}").into(), manifest: Ok(m) }
+        store::Entry { id: id.into(), names: vec![], dir: format!("/nonexistent/{id}").into(), manifest: Ok(m) }
     };
-    let all = [entry(a, Some(b)), entry(b, Some(a)), entry(c, None)];
+    let all = store::Listing { entries: vec![entry(a, Some(b)), entry(b, Some(a)), entry(c, None)], errors: vec![] };
     for result in [store::removal(&all, &[a.into()], true), store::pruning(&all, None)] {
         let err = result.unwrap_err().to_string();
         assert_eq!(err, format!("nothing removed: checkpoints {a}, {b} build on each other in a cycle"));
@@ -1007,11 +1011,12 @@ mod scan {
     }
 
     fn label(e: &Entry) -> &str {
-        e.name.as_deref().unwrap_or(&e.id)
+        e.names.first().map_or(&e.id, String::as_str)
     }
 
-    pub fn remove(all: &[Entry], whats: &[String], force: bool) -> Result<Vec<String>> {
+    pub fn remove(all: &super::store::Listing, whats: &[String], force: bool) -> Result<Vec<String>> {
         let mut doomed: BTreeSet<&str> = whats.iter().map(|w| Ok(find(all, w)?.id.as_str())).collect::<Result<_>>()?;
+        let all = &all.entries;
         loop {
             let more: Vec<&Entry> = all.iter().filter(|e| !doomed.contains(e.id.as_str()) && doomed.iter().any(|d| builds_on(e, d))).collect();
             let Some(first) = more.first() else { break };
@@ -1067,10 +1072,16 @@ fn store_dependency_index_matches_the_scan_on_every_small_graph() {
                     };
                     let mut m = manifest(1, parent.map(|p| Parent { path: format!("../{p}").into(), id: p }), json!({}));
                     m.created_unix_ms = i as u64 * 10;
-                    store::Entry { id: id(i), name: (i % 2 == 1).then(|| format!("n{i}")), dir: format!("/nonexistent/{i}").into(), manifest: Ok(m) }
+                    store::Entry {
+                        id: id(i),
+                        names: (i % 2 == 1).then(|| format!("n{i}")).into_iter().collect(),
+                        dir: format!("/nonexistent/{i}").into(),
+                        manifest: Ok(m),
+                    }
                 })
                 .collect();
-            let ids = |order: Vec<usize>| order.into_iter().map(|i| all[i].id.clone()).collect::<Vec<_>>();
+            let all = store::Listing { entries: all, errors: vec![] };
+            let ids = |order: Vec<usize>| order.into_iter().map(|i| all.entries[i].id.clone()).collect::<Vec<_>>();
             for subset in 0..1usize << n {
                 let whats: Vec<String> = (0..n).filter(|i| subset >> i & 1 == 1).map(|i| if i % 2 == 1 { format!("n{i}") } else { id(i) }).collect();
                 for force in [false, true] {
@@ -1082,7 +1093,7 @@ fn store_dependency_index_matches_the_scan_on_every_small_graph() {
             for before in std::iter::once(None).chain((0..=n as u64).map(|i| Some(i * 10))) {
                 assert_eq!(
                     store::pruning(&all, before).map(ids).map_err(|e| e.to_string()),
-                    scan::prune(&all, before).map_err(|e| e.to_string()),
+                    scan::prune(&all.entries, before).map_err(|e| e.to_string()),
                     "prune {before:?} from {code} of {n}"
                 );
             }
@@ -1108,12 +1119,10 @@ fn listing_errors_are_never_empty_or_complete() {
             assert_eq!(results[1].as_ref().unwrap_err().raw_os_error(), Some(entry_error));
             assert_eq!(results[2].as_ref().unwrap(), &2);
         }
-        let dir = Path::new("/state/checkpoints");
         let entries = std::iter::once(Err(io::Error::from_raw_os_error(errno).into()));
-        let results: Vec<_> = managed_entries(dir.into(), entries).collect();
+        let results: Vec<_> = managed_entries(entries).collect();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, dir);
-        assert!(results[0].1.is_err());
+        assert!(results[0].is_err());
     }
 }
 
@@ -1134,10 +1143,10 @@ fn failed_checkpoint_listings_keep_templates_and_refuse_removal() {
         assert!(users.iter().any(|u| u.starts_with(crate::template::KEEP_ALL) && u.contains(&dir.display().to_string())), "{users:?}");
         if name == "checkpoints" {
             let mut all = store::list(&host.state);
-            assert_eq!(all.len(), 1);
-            assert!(all[0].manifest.is_err());
+            assert!(all.entries.is_empty());
+            assert_eq!(all.errors.len(), 2);
             let id = "aaaaaaaaaaaaaaaa";
-            all.push(store::Entry { id: id.into(), name: None, dir: dir.join(id), manifest: Ok(manifest(1, None, json!({}))) });
+            all.entries.push(store::Entry { id: id.into(), names: vec![], dir: dir.join(id), manifest: Ok(manifest(1, None, json!({}))) });
             for result in [store::removal(&all, &[id.into()], false), store::removal(&all, &[id.into()], true), store::pruning(&all, None)] {
                 let err = result.unwrap_err().to_string();
                 assert!(err.starts_with("nothing removed:") && err.contains(&dir.display().to_string()), "{err}");
@@ -1145,10 +1154,96 @@ fn failed_checkpoint_listings_keep_templates_and_refuse_removal() {
             let err = store::removal(&all, &["checkpoints".into()], true).unwrap_err().to_string();
             assert!(err.contains("listing") && err.contains(&dir.display().to_string()), "{err}");
             let err = store::find(&all, "bbbbbbbbbbbbbbbb").err().unwrap().to_string();
-            assert!(err.starts_with("no checkpoint \"bbbbbbbbbbbbbbbb\" found: listing") && err.contains(&dir.display().to_string()), "{err}");
+            assert!(err.contains("incomplete checkpoint listing") && err.contains(&dir.display().to_string()), "{err}");
             assert_eq!(store::find(&all, id).unwrap().id, id);
         }
         fs::remove_file(dir).unwrap();
         assert!(host.template_users().is_empty());
+    }
+}
+
+#[test]
+fn store_keeps_all_names_and_unlinks_them_by_id() {
+    let state = tmp("store-aliases");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let id = stored(&state, None, 1);
+    for name in ["z", "a"] {
+        store::link(&state, name, &id).unwrap();
+    }
+    let all = store::list(&state);
+    assert!(all.errors.is_empty());
+    assert_eq!(all.entries.len(), 1);
+    assert_eq!(all.entries[0].names, ["a", "z"]);
+    for name in ["a", "z", &id] {
+        assert_eq!(store::find(&all, name).unwrap().id, id);
+    }
+    assert_eq!(store::rows(&state, &[])[0]["name"], "a, z");
+    assert_eq!(store::remove(&state, &[id.clone()], false).unwrap(), [json!({"deleted": id, "name": "a, z"})]);
+    assert!(fs::read_dir(store::dir(&state).join("names")).unwrap().next().is_none());
+}
+
+#[test]
+fn name_errors_block_prefixes_and_removal_but_allow_exact_lookups() {
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+    let state = tmp("name-errors");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let id = stored(&state, None, 1);
+    store::link(&state, "good", &id).unwrap();
+    let names = store::dir(&state).join("names");
+    for damage in ["directory", "readlink", "target", "utf8"] {
+        match damage {
+            "directory" => {
+                fs::rename(&names, names.with_extension("saved")).unwrap();
+                fs::write(&names, b"not a directory").unwrap();
+            }
+            "readlink" => fs::write(names.join("bad"), b"not a link").unwrap(),
+            "target" => symlink("..", names.join("bad")).unwrap(),
+            _ => symlink(format!("../{id}"), names.join(std::ffi::OsStr::from_bytes(b"bad\xff"))).unwrap(),
+        }
+        let all = store::list(&state);
+        assert_eq!(all.entries.len(), 1);
+        assert_eq!(all.errors.len(), 1);
+        let err = store::find(&all, &id[..6]).err().unwrap().to_string();
+        assert!(err.contains("incomplete checkpoint listing") && err.contains("names"), "{err}");
+        assert!(store::find(&all, "missing").is_err());
+        assert_eq!(store::find(&all, &id).unwrap().id, id);
+        if damage != "directory" {
+            assert_eq!(store::find(&all, "good").unwrap().id, id);
+            assert!(store::remove(&state, &[id.clone()], true).is_err());
+            assert!(store::prune(&state, None).is_err());
+        }
+        for result in [store::removal(&all, &[id.clone()], true), store::pruning(&all, None)] {
+            assert!(result.unwrap_err().to_string().contains("nothing removed:"));
+        }
+        assert!(store::rows(&state, &[]).iter().any(|r| r["error"].is_string()));
+        assert!(store::dir(&state).join(&id).exists());
+        match damage {
+            "directory" => {
+                fs::remove_file(&names).unwrap();
+                fs::rename(names.with_extension("saved"), &names).unwrap();
+            }
+            "utf8" => fs::remove_file(names.join(std::ffi::OsStr::from_bytes(b"bad\xff"))).unwrap(),
+            _ => fs::remove_file(names.join("bad")).unwrap(),
+        }
+    }
+}
+
+#[test]
+fn partial_checkpoint_and_name_listings_refuse_a_single_visible_prefix_match() {
+    let state = tmp("partial-listings");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let id = stored(&state, None, 1);
+    store::link(&state, "good", &id).unwrap();
+    for names in [false, true] {
+        let error = || format!("listing {}: injected failure", store::dir(&state).join(if names { "names" } else { "" }).display());
+        let checkpoints = managed(&state).chain((!names).then(|| Err(error().into())));
+        let links = entries(&store::dir(&state).join("names")).chain(names.then(|| Err(error().into())));
+        let all = store::listed(checkpoints, links);
+        assert_eq!(all.errors.len(), 1);
+        assert!(store::find(&all, &id[..6]).err().unwrap().to_string().contains("incomplete checkpoint listing"));
+        assert_eq!(store::find(&all, "good").unwrap().id, id);
+        assert_eq!(store::find(&all, &id).unwrap().id, id);
+        assert!(store::removal(&all, &[id.clone()], true).is_err());
+        assert!(store::pruning(&all, None).is_err());
     }
 }

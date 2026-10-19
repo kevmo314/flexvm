@@ -770,7 +770,8 @@ impl Host {
             Err(e) => Some(Err(e)),
         });
         let mut unreadable = vec![];
-        for manifest in suspended.chain(crate::checkpoint::managed(&self.state).map(|(_, m)| m)) {
+        let stored = crate::checkpoint::store::list(&self.state);
+        for manifest in suspended.chain(stored.entries.into_iter().map(|e| e.manifest)).chain(stored.errors.into_iter().map(Err)) {
             match manifest {
                 Ok(m) => drop(ids.insert(m.template_id)),
                 Err(err) => unreadable.push(err.to_string()),

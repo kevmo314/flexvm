@@ -348,7 +348,7 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
     let header = Header {
         format: EXPORT_FORMAT,
         id: entry.id.clone(),
-        name: entry.name.clone(),
+        name: entry.names.iter().find(|n| n.as_str() == what).or(entry.names.first()).cloned(),
         chain,
         template_id: tid.clone(),
         template: sending.is_some(),
@@ -384,7 +384,7 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
         out.member(&template_member(&tid), s.len(), |w| s.write(w).map(drop))?;
     }
     let bytes = out.finish()?;
-    Ok(json!({"saved": entry.id, "name": entry.name, "chain": header.chain.len(), "template_id": tid, "template": header.template, "bytes": bytes,
+    Ok(json!({"saved": entry.id, "name": header.name, "chain": header.chain.len(), "template_id": tid, "template": header.template, "bytes": bytes,
               "sha256": digest.finish()}))
 }
 
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     fn ids(state: &Path) -> Vec<String> {
-        store::list(state).into_iter().map(|e| e.id).collect()
+        store::list(state).entries.into_iter().map(|e| e.id).collect()
     }
 
     fn gens(paths: &Paths) -> Vec<String> {
@@ -1102,6 +1102,25 @@ mod tests {
             (Some(&head[..]), Some(2), Some(true), Some(tar.len() as u64))
         );
         (dir, paths, tpl, state, vec![head, base], tar)
+    }
+
+    #[test]
+    fn loading_another_name_keeps_both_and_saves_the_requested_name() {
+        let (_dir, paths, _tpl, _state, chain, tar) = saved();
+        let b = fresh(&paths);
+        load_bytes(&b, &tar, None).unwrap();
+        assert_eq!(load_bytes(&b, &tar, Some("alias")).unwrap()["stored"], 0);
+        let all = store::list(&b.state);
+        assert_eq!(all.entries.iter().find(|e| e.id == chain[0]).unwrap().names, ["alias", "web"]);
+        for name in ["web", "alias"] {
+            assert_eq!(store::find(&all, name).unwrap().id, chain[0]);
+            let mut tar = vec![];
+            assert_eq!(save(&b.state, &b.paths, name, &mut tar).unwrap()["name"], name);
+            let c = fresh(&paths);
+            assert_eq!(load_bytes(&c, &tar, None).unwrap()["name"], name);
+        }
+        store::remove(&b.state, &[chain[0].clone()], false).unwrap();
+        assert!(fs::read_dir(store::dir(&b.state).join("names")).unwrap().next().is_none());
     }
 
     #[test]
@@ -1329,12 +1348,12 @@ mod tests {
         // The head vouches for other files: its template is refused before it is published.
         let mut other = tpl.digests().unwrap();
         other.insert("rootfs".into(), "0".repeat(64));
-        let base = store::list(&state)[0].id.clone();
+        let base = store::list(&state).entries[0].id.clone();
         let head = stored(&state, &tpl, Some(&base), 20, &[5], |m| m.template_digests = Some(other.clone()));
         // The save refuses what the template here does not match.
         assert!(save(&state, &paths, &head, &mut vec![]).err().unwrap().to_string().contains("SHA-256"));
         let mut tar = vec![];
-        let good = store::list(&state)[1].id.clone();
+        let good = store::list(&state).entries[1].id.clone();
         save(&state, &paths, &good, &mut tar).unwrap();
         // The same save with the head's digests forged (its id changes with them, so it is another chain).
         let b = fresh(&paths);
