@@ -17,6 +17,8 @@ directories of this run's own.
 scenarios run (python3, socat, iproute2):
     sudo scripts/test-image.py /var/tmp/test-image
     sudo flexvm pull /var/tmp/test-image --tag small --vcpus 2 --max 2048
+(scripts/e2e.py's heavy shard builds it with --max 10240: scenarios that set
+up 1500 MiB or more, such as pages_dead, need that.)
 
 Each scenario ends `ok`, `FAILED` or `SKIPPED` (this host lacks what it tests,
 or it restarts listeners it was not given: --no-listeners); --no-skips counts
