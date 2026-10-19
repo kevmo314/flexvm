@@ -1006,7 +1006,7 @@ fn run_as(
     // A foreground -i or -t runs it in the background, and attaches to it (as `attach`).
     let attached = (args.has("interactive") || args.has("tty")) && !args.has("detach") && !tried;
     // A claimed standby VM writes where this process would, to opens made here (`own`).
-    let log = (args.has("detach") || attached).then(|| log_file(host, &name)).transpose()?;
+    let log = (args.has("detach") || attached).then(|| new_run_log(host, &name)).transpose()?;
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
@@ -1161,13 +1161,19 @@ fn run_checkpoint(args: &Args) -> Result<()> {
             Some(name) => name.to_string(),
             None => checkpoint::read_manifest(&dir)?.name,
         };
-        return print(spawn_detached(&host, &name, &args.child_args, &log_file(&host, &name)?, false)?);
+        return print(spawn_detached(&host, &name, &args.child_args, &new_run_log(&host, &name)?, false)?);
     }
     vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }
 
 /// What a foreground `run` that claimed a standby VM forwards to it (SIGHUP is ignored).
 const FOLLOW_SIGNALS: [i32; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
+
+fn new_run_log(host: &Host, name: &str) -> Result<std::fs::File> {
+    // Refuse a taken name and clear a failed VM's logs before opening it for the child.
+    let _name = host.take_name(name, false)?;
+    log_file(host, name)
+}
 
 fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     host::check_name(name)?;
@@ -1389,7 +1395,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
 
 /// `rm` without -f: under the name, so a `start` meanwhile either wins first (and this is
 /// refused: the VM runs) or waits until it is gone; no process is ever signalled. `had`:
-/// a stopped VM's records were there before (taking the name clears failed and lost ones).
+/// a stopped VM's records were there before.
 fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
     if !had {
         return match std::fs::read_to_string(host.vms(name, "moved")?) {
@@ -1406,7 +1412,9 @@ fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
     if host.suspended(name)?.exists() {
         lifecycle::revoke(host, name)??;
     }
-    let _ = std::fs::remove_file(host.vms(name, "exited")?);
+    for ext in ["exited", "failed", "lost"] {
+        let _ = std::fs::remove_file(host.vms(name, ext)?);
+    }
     Ok(())
 }
 
@@ -2410,6 +2418,29 @@ mod exec_tests {
         }
         for value in ["1", "2", "32"] {
             assert_eq!(template_vcpus(&parse(&["--vcpus", value])).unwrap().to_string(), value);
+        }
+    }
+
+    #[test]
+    fn a_detached_run_checks_the_name_before_opening_its_log() {
+        let root = crate::test_util::TempDir::new("run-log");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("web", false).unwrap();
+        let log = host.vms("web", "log").unwrap();
+        assert!(host::name_taken(&new_run_log(&host, "web").unwrap_err()));
+        assert!(!log.exists());
+        std::fs::write(&log, "other vm").unwrap();
+        assert!(new_run_log(&host, "web").is_err());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "other vm");
+        drop(name);
+        for record in ["failed", "lost"] {
+            std::fs::write(host.vms("web", record).unwrap(), "old vm").unwrap();
+            std::fs::write(host.vms("web", "log.1").unwrap(), "older vm").unwrap();
+            let mut out = new_run_log(&host, "web").unwrap();
+            let _name = host.take_name("web", false).unwrap();
+            out.write_all(b"new vm").unwrap();
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "new vm");
+            assert!(!host.has_record("web", "log.1"));
         }
     }
 

@@ -249,7 +249,7 @@ A background VM's output (an image app's stdout and stderr, flexvm's own
 messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: past
 8 MiB, `NAME.log` becomes `NAME.log.1` (replacing the one before) and a new
 one is started; the logs of a name with nothing left on
-the host (no VM, stopped VM, `exited`, `failed` or moved record) are removed once
+the host (no VM, stopped VM, `exited`, `failed`, `lost` or moved record) are removed once
 unwritten for an hour, by sweeps that run when a VM starts and about every
 30 s while a listener or any VM process runs. Logs do not survive a reboot.
 

@@ -800,6 +800,8 @@ fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
 /// Its lock goes with it: held, it is the caller's to let go of then.
 pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accepted: bool) -> Result<()> {
     if accepted {
+        let _logs = host.logs_lock(libc::LOCK_SH)?;
+        let _ = std::fs::remove_file(host.vms(name, "log.1")?);
         std::fs::rename(log, host.vms(name, "log")?)?;
     } else {
         std::fs::remove_file(log)?;
@@ -1550,15 +1552,19 @@ mod tests {
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let arrival = host.run.join("vms/.incoming.log");
         let existing = host.vms("web", "log").unwrap();
+        let previous = host.vms("web", "log.1").unwrap();
         std::fs::write(&existing, b"existing vm").unwrap();
+        std::fs::write(&previous, b"earlier stay").unwrap();
         std::fs::write(&arrival, b"refused").unwrap();
         finish_incoming_log(&host, "web", &arrival, false).unwrap();
         assert!(!arrival.exists());
         assert_eq!(std::fs::read(&existing).unwrap(), b"existing vm");
+        assert_eq!(std::fs::read(&previous).unwrap(), b"earlier stay");
         std::fs::write(&arrival, b"accepted").unwrap();
         finish_incoming_log(&host, "web", &arrival, true).unwrap();
         assert!(!arrival.exists());
         assert_eq!(std::fs::read(&existing).unwrap(), b"accepted");
+        assert!(!previous.exists());
     }
 
     #[test]

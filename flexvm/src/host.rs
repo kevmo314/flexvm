@@ -833,7 +833,20 @@ impl Host {
         if !resuming && self.has_record(name, "exited") {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
-        for ext in ["json", "sock", "moved", "failed", "lost"] {
+        // A new VM of a failed or lost one's name starts a fresh log; a resume (`start`) keeps its VM's.
+        let _logs = self.logs_lock(libc::LOCK_SH)?;
+        if !resuming && ["failed", "lost"].iter().any(|ext| self.has_record(name, ext)) {
+            for ext in ["log", "log.1"] {
+                let _ = std::fs::remove_file(self.vms(name, ext)?);
+            }
+        }
+        // A resume clears them only for a VM it can go on with (stopped or exited): one refused
+        // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log.
+        let records: &[&str] = match !resuming || suspended.exists() || self.has_record(name, "exited") {
+            true => &["json", "sock", "moved", "failed", "lost"],
+            false => &["json", "sock", "moved"],
+        };
+        for ext in records {
             let _ = std::fs::remove_file(self.vms(name, ext)?);
         }
         f.set_len(0)?;
@@ -5089,6 +5102,38 @@ pub(crate) mod tests {
         std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
         std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
         assert!(h.take_name("s", false).is_err() && h.take_name("s", true).is_ok());
+    }
+
+    #[test]
+    fn reusing_a_failed_or_lost_name_removes_both_logs() {
+        let (_dir, h) = host("reuse-logs");
+        for record in ["failed", "lost"] {
+            for ext in [record, "log", "log.1"] {
+                std::fs::write(h.vms("web", ext).unwrap(), "old vm").unwrap();
+            }
+            assert!(h.take_unrecorded_name("web").is_err());
+            assert!(h.has_record("web", "log") && h.has_record("web", "log.1"));
+            let _name = h.take_name("web", false).unwrap();
+            for ext in [record, "log", "log.1"] {
+                assert!(!h.has_record("web", ext), "{ext}");
+            }
+        }
+        // `start` of a failed VM with no checkpoint: refused after, so its record stays for the next `run`.
+        std::fs::write(h.vms("web", "log").unwrap(), "died").unwrap();
+        std::fs::write(h.vms("web", "failed").unwrap(), "died").unwrap();
+        drop(h.take_name("web", true).unwrap());
+        assert!(h.has_record("web", "failed") && h.has_record("web", "log"));
+        drop(h.take_name("web", false).unwrap());
+        assert!(!h.has_record("web", "failed") && !h.has_record("web", "log"));
+        // A stopped VM's resume clears the record and keeps its log.
+        let dir = h.suspended("web").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(h.vms("web", "log").unwrap(), "resume").unwrap();
+        std::fs::write(h.vms("web", "failed").unwrap(), "died resuming").unwrap();
+        let _name = h.take_name("web", true).unwrap();
+        assert!(!h.has_record("web", "failed"));
+        assert_eq!(std::fs::read_to_string(h.vms("web", "log").unwrap()).unwrap(), "resume");
     }
 
     #[test]

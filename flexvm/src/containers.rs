@@ -412,7 +412,7 @@ fn take_rename_name(host: &Host, from: &str) -> Result<host::NameLock> {
     })
 }
 
-/// Its logs (and the writers' locks with them) and exit status, under the logs lock shared, as a
+/// Its logs and exit records, under the logs lock shared, as a
 /// start opens a log: a sweep never decides on a log midway.
 fn move_records(host: &Host, from: &str, to: &str) -> Result<()> {
     let _logs = host.logs_lock(libc::LOCK_SH)?;
