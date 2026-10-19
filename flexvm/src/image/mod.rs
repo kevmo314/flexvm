@@ -844,7 +844,8 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let image = create_new(dest)?;
     image.set_len(mib << 20)?;
     let meta = std::fs::metadata(dir)?;
-    let root = format!("root_owner={}:{},root_perms={:o}", meta.uid(), meta.gid(), meta.mode() & 0o7777);
+    // root_owner is in every mke2fs we support; root_perms only since e2fsprogs 1.47.1.
+    let root = format!("root_owner={}:{}", meta.uid(), meta.gid());
     let image_path = format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd());
     let mut cmd = Command::new("mkfs.ext4");
     cmd.args(["-q", "-F", "-b", "4096", "-I", "256", "-L", "flexroot", "-N", &inodes.to_string(), "-d"]);
@@ -853,12 +854,14 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     if !out.status.success() {
         bail!("mkfs.ext4 failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    // -d copies root xattrs, but leaves its timestamp at filesystem creation time.
-    let out = run_until(Command::new("debugfs").args(["-w", "-R", &format!("set_inode_field / mtime @{}", meta.mtime()), &image_path]), interrupted)?;
-    // debugfs also reports command errors on stderr with a successful exit status.
-    let errors = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() || errors.lines().any(|line| !line.starts_with("debugfs ")) {
-        bail!("debugfs setting root mtime failed: {}", errors.trim());
+    // Root xattrs come with -d (from 1.47.1); its mode and mtime are set here, as older mke2fs can't.
+    for (field, value) in [("mode", format!("0{:o}", libc::S_IFDIR | (meta.mode() & 0o7777))), ("mtime", format!("@{}", meta.mtime()))] {
+        let out = run_until(Command::new("debugfs").args(["-w", "-R", &format!("set_inode_field / {field} {value}"), &image_path]), interrupted)?;
+        // debugfs also reports command errors on stderr with a successful exit status.
+        let errors = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() || errors.lines().any(|line| !line.starts_with("debugfs ")) {
+            bail!("debugfs setting root {field} failed: {}", errors.trim());
+        }
     }
     crate::log!("image: root filesystem built ({mib} MiB, {entries} entries)");
     Ok(())
@@ -1120,6 +1123,9 @@ mod tests {
             assert_eq!(metadata(), expected);
             let dest = dir.join(format!("{note}.ext4"));
             mkfs(&staging, root.entries, &dest).unwrap();
+            // debugfs's root edits keep the inode checksum valid.
+            let fsck = Command::new("e2fsck").arg("-fn").arg(&dest).output().unwrap();
+            assert!(fsck.status.success(), "{}", String::from_utf8_lossy(&fsck.stdout));
             let out = Command::new("debugfs").args(["-R", "stat /"]).arg(&dest).output().unwrap();
             assert!(out.status.success());
             let stat = String::from_utf8(out.stdout).unwrap();

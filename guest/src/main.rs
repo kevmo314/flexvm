@@ -108,7 +108,9 @@ fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str
     }
 }
 
-/// Overlayfs takes the merged root's attributes from the upper directory.
+/// Overlayfs takes the merged root's attributes from the upper directory. Xattrs are best-effort:
+/// tmpfs may lack a namespace (user.* before 6.6, ACLs without TMPFS_POSIX_ACL), and overlayfs's
+/// own trusted.overlay.* would change how the upper root is read.
 fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
     let lower = File::open(lower)?;
     let upper = File::open(upper)?;
@@ -121,10 +123,18 @@ fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
     let n = os(unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) })?;
     for name in names[..n as usize].split_inclusive(|&b| b == 0) {
         let name = CStr::from_bytes_with_nul(name).map_err(io::Error::other)?;
-        let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), std::ptr::null_mut(), 0) })?;
-        let mut value = vec![0u8; n as usize];
-        let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) })?;
-        os(unsafe { libc::fsetxattr(dst, name.as_ptr(), value.as_ptr().cast(), n as usize, 0) })?;
+        if name.to_bytes().starts_with(b"trusted.overlay.") {
+            continue;
+        }
+        let copied = (|| {
+            let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), std::ptr::null_mut(), 0) })?;
+            let mut value = vec![0u8; n as usize];
+            let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) })?;
+            os(unsafe { libc::fsetxattr(dst, name.as_ptr(), value.as_ptr().cast(), n as usize, 0) })
+        })();
+        if let Err(e) = copied {
+            log(&format!("root xattr {}: {e}", name.to_string_lossy()));
+        }
     }
     Ok(())
 }
@@ -139,7 +149,9 @@ fn setup_root() -> io::Result<()> {
     for d in ["/run/ovl/upper", "/run/ovl/work", "/run/root"] {
         std::fs::create_dir_all(d)?;
     }
-    copy_root_metadata("/", "/run/ovl/upper")?;
+    if let Err(e) = copy_root_metadata("/", "/run/ovl/upper") {
+        log(&format!("root metadata: {e}"));
+    }
     mount("overlay", "/run/root", "overlay", 0, "lowerdir=/,upperdir=/run/ovl/upper,workdir=/run/ovl/work")?;
     for d in ["/proc", "/sys", "/dev"] {
         mount(d, &format!("/run/root{d}"), "", libc::MS_MOVE, "")?;
