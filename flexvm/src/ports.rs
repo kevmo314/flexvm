@@ -127,6 +127,11 @@ impl Forwarder {
     }
 
     #[cfg(test)]
+    pub fn bound_socket(&self) -> BorrowedFd<'_> {
+        self.bound[0].0[0].as_fd()
+    }
+
+    #[cfg(test)]
     fn start(ports: &[Port], vm: Ipv4Addr) -> Result<Self> {
         let mut f = Self::bind(ports)?;
         f.serve(vm)?;
@@ -625,10 +630,12 @@ mod tests {
 
     /// A TCP worker of `cap` connections to a new guest listener: its address, the guest, and its stop.
     fn worker(cap: usize, idle: Duration) -> (SocketAddr, TcpListener, Arc<OwnedFd>, JoinHandle<()>) {
-        let guest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        // Unrelated localhost RPC retries must not enter the guest's accept queue.
+        let ip = Ipv4Addr::new(127, 0, 0, 2);
+        let guest = TcpListener::bind((ip, 0)).unwrap();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (addr, target) = (listener.local_addr().unwrap(), SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest.local_addr().unwrap().port()));
+        let (addr, target) = (listener.local_addr().unwrap(), SocketAddrV4::new(ip, guest.local_addr().unwrap().port()));
         let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
         let worker = {
             let stop = stop.clone();
@@ -710,6 +717,7 @@ mod tests {
     fn at_the_cap_a_waiting_client_replaces_the_idlest_forward_once_it_is_idle() {
         const IDLE: Duration = Duration::from_secs(2);
         let (addr, guest, stop, worker) = worker(2, IDLE);
+        let at = Instant::now();
         let mut forwards = Vec::new();
         for _ in 0..2 {
             let mut client = TcpStream::connect(addr).unwrap();
@@ -717,15 +725,24 @@ mod tests {
             let (mut server, _) = crate::test_util::accept_tcp(&guest);
             echo(&mut client, &mut server);
             forwards.push((client, server));
-            thread::sleep(Duration::from_millis(50));
         }
         let mut waiting = TcpStream::connect(addr).unwrap();
         waiting.write_all(b"w").unwrap();
-        thread::sleep(Duration::from_millis(200));
         guest.set_nonblocking(true).unwrap();
-        assert!(guest.accept().is_err(), "a forward was closed before it was idle");
-        guest.set_nonblocking(false).unwrap();
-        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        let mut accepted = None;
+        wait_until("the waiting client to replace the idle forward", || {
+            let (client, server) = &mut forwards[1];
+            echo(client, server);
+            match guest.accept() {
+                Ok((server, _)) => accepted = Some(server),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return false,
+                Err(e) => panic!("accept: {e}"),
+            }
+            true
+        });
+        assert!(at.elapsed() >= IDLE, "a forward was closed before it was idle");
+        let mut server = accepted.unwrap();
+        server.set_read_timeout(Some(WAIT)).unwrap();
         let mut b = [0];
         server.read_exact(&mut b).unwrap();
         assert_eq!(&b, b"w");
