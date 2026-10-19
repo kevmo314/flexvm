@@ -257,6 +257,10 @@ pub fn remove(state: &Path, whats: &[String], force: bool) -> Result<Vec<Value>>
     // Names removed alone cannot affect a checkpoint's dependants.
     let (names, whats): (Vec<String>, Vec<String>) =
         whats.iter().cloned().partition(|w| all.dangling.contains(w) || (force && all.malformed.contains_key(&all.names.join(w))));
+    // A dangling name may be one of a checkpoint the listing missed; a malformed one is no checkpoint's.
+    if names.iter().any(|n| all.dangling.contains(n)) {
+        all.complete().map_err(|e| format!("nothing removed: {e}"))?;
+    }
     let names: Vec<PathBuf> = names.iter().map(|n| all.names.join(n)).collect();
     if whats.is_empty() {
         return unname(&names);
@@ -442,6 +446,26 @@ mod tests {
             assert!(checkpoint.exists());
             assert!(leftover.exists());
         }
+    }
+
+    #[test]
+    fn a_name_whose_checkpoint_the_listing_missed_stays() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Root lists a directory without read permission.
+        }
+        let state = crate::test_util::TempDir::new("dangling-hidden");
+        let checkpoint = unreadable(&state);
+        link(&state, "live", "0123456789abcdef").unwrap();
+        let store = dir(&state);
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o300)).unwrap();
+        let all = list(&state);
+        let result = remove(&state, &["live".into()], true);
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!all.errors.is_empty() && all.dangling == ["live"]);
+        assert!(result.unwrap_err().to_string().contains("incomplete checkpoint listing"));
+        assert!(fs::symlink_metadata(store.join("names/live")).is_ok());
+        assert!(checkpoint.exists());
     }
 
     #[test]

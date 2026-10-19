@@ -468,7 +468,8 @@ The store's lock (`checkpoints/.locks/store`, a flock) orders the rest:
   leaves whole chains, perhaps one checkpoint unnamed. A checkpoint may have
   several names (`checkpoint load --name`); all go. Names whose `ID` is gone
   (what `rm ID` left before #862) go too: `prune` all, `rm NAME` that one.
-  Removing a name alone works even with an unreadable checkpoint kept.
+  Removing a name alone works even with an unreadable checkpoint kept, not
+  with a listing error (its checkpoint may be one the listing missed).
   Malformed name entries (not a symlink to `../ID`, or not UTF-8) go with
   `prune` or `rm -f NAME`; removing a name alone never runs checkpoint deletion.
 

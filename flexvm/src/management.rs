@@ -310,7 +310,7 @@ fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {
         for v in &rows {
             match v["id"].as_str() {
                 Some(id) => output(format_args!("{id}\n"))?,
-                None => drop(writeln!(std::io::stderr(), "flexvm: warning: {}", s(v, "error"))),
+                None => drop(writeln!(std::io::stderr(), "flexvm: warning: {}: {}", s(v, "directory"), s(v, "error"))),
             }
         }
         return Ok(());
