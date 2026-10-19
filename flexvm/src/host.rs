@@ -2371,7 +2371,11 @@ impl AddrClaim {
 
 impl Drop for AddrClaim {
     fn drop(&mut self) {
-        if let (false, Ok(l)) = (self.kept, self.host.lock()) {
+        // Kept (`keep`, `release`): nothing to give back, so the host lock is not taken.
+        if self.kept {
+            return;
+        }
+        if let Ok(l) = self.host.lock() {
             let _ = self.host.release(&l, self.ip, &self.holder, Some(&self.id));
         }
     }
