@@ -485,7 +485,11 @@ impl Pager {
                 let n = pages.claim(i, end - i, BASE, |p| self.base.has_data(p) == data);
                 if n > 0 {
                     let src = |p: usize, c: usize| data.then(|| self.base.pages(p, c));
-                    let _ = pages.install(i, n, BASE, Some(&|| self.quiesce.load(Ordering::SeqCst)), |p, c| self.populate(p, c, src(p, c)));
+                    // A cold template read happens here, not under `events`, where it would hold up every fault batch.
+                    let prefault = |p: usize, c: usize| self.base.prefault(p, c);
+                    let stop = || self.quiesce.load(Ordering::SeqCst);
+                    let _ = pages
+                        .install_prepared(i, n, BASE, Some(&stop), data.then_some(&prefault as &dyn Fn(usize, usize)), |p, c| self.populate(p, c, src(p, c)));
                 }
                 i += n.max(1);
             }
