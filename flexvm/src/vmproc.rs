@@ -2195,15 +2195,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     // Blocked first: every thread from here on (the output relays too) inherits it.
     let signals = crate::util::block_signals(&SIGNALS);
     crate::util::output::guard()?;
-    unsafe {
-        let mut limit: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur = limit.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-                crate::log!("raising file descriptor limit: {}", std::io::Error::last_os_error());
-            }
-        }
-    }
+    crate::util::raise_nofile();
     let _ = crate::net::ip_forward();
     if let Some(dev) = &host.cfg.announce_dev() {
         let _ = crate::net::proxy_arp(dev);
