@@ -465,7 +465,15 @@ The store's lock (`checkpoints/.locks/store`, a flock) orders the rest:
   (a revoked publication's leftover: a checkpoint is published whole). Then,
   per checkpoint, dependants before what they build on: unlink its name
   durably, rename it `.removed-ID`, fsync the store, delete it. A crash
-  leaves whole chains, perhaps one checkpoint unnamed.
+  leaves whole chains, perhaps one checkpoint unnamed. A checkpoint may have
+  several names (`checkpoint load --name`); all go. Names whose `ID` is gone
+  (what `rm ID` left before #862) go too: `prune` all, `rm NAME` that one.
+
+`store::list` returns a `Listing`: entries, and every error reading the
+store or `names` (unreadable entries stay entries). With any error, `rm`,
+`prune` and an id's start are refused; a name read resolves, and a whole id
+does unless `names/ID` exists (a name before #862 may look like an id; new
+ones may not), or a name and an id are two checkpoints'.
 
 `rm` refuses a checkpoint that one not removed with it builds on
 (`manifest.parent.id`), unless `-f` adds those too, transitively. `prune`

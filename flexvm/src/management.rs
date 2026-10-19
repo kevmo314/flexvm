@@ -272,10 +272,16 @@ fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {
     };
     let templates = crate::template::images(&Paths::new(&host.state)).unwrap_or_default();
     let mut rows = crate::checkpoint::store::rows(&host.state, &templates);
-    // A key again: either value.
-    rows.retain(|v| filters.iter().all(|(k, _)| filters.iter().any(|(k2, want)| k2 == k && matches(v, k, want))));
+    // A key again: either value. A listing error (no id) stays: what it hid may match.
+    rows.retain(|v| v["id"].is_null() || filters.iter().all(|(k, _)| filters.iter().any(|(k2, want)| k2 == k && matches(v, k, want))));
     if args.has("quiet") {
-        return rows.iter().try_for_each(|v| output(format_args!("{}\n", s(v, "id"))));
+        for v in &rows {
+            match v["id"].as_str() {
+                Some(id) => output(format_args!("{id}\n"))?,
+                None => drop(writeln!(std::io::stderr(), "flexvm: warning: {}", s(v, "error"))),
+            }
+        }
+        return Ok(());
     }
     if let Some(f) = format {
         return output(format_args!("{}", f.render(&rows)?));

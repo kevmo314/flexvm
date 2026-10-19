@@ -96,6 +96,10 @@ impl<'a> Index<'a> {
 pub struct Listing {
     pub entries: Vec<Entry>,
     pub errors: Vec<crate::util::Error>,
+    /// Names whose checkpoint is not listed: gone (left by a removal before #862), or hidden by an error.
+    pub dangling: Vec<String>,
+    /// `names`, probed for a name the listing may have missed.
+    pub(super) names: PathBuf,
 }
 
 impl Listing {
@@ -109,11 +113,16 @@ impl Listing {
 
 /// Every stored checkpoint, oldest first, with all its names; staging and removed ones are not.
 pub fn list(state: &Path) -> Listing {
-    listed(managed(state), super::entries(&dir(state).join(NAMES)))
+    let names = dir(state).join(NAMES);
+    listed(managed(state), super::entries(&names), names)
 }
 
-pub(super) fn listed(checkpoints: impl Iterator<Item = Result<(PathBuf, Result<Manifest>)>>, links: impl Iterator<Item = Result<PathBuf>>) -> Listing {
-    let mut all = Listing::default();
+pub(super) fn listed(
+    checkpoints: impl Iterator<Item = Result<(PathBuf, Result<Manifest>)>>,
+    links: impl Iterator<Item = Result<PathBuf>>,
+    names_dir: PathBuf,
+) -> Listing {
+    let mut all = Listing { names: names_dir, ..Listing::default() };
     let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for link in links {
         let read = (|| -> Result<_> {
@@ -142,6 +151,8 @@ pub(super) fn listed(checkpoints: impl Iterator<Item = Result<(PathBuf, Result<M
             Err(e) => all.errors.push(e),
         }
     }
+    all.dangling = names.into_values().flatten().collect();
+    all.dangling.sort();
     all.entries
         .sort_by(|a, b| (a.manifest.as_ref().map_or(0, |m| m.created_unix_ms), &a.id).cmp(&(b.manifest.as_ref().map_or(0, |m| m.created_unix_ms), &b.id)));
     all
@@ -152,12 +163,35 @@ pub(crate) fn is_id(name: &str) -> bool {
 }
 
 /// The checkpoint `what` names: by its name, else its id or the start of one (4 or more digits).
+/// A name and an id of two checkpoints (a name given before #862 may look like an id) is refused,
+/// as is an id while a name the listing missed may be it.
 pub fn find<'a>(all: &'a Listing, what: &str) -> Result<&'a Entry> {
-    if let Some(e) = all.entries.iter().find(|e| e.names.iter().any(|n| n == what)) {
-        return Ok(e);
+    let named = all.entries.iter().find(|e| e.names.iter().any(|n| n == what));
+    let by_id = all.entries.iter().find(|e| is_id(what) && e.id == what);
+    if named.is_none() && all.dangling.iter().any(|n| n == what) {
+        all.complete().map_err(|e| format!("cannot resolve checkpoint {what:?}: {e}"))?;
+        bail!("checkpoint name {what:?} is of a checkpoint no longer here: flexvm checkpoint rm {what} removes the name");
     }
-    if let Some(e) = all.entries.iter().find(|e| is_id(what) && e.id == what) {
-        return Ok(e);
+    match (named, by_id) {
+        (Some(n), Some(i)) if n.id != i.id => bail!("{what:?} is a name of checkpoint {} and the id of another; give that one's name, or rename", n.id),
+        (Some(e), _) => return Ok(e),
+        (None, Some(e)) => {
+            let Some(missed) = all.errors.first() else { return Ok(e) };
+            // A name `what` the listing missed, or one of a checkpoint it missed, may be another's.
+            let hidden = match std::fs::symlink_metadata(all.names.join(what)) {
+                Ok(_) => Ok(true),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENOTDIR) => Ok(false),
+                Err(err) => Err(err),
+            };
+            match hidden {
+                Ok(false) => return Ok(e),
+                Ok(true) => bail!("cannot resolve checkpoint {what:?}: it is also a checkpoint name, of one the listing missed ({missed})"),
+                Err(err) => bail!(
+                    "cannot resolve checkpoint {what:?}: whether it is also a checkpoint name is not known ({err}), as the listing is incomplete ({missed})"
+                ),
+            }
+        }
+        (None, None) => {}
     }
     all.complete().map_err(|e| format!("cannot resolve checkpoint {what:?}: {e}"))?;
     let found: Vec<&Entry> = all.entries.iter().filter(|e| what.len() >= 4 && e.id.starts_with(what)).collect();
@@ -170,8 +204,8 @@ pub fn find<'a>(all: &'a Listing, what: &str) -> Result<&'a Entry> {
 
 /// Refused if `name` is no checkpoint name or is taken.
 pub fn check_free(state: &Path, name: &str) -> Result<()> {
-    if crate::host::check_name(name).is_err() {
-        bail!("bad checkpoint name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.'");
+    if crate::host::check_name(name).is_err() || is_id(name) {
+        bail!("bad checkpoint name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.', and not 16 hex digits (an id)");
     }
     if std::fs::symlink_metadata(dir(state).join(NAMES).join(name)).is_ok() {
         bail!("checkpoint name {name:?} is taken (see flexvm checkpoint ls)");
@@ -192,8 +226,17 @@ pub fn link(state: &Path, name: &str, id: &str) -> Result<()> {
 pub fn remove(state: &Path, whats: &[String], force: bool) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
     let all = list(state);
-    let order = removal(&all, whats, force)?;
-    delete(state, &all.entries, order)
+    // A name whose checkpoint is gone (`find` resolves it to none) goes on its own.
+    let (names, whats): (Vec<String>, Vec<String>) = whats.iter().cloned().partition(|w| all.dangling.contains(w));
+    let order = removal(&all, &whats, force)?;
+    let mut out = unname(state, &names)?;
+    out.extend(delete(state, &all.entries, order)?);
+    Ok(out)
+}
+
+/// Unlinks names whose checkpoint is gone, under the lock, from a complete listing.
+fn unname(state: &Path, names: &[String]) -> Result<Vec<Value>> {
+    names.iter().map(|n| Ok(crate::util::unlink_durably(&dir(state).join(NAMES).join(n)).map(|()| json!({"deleted": null, "name": n}))?)).collect()
 }
 
 /// `checkpoint prune`: every checkpoint created before `before` (Unix ms; all without), unless
@@ -202,7 +245,9 @@ pub fn prune(state: &Path, before: Option<u64>) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
     let all = list(state);
     let order = pruning(&all, before)?;
-    delete(state, &all.entries, order)
+    let mut out = unname(state, &all.dangling)?;
+    out.extend(delete(state, &all.entries, order)?);
+    Ok(out)
 }
 
 /// What `remove` deletes, as positions in `all`, in the order it deletes them.

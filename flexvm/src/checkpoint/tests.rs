@@ -751,10 +751,6 @@ fn template_users_count_every_suspended_vm() {
     fs::create_dir_all(host.state.join("checkpoints/.staging")).unwrap();
     let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222", "dddd4444"].map(String::from).into();
     assert_eq!(host.template_users(), want);
-    let names = host.state.join("checkpoints/names");
-    fs::create_dir(&names).unwrap();
-    fs::write(names.join("bad"), b"not a link").unwrap();
-    assert!(host.template_users().iter().any(|u| u.starts_with(crate::template::KEEP_ALL) && u.contains("reading checkpoint name")));
 }
 
 #[test]
@@ -907,7 +903,7 @@ fn store_cycles_refuse_before_deleting_anything() {
         let m = manifest(1, parent.map(|p| Parent { path: format!("../{p}").into(), id: p.into() }), json!({}));
         store::Entry { id: id.into(), names: vec![], dir: format!("/nonexistent/{id}").into(), manifest: Ok(m) }
     };
-    let all = store::Listing { entries: vec![entry(a, Some(b)), entry(b, Some(a)), entry(c, None)], errors: vec![] };
+    let all = store::Listing { entries: vec![entry(a, Some(b)), entry(b, Some(a)), entry(c, None)], errors: vec![], ..Default::default() };
     for result in [store::removal(&all, &[a.into()], true), store::pruning(&all, None)] {
         let err = result.unwrap_err().to_string();
         assert_eq!(err, format!("nothing removed: checkpoints {a}, {b} build on each other in a cycle"));
@@ -1080,7 +1076,7 @@ fn store_dependency_index_matches_the_scan_on_every_small_graph() {
                     }
                 })
                 .collect();
-            let all = store::Listing { entries: all, errors: vec![] };
+            let all = store::Listing { entries: all, errors: vec![], ..Default::default() };
             let ids = |order: Vec<usize>| order.into_iter().map(|i| all.entries[i].id.clone()).collect::<Vec<_>>();
             for subset in 0..1usize << n {
                 let whats: Vec<String> = (0..n).filter(|i| subset >> i & 1 == 1).map(|i| if i % 2 == 1 { format!("n{i}") } else { id(i) }).collect();
@@ -1238,7 +1234,7 @@ fn partial_checkpoint_and_name_listings_refuse_a_single_visible_prefix_match() {
         let error = || format!("listing {}: injected failure", store::dir(&state).join(if names { "names" } else { "" }).display());
         let checkpoints = managed(&state).chain((!names).then(|| Err(error().into())));
         let links = entries(&store::dir(&state).join("names")).chain(names.then(|| Err(error().into())));
-        let all = store::listed(checkpoints, links);
+        let all = store::listed(checkpoints, links, store::dir(&state).join("names"));
         assert_eq!(all.errors.len(), 1);
         assert!(store::find(&all, &id[..6]).err().unwrap().to_string().contains("incomplete checkpoint listing"));
         assert_eq!(store::find(&all, "good").unwrap().id, id);
@@ -1246,4 +1242,71 @@ fn partial_checkpoint_and_name_listings_refuse_a_single_visible_prefix_match() {
         assert!(store::removal(&all, &[id.clone()], true).is_err());
         assert!(store::pruning(&all, None).is_err());
     }
+}
+
+#[test]
+fn an_id_shaped_name_the_listing_missed_is_not_taken_for_that_id() {
+    use std::os::unix::fs::symlink;
+    let state = tmp("id-names");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let (a, b) = (stored(&state, None, 1), stored(&state, None, 2));
+    assert!(store::check_free(&state, &b).unwrap_err().to_string().contains("16 hex digits"), "new names are never ids");
+    // As a name given before #862 could be: A's name is B's id.
+    let names = store::dir(&state).join("names");
+    symlink(format!("../{a}"), names.join(&b)).unwrap();
+    let all = store::list(&state);
+    let err = store::find(&all, &b).err().unwrap().to_string();
+    assert!(err.contains("is a name of checkpoint") && err.contains(&a), "{err}");
+    assert!(store::remove(&state, &[b.clone()], false).is_err());
+    // The listing misses that name: B's id must not resolve to B either.
+    let missed = || -> crate::util::Error { format!("listing {}: injected failure", names.display()).into() };
+    let links = entries(&names).filter(|l| l.as_ref().map_or(true, |p| !p.ends_with(&b))).chain(std::iter::once(Err(missed())));
+    let all = store::listed(managed(&state), links, names.clone());
+    let err = store::find(&all, &b).err().unwrap().to_string();
+    assert!(err.contains("also a checkpoint name"), "{err}");
+    assert_eq!(store::find(&all, &a).unwrap().id, a, "an id no name shadows still resolves");
+    // The name is read, but the checkpoint it names is missed: B's id is refused too.
+    let checkpoints = managed(&state).filter(|c| c.as_ref().map_or(true, |(d, _)| !d.ends_with(&a))).chain(std::iter::once(Err(missed())));
+    let all = store::listed(checkpoints, entries(&names), names.clone());
+    assert_eq!(all.dangling, [b.clone()]);
+    assert!(store::find(&all, &b).is_err());
+    fs::remove_file(names.join(&b)).unwrap();
+    assert_eq!(store::find(&store::list(&state), &b).unwrap().id, b);
+}
+
+#[test]
+fn a_dangling_name_resolves_to_nothing_and_rm_or_prune_unlinks_it() {
+    use std::os::unix::fs::symlink;
+    let state = tmp("dangling-names");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let b = stored(&state, None, 1);
+    let names = store::dir(&state).join("names");
+    // What `rm ID` left before #862 of a second name: its checkpoint is gone. Its name starts B's id.
+    let dead = b[..4].to_string();
+    symlink("../0123456789abcdef", names.join(&dead)).unwrap();
+    let all = store::list(&state);
+    assert!(all.errors.is_empty());
+    assert_eq!(all.dangling, [dead.clone()]);
+    let err = store::find(&all, &dead).err().unwrap().to_string();
+    assert!(err.contains("no longer here"), "{err}");
+    assert!(store::check_free(&state, &dead).is_err(), "taken until removed");
+    assert_eq!(store::remove(&state, &[dead.clone()], false).unwrap(), [json!({"deleted": null, "name": dead})]);
+    assert!(store::dir(&state).join(&b).exists(), "B is not what the name named");
+    store::check_free(&state, &dead).unwrap();
+    symlink("../0123456789abcdef", names.join("old")).unwrap();
+    let out = store::prune(&state, Some(0)).unwrap();
+    assert_eq!(out, [json!({"deleted": null, "name": "old"})]);
+    assert!(store::dir(&state).join(&b).exists());
+}
+
+#[test]
+fn a_bad_name_link_keeps_template_users_exact() {
+    let root = tmp("name-error-templates");
+    let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+    drop(store::lock(&host.state, libc::LOCK_SH).unwrap());
+    stored(&host.state, None, 1);
+    fs::write(store::dir(&host.state).join("names").join("bad"), b"not a link").unwrap();
+    assert!(!store::list(&host.state).errors.is_empty());
+    let users = host.template_users();
+    assert!(users.iter().all(|u| !u.starts_with(crate::template::KEEP_ALL)), "{users:?}");
 }

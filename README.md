@@ -415,7 +415,8 @@ flexvm checkpoint save base -o base.tar             # to a file; checkpoint load
 
 flexvm keeps checkpoints in `STATE/checkpoints`, each under its id (the
 checksum of its manifest), and a name, given at `create`, links to one.
-Names are unique: `create` with a taken one is refused. One being written is
+Names are unique: `create` with a taken one is refused, as is one of 16 hex
+digits (an id); a checkpoint loaded again under another name has both. One being written is
 not listed, restored or built on until it is complete. `--incremental` stores
 a delta on the VM's last checkpoint, taken here since it last started, was
 restored or migrated, that it ran on after; with that one removed, take a
@@ -423,7 +424,10 @@ full one. `checkpoint rm NAME|ID...` (an id's first 4 or more digits will do)
 is refused while a checkpoint not removed with it builds on it; `-f` removes
 those too. `checkpoint prune` removes every checkpoint, or with
 `--older-than AGE` (`90s`, `30m`, `24h`, `7d`) those older, except what a kept one
-builds on; it lists what it removed. Both wait for checkpoints being
+builds on; it lists what it removed. A name whose checkpoint is gone resolves to
+none until `rm NAME` or `prune` removes it. While the store cannot be listed
+whole, both are refused, as is an id's start; a name or a whole id still works.
+Both wait for checkpoints being
 written and for restores still opening one. A VM restored from a checkpoint runs
 on after the checkpoint is removed. `ls -q` prints ids; `--filter name=PART`,
 `vm=NAME` and `template=IMAGE|ID` select (a key again: either value); `--format`
