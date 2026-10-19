@@ -6080,7 +6080,9 @@ pub(crate) mod tests {
                 assert!(!h.has_record("web", "lost") && !h.boot_marker().exists());
             }
             drop(held);
-            assert_eq!(h.after_boot_with("boot-busy", |_, _| Ok(())).unwrap(), Some(true));
+            // A parallel test's fork can keep the raw file's flock alive until exec/close.
+            // Recovery retries this transient contention just as it did while we held it.
+            wait_until("boot recovery after the busy name is released", || h.after_boot_with("boot-busy", |_, _| Ok(())).unwrap() == Some(true));
             assert!(h.has_record("web", "lost"));
             let a = h.addr(&h.lock().unwrap(), ip).unwrap();
             assert!(a.withdrawn && a.holder_id.is_none());
