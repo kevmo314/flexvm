@@ -5491,10 +5491,13 @@ def pull_enomem():
     with armed_fault(B, "pull_enomem", 60000):
         ok(migrate(A, n, B))
         st = wait_released(B, n, timeout=30)
-    check("pull enomem: every page arrives and the source lets go",
-          st["released"] is True and st["background_pull_ms"] is not None and st["failed"] is None, st)
-    check("pull enomem: the pullers retried", "background pull" in log(B, n) and "retrying" in log(B, n), log(B, n)[-500:])
-    check("pull enomem: memory intact", md5(B, n) == m)
+    good = check("pull enomem: every page arrives and the source lets go",
+                 st["released"] is True and st["background_pull_ms"] is not None and st["failed"] is None, st)
+    good &= check("pull enomem: the pullers retried", "background pull" in log(B, n) and "retrying" in log(B, n), log(B, n)[-500:])
+    good &= check("pull enomem: memory intact", md5(B, n) == m)
+    if not good:
+        # The whole of B's log, the guest's console with it: a crash's cause is well before its tail (#958).
+        print(f"pull enomem: B's log of {n}:\n{log(B, n)}", flush=True)
 
 
 def fetch_enomem_stuck():
