@@ -1235,7 +1235,9 @@ fn shared_users(paths: &Paths, force: bool) -> BTreeSet<String> {
             {
                 if force {
                     crate::log!("flexvm: {} is gone: its record as a user of these templates goes", state.display());
-                    let _ = std::fs::remove_file(entry.path());
+                    if let Err(e) = std::fs::remove_file(entry.path()).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }) {
+                        keep(&mut ids, format!("{} cannot be removed ({e})", entry.path().display()));
+                    }
                 } else {
                     keep(
                         &mut ids,
@@ -1469,12 +1471,9 @@ pub fn receive<R: Read>(
                 if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) {
                     bail!("replaced as it was opened");
                 }
-                let (c, sha) = hash_and_digest(&have, &meta.rootfs)?;
-                Ok((c.hash == meta.components["rootfs"].hash).then_some((c, sha, held)))
+                Ok((have, held))
             })()
-            .ok()
-            .flatten()
-            .ok_or_else(|| format!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display()))?,
+            .map_err(|e| format!("template {id} names its root filesystem by its path {}, which does not hold it here ({e})", meta.rootfs.display()))?,
         ),
     };
     let sent_rootfs = file(r, "rootfs", 0..=MAX_FILE)?;
@@ -1484,9 +1483,14 @@ pub fn receive<R: Read>(
     let mem = file(r, "mem", meta.max_mib << 20..=meta.max_mib << 20)?;
     let staged = |n: &str| staging.dir.join(n);
     let (rootfs, rootfs_use) = match local {
-        Some((have, sha, held)) => {
+        Some((have, held)) => {
+            // Read the stream before hashing the cached copy: a slow disk must not stall the paced sender.
+            let (c, sha) = hash_and_digest(&have, &meta.rootfs).map_err(|e| format!("template {id}: its root filesystem {}: {e}", meta.rootfs.display()))?;
+            if c.hash != meta.components["rootfs"].hash {
+                bail!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display());
+            }
             std::fs::remove_file(staged("rootfs"))?;
-            ((have, sha), Some(held))
+            ((c, sha), Some(held))
         }
         None => (sent_rootfs, None),
     };
@@ -1857,7 +1861,10 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
     sweep_locked(paths)?;
     // `--force-shared` brings the record up to date (the marker, gone states) whether or not anything is pruned.
     if force_shared {
-        drop(shared_users(paths, true));
+        let shared = shared_users(paths, true);
+        if let Some(why) = shared.iter().find_map(|u| u.strip_prefix(KEEP_ALL)) {
+            bail!("image prune --force-shared: {why}");
+        }
     }
     let named: BTreeSet<String> = names(&paths.templates)?.into_iter().map(|(_, id)| id).collect();
     let (gens, locks) = (paths.templates.join(GENERATIONS), crate::host::host_locks()?);
@@ -2421,6 +2428,36 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn cached_rootfs_is_hashed_after_the_stream_is_read() {
+        struct Stream<'a> {
+            bytes: &'a [u8],
+            rootfs: &'a Path,
+        }
+        impl Read for Stream<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.bytes.read(buf)?;
+                if self.bytes.is_empty() {
+                    std::fs::write(self.rootfs, b"rootfs")?;
+                }
+                Ok(n)
+            }
+        }
+        let mut f = Fixture::new();
+        let cache = f.paths.images.join("rootfs");
+        std::fs::create_dir_all(&cache).unwrap();
+        f.meta.rootfs = std::fs::canonicalize(&cache).unwrap().join("k.ext4");
+        std::fs::rename(f.dir.join("rootfs"), &f.meta.rootfs).unwrap();
+        let named = f.meta.rootfs.to_string_lossy().into_owned();
+        let (tpl, buf) = sent(&mut f, &named);
+        std::fs::write(&f.meta.rootfs, b"not yet the cached image").unwrap();
+        let (_dir, paths) = elsewhere(&f);
+        let mut stream = Stream { bytes: &buf, rootfs: &f.meta.rootfs };
+        let got = receive(&paths, &mut stream, &tpl.meta.id, None, |_| Ok(()), |_| Ok(())).unwrap();
+        assert!(stream.bytes.is_empty());
+        assert_eq!(got.meta.rootfs, f.meta.rootfs);
+    }
+
     /// `buf` (a `send` of a generation whose vmstate names `ROOTFS` or a path) with `meta` for its metadata and
     /// `vmstate` for its vmstate, the rest as sent.
     fn forged_stream(buf: &[u8], meta: &Meta, vmstate: &[u8]) -> Vec<u8> {
@@ -2762,6 +2799,48 @@ pub(crate) mod tests {
         note_shared(&theirs, &other).unwrap();
         assert!(prune(&f.paths, Some(&old), &none, false).unwrap().is_empty() && Template::generation(&f.paths, &old).is_some());
         assert_eq!(prune(&f.paths, None, &none, false).unwrap().len(), 1, "image prune still removes it");
+    }
+
+    #[test]
+    fn force_shared_reports_registry_failures_without_prune_candidates() {
+        for (broken, why) in [(SHARED, "cannot be read"), (STATES, "cannot be listed"), (".states/entry", "cannot be read")] {
+            let f = Fixture::new();
+            if broken == SHARED {
+                std::fs::create_dir(f.paths.templates.join(SHARED)).unwrap();
+            } else {
+                std::fs::write(f.paths.templates.join(SHARED), RECORDED).unwrap();
+                if broken == STATES {
+                    std::fs::write(f.paths.templates.join(STATES), b"not a directory").unwrap();
+                } else {
+                    std::fs::create_dir_all(f.paths.templates.join(broken)).unwrap();
+                }
+            }
+            let error = prune(&f.paths, None, &BTreeSet::new, true).unwrap_err().to_string();
+            assert!(error.contains("image prune --force-shared") && error.contains(broken) && error.contains(why), "{error}");
+        }
+    }
+
+    #[test]
+    fn force_shared_reports_failed_marker_updates_and_record_deletions() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        for marker in [true, false] {
+            let f = Fixture::new();
+            std::fs::write(f.paths.templates.join(SHARED), if marker { b"" } else { RECORDED }).unwrap();
+            let states = f.paths.templates.join(STATES);
+            std::fs::create_dir(&states).unwrap();
+            std::fs::write(states.join("gone"), f.dir.join("gone-state").as_os_str().as_encoded_bytes()).unwrap();
+            let readonly = if marker { &f.paths.templates } else { &states };
+            let permissions = std::fs::metadata(readonly).unwrap().permissions();
+            std::fs::set_permissions(readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let result = prune(&f.paths, None, &BTreeSet::new, true);
+            std::fs::set_permissions(readonly, permissions).unwrap();
+            let error = result.unwrap_err().to_string();
+            let (path, why) = if marker { (SHARED, "cannot be updated") } else { ("gone", "cannot be removed") };
+            assert!(error.contains("image prune --force-shared") && error.contains(path) && error.contains(why), "{error}");
+        }
     }
 
     #[test]
