@@ -106,9 +106,34 @@ for h in () if args.no_listeners else (A, B):
 listeners = {}
 
 
+# What `rm` deleted of a VM's NAME.log, by (run directory, name): `log` reads it first, so it reads
+# on as from one file across the removal (a VM's last words, written as `rm -f` kills it, included).
+REMOVED_LOGS = {}
+
+
+def held_logs(run, a):
+    """`rm [-f] NAME...` deletes the VMs' logs: open now, each is read once the removal is done."""
+    held = {}
+    for n in a[1:] if a[:1] == ("rm",) else ():
+        with suppress(OSError):
+            held[n] = open(os.path.join(run, "vms", f"{n}.log"))
+    return held
+
+
+def keep_removed(run, held):
+    for n, f in held.items():
+        with f:
+            if os.fstat(f.fileno()).st_nlink == 0:
+                REMOVED_LOGS[(run, n)] = REMOVED_LOGS.get((run, n), "") + f.read()
+
+
 def cli(host, *a, timeout=120):
     """Runs flexvm against `host`; returns (exit code, stdout, stderr)."""
-    r = subprocess.run([BIN, "--state", host.state, "--run", host.run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
+    held = held_logs(host.run, a)
+    try:
+        r = subprocess.run([BIN, "--state", host.state, "--run", host.run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
+    finally:
+        keep_removed(host.run, held)
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -458,14 +483,16 @@ class Skip(Exception):
 
 
 def log(host, name):
-    """What VM processes named `name` on `host` wrote (incoming ones included)."""
+    """What VM processes named `name` on `host` wrote (incoming ones included), removed ones too."""
     try:
-        return open(os.path.join(host.run, "vms", f"{name}.log")).read()
+        cur = open(os.path.join(host.run, "vms", f"{name}.log")).read()
     except OSError:
-        return ""
+        cur = ""
+    return REMOVED_LOGS.get((host.run, name), "") + cur
 
 
 def clear_log(host, name):
+    REMOVED_LOGS.pop((host.run, name), None)
     with suppress(OSError):
         os.unlink(os.path.join(host.run, "vms", f"{name}.log"))
 

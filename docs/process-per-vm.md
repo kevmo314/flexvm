@@ -298,9 +298,10 @@ Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a 
 VM, suspended VM, `failed`, `lost`, `exited` or `moved` record go once unwritten for an hour,
 decided and removed holding `RUN/.locks/logs`, which a start holds (shared)
 while it opens and marks its log (whether a VM holds the name is read from its lock's record, never by probing the lock a start takes without waiting); `NAME.moved` goes after an hour.
-Explicit `rm`, including `rm -f` of a running VM, removes `NAME.log` and
+Explicit `rm`, including `rm -f` of a running VM (once its process has exited, so
+its last words are in the log removed), removes `NAME.log` and
 `NAME.log.1` while holding the name and `RUN/.locks/logs` shared, before
-another VM can take the name. Logs remain available for stopped and exited
+another VM can take the name; `kill` and a foreground `run -i`/`-t`'s end keep them. Logs remain available for stopped and exited
 VMs until removal; `start` keeps them. A detached `run` opens its log in the
 parent before the child takes the name, so removal clears the logs before
 that parent opens them. Released migration records are retired as below.

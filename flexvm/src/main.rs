@@ -1067,7 +1067,8 @@ fn run_attached(host: &Host, name: &str, keep: bool) -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     if !keep && !host.alive(name) && host.vms(name, "exited")?.exists() {
-        let _ = remove_stopped(host, name, true);
+        // Its log stays, as a foreground run's without a terminal (its diagnostics are there alone).
+        let _ = remove_stopped(host, name, true, false);
     }
     util::exit(code)
 }
@@ -1349,7 +1350,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     }
     let done = || output(format_args!("{name}\n"));
     if !running {
-        return remove_stopped(host, name, records()?).and_then(|()| done());
+        return remove_stopped(host, name, records()?, true).and_then(|()| done());
     }
     // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
     if host.entry(name).is_ok_and(|e| e.state == "source") {
@@ -1367,7 +1368,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     }
     // `rm -f` also removes logs and any exit or suspend record that won the race, under the name.
     if stopped {
-        return remove_stopped(host, name, killed.is_some() || records()?).and_then(|()| done());
+        return remove_stopped(host, name, killed.is_some() || records()?, true).and_then(|()| done());
     }
     // A suspend that finished first is undone: the kill wins.
     if killed.is_some() && !host.suspended(name)?.exists() {
@@ -1390,13 +1391,14 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
             format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()).into()
         );
     }
-    remove_stopped(host, name, false)
+    remove_stopped(host, name, false, true)
 }
 
 /// `rm` (after killing a running VM for -f): under the name, so a `start` meanwhile either
 /// wins first (and this is refused: the VM runs) or waits until it is gone; signals nothing.
-/// `had`: a stopped VM's records were there before, or -f just killed its process.
-fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
+/// `had`: a stopped VM's records were there before, or -f just killed its process. `logs`: its logs
+/// go too (`rm`, so a new VM of the name starts a fresh one).
+fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool) -> Result<()> {
     if !had {
         if host.alive(name) {
             bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
@@ -1415,7 +1417,9 @@ fn remove_stopped(host: &Host, name: &str, had: bool) -> Result<()> {
     if host.suspended(name)?.exists() {
         lifecycle::revoke(host, name)??;
     }
-    lock.remove_logs()?;
+    if logs {
+        lock.remove_logs()?;
+    }
     for ext in ["exited", "failed", "lost"] {
         let _ = std::fs::remove_file(host.vms(name, ext)?);
     }
@@ -2686,7 +2690,7 @@ mod exec_tests {
         for ext in ["log", "log.1"] {
             std::fs::write(host.vms("web", ext).unwrap(), "running vm").unwrap();
         }
-        let e = remove_stopped(&host, "web", true).unwrap_err().to_string();
+        let e = remove_stopped(&host, "web", true, true).unwrap_err().to_string();
         assert!(e.contains("is running") && e.contains("rm -f web"), "{e}");
         assert!(host.vms("web", "failed").unwrap().exists());
         for ext in ["log", "log.1"] {
