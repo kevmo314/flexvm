@@ -1100,10 +1100,15 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
 - Taps are created with each VM's Firecracker (ahead of time for standby VMs). The
   host route and a permanent neighbour entry are set with rtnetlink while the
   snapshot loads, so networking adds nothing to start time.
-- udev with `MACAddressPolicy=persistent` can replace a new tap's MAC after
-  flexvm set it to the gateway MAC, which leaves the guest's pinned
-  gateway entry pointing nowhere. The VM process puts the MAC back (one
-  `RTM_SETLINK`) whenever it hands a tap to a VM. To stop udev touching the
+- udev with `MACAddressPolicy=persistent` (systemd's default) can replace a new
+  tap's MAC after flexvm set it to the gateway MAC: it read the kernel's random
+  one first, and its write lands whenever its worker gets to it. The host then
+  drops everything the guest sends (to the gateway MAC), so connections to the VM
+  time out (#841). The VM process puts the MAC back (one `RTM_SETLINK`) whenever it
+  hands a tap to a VM. Also, when udevd runs and sees flexvm's network namespace,
+  `create_tap` subscribes to udev's monitor before it makes the tap and puts the
+  MAC back once udev broadcasts that it is done with the tap (checking it every
+  5 s until then, for as long as the tap is there). To stop udev touching the
   taps at all, match their state directory's prefix (`f` and five base-36
   digits, followed by the process and tap suffix) in a link file:
 
