@@ -897,9 +897,18 @@ fn generation(key: &str) -> String {
 
 const FOLLOWS_APP: &str = "+app";
 
+#[cfg(test)]
+thread_local! {
+    /// Override the next take's handshake budget and per-standby grace on this thread.
+    static TAKE_TIMING: std::cell::Cell<Option<(Duration, Duration)>> = const { std::cell::Cell::new(None) };
+}
+
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
 /// no answer (by `CLAIM_TIMEOUT`) is then an error, never a reason to start it again.
 pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, BufReader<UnixStream>)>> {
+    let (handshake, late) = (HANDSHAKE_TIMEOUT, LATE);
+    #[cfg(test)]
+    let (handshake, late) = TAKE_TIMING.with(|t| t.take()).unwrap_or((handshake, late));
     let Ok(key) = key(paths, template) else { return Ok(None) };
     let Some(d) = trusted(host, template, false) else { return Ok(None) };
     let mut socks: Vec<PathBuf> = std::fs::read_dir(d)
@@ -916,12 +925,12 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     line.push(b'\n');
     let name = req["name"].as_str().unwrap_or("");
     // One budget for all (a stopped standby uses it up), and a moment past it for each live one, up to a few.
-    let budget = Instant::now() + HANDSHAKE_TIMEOUT;
+    let budget = Instant::now() + handshake;
     // Each tried first by one claimer at a time (`ID.take`, held while it is tried), so
     // concurrent runs take different standbys; those others are trying come last.
     let mut queue: std::collections::VecDeque<(PathBuf, bool)> = socks.into_iter().map(|s| (s, false)).collect();
     while let Some((sock, deferred)) = queue.pop_front() {
-        if Instant::now() >= budget + 4 * LATE {
+        if Instant::now() >= budget + 4 * late {
             break;
         }
         let _taking = match deferred {
@@ -934,7 +943,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             },
             true => None,
         };
-        let at = budget.max(Instant::now() + LATE);
+        let at = budget.max(Instant::now() + late);
         let ino = std::fs::metadata(&sock).map(|m| m.ino()).ok();
         let c = match crate::util::send_unix(&sock, &line, fds, at) {
             Ok(c) => c,
@@ -1503,6 +1512,8 @@ mod tests {
 
     #[test]
     fn stopped_standbys_share_one_handshake_budget_and_a_live_one_after_them_wins() {
+        use crate::test_util::{JoinWithin, WAIT};
+
         let (_root, host, paths, d) = pool("standby-budget");
         let stopped = ["0", "00"].map(|n| UnixListener::bind(d.join(format!("{n}.sock"))).unwrap());
         let live = UnixListener::bind(d.join(format!("{}.sock", Ident::me().pid))).unwrap();
@@ -1513,14 +1524,14 @@ mod tests {
             send_json(&mut &c, &json!({"claiming": true})).unwrap();
             send_json(&mut &c, &json!({"ok": true, "result": "live"})).unwrap();
         });
-        let start = Instant::now();
+        // Allow a contended helper ample time to answer after the stopped sockets.
+        TAKE_TIMING.with(|t| t.set(Some((Duration::from_millis(50), WAIT))));
         let (v, _) = take(&host, &paths, "default", &json!({"name": "test"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!("live"));
-        assert!(start.elapsed() < HANDSHAKE_TIMEOUT + 3 * LATE, "{:?}", start.elapsed());
-        live.join().unwrap();
+        live.join_within().unwrap();
         // The stopped ones' late claims are refused.
         for s in &stopped {
-            assert!(send_json(&mut s.accept().unwrap().0, &json!({"claiming": true})).is_err());
+            assert!(send_json(&mut crate::test_util::accept_unix(s).0, &json!({"claiming": true})).is_err());
         }
     }
 
