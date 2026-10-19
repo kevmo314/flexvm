@@ -252,29 +252,47 @@ fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: i
     let stream = arg.trim().parse::<u64>().map_err(|_| io::Error::other(format!("bad stream {arg:?}")))?;
     // Claimed with no connection, which the app's end (`app_ended`) would shut down with no hello sent: the client
     // must always be told "ok" or "closed", or a fast `run -i` app's status is lost (#832).
-    let (stdin, me) = {
+    let closed = |app: &App| msg(out, format!("closed {}", u8::from(app.tty)));
+    let running = |app: &App| app.stdin.clone().filter(|_| matches!(app.state, State::Running(_)));
+    let stdin = {
+        let app = apps.lock().unwrap();
+        match running(&app) {
+            Some(stdin) => stdin,
+            None => return closed(&app),
+        }
+    };
+    // An evicted client (`input::FORGOTTEN`) is refused before it takes the slot from the one feeding. Not under
+    // APP's lock (see below); one evicted between this and its `taken` is refused there.
+    if let Err(e) = stdin.taken(stream) {
+        return fail(out, e);
+    }
+    let me = {
         let mut app = apps.lock().unwrap();
-        let Some(stdin) = app.stdin.clone().filter(|_| matches!(app.state, State::Running(_))) else {
-            let tty = app.tty;
-            drop(app);
-            return msg(out, format!("closed {}", u8::from(tty)));
-        };
+        if !running(&app).is_some_and(|s| Arc::ptr_eq(&s, &stdin)) {
+            return closed(&app);
+        }
         app.appins += 1;
         let me = app.appins;
         if let Some((_, Some(old))) = app.appin.replace((me, None)) {
             unsafe { libc::shutdown(old.as_raw_fd(), libc::SHUT_RDWR) };
         }
-        (stdin, me)
+        me
     };
     // Not under APP's lock: the feeder replaced may hold the stdin's while it asks `current` (APP's) once more.
     let taken = stdin.taken(stream);
     claimed();
     let text = {
-        let app = apps.lock().unwrap();
-        if matches!(app.state, State::Running(_)) {
-            format!("ok {taken} {}", u8::from(stdin.tty()))
-        } else {
-            format!("closed {}", u8::from(app.tty))
+        let mut app = apps.lock().unwrap();
+        match taken {
+            _ if !matches!(app.state, State::Running(_)) => format!("closed {}", u8::from(app.tty)),
+            Ok(taken) => format!("ok {taken} {}", u8::from(stdin.tty())),
+            Err(e) => {
+                if app.appin.as_ref().is_some_and(|(id, _)| *id == me) {
+                    app.appin = None;
+                }
+                drop(app);
+                return fail(out, e);
+            }
         }
     };
     // No connection is registered until the hello is sent: an exit or replacement cannot cut it off.
@@ -1106,6 +1124,23 @@ mod tests {
             assert_eq!(apps.lock().unwrap().appin.as_ref().map(|(id, c)| (*id, c.is_some())), newer.then_some((2, false)));
             drop(r);
         }
+    }
+
+    /// #868: an evicted client is refused (the host then ends it, never resending from 0), and the client
+    /// feeding keeps its slot.
+    #[test]
+    fn an_evicted_appin_is_refused_and_takes_no_slot() {
+        let stdin = Arc::new(Stdin::new(File::options().write(true).open("/dev/null").unwrap(), None).unwrap());
+        stdin.taken(7).unwrap();
+        for other in 100..120 {
+            stdin.taken(other).unwrap();
+        }
+        let apps = Mutex::new(App { state: State::Running(1), stdin: Some(stdin), appin: Some((5, None)), appins: 5, ..App::default() });
+        let (mut peer, ours) = std::io::pipe().unwrap();
+        let out = File::from(std::os::fd::OwnedFd::from(ours));
+        appin_on(&apps, "7", &out, &[], || panic!("claimed"), |_| panic!("said ok")).unwrap();
+        assert!(hello(&mut peer).starts_with("error: stdin stream 7 was forgotten"));
+        assert_eq!(apps.lock().unwrap().appin.as_ref().map(|(id, _)| *id), Some(5));
     }
 
     #[test]

@@ -1868,6 +1868,25 @@ def interactive():
     p = Pty(A, "attach", vm).wait_raw()
     try:
         typed(p, "echo again-$x", r"again-kept-9\r\n")
+        # A second attach -t (#868): idle, neither takes stdin from the other (each reconnect used to resize the
+        # pty, to its own size); a typed key takes it, without a resize; a SIGWINCH resizes.
+        since = len(p.out)
+        typed(p, "tty", r"/dev/pts/\d+\r\n")
+        pts = re.findall(rb"/dev/pts/\d+", p.out[since:])[-1].decode()
+        q = Pty(A, "attach", vm, rows=30, cols=100).wait_raw()
+        try:
+            time.sleep(1)
+            _, sizes, _ = A.exec(vm, f"for i in $(seq 40); do stty size < {pts}; sleep 0.05; done | sort -u")
+            check("two attaches: idle, the pty keeps the newest one's size", sizes == "30 100\n", sizes)
+            typed(p, "stty size", r"30 100\r\n")
+            check("two attaches: typing takes stdin, without a resize", True)
+            typed(q, "echo from-$((5 * 5))", r"from-25\r\n")
+            p.resize(40, 120)
+            time.sleep(0.5)
+            typed(p, "stty size", r"40 120\r\n")
+            check("two attaches: a SIGWINCH resizes", True)
+        finally:
+            q.close()
         A.migrate(vm, B)
         check("attach: a migration ends it, saying where", p.wait(60) != 0 and b"moved to" in p.out, p.out[-500:])
     finally:

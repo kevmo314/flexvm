@@ -94,6 +94,8 @@ pub struct Feed {
     st: Mutex<St>,
     cv: Condvar,
     tty: bool,
+    /// The terminal's size (`size`, but a test's).
+    size: fn() -> Option<(u16, u16)>,
 }
 
 #[derive(Default)]
@@ -105,6 +107,10 @@ struct St {
     detached: bool,
     /// Bumped by SIGWINCH.
     resizes: u64,
+    /// The `resizes` the writers last looked at, and the size last sent (on any connection): a reconnect sends the
+    /// size only if it changed meanwhile, as docker's resizes go only on attaching and on SIGWINCH (#868).
+    resizes_seen: Option<u64>,
+    size_sent: Option<(u16, u16)>,
     /// The connection being served; an older one's writer stops.
     conn: u64,
     /// SESSION_DONE goes out on this connection, then `done_sent`.
@@ -117,10 +123,14 @@ struct St {
 impl Feed {
     /// `src`: stdin (None: none, a pty's size only); `keys`: docker's detach keys detach, calling `on_detach`.
     pub fn start(src: Option<Box<dyn Read + Send>>, tty: bool, keys: bool, on_detach: fn()) -> Result<Arc<Feed>> {
+        Feed::start_sized(src, tty, keys, on_detach, size)
+    }
+
+    fn start_sized(src: Option<Box<dyn Read + Send>>, tty: bool, keys: bool, on_detach: fn(), size: fn() -> Option<(u16, u16)>) -> Result<Arc<Feed>> {
         // Blocked before its threads start, which inherit that: they go to the waiter its caller sets up
         // (`util::on_signal`), which puts the terminal back, never to a thread that would just end the process.
         util::block_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
-        let feed = Arc::new(Feed { st: Mutex::new(St::default()), cv: Condvar::new(), tty });
+        let feed = Arc::new(Feed { st: Mutex::new(St::default()), cv: Condvar::new(), tty, size });
         if let Some(src) = src {
             let f = feed.clone();
             std::thread::Builder::new().spawn(move || f.read(src, keys, on_detach))?;
@@ -214,42 +224,52 @@ impl Feed {
     }
 
     fn write(&self, gen: u64, mut conn: UnixStream) {
-        let (mut sent, mut eof_sent, mut detach_sent, mut resized) = (0, false, false, None);
+        let (mut sent, mut eof_sent, mut detach_sent) = (0, false, false);
         loop {
-            let (bytes, done) = {
+            let (bytes, done, resize) = {
                 let mut st = self.st.lock().unwrap();
                 loop {
                     if st.conn != gen {
                         return;
                     }
                     if st.done == Some(gen) {
-                        break (vec![SESSION_DONE], true);
+                        break (vec![SESSION_DONE], true, false);
                     }
                     sent = sent.max(st.acked);
                     let end = st.acked + st.buf.len() as u64;
-                    if self.tty && resized != Some(st.resizes) {
-                        resized = Some(st.resizes);
-                        if let Some((rows, cols)) = size() {
-                            break (frame(IN_RESIZE, &[&rows.to_le_bytes(), &cols.to_le_bytes()]), false);
+                    let resize = match self.tty && st.resizes_seen != Some(st.resizes) {
+                        true => {
+                            st.resizes_seen = Some(st.resizes);
+                            (self.size)().filter(|now| st.size_sent != Some(*now))
                         }
+                        false => None,
+                    };
+                    if let Some((rows, cols)) = resize {
+                        st.size_sent = resize;
+                        break (frame(IN_RESIZE, &[&rows.to_le_bytes(), &cols.to_le_bytes()]), false, true);
                     } else if sent < end {
                         let from = (sent - st.acked) as usize;
                         let chunk: Vec<u8> = st.buf.range(from..(from + MAX_INPUT).min(st.buf.len())).copied().collect();
                         let f = frame(IN_DATA, &[&sent.to_le_bytes(), &chunk]);
                         sent += chunk.len() as u64;
-                        break (f, false);
+                        break (f, false, false);
                     } else if st.eof && !eof_sent {
                         eof_sent = true;
-                        break (frame(IN_EOF, &[&end.to_le_bytes()]), false);
+                        break (frame(IN_EOF, &[&end.to_le_bytes()]), false, false);
                     } else if st.detached && !detach_sent {
                         detach_sent = true;
-                        break (frame(IN_DETACH, &[]), false);
+                        break (frame(IN_DETACH, &[]), false, false);
                     } else {
                         st = self.cv.wait(st).unwrap();
                     }
                 }
             };
             let wrote = conn.write_all(&bytes).is_ok();
+            if resize && !wrote {
+                // Sent again on the next connection.
+                let mut st = self.st.lock().unwrap();
+                (st.resizes_seen, st.size_sent) = (None, None);
+            }
             if done {
                 self.st.lock().unwrap().done_sent = true;
                 self.cv.notify_all();
@@ -265,6 +285,16 @@ impl Feed {
         self.st.lock().unwrap().done = Some(w.gen);
         self.cv.notify_all();
         drop(self.cv.wait_timeout_while(self.st.lock().unwrap(), Duration::from_secs(2), |s| !s.done_sent).unwrap());
+    }
+
+    /// Waits until there is something to send (input not yet taken, an EOF, a resize): a client whose connection
+    /// was taken over by another attach's, with nothing to send, takes it back only once it has (#868). Whether it waited.
+    pub fn wait_unsent(&self) -> bool {
+        let unsent = |s: &St| !s.buf.is_empty() || s.eof || s.detached || s.cancelled || (self.tty && s.resizes_seen != Some(s.resizes));
+        let st = self.st.lock().unwrap();
+        let waited = !unsent(&st);
+        drop(self.cv.wait_while(st, |s| !unsent(s)).unwrap());
+        waited
     }
 
     fn resized(&self) {
@@ -455,21 +485,51 @@ fn stdin_hello(mut open: impl FnMut() -> Result<BufReader<UnixStream>>, name: &s
     }
 }
 
-/// A resumed stream must still remember everything this client was told it took.
+/// The stdin request's reply: its stream's input taken so far, and whether the app has a pty.
+#[derive(Debug, PartialEq)]
+enum Hello {
+    Ok {
+        taken: u64,
+        tty: bool,
+    },
+    /// The app's stdin is closed (it ended, or ran without -i).
+    Closed {
+        tty: bool,
+    },
+}
+
+fn parse_hello(m: &[u8]) -> Result<Hello> {
+    let text = String::from_utf8_lossy(m);
+    match text.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["ok", taken, tty] => Ok(Hello::Ok { taken: taken.parse()?, tty: *tty == "1" }),
+        ["closed", tty] => Ok(Hello::Closed { tty: *tty == "1" }),
+        _ => bail!("{}", guest::refusal(m)),
+    }
+}
+
+/// A resumed stream must still remember everything this client was told it took (an evicted one is refused by a
+/// guest agent since #868; one before then says 0, which is caught here only once one of its acks came). What it
+/// says it took is taken: an ack lost with the last connection. False: the app's stdin is closed.
 fn stdin_resume(feed: &Feed, hello: &[u8]) -> Result<bool> {
-    let text = String::from_utf8_lossy(hello);
-    let words: Vec<_> = text.split_whitespace().collect();
-    match words.as_slice() {
-        ["ok", taken, _] => {
-            let taken: u64 = taken.parse()?;
+    match parse_hello(hello) {
+        Ok(Hello::Ok { taken, .. }) => {
             if taken < feed.st.lock().unwrap().acked {
                 bail!("stdin stream is gone from the guest; attach again to send more input");
             }
+            feed.ack(taken);
             Ok(true)
         }
-        ["closed", _] => Ok(false),
-        _ => bail!("{}", guest::refusal(hello)),
+        Ok(Hello::Closed { .. }) => Ok(false),
+        Err(e) => bail!("stdin stream refused by the guest ({e}); attach again to send more input"),
     }
+}
+
+/// The stdin stream is lost (the guest forgot it, or refused it): as docker's attach when its connection is lost,
+/// this client ends, the terminal put back, with why; the app runs on.
+fn stdin_lost(name: &str, e: &util::Error) -> ! {
+    restore_terminal();
+    let _ = std::io::stderr().write_all(format!("\r\nflexvm: {name}: {e}\n").as_bytes());
+    util::exit(1)
 }
 
 /// `attach NAME`, and a foreground `run -i`/`-t` (from 0): the app's output from `from` (None: from now on),
@@ -487,11 +547,9 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
         Err(_) if from == Some(0) && ended(&vm) => return gone(&vm),
         Err(e) => return Err(e),
     };
-    let words: Vec<&str> = hello.split_whitespace().collect();
-    let (open_stdin, tty) = match words.as_slice() {
-        ["ok", _, tty] => (true, *tty == "1"),
-        ["closed", tty] => (false, *tty == "1"),
-        _ => bail!("vm {name}: {}", guest::refusal(hello.as_bytes())),
+    let (open_stdin, tty) = match parse_hello(hello.as_bytes()).map_err(|e| format!("vm {name}: {e}"))? {
+        Hello::Ok { tty, .. } => (true, tty),
+        Hello::Closed { tty } => (false, tty),
     };
     if open_stdin && tty && !is_tty(0) {
         bail!("the input device is not a TTY");
@@ -528,7 +586,12 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
                     }
                     drop(writer);
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                // Taken over by another attach (or lost, a pause's) with nothing to send, it connects again only
+                // once it has something, then at once; with input not yet taken, every 200 ms. Two attaches then
+                // take stdin from each other only as each is typed into (#868).
+                if !feed.wait_unsent() {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
                 if !vm.alive() {
                     return;
                 }
@@ -538,13 +601,13 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
                     Ok(mut r) => match guest::read_frame(&mut r) {
                         Ok(Some((FRAME_MSG, m))) => match stdin_resume(&feed, &m) {
                             Ok(true) => Some(r),
-                            result => {
-                                if let Err(e) = result {
-                                    crate::log!("flexvm: {}: {e}", vm.name());
-                                }
+                            // The app ended: its status follows on the output.
+                            Ok(false) => {
                                 feed.cancel();
                                 return;
                             }
+                            // Neither typing nor the detach keys would go anywhere (#868).
+                            Err(e) => stdin_lost(&vm.name(), &e),
                         },
                         _ => None,
                     },
@@ -786,12 +849,70 @@ mod tests {
     #[test]
     fn a_forgotten_stdin_stream_is_not_retried() {
         let feed = Feed::start(None, false, false, || ()).unwrap();
-        feed.st.lock().unwrap().acked = 12;
+        {
+            let mut st = feed.st.lock().unwrap();
+            (st.acked, st.buf) = (12, b"abcdef".iter().copied().collect());
+        }
         assert!(stdin_resume(&feed, b"ok 12 0").unwrap());
         assert!(stdin_resume(&feed, b"ok 15 0").unwrap(), "an ack may have been lost");
+        let st = feed.st.lock().unwrap();
+        assert_eq!((st.acked, st.buf.iter().copied().collect::<Vec<_>>()), (15, b"def".to_vec()), "what it took is taken");
+        drop(st);
         assert!(stdin_resume(&feed, b"ok 0 0").unwrap_err().to_string().contains("stdin stream is gone"));
         assert!(!stdin_resume(&feed, b"closed 0").unwrap());
         assert!(stdin_resume(&feed, b"bad reply").is_err());
+        // #868: a guest agent that remembers its evictions refuses one (acknowledged or not).
+        let e = stdin_resume(&feed, b"error: stdin stream 7 was forgotten").unwrap_err().to_string();
+        assert!(e.contains("refused") && e.contains("forgotten") && e.contains("attach again"), "{e}");
+    }
+
+    #[test]
+    fn stdin_hellos_parse_once() {
+        assert_eq!(parse_hello(b"ok 12 1").unwrap(), Hello::Ok { taken: 12, tty: true });
+        assert_eq!(parse_hello(b"ok 0 0").unwrap(), Hello::Ok { taken: 0, tty: false });
+        assert_eq!(parse_hello(b"closed 1").unwrap(), Hello::Closed { tty: true });
+        for bad in [&b"ok x 1"[..], b"ok 1", b"closed", b"", b"unknown request APPIN"] {
+            assert!(parse_hello(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_hello(b"unknown request APPIN").unwrap_err().to_string().contains("rebuild the rootfs"));
+    }
+
+    static ROWS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(30);
+
+    /// #868: a reconnect resizes the pty only if the terminal's size changed (two attaches taking stdin from each
+    /// other would redraw a full-screen app on each), and a client with nothing to send waits to connect again.
+    #[test]
+    fn a_reconnect_resizes_only_on_a_change_and_an_idle_client_waits() {
+        let feed = Feed::start_sized(None, true, false, || (), || Some((ROWS.load(Ordering::SeqCst), 100))).unwrap();
+        let resize = |rows: u16| (IN_RESIZE, [rows.to_le_bytes(), 100u16.to_le_bytes()].concat());
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        let w = feed.serve(conn).unwrap();
+        assert_eq!(frames(&mut peer, 1), [resize(30)]);
+        drop(w);
+        // Nothing to send: it waits.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let feed = feed.clone();
+            move || tx.send(feed.wait_unsent()).unwrap()
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "an idle client connects again");
+        // A SIGWINCH is something to send; on the new connection only a size that changed goes.
+        feed.resized();
+        assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), "it waited");
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        let w = feed.serve(conn).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        assert!(guest::read_frame(&mut peer).is_err(), "resized to the same size");
+        ROWS.store(40, Ordering::SeqCst);
+        feed.resized();
+        assert_eq!(frames(&mut peer, 1), [resize(40)]);
+        drop(w);
+        // Input not yet taken: no wait.
+        feed.st.lock().unwrap().buf.push_back(b'x');
+        assert!(!feed.wait_unsent());
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        let _w = feed.serve(conn).unwrap();
+        assert_eq!(data(&frames(&mut peer, 1)[0]), (0, b"x".to_vec()), "and no resize first");
     }
 
     #[test]
