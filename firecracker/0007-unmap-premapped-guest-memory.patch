@@ -1,0 +1,128 @@
+diff --git a/src/vmm/src/persist.rs b/src/vmm/src/persist.rs
+index 9e3e81e..bb61612 100644
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -19,6 +19,7 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+ 
+ #[cfg(target_arch = "aarch64")]
+ use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
++use crate::arch::host_page_size;
+ use crate::builder::{self, BuildMicrovmFromSnapshotError};
+ use crate::cpu_config::templates::StaticCpuTemplate;
+ #[cfg(target_arch = "x86_64")]
+@@ -859,6 +860,48 @@ pub enum GuestMemoryFromUffdError {
+     Connect(#[from] std::io::Error),
+     /// Failed to sends file descriptor: {0}
+     Send(#[from] vmm_sys_util::errno::Error),
++    /// Failed to unmap guest memory mapped before its userfaultfd covered it: {0}
++    Premapped(std::io::Error),
++}
++
++/// flexvm: how many times `unmap_premapped` drops pages mapped behind the userfaultfd's back.
++const PREMAPPED_TRIES: usize = 16;
++
++/// flexvm: drops whatever of the registered `[addr, addr + len)` is mapped already. Another process that reads ours
++/// (`/proc/PID/mem`, `process_vm_readv`: a debugger, a memory scanner) between the mmap and the registration faults
++/// pages in the ordinary way, the zero page or, with THP, the huge zero page for 2 MiB. Registering leaves them mapped:
++/// the guest never faults on them, the handler never fills them, and the guest reads zeroes where the snapshot has
++/// data. They are dropped with the range unregistered, so that the handler gets no REMOVE event for them, and the
++/// range is checked again once it is registered again, until nothing of it is mapped.
++fn unmap_premapped(uffd: &Uffd, addr: *mut u8, len: usize) -> Result<(), GuestMemoryFromUffdError> {
++    let page = host_page_size();
++    let mut resident = vec![0u8; len.div_ceil(page)];
++    for _ in 0..PREMAPPED_TRIES {
++        // SAFETY: the range is one mapping of ours and `resident` has a byte for each of its pages.
++        if unsafe { libc::mincore(addr.cast(), len, resident.as_mut_ptr()) } != 0 {
++            return Err(GuestMemoryFromUffdError::Premapped(io::Error::last_os_error()));
++        }
++        let Some(first) = resident.iter().position(|&r| r & 1 != 0) else {
++            return Ok(());
++        };
++        let last = resident.iter().rposition(|&r| r & 1 != 0).unwrap();
++        warn!(
++            "guest memory at {:#x}..{:#x} was mapped before its userfaultfd covered it; dropping it",
++            addr as usize + first * page,
++            addr as usize + (last + 1) * page
++        );
++        uffd.unregister(addr.cast(), len)
++            .map_err(GuestMemoryFromUffdError::Register)?;
++        // SAFETY: nothing of the guest's is in this memory yet: it is only being set up.
++        if unsafe { libc::madvise(addr.cast(), len, libc::MADV_DONTNEED) } != 0 {
++            return Err(GuestMemoryFromUffdError::Premapped(io::Error::last_os_error()));
++        }
++        uffd.register(addr.cast(), len)
++            .map_err(GuestMemoryFromUffdError::Register)?;
++    }
++    Err(GuestMemoryFromUffdError::Premapped(io::Error::other(format!(
++        "still mapped after {PREMAPPED_TRIES} tries"
++    ))))
+ }
+ 
+ fn guest_memory_from_uffd(
+@@ -888,6 +931,8 @@ fn guest_memory_from_uffd(
+     for mem_region in guest_memory.iter() {
+         uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
+             .map_err(GuestMemoryFromUffdError::Register)?;
++        // flexvm: before the handler gets the userfaultfd, nothing of guest memory may be mapped.
++        unmap_premapped(&uffd, mem_region.as_ptr(), mem_region.size())?;
+     }
+ 
+     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+@@ -979,6 +1024,57 @@ mod tests {
+ 
+     use super::*;
+     use crate::Vmm;
++
++    // flexvm: pages another process faulted in before the registration are gone after it, and the range is
++    // registered still.
++    #[test]
++    fn test_unmap_premapped() {
++        use std::os::unix::fs::FileExt;
++
++        let page = host_page_size();
++        let len = 64 * page;
++        // SAFETY: a fresh anonymous mapping, unmapped at the end.
++        let addr = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                len,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
++                -1,
++                0,
++            )
++        }
++        .cast::<u8>();
++        assert_ne!(addr, libc::MAP_FAILED.cast());
++        let resident = || {
++            let mut v = vec![0u8; 64];
++            // SAFETY: `v` has a byte for each page of the mapping.
++            assert_eq!(unsafe { libc::mincore(addr.cast(), len, v.as_mut_ptr()) }, 0);
++            v.iter().filter(|&&r| r & 1 != 0).count()
++        };
++        // As a scanner reads it: through /proc/self/mem, which maps the zero page.
++        let mem = File::open("/proc/self/mem").unwrap();
++        let mut b = [0u8; 1];
++        for i in [0, 5, 63] {
++            mem.read_exact_at(&mut b, (addr as usize + i * page) as u64).unwrap();
++        }
++        assert_eq!(resident(), 3);
++        // Unprivileged processes may only handle faults from user space.
++        let uffd = UffdBuilder::new()
++            .close_on_exec(true)
++            .non_blocking(true)
++            .user_mode_only(true)
++            .create()
++            .unwrap();
++        uffd.register(addr.cast(), len).unwrap();
++        unmap_premapped(&uffd, addr, len).unwrap();
++        assert_eq!(resident(), 0);
++        // Registered: a read through /proc/self/mem now fails rather than mapping a page behind the handler.
++        assert!(mem.read_exact_at(&mut b, addr as u64).is_err());
++        assert_eq!(resident(), 0);
++        // SAFETY: mapped above.
++        unsafe { libc::munmap(addr.cast(), len) };
++    }
+     #[cfg(target_arch = "x86_64")]
+     use crate::builder::tests::insert_vmclock_device;
+     #[cfg(target_arch = "x86_64")]

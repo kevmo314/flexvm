@@ -1433,6 +1433,25 @@ as absent. Memory mapped from a file (a restore without UFFD), served by a
 userfaultfd handler, or a memfd can hold data where this process maps nothing,
 so those, and a Firecracker without `/proc`, still write every page.
 
+`firecracker/0007-unmap-premapped-guest-memory.patch`: Firecracker maps a
+restore's guest memory and only then registers it with the userfaultfd it
+hands the pager. A process that reads Firecracker's memory in between
+(`/proc/PID/mem`, `process_vm_readv`) faults pages in as for any anonymous
+memory: the zero page, or with THP the huge zero page for a whole 2 MiB.
+Registering leaves them mapped, so the guest never faults on them and the
+pager never installs them: the guest reads zeroes where the template has data.
+GitHub's runners have an agent that reads every new process this way (#949):
+the first 2 MiB went, and with it the DSDT, so the VMGenID notification never
+ran and no standby reseeded; Firecracker's vmclock write then copied the huge
+zero page into a zeroed huge page. After registering each region the patch
+checks it with `mincore(2)` (a zero page counts as resident) and, while
+anything of it is mapped, unregisters it, drops it with `MADV_DONTNEED` (no
+REMOVE event reaches the pager, the range being unregistered) and registers it
+again, up to 16 times (a unit test reads through `/proc/self/mem` before registering). The pager checks for the same thing after every load
+(`Pager::foreign_pages`: pages mapped while it has them BASE or REMOTE, and
+installs that hit EEXIST), so a Firecracker without the patch fails the load
+with a clear error instead of starting a guest with zeroed memory.
+
 ### Kernel patches (optional, host kernel)
 
 `kernel/` carries two patches against Linux v6.18 for the host kernel, applied
