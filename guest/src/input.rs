@@ -18,7 +18,8 @@ use crate::proto::{IN_DATA, IN_DETACH, IN_EOF, IN_RESIZE, MAX_INPUT, SESSION_DON
 /// Clients whose offsets are remembered, least recently used evicted first.
 const STREAMS: usize = 16;
 /// Evicted clients remembered as such (8 bytes each): one coming back is refused, never taken for a new client
-/// starting from 0 (its input would be written twice, as when no ack of its reached it before the eviction).
+/// starting from 0 (its input would be written twice, as when no ack of its reached it before the eviction). One
+/// away for more evictions than that is taken for new again: its host catches that only once an ack reached it.
 const FORGOTTEN: usize = 1024;
 
 pub(crate) struct Stdin {
@@ -28,6 +29,9 @@ pub(crate) struct Stdin {
     pty: Option<File>,
     /// What the last write left taken, of whichever stream (a session has only stream 0).
     last: AtomicU64,
+    /// Streams evicted from `State::streams`, the latest first. A lock of its own (taken after `state`'s, if both):
+    /// `forgot` never waits for a write that blocks while its app does not read.
+    forgotten: Mutex<VecDeque<u64>>,
 }
 
 struct State {
@@ -35,22 +39,21 @@ struct State {
     fd: Option<File>,
     /// Bytes taken, by client stream, most recently used first.
     streams: VecDeque<(u64, u64)>,
-    /// Streams evicted from `streams`, the latest first.
-    forgotten: VecDeque<u64>,
 }
 
 impl State {
     /// `stream` made the most recently used (a new one from 0): what it has taken. None: it was evicted.
-    fn touch(&mut self, stream: u64) -> Option<u64> {
+    fn touch(&mut self, forgotten: &Mutex<VecDeque<u64>>, stream: u64) -> Option<u64> {
         let taken = match self.streams.iter().position(|(s, _)| *s == stream) {
             Some(i) => self.streams.remove(i).map_or(0, |(_, t)| t),
-            None if self.forgotten.contains(&stream) => return None,
+            None if forgotten.lock().unwrap().contains(&stream) => return None,
             None => 0,
         };
         while self.streams.len() >= STREAMS {
             let (old, _) = self.streams.pop_back().unwrap();
-            self.forgotten.truncate(FORGOTTEN - 1);
-            self.forgotten.push_front(old);
+            let mut forgotten = forgotten.lock().unwrap();
+            forgotten.truncate(FORGOTTEN - 1);
+            forgotten.push_front(old);
         }
         self.streams.push_front((stream, taken));
         Some(taken)
@@ -75,7 +78,8 @@ impl Stdin {
     /// `fd`: the command's stdin (a pipe's end, or the pty's master, `pty`, again).
     pub(crate) fn new(fd: File, pty: Option<File>) -> io::Result<Stdin> {
         nonblocking(&fd)?;
-        Ok(Stdin { state: Mutex::new(State { fd: Some(fd), streams: VecDeque::new(), forgotten: VecDeque::new() }), pty, last: AtomicU64::new(0) })
+        let state = Mutex::new(State { fd: Some(fd), streams: VecDeque::new() });
+        Ok(Stdin { state, pty, last: AtomicU64::new(0), forgotten: Mutex::default() })
     }
 
     pub(crate) fn tty(&self) -> bool {
@@ -86,20 +90,28 @@ impl Stdin {
         self.last.load(Ordering::Acquire)
     }
 
-    /// What `stream` has taken, made the most recently used; an evicted one's an error.
+    /// What `stream` has taken, made the most recently used; an evicted one's an error. Waits for a write under way.
     pub(crate) fn taken(&self, stream: u64) -> io::Result<u64> {
-        self.state.lock().unwrap().touch(stream).ok_or_else(|| forgotten(stream))
+        self.state.lock().unwrap().touch(&self.forgotten, stream).ok_or_else(|| forgotten(stream))
+    }
+
+    /// Whether `stream` was evicted, without waiting for a write under way (`APPIN`'s, before it takes over).
+    pub(crate) fn forgot(&self, stream: u64) -> io::Result<()> {
+        match self.forgotten.lock().unwrap().contains(&stream) {
+            true => Err(forgotten(stream)),
+            false => Ok(()),
+        }
     }
 
     /// A use of `stream` (a resize's): it is evicted last.
     fn touch(&self, stream: u64) {
-        self.state.lock().unwrap().touch(stream);
+        self.state.lock().unwrap().touch(&self.forgotten, stream);
     }
 
     /// Writes what of `data` (at `offset`) was not taken yet, while `current()`; returns what is taken.
     fn write(&self, stream: u64, offset: u64, data: &[u8], current: &dyn Fn() -> bool) -> io::Result<u64> {
         let mut st = self.state.lock().unwrap();
-        let mut taken = st.touch(stream).ok_or_else(|| forgotten(stream))?;
+        let mut taken = st.touch(&self.forgotten, stream).ok_or_else(|| forgotten(stream))?;
         if offset > taken {
             return Err(io::Error::other(format!("stdin from byte {offset}, but only {taken} were taken")));
         }
@@ -131,7 +143,7 @@ impl Stdin {
     /// EOF at `offset`: once all before it is taken, a pipe is closed. A pty is not: it has no EOF of its own.
     fn eof(&self, stream: u64, offset: u64) {
         let mut st = self.state.lock().unwrap();
-        let taken = st.touch(stream);
+        let taken = st.touch(&self.forgotten, stream);
         if self.pty.is_none() && taken.is_some_and(|t| offset <= t) {
             st.fd = None;
         }
@@ -275,7 +287,7 @@ mod tests {
         assert!(st.streams.contains(&(1, 1)));
         assert!(st.streams.contains(&(2, 1)));
         assert!(!st.streams.iter().any(|(s, _)| *s == 3));
-        assert_eq!(st.forgotten, [3]);
+        assert_eq!(*stdin.forgotten.lock().unwrap(), [3]);
     }
 
     /// #868: an evicted client coming back is refused, its first ack lost or not, never fed again from 0.
@@ -297,7 +309,9 @@ mod tests {
         for other in 1000..1000 + (FORGOTTEN + STREAMS) as u64 {
             stdin.taken(other).unwrap();
         }
-        assert_eq!(stdin.state.lock().unwrap().forgotten.len(), FORGOTTEN);
+        assert_eq!(stdin.forgotten.lock().unwrap().len(), FORGOTTEN);
+        // Away for more evictions than are remembered, it is taken for a new client (documented at FORGOTTEN).
+        assert_eq!(stdin.taken(100).unwrap(), 0);
         drop(stdin);
         let mut got = String::new();
         r.read_to_string(&mut got).unwrap();

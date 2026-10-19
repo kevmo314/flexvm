@@ -111,6 +111,9 @@ struct St {
     /// size only if it changed meanwhile, as docker's resizes go only on attaching and on SIGWINCH (#868).
     resizes_seen: Option<u64>,
     size_sent: Option<(u16, u16)>,
+    /// The connection the size went on, and where its input was then: the guest has it once an ack past that
+    /// came on the same connection (it takes frames in order); until then, the next connection sends it again.
+    size_unconfirmed: Option<(u64, u64)>,
     /// The connection being served; an older one's writer stops.
     conn: u64,
     /// SESSION_DONE goes out on this connection, then `done_sent`.
@@ -195,6 +198,9 @@ impl Feed {
         let n = taken.saturating_sub(st.acked).min(st.buf.len() as u64);
         st.buf.drain(..n as usize);
         st.acked += n;
+        if st.size_unconfirmed.is_some_and(|(conn, at)| conn == st.conn && taken > at) {
+            st.size_unconfirmed = None;
+        }
         drop(st);
         self.cv.notify_all();
     }
@@ -215,6 +221,9 @@ impl Feed {
         let gen = {
             let mut st = self.st.lock().unwrap();
             st.conn += 1;
+            if st.size_unconfirmed.take().is_some() {
+                (st.resizes_seen, st.size_sent) = (None, None);
+            }
             st.conn
         };
         self.cv.notify_all();
@@ -226,14 +235,14 @@ impl Feed {
     fn write(&self, gen: u64, mut conn: UnixStream) {
         let (mut sent, mut eof_sent, mut detach_sent) = (0, false, false);
         loop {
-            let (bytes, done, resize) = {
+            let (bytes, done) = {
                 let mut st = self.st.lock().unwrap();
                 loop {
                     if st.conn != gen {
                         return;
                     }
                     if st.done == Some(gen) {
-                        break (vec![SESSION_DONE], true, false);
+                        break (vec![SESSION_DONE], true);
                     }
                     sent = sent.max(st.acked);
                     let end = st.acked + st.buf.len() as u64;
@@ -245,31 +254,26 @@ impl Feed {
                         false => None,
                     };
                     if let Some((rows, cols)) = resize {
-                        st.size_sent = resize;
-                        break (frame(IN_RESIZE, &[&rows.to_le_bytes(), &cols.to_le_bytes()]), false, true);
+                        (st.size_sent, st.size_unconfirmed) = (resize, Some((gen, sent)));
+                        break (frame(IN_RESIZE, &[&rows.to_le_bytes(), &cols.to_le_bytes()]), false);
                     } else if sent < end {
                         let from = (sent - st.acked) as usize;
                         let chunk: Vec<u8> = st.buf.range(from..(from + MAX_INPUT).min(st.buf.len())).copied().collect();
                         let f = frame(IN_DATA, &[&sent.to_le_bytes(), &chunk]);
                         sent += chunk.len() as u64;
-                        break (f, false, false);
+                        break (f, false);
                     } else if st.eof && !eof_sent {
                         eof_sent = true;
-                        break (frame(IN_EOF, &[&end.to_le_bytes()]), false, false);
+                        break (frame(IN_EOF, &[&end.to_le_bytes()]), false);
                     } else if st.detached && !detach_sent {
                         detach_sent = true;
-                        break (frame(IN_DETACH, &[]), false, false);
+                        break (frame(IN_DETACH, &[]), false);
                     } else {
                         st = self.cv.wait(st).unwrap();
                     }
                 }
             };
             let wrote = conn.write_all(&bytes).is_ok();
-            if resize && !wrote {
-                // Sent again on the next connection.
-                let mut st = self.st.lock().unwrap();
-                (st.resizes_seen, st.size_sent) = (None, None);
-            }
             if done {
                 self.st.lock().unwrap().done_sent = true;
                 self.cv.notify_all();
@@ -889,6 +893,16 @@ mod tests {
         let w = feed.serve(conn).unwrap();
         assert_eq!(frames(&mut peer, 1), [resize(30)]);
         drop(w);
+        // Not known to have reached the guest (no ack after it): sent again on the next connection.
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        let w = feed.serve(conn).unwrap();
+        assert_eq!(frames(&mut peer, 1), [resize(30)]);
+        // Input after it, acknowledged: the guest has both.
+        feed.st.lock().unwrap().buf.push_back(b'a');
+        feed.cv.notify_all();
+        assert_eq!(data(&frames(&mut peer, 1)[0]), (0, b"a".to_vec()));
+        feed.ack(1);
+        drop(w);
         // Nothing to send: it waits.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn({
@@ -912,7 +926,9 @@ mod tests {
         assert!(!feed.wait_unsent());
         let (conn, mut peer) = UnixStream::pair().unwrap();
         let _w = feed.serve(conn).unwrap();
-        assert_eq!(data(&frames(&mut peer, 1)[0]), (0, b"x".to_vec()), "and no resize first");
+        let got = frames(&mut peer, 2);
+        assert_eq!(got[0], resize(40), "the last resize, unconfirmed, again first");
+        assert_eq!(data(&got[1]), (1, b"x".to_vec()));
     }
 
     #[test]

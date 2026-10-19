@@ -261,9 +261,10 @@ fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: i
             None => return closed(&app),
         }
     };
-    // An evicted client (`input::FORGOTTEN`) is refused before it takes the slot from the one feeding. Not under
-    // APP's lock (see below); one evicted between this and its `taken` is refused there.
-    if let Err(e) = stdin.taken(stream) {
+    // An evicted client (`input::FORGOTTEN`) is refused before it takes the slot from the one feeding: never
+    // waiting for that one's write, which blocks while the app does not read (it stops once replaced, below).
+    // One evicted between this and its `taken` is refused there.
+    if let Err(e) = stdin.forgot(stream) {
         return fail(out, e);
     }
     let me = {
@@ -1141,6 +1142,48 @@ mod tests {
         appin_on(&apps, "7", &out, &[], || panic!("claimed"), |_| panic!("said ok")).unwrap();
         assert!(hello(&mut peer).starts_with("error: stdin stream 7 was forgotten"));
         assert_eq!(apps.lock().unwrap().appin.as_ref().map(|(id, _)| *id), Some(5));
+    }
+
+    /// #868 review: a feeder blocked writing (its app reads nothing) holds stdin's lock; a newer APPIN takes over
+    /// all the same, never waiting on that lock before it has made the old one stop.
+    #[test]
+    fn an_appin_takes_over_from_a_feeder_blocked_on_a_full_pipe() {
+        use std::os::unix::net::UnixStream;
+        let (_r, w) = std::io::pipe().unwrap();
+        let apps = Mutex::new(App {
+            state: State::Running(1),
+            stdin: Some(Arc::new(Stdin::new(File::from(std::os::fd::OwnedFd::from(w)), None).unwrap())),
+            ..App::default()
+        });
+        thread::scope(|s| {
+            let (ours, mut peer) = UnixStream::pair().unwrap();
+            let out = File::from(std::os::fd::OwnedFd::from(ours));
+            let apps = &apps;
+            let first = s.spawn(move || appin_on(apps, "1", &out, &[], || (), |text| msg(&out, text)));
+            peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            assert_eq!(hello(&mut peer), "ok 0 0");
+            // More than the pipe holds, never read.
+            let big = vec![b'x'; crate::proto::MAX_INPUT];
+            let flood = s.spawn(move || {
+                for i in 0..8u64 {
+                    let _ = peer.write_all(&crate::proto::frame(crate::proto::IN_DATA, &[&(i * big.len() as u64).to_le_bytes(), &big]));
+                }
+                peer
+            });
+            // Its write blocks, under stdin's lock.
+            thread::sleep(Duration::from_millis(300));
+            assert!(!first.is_finished(), "the first one blocks writing");
+            let (ours, mut peer) = UnixStream::pair().unwrap();
+            let out = File::from(std::os::fd::OwnedFd::from(ours));
+            let second = s.spawn(move || appin_on(apps, "2", &out, &[], || (), |text| msg(&out, text)));
+            peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            assert_eq!(hello(&mut peer), "ok 0 0", "the newer one took over");
+            drop(peer);
+            assert!(second.join().unwrap().is_ok());
+            // Ended (its ack to a connection shut down fails, as it may).
+            let _ = first.join().unwrap();
+            drop(flood.join().unwrap());
+        });
     }
 
     #[test]
