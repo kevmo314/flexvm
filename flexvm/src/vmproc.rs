@@ -939,7 +939,7 @@ impl Proc {
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let cmd = self.cmd.lock().unwrap().clone();
         let rec = crate::app::Exited::new(code, vm.template.name.clone(), cmd, vm.resources(), spec, at);
-        if let Err(e) = crate::host::store(&path, &rec, true) {
+        if let Err(e) = crate::host::store_private(&path, &rec, true) {
             crate::log!("vm {}: its exited record {}: {e}", vm.name, path.display());
         }
     }
