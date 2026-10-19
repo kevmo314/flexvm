@@ -87,7 +87,7 @@ impl Firecracker {
             dir: dir.into(),
             cgroup: None,
             tap: String::new(),
-            api: Api::default(),
+            api: Api { bin: bin.into(), ..Api::default() },
             joining: RefCell::new(None),
             capped: false,
             logging: RefCell::new(Some(logging)),
@@ -273,6 +273,7 @@ fn exited(child: &Child) -> std::io::Result<Option<ExitStatus>> {
 /// Calls on a VM hold its `fc` mutex; idle Firecrackers have one owner.
 #[derive(Default)]
 struct Api {
+    bin: PathBuf,
     connection: RefCell<Option<BufReader<crate::util::By<UnixStream>>>>,
 }
 
@@ -325,11 +326,23 @@ impl Api {
             }
             let text = String::from_utf8_lossy(&buf);
             if !(200..300).contains(&code) {
-                bail!("firecracker {method} {path}: {code} {text}");
+                return Err(api_error(method, path, code, &text, &self.bin));
             }
             return if text.trim().is_empty() { Ok(Value::Null) } else { Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned()))) };
         }
     }
+}
+
+fn api_error(method: &str, path: &str, code: u16, text: &str, bin: &Path) -> crate::util::Error {
+    if code == 400 && matches!(path, "/snapshot/load" | "/snapshot/prepare") && text.contains("unknown field `confined_pmem`") {
+        return format!(
+            "firecracker {method} {path}: this Firecracker predates flexvm's pmem confinement (artifacts-4); \
+             remove {} so the pinned one is downloaded, or build one with scripts/build-firecracker.sh, then pull its templates again",
+            bin.display()
+        )
+        .into();
+    }
+    format!("firecracker {method} {path}: {code} {text}").into()
 }
 
 const API_LINE: u64 = 8192;
@@ -754,6 +767,27 @@ mod tests {
     }
 
     const NO_CONTENT: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
+
+    #[test]
+    fn snapshot_unknown_confined_pmem_names_the_fix() {
+        let body = r#"{"fault_message":"unknown field `confined_pmem`, expected `snapshot_path` at line 1 column 16"}"#;
+        let bin = Path::new("/custom/state/artifacts/firecracker");
+        for path in ["/snapshot/load", "/snapshot/prepare"] {
+            let error = api_error("PUT", path, 400, body, bin).to_string();
+            assert_eq!(error, format!(
+                "firecracker PUT {path}: this Firecracker predates flexvm's pmem confinement (artifacts-4); \
+                 remove /custom/state/artifacts/firecracker so the pinned one is downloaded, or build one with scripts/build-firecracker.sh, then pull its templates again"
+            ));
+        }
+        for (path, code, body) in [
+            ("/snapshot/load", 500, body),
+            ("/vm", 400, body),
+            ("/snapshot/load", 400, "unknown field `other`, expected `confined_pmem`"),
+            ("/snapshot/prepare", 400, "cannot open confined_pmem"),
+        ] {
+            assert_eq!(api_error("PUT", path, code, body, bin).to_string(), format!("firecracker PUT {path}: {code} {body}"));
+        }
+    }
 
     /// How long a test side waits on the other: a bound for a hung test, never what one checks. A loaded host
     /// stalls a test process for seconds (#136), which a tighter call deadline took for a failed call.
