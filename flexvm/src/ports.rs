@@ -28,6 +28,15 @@ const TICK: libc::c_int = 1000;
 /// How long accepting rests once out of descriptors (or memory).
 const ACCEPT_REST: Duration = Duration::from_millis(100);
 
+/// Idle time alone can be pinned in a test worker; socket deadlines keep using real time.
+fn idle_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = tests::CLOCK.with(|c| c.borrow().as_ref().map(|(_, now)| *now)) {
+        return now;
+    }
+    Instant::now()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -350,12 +359,12 @@ const DOWN: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
 /// The connected forward idle longest, if for at least `idle`: the one to close for a new client at the cap.
 fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
     let (i, c) = connections.iter().enumerate().filter(|(_, c)| c.connected).min_by_key(|(_, c)| c.active)?;
-    (c.active.elapsed() >= idle).then_some(i)
+    (idle_now().duration_since(c.active) >= idle).then_some(i)
 }
 
 /// How many connected forwards have been idle for `idle`: each may make way for one more client.
 fn spare(connections: &[Connection], idle: Duration) -> usize {
-    connections.iter().filter(|c| c.connected && c.active.elapsed() >= idle).count()
+    connections.iter().filter(|c| c.connected && idle_now().duration_since(c.active) >= idle).count()
 }
 
 /// Keeps at most `cap` connected: each fresh one over it replaces the idlest, or else is closed itself.
@@ -394,6 +403,8 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
         if !wait(&mut fds, stop, resting) {
             return;
         }
+        #[cfg(test)]
+        tests::tick_clock();
         let (accepting, forwarding) = fds.split_at(listeners.len());
         let mut each = forwarding.chunks(2);
         connections.retain_mut(|c| {
@@ -410,7 +421,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                     return c.since.elapsed() <= CONNECT_WAIT;
                 }
                 // It moves nothing until it is admitted below.
-                (c.fresh, c.active) = (true, Instant::now());
+                (c.fresh, c.active) = (true, idle_now());
                 return true;
             } else if c.lingering.is_some_and(|t| t.elapsed() > LINGER) {
                 return false;
@@ -421,7 +432,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
             // Both directions: what one socket sent before failing still goes out the other way.
             let (out, incoming) = (c.out.pump(&c.client, &c.guest), c.incoming.pump(&c.guest, &c.client));
             if out || incoming {
-                c.active = Instant::now();
+                c.active = idle_now();
             }
             // A failed socket (an error polled, or found reading or writing it): nothing reaches it any
             // more. A failed client ends the forward once what it sent is with the guest; a failed
@@ -460,7 +471,7 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                             connected: false,
                             fresh: false,
                             since: Instant::now(),
-                            active: Instant::now(),
+                            active: idle_now(),
                             out: Direction::default(),
                             incoming: Direction::default(),
                             client_down: 0,
@@ -582,14 +593,18 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
         if !wait(&mut fds, stop, None) {
             return;
         }
+        #[cfg(test)]
+        tests::tick_clock();
         // Replies first: the sessions polled are those in `peers`, before any is added below.
         for (peer, fd) in peers.iter().zip(&fds[listeners.len()..]) {
             let Some((s, at, i)) = clients.get_mut(peer).filter(|_| fd.revents != 0) else { continue };
             for _ in 0..BURST {
                 match s.recv(&mut buf) {
                     Ok(n) => {
+                        #[cfg(test)]
+                        tests::tick_clock();
                         let _ = send_datagram(&listeners[*i], &buf[..n], peer.0, peer.1);
-                        *at = Instant::now();
+                        *at = idle_now();
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     // WouldBlock, or the guest refused one (ICMP): the session goes on.
@@ -607,28 +622,30 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
+                #[cfg(test)]
+                tests::tick_clock();
                 if !clients.contains_key(&peer) {
                     // Half the expiry protects recent traffic while letting new clients through.
                     // Admitted (in place of the victim, if any) only once its socket is ready.
-                    let admit = if clients.len() < cap { Some(None) } else { udp_idle(&clients, Instant::now(), idle / 2).map(Some) };
+                    let admit = if clients.len() < cap { Some(None) } else { udp_idle(&clients, idle_now(), idle / 2).map(Some) };
                     if let Some(victim) = admit {
                         if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
                             if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
                                 if let Some(v) = victim {
                                     clients.remove(&v);
                                 }
-                                clients.insert(peer, (s, Instant::now(), i));
+                                clients.insert(peer, (s, idle_now(), i));
                             }
                         }
                     }
                 }
                 if let Some((s, at, _)) = clients.get_mut(&peer) {
                     let _ = s.send(&buf[..n]);
-                    *at = Instant::now();
+                    *at = idle_now();
                 }
             }
         }
-        clients.retain(|_, (_, at, _)| at.elapsed() < idle);
+        clients.retain(|_, (_, at, _)| idle_now().duration_since(*at) < idle);
     }
 }
 
@@ -636,6 +653,25 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    // Snapshot per TCP pass or UDP datagram: advancing time cannot age a timestamp between
+    // relaying bytes and recording their activity. Other workers and tests keep real clocks.
+    thread_local! {
+        pub(super) static CLOCK: std::cell::RefCell<Option<(Arc<std::sync::Mutex<Instant>>, Instant)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn tick_clock() {
+        CLOCK.with(|c| {
+            if let Some((clock, now)) = c.borrow_mut().as_mut() {
+                *now = *clock.lock().unwrap();
+            }
+        });
+    }
+
+    fn pin_clock(clock: Arc<std::sync::Mutex<Instant>>) {
+        let now = *clock.lock().unwrap();
+        CLOCK.with(|c| *c.borrow_mut() = Some((clock, now)));
+    }
 
     fn transient(e: &io::Error) -> bool {
         matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
@@ -673,45 +709,51 @@ mod tests {
 
     #[test]
     fn at_the_udp_cap_a_new_client_replaces_only_the_session_quiet_longest() {
-        const IDLE: Duration = Duration::from_secs(4);
         let ip = Ipv4Addr::new(127, 0, 0, 2);
         let guest = UdpSocket::bind((ip, 0)).unwrap();
         let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (addr, target) = (listener.local_addr().unwrap(), SocketAddrV4::new(ip, guest.local_addr().unwrap().port()));
         let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
         let worker = {
             let stop = stop.clone();
-            thread::spawn(move || udp(vec![listener], target, stop.as_fd(), 2, IDLE))
+            let clock = clock.clone();
+            thread::spawn(move || {
+                pin_clock(clock);
+                udp(vec![listener], target, stop.as_fd(), 2, IDLE);
+            })
         };
         let client = || UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let (a, b, c) = (client(), client(), client());
-        // What the guest gets next, and from which session, if anything within `within`.
-        let got = |within: Duration| {
-            guest.set_read_timeout(Some(within)).unwrap();
+        // What the guest gets next, and from which session.
+        let got = || {
+            guest.set_read_timeout(Some(WAIT)).unwrap();
             let mut buf = [0; 16];
-            guest.recv_from(&mut buf).ok().map(|(n, from)| (String::from_utf8_lossy(&buf[..n]).into_owned(), from))
+            let (n, from) = guest.recv_from(&mut buf).unwrap();
+            (String::from_utf8_lossy(&buf[..n]).into_owned(), from)
         };
-        let start = Instant::now();
         a.send_to(b"a", addr).unwrap();
-        let (_, from_a) = got(WAIT).unwrap();
+        let (_, from_a) = got();
         b.send_to(b"b", addr).unwrap();
-        let (_, from_b) = got(WAIT).unwrap();
+        let (_, from_b) = got();
         c.send_to(b"c", addr).unwrap();
-        assert_eq!(got(Duration::from_millis(300)), None, "admitted over the cap with both sessions recent");
-        thread::sleep((start + IDLE * 3 / 8).saturating_duration_since(Instant::now()));
+        // Same listener, in order: b's arrival proves c was processed and refused.
         b.send_to(b"b", addr).unwrap();
-        assert_eq!(got(WAIT).unwrap(), ("b".into(), from_b));
+        assert_eq!(got(), ("b".into(), from_b), "admitted over the cap with both sessions recent");
+        *clock.lock().unwrap() = start + IDLE * 3 / 8;
+        b.send_to(b"b", addr).unwrap();
+        assert_eq!(got(), ("b".into(), from_b));
         // a quiet for half the expiry, b not: a goes for c.
-        thread::sleep((start + IDLE * 5 / 8).saturating_duration_since(Instant::now()));
+        *clock.lock().unwrap() = start + IDLE * 5 / 8;
         c.send_to(b"c", addr).unwrap();
-        let (data, from_c) = got(WAIT).unwrap();
+        let (data, from_c) = got();
         assert!(data == "c" && from_c != from_a && from_c != from_b);
-        assert!(start.elapsed() < IDLE, "too slow to tell eviction from expiry");
+        assert!(clock.lock().unwrap().duration_since(start) < IDLE, "replacement must precede expiry");
         a.send_to(b"a", addr).unwrap();
-        assert_eq!(got(Duration::from_millis(300)), None, "a's session was not the one replaced");
         b.send_to(b"b", addr).unwrap();
-        assert_eq!(got(WAIT).unwrap(), ("b".into(), from_b), "b's busy session was replaced");
+        assert_eq!(got(), ("b".into(), from_b), "a was not replaced or b's busy session was replaced");
         unsafe { libc::write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
         worker.join_within().unwrap();
     }
@@ -824,6 +866,10 @@ mod tests {
 
     /// A TCP worker of `cap` connections to a new guest listener: its address, the guest, and its stop.
     fn worker(cap: usize, idle: Duration) -> (SocketAddr, TcpListener, Arc<OwnedFd>, JoinHandle<()>) {
+        worker_with_clock(cap, idle, None)
+    }
+
+    fn worker_with_clock(cap: usize, idle: Duration, clock: Option<Arc<std::sync::Mutex<Instant>>>) -> (SocketAddr, TcpListener, Arc<OwnedFd>, JoinHandle<()>) {
         // Unrelated localhost RPC retries must not enter the guest's accept queue.
         let ip = Ipv4Addr::new(127, 0, 0, 2);
         let guest = TcpListener::bind((ip, 0)).unwrap();
@@ -833,7 +879,12 @@ mod tests {
         let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
         let worker = {
             let stop = stop.clone();
-            thread::spawn(move || tcp(vec![listener], target, stop.as_fd(), cap, idle))
+            thread::spawn(move || {
+                if let Some(clock) = clock {
+                    pin_clock(clock);
+                }
+                tcp(vec![listener], target, stop.as_fd(), cap, idle)
+            })
         };
         (addr, guest, stop, worker)
     }
@@ -860,14 +911,15 @@ mod tests {
 
     #[test]
     fn a_replacement_that_finds_none_idle_once_connected_is_closed() {
-        const IDLE: Duration = Duration::from_secs(1);
-        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        let (addr, guest, stop, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
         echo(&mut client, &mut server);
         let _filler = fill(&guest);
-        thread::sleep(IDLE + Duration::from_millis(200));
+        *clock.lock().unwrap() = start + IDLE;
         // Admitted while the forward is idle, it is still connecting when the forward is busy again.
         let replacement = TcpStream::connect(addr).unwrap();
         thread::sleep(Duration::from_millis(TICK as u64) * 2);
