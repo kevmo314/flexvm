@@ -441,12 +441,21 @@ impl Peers {
         let mut out = vec![from];
         for n in &cfg.peers {
             let addrs = n.parse::<SocketAddr>().map_or_else(|_| r.get(n).cloned().unwrap_or_default(), |a| vec![a.ip()]);
-            if is_peer(&addrs, from) {
+            if is_peer(&addrs, from) || cfg.underlays_of(n).iter().any(|&u| IpAddr::V4(u) == from.to_canonical()) {
                 out.extend(addrs);
                 out.extend(cfg.underlays_of(n).iter().map(|&u| IpAddr::V4(u)));
             }
         }
         out
+    }
+
+    fn borrower(&self, cfg: &crate::host::Config, from: IpAddr) -> String {
+        let sender = self.sender(cfg, from);
+        cfg.peers
+            .iter()
+            .find(|n| self.addrs(std::slice::from_ref(n)).iter().any(|&a| is_peer(&sender, a)))
+            .cloned()
+            .unwrap_or_else(|| from.to_canonical().to_string())
     }
 
     /// The addresses of `names`; a name not resolved yet is looked up.
@@ -639,7 +648,19 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
         "pages" => return pages(host, &req, conn),
         "template" => return push(host, &req, conn),
         _ if matches!(locking, Some(None)) => Err(BUSY.into()),
-        "migration" => migration(host, &req),
+        "migration" => (|| {
+            if req["done"] != true {
+                return migration(host, &req, |_, _| false);
+            }
+            let cfg = host.config_now();
+            let from = conn.peer_addr()?.ip();
+            peers.all_addrs(&cfg.peers, Instant::now() + ADMIT_WAIT)?;
+            let sender = peers.sender(&cfg, from);
+            let borrower = peers.borrower(&cfg, from);
+            migration(host, &req, |source, peer| {
+                peer.map_or_else(|| source == borrower || source.parse::<SocketAddr>().is_ok_and(|a| is_peer(&sender, a.ip())), |p| is_peer(&sender, p))
+            })
+        })(),
         // Its peers by address, those configured by name too, and the one asking.
         // And their configured underlays; a withdrawal goes by the asking peer's own (`Peers::sender`).
         "route" => {
@@ -650,9 +671,13 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
                 route(host, &req, &all, &from.map(|f| peers.sender(&cfg, f)).unwrap_or_default())
             })
         }
-        "lend" => peers
-            .all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT)
-            .and_then(|p| lend(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat())),
+        "lend" => (|| {
+            let cfg = host.config_now();
+            let from = conn.peer_addr()?.ip();
+            let mut all = peers.all_addrs(&cfg.peers, Instant::now() + ADMIT_WAIT)?;
+            all.push(from);
+            lend(host, &req, &all, &peers.borrower(&cfg, from))
+        })(),
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
             .map_err(|e| format!("bad ident: {e}").into())
@@ -929,7 +954,7 @@ fn host_lock(host: &Host) -> Result<crate::host::Locked> {
     })
 }
 
-fn migration(host: &Host, req: &Value) -> Result<Value> {
+fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> bool) -> Result<Value> {
     if fault("status") {
         bail!("injected fault: migration status unavailable");
     }
@@ -937,7 +962,7 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
     // Held through `mig_done` or `mig_status`, which take it again (reentrant) without waiting.
     let _l = host_lock(host)?;
     if req["done"] == json!(true) {
-        if host.mig_done(mig)? {
+        if host.mig_done_from(mig, source)? {
             crate::info!("migration {mig}: its source says done; forgetting it");
         }
         return Ok(json!({"done": true}));
@@ -947,11 +972,17 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
     Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay_known().map(|u| u.to_string())}))
 }
 
-fn lend(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
+fn lend(host: &Host, req: &Value, peers: &[IpAddr], borrower: &str) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
     routable(ip, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
-    let gen = host.lend_new(&host_lock(host)?, ip)?;
-    Ok(json!({"ip": ip.to_string(), "gen": gen}))
+    let l = host_lock(host)?;
+    if req["start"] == true {
+        let gen = req["gen"].as_u64().ok_or("missing gen")?;
+        host.start_loan(&l, ip, gen, borrower)?;
+        return Ok(json!({"ip": ip.to_string(), "gen": gen}));
+    }
+    let gen = host.lend_new(&l, ip, borrower, req["lease"] == true)?;
+    Ok(json!({"ip": ip.to_string(), "gen": gen, "lease": req["lease"] == true}))
 }
 
 /// Stale generations and revisions (see `host::Addr`) are ignored; an
@@ -1286,11 +1317,31 @@ mod tests {
     }
 
     #[test]
+    fn migration_done_belongs_to_the_source_peer_across_ports_and_underlays() {
+        let (_root, mut host) = crate::host::tests::host("done-peer");
+        host.cfg.peers = vec!["192.0.2.1:7070".into(), "192.0.2.2:7070".into()];
+        host.cfg.peer_underlays.insert("192.0.2.1:7070".into(), vec!["198.51.100.1".parse().unwrap()]);
+        let peers = Peers::default();
+        for (id, from) in [(1, "192.0.2.1:49152"), (2, "198.51.100.1:50001"), (3, "[::ffff:192.0.2.1]:50002")] {
+            let mut r = host.mig_begin(id, "192.0.2.1:7070", None, None).unwrap().with_peer("192.0.2.1".parse().unwrap());
+            r.commit(&host.lock().unwrap()).unwrap();
+            r.release(None, None).unwrap();
+            let req = json!({"mig": id, "done": true});
+            let other = peers.sender(&host.cfg, "192.0.2.2".parse().unwrap());
+            assert!(migration(&host, &req, |_, p| p.is_some_and(|p| is_peer(&other, p))).is_err());
+            let sender = peers.sender(&host.cfg, from.parse::<SocketAddr>().unwrap().ip());
+            assert!(migration(&host, &req, |_, p| p.is_some_and(|p| is_peer(&sender, p))).is_ok());
+            assert_eq!(host.mig_status(id).unwrap(), "released");
+            assert_eq!(peers.borrower(&host.cfg, from.parse::<SocketAddr>().unwrap().ip()), "192.0.2.1:7070");
+        }
+    }
+
+    #[test]
     fn lend_refuses_peer_addresses_without_creating_a_record() {
         let root = crate::test_util::TempDir::new("lend-peer");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let ip = "10.9.0.1";
-        let e = lend(&host, &json!({"ip": ip}), &[ip.parse().unwrap()]).unwrap_err();
+        let e = lend(&host, &json!({"ip": ip}), &[ip.parse().unwrap()], "borrower").unwrap_err();
         assert!(e.to_string().contains("not a vm's address"));
         assert!(!host.state.join("addrs").join(ip).exists());
     }

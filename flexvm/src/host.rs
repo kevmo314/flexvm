@@ -20,6 +20,10 @@ use crate::bail;
 use crate::net::IpRange;
 use crate::util::{Error, Result};
 
+const MAX_UNSTARTED_LOANS: usize = 16;
+const LOAN_WAIT_MS: u64 = 5 * 60 * 1000;
+const MIG_DONE_MS: u64 = 24 * 60 * 60 * 1000;
+
 /// A held grant (`Host::grant_start`): counted while this lives, and not a
 /// moment after its process does (the kernel drops the flock). Dropping it
 /// removes the file; if that fails, the free lock tells admission it is gone.
@@ -1129,7 +1133,12 @@ impl Host {
         self.state.join("addrs").join(ALLOC_HINT)
     }
 
-    pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr) -> Result<u64> {
+    pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr, borrower: &str, lease: bool) -> Result<u64> {
+        self.expire_loans(l, wall_ms())?;
+        let count = self.loan_addrs(l)?.iter().filter(|(_, a)| a.lent.is_some() && a.loan.as_ref().is_some_and(|b| b.peer == borrower && !b.started)).count();
+        if count >= MAX_UNSTARTED_LOANS {
+            bail!("too many unstarted loans for {borrower} (at most {MAX_UNSTARTED_LOANS})");
+        }
         // A fresh loan: only an address this host would hand out itself, by its range now.
         let cfg = self.config_now();
         if !cfg.range()?.allocatable(ip) {
@@ -1143,8 +1152,60 @@ impl Host {
             bail!("{ip} is in use");
         }
         let gen = self.next_gen(a.seen)?;
-        self.put_addr(ip, &Addr { seen: gen, lent: Some(gen), ..Addr::default() }, true)?;
+        self.put_addr(
+            ip,
+            &Addr {
+                seen: gen,
+                lent: Some(gen),
+                loan: Some(Loan { peer: borrower.into(), started: false, expires_ms: lease.then(|| wall_ms() + LOAN_WAIT_MS) }),
+                ..Addr::default()
+            },
+            true,
+        )?;
         Ok(gen)
+    }
+
+    fn loan_addrs(&self, l: &Locked) -> Result<Vec<(Ipv4Addr, Addr)>> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(self.state.join("addrs"))? {
+            let Some(ip) = e?.file_name().to_str().and_then(|n| n.parse().ok()) else { continue };
+            let a = self.addr(l, ip)?;
+            if a.loan.is_some() {
+                out.push((ip, a));
+            }
+        }
+        Ok(out)
+    }
+
+    /// A restore has claimed the loan: it must no longer expire, even before its route arrives.
+    pub fn start_loan(&self, l: &Locked, ip: Ipv4Addr, gen: u64, borrower: &str) -> Result<()> {
+        self.expire_loans(l, wall_ms())?;
+        let a = self.addr(l, ip)?;
+        if a.lent != Some(gen) || !a.current(gen) {
+            bail!("{ip} generation {gen} is no longer lent");
+        }
+        if a.loan.as_ref().is_some_and(|b| b.peer != borrower) {
+            bail!("{ip} is lent to another peer");
+        }
+        self.update(l, ip, true, |a| {
+            if let Some(b) = &mut a.loan {
+                b.started = true;
+                b.expires_ms = None;
+            }
+        })
+    }
+
+    fn expire_loans(&self, l: &Locked, now: u64) -> Result<()> {
+        for (ip, a) in self.loan_addrs(l)? {
+            if a.loan.as_ref().and_then(|b| b.expires_ms).is_some_and(|until| now >= until) {
+                // Withdrawal fences a late claim or announcement of this generation.
+                if let Some(gen) = a.lent {
+                    self.observe_and(l, ip, gen, 0, None, |_| ())?;
+                }
+                self.update(l, ip, true, |a| a.loan = None)?;
+            }
+        }
+        Ok(())
     }
 
     fn gens_path(&self) -> PathBuf {
@@ -1352,6 +1413,12 @@ impl Host {
             (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
             if via.is_none() && a.lent.is_some_and(|lent| lent <= gen) {
                 a.lent = None;
+            }
+            if via.is_none() {
+                a.loan = None;
+            } else if let Some(b) = &mut a.loan {
+                b.started = true;
+                b.expires_ms = None;
             }
             also(a);
             true
@@ -1880,7 +1947,7 @@ impl Host {
             bail!("migration {id} was already seen here");
         }
         store(&self.mig_path(id), &Mig::Pending { owner: Ident::me(), ip }, true)?;
-        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), by, ip })
+        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), peer: None, by, ip })
     }
 
     /// A record whose process died becomes aborted once its Firecrackers are
@@ -1890,7 +1957,7 @@ impl Host {
         let path = self.mig_path(id);
         let (owner, ip) = match load(&path)? {
             None => return Ok("aborted"),
-            Some(Mig::Released { .. }) => return Ok("released"),
+            Some(Mig::Released { .. } | Mig::Done { .. }) => return Ok("released"),
             Some(Mig::Pending { owner, .. }) if owner.alive() => return Ok("pending"),
             Some(Mig::Committed { owner }) if owner.alive() => return Ok("committed"),
             Some(Mig::Pending { owner, ip }) => (owner, ip),
@@ -1919,21 +1986,32 @@ impl Host {
         Ok("aborted")
     }
 
-    /// A released record goes, its address's arrival settled first: it is the
-    /// evidence `withdraw_dead` reads should the release have been cut short.
-    /// Whether it went (there was one).
+    /// Settles the arrival before replacing its released record with a one-day
+    /// tombstone: a source querying again must still find the terminal outcome.
+    /// Whether it was replaced (there was a released record).
     pub fn mig_done(&self, id: u64) -> Result<bool> {
         let l = self.lock()?;
         match load(&self.mig_path(id))? {
-            Some(Mig::Released { ip, .. }) => {
+            Some(Mig::Released { ip, source, peer, .. }) => {
                 if let Some(ip) = ip {
                     self.settle_arrived(&l, ip, id)?;
                 }
-                crate::util::unlink_durably(&self.mig_path(id))?;
+                store(&self.mig_path(id), &Mig::Done { source, peer, until_ms: wall_ms() + MIG_DONE_MS }, true)?;
                 Ok(true)
             }
             _ => Ok(false),
         }
+    }
+
+    pub fn mig_done_from(&self, id: u64, allowed: impl Fn(&str, Option<IpAddr>) -> bool) -> Result<bool> {
+        let _l = self.lock()?;
+        match load(&self.mig_path(id))? {
+            Some(Mig::Released { source, peer, .. } | Mig::Done { source, peer, .. }) if !allowed(&source, peer) => {
+                bail!("migration {id}: done is only accepted from its source");
+            }
+            _ => (),
+        }
+        self.mig_done(id)
     }
 
     // Outcomes owed: `STATE/owed/ID`, a migration away whose source process
@@ -2172,6 +2250,14 @@ impl Host {
         ids.truncate(budget);
         let mut unavailable = HashSet::new();
         for &id in &ids {
+            let Ok(_l) = self.lock() else { continue };
+            if let Ok(Some(Mig::Done { until_ms, .. })) = load(&self.mig_path(id)) {
+                if wall_ms() >= until_ms {
+                    let _ = crate::util::unlink_durably(&self.mig_path(id));
+                }
+                continue;
+            }
+            drop(_l);
             let Ok(Some(Mig::Released { source, by, .. })) = load(&self.mig_path(id)) else {
                 let _ = self.mig_status(id);
                 continue;
@@ -2322,6 +2408,8 @@ pub struct Addr {
     pub withdrawn: bool,
     /// Gone with a VM of this generation: not handed out until withdrawn or back.
     pub lent: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) loan: Option<Loan>,
     pub holder: Option<String>,
     /// The instance (process) of `holder` that claimed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2342,6 +2430,14 @@ pub struct Addr {
     /// compatibility is kept with them.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leaving: Option<Leaving>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Loan {
+    peer: String,
+    started: bool,
+    // Older borrowers cannot acknowledge a claim before running: their loans stay until a route arrives.
+    expires_ms: Option<u64>,
 }
 
 /// Lets go of `holder`'s claim in `a`; with `id`, only that instance's. The instance let go, if any.
@@ -2418,6 +2514,12 @@ impl Drop for AddrClaim {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum Mig {
+    Done {
+        source: String,
+        #[serde(default)]
+        peer: Option<IpAddr>,
+        until_ms: u64,
+    },
     Pending {
         owner: Ident,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2429,6 +2531,8 @@ pub enum Mig {
     Released {
         #[serde(default)]
         source: String,
+        #[serde(default)]
+        peer: Option<IpAddr>,
         /// The source's VM process.
         #[serde(default)]
         by: Option<Ident>,
@@ -2463,12 +2567,18 @@ pub struct MigRecord {
     pub id: u64,
     committed: bool,
     source: String,
+    peer: Option<IpAddr>,
     by: Option<Ident>,
     /// The VM's address: once released, its claim here is no longer `arriving`.
     ip: Option<Ipv4Addr>,
 }
 
 impl MigRecord {
+    pub fn with_peer(mut self, peer: IpAddr) -> Self {
+        self.peer = Some(peer.to_canonical());
+        self
+    }
+
     /// From here this host owns the VM. Refused if a source query fenced it off.
     pub fn commit(&mut self, _: &Locked) -> Result<()> {
         let path = self.host.mig_path(self.id);
@@ -2500,7 +2610,7 @@ impl MigRecord {
         let (mut delay, start) = (Duration::from_millis(100), std::time::Instant::now());
         loop {
             let done = self.host.lock_by(within.map(|w| start + w)).and_then(|l| {
-                store(&self.host.mig_path(self.id), &Mig::Released { source: self.source.clone(), by: self.by.clone(), ip: self.ip }, true)?;
+                store(&self.host.mig_path(self.id), &Mig::Released { source: self.source.clone(), peer: self.peer, by: self.by.clone(), ip: self.ip }, true)?;
                 // Released first, with the address: what a crash leaves undone, the record finishes.
                 if let Some(ip) = self.ip {
                     self.host.settle_arrived(&l, ip, self.id)?;
@@ -3119,6 +3229,7 @@ impl Host {
     }
 
     fn collect_garbage_with(&self, lost: bool) -> Result<Vec<Withdrawn>> {
+        let expired = self.lock().and_then(|l| self.expire_loans(&l, wall_ms()));
         collect_dead_taps(&self.run, None);
         collect_owned(&self.run);
         // What a write killed midway left of the records.
@@ -3128,10 +3239,15 @@ impl Host {
         remove_write_debris(&self.run, |n| n.starts_with("..gens.next.") || n.starts_with("..boot"));
         let withdrawn = self.withdraw_dead(lost);
         // After the sweep of dead holders, whose claims took their published revisions with them.
-        match (withdrawn, self.sweep_live()) {
+        let collected = match (withdrawn, self.sweep_live()) {
             (Ok(withdrawn), Ok(())) => Ok(withdrawn),
             (Err(e), Ok(())) | (Ok(_), Err(e)) => Err(e),
             (Err(withdraw), Err(live)) => Err(format!("{withdraw}; sweeping live revisions: {live}").into()),
+        };
+        match (expired, collected) {
+            (Ok(()), collected) => collected,
+            (Err(e), Ok(_)) => Err(e),
+            (Err(expired), Err(collected)) => Err(format!("expiring loans: {expired}; {collected}").into()),
         }
     }
 
@@ -3164,7 +3280,7 @@ impl Host {
             .iter()
             .filter_map(|(_, m)| match m {
                 Mig::Pending { owner, .. } | Mig::Committed { owner } => Some(owner.clone()),
-                Mig::Released { .. } => None,
+                Mig::Released { .. } | Mig::Done { .. } => None,
             })
             .collect();
         let released: HashSet<(u64, Ipv4Addr)> = migs.iter().filter_map(|(id, m)| Some((*id, released_ip(m)?))).collect();
@@ -5190,6 +5306,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unstarted_loans_are_bounded_per_peer_and_expire() {
+        let (_dir, mut h) = host("loan-quota");
+        h.cfg.vm_ips = "10.9.0.1-10.9.0.100".into();
+        let l = h.lock().unwrap();
+        for n in 1..=MAX_UNSTARTED_LOANS {
+            h.lend_new(&l, Ipv4Addr::new(10, 9, 0, n as u8), "a", true).unwrap();
+        }
+        let next = ip("10.9.0.17");
+        assert!(h.lend_new(&l, next, "a", true).unwrap_err().to_string().contains("too many unstarted"));
+        assert_eq!(h.addr(&l, next).unwrap(), Addr::default());
+        h.lend_new(&l, next, "b", true).unwrap();
+        let first = ip("10.9.0.1");
+        let before = h.addr(&l, first).unwrap();
+        let gen = before.lent.unwrap();
+        assert!(h.start_loan(&l, first, gen, "b").is_err());
+        assert_eq!(h.addr(&l, first).unwrap(), before);
+        h.start_loan(&l, first, gen, "a").unwrap();
+        h.lend_new(&l, ip("10.9.0.18"), "a", true).unwrap();
+        // Put it back to pending to exercise the expiry boundary below.
+        h.put_addr(first, &before, true).unwrap();
+        let until = before.loan.unwrap().expires_ms.unwrap();
+        h.expire_loans(&l, until - 1).unwrap();
+        assert_eq!(h.addr(&l, first).unwrap().lent, Some(gen));
+        h.expire_loans(&l, wall_ms() + LOAN_WAIT_MS + 1).unwrap();
+        let expired = h.addr(&l, first).unwrap();
+        assert!(expired.withdrawn && expired.lent.is_none());
+        assert!(h.start_loan(&l, first, gen, "a").is_err());
+        assert!(!h.observe(&l, first, gen, 0, Some(ip("192.0.2.1"))).unwrap());
+        assert!(h.lend_new(&l, first, "a", true).unwrap() > gen);
+    }
+
+    #[test]
+    fn claimed_and_legacy_loans_do_not_expire() {
+        let (_dir, h) = host("loan-claims");
+        let l = h.lock().unwrap();
+        let (x, y, z) = (ip("10.9.0.1"), ip("10.9.0.2"), ip("10.9.0.3"));
+        let a = h.lend_new(&l, x, "a", true).unwrap();
+        let b = h.lend_new(&l, y, "b", true).unwrap();
+        let c = h.lend_new(&l, z, "old", false).unwrap();
+        h.start_loan(&l, x, a, "a").unwrap();
+        h.start_loan(&l, x, a, "a").unwrap();
+        assert!(h.start_loan(&l, x, a, "b").is_err());
+        h.observe(&l, y, b, 0, Some(ip("192.0.2.1"))).unwrap();
+        h.expire_loans(&l, u64::MAX).unwrap();
+        for (ip, gen, peer) in [(x, a, "a"), (y, b, "b"), (z, c, "old")] {
+            let a = h.addr(&l, ip).unwrap();
+            assert_eq!(a.lent, Some(gen));
+            assert_eq!(a.loan.unwrap().peer, peer);
+        }
+        h.observe(&l, x, a, 0, None).unwrap();
+        assert!(h.addr(&l, x).unwrap().loan.is_none());
+    }
+
+    #[test]
+    fn quiet_hosts_sweep_expired_loans() {
+        let (_dir, h) = host("loan-sweep");
+        let x = ip("10.9.0.1");
+        let l = h.lock().unwrap();
+        h.observe(&l, x, RECV_MAX, 0, None).unwrap();
+        assert!(h.lend_new(&l, x, "a", true).unwrap() > RECV_MAX);
+        h.update(&l, x, true, |a| a.loan.as_mut().unwrap().expires_ms = Some(0)).unwrap();
+        drop(l);
+        h.collect_garbage().unwrap();
+        assert!(h.addr(&h.lock().unwrap(), x).unwrap().lent.is_none());
+    }
+
+    #[test]
+    fn migration_done_keeps_a_bounded_terminal_outcome() {
+        let (_dir, h) = host("mig-done");
+        let peer = "192.0.2.1".parse().unwrap();
+        let mut r = h.mig_begin(1, "source:7070", None, None).unwrap().with_peer(peer);
+        r.commit(&h.lock().unwrap()).unwrap();
+        r.release(None, None).unwrap();
+        assert!(h.mig_done_from(1, |_, _| false).is_err());
+        assert!(matches!(load::<Mig>(&h.mig_path(1)).unwrap(), Some(Mig::Released { .. })));
+        assert!(h.mig_done_from(1, |source, from| source == "source:7070" && from == Some(peer)).unwrap());
+        assert_eq!(h.mig_status(1).unwrap(), "released");
+        assert!(h.mig_begin(1, "other", None, None).is_err());
+        let before = load::<Mig>(&h.mig_path(1)).unwrap().unwrap();
+        assert!(!h.mig_done_from(1, |_, _| true).unwrap());
+        assert_eq!(load::<Mig>(&h.mig_path(1)).unwrap(), Some(before));
+        h.retire_migrations_with(1, |_, _| panic!("tombstones need no peer call"));
+        assert_eq!(h.mig_status(1).unwrap(), "released");
+        store(&h.mig_path(1), &Mig::Done { source: "source:7070".into(), peer: Some(peer), until_ms: 0 }, true).unwrap();
+        h.retire_migrations_with(1, |_, _| panic!("expired tombstone"));
+        assert!(!h.mig_path(1).exists());
+    }
+
+    #[test]
     fn addresses_generations_and_loans() {
         let (_h_dir, h) = host("addrs");
         let _a = h.take_name("a", false).unwrap();
@@ -5408,12 +5613,12 @@ pub(crate) mod tests {
         mig(21, Mig::Committed { owner: committed });
         // Released, then killed before its address was settled: its own VM, a loan of it too (it came home).
         claim(ips[14], "released", Some(dead(999_999_943)), 4, &|a| a.arriving = Some(22));
-        mig(22, Mig::Released { source: String::new(), by: None, ip: Some(ips[14]) });
+        mig(22, Mig::Released { source: String::new(), peer: None, by: None, ip: Some(ips[14]) });
         claim(ips[15], "homecoming", Some(dead(999_999_944)), 4, &|a| (a.arriving, a.lent) = (Some(23), Some(4)));
-        mig(23, Mig::Released { source: String::new(), by: None, ip: Some(ips[15]) });
+        mig(23, Mig::Released { source: String::new(), peer: None, by: None, ip: Some(ips[15]) });
         // Arrived and settled, then a source again: the old release is no proof.
         claim(ips[16], "left-again", Some(dead(999_999_945)), 4, &|a| a.leaving = leaving(41));
-        mig(24, Mig::Released { source: String::new(), by: None, ip: Some(ips[16]) });
+        mig(24, Mig::Released { source: String::new(), peer: None, by: None, ip: Some(ips[16]) });
         let before: Vec<Addr> = ips.iter().map(|&i| h.addr(&l, i).unwrap()).collect();
         drop(l);
         h.withdraw_dead(false).unwrap();
@@ -5497,7 +5702,7 @@ pub(crate) mod tests {
         let l = h.lock().unwrap();
         h.release(&l, away, "vm3", None).unwrap();
         let x = ip("10.9.0.2");
-        let gen = h.lend_new(&l, x).unwrap();
+        let gen = h.lend_new(&l, x, "borrower", false).unwrap();
         drop(l);
         let r = h.mig_begin(12, "", None, Some(x)).unwrap();
         h.claim_arrival(&h.lock().unwrap(), "vm4", x, gen, 1, 12).unwrap().keep();
@@ -5771,11 +5976,12 @@ pub(crate) mod tests {
         let gone = dead_owner(&h, 999_999_952, &[]);
         let a = Addr { seen: 4, lent: Some(4), holder: Some("vm".into()), holder_id: Some(gone), held: 4, arriving: Some(30), ..Addr::default() };
         h.put_addr(x, &a, false).unwrap();
-        store(&h.mig_path(30), &Mig::Released { source: "s".into(), by: None, ip: Some(x) }, false).unwrap();
-        // The source is done (or gone) before any sweep: the record goes, its evidence moved to the address.
+        store(&h.mig_path(30), &Mig::Released { source: "s".into(), peer: None, by: None, ip: Some(x) }, false).unwrap();
+        // The source is done before any sweep: settle the address before keeping only the outcome.
         h.mig_done(30).unwrap();
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
-        assert!(!h.mig_path(30).exists() && a.arriving.is_none() && a.lent.is_none(), "{a:?}");
+        assert_eq!(h.mig_status(30).unwrap(), "released");
+        assert!(a.arriving.is_none() && a.lent.is_none(), "{a:?}");
         h.withdraw_dead(false).unwrap();
         assert!(h.addr(&h.lock().unwrap(), x).unwrap().withdrawn);
     }
@@ -6024,7 +6230,7 @@ pub(crate) mod tests {
             std::fs::write(h.vms("v", "lock").unwrap(), unreadable).unwrap();
             assert!(h.take_name("v", false).is_err(), "a held corrupt lock cannot be taken over");
             assert_eq!(h.holder(&l, x.ip).unwrap().as_deref(), Some("v"), "{unreadable:?}");
-            assert!(h.claim_new(&l, "w", Some(x.ip)).is_err() && h.lend_new(&l, x.ip).is_err());
+            assert!(h.claim_new(&l, "w", Some(x.ip)).is_err() && h.lend_new(&l, x.ip, "borrower", false).is_err());
         }
         // Read, and naming another instance: not this claim's holder.
         store(&h.vms("v", "lock").unwrap(), &Ident { start: 1, ..Ident::me() }, false).unwrap();
@@ -6759,9 +6965,9 @@ pub(crate) mod tests {
         h.cfg.vm_ips = "10.9.255.254-10.10.0.2".into();
         let l = h.lock().unwrap();
         for x in [ip("10.10.0.0"), ip("10.9.255.255")] {
-            assert!(h.lend_new(&l, x).is_err() && h.claim_new(&l, "w", Some(x)).is_err(), "{x}");
+            assert!(h.lend_new(&l, x, "borrower", false).is_err() && h.claim_new(&l, "w", Some(x)).is_err(), "{x}");
         }
-        h.lend_new(&l, ip("10.10.0.1")).unwrap();
+        h.lend_new(&l, ip("10.10.0.1"), "borrower", false).unwrap();
     }
 
     /// A `vm_ips` change reaches a Host opened before it (a standby, the listener, a
@@ -6782,7 +6988,7 @@ pub(crate) mod tests {
         let l = h.lock().unwrap();
         let e = h.claim_new(&l, "x", Some(old)).err().unwrap().to_string();
         assert!(e.contains("range 10.7.0.5-10.7.0.5"), "{e}");
-        let e = h.lend_new(&l, old).unwrap_err().to_string();
+        let e = h.lend_new(&l, old, "borrower", false).unwrap_err().to_string();
         assert!(e.contains("range 10.7.0.5-10.7.0.5"), "{e}");
         let c = h.claim_new(&l, "x", None).unwrap();
         assert_eq!(c.ip, new);
@@ -6820,7 +7026,7 @@ pub(crate) mod tests {
         assert_eq!(h.addr(&l, x).unwrap().lent, Some(gen));
         assert!(h.claim_new(&l, "w", Some(x)).err().unwrap().to_string().contains("lent out"));
         assert!(h.claim_new(&l, "w", None).is_err(), "nothing else to hand out");
-        assert!(h.lend_new(&l, x).is_err());
+        assert!(h.lend_new(&l, x, "borrower", false).is_err());
         // Withdrawn (the VM gone wherever it ran): free again.
         assert!(h.observe(&l, x, gen, 0, None).unwrap());
         assert_eq!(h.claim_new(&l, "w", None).unwrap().ip, x);
@@ -6831,15 +7037,15 @@ pub(crate) mod tests {
         let (_h_dir, h) = host("lend");
         let l = h.lock().unwrap();
         let x = ip("10.9.0.2");
-        assert!(h.lend_new(&l, ip("10.9.9.9")).is_err(), "not ours");
-        let g = h.lend_new(&l, x).unwrap();
-        assert!(h.lend_new(&l, x).unwrap_err().to_string().contains("lent"));
+        assert!(h.lend_new(&l, ip("10.9.9.9"), "borrower", false).is_err(), "not ours");
+        let g = h.lend_new(&l, x, "borrower", false).unwrap();
+        assert!(h.lend_new(&l, x, "borrower", false).unwrap_err().to_string().contains("lent"));
         assert!(h.claim_new(&l, "x", Some(x)).err().unwrap().to_string().contains("lent"));
         assert!(h.observe(&l, x, g, 0, None).unwrap());
         let _x = h.take_name("x", false).unwrap();
         let c = h.claim_new(&l, "x", Some(x)).unwrap();
         assert!(c.gen > g && c.fresh);
-        assert!(h.lend_new(&l, x).unwrap_err().to_string().contains("in use"));
+        assert!(h.lend_new(&l, x, "borrower", false).unwrap_err().to_string().contains("in use"));
     }
 
     #[test]
@@ -6950,7 +7156,7 @@ pub(crate) mod tests {
             let l = h.lock().unwrap();
             assert!(h.observe(&l, x, RECV_MAX, 0, Some(ip("10.1.0.2"))).unwrap());
             assert!(h.observe(&l, x, RECV_MAX, 0, None).unwrap(), "the peer withdraws it");
-            h.lend_new(&l, x).unwrap()
+            h.lend_new(&l, x, "borrower", false).unwrap()
         };
         assert!(gen > RECV_MAX);
         assert_eq!(h.reclaim(x, gen).unwrap(), (gen, vec![]));
@@ -7014,7 +7220,7 @@ pub(crate) mod tests {
     }
 
     fn released_migration(h: &Host, id: u64, source: &str) {
-        store(&h.mig_path(id), &Mig::Released { source: source.into(), by: Some(Ident { start: id, ..Ident::me() }), ip: None }, false).unwrap();
+        store(&h.mig_path(id), &Mig::Released { source: source.into(), peer: None, by: Some(Ident { start: id, ..Ident::me() }), ip: None }, false).unwrap();
     }
 
     #[test]
@@ -7111,7 +7317,7 @@ pub(crate) mod tests {
         let reopened = Host::open(&h.state, &h.run).unwrap();
         assert_eq!(pass(&reopened), [3, 4]);
         assert_eq!(pass(&reopened), [5, 6]);
-        assert_eq!(pass(&reopened), [2, 3]);
+        assert_eq!(pass(&reopened), [2], "the tombstone still counts against the record budget");
     }
 
     #[test]
@@ -7120,7 +7326,7 @@ pub(crate) mod tests {
         for (id, source) in [(1, "unreachable"), (2, "reachable"), (3, "unreachable"), (4, "reachable"), (5, "unknown"), (6, "unreachable")] {
             released_migration(&h, id, source);
         }
-        store(&h.mig_path(7), &Mig::Released { source: "reachable".into(), by: None, ip: None }, false).unwrap();
+        store(&h.mig_path(7), &Mig::Released { source: "reachable".into(), peer: None, by: None, ip: None }, false).unwrap();
         released_migration(&h, 8, "");
         let mut queried = Vec::new();
         h.retire_migrations_with(8, |source, by| {
@@ -7132,7 +7338,7 @@ pub(crate) mod tests {
             }
         });
         assert_eq!(queried, [1, 2, 4, 5]);
-        assert!(!h.mig_path(4).exists(), "only an explicit gone response retires a record");
+        assert_eq!(h.mig_status(4).unwrap(), "released");
         assert!([1, 2, 3, 5, 6, 7, 8].iter().all(|id| h.mig_path(*id).exists()));
         queried.clear();
         h.retire_migrations_with(3, |_, by| {
@@ -7388,7 +7594,7 @@ pub(crate) mod tests {
         r.release(Some((home, 9)), None).unwrap();
         assert!(h.mig_status(3).unwrap() == "released" && lent(&h).is_none());
         h.mig_done(3).unwrap();
-        assert!(rec(3).is_none());
+        assert!(matches!(rec(3), Some(Mig::Done { .. })));
         let mut r = h.mig_begin(4, "", None, None).unwrap();
         store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]), ip: None }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
@@ -7407,7 +7613,7 @@ pub(crate) mod tests {
         r.settle(true);
         assert_eq!(h.mig_status(7).unwrap(), "released");
         // A source that cannot be asked keeps its released record.
-        store(&h.mig_path(8), &Mig::Released { source: "127.0.0.1:1".into(), by: Some(Ident::me()), ip: None }, false).unwrap();
+        store(&h.mig_path(8), &Mig::Released { source: "127.0.0.1:1".into(), peer: None, by: Some(Ident::me()), ip: None }, false).unwrap();
         // Only proof retires: another boot, no such pid, or another process with the pid.
         let me = Ident::me();
         assert_eq!(me.liveness(), Liveness::Alive);

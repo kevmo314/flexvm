@@ -970,7 +970,7 @@ impl Proc {
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo. Never past the guest's size.
         self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req), Some(until)).map_err(late)?;
         let l = self.host.lock_by(Some(until)).map_err(late)?;
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?.with_peer(from));
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
         let claim = self.host.claim_arrival(&l, &name, ip, req["gen"].as_u64().unwrap_or(0), rev, mig)?;

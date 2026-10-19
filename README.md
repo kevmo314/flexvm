@@ -946,9 +946,12 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
   both hosts.
 - IPv4 only; peers form a full mesh; address ranges are per host and set by hand.
 - The peer protocol is plain TCP, served to the peers' addresses only, without
-  authentication: trusted networks only.
-- An address lent to a restore elsewhere stays lent if that restore's host
-  dies before it starts the VM (a leak, never a collision).
+  authentication: trusted networks only. A listed peer can claim any VM
+  address and reserve this host's addresses and disk.
+- Unstarted restore loans are limited to 16 per peer and expire after five
+  minutes. A claimed loan stays lent if the restore's host dies before it
+  starts the VM (a leak, never a collision). Older borrowers' loans cannot
+  expire safely and stay lent until announced or withdrawn.
 - `exec` reaches VMs on this host; one that migrates away ends its exec
   saying where it went and exits 125 (the command keeps running there).
 - Templates must be identical on every host (checked by content id), as
