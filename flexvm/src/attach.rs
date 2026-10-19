@@ -496,9 +496,6 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
     if open_stdin && tty && !is_tty(0) {
         bail!("the input device is not a TTY");
     }
-    // From now on: the guest fixes where "now" is before any stdin goes (#866), else what it echoes or prints
-    // first can come before that and be left out. Failed, the follow retries as it would.
-    let output = if from.is_none() { open_output(&vm, u64::MAX).ok() } else { None };
     let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
     // Before the terminal goes raw, so that no signal finds it raw and nothing to put it back.
     match tty {
@@ -507,8 +504,15 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
         // As docker's --sig-proxy: to the app.
         false => proxy_signals(vm.clone(), signals),
     }
-    let raw = (open_stdin && tty).then(raw).transpose()?;
-    if open_stdin {
+    // Raw, and stdin on, only once the output follow is open: from now on, the guest has fixed where "now" is
+    // (#866), else what it echoes or prints first can come before that and be left out.
+    let mut term = None;
+    let code = follow_output(&vm, from, || {
+        term = (open_stdin && tty).then(raw).transpose()?;
+        if !open_stdin {
+            drop(first);
+            return Ok(());
+        }
         let feed = Feed::start(Some(Box::new(std::io::stdin())), tty, tty && is_tty(0), detach_now)?;
         let vm = vm.clone();
         std::thread::Builder::new().spawn(move || {
@@ -548,11 +552,9 @@ pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
                 };
             }
         })?;
-    } else {
-        drop(first);
-    }
-    let code = follow_output(&vm, from, output);
-    drop(raw);
+        Ok(())
+    });
+    drop(term);
     code
 }
 
@@ -586,14 +588,19 @@ fn open_output(vm: &Pinned, offset: u64) -> Result<BufReader<UnixStream>> {
     Ok(r)
 }
 
-/// The app's output (FRAME_NOTE, flexvm-init's own lines, is left out) until it exits; `first`: its follow opened already.
-fn follow_output(vm: &Pinned, from: Option<u64>, mut first: Option<BufReader<UnixStream>>) -> Result<i32> {
+/// The app's output (FRAME_NOTE, flexvm-init's own lines, is left out) until it exits; `started` runs once
+/// its first follow is open.
+fn follow_output(vm: &Pinned, from: Option<u64>, started: impl FnOnce() -> Result<()>) -> Result<i32> {
+    let mut started = Some(started);
     let mut offset = from.unwrap_or(u64::MAX);
     let (mut stdout, mut stderr) = (std::io::stdout(), std::io::stderr());
     loop {
         let name = &vm.name();
-        match first.take().map_or_else(|| open_output(vm, offset), Ok) {
+        match open_output(vm, offset) {
             Ok(mut r) => {
+                if let Some(start) = started.take() {
+                    start()?;
+                }
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut r) {
                     match kind {
                         FRAME_STDOUT | FRAME_STDERR | FRAME_NOTE => {
