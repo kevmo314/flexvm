@@ -1,6 +1,6 @@
 //! Garbage collection beyond what dead processes hold (`Host::collect_garbage`):
-//! logs on the run directory's tmpfs, `NAME.moved` markers and standby
-//! sockets. `sweep` runs once a boot as the host is first opened (`after_boot`), and about every `EVERY` on a host with a listener or
+//! logs on the run directory's tmpfs, `NAME.moved` markers, standby
+//! sockets, and templates' leftovers and unused received generations. `sweep` runs once a boot as the host is first opened (`after_boot`), and about every `EVERY` on a host with a listener or
 //! any VM process (as one starts, then through `periodic`), whether or not
 //! VMs start. Port forwards own only process sockets (`ports`): process death
 //! releases them before a sweep, leaving no NAT rules or reservations to collect.
@@ -182,10 +182,20 @@ fn cleanup_locked(host: &Host, lock: Option<Flock>) -> Result<()> {
         }
     }
     load_sets(&host.run.join("standby"));
+    templates(host);
     match collected {
         // The address stays held, and the next sweep tries its lost record again.
         Err(e) if crate::host::name_busy(&e) => Ok(()),
         other => other.map(|_| ()),
+    }
+}
+
+/// What killed builds and receives left in the templates directory, and received generations unused for
+/// `template::RECEIVED_IDLE` (`template::collect`).
+fn templates(host: &Host) {
+    let paths = crate::template::Paths::new(&host.state);
+    if let Err(e) = crate::template::collect(&paths, crate::template::RECEIVED_IDLE, &|| host.template_users()) {
+        crate::log!("garbage collection: templates: {e}");
     }
 }
 

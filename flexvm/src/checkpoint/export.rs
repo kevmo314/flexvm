@@ -872,7 +872,7 @@ fn import(
                         t.end()
                     };
                     // Refused unless its digests are `vouched`, as `check_vouched` would.
-                    (Some(template::receive(paths, tar, tid, Some(vouched), finish)?), How::Received)
+                    (Some(template::receive(paths, tar, tid, Some(vouched), |_| Ok(()), finish)?), How::Received)
                 }
             }
         }

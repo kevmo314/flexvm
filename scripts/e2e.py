@@ -878,6 +878,48 @@ def push_killed():
 
 
 @case
+def push_slow_ops():
+    """a template push holds no op lock (#824): while it is parked half way, the VM resizes and checkpoints
+    without "busy", and the migration goes on once the push does"""
+    vm, ck = "e2e-push-slow", "e2e-push-slow-ck"
+    with b_unpulled() as templates:
+        A.run(vm)
+        m, proc = fill(A, vm), marker(A, vm)
+        gates = os.path.join(B.run_dir, "gates")
+        B.cli("debug", "fault", "receive_hold", "120000")
+        mig = subprocess.Popen([BIN, "--state", A.state_dir, "--run", A.run_dir, "migrate", vm, B.addr], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+        B.vms.add(vm)
+        try:
+            check("B: the push is parked half way", wait_for(lambda: os.path.isdir(gates) and any(f.startswith("receive_hold.") for f in os.listdir(gates)), 120))
+
+            def control(req):
+                with socket.socket(socket.AF_UNIX) as s:
+                    s.settimeout(60)
+                    s.connect(os.path.join(A.run_dir, "vms", f"{vm}.sock"))
+                    s.sendall((json.dumps(req) + "\n").encode())
+                    return json.loads(s.makefile().readline() or '{"ok": false, "error": "hung up"}')
+            plugged = A.ps().get(vm, {}).get("plugged_mib") or 0
+            r = control({"op": "debug", "what": "hotplug", "mib": plugged + 128})
+            check("A: a resize during the push is not busy", r.get("ok") is True, r)
+            r = A.cli("checkpoint", "create", vm, ck, check=False)
+            check("A: a checkpoint during the push is not busy", r.returncode == 0, r.stderr)
+            check("A: the migration is still pushing", mig.poll() is None)
+        finally:
+            B.cli("debug", "fault", "receive_hold", "0")
+            for f in os.listdir(gates) if os.path.isdir(gates) else []:
+                if f.startswith("receive_hold."):
+                    os.remove(os.path.join(gates, f))
+        out, err = mig.communicate(timeout=300)
+        check("the migration finished once the push did", mig.returncode == 0, err)
+        r = json.loads(out or "{}")
+        check("A -> B: the template was sent", r.get("template_push", {}).get("sent_mib", 0) > 0, r)
+        moved(A, B, vm, m, proc)
+        check("B: one generation", generations(templates) == [template_id(A, args.template)])
+        A.cli("checkpoint", "rm", "-f", ck, check=False)
+        B.kill(vm)
+
+
+@case
 def migrate_unpulled_pair():
     """two VMs of one template migrate at once to a host without it: it is sent once, both arrive"""
     vms, want = ("e2e-pair-1", "e2e-pair-2"), template_id(A, args.template)

@@ -102,35 +102,52 @@ impl Proc {
         let Some(source) = self.host.config_now().advertise()? else {
             bail!("this host runs no peer listener (flexvm listen): the target fetches the vm's memory through it");
         };
+        let refused = || -> Result<()> {
+            if self.cmd.lock().unwrap().is_some() {
+                match evict {
+                    true => return Err(Busy(format!("vm {} runs a command here that its process ends with; {BUSY}", vm.name)).into()),
+                    false => bail!("vm {} runs `run -- CMD`, which ends with its command here: it cannot migrate", vm.name),
+                }
+            }
+            if if_idle && self.arrived.lock().unwrap().is_some() {
+                return Err(Busy(format!("vm {} is still arriving; {BUSY}", vm.name)).into());
+            }
+            Ok(())
+        };
+        // What refuses it below, at once: not after a push of minutes.
+        if if_idle && self.op_now().is_none() {
+            return Err(Busy(format!("vm {}: {BUSY}", vm.name)).into());
+        }
+        refused()?;
+        vm.template.verify(&self.paths)?;
+        // Before the op lock: however long the push takes, the VM is resized, checkpointed or evicted meanwhile (#824).
+        // Still before the pause.
+        let pushed = push_template(to, &vm.template, false)?;
+        if pushed.is_none() && !vm.template.names_rootfs_by_path()? {
+            bail!("{to} runs flexvm v0.1.0, which cannot load template {} (built since): upgrade it first", vm.template.meta.id);
+        }
         let op = match if_idle {
             true => self.op_now().ok_or_else(|| Busy(format!("vm {}: {BUSY}", vm.name)))?,
             false => self.op_within()?,
         };
-        if self.cmd.lock().unwrap().is_some() {
-            match evict {
-                true => return Err(Busy(format!("vm {} runs a command here that its process ends with; {BUSY}", vm.name)).into()),
-                false => bail!("vm {} runs `run -- CMD`, which ends with its command here: it cannot migrate", vm.name),
-            }
-        }
-        if if_idle && self.arrived.lock().unwrap().is_some() {
-            return Err(Busy(format!("vm {} is still arriving; {BUSY}", vm.name)).into());
-        }
+        refused()?;
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.can_leave()?;
-        vm.template.verify(&self.paths)?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
-        // Right before the prepare, which opens it there (`listen::PUSH_HOLD`).
-        let pushed = push_template(to, &vm.template)?;
-        if pushed.is_none() && !vm.template.names_rootfs_by_path()? {
-            bail!("{to} runs flexvm v0.1.0, which cannot load template {} (built since): upgrade it first", vm.template.meta.id);
+        // Asked again right before the prepare, which opens it there: still there, the same files, and held
+        // again for `listen::PUSH_HOLD`.
+        if pushed.is_some() {
+            push_template(to, &vm.template, true)?;
         }
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let vouched = pushed.as_ref().map_or(Value::Null, |p| p.1.clone());
         let (conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict, vouched).map_err(|e| match &pushed {
-            None => format!("{e} ({to} is too old to be sent template {}: it migrates in only VMs of templates it has)", vm.template.meta.id).into(),
-            Some(_) => e,
+            None if missing_template(&e) => {
+                format!("{e} ({to} is too old to be sent template {}: it migrates in only VMs of templates it has)", vm.template.meta.id).into()
+            }
+            _ => e,
         })?;
         // Before the pause: dropped, the connection ends the target's arrival.
         check_app_support(to, &vm.name.get(), &prepared, &self.spec.lock().unwrap().moving(), vm.template.meta.image.as_ref())?;
@@ -1027,21 +1044,50 @@ impl Proc {
 /// Has `to` take generation `tpl`, by content id, before anything else of a migration (so before the
 /// pause): sent unless it has it. Returns its timings and, for a copy `to` received from a peer, the
 /// digests this host vouches for it with (`template::digests`), which the arrival checks. None if `to`
-/// is too old to be sent one (then it must have it).
-fn push_template(to: &str, tpl: &Template) -> Result<Option<(Value, Value)>> {
-    let (start, at) = (Instant::now(), Instant::now() + crate::listen::PUSH_WAIT);
+/// is too old to be sent one (then it must have it). With `only_ask`, nothing is sent: an error unless `to`
+/// has it still (the check right before the prepare, which refreshes its hold there).
+pub(crate) fn push_template(to: &str, tpl: &Template, only_ask: bool) -> Result<Option<(Value, Value)>> {
+    use crate::listen::{ANSWER_WAIT, PUSH_GRACE, PUSH_RATE, TURN_WAIT};
+    let start = Instant::now();
     let fail = |e: Error| -> Error { format!("cannot send template {} to {to}: {e}", tpl.meta.id).into() };
     // Before the request: once answered, the target holds the generation only so long (`listen::PUSH_HOLD`).
     let ours = json!(tpl.digests()?);
-    let (conn, mut reply) = match crate::util::rpc(to, Duration::from_secs(2), at, &json!({"op": "template", "id": tpl.meta.id})) {
+    let sending = match only_ask {
+        true => None,
+        false => Some(crate::template::Sending::new(tpl).map_err(fail)?),
+    };
+    let req = match &sending {
+        None => json!({"op": "template", "id": tpl.meta.id, "have": true}),
+        Some(s) => json!({"op": "template", "id": tpl.meta.id, "ack": true, "bytes": s.len()}),
+    };
+    // A push's first answer may wait for another arrival's receive of it (`listen::TURN_WAIT`); a question's
+    // waits for nothing, and is asked holding the op lock.
+    let wait = if only_ask { ASK_WAIT } else { TURN_WAIT + ANSWER_WAIT };
+    let (conn, mut reply) = match crate::util::rpc(to, Duration::from_secs(2), Instant::now() + wait, &req) {
         Err(e) if e.to_string().contains("unknown op \"template\"") => return Ok(None),
         r => r.map_err(fail)?,
     };
     let mut sent = 0;
     if reply["have"] != json!(true) {
-        let n = crate::template::send(tpl, &mut std::io::BufWriter::with_capacity(1 << 20, By { s: &conn, at }));
-        // Its answer says more than a failed write: it may have refused the template part way.
-        reply = crate::util::recv_json(&mut BufReader::new(By { s: &conn, at })).and_then(|r| crate::util::answer(r, to, "refused")).map_err(fail)?;
+        let Some(sending) = sending else {
+            bail!("{to} no longer has template {}, sent to it for this migration (removed there meanwhile?); try again", tpl.meta.id);
+        };
+        let read = |at| crate::util::recv_json(&mut BufReader::new(By { s: &conn, at })).and_then(|r| crate::util::answer(r, to, "refused")).map_err(fail);
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::util::Paced::new(&conn, PUSH_GRACE, PUSH_RATE));
+        let n = match reply["ack"] == true {
+            // Its metadata answered first: what the target refuses (room, limits, Firecracker), it refuses before the data.
+            true => {
+                let meta = sending.write_meta(&mut w);
+                read(Instant::now() + ANSWER_WAIT)?;
+                meta.map_err(fail)?;
+                sending.write_files(&mut w)
+            }
+            false => sending.write(&mut w),
+        };
+        // Its answer says more than a failed write: it may have refused the template part way. It publishes it
+        // within the pace of its bytes again (it syncs them).
+        let moved = w.get_ref().moved;
+        reply = read(Instant::now() + PUSH_GRACE + Duration::from_secs(moved / PUSH_RATE))?;
         sent = n.map_err(fail)?;
     }
     let digests = if reply["digests"].is_null() { Value::Null } else { ours };
@@ -1049,6 +1095,16 @@ fn push_template(to: &str, tpl: &Template) -> Result<Option<(Value, Value)>> {
         bail!("{to} has a copy of template {} received from a peer whose files differ from this host's: remove it there (flexvm rmi {0})", tpl.meta.id);
     }
     Ok(Some((json!({"sent_mib": sent >> 20, "ms": ms(start.elapsed())}), digests)))
+}
+
+/// How long `push_template`'s question (`only_ask`) waits for its answer.
+const ASK_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether a target's refusal of an arrival says it has no such template (one too old to be sent it, `push_template`):
+/// by name (`Template::resolve`) or with another build under it (`Template::check_id`), as v0.1.0 words them.
+fn missing_template(e: &Error) -> bool {
+    let e = e.to_string();
+    e.contains("no image ") || e.contains(" id mismatch: local ")
 }
 
 /// Header, state, preload and commit reply share one cap: partial writes cannot extend the pause.

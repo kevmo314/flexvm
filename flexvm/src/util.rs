@@ -792,6 +792,55 @@ impl<S: Timed + Write> Write for By<S> {
     }
 }
 
+/// `By` with a deadline that moves with what it carries: `grace` from when it was made, plus a second for each
+/// `rate` bytes read or written through it. A transfer of any size that keeps that pace runs to its end; one that
+/// stalls or trickles below it still ends (a template push, #824).
+pub struct Paced<S> {
+    pub s: S,
+    start: Instant,
+    grace: Duration,
+    rate: u64,
+    /// The bytes read and written so far.
+    pub moved: u64,
+}
+
+impl<S> Paced<S> {
+    pub fn new(s: S, grace: Duration, rate: u64) -> Self {
+        Paced { s, start: Instant::now(), grace, rate: rate.max(1), moved: 0 }
+    }
+
+    /// Its deadline now.
+    pub fn at(&self) -> Instant {
+        let nanos = self.moved as u128 * 1_000_000_000 / self.rate as u128;
+        self.start + self.grace + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+    }
+
+    fn left(&self) -> io::Result<Duration> {
+        By { s: (), at: self.at() }.left()
+    }
+}
+
+impl<S: Timed> Read for Paced<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.s.read_timeout(self.left()?)?;
+        let n = self.s.read(buf).map_err(timed_out)?;
+        self.moved += n as u64;
+        Ok(n)
+    }
+}
+
+impl<S: Timed + Write> Write for Paced<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.s.write_timeout(self.left()?)?;
+        let n = self.s.write(buf).map_err(timed_out)?;
+        self.moved += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.s.flush()
+    }
+}
+
 /// Connects within `timeout`: a blocking connect waits while the listener's backlog is full.
 pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<UnixStream> {
     use std::os::unix::ffi::OsStrExt;
@@ -1648,6 +1697,21 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paced_deadline_moves_with_the_bytes() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut w = Paced::new(&a, Duration::from_millis(300), 1000);
+        let first = w.at();
+        w.write_all(&[1; 500]).unwrap();
+        assert_eq!(w.at() - first, Duration::from_millis(500));
+        let mut r = Paced::new(&b, Duration::from_millis(300), 1000);
+        let started = Instant::now();
+        r.read_exact(&mut [0; 500]).unwrap();
+        // Nothing more comes: it times out at its deadline, the grace and the pace of what came.
+        let e = r.read(&mut [0; 1]).unwrap_err();
+        assert!(e.kind() == io::ErrorKind::TimedOut && started.elapsed() >= Duration::from_millis(790), "{e} after {:?}", started.elapsed());
+    }
     use crate::test_util::{JoinWithin, WAIT};
 
     #[test]

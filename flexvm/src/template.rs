@@ -157,15 +157,68 @@ fn content_hash(file: &File) -> Result<String> {
 
 /// `content_hash`'s page walk, but cryptographic: what a received generation is compared by.
 fn digest(path: &Path) -> Result<String> {
-    use sha2::Digest;
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut h = sha2::Sha256::new();
-    h.update(file.metadata()?.len().to_le_bytes());
-    nonzero_pages(&file, |n, p| {
-        h.update(n.to_le_bytes());
-        h.update(p);
-    })?;
-    Ok(format!("{:x}", h.finalize()))
+    let mut h = Hashing::new(file.metadata()?.len());
+    nonzero_pages(&file, |n, p| h.page(n, p))?;
+    Ok(h.finish().1)
+}
+
+/// `content_hash` and `digest` together, of a file's pages as they come, in order (`receive_file`, as it writes
+/// them, so a received file is not read again; #46): bytes at any offsets past the last, holes left zero.
+struct Hashing {
+    fnv: Hash,
+    sha: sha2::Sha256,
+    /// The page bytes are being written into, by index: hashed once one past it is written to, or at the end.
+    page: Option<(u64, Box<[u8; PAGE_SIZE]>)>,
+}
+
+impl Hashing {
+    fn new(len: u64) -> Self {
+        use sha2::Digest;
+        let (mut fnv, mut sha) = (Hash::new(), sha2::Sha256::new());
+        fnv.word(len);
+        sha.update(len.to_le_bytes());
+        Hashing { fnv, sha, page: None }
+    }
+
+    /// Whole page `n`, as `nonzero_pages` gives it.
+    fn page(&mut self, n: u64, p: &[u8]) {
+        use sha2::Digest;
+        if !zero(p) {
+            self.fnv.word(n);
+            self.fnv.update(p);
+            self.sha.update(n.to_le_bytes());
+            self.sha.update(p);
+        }
+    }
+
+    /// `bytes` at `off`, at or past every offset written before.
+    fn write(&mut self, mut off: u64, mut bytes: &[u8]) {
+        let size = PAGE_SIZE as u64;
+        while !bytes.is_empty() {
+            let (n, at) = (off / size, (off % size) as usize);
+            if self.page.as_ref().is_none_or(|(i, _)| *i != n) {
+                self.flush();
+                self.page = Some((n, Box::new([0; PAGE_SIZE])));
+            }
+            let take = (PAGE_SIZE - at).min(bytes.len());
+            self.page.as_mut().unwrap().1[at..at + take].copy_from_slice(&bytes[..take]);
+            (off, bytes) = (off + take as u64, &bytes[take..]);
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some((n, p)) = self.page.take() {
+            self.page(n, &p[..]);
+        }
+    }
+
+    /// `content_hash` and `digest`.
+    fn finish(mut self) -> (String, String) {
+        use sha2::Digest;
+        self.flush();
+        (self.fnv.finish(), format!("{:x}", self.sha.finalize()))
+    }
 }
 
 /// Calls `f` with each page of `file` that is not all zero, by index, in order.
@@ -196,13 +249,16 @@ fn nonzero_pages(file: &File, mut f: impl FnMut(u64, &[u8])) -> Result<()> {
 /// The SHA-256 digests of a generation's files and of what its metadata says beyond its content id
 /// (its host's CPU and Firecracker, sizes, image, recipe), which `Meta::digests` records.
 fn digests(meta: &Meta, vmstate: &Path, mem: &Path, rootfs: &Path) -> Result<BTreeMap<String, String>> {
+    digests_of(meta, [digest(vmstate)?, digest(mem)?, digest(rootfs)?])
+}
+
+/// `digests`, given its files' (vmstate, mem, rootfs).
+fn digests_of(meta: &Meta, [vmstate, mem, rootfs]: [String; 3]) -> Result<BTreeMap<String, String>> {
     use sha2::Digest;
     let said =
         serde_json::to_vec(&(&meta.id, &meta.compatibility, [meta.vcpus as u64, meta.mem_mib, meta.max_mib, meta.plugged_mib], &meta.image, &meta.recipe))?;
     let mut out = BTreeMap::from([("meta".to_string(), format!("{:x}", sha2::Sha256::digest(said)))]);
-    for (name, path) in [("vmstate", vmstate), ("mem", mem), ("rootfs", rootfs)] {
-        out.insert(name.into(), digest(path)?);
-    }
+    out.extend([("vmstate", vmstate), ("mem", mem), ("rootfs", rootfs)].map(|(n, d)| (n.to_string(), d)));
     Ok(out)
 }
 
@@ -220,6 +276,50 @@ pub(crate) fn hash_file(path: &Path) -> Result<Component> {
         bail!("template component {} changed while hashing", path.display());
     }
     Ok(Component { hash, metadata })
+}
+
+/// `hash_file` and `digest` of `file` (at `path`), in one read.
+fn hash_and_digest(file: &File, path: &Path) -> Result<(Component, String)> {
+    let metadata = Stamp::of(&file.metadata()?);
+    let mut h = Hashing::new(file.metadata()?.len());
+    nonzero_pages(file, |n, p| h.page(n, p))?;
+    if Stamp::of(&file.metadata()?) != metadata {
+        bail!("template component {} changed while hashing", path.display());
+    }
+    let (hash, digest) = h.finish();
+    Ok((Component { hash, metadata }, digest))
+}
+
+/// The image cache's root filesystem `path` names, opened only if it is one: a regular file `KEY.ext4` right in
+/// `paths.images`' `rootfs` directory, reached through no symlink. A peer names it (an older generation's vmstate,
+/// `receive`), so nothing else is opened for reading, not a device, FIFO or watchdog an open alone acts on, nor any
+/// file elsewhere whose content a hash comparison would reveal (#823): it is opened `O_PATH` and checked first.
+fn open_cached_rootfs(paths: &Paths, path: &Path) -> Result<File> {
+    let dir = std::fs::canonicalize(paths.images.join("rootfs")).map_err(|e| format!("this host's image cache: {e}"))?;
+    let name = path
+        .file_name()
+        .filter(|n| path.parent() == Some(dir.as_path()) && Path::new(n).extension() == Some("ext4".as_ref()) && n.len() > 5)
+        .ok_or("not a root filesystem of this host's image cache")?;
+    open_regular_at(&dir, name)
+}
+
+/// The regular file `name` in `dir`, not through a symlink, opened for reading only once that is checked.
+fn open_regular_at(dir: &Path, name: &std::ffi::OsStr) -> Result<File> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = crate::util::openat(libc::AT_FDCWD, &crate::util::cpath(dir)?, libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| "NUL in its name")?;
+    let fd = crate::util::openat(dir.as_raw_fd(), &name, libc::O_PATH | libc::O_NOFOLLOW)?;
+    let st = crate::util::fstat(fd.as_raw_fd())?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        bail!("not a regular file");
+    }
+    // The inode just checked, opened for reading through its O_PATH descriptor.
+    let file = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    let got = crate::util::fstat(file.as_raw_fd())?;
+    if (got.st_dev, got.st_ino) != (st.st_dev, st.st_ino) {
+        bail!("replaced as it was opened");
+    }
+    Ok(file)
 }
 
 fn content_id(components: &BTreeMap<String, Component>, image: Option<&ImageMeta>) -> String {
@@ -886,6 +986,15 @@ fn sweep(paths: &Paths) -> Result<()> {
     sweep_locked(paths)
 }
 
+/// `sweep`, if there is a templates directory: what a killed build or receive left, at once (a listener's start).
+pub fn sweep_leftovers(paths: &Paths) -> Result<()> {
+    if !paths.templates.is_dir() {
+        return Ok(());
+    }
+    let parent = crate::host::Directory::open(&paths.templates)?;
+    sweep(&Paths { templates: parent.path.clone(), ..paths.clone() })
+}
+
 fn sweep_locked(paths: &Paths) -> Result<()> {
     let locks = crate::host::host_locks()?;
     let prefix = template_lock_name(paths, "template-new", "-")?;
@@ -1100,8 +1209,19 @@ impl Sending {
     /// Its metadata, then its vmstate, root filesystem and memory, each as its length, its data
     /// extents and their bytes, so holes stay holes. Returns the data bytes.
     pub fn write(self, w: &mut impl Write) -> Result<u64> {
+        self.write_meta(w)?;
+        self.write_files(w)
+    }
+
+    /// What `write` writes first: the metadata, which `receive` checks before it reads on (its `ready`).
+    pub fn write_meta(&self, w: &mut impl Write) -> Result<()> {
         w.write_all(&(self.meta.len() as u64).to_le_bytes())?;
         w.write_all(&self.meta)?;
+        Ok(w.flush()?)
+    }
+
+    /// The rest of `write`, after `write_meta`. Returns the data bytes.
+    pub fn write_files(self, w: &mut impl Write) -> Result<u64> {
         let (mut sent, mut buf) = (0, vec![0u8; 1 << 20]);
         for (file, len, extents) in self.files {
             let head = [len, extents.len() as u64].into_iter().chain(extents.iter().flat_map(|&(s, e)| [s, e]));
@@ -1122,6 +1242,7 @@ impl Sending {
 }
 
 /// Writes generation `tpl` for `receive` (`Sending::write`). Returns the data bytes.
+#[cfg(test)]
 pub fn send(tpl: &Template, w: &mut impl Write) -> Result<u64> {
     Sending::new(tpl)?.write(w)
 }
@@ -1147,14 +1268,17 @@ pub fn turn(paths: &Paths, id: &str, by: Instant) -> Result<crate::host::HeldLoc
 /// Reads a generation `send` wrote and publishes it unnamed (no name here is taken or moved), once its
 /// content id is `id` and each file it got hashes to its component: it is never named or found by
 /// tag. Returns it open, so held: no `rmi`, prune or sweep removes it while it is. A failure leaves no
-/// generation: its staging goes, or, killed, the next build's or receive's sweep. With `vouched` (a
-/// checkpoint's `template_digests`), one whose digests differ is refused before it is published, as
-/// is one that `finish` (given the reader, once all of it is read: what follows it) fails.
+/// generation: its staging goes, or, killed, the next build's or receive's sweep (or the listener's, `collect`).
+/// `ready` (given its metadata, checked) is called before any file is read: what it fails is refused before
+/// the source sends its data (`listen::push`). With `vouched` (a checkpoint's `template_digests`), one whose
+/// digests differ is refused before it is published, as is one that `finish` (given the reader, once all of
+/// it is read: what follows it) fails.
 pub fn receive<R: Read>(
     paths: &Paths,
     r: &mut R,
     id: &str,
     vouched: Option<&BTreeMap<String, String>>,
+    ready: impl FnOnce(&Meta) -> Result<()>,
     finish: impl FnOnce(&mut R) -> Result<()>,
 ) -> Result<Arc<Template>> {
     let [len] = read_words(r)?;
@@ -1173,56 +1297,52 @@ pub fn receive<R: Read>(
     if firecracker.hash != meta.components["firecracker"].hash {
         bail!("template {id} was built with another Firecracker than {}: copy one Firecracker binary to every host", paths.firecracker.display());
     }
+    ready(&meta)?;
     let staging = Staging::new(paths, id)?;
     let gen = std::fs::canonicalize(&staging.parent.path)?.join(GENERATIONS).join(id);
     let mut budget = MAX_DATA;
     let mut file =
         |r: &mut _, name: &str, len| receive_file(r, &staging.dir.join(name), len, &mut budget).map_err(|e| format!("template {id}: its {name}: {e}"));
-    file(r, "vmstate", 0..=MAX_VMSTATE)?;
-    // Older generations name the root filesystem by its path (not `ROOTFS`), which must hold it here too.
-    // Its use lock held through publication, as a pull holds it (`image::Cached::reserved`): no `rmi` removes it meanwhile.
+    let vmstate = file(r, "vmstate", 0..=MAX_VMSTATE)?;
+    // Older generations name the root filesystem by its path (not `ROOTFS`), which must hold it here too: only
+    // a file of this host's image cache (`open_cached_rootfs`). Its use lock held through publication, as a pull
+    // holds it (`image::Cached::reserved`): no `rmi` removes it meanwhile.
     let local = match names_by_path(&std::fs::read(staging.dir.join("vmstate"))?, &meta.rootfs) {
         false => None,
         true => Some(
             (|| -> Result<_> {
-                let st = crate::util::fstat(File::open(&meta.rootfs)?.as_raw_fd())?;
+                let have = open_cached_rootfs(paths, &meta.rootfs)?;
+                let st = crate::util::fstat(have.as_raw_fd())?;
                 let held = crate::host::shared_at(&crate::host::host_locks()?, &crate::host::use_lock(&st))?;
-                let c = hash_file(&meta.rootfs)?;
-                let same = meta.rootfs.is_file() && (c.metadata.device, c.metadata.inode) == (st.st_dev, st.st_ino);
-                Ok((same && c.hash == meta.components["rootfs"].hash).then_some((c, held)))
+                let (c, sha) = hash_and_digest(&have, &meta.rootfs)?;
+                Ok((c.hash == meta.components["rootfs"].hash).then_some((c, sha, held)))
             })()
             .ok()
             .flatten()
             .ok_or_else(|| format!("template {id} names its root filesystem by its path {}, which does not hold it here", meta.rootfs.display()))?,
         ),
     };
-    file(r, "rootfs", 0..=MAX_FILE)?;
+    let sent_rootfs = file(r, "rootfs", 0..=MAX_FILE)?;
     // Test gate: half received, for a test to kill the receiver.
     crate::host::hold("receive_hold");
     // As long as its guest memory, which opening it maps a bitmap of.
-    file(r, "mem", meta.max_mib << 20..=meta.max_mib << 20)?;
+    let mem = file(r, "mem", meta.max_mib << 20..=meta.max_mib << 20)?;
     let staged = |n: &str| staging.dir.join(n);
-    let rootfs = local.as_ref().map_or(staged("rootfs"), |_| meta.rootfs.clone());
-    (meta.digests, meta.received) = (Some(digests(&meta, &staged("vmstate"), &staged("mem"), &rootfs)?), true);
+    let (rootfs, rootfs_use) = match local {
+        Some((have, sha, held)) => {
+            std::fs::remove_file(staged("rootfs"))?;
+            ((have, sha), Some(held))
+        }
+        None => (sent_rootfs, None),
+    };
+    (meta.digests, meta.received) = (Some(digests_of(&meta, [vmstate.1.clone(), mem.1.clone(), rootfs.1.clone()])?), true);
     if vouched.is_some_and(|v| Some(v) != meta.digests.as_ref()) {
         bail!("template {id}: its files do not match the SHA-256 digests the checkpoint records");
     }
-    let (rootfs, _rootfs_use) = match local {
-        Some((have, held)) => {
-            std::fs::remove_file(staged("rootfs"))?;
-            (have, Some(held))
-        }
-        None => {
-            meta.rootfs = gen.join("rootfs");
-            (hash_file(&staged("rootfs"))?, None)
-        }
-    };
-    let got = [
-        ("vmstate", hash_file(&staging.dir.join("vmstate"))?),
-        ("mem", hash_file(&staging.dir.join("mem"))?),
-        ("rootfs", rootfs),
-        ("firecracker", firecracker),
-    ];
+    if rootfs_use.is_none() {
+        meta.rootfs = gen.join("rootfs");
+    }
+    let got = [("vmstate", vmstate.0), ("mem", mem.0), ("rootfs", rootfs.0), ("firecracker", firecracker)];
     for (name, c) in got {
         if c.hash != meta.components[name].hash {
             bail!("template {id}: its {name} does not hash to the template's");
@@ -1239,6 +1359,23 @@ pub fn receive<R: Read>(
     Ok(tpl)
 }
 
+/// Whether the templates filesystem has room for a push of `bytes` (what its source says it sends, `Sending::len`),
+/// so one that cannot fit is refused before its data is sent. Each file's blocks are checked again as they are
+/// allocated (`receive_file`).
+pub fn check_room(paths: &Paths, bytes: u64) -> Result<()> {
+    if bytes > MAX_DATA + MAX_VMSTATE + MAX_META {
+        bail!("{} MiB is past the {} MiB a template may be", bytes >> 20, MAX_DATA >> 20);
+    }
+    crate::util::create_dir_durably(&paths.templates, 0o777)?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let dir = crate::util::cpath(&paths.templates)?;
+    crate::util::check(unsafe { libc::statvfs(dir.as_ptr(), &mut st) })?;
+    if st.f_bavail.saturating_mul(st.f_frsize) < bytes.saturating_add(KEEP_FREE) {
+        bail!("no room for its {} MiB: it would leave less than {} MiB free", bytes >> 20, KEEP_FREE >> 20);
+    }
+    Ok(())
+}
+
 fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
     let (mut out, mut b) = ([0; N], [0u8; 8]);
     for w in &mut out {
@@ -1253,8 +1390,9 @@ fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
 pub(crate) const ROOM_LOCK: &str = "receive-room";
 
 /// One of `send`'s files, written to a new `path` with the same length (one of `lens`) and holes, within
-/// what is left of the generation's `budget` (`MAX_DATA`) and of its filesystem's room, by blocks.
-fn receive_file(r: &mut impl Read, path: &Path, lens: std::ops::RangeInclusive<u64>, budget: &mut u64) -> Result<()> {
+/// what is left of the generation's `budget` (`MAX_DATA`) and of its filesystem's room, by blocks. Returns
+/// its component (hash and stamp) and digest, hashed as it is written (`Hashing`).
+fn receive_file(r: &mut impl Read, path: &Path, lens: std::ops::RangeInclusive<u64>, budget: &mut u64) -> Result<(Component, String)> {
     let [len, n] = read_words(r)?;
     if !lens.contains(&len) || n > MAX_EXTENTS {
         bail!("{len} bytes in {n} extents is past the limits");
@@ -1280,16 +1418,18 @@ fn receive_file(r: &mut impl Read, path: &Path, lens: std::ops::RangeInclusive<u
             .map_err(|e| format!("allocating its blocks: {e}"))?;
     }
     drop(admit);
-    let mut buf = vec![0u8; 1 << 20];
+    let (mut buf, mut hash) = (vec![0u8; 1 << 20], Hashing::new(len));
     for (mut off, end) in extents {
         while off < end {
             let n = (end - off).min(buf.len() as u64) as usize;
             r.read_exact(&mut buf[..n])?;
             file.write_all_at(&buf[..n], off)?;
+            hash.write(off, &buf[..n]);
             off += n as u64;
         }
     }
-    Ok(())
+    let (hash, digest) = hash.finish();
+    Ok((Component { hash, metadata: Stamp::of(&file.metadata()?) }, digest))
 }
 
 fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: &str, image: ImageMeta) -> Result<()> {
@@ -1571,6 +1711,58 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
     Ok(removed)
 }
 
+/// How long a received generation (`receive`) that no name links to stays once nothing uses it: no VM process
+/// has it open, no VM record or checkpoint here names it and no listener holds it for an arrival. A push serves
+/// the arrival right behind it, and that VM process holds it as long as it runs; an hour unused more spares a
+/// VM moving back, or another of its template coming, a second copy of GiBs, yet keeps what a peer pushing
+/// distinct templates leaves bounded by an hour of its pushes (and each receive leaves `KEEP_FREE`).
+pub const RECEIVED_IDLE: Duration = Duration::from_secs(3600);
+
+/// The periodic collection (`gc`): a sweep of what killed builds and receives left (`sweep`), then each received
+/// generation that no name links to and nothing has used for `idle` (`RECEIVED_IDLE`), removed as `rmi ID` would.
+/// One in use is stamped (its directory's mtime) as used now: how long it has been unused is how long since the
+/// last such stamp. Pulled generations and templates directories other states share (`SHARED`: their VMs and
+/// checkpoints are not in `in_use`) are left to `image prune`. Skipped while another holds the templates lock.
+/// Returns the ids removed.
+pub fn collect(paths: &Paths, idle: Duration, in_use: &dyn Fn() -> BTreeSet<String>) -> Result<Vec<String>> {
+    if !paths.templates.is_dir() {
+        return Ok(vec![]);
+    }
+    let linked = paths.templates.is_symlink();
+    let parent = crate::host::Directory::open(&paths.templates)?;
+    let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
+    let Ok(_lock) = templates_lock(paths, libc::LOCK_EX | libc::LOCK_NB) else { return Ok(vec![]) };
+    sweep_locked(paths)?;
+    if linked || paths.templates.join(SHARED).exists() {
+        return Ok(vec![]);
+    }
+    let (named, gens) = (names(&paths.templates)?, paths.templates.join(GENERATIONS));
+    let mut users = None;
+    let mut removed = vec![];
+    for id in generations(&paths.templates)? {
+        let dir = gens.join(&id);
+        if named.iter().any(|(_, i)| *i == id) || !Meta::read(&dir).is_ok_and(|m| m.received) {
+            continue;
+        }
+        let Ok(handle) = File::open(&dir) else { continue };
+        let st = crate::util::fstat(handle.as_raw_fd())?;
+        let open = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))?.is_none();
+        if open || users.get_or_insert_with(in_use).contains(&id) {
+            crate::util::check(unsafe { libc::futimens(handle.as_raw_fd(), std::ptr::null()) })?;
+            continue;
+        }
+        let unused = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().saturating_sub(st.st_mtime as u64);
+        if unused < idle.as_secs() {
+            continue;
+        }
+        if delete_unused(paths, &id, in_use)?.is_ok() {
+            crate::log!("template: removed received generation {id}, unused for {} s", unused);
+            removed.push(id);
+        }
+    }
+    Ok(removed)
+}
+
 /// `rmi`: removes the name `name` (if given), then the generation `id` (the one the name linked to)
 /// unless a name still links to it or a VM here uses it, and the image root filesystems that no
 /// generation left uses. The caller checked that no VM uses the name. `in_use` reads the content ids
@@ -1845,7 +2037,7 @@ pub(crate) mod tests {
         let mut f = Fixture::new();
         let (tpl, buf) = sent(&mut f, ROOTFS);
         let (dir, paths) = elsewhere(&f);
-        let got = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(())).unwrap();
+        let got = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(()), |_| Ok(())).unwrap();
         assert_eq!(got.meta.id, tpl.meta.id);
         let gen = std::fs::canonicalize(&*dir).unwrap().join(GENERATIONS).join(&tpl.meta.id);
         assert_eq!(got.meta.rootfs, gen.join("rootfs"));
@@ -1871,18 +2063,18 @@ pub(crate) mod tests {
             &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..],
         ]
         .concat();
-        let poisoned = receive(&elsewhere_paths, &mut &forged[..], &tpl.meta.id, None, |_| Ok(())).unwrap();
+        let poisoned = receive(&elsewhere_paths, &mut &forged[..], &tpl.meta.id, None, |_| Ok(()), |_| Ok(())).unwrap();
         assert!(poisoned.check_vouched(Some(&tpl.digests().unwrap()), "a checkpoint of it").is_err());
         // Vouched for by other digests (a checkpoint's): refused before it is published.
         let (_other, vouching) = elsewhere(&f);
         let mut other = tpl.digests().unwrap();
         other.insert("mem".into(), "0".repeat(64));
-        let e = receive(&vouching, &mut &buf[..], &tpl.meta.id, Some(&other), |_| Ok(())).err().unwrap().to_string();
+        let e = receive(&vouching, &mut &buf[..], &tpl.meta.id, Some(&other), |_| Ok(()), |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("do not match the SHA-256 digests") && nothing_in(&vouching), "{e}");
-        assert!(receive(&vouching, &mut &buf[..], &tpl.meta.id, Some(&tpl.digests().unwrap()), |_| Ok(())).is_ok());
+        assert!(receive(&vouching, &mut &buf[..], &tpl.meta.id, Some(&tpl.digests().unwrap()), |_| Ok(()), |_| Ok(())).is_ok());
         // An identical one arriving again keeps the first.
         drop(got);
-        receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(())).unwrap();
+        receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(()), |_| Ok(())).unwrap();
         assert_eq!(generations(&paths.templates).unwrap(), [tpl.meta.id.clone()]);
     }
 
@@ -1894,17 +2086,17 @@ pub(crate) mod tests {
         let (_dir, paths) = elsewhere(&f);
         let mut corrupt = buf.clone();
         *corrupt.last_mut().unwrap() ^= 1;
-        let e = receive(&paths, &mut &corrupt[..], id, None, |_| Ok(())).err().unwrap().to_string();
+        let e = receive(&paths, &mut &corrupt[..], id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("its mem does not hash"), "{e}");
-        assert!(receive(&paths, &mut &buf[..buf.len() - 10], id, None, |_| Ok(())).is_err());
+        assert!(receive(&paths, &mut &buf[..buf.len() - 10], id, None, |_| Ok(()), |_| Ok(())).is_err());
         // A root filesystem path that is empty or relative, or memory past the cap, is refused before anything is read.
         assert!(!names_by_path(b"anything", Path::new("")));
         for (rootfs, max_mib) in [("", tpl.meta.max_mib), ("rootfs", tpl.meta.max_mib), ("/r", MAX_MEM_MIB + 1)] {
             let meta = serde_json::to_vec(&Meta { rootfs: rootfs.into(), max_mib, ..tpl.meta.clone() }).unwrap();
             let forged = [&(meta.len() as u64).to_le_bytes()[..], &meta, &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..]].concat();
-            assert!(receive(&paths, &mut &forged[..], id, None, |_| Ok(())).err().unwrap().to_string().contains("past the limits"));
+            assert!(receive(&paths, &mut &forged[..], id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string().contains("past the limits"));
         }
-        let e = receive(&paths, &mut &buf[..], "abcd", None, |_| Ok(())).err().unwrap().to_string();
+        let e = receive(&paths, &mut &buf[..], "abcd", None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("not that template's"), "{e}");
         assert!(nothing_in(&paths));
         // Extents past the file, and more data than the cap.
@@ -1919,25 +2111,188 @@ pub(crate) mod tests {
         std::fs::write(&paths.firecracker, "another build").unwrap();
         use sha2::Digest;
         std::fs::write(paths.templates.join("firecracker.sha256"), format!("{:x}  firecracker\n", sha2::Sha256::digest("another build"))).unwrap();
-        let e = receive(&paths, &mut &buf[..], id, None, |_| Ok(())).err().unwrap().to_string();
+        let e = receive(&paths, &mut &buf[..], id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("another Firecracker"), "{e}");
     }
 
     #[test]
     fn an_older_generation_needs_its_root_filesystem_at_its_path() {
         let mut f = Fixture::new();
+        // Where a pull puts it: the image cache's (`image::Cached`).
+        let cache = f.paths.images.join("rootfs");
+        std::fs::create_dir_all(&cache).unwrap();
+        f.meta.rootfs = std::fs::canonicalize(&cache).unwrap().join("k.ext4");
+        std::fs::rename(f.dir.join("rootfs"), &f.meta.rootfs).unwrap();
         let rootfs = f.meta.rootfs.to_string_lossy().into_owned();
         let (tpl, buf) = sent(&mut f, &rootfs);
         let (_dir, paths) = elsewhere(&f);
-        let got = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(())).unwrap();
+        let got = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(()), |_| Ok(())).unwrap();
         assert_eq!(got.meta.rootfs, f.meta.rootfs, "the file its snapshot names, already here");
         assert!(!got.fixed.join("rootfs").exists());
         drop(got);
         let (_dir, paths) = elsewhere(&f);
         std::fs::write(&f.meta.rootfs, "another build").unwrap();
-        let e = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(())).err().unwrap().to_string();
+        let e = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("names its root filesystem by its path"), "{e}");
         assert!(nothing_in(&paths));
+        // A peer naming any other file, a device, a FIFO or a file outside the image cache, is refused without
+        // opening it to read (#823), and at once: a FIFO's open would block.
+        let fifo = std::fs::canonicalize(&cache).unwrap().join("fifo.ext4");
+        let path = crate::util::cpath(&fifo).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let elsewhere_file = f.dir.join("elsewhere.ext4");
+        std::fs::write(&elsewhere_file, "another build").unwrap();
+        for named in [Path::new("/dev/zero"), Path::new("/dev/watchdog"), &fifo, &elsewhere_file] {
+            let mut meta = tpl.meta.clone();
+            meta.rootfs = named.into();
+            let state = format!("state, pmem at {}", named.display());
+            let (_dir, paths) = elsewhere(&f);
+            let forged = forged_stream(&buf, &meta, state.as_bytes());
+            let started = Instant::now();
+            let e = receive(&paths, &mut &forged[..], &tpl.meta.id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string();
+            assert!(e.contains("which does not hold it here") && started.elapsed() < Duration::from_secs(5), "{named:?}: {e}");
+            assert!(nothing_in(&paths));
+        }
+    }
+
+    /// `buf` (a `send` of a generation whose vmstate names `ROOTFS` or a path) with `meta` for its metadata and
+    /// `vmstate` for its vmstate, the rest as sent.
+    fn forged_stream(buf: &[u8], meta: &Meta, vmstate: &[u8]) -> Vec<u8> {
+        let skip = 8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize;
+        let [len, n] = [0, 8].map(|o| u64::from_le_bytes(buf[skip + o..skip + o + 8].try_into().unwrap()));
+        let rest = &buf[skip + 16 + 16 * n as usize + len as usize..];
+        let meta = serde_json::to_vec(meta).unwrap();
+        let state = [vmstate.len() as u64, 1, 0, vmstate.len() as u64].map(u64::to_le_bytes).concat();
+        [&(meta.len() as u64).to_le_bytes()[..], &meta, &state, vmstate, rest].concat()
+    }
+
+    #[test]
+    fn only_a_regular_file_of_the_image_cache_is_opened() {
+        let f = Fixture::new();
+        let cache = f.paths.images.join("rootfs");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cache = std::fs::canonicalize(&cache).unwrap();
+        std::fs::write(cache.join("k.ext4"), "fs").unwrap();
+        let mut got = String::new();
+        open_cached_rootfs(&f.paths, &cache.join("k.ext4")).unwrap().read_to_string(&mut got).unwrap();
+        assert_eq!(got, "fs");
+        std::os::unix::fs::symlink(cache.join("k.ext4"), cache.join("link.ext4")).unwrap();
+        std::fs::create_dir(cache.join("dir.ext4")).unwrap();
+        let fifo = crate::util::cpath(&cache.join("fifo.ext4")).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(f.dir.join("out.ext4"), "fs").unwrap();
+        std::fs::write(cache.join("k"), "fs").unwrap();
+        let started = Instant::now();
+        for path in [
+            cache.join("link.ext4"),
+            cache.join("dir.ext4"),
+            cache.join("fifo.ext4"),
+            cache.join("missing.ext4"),
+            cache.join("../rootfs/k.ext4"),
+            cache.join("k"),
+            cache.join(".ext4"),
+            f.dir.join("out.ext4"),
+            "/dev/null".into(),
+        ] {
+            assert!(open_cached_rootfs(&f.paths, &path).is_err(), "{path:?}");
+        }
+        // Devices are neither opened (O_PATH: no driver's open runs) nor accepted.
+        for dev in ["null", "zero", "urandom"] {
+            let e = open_regular_at(Path::new("/dev"), dev.as_ref()).err().unwrap().to_string();
+            assert!(e.contains("not a regular file"), "{dev}: {e}");
+        }
+        assert!(open_regular_at(&cache, "fifo.ext4".as_ref()).err().unwrap().to_string().contains("not a regular file"));
+        assert!(started.elapsed() < Duration::from_secs(5), "nothing waited on");
+    }
+
+    #[test]
+    fn a_file_is_hashed_as_it_is_received() {
+        let dir = crate::test_util::TempDir::new("hash-received");
+        let page = PAGE_SIZE as u64;
+        let len = 40 * page + 123;
+        // Extents not page aligned, two in one page, a page all zero, and the last page partial.
+        let extents = [(100, 200), (300, page + 7), (3 * page, 4 * page), (9 * page + 1, 9 * page + 2), (39 * page + 5, len)];
+        let byte = |o: u64| if (3 * page..4 * page).contains(&o) { 0 } else { (o % 251 + 1) as u8 };
+        let mut stream: Vec<u8> = [len, extents.len() as u64].into_iter().chain(extents.iter().flat_map(|&(s, e)| [s, e])).flat_map(u64::to_le_bytes).collect();
+        for &(s, e) in &extents {
+            stream.extend((s..e).map(byte));
+        }
+        let path = dir.join("f");
+        let (c, sha) = receive_file(&mut &stream[..], &path, 0..=len, &mut MAX_DATA.clone()).unwrap();
+        assert_eq!(c.hash, hash_file(&path).unwrap().hash);
+        assert_eq!(c.metadata, Stamp::of(&std::fs::metadata(&path).unwrap()));
+        assert_eq!(sha, digest(&path).unwrap());
+        assert_eq!(hash_and_digest(&File::open(&path).unwrap(), &path).unwrap().1, sha);
+        // As a dense copy of the same bytes hashes.
+        let dense = dir.join("dense");
+        std::fs::write(&dense, std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!((hash_file(&dense).unwrap().hash, digest(&dense).unwrap()), (c.hash, sha));
+    }
+
+    #[test]
+    fn room_is_checked_before_a_push_sends_its_data() {
+        let f = Fixture::new();
+        check_room(&f.paths, 1 << 20).unwrap();
+        assert!(check_room(&f.paths, MAX_DATA * 2).err().unwrap().to_string().contains("past"));
+        assert!(check_room(&f.paths, (1 << 50) - 1).is_err());
+    }
+
+    #[test]
+    fn received_generations_are_collected_once_unused_for_a_while() {
+        let mut f = Fixture::new();
+        let (tpl, buf) = sent(&mut f, ROOTFS);
+        let id = tpl.meta.id.clone();
+        let (_dir, paths) = elsewhere(&f);
+        let none = || BTreeSet::new();
+        let got = receive(&paths, &mut &buf[..], &id, None, |_| Ok(()), |_| Ok(())).unwrap();
+        let gen = paths.templates.join(GENERATIONS).join(&id);
+        let age = |secs: i64| {
+            let t = libc::timespec { tv_sec: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - secs, tv_nsec: 0 };
+            let p = crate::util::cpath(&gen).unwrap();
+            assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, p.as_ptr(), [t, t].as_ptr(), 0) }, 0);
+        };
+        // Open (a listener holds it, or a VM process runs it): kept, and stamped as used now.
+        age(7200);
+        assert!(collect(&paths, RECEIVED_IDLE, &none).unwrap().is_empty());
+        assert!(std::fs::metadata(&gen).unwrap().modified().unwrap().elapsed().unwrap() < Duration::from_secs(60), "stamped");
+        drop(got);
+        // Used by a VM record or checkpoint here: kept.
+        age(7200);
+        assert!(collect(&paths, RECEIVED_IDLE, &|| BTreeSet::from([id.clone()])).unwrap().is_empty());
+        // Unused, but not for long: kept.
+        assert!(collect(&paths, RECEIVED_IDLE, &none).unwrap().is_empty() && Template::generation(&paths, &id).is_some());
+        // Named here: kept (`image prune` and `rmi` decide).
+        age(7200);
+        std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&id), paths.templates.join("t")).unwrap();
+        assert!(collect(&paths, RECEIVED_IDLE, &none).unwrap().is_empty());
+        std::fs::remove_file(paths.templates.join("t")).unwrap();
+        // Templates other states share: their checkpoints are not known here.
+        std::fs::write(paths.templates.join(SHARED), "").unwrap();
+        assert!(collect(&paths, RECEIVED_IDLE, &none).unwrap().is_empty());
+        std::fs::remove_file(paths.templates.join(SHARED)).unwrap();
+        // A killed receive's staging is swept by it too.
+        std::fs::create_dir(paths.templates.join(format!(".{id}.new-{}", crate::util::random_hex(8).unwrap()))).unwrap();
+        assert_eq!(collect(&paths, RECEIVED_IDLE, &none).unwrap(), [id.clone()]);
+        assert!(nothing_in(&paths));
+        // A built (pulled) one is never collected.
+        drop(receive(&paths, &mut &buf[..], &id, None, |_| Ok(()), |_| Ok(())).unwrap());
+        let mut meta = Meta::read(&gen).unwrap();
+        meta.received = false;
+        f.write_meta(&meta, &gen);
+        age(7200);
+        assert!(collect(&paths, Duration::ZERO, &none).unwrap().is_empty() && Template::generation(&paths, &id).is_some());
+    }
+
+    #[test]
+    fn a_killed_receives_staging_is_swept_at_once() {
+        let f = Fixture::new();
+        let (_dir, paths) = elsewhere(&f);
+        sweep_leftovers(&Paths { templates: paths.templates.join("none"), ..paths.clone() }).unwrap();
+        let staging = paths.templates.join(format!(".abcd.new-{}", crate::util::random_hex(8).unwrap()));
+        std::fs::create_dir(&staging).unwrap();
+        let live = Staging::new(&paths, "abce").unwrap();
+        sweep_leftovers(&paths).unwrap();
+        assert!(!staging.exists() && live.dir.exists(), "only the dead one's");
     }
 
     #[test]
@@ -2331,7 +2686,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sweep_keeps_rootfs_used_by_a_live_generation() {
+    fn sweep_keepsrootfs_used_by_a_live_generation() {
         let f = Fixture::new();
         let cache = f.dir.join("images");
         std::fs::create_dir_all(cache.join("rootfs")).unwrap();
