@@ -292,8 +292,16 @@ target's reply to them.
    the next build or push sweeps, never a generation. The listener holds the
    generation open for 17 s, until the arrival has opened it itself, so no
    `rmi` or prune removes it in between; from then on the VM holds it as any
-   VM does. Caps: 4 pushes at once (2 from one peer), 64 GiB of data, 1 GiB
-   left free on the disk, and 10 minutes for the whole push. A v0.1.0 target
+   VM does. Caps: 4 pushes at once (2 from one peer), 64 GiB of data, 2 GiB
+   left free on the disk (1 GiB of it for local checkpoints and suspends), and
+   10 minutes for the whole push. Spare received generations (unnamed, used by
+   nothing here or in a state sharing the templates, held for an arrival or
+   open in no VM process) and pushes under way are budgeted by their allocated
+   blocks (templates are sparse): an eighth of the filesystem (4 to 128 GiB) in
+   all and a quarter of that per peer, though a push with nothing else charged
+   may be larger. A push past the room or the budget first removes spares,
+   oldest first, within their hour of grace too, but none received in the last
+   5 minutes (its arrival may not hold it yet). A v0.1.0 target
    answers `unknown op`: the migration goes on and needs the generation there,
    as before, and one built since (whose snapshot names `rootfs`, which v0.1.0
    does not link) is refused at once. Disk room is checked and each file's
