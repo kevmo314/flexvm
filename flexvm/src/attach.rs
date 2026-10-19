@@ -752,7 +752,7 @@ mod tests {
         let got = frames(&mut peer, 2);
         assert_eq!(data(&got[0]), (0, b"a\x10b\x10".to_vec()));
         assert_eq!(got[1], (IN_DETACH, vec![]));
-        assert!(DETACHED.load(Ordering::SeqCst) && feed.detached());
+        crate::test_util::wait_until("detach callback", || DETACHED.load(Ordering::SeqCst) && feed.detached());
     }
 
     #[test]
