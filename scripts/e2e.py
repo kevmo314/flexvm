@@ -997,6 +997,148 @@ def checkpoint_store():
             A.kill(n, check=False)
 
 
+def relay(src, what, dst, flip=None, cut=None, load_args=()):
+    """`checkpoint save WHAT` on src piped into `checkpoint load` on dst, as `save | ssh b flexvm checkpoint
+    load`; flip: (member name suffix, offset) of a byte to change on the way, cut: bytes after which the
+    stream ends. Returns load's (exit status, output, error)."""
+    save = subprocess.Popen([BIN, "--state", src.state_dir, "--run", src.run_dir, "checkpoint", "save", what],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
+    load = subprocess.Popen([BIN, "--state", dst.state_dir, "--run", dst.run_dir, "checkpoint", "load", *load_args],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
+    sent = [0]
+
+    def put(b):
+        if cut is not None:
+            b = b[:max(0, cut - sent[0])]
+        load.stdin.write(b)
+        sent[0] += len(b)
+        if cut is not None and sent[0] >= cut:
+            raise EOFError
+
+    def take(n):
+        b = save.stdout.read(n)
+        assert len(b) == n, f"save ended early: {save.wait()} {save.stderr.read().decode()}"
+        return b
+
+    try:
+        while True:
+            h = take(512)
+            put(h)
+            if h == bytes(512):
+                put(save.stdout.read())
+                break
+            name = h[:100].rstrip(b"\0").decode()
+            size = int.from_bytes(h[125:136], "big") if h[124] & 0x80 else int(h[124:136].strip(b"\0 ") or b"0", 8)
+            left, pos = size + (-size % 512), 0
+            while left:
+                b = bytearray(take(min(left, 1 << 20)))
+                if flip and name.endswith(flip[0]) and pos <= flip[1] < pos + len(b):
+                    b[flip[1] - pos] ^= 0x40
+                pos, left = pos + len(b), left - len(b)
+                put(bytes(b))
+    except (BrokenPipeError, EOFError):
+        pass
+    finally:
+        with contextlib.suppress(BrokenPipeError):
+            load.stdin.close()
+        out, err = load.communicate(timeout=600)
+        if save.poll() is None:
+            save.kill()
+        save.wait()
+    return load.returncode, out.decode(), err.decode()
+
+
+def stored_ids(host):
+    return host.cli("checkpoint", "ls", "-q").stdout.split()
+
+
+def clear_checkpoints(*hosts):
+    for h in hosts:
+        for ck in stored_ids(h):
+            h.cli("checkpoint", "rm", "-f", ck, check=False)
+
+
+@case
+def checkpoint_save_load():
+    """checkpoint save | load (#775) of a chain onto a host that never pulled the image, and its restore there.
+    The template arrives by content id, unnamed; a tampered or truncated save is refused, publishing nothing."""
+    vm, fork, want = "e2e-save", "e2e-save-b", template_id(A, args.template)
+    with b_unpulled() as templates:
+        try:
+            A.run(vm)
+            m, proc = fill(A, vm), marker(A, vm)
+            base = A.checkpoint(vm, name="base")
+            must(A, vm, "echo 1 > /tmp/one")
+            head = A.checkpoint(vm, name="web", incremental=True)
+            # Refused while a member is cut or changed: nothing of it here after, not even the template.
+            layout = [("pages", "a checkpoint's page"), ("manifest.json", "a manifest"), (f"template/{want}", "the template")]
+            for member, what in layout:
+                code, out, err = relay(A, "web", B, flip=(member, 300))
+                check(f"load: a changed byte in {what} is refused", code != 0 and not stored_ids(B) and generations(templates) == [], (code, err))
+            for cut in (1 << 20, 64 << 20):
+                code, out, err = relay(A, "web", B, cut=cut)
+                check(f"load: a save cut at {cut >> 20} MiB is refused", code != 0 and not stored_ids(B) and generations(templates) == [], (code, err))
+            code, out, err = relay(A, "web", B)
+            loaded = json.loads(out) if code == 0 else {}
+            print(f"  save | load: {loaded}")
+            check("save | load: the chain and its template", loaded.get("loaded") == head["id"] and loaded.get("chain") == 2 and loaded.get("stored") == 2
+                  and loaded.get("template") == "received", (code, err))
+            check("B: the source's generation, unnamed", generations(templates) == [want] and template_id(B, None) == want and not template_id(B, args.template),
+                  json.loads(B.cli("images", "--json").stdout))
+            rows = {c["id"]: c for c in map(json.loads, B.cli("checkpoint", "ls", "--format", "json").stdout.splitlines())}
+            check("B: ls has the chain, named as on A", set(rows) == {base["id"], head["id"]} and rows[head["id"]]["name"] == "web"
+                  and rows[head["id"]]["parent"] == base["id"] and rows[head["id"]]["template_id"] == want, rows)
+            B.restore("web", name=fork, ip="auto")
+            check("B: restored, its memory and files as at the checkpoint", md5(B, fork) == m and marker_id(B, fork) == proc
+                  and B.exec(fork, "cat /tmp/one")[1].strip() == "1")
+            B.kill(fork)
+            code, out, err = relay(A, "web", B)
+            again = json.loads(out) if code == 0 else {}
+            check("load again: nothing new", again.get("stored") == 0 and again.get("template") == "present", (code, err))
+            # A stored checkpoint keeps its generation through image prune.
+            B.cli("image", "prune", "-f")
+            check("B: image prune keeps the generation a checkpoint uses", generations(templates) == [want])
+            clear_checkpoints(B)
+            pruned = []
+
+            def prune():
+                pruned.append(B.cli("image", "prune", "-f"))
+                return generations(templates) == []
+            check("B: once its checkpoints are gone, prune removes it", wait_for(prune, 40, 2), pruned[-1].stdout)
+        finally:
+            for h, n in ((A, vm), (B, fork)):
+                h.kill(n, check=False)
+            clear_checkpoints(A, B)
+
+
+@case
+def checkpoint_load_other_build():
+    """checkpoint load onto a host with another build under the same tag (#775): its tag stays on its build.
+    The restore runs the checkpoint's generation, by content id."""
+    vm, want = "e2e-load-other", template_id(A, args.template)
+    with b_unpulled() as templates:
+        try:
+            B.cli("pull", TEST_IMAGE, "--tag", args.template, "--vcpus", "2", "--max", TEMPLATE_MAX, timeout=600)
+            theirs = template_id(B, args.template)
+            check("B: its own build, another content id", theirs and theirs != want, (theirs, want))
+            A.run(vm)
+            m, proc = fill(A, vm), marker(A, vm)
+            ck = A.checkpoint(vm, name="other", stop=True)
+            code, out, err = relay(A, "other", B)
+            loaded = json.loads(out) if code == 0 else {}
+            check("load: the source's template received, by content id", loaded.get("loaded") == ck["id"] and loaded.get("template") == "received", (code, err))
+            check("B: its tag still names its own build", template_id(B, args.template) == theirs)
+            check("B: the source's generation is there unnamed", generations(templates) == sorted([want, theirs]) and template_id(B, None) == want)
+            B.restore("other")
+            check("B: restored onto the source's generation", md5(B, vm) == m and marker_id(B, vm) == proc
+                  and want in B.cli("inspect", vm).stdout and theirs not in B.cli("inspect", vm).stdout)
+            B.kill(vm)
+        finally:
+            A.kill(vm, check=False)
+            B.kill(vm, check=False)
+            clear_checkpoints(A, B)
+
+
 @case
 def suspend_resume():
     """stop (suspend) frees the VM's Firecracker; start brings back process and RAM; rm removes a stopped VM."""
@@ -2143,7 +2285,7 @@ COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "f
         "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
         "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
-        "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "checkpoint_store": 12, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
+        "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "checkpoint_store": 12, "checkpoint_save_load": 20, "checkpoint_load_other_build": 15, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
         "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
         "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,

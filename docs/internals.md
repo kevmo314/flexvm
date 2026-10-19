@@ -474,6 +474,49 @@ one builds on. `run --checkpoint` takes a name, else an id or a unique start
 of one (4+ digits); an argument with a `/` is a directory, restored as is
 (flexvm 0.1.0 wrote them with `checkpoint VM DIR`, which is refused now).
 
+#### Moving checkpoints: save and load (#775)
+
+`checkpoint save` writes a tar (`checkpoint::export`, GNU headers, regular files
+only) whose members are, in order: `flexvm-checkpoint.json` (the `Header`:
+the head's id, its name, the chain's ids head first, the template's content id,
+whether the template follows); per checkpoint of the chain, oldest first,
+`checkpoints/ID/manifest.json`, `vmstate`, `pagemap` and `pages`; then
+`template/TEMPLATE_ID`, the generation as a migration pushes it
+(`template::Sending`: its metadata, then vmstate, root filesystem and memory
+as length, data extents and their bytes; its length is known before it is
+written, as a tar header needs). Save opens all of it under the store's lock
+(shared) and the generation's use lock, then lets the store lock go: removal
+leaves open files readable, so a slow reader holds up no `rm`. It refuses a
+template whose digests are not the checkpoint's, and leaves out one whose
+checkpoint records none (v0.1.0's), with a warning.
+
+`checkpoint load` reads the members by the names expected next, each within its
+limit (header 64 KiB, manifest 1 MiB, vmstate as `MAX_VMSTATE`, a page map 36
+bytes per guest page, metadata of the chain within `chain_meta_budget`, pages
+within the store's free space less 1 GiB, the template within
+`template::receive`'s): it takes no path from the archive. The header's ids are
+checked first (16 hex digits, distinct, at most `MAX_CHAIN`; the template's a
+content id), and a name another checkpoint has is refused then. Each checkpoint
+is verified as `Link::open` and `PageFile::read` would (its manifest's checksum
+is its id, its parent the chain's next, the same template and size, its files'
+lengths and checksums, its page map, each page's CRC32C), and staged in the
+store (`Staging::import`); one the store has by its id is skipped. A parent is
+named `../ID` here: a manifest that names it otherwise (a v0.1.0 directory's) is
+rewritten, so it and its descendants get new ids. The template is taken only if
+no generation of that content id is here: received by `template::receive` with
+the head's `template_digests` as `vouched`, refused before publication unless
+they match its files, and after the end of the archive is checked (`finish`).
+A generation here that was received with other digests is refused
+(`check_vouched`). No name in `templates/` is read or written: the source's
+tags may name other builds. Then, under the store's lock (shared, ordered with
+`rm` and `prune`), the chain is published oldest first (`publish_as`,
+`RENAME_NOREPLACE`; one published meanwhile is kept), opened as a restore
+would, and named; the template stays open (its use lock) until then, so no
+prune or `rmi` takes it before a stored checkpoint keeps it. A crash leaves
+staging, which the next staging clears, and perhaps an older part of the chain,
+whole. `load -i DIR` reads the same members from a checkpoint directory and its
+chain (`Checkpoint::open`), through descriptors.
+
 #### Checkpoint format (versions 2 and 3)
 
 A checkpoint is a directory that is written in full or not at all. Its

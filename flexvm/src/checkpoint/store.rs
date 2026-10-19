@@ -102,7 +102,7 @@ pub fn list(state: &Path) -> Vec<Entry> {
     all
 }
 
-fn is_id(name: &str) -> bool {
+pub(crate) fn is_id(name: &str) -> bool {
     name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 

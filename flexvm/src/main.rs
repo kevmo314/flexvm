@@ -107,6 +107,12 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm checkpoint prune [--older-than AGE] [-f]
                                      remove stored checkpoints (older than AGE: 30m, 24h, 7d) no kept
                                      one builds on (-f: without asking)
+  flexvm checkpoint save NAME|ID [-o FILE]
+                                     write a stored checkpoint, its chain and its template as one
+                                     tar, to stdout unless -o (save web | ssh b flexvm checkpoint load)
+  flexvm checkpoint load [-i FILE|DIR] [--name NAME]
+                                     store a save (from stdin unless -i) or a checkpoint directory,
+                                     verified first; its template by content id, unnamed, if not here
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
               [--standby N] ...      pull an image and build its template (an archive or OCI layout
@@ -268,6 +274,8 @@ impl Args {
                 "-w" if cmd == Some("exec") => Some("workdir"),
                 "-u" if cmd == Some("exec") => Some("user"),
                 "-s" if cmd == Some("kill") => Some("signal"),
+                "-o" if cmd == Some("checkpoint") => Some("output"),
+                "-i" if cmd == Some("checkpoint") => Some("input"),
                 _ => None,
             };
             match valued.or_else(|| option.strip_prefix("--")) {
@@ -436,7 +444,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("unpause", NAMES, &[]),
     ("kill", NAMES, &["signal"]),
     ("rm", NAMES, &["force"]),
-    ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than"]),
+    ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -499,8 +507,10 @@ fn check_applies(args: &Args) -> Result<()> {
                 Some(op @ "ls") => (op, 2, &["quiet", "format", "filter"]),
                 Some(op @ "rm") => (op, NAMES, &["force"]),
                 Some(op @ "prune") => (op, 2, &["older-than", "force"]),
+                Some(op @ "save") => (op, 3, &["output"]),
+                Some(op @ "load") => (op, 2, &["input", "name"]),
                 // `checkpoint VM DIR`, before #775.
-                _ => bail!("checkpoint needs create, ls, rm or prune: flexvm checkpoint create VM [NAME] keeps a VM's checkpoint in STATE/checkpoints (it took a DIR before), and run --checkpoint NAME restores it"),
+                _ => bail!("checkpoint needs create, ls, rm, prune, save or load: flexvm checkpoint create VM [NAME] keeps a VM's checkpoint in STATE/checkpoints (it took a DIR before), and run --checkpoint NAME restores it"),
             };
             if let Some((f, _)) = args.flags.iter().find(|(f, _)| !GLOBAL.contains(&f.as_str()) && !flags.contains(&f.as_str())) {
                 bail!("--{f} does not apply to checkpoint {op} (see flexvm --help)");
@@ -511,6 +521,7 @@ fn check_applies(args: &Args) -> Result<()> {
             match op {
                 "create" if args.positional.len() < 3 => bail!("checkpoint create needs VM"),
                 "rm" if args.positional.len() < 3 => bail!("checkpoint rm needs NAME|ID"),
+                "save" if args.positional.len() < 3 => bail!("checkpoint save needs NAME|ID"),
                 _ => {}
             }
         }
@@ -2442,17 +2453,31 @@ mod exec_tests {
             &["checkpoint", "ls", "-q", "--filter", "vm=web", "--format", "{{.ID}}"],
             &["checkpoint", "rm", "-f", "a", "b"],
             &["checkpoint", "prune", "--older-than", "24h", "-f"],
+            &["checkpoint", "save", "web"],
+            &["checkpoint", "save", "web", "-o", "web.tar"],
+            &["checkpoint", "save", "-oweb.tar", "web"],
+            &["checkpoint", "load"],
+            &["checkpoint", "load", "-i", "web.tar", "--name", "w"],
         ] {
             check_applies(&parse(argv)).unwrap();
         }
+        let p = parse(&["checkpoint", "save", "web", "-o", "out.tar"]);
+        assert_eq!((p.get("output"), p.names()), (Some("out.tar"), &["save".to_string(), "web".into()][..]));
+        assert_eq!(parse(&["checkpoint", "load", "-i", "/d"]).get("input"), Some("/d"));
         let err = |argv: &[&str]| check_applies(&parse(argv)).unwrap_err().to_string();
         assert!(err(&["checkpoint", "web", "/tmp/ck"]).contains("flexvm checkpoint create VM [NAME]"), "the form before #775");
-        assert!(err(&["checkpoint"]).contains("needs create, ls, rm or prune"));
+        assert!(err(&["checkpoint"]).contains("needs create, ls, rm, prune, save or load"));
         assert_eq!(err(&["checkpoint", "create"]), "checkpoint create needs VM");
         assert_eq!(err(&["checkpoint", "rm"]), "checkpoint rm needs NAME|ID");
         assert!(err(&["checkpoint", "ls", "--stop"]).contains("--stop does not apply to checkpoint ls"));
         assert!(err(&["checkpoint", "create", "web", "a", "b"]).contains("does not take \"b\""));
         assert!(err(&["checkpoint", "prune", "x"]).contains("does not take"));
+        assert_eq!(err(&["checkpoint", "save"]), "checkpoint save needs NAME|ID");
+        assert!(err(&["checkpoint", "save", "a", "b"]).contains("does not take \"b\""));
+        assert!(err(&["checkpoint", "load", "x"]).contains("does not take"));
+        assert!(err(&["checkpoint", "load", "-o", "x"]).contains("--output does not apply to checkpoint load"));
+        assert!(err(&["checkpoint", "save", "web", "--name", "x"]).contains("--name does not apply to checkpoint save"));
+        assert!(err(&["checkpoint", "create", "web", "-i", "x"]).contains("--input does not apply"));
         let age = |s| util::parse_age(s).map(|d| d.as_secs());
         assert_eq!(["90s", "30m", "24h", "7d", "0d"].map(age), [Some(90), Some(1800), Some(86400), Some(604800), Some(0)]);
         assert!(["", "h", "1", "1w", "-1h", "1.5h"].into_iter().all(|s| age(s).is_none()));

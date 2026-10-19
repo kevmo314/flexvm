@@ -7,6 +7,7 @@ use super::{
     FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL,
 };
 use crate::{
+    bail,
     uffd::Runs,
     util::{Error, Phases, Result, PAGE_SIZE},
     vm::Vm,
@@ -130,6 +131,34 @@ impl Staging {
         let mut s = Staging::new(&store.join("new"), vmstate)?;
         s.by_id = true;
         Ok(s)
+    }
+
+    /// Into the store for `checkpoint load`: files added with `create`/`add_file`, then `publish_as`.
+    pub fn import(store: &Path) -> Result<Staging> {
+        let mut s = Staging::new(&store.join("new"), PathBuf::new())?;
+        s.by_id = true;
+        Ok(s)
+    }
+
+    /// Publishes what was added as the store's entry `id` (its manifest's checksum), never over
+    /// one: false if one is there already (identical, by its id), and this staging goes.
+    pub fn publish_as(mut self, id: &str) -> Result<bool> {
+        ensure!(self.by_id, "publish_as is for the store's staging");
+        check(unsafe { libc::fsync(self.ck.as_raw_fd()) })?;
+        (self.base, self.dest) = (cname(id), self.dest.with_file_name(id));
+        crate::util::sync_ancestors_fd(self.parent.as_raw_fd())?;
+        let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
+        match check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) }) {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) => return Ok(false),
+            r => r.map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?,
+        }
+        self.published = true;
+        if let Err(e) = check(unsafe { libc::fsync(parent) }) {
+            // Not durably there: none is better than one a crash may tear (a missing manifest revokes it).
+            let revoked = self.revoke();
+            bail!("making checkpoint {} durable: {e} (revoking it: {revoked:?})", self.dest.display());
+        }
+        Ok(true)
     }
 
     /// Where it is published: `dest`, or for `in_store` the store's entry `id`.
@@ -324,7 +353,9 @@ impl Drop for Staging {
     fn drop(&mut self) {
         let ck = (!self.published).then(|| self.ck.as_raw_fd());
         remove_staging(self.parent.as_raw_fd(), &self.outer_name, self.outer.as_raw_fd(), ck);
-        let _ = std::fs::remove_file(&self.vmstate);
+        if !self.vmstate.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.vmstate);
+        }
     }
 }
 
