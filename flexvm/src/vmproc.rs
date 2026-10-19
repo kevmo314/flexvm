@@ -557,7 +557,7 @@ impl Proc {
             .filter_map(|peer| {
                 thread::Builder::new()
                     .spawn(move || {
-                        let r = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string()}));
+                        let r = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string(), "lease": true}));
                         (peer, r)
                     })
                     .inspect_err(|e| crate::log!("borrow {ip}: cannot start peer call: {e}"))
@@ -566,21 +566,32 @@ impl Proc {
             .collect();
         let (mut lent, mut why) = (Vec::new(), Vec::new());
         for (peer, r) in asks.into_iter().filter_map(|a| a.join().ok()) {
-            match r.map(|r| r["gen"].as_u64().filter(|&g| g > 0)) {
-                Ok(Some(gen)) => lent.push((peer, gen)),
-                Ok(None) => why.push(format!("{peer} lent {ip} without a generation")),
+            match r {
+                Ok(r) => match r["gen"].as_u64().filter(|&g| g > 0) {
+                    Some(gen) => lent.push((peer, gen, r["lease"] == true)),
+                    None => why.push(format!("{peer} lent {ip} without a generation")),
+                },
                 Err(e) => why.push(e.to_string()),
             }
         }
         let mut lent = lent.into_iter();
         let first = lent.next();
-        for (peer, gen) in lent {
+        for (peer, gen, _) in lent {
             let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
         }
-        if let Some((peer, gen)) = first {
+        if let Some((peer, gen, lease)) = first {
             return match self.host.lock().and_then(|l| self.host.claim_incoming(&l, name, ip, gen, None)) {
                 Ok(mut c) => {
                     c.fresh = true;
+                    // Claimed before its lease is up (only a lender that leases: an older one would take
+                    // this for another loan). Refused, it may have expired: given back, never run.
+                    if lease {
+                        if let Err(e) = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string(), "gen": gen, "start": true})) {
+                            drop(c);
+                            let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+                            bail!("cannot claim {ip} borrowed from {peer}: {e}");
+                        }
+                    }
                     Ok(c)
                 }
                 Err(e) => {
@@ -3209,6 +3220,39 @@ fn call_checked(host: &Host, name: &str, req: Value, at: Option<Instant>, check:
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn borrowing_acknowledges_leases_and_still_accepts_older_lenders() {
+        for (lease, accepted) in [(true, true), (true, false), (false, true)] {
+            let root = crate::test_util::TempDir::new("borrow-lease");
+            let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            host.cfg.peers = vec![listener.local_addr().unwrap().to_string()];
+            let p = Proc::new(host, Paths::new(&root)).unwrap();
+            let lender = thread::spawn(move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                let req = crate::util::recv_json(&mut std::io::BufReader::new(&conn)).unwrap().unwrap();
+                assert_eq!(req["lease"], true);
+                send_json(&mut conn, &json!({"ok": true, "result": {"gen": 7, "lease": lease}})).unwrap();
+                if lease {
+                    let (mut conn, _) = listener.accept().unwrap();
+                    let req = crate::util::recv_json(&mut std::io::BufReader::new(&conn)).unwrap().unwrap();
+                    assert_eq!(req, json!({"op": "lend", "ip": "10.9.0.1", "gen": 7, "start": true}));
+                    send_json(&mut conn, &json!({"ok": accepted, "result": {}, "error": "expired"})).unwrap();
+                    if !accepted {
+                        let (conn, _) = listener.accept().unwrap();
+                        let req = crate::util::recv_json(&mut std::io::BufReader::new(&conn)).unwrap().unwrap();
+                        assert_eq!(req, json!({"op": "route", "ip": "10.9.0.1", "gen": 7}), "a refused claim gives the loan back");
+                    }
+                }
+            });
+            let claim = p.borrow("restore", "10.9.0.1".parse().unwrap());
+            assert_eq!(claim.is_ok(), accepted);
+            drop(claim);
+            assert!(p.host.addr(&p.host.lock().unwrap(), "10.9.0.1".parse().unwrap()).unwrap().holder.is_none());
+            lender.join_within().unwrap();
+        }
+    }
 
     /// What the controller shows left: MemAvailable above the reserve less what admission promised; unreadable
     /// promises leave none, unreadable MemAvailable leaves it unknown (none, `cow::Room::refresh`).
