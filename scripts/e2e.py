@@ -65,7 +65,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare forged_vmstate slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded signals suspend_gen standby standby_vm_ips restore_ip_peer spoof_filter killed_migrated "
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims standby_claim_caps fc_died fc_died_starting cow_grow plug_race plug_storm suspend_debris revoked_publication "
-          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
+          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_qdisc_backlog same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_slow_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
@@ -2305,7 +2305,7 @@ COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "f
         "faults/warm_ready": 7, "faults/guest_calls": 7, "faults/resume_slow_guest": 7, "faults/suspend_cmd": 7, "faults/suspend_resume": 7,
         "faults/bad_app_log": 6, "faults/checkpoint_hotplug": 6, "faults/exec_race": 6, "faults/fc_died_busy": 6,
         "faults/pause_cmd_start": 6, "faults/reconcile_announce": 6, "faults/resume_unpause_fail": 6,
-        "faults/same_host_hold_route_fail": 6, "faults/standby_lock_timeout": 6, "faults/standby_refill_race": 6,
+        "faults/same_host_hold_route_fail": 6, "faults/same_host_qdisc_backlog": 4, "faults/standby_lock_timeout": 6, "faults/standby_refill_race": 6,
         "faults/checkpoint_fork": 5, "faults/checkpoint_restore": 5, "faults/ckpt_backlog": 5,
         "faults/ckpt_rearm": 5, "faults/resume_failures": 5, "faults/resume_kill": 5,
         "faults/source_unpublished": 5, "pause_resume": 5, "faults/bad_preload": 4, "faults/basic": 4,

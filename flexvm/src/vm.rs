@@ -19,6 +19,8 @@ use crate::util::{Phases, Result, PAGE_SIZE};
 /// How long a VM about to be paused gets to take what is queued on its tap (`Vm::drain_tap`).
 /// It runs meanwhile; only what reaches its held address waits.
 const TAP_DRAIN_WAIT: Duration = Duration::from_millis(500);
+/// For what the tap's qdisc still holds after the pause to reach the tap's queue before the link goes down.
+const QDISC_DRAIN_WAIT: Duration = Duration::from_millis(20);
 
 const PULL_WAIT: Duration = Duration::from_secs(30);
 /// A clock request slower than this may have left the guest that far behind.
@@ -328,7 +330,22 @@ impl Vm {
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
             }
         };
+        // Test fault `tap_qdisc_backlog`: what is routed to the tap in the 3 ms before the hold
+        // waits in its qdisc (our released plug, plugged again) until 10 ms after it, past the
+        // pause, as a late sender's packet would (#817).
+        let backlog = crate::host::fault("tap_qdisc_backlog") && crate::net::plug_is_root(&self.tap) && crate::net::plug_tap(&self.tap).1.is_ok();
+        if backlog {
+            std::thread::sleep(Duration::from_millis(3));
+        }
         let held = unroute();
+        if backlog {
+            crate::log!("vm {}: injected fault: its tap's qdisc holds what reaches it until 10 ms after the hold", self.name);
+            let tap = self.tap.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                let _ = crate::net::unplug_tap(&tap);
+            });
+        }
         // Read while its Firecracker is still stopped, so a guest that empties the queue before
         // `drain_tap` first looks is still seen to have had one (#294).
         let backlog = stopped.is_some() && watch.as_ref().is_some_and(|fd| crate::net::tap_queued(fd).unwrap_or(false));
@@ -350,8 +367,14 @@ impl Vm {
         self.fc(|fc| fc.pause(API_TIMEOUT))?;
         t.mark("pause");
         // Link-down waits for an RCU grace period; joined on every path so `resume` never races it.
+        // Before it, what the tap's qdisc still holds (from a sender that looked the route up
+        // before the hold) goes on to the tap's queue, where `take_tap_queue` takes it: the
+        // link-down's qdisc reset would free it uncounted (#817). What is left is counted.
         let tap = self.tap.clone();
-        let down = std::thread::spawn(move || crate::net::set_link_up(&tap, false));
+        let down = std::thread::spawn(move || {
+            let left = crate::net::drain_qdisc(&tap, QDISC_DRAIN_WAIT);
+            (left, crate::net::set_link_up(&tap, false))
+        });
         // Test fault `snapshot_fail`: Firecracker's snapshot fails, the VM paused.
         let saved = match crate::host::tripped("snapshot_fail") {
             true => Err("injected fault: creating the snapshot failed".into()),
@@ -361,7 +384,10 @@ impl Vm {
             }),
         };
         t.mark("snapshot_create");
-        let down = down.join().unwrap_or_else(|_| Err("link-down thread panicked".into()));
+        let (left, down) = down.join().unwrap_or_else(|_| (0, Err("link-down thread panicked".into())));
+        if left > 0 {
+            crate::log!("vm {}: dropped {left} packets still in its tap's qdisc {} ms after the pause", self.name, QDISC_DRAIN_WAIT.as_millis());
+        }
         t.mark("link_down");
         saved?;
         down?;
