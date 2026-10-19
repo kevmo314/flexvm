@@ -193,7 +193,9 @@ impl Pager {
     }
 }
 
-/// Publish each disk chunk through the same progress callback as a streamed reply. A stop between chunks is
+/// Publish each disk chunk through the same progress callback as a streamed reply: the run's first `STREAM_RUN` pages,
+/// then the rest. The head is where a fault lands (a steered run starts just past the latest fault); a read per
+/// `STREAM_RUN` pages, one at a time, made a 256-page run take ~2.5x as long. A stop between chunks is
 /// `FetchFailure::Cancelled`, as for a source, not a (fatal) checkpoint error.
 fn read_file(
     off: u64,
@@ -207,7 +209,7 @@ fn read_file(
         if stop.load(Ordering::SeqCst) {
             return Err(io::Error::other(FetchFailure::Cancelled));
         }
-        let end = (done + STREAM_RUN * PAGE_SIZE).min(buf.len());
+        let end = if done == 0 { (STREAM_RUN * PAGE_SIZE).min(buf.len()) } else { buf.len() };
         read((off as usize + done) / PAGE_SIZE, &mut buf[done..end])?;
         done = end;
         if !progress(&buf[..done]) {
