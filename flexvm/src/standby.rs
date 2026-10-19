@@ -358,16 +358,18 @@ pub(crate) fn refill_later(host: &Host, template: &str) -> Result<usize> {
 /// Only a count set by hand (`set`) starts them regardless. `ready_wait`: their readiness replies
 /// are waited for (else they go on loading on their own, each listed already).
 fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool, ready_wait: bool) -> Result<usize> {
-    refill_with(host, template, wait, || refill_once(host, template, cooldown, ready_wait))
+    refill_with(host, template, wait, |later| refill_once(host, template, cooldown || later, ready_wait))
 }
 
-fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnMut() -> Result<usize>) -> Result<usize> {
+/// `refill(later)`: `later` for a recount another asked for, which keeps pressure's cooldown
+/// whatever this caller's (a `set` must not start standbys relief just stopped).
+fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnMut(bool) -> Result<usize>) -> Result<usize> {
     let pending = refill_lock_path(host, template).with_extension("pending");
     // Publish before trying the lock: its holder either sees this, or we get the lock ourselves.
     drop(crate::host::private_file(&pending)?);
     let mut started = 0;
     // Bound work under repeated pulls; further requests stay pending for the next refill.
-    for _ in 0..3 {
+    for round in 0..3 {
         let how = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
         let Some(lock) = refill_locked(Flock::new(refill_lock(host, template)?, how), wait)? else { break };
         let d = create_dir(host, template)?;
@@ -376,7 +378,7 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             r => r?,
         }
-        started += refill()?;
+        started += refill(round > 0)?;
         drop(legacy);
         drop(lock);
         // Check after unlocking too, so a request between the last recount and unlock is not lost.
@@ -703,6 +705,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                     // It may have outlived `superseded`'s wait. Unlist and free its VM before
                     // recounting, even without a listener; a busy refill takes over the request.
                     drop(p.standby.lock().unwrap().take());
+                    // Its grant too, if still in its window: the refill's grants must not count it.
+                    p.refund_start();
                     drop(low);
                     let files = std::mem::take(&mut *p.files.lock().unwrap());
                     if let Err(e) = refill_departed(host, template, files) {
@@ -1715,7 +1719,7 @@ mod tests {
         let p = paths.clone();
         let holder = std::thread::spawn(move || {
             let mut rounds = 0;
-            let started = refill_with(&h, "default", true, || {
+            let started = refill_with(&h, "default", true, |_| {
                 rounds += 1;
                 if rounds == 1 {
                     assert_eq!(key(&p, "default").unwrap(), "a");
@@ -1749,8 +1753,10 @@ mod tests {
         let lock = Flock::new(crate::host::private_file(&record).unwrap(), libc::LOCK_EX).unwrap();
         crate::host::write_record(&record, &serde_json::to_vec(&me).unwrap()).unwrap();
         let mut rounds = 0;
-        refill_with(&host, "default", true, || {
+        refill_with(&host, "default", true, |later| {
             rounds += 1;
+            // A recount on another's behalf keeps pressure's cooldown.
+            assert_eq!(later, rounds > 1);
             if rounds == 1 {
                 assert_eq!(live(&host, "default"), [me.clone()]);
                 // Like a standby that was still counted when the pull's five-second wait ended.
@@ -1771,9 +1777,10 @@ mod tests {
         let (_root, host, _paths, _d) = pool("refill-bounded");
         let mut rounds = 0;
         assert_eq!(
-            refill_with(&host, "default", true, || {
+            refill_with(&host, "default", true, |later| {
                 rounds += 1;
-                assert_eq!(refill_with(&host, "default", false, || panic!("refill lock was released")).unwrap(), 0);
+                assert_eq!(later, rounds > 1);
+                assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
                 Ok(1)
             })
             .unwrap(),
@@ -1781,7 +1788,7 @@ mod tests {
         );
         assert_eq!(rounds, 3);
         assert!(refill_lock_path(&host, "default").with_extension("pending").exists());
-        assert_eq!(refill_with(&host, "default", false, || Ok(0)).unwrap(), 0);
+        assert_eq!(refill_with(&host, "default", false, |_| Ok(0)).unwrap(), 0);
         assert!(!refill_lock_path(&host, "default").with_extension("pending").exists());
     }
 
