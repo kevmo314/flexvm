@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use libc::{
     c_int, IFA_ADDRESS, IFA_LOCAL, IFLA_ADDRESS, IFLA_IFALIAS, NDA_DST, NDA_LLADDR, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST,
     NUD_PERMANENT, RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTPROT_STATIC,
-    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
+    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
 };
 
 use crate::bail;
@@ -255,9 +255,7 @@ fn keep_mac_from_udev(udev: &OwnedFd, index: u32, name: &str, recheck: std::time
 /// Puts the gateway MAC back on tap `name` at `index` if something replaced it, while the
 /// index still has that name (as `delete_link`): never another device's. Whether it still has.
 fn restore_mac(index: u32, name: &str) -> bool {
-    let mut now = [0 as libc::c_char; libc::IFNAMSIZ];
-    let named = unsafe { libc::if_indextoname(index, now.as_mut_ptr()) };
-    if named.is_null() || unsafe { std::ffi::CStr::from_ptr(named) }.to_bytes() != name.as_bytes() {
+    if !has_name(index, name) {
         return false;
     }
     let mac = std::fs::read_to_string(format!("/sys/class/net/{name}/address")).ok().and_then(|s| parse_mac(&s).ok());
@@ -279,11 +277,15 @@ pub fn delete_tap(name: &str) {
 /// index, and one renamed or moved away (its index reused) another name. A rename in
 /// between the check and the delete is not caught.
 pub fn delete_link(ifindex: u32, name: &str) {
-    let mut now = [0 as libc::c_char; libc::IFNAMSIZ];
-    let named = unsafe { libc::if_indextoname(ifindex, now.as_mut_ptr()) };
-    if !named.is_null() && unsafe { std::ffi::CStr::from_ptr(named) }.to_bytes() == name.as_bytes() {
+    if has_name(ifindex, name) {
         let _ = netlink(RTM_DELLINK, 0, &ifinfomsg(ifindex));
     }
+}
+
+fn has_name(index: u32, name: &str) -> bool {
+    let mut now = [0 as libc::c_char; libc::IFNAMSIZ];
+    let named = unsafe { libc::if_indextoname(index, now.as_mut_ptr()) };
+    !named.is_null() && unsafe { std::ffi::CStr::from_ptr(named) }.to_bytes() == name.as_bytes()
 }
 
 /// A longer name is refused: the kernel would take it truncated.
@@ -654,8 +656,7 @@ fn parse_new_route(reply: &[u8]) -> Option<(u32, Ipv4Addr)> {
 
 /// Hosts sharing a netns share routes: never replace the target's tap route with one via us.
 pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
-    // Not knowing is no reason to leave a peer's VM unrouted.
-    if is_local_addr(via).unwrap_or(false) {
+    if is_local_addr(via)? {
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| crate::info!("not routing {ip} via {via}: a local address (hosts sharing a network namespace); this is logged once"));
         return Ok(());
@@ -681,8 +682,12 @@ pub fn route_dev(add: bool, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
     netlink(kind, flags, &route)
 }
 
+/// Removes `ip`'s route through a gateway (`route_via`'s, whichever peer it names: a migration's
+/// switch to its target is never recorded, and a record can name a newer peer than the route):
+/// universe scope only, so never a tap's or the hold device's (`route_dev`, link scope), which
+/// hosts sharing a network namespace each keep for their own VMs.
 pub fn unroute(ip: Ipv4Addr) {
-    let mut route = rtmsg(RT_SCOPE_NOWHERE);
+    let mut route = rtmsg(RT_SCOPE_UNIVERSE);
     attr(&mut route, RTA_DST, &ip.octets());
     let _ = netlink(RTM_DELROUTE, 0, &route);
 }
@@ -841,6 +846,7 @@ pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
     frame.extend_from_slice(&ip.octets());
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
+    addr.sll_protocol = (libc::ETH_P_ARP as u16).to_be();
     addr.sll_ifindex = ifindex as i32;
     addr.sll_halen = 6;
     addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
@@ -1238,6 +1244,61 @@ mod tests {
             // Works without CAP_NET_ADMIN: no route request is sent.
             route_via(Ipv4Addr::new(192, 0, 2, 123), via).unwrap();
         }
+    }
+
+    #[test]
+    fn a_failed_local_address_check_stops_routing() {
+        const CHILD: &str = "FLEXVM_TEST_GETIFADDRS_FAILURE";
+        if std::env::var_os(CHILD).is_some() {
+            // A fresh process has no cached addresses; no spare fd makes getifaddrs fail.
+            let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            let e = route_via(Ipv4Addr::new(198, 51, 100, 7), Ipv4Addr::new(192, 0, 2, 1)).unwrap_err().to_string();
+            assert!(e.contains("getifaddrs"), "{e}");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "net::tests::a_failed_local_address_check_stops_routing", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn interface_indices_must_still_have_the_expected_name() {
+        let index = ifindex("lo").unwrap();
+        assert!(has_name(index, "lo"));
+        assert!(!has_name(index, "flexvm-none0"));
+        assert!(!has_name(0, "lo"));
+    }
+
+    /// Needs CAP_SYS_ADMIN and CAP_NET_ADMIN, and iproute2; no VM. Routes stay in a private netns.
+    #[test]
+    #[ignore]
+    fn withdrawals_remove_only_gateway_routes() {
+        std::thread::spawn(|| {
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0, "{}", std::io::Error::last_os_error());
+            let ip = |args: &[&str]| {
+                let out = std::process::Command::new("ip").args(args).output().unwrap();
+                assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap()
+            };
+            ip(&["link", "add", "peer0", "type", "dummy"]);
+            ip(&["addr", "add", "192.0.2.3/24", "dev", "peer0"]);
+            ip(&["link", "set", "peer0", "up"]);
+            let index = ifindex("peer0").unwrap();
+            let target = Ipv4Addr::new(198, 51, 100, 7);
+            let route = || ip(&["-4", "route", "show", "198.51.100.7/32"]);
+            route_dev(true, target, index).unwrap();
+            unroute(target);
+            assert!(route().contains("dev peer0"), "a tap route survives a withdrawal");
+            route_via(target, Ipv4Addr::new(192, 0, 2, 2)).unwrap();
+            unroute(target);
+            assert!(route().is_empty(), "a route via any peer goes");
+        })
+        .join()
+        .unwrap();
     }
 
     /// An already enabled sysctl needs no write, so a read-only one that is on is no failure.
