@@ -2738,6 +2738,20 @@ pub struct NameLock {
 }
 
 impl NameLock {
+    /// Explicit removal clears both rotations before the name can be reused. A detached run's parent
+    /// opens its log before the child takes the name, so clearing at the child's start is too late.
+    pub fn remove_logs(&self) -> Result<()> {
+        let _logs = self.host.logs_lock(libc::LOCK_SH)?;
+        for ext in ["log", "log.1"] {
+            match std::fs::remove_file(self.host.vms(&self.name, ext)?) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     pub fn publish(&self, e: &Entry) -> Result<()> {
         store(&self.host.vms(&self.name, "json")?, e, false)
     }
