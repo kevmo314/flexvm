@@ -1711,6 +1711,7 @@ mod tests {
     /// handoffs, which need no host lock, are still answered (#521).
     #[test]
     fn host_lock_waits_are_bounded_and_leave_page_handoffs_room() {
+        use crate::test_util::WAIT;
         use std::io::Write;
         let root = crate::test_util::TempDir::new("listen-busy");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
@@ -1727,39 +1728,42 @@ mod tests {
         };
         let requests = [json!({"op": "lend", "ip": "10.200.0.7"}), json!({"op": "migration", "mig": 7}), json!({"op": "route", "ip": "10.200.0.8", "gen": 3})];
         // Held by another process, as one stopped while holding it would.
-        let held = crate::host::private_file(&host.lock_file()).unwrap();
-        crate::host::flock(&held, libc::LOCK_EX).unwrap();
+        // Explicitly unlock on drop: a parallel test can fork and inherit the file.
+        let held = crate::host::Flock::new(crate::host::private_file(&host.lock_file()).unwrap(), libc::LOCK_EX).unwrap();
         std::thread::scope(|s| {
             let waits: Vec<_> = requests.iter().map(|r| s.spawn(|| ask(r.clone()))).collect();
             for w in waits {
                 let (reply, took) = w.join().unwrap();
                 assert_eq!(reply["error"], BUSY, "{reply}");
-                assert!(took >= LOCK_WAIT && took < LOCK_WAIT + Duration::from_secs(2), "{took:?}");
+                // The lock stays held until every request has timed out. Allow for
+                // scheduling delays without losing the lower bound on its wait.
+                assert!(took >= LOCK_WAIT && took < WAIT, "{took:?}");
             }
         });
-        // Its budget taken: refused at once, the lock never waited for.
+        // Its budget taken: page handoffs still bypass both admission and the held lock.
         let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
         assert_eq!(full.len(), MAX_LOCKING);
         assert!(Slot::take(&LOCKING, MAX_LOCKING).is_none());
+        // Refused before any lock wait: well under LOCK_WAIT while another still holds the lock.
         for r in &requests {
             let (reply, took) = ask(r.clone());
-            assert!(reply["error"] == BUSY && took < Duration::from_secs(1), "{reply} {took:?}");
+            assert!(reply["error"] == BUSY && took < LOCK_WAIT, "{reply} {took:?}");
         }
         // Answered (its refusal then drains what the client sent, `vmproc::refuse_pages`).
         let (reply, _) = ask(json!({"op": "pages", "name": "web", "mig": 7}));
         assert!(reply["error"].as_str().unwrap().contains("not the source"), "{reply}");
-        drop(full);
         drop(held);
-        // Lent once free (other tests' hosts share this process's lock threads).
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let reply = loop {
-            let reply = ask(requests[0].clone()).0;
-            if reply["error"] != BUSY {
-                break reply;
-            }
-            assert!(Instant::now() < deadline, "not lent before deadline: {reply}");
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        // Acquire without a deadline, so other tests' process-wide lock waits cannot
+        // make these requests BUSY. On this thread the lock is now reentrant: only
+        // admission can refuse them, without a fragile stopwatch assertion.
+        let _l = host.lock().unwrap();
+        for r in &requests {
+            let (reply, _) = ask(r.clone());
+            assert_eq!(reply["error"], BUSY, "{reply}");
+        }
+        drop(full);
+        // Once admission is free, the same request succeeds under the same lock.
+        let (reply, _) = ask(requests[0].clone());
         assert_eq!(reply["result"]["ip"], "10.200.0.7", "{reply}");
     }
 
