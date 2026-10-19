@@ -429,13 +429,6 @@ fn refill_once(host: &Host, template: &str, cooldown: bool, ready_wait: bool) ->
     }
 }
 
-fn refill_departed(host: &Host, template: &str, files: Vec<PathBuf>) -> Result<usize> {
-    for f in files {
-        let _ = std::fs::remove_file(f);
-    }
-    refill_later(host, template)
-}
-
 fn refill_locked(lock: std::io::Result<Flock>, wait: bool) -> Result<Option<Flock>> {
     match lock {
         Ok(lock) => Ok(Some(lock)),
@@ -498,7 +491,10 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
         let args =
             ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--standby".as_ref(), template.as_ref()];
         crate::util::start_reaper()?;
-        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &[("FLEXVM_NOTIFY_FD", "3")])?;
+        // Its grant's id: a standby that leaves within the grant's window gives it back (`serve`).
+        let id = grant.to_string();
+        let env = [("FLEXVM_NOTIFY_FD", "3"), (GRANT_ENV, id.as_str())];
+        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &env)?;
         let by = Instant::now() + LOCKED_TIMEOUT;
         drop(w);
         let mut r = BufReader::new(r);
@@ -515,6 +511,28 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
     drop(stop);
     crate::util::reap_later(child, None);
     Ok(Some(r))
+}
+
+/// The admission grant a refill took for the standby it starts (`start_one`), by id.
+const GRANT_ENV: &str = "FLEXVM_STANDBY_GRANT";
+
+/// This standby's grant (`GRANT_ENV`), taken out of the environment so nothing it starts inherits it.
+fn inherited_grant() -> Option<u64> {
+    let id = std::env::var(GRANT_ENV).ok()?.parse().ok();
+    std::env::remove_var(GRANT_ENV);
+    id
+}
+
+/// A superseded standby leaving: unlisted (`files` removed) and its grant given back, so neither
+/// counts against the refill it then asks for.
+fn refill_departed(host: &Host, template: &str, files: Vec<PathBuf>, grant: Option<u64>) -> Result<usize> {
+    for f in files {
+        let _ = std::fs::remove_file(f);
+    }
+    if let Some(id) = grant {
+        host.refund(id);
+    }
+    refill_later(host, template)
 }
 
 /// Never let relief pass an unlisted live child, including on a partial or invalid reply.
@@ -627,6 +645,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // The key of the generation opened, not of whatever the name resolves to now: a
     // rebuild in between would publish this snapshot under the new generation's key.
     let mine = dir_key(&tpl.dir);
+    let grant = inherited_grant();
     let d = create_dir(host, template)?;
     let me = Ident::me();
     let id = me.key();
@@ -705,11 +724,9 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                     // It may have outlived `superseded`'s wait. Unlist and free its VM before
                     // recounting, even without a listener; a busy refill takes over the request.
                     drop(p.standby.lock().unwrap().take());
-                    // Its grant too, if still in its window: the refill's grants must not count it.
-                    p.refund_start();
                     drop(low);
                     let files = std::mem::take(&mut *p.files.lock().unwrap());
-                    if let Err(e) = refill_departed(host, template, files) {
+                    if let Err(e) = refill_departed(host, template, files, grant) {
                         crate::log!("standby {template}: {e}");
                     }
                 }
@@ -1760,7 +1777,7 @@ mod tests {
             if rounds == 1 {
                 assert_eq!(live(&host, "default"), [me.clone()]);
                 // Like a standby that was still counted when the pull's five-second wait ended.
-                assert_eq!(refill_departed(&host, "default", vec![record.clone()]).unwrap(), 0);
+                assert_eq!(refill_departed(&host, "default", vec![record.clone()], None).unwrap(), 0);
             } else {
                 assert!(live(&host, "default").is_empty());
                 assert_eq!(target(&host, "default"), 1);
@@ -1770,6 +1787,23 @@ mod tests {
         .unwrap();
         assert_eq!(rounds, 2);
         drop(lock);
+    }
+
+    #[test]
+    fn a_superseded_standbys_grant_no_longer_counts() {
+        let (_root, mut host, _paths, _d) = pool("refill-departed-grant");
+        host.cfg.reserve_mib = Some(0);
+        let grants =
+            |h: &Host| -> Vec<u64> { crate::host::load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default().into_iter().map(|g| g.2).collect() };
+        let mine = host.grant_above(MIN_GRANT_MIB, crate::host::Floor::Reserve, None).unwrap().unwrap();
+        let other = host.grant_above(MIN_GRANT_MIB, crate::host::Floor::Reserve, None).unwrap().unwrap();
+        std::env::set_var(GRANT_ENV, mine.to_string());
+        let grant = inherited_grant();
+        assert_eq!(grant, Some(mine));
+        assert!(std::env::var_os(GRANT_ENV).is_none());
+        // Its count is 0 here: only the grant is under test.
+        assert_eq!(refill_departed(&host, "default", Vec::new(), grant).unwrap(), 0);
+        assert_eq!(grants(&host), [other]);
     }
 
     #[test]
