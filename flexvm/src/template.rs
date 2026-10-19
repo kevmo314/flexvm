@@ -1622,7 +1622,6 @@ fn receive_inner<R: Read>(
     ready(&meta)?;
     let staging = Staging::new(paths, id)?;
     let paths = &Paths { templates: staging.parent.path.clone(), ..paths.clone() };
-    File::create(staging.dir.join(RECEIVED_AT))?;
     if let Some(push) = push {
         std::fs::write(staging.dir.join(PUSH_PEER), push.peer.to_canonical().to_string())?;
     }
@@ -1687,6 +1686,8 @@ fn receive_inner<R: Read>(
     meta.kernel = paths.kernel.clone();
     std::fs::write(staging.dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     finish(r)?;
+    // Stamped once all of it is in, however long it took: fresh from its publication on.
+    File::create(staging.dir.join(RECEIVED_AT))?;
     let (_, _l) = publish_generation(paths, &staging.dir, libc::LOCK_SH, || Ok(()))?;
     let tpl = Template::open_dir(id, paths.templates.join(GENERATIONS).join(id))?;
     tpl.verify(paths)?;
@@ -2793,6 +2794,30 @@ pub(crate) mod tests {
         std::fs::remove_file(paths.templates.join(GENERATIONS).join(&id).join(PUSH_PEER)).unwrap();
         let (legacy, ours, _) = push.usage(&paths, None).unwrap();
         assert!(legacy > 0 && ours == 0);
+    }
+
+    /// A slow transfer's generation is fresh from its publication, not from when its transfer began.
+    #[test]
+    fn a_slow_receipt_is_fresh_once_published() {
+        let mut f = Fixture::new();
+        let (tpl, buf) = sent(&mut f, ROOTFS);
+        let (_dir, paths) = elsewhere(&f);
+        let staging = || std::fs::read_dir(&paths.templates).unwrap().flatten().find(|e| leftover(&e.file_name().to_string_lossy(), "new")).unwrap().path();
+        let ended = std::cell::Cell::new(None);
+        // Its staging aged past `RECLAIM_AFTER` as the last of it arrives, as a transfer that took that long.
+        let finish = |_: &mut &[u8]| {
+            let dir = staging();
+            assert!(!dir.join(RECEIVED_AT).exists(), "not stamped before all of it is in");
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                aged(&e.path(), 2 * RECLAIM_AFTER.as_secs() as i64);
+            }
+            aged(&dir, 2 * RECLAIM_AFTER.as_secs() as i64);
+            ended.set(Some(std::time::SystemTime::now()));
+            Ok(())
+        };
+        let got = receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(()), finish).unwrap();
+        let at = std::fs::metadata(got.fixed.join(RECEIVED_AT)).unwrap().modified().unwrap();
+        assert!(at >= ended.get().unwrap() - Duration::from_secs(1) && fresh(&got.fixed));
     }
 
     #[test]
