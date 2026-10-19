@@ -1270,6 +1270,13 @@ fn an_id_shaped_name_the_listing_missed_is_not_taken_for_that_id() {
     let all = store::listed(checkpoints, entries(&names), names.clone());
     assert_eq!(all.dangling, [b.clone()]);
     assert!(store::find(&all, &b).is_err());
+    // B is missed, A's name (B's id) is read: that name must not select A.
+    let checkpoints = managed(&state).filter(|c| c.as_ref().map_or(true, |(d, _)| !d.ends_with(&b))).chain(std::iter::once(Err(missed())));
+    let all = store::listed(checkpoints, entries(&names), names.clone());
+    assert_eq!(all.entries.len(), 1);
+    let err = store::find(&all, &b).err().unwrap().to_string();
+    assert!(err.contains("may be the id of one the listing missed") && err.contains(&a), "{err}");
+    assert_eq!(store::find(&all, &a).unwrap().id, a);
     fs::remove_file(names.join(&b)).unwrap();
     assert_eq!(store::find(&store::list(&state), &b).unwrap().id, b);
 }

@@ -164,7 +164,8 @@ pub(crate) fn is_id(name: &str) -> bool {
 
 /// The checkpoint `what` names: by its name, else its id or the start of one (4 or more digits).
 /// A name and an id of two checkpoints (a name given before #862 may look like an id) is refused,
-/// as is an id while a name the listing missed may be it.
+/// as is an id while a name the listing missed may be it, or an id-shaped name while a checkpoint
+/// the listing missed may have that id.
 pub fn find<'a>(all: &'a Listing, what: &str) -> Result<&'a Entry> {
     let named = all.entries.iter().find(|e| e.names.iter().any(|n| n == what));
     let by_id = all.entries.iter().find(|e| is_id(what) && e.id == what);
@@ -174,6 +175,10 @@ pub fn find<'a>(all: &'a Listing, what: &str) -> Result<&'a Entry> {
     }
     match (named, by_id) {
         (Some(n), Some(i)) if n.id != i.id => bail!("{what:?} is a name of checkpoint {} and the id of another; give that one's name, or rename", n.id),
+        // An id-shaped name (one given before #862): the checkpoint with that id may be one the listing missed.
+        (Some(n), None) if is_id(what) && !all.errors.is_empty() => {
+            bail!("cannot resolve checkpoint {what:?}: it is a name of checkpoint {}, and may be the id of one the listing missed ({})", n.id, all.errors[0])
+        }
         (Some(e), _) => return Ok(e),
         (None, Some(e)) => {
             let Some(missed) = all.errors.first() else { return Ok(e) };
