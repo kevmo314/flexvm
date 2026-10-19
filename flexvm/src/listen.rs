@@ -31,7 +31,7 @@ static LOCKING: AtomicUsize = AtomicUsize::new(0);
 /// (`vmproc::peer_call`), and asks again.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// What a request that took the host lock too long, or found no room, is answered.
-const BUSY: &str = "host busy, try again";
+pub(crate) const BUSY: &str = "host busy, try again";
 /// Arrival processes from their start until they commit or are refused (or end), in all
 /// and from any one peer address; more arrivals are refused at once, before their source
 /// pauses anything.
@@ -451,10 +451,13 @@ impl Peers {
 
     /// The configured peer `from` is one of (`sender`), else `from` itself: who a loan is to.
     fn borrower(&self, cfg: &crate::host::Config, from: IpAddr) -> String {
-        let sender = self.sender(cfg, from);
+        let r = self.0.resolved.read().unwrap();
         cfg.peers
             .iter()
-            .find(|n| self.addrs(std::slice::from_ref(n)).iter().any(|&a| is_peer(&sender, a)))
+            .find(|n| {
+                let addrs = n.parse::<SocketAddr>().map_or_else(|_| r.get(*n).cloned().unwrap_or_default(), |a| vec![a.ip()]);
+                is_peer(&addrs, from) || cfg.underlays_of(n).iter().any(|&u| IpAddr::V4(u) == from.to_canonical())
+            })
             .cloned()
             .unwrap_or_else(|| from.to_canonical().to_string())
     }
@@ -1345,6 +1348,30 @@ mod tests {
             assert_eq!(host.mig_status(id).unwrap(), "released");
             assert_eq!(peers.borrower(&host.cfg, from.parse::<SocketAddr>().unwrap().ip()), "192.0.2.1:7070");
         }
+    }
+
+    #[test]
+    fn loan_connections_use_the_same_peer_across_addresses_and_underlays() {
+        let mut cfg = crate::host::Config { peers: vec!["other:7070".into(), "borrower:7070".into(), "unresolved:7070".into()], ..Default::default() };
+        cfg.peer_underlays.insert("borrower:7070".into(), vec!["198.51.100.1".parse().unwrap()]);
+        cfg.peer_underlays.insert("unresolved:7070".into(), vec!["198.51.100.2".parse().unwrap(), "198.51.100.3".parse().unwrap()]);
+        let peers = Peers::default();
+        peers.0.resolved.write().unwrap().extend([
+            // The old sender expansion would pick 'other' for one borrower address only.
+            ("other:7070".into(), vec!["192.0.2.9".parse().unwrap()]),
+            ("borrower:7070".into(), vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap(), "192.0.2.9".parse().unwrap()]),
+            ("unresolved:7070".into(), vec![]),
+        ]);
+        for (name, sources) in [
+            ("borrower:7070", vec!["192.0.2.1", "192.0.2.2", "198.51.100.1", "::ffff:192.0.2.1", "::ffff:198.51.100.1"]),
+            ("unresolved:7070", vec!["198.51.100.2", "198.51.100.3"]),
+        ] {
+            for from in sources {
+                let borrower = peers.borrower(&cfg, from.parse().unwrap());
+                assert_eq!(borrower, name, "{from}");
+            }
+        }
+        assert_eq!(peers.borrower(&cfg, "::ffff:203.0.113.1".parse().unwrap()), "203.0.113.1");
     }
 
     #[test]

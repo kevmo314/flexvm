@@ -23,7 +23,7 @@ use crate::util::{Error, Result};
 /// Loans to one peer not yet announced (`Host::lend_new`).
 const MAX_UNANNOUNCED_LOANS: usize = 64;
 /// Until the borrower claims it (`Host::start_loan`).
-const LOAN_WAIT_MS: u64 = 5 * 60 * 1000;
+pub(crate) const LOAN_WAIT_MS: u64 = 5 * 60 * 1000;
 /// How long a done migration's outcome is kept (`Host::mig_done`).
 const MIG_DONE_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -1183,7 +1183,7 @@ impl Host {
         Ok(gen)
     }
 
-    /// The borrower has claimed the loan: it no longer expires. Refused once it has.
+    /// The borrower has claimed the loan: it no longer expires. Repeated claims are idempotent.
     pub fn start_loan(&self, l: &Locked, ip: Ipv4Addr, gen: u64, borrower: &str) -> Result<()> {
         self.expire_loans(l, wall_ms());
         let a = self.addr(l, ip)?;
