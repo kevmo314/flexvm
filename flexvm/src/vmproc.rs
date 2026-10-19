@@ -3809,7 +3809,9 @@ mod tests {
         assert!(e.to_string().contains("recording its revision"), "{e}");
         std::fs::remove_dir(&blocker).unwrap();
         p.record_for_suspend().unwrap();
-        p.addr.lock().unwrap().take().unwrap().keep();
+        // As a suspend keeps it: taken out of `addr` first. `keep` takes the host lock, which the
+        // revision retry `advance` started may hold while it waits for `addr` (#810).
+        p.keep_addr();
         let l = p.host.lock().unwrap();
         assert_eq!(p.host.addr(&l, ip).unwrap().rev, 2, "recorded before the claim was kept");
         assert!(!p.host.unsynced_marker(ip).exists(), "and durably");

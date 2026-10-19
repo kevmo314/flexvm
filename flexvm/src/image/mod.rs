@@ -1582,31 +1582,65 @@ mod tests {
 
     /// #631: an rmi between the cache check and reading `.conf` (or reserving) made the pull fail.
     /// Both are under the key's lock now: every pull racing removals gets an intact, reserved entry.
+    ///
+    /// #810: a remover never pausing held the key's lock nearly always (its lock file made and
+    /// unlinked each time, slow on a disk), and a pull takes it by polling every 100 ms: pulls
+    /// starved for many minutes. The remover is in `remove_rootfs` a tenth of the time at most.
     #[test]
     fn a_pull_racing_removals_always_gets_a_reserved_entry() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::test_util::JoinWithin;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+        /// Ends the remover however the test ends, so a failure leaves nothing spinning.
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
         let root = crate::test_util::TempDir::new("rmi-pull-race");
         let (images, cached) = (root.join("images"), root.join("images/rootfs/k.ext4"));
         std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (stop, tries, removed) = (Stop(Arc::new(AtomicBool::new(false))), Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let remover = {
-            let (stop, images, cached) = (stop.clone(), images.clone(), cached.clone());
+            let (stop, tries, removed, images, cached) = (stop.0.clone(), tries.clone(), removed.clone(), images.clone(), cached.clone());
             std::thread::spawn(move || {
-                let mut removed = 0;
-                while !stop.load(Ordering::Relaxed) {
-                    removed += (remove_rootfs(&images, &cached).unwrap() == Removal::Removed) as u32;
+                while !stop.load(Ordering::SeqCst) {
+                    let start = Instant::now();
+                    if remove_rootfs(&images, &cached).unwrap() == Removal::Removed {
+                        removed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    tries.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(start.elapsed() * 9);
                 }
-                removed
             })
         };
-        for _ in 0..300 {
-            let got = cached_rootfs(&cached, build("built"), sync_dir).unwrap();
-            assert_eq!(got.conf, "built config");
-            assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
-            assert_eq!(read(&got.path), "built image");
-        }
-        stop.store(true, Ordering::Relaxed);
-        assert!(remover.join().unwrap() > 0, "the remover never got in: the race was not exercised");
+        let pulls = {
+            let (tries, images) = (tries.clone(), images.clone());
+            std::thread::spawn(move || {
+                // Called under the pull's key lock, after its cache check (and in a publication): refused there.
+                let sync = |dir: &Path| {
+                    assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
+                    sync_dir(dir)
+                };
+                for round in 0..300 {
+                    let got = cached_rootfs(&cached, build("built"), sync).unwrap();
+                    assert_eq!(got.conf, "built config");
+                    assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
+                    assert_eq!(read(&got.path), "built image");
+                    drop(got);
+                    // Every other round, a removal tried wholly after the entry is let go.
+                    if round % 2 == 0 {
+                        let from = tries.load(Ordering::SeqCst);
+                        crate::test_util::wait_until("the remover to try again", || tries.load(Ordering::SeqCst) >= from + 2);
+                    }
+                }
+            })
+        };
+        pulls.join_within().unwrap();
+        drop(stop);
+        remover.join_within().unwrap();
+        assert!(removed.load(Ordering::SeqCst) > 0, "the remover never got in: the race was not exercised");
     }
 
     #[test]
