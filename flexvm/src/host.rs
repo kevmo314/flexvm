@@ -214,9 +214,12 @@ impl Config {
         if let Some(p) = self.peers.iter().find(|p| !is_endpoint(p)) {
             bail!("bad peer {p:?}: give HOST:PORT, a peer's flexvm listen address");
         }
+        if let Some(ip) = self.underlay.filter(|ip| !is_underlay(ip)) {
+            bail!("underlay {ip} is loopback or not unicast");
+        }
         // A peer's underlays count only while it is a peer (`underlays_of`): a dropped peer's are ignored.
         for (peer, ips) in &self.peer_underlays {
-            if let Some(ip) = ips.iter().find(|i| i.is_unspecified() || i.is_broadcast() || i.is_multicast() || i.is_loopback()) {
+            if let Some(ip) = ips.iter().find(|ip| !is_underlay(ip)) {
                 bail!("peer_underlays {peer}: {ip} is loopback or not unicast");
             }
         }
@@ -406,6 +409,11 @@ impl Config {
             ),
         }
     }
+}
+
+/// Explicit host and peer underlays must be non-loopback unicast addresses.
+fn is_underlay(ip: &Ipv4Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() && !ip.is_loopback()
 }
 
 /// HOST:PORT, an IPv6 address in brackets; a name is resolved only when used.
@@ -4485,6 +4493,53 @@ pub(crate) mod tests {
         assert!(!check(Ok(false)).contains("peer_underlays"));
         assert!(check(Ok(true)).contains("peer_underlays peer:7070: 192.0.2.7 is local"));
         assert!(check(Err("getifaddrs failed")).contains("cannot check whether 192.0.2.7 is local: getifaddrs failed"));
+    }
+
+    #[test]
+    fn host_and_peer_underlays_accept_the_same_addresses() {
+        for (ip, valid) in [
+            ("192.0.2.7", true),
+            ("10.0.0.1", true),
+            ("169.254.1.2", true),
+            ("0.0.0.0", false),
+            ("255.255.255.255", false),
+            ("224.0.0.1", false),
+            ("239.255.255.255", false),
+            ("127.0.0.1", false),
+            ("127.1.2.3", false),
+        ] {
+            let ip = ip.parse().unwrap();
+            let mut cfg = Config { underlay: Some(ip), ..Config::default() };
+            assert_eq!(cfg.validate().is_ok(), valid, "underlay {ip}");
+            cfg.underlay = None;
+            cfg.peer_underlays.insert("peer:7070".into(), vec![ip]);
+            assert_eq!(cfg.validate().is_ok(), valid, "peer_underlays {ip}");
+        }
+    }
+
+    #[test]
+    fn explicit_underlay_content_is_checked_on_open_reload_and_write() {
+        let (_dir, mut h) = host("explicit-underlay-validation");
+        let path = h.state.join("host.json");
+        assert!(h.cfg.underlay.is_none());
+        for good in ["192.0.2.7", "10.0.0.1"] {
+            store(&path, &Config { underlay: Some(good.parse().unwrap()), ..Config::default() }, true).unwrap();
+            assert_eq!(Host::open(&h.state, &h.run).unwrap().cfg.underlay, Some(good.parse().unwrap()));
+            assert_eq!(h.config_now().underlay, Some(good.parse().unwrap()));
+        }
+        // Keep a valid live reload newer than the original (unset) configuration.
+        let good = h.config_now().underlay;
+        for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "239.255.255.255", "127.0.0.1", "127.1.2.3"] {
+            let bad = Config { underlay: Some(ip.parse().unwrap()), ..Config::default() };
+            store(&path, &bad, true).unwrap();
+            let e = Host::open(&h.state, &h.run).err().unwrap().to_string();
+            assert!(e.contains(&format!("underlay {ip} is loopback or not unicast")), "{e}");
+            assert_eq!(h.config_now().underlay, good, "{ip}");
+            assert!(h.configure(|_| Ok(())).is_err(), "{ip}");
+        }
+        store(&path, &Config::default(), true).unwrap();
+        assert!(Host::open(&h.state, &h.run).unwrap().cfg.underlay.is_none());
+        assert!(h.config_now().underlay.is_none());
     }
 
     #[test]
