@@ -17,13 +17,22 @@ artifacts (`artifacts/`), templates (`templates/`), pulled images
 binary with another default, set `FLEXVM_STATE_DIR` to an absolute path when
 building (`FLEXVM_STATE_DIR=/srv/flexvm cargo build --release`); `--state`
 still overrides it at run time. This README writes `/var/lib/flexvm` for
-whichever default the binary was built with, except where it says which state
-owns `/run/flexvm`: that is always the literal `/var/lib/flexvm`. The test and lab scripts
+whichever default the binary was built with, except in the run-path rules
+below. The test and lab scripts
 (`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`) take
 `FLEXVM_STATE_DIR` from the environment too; `fetch.sh` and
-`build-firecracker.sh` take `--state`. `/run/flexvm` stays `/var/lib/flexvm`'s whatever the
-built-in default: a binary built with another default runs its state in
-`/run/flexvm-PREFIX`, and an existing `/var/lib/flexvm` keeps working with
+`build-firecracker.sh` take `--state`.
+
+Each state directory is bound to one canonical run directory on first open:
+`STATE/run.json` records its run path, and `RUN/state.json` records its state.
+Using either with a different partner is refused, including after a reboot.
+Without `--run`, the run path follows from the state's path alone:
+`/run/flexvm` for the literal `/var/lib/flexvm`, and `/run/flexvm-PREFIX`
+(its tap prefix) for any other state. A state bound to a different run path
+must be given that `--run`. `/run/flexvm` belongs to `/var/lib/flexvm` alone,
+whatever default the binary was built with; any other state is refused it,
+even with `--run`. A binary built with another default therefore uses
+`/run/flexvm-PREFIX`, while an existing `/var/lib/flexvm` keeps working with
 `--state /var/lib/flexvm`, so both can be used side by side.
 
 ```sh
@@ -135,8 +144,8 @@ does: when the app exits, the VM exits with the app's status. In the
 foreground `run` returns that status. With `-d` the VM becomes an `exited`
 record: `ps -a` lists it with its status, its output stays in its log, `rm`
 removes it and `start` runs it again. `--rm` leaves no record (its log goes
-with the next sweep). `--keep` keeps the VM up once its app exits, to `exec`
-into. An image with no entrypoint and no command has no app: its VMs idle
+at a sweep once unwritten for an hour). `--keep` keeps the VM up once its
+app exits, to `exec` into. An image with no entrypoint and no command has no app: its VMs idle
 until told what to run (`exec`, `run IMAGE CMD`), and so does
 `run -d IMAGE sleep infinity`. With CMD, the VM follows CMD instead (the
 image's app, if any, still starts, but its exit does not end the VM). When the
@@ -206,7 +215,7 @@ fails `inspect` once the others are printed.
 | `suspended` | stopped: on disk, no process (`flexvm stop`, SIGTERM); `flexvm start` brings it back |
 | `quarantined` | a stopped VM that cannot be started (its address generation is unknown); `run --checkpoint` its directory with a new name and `--ip auto`, or `flexvm rm` it |
 | `exited` | its app (or CMD) exited in the background, with the status `ps` shows; `flexvm start` runs it again, `flexvm rm` removes it |
-| `failed` | died under its process (exit 124); `ps -a --json` (or `/run/flexvm/vms/NAME.failed`) says why, until `flexvm rm` |
+| `failed` | died under its process (exit 124); `ps -a --json` (or `/run/flexvm/vms/NAME.failed`) gives the reason and Firecracker's post-mortem summary (last lines, plus the start of a guest crash report); `flexvm logs NAME` has the full tail (up to 64 KiB), until `flexvm rm` |
 | `lost` | ran here when the host went down (a reboot, or its process was SIGKILLed); its address is withdrawn, until `flexvm rm` |
 
 The last five are stopped: `ps` lists them with `-a`. Standby VMs are not
@@ -308,8 +317,9 @@ column; `ps --json` and `run -d` return `ports` objects with `ip`, `host_port`, 
 These are single-host userspace proxies in the VM process. The guest sees
 the host as the client. Each mapping uses one thread, with up to 256 TCP
 connections or UDP client sessions; UDP sessions expire after 60 idle
-seconds. TCP buffers are bounded and support half-close. Killing or
-removing the VM closes its listeners and connections. Process death closes
+seconds. At the TCP cap, a new client can replace the connection idle
+longest if it has been idle for at least 60 seconds. TCP buffers are bounded
+and support half-close. Killing or removing the VM closes its listeners and connections. Process death closes
 them in the kernel immediately, so garbage collection has no forwarding
 rules or reservations left to remove.
 
@@ -527,9 +537,12 @@ warnings about likely mistakes.
 Every command checks the file as it loads it (`Config::validate`): a key it
 does not know, a malformed address or range, a `peers` entry that is not
 `HOST:PORT`, a `peer_underlays` address that is loopback or not unicast, a
-non-IPv4 `dns`, or a `vm_ips` not inside `cluster_ips` makes every command
-refuse to start, naming the file and the problem, until it is fixed. A
-running process keeps the last valid configuration meanwhile, so an edit
+non-IPv4 `dns`, a `listen` address without a nonzero port, or a `vm_ips`
+not inside `cluster_ips` makes every command refuse to start, naming the
+file and the problem, until it is fixed. An explicit `underlay` that is
+loopback or not unicast is refused on write; on read it is ignored with a
+warning and the underlay is derived instead. A running process keeps the
+last valid configuration meanwhile, so an edit
 mid-write is never taken. Write it whole (an editor's save, or a temporary
 file renamed over it); it must be a regular file, not a link, that no one
 but its owner (root) may write. A new `vm_ips` or `dns` applies to
@@ -601,7 +614,8 @@ warns until then). Derived values:
   `peer_underlays`.
 - `peer_underlays`: a peer's next hops besides its `peers` address, its
   `underlay` on another network. Only these, set here, are trusted: never an
-  address because it is on-link. Each must be unicast and not this host's.
+  address because it is on-link. Each must be non-loopback and unicast;
+  a local address is accepted with a warning.
   Entries for a host no longer in `peers` are ignored (`info` warns).
 - `announce_dev`, where the host answers ARP for its VMs (`proxy_arp`) and
   announces a VM that arrives: that route's device, none for peers on this
@@ -870,13 +884,8 @@ records itself (and the state the directory belongs to) in it, so `image prune`
 there can read each one's stopped VMs and checkpoints; pulls through a shared
 one leave old generations to `image prune` (see Images);
 after upgrading to this release, run a command with each such state (`flexvm --state S
-ps`) before pulling, or a stopped VM there may lose its generation. On first open, each state directory permanently records its canonical run
-path in `run.json`, and the run directory records its state in `state.json`; using
-either with a different partner is refused. Without `--run`, the run directory follows
-from the state's path alone (`/run/flexvm` for `/var/lib/flexvm`, `/run/flexvm-PREFIX` for
-any other), so after a reboot no state defaults into another's; a state bound to any other
-run directory must be given it. `/run/flexvm` belongs to `/var/lib/flexvm` alone, whatever default the binary was built with: any other
-state is refused it, even with `--run`.
+ps`) before pulling, or a stopped VM there may lose its generation.
+The state/run directory binding and defaults are described in [Setup](#setup).
 `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 
@@ -891,8 +900,9 @@ flexvm bench --lifecycle --to-state S --to-run R                 # pause, checkp
 ```
 
 The other host's state (S) holds the same artifacts and templates (symlinks
-to this host's do). Reports land in `bench/`. With `--dirty-mib`, the guest reads its memory
-back before and right after the migration; `post_copy` has the difference
+to this host's do). Run `bench` from inside a Git checkout; it fails outside
+one and writes reports to `bench/` at the Git top level. With `--dirty-mib`,
+the guest reads its memory back before and right after the migration; `post_copy` has the difference
 (`stall`) and the target's fault service per kind, including write-protect faults.
 Run percentiles are split into `run_standby` and `run_cold` (with matching
 `*_client` groups, and `ready_standby`/`ready_cold` with `--ready-port`); an
@@ -900,6 +910,15 @@ absent population is omitted. Phase percentiles use only
 samples containing that phase and include a `count`. Lifecycle `pause_client`
 and `resume_client` include signal dispatch and state polling at 1 ms intervals;
 they are client-observed times, with each trial reporting ten cycles' median.
+
+| option | default | what |
+|---|---|---|
+| `--timeout SECONDS` | 120 (minimum 1) | timeout for state waits, background pulls and app readiness |
+| `--iterations N` | 50; 5 with `--lifecycle` | measured trials (positive; lifecycle clamps to at least 1) |
+| `--warmup N` | 3 | unmeasured trials before run benchmarks; unused with `--lifecycle` |
+| `--settle-ms MS` | 100 | sleep after each run trial, including warmups; unused with `--lifecycle` |
+| `--ready-port PORT` | none | wait for a TCP connection after each run; unused with `--lifecycle` |
+| `--ready-http PORT` | none | send `GET /` and wait for a response byte after each run; unused with `--lifecycle`; mutually exclusive with `--ready-port` |
 
 ## Tests
 
