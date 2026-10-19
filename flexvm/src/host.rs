@@ -3054,7 +3054,8 @@ fn quarantined_now(dir: &Path) -> bool {
     }
 }
 
-pub const DEFAULT_STATE: &str = "/var/lib/flexvm";
+/// `--state` when none is given: `FLEXVM_STATE_DIR` at build time, else `/var/lib/flexvm` (build.rs).
+pub const DEFAULT_STATE: &str = env!("FLEXVM_DEFAULT_STATE");
 pub const DEFAULT_RUN: &str = "/run/flexvm";
 
 /// The run directory of `state` when no `--run` is given, by its path alone: `/run/flexvm` for

@@ -23,8 +23,22 @@ fn main() {
     }
     let commit = git(&root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=FLEXVM_GIT_COMMIT={commit}");
+    state_dir();
     pins(&root);
     init(&root);
+}
+
+/// The default `--state`: `FLEXVM_STATE_DIR` at build time, else `/var/lib/flexvm`.
+fn state_dir() {
+    println!("cargo:rerun-if-env-changed=FLEXVM_STATE_DIR");
+    let dir = std::env::var("FLEXVM_STATE_DIR").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "/var/lib/flexvm".into());
+    let path = Path::new(&dir);
+    assert!(
+        path.is_absolute() && path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_))),
+        "FLEXVM_STATE_DIR must be an absolute path without . or .. components, not {dir:?}"
+    );
+    assert!(!dir.contains(['\n', '\r']), "FLEXVM_STATE_DIR must not contain a newline");
+    println!("cargo:rustc-env=FLEXVM_DEFAULT_STATE={}", dir.trim_end_matches('/'));
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
