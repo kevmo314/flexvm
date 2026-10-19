@@ -809,21 +809,32 @@ fn timed_out(e: io::Error) -> io::Error {
     }
 }
 
+/// Runs `op` on `s` under a socket timeout of what is left until `at`, and again while that timeout (counted in
+/// kernel ticks) fires before `at` (#963).
+fn until<S, T>(s: &mut S, at: Instant, set: fn(&S, Duration) -> io::Result<()>, mut op: impl FnMut(&mut S) -> io::Result<T>) -> io::Result<T> {
+    loop {
+        set(s, By { s: (), at }.left()?)?;
+        match op(s) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            r => return r,
+        }
+    }
+}
+
 impl<S: Timed> Read for By<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.s.read_timeout(self.left()?)?;
-        self.s.read(buf).map_err(timed_out)
+        until(&mut self.s, self.at, S::read_timeout, |s| s.read(buf))
     }
     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
-        self.s.read_timeout(self.left()?)?;
-        self.s.read_vectored(bufs).map_err(timed_out)
+        until(&mut self.s, self.at, S::read_timeout, |s| s.read_vectored(bufs))
     }
 }
 
 impl<S: Timed + BufRead> BufRead for By<S> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.s.read_timeout(self.left()?)?;
-        self.s.fill_buf().map_err(timed_out)
+        // fill_buf's borrow can't leave a retry loop, so wait until it has data (or fails) and take it again.
+        until(&mut self.s, self.at, S::read_timeout, |s| s.fill_buf().map(drop))?;
+        self.s.fill_buf()
     }
     fn consume(&mut self, n: usize) {
         self.s.consume(n);
@@ -832,8 +843,7 @@ impl<S: Timed + BufRead> BufRead for By<S> {
 
 impl<S: Timed + Write> Write for By<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.s.write_timeout(self.left()?)?;
-        self.s.write(buf).map_err(timed_out)
+        until(&mut self.s, self.at, S::write_timeout, |s| s.write(buf))
     }
     fn flush(&mut self) -> io::Result<()> {
         self.s.flush()
@@ -862,16 +872,12 @@ impl<S> Paced<S> {
         let nanos = self.moved as u128 * 1_000_000_000 / self.rate as u128;
         self.start + self.grace + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
     }
-
-    fn left(&self) -> io::Result<Duration> {
-        By { s: (), at: self.at() }.left()
-    }
 }
 
 impl<S: Timed> Read for Paced<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.s.read_timeout(self.left()?)?;
-        let n = self.s.read(buf).map_err(timed_out)?;
+        let at = self.at();
+        let n = until(&mut self.s, at, S::read_timeout, |s| s.read(buf))?;
         self.moved += n as u64;
         Ok(n)
     }
@@ -879,8 +885,8 @@ impl<S: Timed> Read for Paced<S> {
 
 impl<S: Timed + Write> Write for Paced<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.s.write_timeout(self.left()?)?;
-        let n = self.s.write(buf).map_err(timed_out)?;
+        let at = self.at();
+        let n = until(&mut self.s, at, S::write_timeout, |s| s.write(buf))?;
         self.moved += n as u64;
         Ok(n)
     }
