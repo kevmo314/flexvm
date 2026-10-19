@@ -830,7 +830,8 @@ fn covers(local: std::net::SocketAddr, v6only: bool, addrs: &[std::net::SocketAd
 /// wildcard one any of its family (an IPv6 one IPv4 too, unless IPV6_V6ONLY).
 fn takes(local: std::net::SocketAddr, v6only: bool, ip: std::net::IpAddr) -> bool {
     let (ip, bound) = (ip.to_canonical(), local.ip().to_canonical());
-    match (bound.is_unspecified(), local.ip()) {
+    // By the canonical family: a mapped wildcard ([::ffff:0.0.0.0]) takes IPv4 only.
+    match (bound.is_unspecified(), bound) {
         (false, _) => ip == bound,
         (true, std::net::IpAddr::V4(_)) => ip.is_ipv4(),
         (true, std::net::IpAddr::V6(_)) => ip.is_ipv6() || !v6only,
@@ -847,10 +848,15 @@ fn resolve_listener(addr: &str) -> Result<Vec<std::net::SocketAddr>> {
     listener_addresses(addr, resolved)
 }
 
-/// A name's distinct addresses, in the resolver's order: peers may choose any of them.
+/// A name's distinct addresses, in the resolver's order: peers may choose any of them. An IPv4-mapped
+/// one is its IPv4 address: the two share one binding, so binding both would fail.
 fn listener_addresses(addr: &str, resolved: Vec<std::net::SocketAddr>) -> Result<Vec<std::net::SocketAddr>> {
     let mut out: Vec<std::net::SocketAddr> = Vec::new();
     for a in resolved {
+        let a = match a.ip().to_canonical() {
+            std::net::IpAddr::V4(v4) => std::net::SocketAddr::from((v4, a.port())),
+            std::net::IpAddr::V6(_) => a,
+        };
         if a.port() == 0 {
             bail!("listening on {addr}: give a port; peers are told it");
         }
@@ -2727,6 +2733,12 @@ mod exec_tests {
         assert_eq!(listener_addresses("host:7070", vec![v4]).unwrap(), [v4]);
         assert_eq!(listener_addresses("host:7070", vec![v4, v4]).unwrap(), [v4]);
         assert_eq!(listener_addresses("host:7070", vec![v6, v4, v6]).unwrap(), [v6, v4]);
+        // A mapped address is its IPv4 one, so the pair binds once; a plain IPv6 one keeps its scope.
+        let mapped: std::net::SocketAddr = "[::ffff:127.0.0.1]:7070".parse().unwrap();
+        assert_eq!(listener_addresses("host:7070", vec![v4, mapped]).unwrap(), [v4]);
+        assert_eq!(listener_addresses("host:7070", vec![mapped, v4]).unwrap(), [v4]);
+        let scoped: std::net::SocketAddr = "[fe80::1%3]:7070".parse().unwrap();
+        assert_eq!(listener_addresses("host:7070", vec![scoped]).unwrap()[0].to_string(), "[fe80::1%3]:7070");
         assert!(listener_addresses("host:7070", vec![]).is_err());
         assert!(listener_addresses("host:0", vec!["127.0.0.1:0".parse().unwrap()]).is_err());
         // Every address gets its own socket, taking connections; one that cannot be bound fails them all.
@@ -2738,6 +2750,11 @@ mod exec_tests {
             let _c = std::net::TcpStream::connect(a).unwrap();
             l.accept().unwrap();
         }
+        let mapped: std::net::SocketAddr = format!("[::ffff:127.0.0.1]:{port}").parse().unwrap();
+        let once = listener_addresses("host", vec![two[0], mapped]).unwrap();
+        drop(bound);
+        let bound = bind_each("host", &[once, vec![two[1]]].concat()).unwrap();
+        assert_eq!(bound.len(), 2);
         let held = bound.into_iter().nth(1).unwrap();
         let e = bind_each("host", &two).unwrap_err().to_string();
         assert!(e.starts_with(&format!("listen on host (127.0.0.2:{port}): ")), "{e}");
@@ -2759,6 +2776,13 @@ mod exec_tests {
         assert!(activated_at("10.1.2.3:7070", v6, false).is_ok());
         assert!(activated_at("10.1.2.3:7070", v6, true).is_err());
         assert!(activated_at("[::ffff:10.1.2.3]:7070", wildcard, false).is_ok());
+        // A mapped wildcard binds IPv4 only, whatever IPV6_V6ONLY says.
+        let mapped = a("[::ffff:0.0.0.0]:7070");
+        for v6only in [false, true] {
+            assert!(activated_at("10.1.2.3:7070", mapped, v6only).is_ok());
+            assert!(activated_at("[::1]:7070", mapped, v6only).is_err());
+            assert!(!covers(mapped, v6only, &[a("[::1]:7070"), a("127.0.0.1:7070")]));
+        }
         // A name's addresses must all be taken, not only one of them (#826).
         let both = [a("[::1]:7070"), a("127.0.0.1:7070")];
         assert!(!covers(a("127.0.0.1:7070"), false, &both));
