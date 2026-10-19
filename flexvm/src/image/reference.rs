@@ -30,11 +30,15 @@ impl Reference {
             }
             d => (d.to_string(), path),
         };
-        if repository.is_empty() || !repository.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-/".contains(c)) {
+        if repository.split('/').any(|p| matches!(p, "" | "." | ".."))
+            || !repository.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-/".contains(c))
+        {
             bail!("bad image reference {s:?}");
         }
         let reference = match (digest, tag) {
-            (Some(d), _) if !d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit())) => {
+            (Some(d), _)
+                if !d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))) =>
+            {
                 bail!("bad digest in {s:?}: only sha256 digests are supported")
             }
             (d, t) => d.or(t).unwrap_or("latest").to_string(),
@@ -142,10 +146,25 @@ mod tests {
             let r = Reference::parse(&format!("app:{tag}")).unwrap();
             assert_eq!(Reference::from_template_name(&r.template_name()).unwrap(), r);
         }
-        for hex in ["a".repeat(63), "a".repeat(65), format!("{}g", "a".repeat(63)), format!("{}/", "a".repeat(63)), format!("{}.", "a".repeat(63))] {
+        for hex in
+            ["a".repeat(63), "a".repeat(65), format!("{}g", "a".repeat(63)), format!("{}/", "a".repeat(63)), format!("{}.", "a".repeat(63)), "aB09".repeat(16)]
+        {
             assert!(Reference::parse(&format!("app@sha256:{hex}")).is_err(), "{hex}");
         }
-        assert!(Reference::parse(&format!("app@sha256:{}", "aB09".repeat(16))).is_ok());
+        assert!(Reference::parse(&format!("app@sha256:{}", "ab09".repeat(16))).is_ok());
+    }
+
+    #[test]
+    fn repository_components_are_nonempty_and_not_dots() {
+        for repo in ["", "/app", "app/", "org//app", ".", "..", "org/./app", "org/../app"] {
+            assert!(Reference::parse(&format!("ghcr.io/{repo}")).is_err(), "{repo}");
+        }
+        for repo in ["app", "org/app", "org/my.app", "org/a..b"] {
+            assert!(Reference::parse(&format!("ghcr.io/{repo}")).is_ok(), "{repo}");
+        }
+        for repo in ["", "app/", "org//app", "org/./app", "org/../app"] {
+            assert!(Reference::parse(repo).is_err(), "{repo}");
+        }
     }
 
     #[test]

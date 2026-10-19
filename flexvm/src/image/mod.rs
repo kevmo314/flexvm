@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -150,7 +151,7 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 /// `init` is flexvm-init's path, or the one built into flexvm (`artifacts::INIT`) for `None`.
 /// The root filesystem comes reserved (`Cached::reserved`): hold it until the template is published.
 pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBuf, ImageMeta, Flock, crate::host::HeldLock)> {
-    crate::util::create_dir_durably(cache, 0o755)?;
+    private_dir(cache)?;
     let cache_dir = crate::host::Directory::open(cache)?;
     let key = crate::host::keyed("image-cache", &cache_dir.stat()?, "");
     let _cache_lock = crate::host::lock_at(crate::host::host_locks()?, &key, libc::LOCK_SH)?;
@@ -291,7 +292,7 @@ pub struct Cached {
 fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<Cached> {
     let dir = cached.parent().unwrap();
     // Entries handed out must survive a crash right after the first build, whoever made the directories.
-    crate::util::create_dir_durably(dir, 0o777)?;
+    private_dir(dir)?;
     // All work is in the directory as opened here, which the locks are keyed by.
     let pinned = crate::host::Directory::open(dir)?;
     let (original, cached) = (cached, pinned.path.join(cached.file_name().unwrap()));
@@ -306,6 +307,9 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         res => res.map(|_| true)?,
     };
     if entry_complete(cached) {
+        for ext in ["ext4", "conf", "ok"] {
+            private_file(&cached.with_extension(ext))?;
+        }
         // A previous publisher may have failed its fsync after renaming .ok.
         sync(dir)?;
         crate::log!("image: root filesystem cached at {}", original.display());
@@ -436,7 +440,7 @@ fn remove_leftovers(cached: &Path) -> Result<()> {
 /// Publishes immutable files, the completion marker last, never replacing one: the caller's
 /// per-key lock leaves no competing publisher, so anything already there is a stray.
 fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<()> {
-    File::open(tmp)?.sync_all()?;
+    private_file(tmp)?.sync_all()?;
     let dir = cached.parent().unwrap();
     let published = rename_noreplace(tmp, cached)? && publish(&cached.with_extension("conf"), bytes(conf.as_bytes()))? && {
         sync(dir)?;
@@ -467,7 +471,11 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     use std::os::unix::fs::OpenOptionsExt;
     // In the directory the publication lock is keyed by, whatever its path names meanwhile.
     let pinned = crate::host::Directory::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+    File::open(&pinned.path)?.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     let path = pinned.path.join(path.file_name().ok_or("no file name")?);
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+        private_file(&path)?;
+    }
     let tmp = path.with_extension(format!("part{}", random_hex(8)?));
     let dir = publish_lock(&pinned)?;
     // Every lock is let go explicitly (`Flock`), not by close: a child another thread forks
@@ -484,6 +492,7 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
         (f, part)
     };
     let res = (|| {
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         write(&mut f)?;
         f.sync_all()?;
         Ok(rename(&tmp, &path)?)
@@ -491,12 +500,23 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     // The name is ours alone: gone if renamed, else a failed write's.
     let _ = std::fs::remove_file(&tmp);
     drop(part);
-    if res.is_ok() {
-        // Published data remains readable; only temporary parts are ever flocked.
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-    }
     res
+}
+
+/// Cache permissions also cover entries made by older versions, without changing ownership.
+fn private_dir(path: &Path) -> Result<()> {
+    crate::util::create_dir_durably(path, 0o700)?;
+    Ok(File::open(path)?.set_permissions(std::fs::Permissions::from_mode(0o700))?)
+}
+
+fn private_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    if !f.metadata()?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(f)
 }
 
 fn bytes(data: &[u8]) -> impl FnOnce(&mut File) -> Result<()> + '_ {
@@ -507,7 +527,7 @@ fn bytes(data: &[u8]) -> impl FnOnce(&mut File) -> Result<()> + '_ {
 fn create_new(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let _ = std::fs::remove_file(path);
-    Ok(std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)?)
+    Ok(std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?)
 }
 
 /// Only root may change what `path` names (sticky directories excepted).
@@ -643,12 +663,22 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
     // Cached blobs are read once, as they are unpacked: one found corrupt is
     // evicted, and the unpack starts over with it downloaded (and checked)
     // again; at most once per layer, however many turn out corrupt.
-    let mut tries = img.layers.len();
+    retry_evicted(&img.layers, attempt)
+}
+
+fn retry_evicted<T>(layers: &[source::Layer], mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut retried = vec![false; layers.len()];
     loop {
         match attempt() {
-            Err(e) if tries > 0 && img.layers.iter().any(|l| l.src.evicted()) && interrupted().is_ok() => {
+            Err(e) if interrupted().is_ok() => {
+                let evicted: Vec<_> = layers.iter().enumerate().filter(|(_, l)| l.src.evicted()).map(|(i, _)| i).collect();
+                if evicted.is_empty() || evicted.iter().any(|&i| retried[i]) {
+                    return Err(e);
+                }
+                for i in evicted {
+                    retried[i] = true;
+                }
                 crate::log!("image: {e}; downloading it again");
-                tries -= 1;
             }
             res => return res,
         }
@@ -981,6 +1011,86 @@ mod tests {
     fn temporaries(dir: &Path) -> Vec<String> {
         let names = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
         names.filter(|n| n.contains(".tmp") || n.contains(".part")).collect()
+    }
+
+    #[test]
+    fn cache_permissions_are_private_on_publish_and_reuse() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmpdir("cache-private");
+        let cache = d.join("images");
+        private_dir(&cache).unwrap();
+        let cached = cache.join("rootfs/key.ext4");
+        cached_rootfs(&cached, build("private"), sync_dir).unwrap();
+        let owner = std::fs::metadata(&cached).unwrap().uid();
+        for legacy in [false, true] {
+            if legacy {
+                for dir in [&cache, cached.parent().unwrap()] {
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                for ext in ["ext4", "conf", "ok"] {
+                    std::fs::set_permissions(cached.with_extension(ext), std::fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                private_dir(&cache).unwrap();
+                cached_rootfs(&cached, never, sync_dir).unwrap();
+            }
+            for dir in [&cache, cached.parent().unwrap()] {
+                let m = std::fs::metadata(dir).unwrap();
+                assert_eq!((m.mode() & 0o777, m.uid()), (0o700, owner));
+            }
+            for ext in ["ext4", "conf", "ok"] {
+                let m = std::fs::metadata(cached.with_extension(ext)).unwrap();
+                assert_eq!((m.mode() & 0o777, m.uid()), (0o600, owner));
+            }
+        }
+        let blob = cache.join("blob");
+        publish(&blob, bytes(b"private")).unwrap();
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!publish(&blob, bytes(b"replacement")).unwrap());
+        assert_eq!(std::fs::metadata(blob).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn each_evicted_layer_gets_one_retry() {
+        let d = tmpdir("layer-retry");
+        let layers: Vec<_> = (0..3)
+            .map(|i| {
+                let digest = sha256_hex(&[i]);
+                let path = registry::blob_path(&d, &digest).unwrap();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, [i]).unwrap();
+                source::Layer {
+                    src: source::Blob::Cached {
+                        blobs: d.to_path_buf(),
+                        registry: std::sync::Arc::new(registry::Registry::new(Reference::parse("localhost/test").unwrap())),
+                        digest: digest.clone(),
+                        size: 1,
+                    },
+                    digest: Some(digest),
+                    size: Some(1),
+                }
+            })
+            .collect();
+        let mut calls = 0;
+        let result: Result<()> = retry_evicted(&layers, || {
+            calls += 1;
+            if calls <= layers.len() {
+                if calls > 1 {
+                    std::fs::write(registry::blob_path(&d, layers[calls - 2].digest.as_ref().unwrap())?, b"fixed")?;
+                }
+                std::fs::remove_file(registry::blob_path(&d, layers[calls - 1].digest.as_ref().unwrap())?)?;
+                bail!("corrupt layer");
+            }
+            bail!("download failed");
+        });
+        assert_eq!(calls, layers.len() + 1);
+        assert!(result.unwrap_err().to_string().contains("download failed"));
+        let mut calls = 0;
+        let result: Result<()> = retry_evicted(&layers, || {
+            calls += 1;
+            bail!("download failed");
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2, "a missing blob must not consume other layers' retries");
     }
 
     #[test]
