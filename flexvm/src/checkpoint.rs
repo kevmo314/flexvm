@@ -26,9 +26,29 @@ pub use staging::{CommitError, Staging};
 pub(crate) use write::{Buf, GuestPages};
 
 /// The checkpoints flexvm keeps itself (`STATE/checkpoints/ID`, #775): their generations stay
-/// (`Host::template_users`). None while the directory is missing.
-pub fn managed(state: &std::path::Path) -> impl Iterator<Item = (std::path::PathBuf, Manifest)> {
-    std::fs::read_dir(state.join("checkpoints")).into_iter().flatten().flatten().filter_map(|e| Some((e.path(), read_manifest(&e.path()).ok()?)))
+/// (`Host::template_users`). None while the directory is missing. One that cannot be read, or
+/// whose manifest is not its `ID`'s (renamed by hand), is an error: it is still there.
+pub fn managed(state: &std::path::Path) -> impl Iterator<Item = (std::path::PathBuf, crate::util::Result<Manifest>)> {
+    std::fs::read_dir(state.join("checkpoints")).into_iter().flatten().flatten().filter_map(|e| {
+        let id = e.file_name().into_string().ok().filter(|n| store::is_id(n))?;
+        let dir = e.path();
+        let read = chain::read_manifest_id(&dir).and_then(|(found, m)| {
+            ensure!(found == id, "checkpoint {} is invalid: its manifest's id is {found}", dir.display());
+            Ok(m)
+        });
+        present(&dir, read).map(|m| (dir, m))
+    })
+}
+
+/// The manifest of the checkpoint record `dir` (a suspended VM's): None if it has none, a revoked
+/// publication or a record being removed; any other error is an unreadable record.
+pub(crate) fn record(dir: &std::path::Path) -> Option<crate::util::Result<Manifest>> {
+    present(dir, read_manifest(dir))
+}
+
+fn present(dir: &std::path::Path, read: crate::util::Result<Manifest>) -> Option<crate::util::Result<Manifest>> {
+    let missing = || std::fs::symlink_metadata(dir.join("manifest.json")).is_err_and(|e| e.kind() == io::ErrorKind::NotFound);
+    (read.is_ok() || !missing()).then_some(read)
 }
 
 fn create_at(dir: RawFd, name: &str) -> io::Result<File> {

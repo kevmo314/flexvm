@@ -747,18 +747,29 @@ impl Host {
 
     /// The template content ids VMs here use as far as their records say: registered VMs, every
     /// suspended (or quarantined) one, even one a live process holds the name of (a resume that has
-    /// not opened its template yet), and flexvm's own checkpoints (`checkpoint::managed`). `rmi` reads it again under a generation's exclusive
+    /// not opened its template yet), and flexvm's own checkpoints (`checkpoint::managed`); while any of
+    /// those records cannot be read, a `template::KEEP_ALL` entry. `rmi` reads it again under a generation's exclusive
     /// use lock: a suspend publishes its checkpoint before its process lets the lock go, and a resume
     /// takes the lock before it marks the checkpoint STARTED, so one of the two shows every such VM.
     pub fn template_users(&self) -> std::collections::BTreeSet<String> {
         let mut ids: std::collections::BTreeSet<String> = self.entries().into_iter().map(|e| e.template_id).filter(|id| !id.is_empty()).collect();
         let suspended = std::fs::read_dir(self.state.join("suspended")).into_iter().flatten().flatten();
-        for name in suspended.filter_map(|e| e.file_name().into_string().ok()).filter(|n| !n.starts_with('.')) {
-            if let (true, Ok(dir)) = (self.is_suspended(&name), self.suspended(&name)) {
-                ids.extend(crate::checkpoint::read_manifest(&dir).ok().map(|m| m.template_id));
+        let suspended = suspended
+            .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
+            .map(|e| e.path())
+            .filter(|d| !d.join("STARTED").exists() && !d.join("DISCARDED").exists())
+            .filter_map(|d| crate::checkpoint::record(&d));
+        let mut unreadable = vec![];
+        for manifest in suspended.chain(crate::checkpoint::managed(&self.state).map(|(_, m)| m)) {
+            match manifest {
+                Ok(m) => drop(ids.insert(m.template_id)),
+                Err(err) => unreadable.push(err.to_string()),
             }
         }
-        ids.extend(crate::checkpoint::managed(&self.state).map(|(_, m)| m.template_id));
+        // It may use any generation: all stay, and `rmi` or `image prune` says why.
+        if !unreadable.is_empty() {
+            ids.insert(format!("{}a checkpoint here cannot be read ({})", crate::template::KEEP_ALL, unreadable.join("; ")));
+        }
         ids
     }
 

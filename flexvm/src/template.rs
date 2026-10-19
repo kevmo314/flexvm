@@ -369,6 +369,11 @@ unsafe impl Sync for Template {}
 /// `templates/.gen/<content id>/` never changes (bar cached stamps); `templates/NAME` is a
 /// symlink to the current one, swapped atomically by `create`.
 pub const GENERATIONS: &str = ".gen";
+/// In an `in_use` set, this and then why: every generation stays (`Host::template_users`, while a
+/// checkpoint record here cannot be read). Content ids are hex, so none starts so.
+pub(crate) const KEEP_ALL: &str = "*";
+/// `delete_unused`'s reason for a generation `KEEP_ALL` kept.
+const KEPT_ALL: &str = "kept while ";
 
 const MAX_LOAD_SET: usize = 512;
 /// Template builds' guest commands, on a possibly loaded host.
@@ -1552,11 +1557,16 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
         return Ok(vec![]);
     }
     sweep_locked(paths)?;
-    let mut removed = vec![];
+    let (mut removed, mut held) = (vec![], None);
     for id in generations(&paths.templates)?.into_iter().filter(|id| only.is_none_or(|o| o == id)) {
-        if let Ok(rootfs) = delete_unused(paths, &id, in_use)? {
-            removed.push(json!({"deleted": id, "rootfs": rootfs}));
+        match delete_unused(paths, &id, in_use)? {
+            Ok(rootfs) => removed.push(json!({"deleted": id, "rootfs": rootfs})),
+            Err((reason, _)) if reason.starts_with(KEPT_ALL) => held = Some(reason),
+            Err(_) => {}
         }
+    }
+    if let Some(reason) = held {
+        crate::log!("flexvm: {}{reason}", only.map_or("image prune: unused generations are ".into(), |id| format!("generation {id} is ")));
     }
     Ok(removed)
 }
@@ -1608,7 +1618,11 @@ fn delete_unused(paths: &Paths, id: &str, in_use: &dyn Fn() -> BTreeSet<String>)
     let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else {
         return Ok(Err(("open in a VM process here".into(), format!("image {id} is open in a VM process here"))));
     };
-    if in_use().contains(id) {
+    let users = in_use();
+    if let Some(why) = users.iter().find_map(|u| u.strip_prefix(KEEP_ALL)) {
+        return Ok(Err((format!("{KEPT_ALL}{why}"), format!("image {id} is {KEPT_ALL}{why}"))));
+    }
+    if users.contains(id) {
         return Ok(Err(("used by a VM here".into(), format!("image {id} is used by a VM here"))));
     }
     let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
@@ -2185,6 +2199,21 @@ pub(crate) mod tests {
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0]["deleted"], "aaaa1111");
         assert_eq!(generations(&f.paths.templates).unwrap(), ["bbbb2222", "cccc3333"]);
+    }
+
+    #[test]
+    fn an_unreadable_checkpoint_keeps_every_generation_and_says_why() {
+        let f = Fixture::new();
+        for id in ["aaaa1111", "bbbb2222"] {
+            publish_as(&f, "t", &Meta { id: id.into(), ..f.meta.clone() });
+        }
+        let users = || BTreeSet::from(["aaaa1111".into(), format!("{KEEP_ALL}checkpoint x is unreadable")]);
+        assert!(prune(&f.paths, None, &users).unwrap().is_empty());
+        let refusal = remove(&f.paths, None, "aaaa1111", &users).unwrap_err().to_string();
+        assert_eq!(refusal, "image aaaa1111 is kept while checkpoint x is unreadable");
+        let r = remove(&f.paths, Some("t"), "bbbb2222", &users).unwrap();
+        assert_eq!((&r["kept"], &r["reason"]), (&json!("bbbb2222"), &json!("kept while checkpoint x is unreadable")));
+        assert_eq!(generations(&f.paths.templates).unwrap(), ["aaaa1111", "bbbb2222"]);
     }
 
     #[test]
