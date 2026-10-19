@@ -798,6 +798,9 @@ impl Host {
     }
 
     fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool) -> Result<NameLock> {
+        if !resuming {
+            check_new_name(name)?;
+        }
         let (lock, suspended) = (self.vms(name, "lock")?, self.suspended(name)?);
         if !resuming && self.is_suspended(name) {
             bail!("vm {name:?} exists (stopped); flexvm start or rm it");
@@ -3665,6 +3668,14 @@ pub fn generated_name(host: &Host) -> Result<String> {
 pub fn name_taken(e: &crate::util::Error) -> bool {
     let e = e.to_string();
     e.contains("is taken") || e.contains("exists (stopped)") || e.contains("exists (exited)")
+}
+
+pub fn check_new_name(name: &str) -> Result<()> {
+    check_name(name)?;
+    if name.starts_with('-') {
+        bail!("bad vm name {name:?}: must not start with '-'");
+    }
+    Ok(())
 }
 
 pub fn check_name(name: &str) -> Result<()> {
@@ -6839,7 +6850,7 @@ pub(crate) mod tests {
         h.put_addr(x, &Addr { seen: 5, lent: Some(5), ..Addr::default() }, false).unwrap();
         let owed = Owed { to: "live:1".into(), ip: x, gen: 5, by: Ident::me() };
         h.owe(7, &owed).unwrap();
-        let error = h.reclaim(x, confirmed).unwrap_err().to_string();
+        let error = crate::reclaim(&h, &x.to_string(), Some(confirmed)).unwrap_err().to_string();
         assert!(error.contains("generation 5, not confirmed generation 4"), "{error}");
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
         assert_eq!((a.seen, a.lent, a.withdrawn), (5, Some(5), false));

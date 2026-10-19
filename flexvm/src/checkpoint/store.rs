@@ -209,8 +209,8 @@ pub fn find<'a>(all: &'a Listing, what: &str) -> Result<&'a Entry> {
 
 /// Refused if `name` is no checkpoint name or is taken.
 pub fn check_free(state: &Path, name: &str) -> Result<()> {
-    if crate::host::check_name(name).is_err() || is_id(name) {
-        bail!("bad checkpoint name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.', and not 16 hex digits (an id)");
+    if crate::host::check_new_name(name).is_err() || is_id(name) {
+        bail!("bad checkpoint name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.' or '-', and not 16 hex digits (an id)");
     }
     if std::fs::symlink_metadata(dir(state).join(NAMES).join(name)).is_ok() {
         bail!("checkpoint name {name:?} is taken (see flexvm checkpoint ls)");

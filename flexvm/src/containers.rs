@@ -326,7 +326,7 @@ fn described(host: &Host, paths: &template::Paths, name: &str, mut v: Value) -> 
 /// renamed here, holding both names.
 pub fn rename(host: &Host, from: &str, to: &str) -> Result<()> {
     host::check_name(from)?;
-    host::check_name(to)?;
+    host::check_new_name(to)?;
     if from == to {
         bail!("vm {from} is named {to} already");
     }
@@ -461,7 +461,7 @@ impl Proc {
         };
         self.not_destroyed()?;
         let from = self.name();
-        host::check_name(to)?;
+        host::check_new_name(to)?;
         if from == to {
             bail!("vm {from} is named {to} already");
         }

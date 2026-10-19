@@ -183,8 +183,8 @@ pub struct Args {
 /// pull's (run's is the internal standby VM's switch).
 fn takes_value(flag: &str, cmd: Option<&str>) -> Option<bool> {
     match flag {
-        "force" => Some(cmd == Some("reclaim")),
-        "standby" => Some(cmd == Some("pull")),
+        "force" => cmd.map(|c| c == "reclaim"),
+        "standby" => cmd.map(|c| c == "pull"),
         f if SWITCHES.contains(&f) => Some(false),
         f if GLOBAL.contains(&f) || IMAGE_FLAGS.contains(&f) || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&f)) => Some(true),
         _ => None,
@@ -194,7 +194,11 @@ fn takes_value(flag: &str, cmd: Option<&str>) -> Option<bool> {
 /// A value that is itself a flag (or `--`) is a forgotten value, as in `--state --run X`; any
 /// other is taken as is, so argv-style ones can start with `--` (`--cmd "--port 8080"`).
 fn is_flag(v: &str) -> bool {
-    v == "--" || v.strip_prefix("--").is_some_and(|f| takes_value(f.split_once('=').map_or(f, |(f, _)| f), None).is_some())
+    v == "--"
+        || v.strip_prefix("--").is_some_and(|f| {
+            let f = f.split_once('=').map_or(f, |(f, _)| f);
+            matches!(f, "force" | "standby") || takes_value(f, None).is_some()
+        })
 }
 
 impl Args {
@@ -281,10 +285,23 @@ impl Args {
             };
             match valued.or_else(|| option.strip_prefix("--")) {
                 Some("") if attached.is_none() => {
-                    a.rest.extend(it.by_ref());
-                    a.child_args.extend(a.rest.iter().cloned());
+                    // Before the command, the words after it would be taken as one.
+                    if cmd.is_none() {
+                        bail!("-- must follow the command");
+                    }
+                    if matches!(cmd, Some("run" | "exec")) {
+                        a.rest.extend(it.by_ref());
+                        a.child_args.extend(a.rest.iter().cloned());
+                    } else {
+                        let words: Vec<_> = it.by_ref().collect();
+                        a.child_args.extend(words.iter().cloned());
+                        a.positional.extend(words);
+                    }
                 }
                 Some(f) => {
+                    if cmd.is_none() && matches!(f, "force" | "standby") {
+                        bail!("--{f} must follow the command");
+                    }
                     let value = match (takes_value(f, cmd), attached) {
                         (Some(false), Some(_)) => bail!("--{f} does not take a value"),
                         (Some(false), None) => "1".into(),
@@ -501,7 +518,7 @@ fn check_applies(args: &Args) -> Result<()> {
         "image" if first.map(String::as_str) != Some("prune") => bail!("image needs prune"),
         "system" if !matches!(first.map(String::as_str), Some("prune" | "df")) => bail!("system needs prune or df"),
         "system" if first.map(String::as_str) == Some("df") && args.has("force") => bail!("system df takes no -f"),
-        "images" if args.has("quiet") && args.has("json") => bail!("images takes either -q or --json"),
+        "images" if args.has("quiet") && args.has("json") => bail!("images takes -q or --json, not both"),
         "checkpoint" => {
             let (op, most, flags): (_, _, &[&str]) = match first.map(String::as_str) {
                 Some(op @ "create") => (op, 4, &["stop", "incremental"]),
@@ -520,6 +537,7 @@ fn check_applies(args: &Args) -> Result<()> {
                 bail!("checkpoint {op} does not take {extra:?} (see flexvm --help)");
             }
             match op {
+                "ls" if args.has("quiet") && args.has("format") => bail!("checkpoint ls takes -q or --format, not both"),
                 "create" if args.positional.len() < 3 => bail!("checkpoint create needs VM"),
                 "rm" if args.positional.len() < 3 => bail!("checkpoint rm needs NAME|ID"),
                 "save" if args.positional.len() < 3 => bail!("checkpoint save needs NAME|ID"),
@@ -538,9 +556,6 @@ fn check_applies(args: &Args) -> Result<()> {
     if let Some(empty) = args.names().iter().find(|n| n.is_empty()) {
         bail!("{cmd} takes no empty word {empty:?}");
     }
-    if !args.rest.is_empty() && cmd != "run" && cmd != "exec" {
-        bail!("{cmd} takes no -- CMD");
-    }
     let interactive = args.has("interactive") || args.has("tty");
     if cmd == "run" && args.has("keep") && !args.rest.is_empty() && !interactive {
         bail!("--keep applies to the image's app: with CMD, the vm ends with CMD");
@@ -553,6 +568,11 @@ fn check_applies(args: &Args) -> Result<()> {
     }
     if cmd == "rename" && args.positional.len() < 3 {
         bail!("rename needs OLD NEW");
+    }
+    if cmd == "ps" && args.has("quiet") {
+        if let Some(f) = ["json", "format"].into_iter().find(|f| args.has(f)) {
+            bail!("ps takes -q or --{f}, not both");
+        }
     }
     if cmd == "ps" && args.has("json") && args.has("format") {
         bail!("ps takes --json or --format, not both");
@@ -636,7 +656,7 @@ fn real_main(args: &Args) -> Result<()> {
             let host = open_host(args)?;
             each(args.names(), |n| match resume(&host, n)? {
                 true => output(format_args!("{n}\n")),
-                false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?, false)?),
+                false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", "--", n]), &log_file(&host, n)?, false)?),
             })
         }
         Some("ps") => ps(&open_host(args)?, args),
@@ -679,7 +699,7 @@ fn real_main(args: &Args) -> Result<()> {
                 }
                 match resume(&host, n)? {
                     true => output(format_args!("{n}\n")),
-                    false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", n]), &log_file(&host, n)?, false)?),
+                    false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", "--", n]), &log_file(&host, n)?, false)?),
                 }
             })
         }
@@ -732,7 +752,10 @@ fn real_main(args: &Args) -> Result<()> {
                 let host = open_host(args)?;
                 gc::sweep_now(&host)
             }
-            "fault" => host::arm(&open_host(args)?, arg2.ok_or("debug fault NAME MS")?, pos.get(3).and_then(|m| m.parse().ok()).unwrap_or(1000)),
+            "fault" => {
+                let ms = pos.get(3).map_or(Ok(1000), |m| m.parse().map_err(|_| format!("bad fault MS {m:?}")))?;
+                host::arm(&open_host(args)?, arg2.ok_or("debug fault NAME MS")?, ms)
+            }
             "ckhash" => print(lifecycle::ckhash(&paths(args)?, std::path::Path::new(arg2.ok_or("debug ckhash DIR")?))?),
             "" => Err("debug fault|ckhash|gc|VM ...".into()),
             _ => call(json!({"op": "debug", "what": arg2.unwrap_or("status")})),
@@ -913,7 +936,7 @@ fn run(args: &Args, image: &str) -> Result<()> {
     let ip = args.get("ip").filter(|&s| s != "auto");
     let ip: Option<std::net::Ipv4Addr> = ip.map(|s| s.parse().map_err(|_| format!("bad --ip {s:?}"))).transpose()?;
     if let Some(name) = args.get("name") {
-        host::check_name(name)?;
+        host::check_new_name(name)?;
     }
     // Parsed once (its `-p` ports included), before a pull: a bad one is refused at once.
     let spec = run_spec(args, ip)?;
@@ -1517,6 +1540,23 @@ fn only_standby(args: &Args) -> bool {
     args.flags.iter().all(|(f, _)| GLOBAL.contains(&f.as_str()) || matches!(f.as_str(), "standby" | "tag"))
 }
 
+/// `--max` is the host's memory unless given (at most what a peer takes, and never below `--mem`:
+/// then there is no hotplug); either given past what a peer takes is refused, as is `--max` below `--mem`.
+fn pull_size(args: &Args) -> Result<template::Size> {
+    let ram = (proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20).min(template::MAX_MEM_MIB);
+    let max = args.parse_or("max", ram)?;
+    let (mem, plug) = (args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
+    for (flag, mib) in [("max", max), ("mem", mem)] {
+        if mib > template::MAX_MEM_MIB {
+            bail!("--{flag} must be at most {} MiB", template::MAX_MEM_MIB);
+        }
+    }
+    if max < mem && args.has("max") {
+        bail!("--max must be at least --mem ({mem} MiB)");
+    }
+    Ok(template::Size { vcpus: template_vcpus(args)?, mem_mib: mem, max_mib: max.max(mem), plug_mib: plug })
+}
+
 /// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date;
 /// then `--standby N`, its count of standby VMs.
 fn pull(args: &Args, src: &str) -> Result<()> {
@@ -1525,7 +1565,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
         None if std::path::Path::new(src).exists() => bail!("{src} is a file or directory: name its image with --tag NAME[:TAG]"),
         None => template::name_of(src)?,
     };
-    let cpus = template_vcpus(args)?;
+    let size = pull_size(args)?;
     let standby = args.get("standby").map(|n| n.parse::<usize>().map_err(|_| format!("bad --standby {n:?}: give a count"))).transpose()?;
     if unsafe { libc::geteuid() } != 0 {
         bail!("run flexvm as root");
@@ -1550,9 +1590,6 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     });
     let paths = paths(args)?;
     let opts = image_options(args, src)?;
-    let max = args.parse_or("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
-    let (mem, plug) = (args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
-    let size = template::Size { vcpus: cpus, mem_mib: mem, max_mib: max, plug_mib: plug };
     let host = open_host(args)?;
     let me = host::Ident::me();
     host::clear_taps(&host.run, &me);
@@ -2100,6 +2137,114 @@ mod exec_tests {
     }
 
     #[test]
+    fn ambiguous_options_must_follow_the_command() {
+        for (flag, cmd, word) in [("force", "reclaim", "10.9.0.2"), ("standby", "pull", "img")] {
+            assert_eq!(takes_value(flag, None), None);
+            for option in [format!("--{flag}"), format!("--{flag}=1")] {
+                let (args, error) = Args::parse_partly([option, cmd.into(), word.into()]);
+                assert_eq!(error.unwrap().to_string(), format!("--{flag} must follow the command"));
+                assert!(!args.has(flag));
+            }
+        }
+        assert_eq!(parse(&["pull", "img", "--standby", "5"]).get("standby"), Some("5"));
+        assert!(parse(&["rm", "--force", "vm"]).has("force"));
+    }
+
+    #[test]
+    fn output_flags_are_exclusive() {
+        for (argv, message) in [
+            (&["ps", "-q", "--json"][..], "ps takes -q or --json, not both"),
+            (&["ps", "--format", "table", "-q"], "ps takes -q or --format, not both"),
+            (&["ps", "--json", "--format", "json"], "ps takes --json or --format, not both"),
+            (&["images", "--json", "-q"], "images takes -q or --json, not both"),
+            (&["checkpoint", "ls", "-q", "--format", "json"], "checkpoint ls takes -q or --format, not both"),
+        ] {
+            assert_eq!(check_applies(&parse(argv)).unwrap_err().to_string(), message);
+        }
+    }
+
+    #[test]
+    fn pull_refuses_invalid_memory_before_kvm() {
+        for (max, mem, message) in [
+            ("255", "256", "--max must be at least --mem (256 MiB)"),
+            ("2097153", "256", "--max must be at most 2097152 MiB"),
+            ("18446744073709551615", "256", "--max must be at most 2097152 MiB"),
+        ] {
+            let args = parse(&["pull", "busybox", "--max", max, "--mem", mem]);
+            assert_eq!(real_main(&args).unwrap_err().to_string(), message);
+        }
+        for max in ["256", "2097152"] {
+            let size = pull_size(&parse(&["pull", "busybox", "--max", max, "--mem", "256"])).unwrap();
+            assert_eq!(size.max_mib.to_string(), max);
+        }
+    }
+
+    #[test]
+    fn debug_fault_refuses_invalid_ms() {
+        for ms in ["bad", "-1", "18446744073709551616"] {
+            assert_eq!(real_main(&parse(&["debug", "fault", "test", "--", ms])).unwrap_err().to_string(), format!("bad fault MS {ms:?}"));
+        }
+    }
+
+    #[test]
+    fn new_names_refuse_flags_but_rm_parses_legacy_names() {
+        for name in ["-f", "--force", "-"] {
+            host::check_name(name).unwrap();
+            assert!(host::check_new_name(name).is_err());
+            let args = parse(&["rm", "--", name]);
+            check_applies(&args).unwrap();
+            assert_eq!(args.names(), &[name]);
+            assert!(!args.has("force"));
+        }
+        host::check_new_name("vm-1").unwrap();
+        // start's VM process, re-run as `start --attach -- NAME`, takes such a name too.
+        let child = parse(&["start", "--attach", "--", "-f"]);
+        check_applies(&child).unwrap();
+        assert!(child.has("attach") && child.names() == ["-f"]);
+    }
+
+    #[test]
+    fn a_bare_dashdash_must_follow_the_command() {
+        for argv in [&["--", "run", "img", "sh"][..], &["--", "rm", "x"], &["--state", "/s", "--"]] {
+            let (_, error) = Args::parse_partly(argv.iter().map(|a| a.to_string()));
+            assert_eq!(error.unwrap().to_string(), "-- must follow the command", "{argv:?}");
+        }
+        assert_eq!(parse(&["run", "img", "--", "sh", "--", "-x"]).rest, ["sh", "--", "-x"]);
+        assert_eq!(parse(&["exec", "web", "--", "-x"]).rest, ["-x"]);
+        let cp = parse(&["cp", "--", "-", "web:/x"]);
+        check_applies(&cp).unwrap();
+        assert_eq!(cp.names(), ["-", "web:/x"]);
+        assert!(cp.rest.is_empty());
+    }
+
+    #[test]
+    fn pull_max_defaults_to_the_host_and_never_below_mem() {
+        let size = pull_size(&parse(&["pull", "busybox"])).unwrap();
+        assert!(size.max_mib <= template::MAX_MEM_MIB && size.mem_mib <= size.max_mib);
+        let size = pull_size(&parse(&["pull", "busybox", "--mem", "2097152"])).unwrap();
+        assert_eq!((size.mem_mib, size.max_mib), (2097152, 2097152), "--mem past the host's memory: no hotplug");
+        assert_eq!(pull_size(&parse(&["pull", "busybox", "--mem", "2097153"])).unwrap_err().to_string(), "--mem must be at most 2097152 MiB");
+    }
+
+    #[test]
+    fn rm_removes_legacy_names_and_creation_and_rename_refuse_them() {
+        let root = crate::test_util::TempDir::new("legacy-name");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        for name in ["-f", "--force", "-"] {
+            assert!(host.take_name(name, false).is_err());
+            assert!(containers::rename(&host, "old", name).is_err());
+            let path = host.vms(name, "failed").unwrap();
+            std::fs::write(&path, "died").unwrap();
+            let args = parse(&["rm", "--", name]);
+            check_applies(&args).unwrap();
+            assert_eq!(args.names(), &[name]);
+            assert!(!args.has("force"));
+            each(args.names(), |n| remove(&host, n, false, true)).unwrap();
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
     fn verbose_is_global_and_preserved_for_children_but_not_app_arguments() {
         for argv in [&["-v", "start", "web"][..], &["start", "--verbose", "web"]] {
             let args = parse(argv);
@@ -2487,7 +2632,7 @@ mod exec_tests {
         for argv in [
             &["checkpoint", "create", "web"][..],
             &["checkpoint", "create", "web", "base", "--stop", "--incremental"],
-            &["checkpoint", "ls", "-q", "--filter", "vm=web", "--format", "{{.ID}}"],
+            &["checkpoint", "ls", "--filter", "vm=web", "--format", "{{.ID}}"],
             &["checkpoint", "rm", "-f", "a", "b"],
             &["checkpoint", "prune", "--older-than", "24h", "-f"],
             &["checkpoint", "save", "web"],
@@ -2594,6 +2739,12 @@ mod exec_tests {
         let args = parse(&["reclaim", "10.9.0.2", "--force", "42"]);
         check_applies(&args).unwrap();
         assert_eq!(args.get("force"), Some("42"));
+        for gen in ["1", "42"] {
+            let option = format!("--force={gen}");
+            let args = parse(&["reclaim", "10.9.0.2", &option]);
+            check_applies(&args).unwrap();
+            assert_eq!(args.get("force"), Some(gen));
+        }
         for gen in ["", "bad", "-1", "18446744073709551616"] {
             let args = parse(&["reclaim", "10.9.0.2", "--force", gen]);
             assert_eq!(real_main(&args).unwrap_err().to_string(), format!("bad --force generation {gen:?}"));
@@ -2667,7 +2818,7 @@ mod exec_tests {
             &["wait", "a", "b"],
             &["restart", "a", "b"],
             &["rename", "a", "b"],
-            &["ps", "-q", "-a", "--filter", "name=web", "--filter", "status=running", "--format", "{{.Name}}"],
+            &["ps", "-a", "--filter", "name=web", "--filter", "status=running", "--format", "{{.Name}}"],
         ] {
             assert_eq!(err(ok), None, "{ok:?}");
         }
@@ -2695,7 +2846,7 @@ mod exec_tests {
         assert!(err(&["start", "--ip", "10.0.0.1", "web"]).is_some());
         assert!(err(&["run", "--checkpoint", "/d", "ubuntu"]).unwrap().contains("takes no IMAGE"));
         assert_eq!(err(&["run", "--paused", "ubuntu"]).unwrap(), "--paused applies to run --checkpoint");
-        assert!(err(&["kill", "web", "--", "x"]).is_some());
+        assert_eq!(err(&["kill", "web", "--", "x"]), None);
         assert_eq!(err(&["run", "--warm", "t"]).unwrap(), "--warm does not apply to run (see flexvm --help)");
         assert_eq!(err(&["images", "--tag", "x"]).unwrap(), "--tag does not apply to images (see flexvm --help)");
         assert!(err(&["rmi", "a", "b"]).is_some());

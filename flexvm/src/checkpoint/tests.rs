@@ -788,7 +788,7 @@ fn the_store_names_lists_and_removes_dependants_first() {
     let c = stored(&state, Some(&b), 3);
     store::link(&state, "base", &a).unwrap();
     assert!(store::link(&state, "base", &d).is_err(), "a name is one checkpoint's");
-    assert!(["", ".x", "a/b", &"x".repeat(65)].iter().all(|n| store::check_free(&state, n).is_err()));
+    assert!(["", ".x", "-x", "--force", "a/b", &"x".repeat(65)].iter().all(|n| store::check_free(&state, n).is_err()));
     // Neither staging nor what a removal left is listed (nor anything not named by an id).
     fs::create_dir_all(store::dir(&state).join(".flexvm-staging-1/ck")).unwrap();
     link(&store::dir(&state).join(".removed-0123456789abcdef"), None, |_| {});
