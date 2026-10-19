@@ -1,5 +1,5 @@
 use super::event::PULL;
-use super::fetch::{connect_ahead, Failed, Fetch, FetchFailure, Lane, Link};
+use super::fetch::{connect_ahead, Failed, Fetch, FetchFailure, Lane, Link, STREAM_RUN};
 use super::{os, Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, PULL_THREADS, REMOTE};
 use crate::checkpoint::{Buf, PageFile};
 use std::io;
@@ -40,8 +40,9 @@ impl Pager {
             // Reads from the checkpoint file (directly, or evicting what it read for a puller where that is buffered) or
             // over a source connection of its own.
             let mut fetch: Box<Fetch> = match (file.clone(), &source) {
-                (Some(file), _) => Box::new(move |off, buf, _, _| {
-                    file.read(off as usize / PAGE_SIZE, buf, puller).map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e)))
+                (Some(file), _) => Box::new(move |off, buf, stop, progress| {
+                    read_file(off, buf, stop, progress, |page, buf| file.read(page, buf, puller))
+                        .map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e)))
                 }),
                 (None, Some(source)) => {
                     let mut link = link.take().filter(|_| !puller).unwrap_or_else(|| Link::new(source.clone()));
@@ -187,6 +188,87 @@ impl Pager {
                 self.fail(format!("background pull {t} failed: {e}"));
                 false
             }
+        }
+    }
+}
+
+/// Publish each disk chunk through the same progress callback as a streamed reply.
+fn read_file(
+    off: u64,
+    buf: &mut [u8],
+    stop: &std::sync::atomic::AtomicBool,
+    progress: &mut dyn FnMut(&[u8]) -> bool,
+    mut read: impl FnMut(usize, &mut [u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        if stop.load(Ordering::SeqCst) {
+            return Err(os(libc::ECANCELED));
+        }
+        let end = (done + STREAM_RUN * PAGE_SIZE).min(buf.len());
+        read((off as usize + done) / PAGE_SIZE, &mut buf[done..end])?;
+        done = end;
+        if !progress(&buf[..done]) {
+            return Err(os(libc::ECANCELED));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Pages, INFLIGHT, PRESENT};
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn file_chunks_settle_before_the_next_read() {
+        for fail in [false, true] {
+            let (first, n) = (7, 2 * STREAM_RUN + 3);
+            let mut pages = Pages::new(first + n);
+            pages.fill(first, n, REMOTE);
+            assert_eq!(pages.claim(first, n, REMOTE, |_| true), n);
+            let stop = AtomicBool::new(false);
+            let mut reads = 0;
+            let mut fetch = |off, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| {
+                read_file(off, buf, stop, progress, |page, out| {
+                    assert!((first..page).all(|p| pages.get(p) == PRESENT), "earlier chunks settled before this read");
+                    assert!((page..first + n).all(|p| pages.get(p) == INFLIGHT));
+                    reads += 1;
+                    if fail && reads == 2 {
+                        return Err(os(libc::EIO));
+                    }
+                    for (i, chunk) in out.chunks_mut(PAGE_SIZE).enumerate() {
+                        chunk.fill((page + i) as u8);
+                    }
+                    Ok(())
+                })
+            };
+            let (resolved, result) = pages.fetch_install(first, n, &mut vec![0; n * PAGE_SIZE], &mut fetch, &stop, &mut |_| false, |page, count, data| {
+                for (i, chunk) in data.chunks(PAGE_SIZE).enumerate() {
+                    assert!(chunk.iter().all(|&b| b == (page + i) as u8));
+                }
+                Ok(count)
+            });
+            let done = if fail { STREAM_RUN } else { n };
+            assert_eq!(resolved, done);
+            assert_eq!(result.is_err(), fail);
+            assert!((first..first + done).all(|p| pages.get(p) == PRESENT));
+            assert!((first + done..first + n).all(|p| pages.get(p) == REMOTE));
+        }
+    }
+
+    #[test]
+    fn file_read_stops_between_chunks() {
+        for stop_before in [false, true] {
+            let stop = AtomicBool::new(stop_before);
+            let mut reads = 0;
+            let result = read_file(0, &mut vec![0; PULL_RUN * PAGE_SIZE], &stop, &mut |_| false, |_, _| {
+                reads += 1;
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+            assert_eq!(reads, usize::from(!stop_before));
         }
     }
 }

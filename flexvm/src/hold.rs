@@ -536,7 +536,7 @@ impl Holder {
     /// Read and queued under `rx`, so packets are queued in the order they were read, by
     /// whichever thread.
     fn read_one(&self, buf: &mut [u8]) -> bool {
-        let _rx = self.rx.lock().unwrap();
+        let rx = self.rx.lock().unwrap();
         let Ok(n) = eintr(|| unsafe { libc::read(self.tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { return false };
         // #362: a guest frame with VIRTIO_NET_HDR_F_NEEDS_CSUM can aim checksum completion at
         // its own IP source, after the tap's ingress filter passed the original. The device
@@ -562,7 +562,13 @@ impl Holder {
                     q.packets.push_back(p.to_vec());
                 }
             }
-            None => self.straggler(ip, p),
+            None => {
+                let gone = self.gone.lock().unwrap().get(&ip).copied().filter(|g| g.at.elapsed() < GONE_FOR);
+                drop(rx);
+                if let Some(g) = gone {
+                    self.straggler(ip, p, g);
+                }
+            }
         }
         true
     }
@@ -581,32 +587,42 @@ impl Holder {
     }
 
     /// A packet for `ip` read after it was let go of: re-sent if the address moved on, else
-    /// counted (and logged by `report_stragglers`, not here: this runs under `rx`). Its TTL
+    /// counted. The let-go record was captured under `rx`; sending holds neither `rx` nor `gone`. Its TTL
     /// goes down by one, so a route that still leads here cannot loop it. Limits, each counted
     /// as dropped: a fragment with IP ID 0 (the kernel would give it a new ID, so it would no
     /// longer reassemble with its siblings), and a packet larger than the new route's MTU
     /// (EMSGSIZE). A re-sent packet can arrive after newer ones that took the new route (and
     /// behind what a plugged tap holds): late rather than lost.
-    fn straggler(&self, ip: Ipv4Addr, p: &mut [u8]) {
-        let mut gone = self.gone.lock().unwrap();
-        let Some(g) = gone.get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR) else { return };
-        let fragment = u16::from_be_bytes([p[6], p[7]]) & 0x3fff != 0;
-        let zero_id = p[4] == 0 && p[5] == 0;
-        let sent = g.moved
-            && !(fragment && zero_id)
-            && p[8] > 1
-            && self.resend.as_ref().is_some_and(|fd| {
-                p[8] -= 1;
+    fn straggler(&self, ip: Ipv4Addr, p: &mut [u8], g: Gone) {
+        self.send_straggler(ip, p, g, |p| {
+            self.resend.as_ref().is_some_and(|fd| {
                 // The kernel fills the header checksum in.
                 let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
                 to.sin_family = libc::AF_INET as u16;
                 to.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
                 let size = std::mem::size_of::<libc::sockaddr_in>() as u32;
                 unsafe { libc::sendto(fd.as_raw_fd(), p.as_ptr().cast(), p.len(), libc::MSG_DONTWAIT, (&to as *const libc::sockaddr_in).cast(), size) >= 0 }
-            });
-        match sent {
-            true => g.resent += 1,
-            false => g.dropped += 1,
+            })
+        });
+    }
+
+    fn send_straggler(&self, ip: Ipv4Addr, p: &mut [u8], g: Gone, send: impl FnOnce(&[u8]) -> bool) {
+        let fragment = u16::from_be_bytes([p[6], p[7]]) & 0x3fff != 0;
+        let zero_id = p[4] == 0 && p[5] == 0;
+        let sent = g.moved && !(fragment && zero_id) && p[8] > 1 && {
+            p[8] -= 1;
+            send(p)
+        };
+        let mut gone = self.gone.lock().unwrap();
+        if let Some(current) = gone.get_mut(&ip).filter(|current| current.at == g.at) {
+            match sent {
+                true => current.resent += 1,
+                false => current.dropped += 1,
+            }
+        } else {
+            // A new hold or release replaced the record while sending: report this packet with the old release.
+            drop(gone);
+            report(ip, &self.dev, &Gone { resent: sent as u64, dropped: !sent as u64, ..g });
         }
     }
 }
@@ -1119,6 +1135,43 @@ mod tests {
     }
 
     #[test]
+    fn straggler_send_releases_locks_and_keeps_release_counts() {
+        let h = holder(std::fs::File::open("/dev/null").unwrap().into());
+        let ip = Ipv4Addr::new(10, 9, 0, 8);
+        for (moved, ttl, success, replace) in
+            [(true, 64, true, false), (true, 64, false, false), (false, 64, true, false), (true, 1, true, false), (true, 64, true, true)]
+        {
+            let g = Gone::new(moved);
+            h.gone.lock().unwrap().insert(ip, g);
+            let mut p = udp_to(ip);
+            p[8] = ttl;
+            let mut sent = false;
+            h.send_straggler(ip, &mut p, g, |packet| {
+                drop(h.rx.try_lock().expect("sending outside rx"));
+                let mut gone = h.gone.try_lock().expect("sending outside gone");
+                assert_eq!(packet[8], ttl - 1);
+                sent = true;
+                if replace {
+                    gone.insert(ip, Gone { at: g.at + Duration::from_secs(1), ..Gone::new(false) });
+                }
+                success
+            });
+            assert_eq!(sent, moved && ttl > 1);
+            let current = h.gone.lock().unwrap()[&ip];
+            assert_eq!(
+                (current.resent, current.dropped),
+                if replace {
+                    (0, 0)
+                } else if sent && success {
+                    (1, 0)
+                } else {
+                    (0, 1)
+                }
+            );
+        }
+    }
+
+    #[test]
     fn completion_never_writes_into_the_ip_header() {
         let p = forgery();
         // Completed as asked, the source is forged and the header checksum still passes.
@@ -1568,10 +1621,12 @@ mod tests {
         let mut frag = [0x45u8, 0, 0, 28, 0, 0, 0x20, 0, 64, 17, 0, 0, 10, 100, 254, 1, 10, 100, 254, 9, 0, 1, 0, 9, 0, 8, 0, 0];
         frag[16..20].copy_from_slice(&ip.octets());
         let before = counts(&a);
-        a.straggler(ip, &mut frag);
+        let g = a.gone.lock().unwrap()[&ip];
+        a.straggler(ip, &mut frag, g);
         assert_eq!(counts(&a), (before.0, before.1 + 1));
         frag[4..6].copy_from_slice(&[0x12, 0x34]);
-        a.straggler(ip, &mut frag);
+        let g = a.gone.lock().unwrap()[&ip];
+        a.straggler(ip, &mut frag, g);
         assert_eq!(counts(&a), (before.0 + 1, before.1 + 1));
     }
 }

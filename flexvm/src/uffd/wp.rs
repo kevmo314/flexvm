@@ -978,7 +978,9 @@ mod tests {
     fn template_prefault_populates_the_source_mapping() {
         use std::os::unix::fs::FileExt;
 
-        let (_dir, pager) = test_pager(1);
+        let (dir, mut pager) = test_pager(1);
+        std::fs::write(dir.join("mem"), vec![42; PAGE_SIZE]).unwrap();
+        pager.base = crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap();
         let ptr = pager.base.pages(0, 1).as_ptr() as *mut libc::c_void;
         // Older kernels only support the asynchronous fallback.
         if unsafe { libc::madvise(ptr, PAGE_SIZE, libc::MADV_POPULATE_READ) } != 0 {
@@ -992,8 +994,14 @@ mod tests {
             u64::from_ne_bytes(entry) & PM_PRESENT != 0
         };
         assert!(!present());
-        pager.base.prefault(0, 1);
+        // Fault preparation needs neither wp nor a claim, so freeze can take a consistent snapshot meanwhile.
+        let _wp = pager.wp.lock().unwrap();
+        assert_eq!(pager.prepare_fault_template(0, 16), 1);
         assert!(present(), "the copy must not be the first access to the source");
+        assert_eq!(pager.pages().get(0), BASE);
+        assert!(!pager.pages().is_dirty(0));
+        assert_eq!(pager.prepare_fault_template(0, 0), 0);
+        assert_eq!(pager.prepare_fault_template(1, 16), 0);
     }
 
     #[test]

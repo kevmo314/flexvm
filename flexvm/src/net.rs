@@ -66,11 +66,24 @@ pub fn read_tap_queue(fd: &OwnedFd, each: &mut dyn FnMut(&[u8])) -> u64 {
     // A frame with its virtio-net header, up to the 64 KiB a GSO frame can be.
     let mut buf = vec![0u8; 65562 + 64];
     let mut n = 0;
-    // Bounded by the ring (TAP_QUEUE) and in case the descriptor were blocking after all.
-    while n < u64::from(TAP_QUEUE) && tap_queued(fd).unwrap_or(false) {
-        let Ok(len) = usize::try_from(unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { break };
+    // Do not change shared descriptor flags; keep polling per frame if it is blocking after all.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    let nonblocking = flags >= 0 && flags & libc::O_NONBLOCK != 0;
+    if !tap_queued(fd).unwrap_or(false) {
+        return 0;
+    }
+    // Bounded by the ring (TAP_QUEUE), even if more traffic arrives meanwhile.
+    while n < u64::from(TAP_QUEUE) {
+        let Ok(len) = crate::util::eintr(|| unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { break };
+        if len == 0 {
+            break;
+        }
+        let len = len as usize;
         each(&buf[..len]);
         n += 1;
+        if !nonblocking && !tap_queued(fd).unwrap_or(false) {
+            break;
+        }
     }
     n
 }
@@ -918,6 +931,32 @@ impl IpRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tap_queue_drains_nonblocking_frames_and_stops_at_empty() {
+        use std::os::unix::net::UnixDatagram;
+
+        let (read, write) = UnixDatagram::pair().unwrap();
+        let fd: OwnedFd = read.into();
+        for nonblocking in [false, true] {
+            if nonblocking {
+                assert_eq!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) }, 0);
+            }
+            write.send(b"first").unwrap();
+            write.send(b"second").unwrap();
+            let mut frames = Vec::new();
+            assert_eq!(read_tap_queue(&fd, &mut |f| frames.push(f.to_vec())), 2);
+            assert_eq!(frames, [b"first".to_vec(), b"second".to_vec()]);
+            assert_eq!(read_tap_queue(&fd, &mut |_| panic!("empty")), 0);
+        }
+        write.send(b"ongoing").unwrap();
+        assert_eq!(
+            read_tap_queue(&fd, &mut |_| {
+                write.send(b"ongoing").unwrap();
+            }),
+            u64::from(TAP_QUEUE)
+        );
+    }
 
     #[test]
     fn proxy_arp_retries_failures_after_a_pause_and_recreated_interfaces() {
