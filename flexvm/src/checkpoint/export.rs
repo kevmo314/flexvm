@@ -399,23 +399,72 @@ fn reserve(file: &File, need: u64) -> Result<()> {
     Ok(())
 }
 
-/// The current member, `len` bytes, is the same as `local`'s bytes (hashed into `sha`).
-fn same(src: &mut Source, len: u64, local: &Path, sha: &mut Sha256) -> Result<bool> {
-    let Ok(mut have) = File::open(local) else { return Ok(false) };
-    if have.metadata()?.len() != len {
-        return Ok(false);
+/// Where a verified checkpoint's files go: staged, or compared with the one this host has under its id.
+enum Sink {
+    Stage(Staging),
+    Same { dir: PathBuf, equal: bool },
+}
+
+/// A checkpoint's pages, as `Sink::pages` takes them.
+enum Pages {
+    Stage(File),
+    Same { have: Option<File>, equal: bool },
+}
+
+impl Sink {
+    fn small(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        match self {
+            Sink::Stage(s) => drop(s.add_file(name, bytes)?),
+            Sink::Same { dir, equal } => *equal &= read_at_most(&dir.join(name), bytes.len() as u64).is_ok_and(|have| have == bytes),
+        }
+        Ok(())
     }
-    let (mut a, mut b, mut left) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20], len);
-    let mut equal = true;
-    while left > 0 {
-        let n = left.min(a.len() as u64) as usize;
-        src.reader().read_exact(&mut a[..n]).map_err(truncated)?;
-        sha.update(&a[..n]);
-        have.read_exact(&mut b[..n])?;
-        equal &= a[..n] == b[..n];
-        left -= n as u64;
+
+    fn pages(&mut self, len: u64) -> Result<Pages> {
+        Ok(match self {
+            Sink::Stage(s) => {
+                let file = s.create("pages")?;
+                reserve(&file, len)?;
+                Pages::Stage(file)
+            }
+            Sink::Same { dir, equal } => {
+                let have = File::open(dir.join("pages")).ok().filter(|f| f.metadata().is_ok_and(|m| m.len() == len));
+                Pages::Same { equal: *equal && have.is_some(), have }
+            }
+        })
     }
-    Ok(equal)
+}
+
+impl Pages {
+    fn put(&mut self, chunk: &[u8]) -> Result<()> {
+        match self {
+            Pages::Stage(f) => f.write_all(chunk)?,
+            Pages::Same { have: Some(f), equal } if *equal => {
+                let mut b = vec![0u8; chunk.len()];
+                *equal = f.read_exact(&mut b).is_ok() && b == chunk;
+            }
+            Pages::Same { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Whether they were the same (staged: synced).
+    fn finish(self) -> Result<bool> {
+        match self {
+            Pages::Stage(f) => {
+                f.sync_all()?;
+                Ok(true)
+            }
+            Pages::Same { equal, .. } => Ok(equal),
+        }
+    }
+}
+
+/// `path`'s bytes, if it has at most `max`.
+fn read_at_most(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = vec![];
+    File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// One checkpoint of the chain, read and verified: staged, or already in the store.
@@ -483,25 +532,15 @@ fn receive(
             text = [format!("{here}\n").as_bytes(), &body].concat();
         }
     }
+    // This host may have one by its id, which is no cryptographic check: what was sent is verified all
+    // the same, then either staged or, for one here, compared byte for byte with it (and used only if equal).
     let local = store_dir.join(&here);
-    if read_manifest(&local).is_ok() {
-        // This host has one by its id, which is no cryptographic check: used only if it is the same, byte for byte.
-        let differs = || bad(&format!("this host has a checkpoint {here} with other files: remove it (flexvm checkpoint rm {here}) to load this one"));
-        ensure!(std::fs::read(local.join("manifest.json")).is_ok_and(|have| have == text), "{}", differs());
-        let mut files = vec![("manifest.json", Sha256::digest(&text).to_vec())];
-        for name in ["vmstate", "pagemap", "pages"] {
-            let len = src.member(&checkpoint_member(id, name))?;
-            let mut sha = Sha256::new();
-            ensure!(same(src, len, &local.join(name), &mut sha)?, "{}", differs());
-            let sha = sha.finalize();
-            digest.file(name, len, &sha);
-            files.push((name, sha.to_vec()));
-        }
-        return Ok(Loaded { id: here, manifest, staging: None, files });
-    }
-    let staging = Staging::import(store_dir)?;
+    let mut sink = match read_manifest(&local) {
+        Ok(_) => Sink::Same { dir: local, equal: std::fs::read(store_dir.join(&here).join("manifest.json")).is_ok_and(|have| have == text) },
+        Err(_) => Sink::Stage(Staging::import(store_dir)?),
+    };
     let want = |name: &str| manifest.files.get(name).cloned().ok_or_else(|| bad(&format!("its manifest lists no {name}")));
-    let mut checked = |name: &str, max: u64, meta_left: &mut u64| -> Result<Vec<u8>> {
+    let mut checked = |name: &str, max: u64, meta_left: &mut u64, sink: &mut Sink| -> Result<Vec<u8>> {
         let want = want(name)?;
         let len = src.member(&checkpoint_member(id, name))?;
         ensure!(len == want.len, "{}", bad(&format!("its {name} is not as long as its manifest says")));
@@ -509,12 +548,12 @@ fn receive(
         let bytes = read_all(src, len)?;
         ensure!(sum(&bytes) == want.hash, "{}", bad(&format!("its {name} does not match its checksum")));
         digest.file(name, len, &Sha256::digest(&bytes));
-        staging.add_file(name, &bytes)?;
+        sink.small(name, &bytes)?;
         Ok(bytes)
     };
-    let vmstate = checked("vmstate", MAX_VMSTATE, meta_left)?;
+    let vmstate = checked("vmstate", MAX_VMSTATE, meta_left, &mut sink)?;
     let map_max = manifest.guest_pages * 36 + 24;
-    let map = checked("pagemap", map_max, meta_left)?;
+    let map = checked("pagemap", map_max, meta_left, &mut sink)?;
     let mut files = vec![("vmstate", Sha256::digest(&vmstate).to_vec()), ("pagemap", Sha256::digest(&map).to_vec())];
     let (runs, sums) = parse_pagemap(&map, manifest.guest_pages, manifest.parent.is_some(), 0).map_err(|e| bad(&e.to_string()))?;
     let data: u64 = runs.iter().filter(|r| r.2 == DATA).map(|r| r.1).sum();
@@ -522,8 +561,7 @@ fn receive(
     ensure!(data == manifest.data_pages && want("pages")?.len == pages_len, "{}", bad("its page counts do not add up"));
     let len = src.member(&checkpoint_member(id, "pages"))?;
     ensure!(len == pages_len, "{}", bad("its pages are not as long as its manifest says"));
-    let file = staging.create("pages")?;
-    reserve(&file, len)?;
+    let mut out = sink.pages(len)?;
     let (mut buf, mut sha) = (vec![0u8; 256 * PAGE_SIZE], Sha256::new());
     let mut d = 0;
     while d < data {
@@ -534,15 +572,28 @@ fn receive(
         for (i, page) in chunk.chunks(PAGE_SIZE).enumerate() {
             ensure!(crate::crc32c::page(page).0 == sums[d as usize + i], "{}", bad(&format!("its data page {} does not match its checksum", d as usize + i)));
         }
-        (&file).write_all(chunk)?;
+        out.put(chunk)?;
         d += n as u64;
     }
-    file.sync_all()?;
+    let equal = out.finish()?;
     let sha = sha.finalize();
     digest.file("pages", len, &sha);
     files.extend([("pages", sha.to_vec()), ("manifest.json", Sha256::digest(&text).to_vec())]);
-    staging.add_file("manifest.json", &text)?;
-    Ok(Loaded { id: here, manifest, staging: Some(staging), files })
+    let staging = match sink {
+        Sink::Stage(staging) => {
+            staging.add_file("manifest.json", &text)?;
+            Some(staging)
+        }
+        Sink::Same { equal: same, .. } => {
+            ensure!(
+                same && equal,
+                "{}",
+                bad(&format!("this host has a checkpoint {here} with other files: remove it (flexvm checkpoint rm {here}) to load this one"))
+            );
+            None
+        }
+    };
+    Ok(Loaded { id: here, manifest, staging, files })
 }
 
 /// `checkpoint load`: a `save`'s tar from `r`, into the store, named `name` (else as it was saved);
@@ -904,6 +955,22 @@ mod tests {
             assert_eq!(r.is_ok(), ok, "{r:?}");
             assert!(ok || nothing(&b));
         }
+    }
+
+    #[test]
+    fn a_damaged_checkpoint_here_is_refused_even_as_its_own_save() {
+        let (_dir, paths, _tpl, state, chain, _) = saved();
+        // Damaged where it is stored: its save carries the damage (save reads pages unchecked), and
+        // loading it back where it came from verifies the pages as for any other host.
+        let pages = store::dir(&state).join(&chain[1]).join("pages");
+        let mut damaged = fs::read(&pages).unwrap();
+        damaged[PAGE_SIZE + 9] ^= 1;
+        fs::write(&pages, &damaged).unwrap();
+        let mut tar = vec![];
+        save(&state, &paths, "web", &mut tar).unwrap();
+        let e = load(&state, &paths, &mut &tar[..], None, None).err().unwrap().to_string();
+        assert!(e.contains("data page 1 does not match its checksum"), "{e}");
+        assert_eq!(ids(&state).len(), 2);
     }
 
     /// `tar` with member `i`'s header (and, if given, its bytes) replaced; sizes as given.

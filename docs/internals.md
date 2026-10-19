@@ -507,8 +507,8 @@ free space. Those checks are not cryptographic (the id is a 64-bit hash), so
 a save also has a SHA-256 (`SaveDigest`: per checkpoint, oldest first, its id
 and each file's name, length and SHA-256), which `save` prints and `load`
 computes from what it read; `--sha256` refuses another before the template is
-read. A checkpoint the store has under one of the ids is compared byte for
-byte with what was sent, and refused if it differs. A parent is
+read. What was sent is verified so even where the store has a checkpoint under
+its id; that one is then compared byte for byte with it, and refused if it differs. A parent is
 named `../ID` here: a manifest that names it otherwise (a v0.1.0 directory's) is
 rewritten, so it and its descendants get new ids. The template is taken only if
 no generation of that content id is here: received by `template::receive` with
