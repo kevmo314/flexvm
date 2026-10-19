@@ -7839,6 +7839,11 @@ pub(crate) mod tests {
         PINNED_MS.with(|p| p.set(Some(ms)));
     }
 
+    /// A reserve grant with fixed MemAvailable, preserving refusals and admission errors.
+    pub(crate) fn grant_with_available(h: &Host, mib: u64, available: u64) -> Result<Option<u64>> {
+        Ok(h.grant_inner(mib, Floor::Reserve, false, None, || Some(available))?.ok().map(|g| g.0))
+    }
+
     /// `grant_inner` against `AVAIL`.
     fn grant_at(h: &Host, mib: u64, floor: Floor, hold: bool) -> std::result::Result<(u64, Option<Hold>), Error> {
         h.grant_inner(mib, floor, hold, None, || Some(AVAIL)).unwrap()
