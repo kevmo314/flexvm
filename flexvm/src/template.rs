@@ -659,6 +659,13 @@ impl Template {
         Ok(names_by_path(&std::fs::read(self.vmstate())?, &self.meta.rootfs))
     }
 
+    /// The only file a load of it may open as pmem: `ROOTFS`, or for one built by v0.1.0 its root
+    /// filesystem's path, which for a received one `receive` found holding it here. Never one its
+    /// vmstate (perhaps a peer's) chooses.
+    pub fn pmem_path(&self) -> Result<PathBuf> {
+        Ok(if self.names_rootfs_by_path()? { self.meta.rootfs.clone() } else { ROOTFS.into() })
+    }
+
     pub fn check_id(&self, id: &str) -> Result<()> {
         if self.meta.id != id {
             bail!("template {:?} id mismatch: local {}, source {id}", self.name, self.meta.id);
@@ -1983,6 +1990,30 @@ pub(crate) mod tests {
 
         fn write_meta(&self, meta: &Meta, dir: &Path) {
             std::fs::write(dir.join("meta.json"), serde_json::to_vec(meta).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn every_load_confines_pmem_to_the_generations_root_filesystem() {
+        for by_path in [false, true] {
+            let mut f = Fixture::new();
+            if by_path {
+                // Where a pull puts it, the only place a received older generation's may be (`open_cached_rootfs`).
+                let cache = f.paths.images.join("rootfs");
+                std::fs::create_dir_all(&cache).unwrap();
+                f.meta.rootfs = std::fs::canonicalize(&cache).unwrap().join("k.ext4");
+                std::fs::rename(f.dir.join("rootfs"), &f.meta.rootfs).unwrap();
+            }
+            let rootfs = f.meta.rootfs.clone();
+            let named = if by_path { rootfs.display().to_string() } else { ROOTFS.to_string() };
+            let (tpl, buf) = sent(&mut f, &named);
+            let want = if by_path { rootfs.display().to_string() } else { ROOTFS.to_string() };
+            let (_dir, paths) = elsewhere(&f);
+            // Local or received, built by v0.1.0 or since: the vmstate chooses no other file.
+            for tpl in [tpl.clone(), receive(&paths, &mut &buf[..], &tpl.meta.id, None, |_| Ok(()), |_| Ok(())).unwrap()] {
+                let body = crate::fc::snapshot_load_body(Path::new("vmstate"), &tpl, "tap0", Path::new("vsock"), Path::new("uffd")).unwrap();
+                assert_eq!(body["confined_pmem"], want, "by_path={by_path}, received={}", tpl.meta.received);
+            }
         }
     }
 

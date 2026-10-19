@@ -147,13 +147,7 @@ impl Firecracker {
     ) -> Result<Value> {
         self.join_cgroup()?;
         self.link_rootfs(&template.meta.rootfs)?;
-        let mut body = serde_json::json!({
-            "snapshot_path": vmstate,
-            "device_reference_path": template.vmstate(),
-            "mem_backend": {"backend_type": "Uffd", "backend_path": self.sockets.uffd},
-            "vsock_override": {"uds_path": self.sockets.vsock},
-            "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
-        });
+        let mut body = snapshot_load_body(vmstate, template, tap, &self.sockets.vsock, &self.sockets.uffd)?;
         let Some(realtime) = clock_realtime else { return self.request_within("PUT", "/snapshot/prepare", Some(body), timeout) };
         body["clock_realtime"] = realtime.into();
         body["resume_vm"] = false.into();
@@ -215,6 +209,20 @@ impl Firecracker {
             let _ = j.join();
         }
     }
+}
+
+/// Common to every load (restore, standby, migration prepare and load): Firecracker opens no pmem
+/// file but the one `template` names (`Template::pmem_path`), read only, whoever sent the vmstate
+/// or the template (`firecracker/0002-*.patch`, #788).
+pub(crate) fn snapshot_load_body(vmstate: &Path, template: &crate::template::Template, tap: &str, vsock: &Path, uffd: &Path) -> Result<Value> {
+    Ok(serde_json::json!({
+        "snapshot_path": vmstate,
+        "device_reference_path": template.vmstate(),
+        "confined_pmem": template.pmem_path()?,
+        "mem_backend": {"backend_type": "Uffd", "backend_path": uffd},
+        "vsock_override": {"uds_path": vsock},
+        "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
+    }))
 }
 
 /// One reader for both streams, with bounded memory even for a console without newlines.
