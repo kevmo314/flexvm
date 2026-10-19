@@ -125,8 +125,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm tag SRC DST                 name a pulled generation again, without rebuilding
   flexvm image prune [-f] [--force-shared]
                                      remove <none> generations no VM here, or in a state sharing
-                                     the templates, uses (-f: without asking; --force-shared: also
-                                     when they were shared before flexvm recorded which states link them)
+                                     the templates, uses (-f: without asking; --force-shared: trust
+                                     the record of those states, forgetting any that are gone)
   flexvm system prune [-f] [--force-shared]
                                      also failed and lost VM records and the layer blob cache
   flexvm system df                   disk space by images, templates, blobs, VMs and checkpoints
