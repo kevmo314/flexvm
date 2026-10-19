@@ -1290,7 +1290,8 @@ mod tests {
         let go = dir.join("go");
         // Half the ring, then more: with its client away but within GRACE, the pump waits for it
         // before taking the rest, and the shell exits meanwhile (the rest fits the pipe).
-        let command = format!("head -c 65536 /dev/zero; while [ -d '{}' ] && [ ! -e '{}' ]; do sleep 0.01; done; echo more; exit 3", dir.display(), go.display());
+        let command =
+            format!("head -c 65536 /dev/zero; while [ -d '{}' ] && [ ! -e '{}' ]; do sleep 0.01; done; echo more; exit 3", dir.display(), go.display());
         let (output, group) = start(&sessions, &statuses, "slow", command.as_bytes());
         // The first half comes in; the pump waits for the client there, well within GRACE.
         let ring = output.0.lock().unwrap();
