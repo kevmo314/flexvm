@@ -481,13 +481,13 @@ impl Proc {
     }
 
     /// Admits a start against the host's floor. `held` is memory already here;
-    /// None holds the grant until a disk restore or arrival finishes pulling.
-    pub fn admit_start(&self, need: u64, held: Option<u64>, floor: crate::host::Floor) -> Result<()> {
+    /// None holds the grant until a disk restore or arrival finishes pulling. Not under the host lock (`grant_start`).
+    pub fn admit_start(&self, need: u64, held: Option<u64>, floor: crate::host::Floor, deadline: Option<Instant>) -> Result<()> {
         let mib = crate::limit::allowance(need);
         let id = match held {
-            Some(held) => self.host.grant_start(mib.saturating_sub(held), floor, false)?.0,
+            Some(held) => self.host.grant_start(mib.saturating_sub(held), floor, false, deadline)?.0,
             None => {
-                let (id, hold) = self.host.grant_start(mib, floor, true)?;
+                let (id, hold) = self.host.grant_start(mib, floor, true, deadline)?;
                 *self.held_grant.lock().unwrap() = Some(hold.ok_or("no hold")?);
                 id
             }
@@ -517,7 +517,7 @@ impl Proc {
     }
 
     pub(crate) fn release_hold(&self) {
-        drop(self.held_grant.lock().unwrap().take());
+        self.host.release_hold(&self.held_grant);
     }
 
     /// Waits for `vm`'s pull, its hold counting only what is still to come:
@@ -1163,7 +1163,7 @@ impl Proc {
         self.spec.lock().unwrap().check(tpl.meta.image.as_ref())?;
         t.mark("template");
         // Before the claim: a refused start mints no generation (nor withdraws one).
-        self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
+        self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve, None)?;
         self.bind_ports()?;
         let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
         let ip = self.set_addr(claim);
@@ -2746,7 +2746,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     if fault("no_evict") {
         return;
     }
-    let rss = |e: &Entry| e.firecracker.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 10;
+    let rss = |e: &Entry| e.firecracker.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 20;
     let mut vms = rank(host.entries(), rss);
     if !pressure {
         vms.retain(|e| e.starved);

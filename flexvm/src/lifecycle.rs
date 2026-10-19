@@ -428,7 +428,7 @@ impl Proc {
         tpl.check_vouched(ck.manifest.template_digests.as_ref(), "the checkpoint")?;
         t.mark("verify_template");
         // The template's working set is prefetched too.
-        self.admit_start(tpl.working_set_mib() + ((ck.data_pages() * PAGE_SIZE as u64) >> 20), None, crate::host::Floor::Reserve)?;
+        self.admit_start(tpl.working_set_mib() + ((ck.data_pages() * PAGE_SIZE as u64) >> 20), None, crate::host::Floor::Reserve, None)?;
         Ok(tpl)
     }
 

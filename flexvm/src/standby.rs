@@ -424,7 +424,7 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
     }
     // Above the eviction mark, and none while an eviction runs here: a refill never takes
     // the room eviction is moving VMs away to make (#600).
-    let grant = match host.grant_above(mib, crate::host::Floor::EvictMark, Some(by)) {
+    let grant = match host.grant_above(mib, crate::host::Floor::Refill, Some(by)) {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(None),
         Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => return Ok(None),
@@ -760,7 +760,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     // Its memory is already out of MemAvailable: only the step is charged. Sized
     // as it was loaded (`serve`), and admitted before the address is claimed.
     let held = p.sizes.lock().unwrap().map_or(0, |(held, _)| held);
-    p.admit_start(held, Some(held), crate::host::Floor::Reserve).map_err(|e| (e, true))?;
+    p.admit_start(held, Some(held), crate::host::Floor::Reserve, None).map_err(|e| (e, true))?;
     let not_run = |e: Error, retry: bool| {
         p.refund_start();
         (e, retry)

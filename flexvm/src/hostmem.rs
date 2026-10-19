@@ -59,7 +59,7 @@ fn poll() -> Duration {
     POLL
 }
 
-/// The last request: its number and when it was made (boottime ms).
+/// The last request: its number and when it started (boottime ms).
 fn request(run: &Path) -> PathBuf {
     locks(run).join(format!("release-{}", crate::host::boot_id()))
 }
@@ -106,23 +106,29 @@ pub fn serve(run: &Path, release: impl Fn()) {
 pub fn release_kept(host: &Host, deadline: Option<Instant>) {
     let by = Instant::now() + release_wait();
     let by = deadline.map_or(by, |d| d.min(by));
-    if let Some(n) = ask(host, by) {
+    if let Some((n, by)) = ask(host, by) {
         wait(&host.run, n, by);
     }
 }
 
 /// Raises the request's number under the host lock, or returns the existing number within `RELEASE_GAP_MS`
-/// so callers still wait for its outstanding answers. None if the lock cannot be taken or the request written.
-fn ask(host: &Host, by: Instant) -> Option<u64> {
+/// with its remaining wait, so joining callers share its deadline. None if the lock or write fails.
+fn ask(host: &Host, by: Instant) -> Option<(u64, Instant)> {
+    let started = crate::host::boottime_ms();
     let _l = host.lock_by(Some(by)).ok()?;
     let (n, at) = last(&host.run).unwrap_or_default();
+    let when = Instant::now();
     let now = crate::host::boottime_ms();
+    let until = |at| {
+        let left = release_wait().saturating_sub(Duration::from_millis(now.wrapping_sub(at)));
+        by.min(when + left)
+    };
     if at != 0 && now.wrapping_sub(at) < RELEASE_GAP_MS {
-        return Some(n);
+        return Some((n, until(at)));
     }
     let path = request(&host.run);
-    match crate::host::private_dir(&locks(&host.run)).map_err(Into::into).and_then(|()| store(&path, &(n + 1, now), false)) {
-        Ok(()) => Some(n + 1),
+    match crate::host::private_dir(&locks(&host.run)).map_err(Into::into).and_then(|()| store(&path, &(n + 1, started), false)) {
+        Ok(()) => Some((n + 1, until(started))),
         Err(e) => {
             crate::log!("hostmem: cannot ask for kept memory back: {e}");
             None
@@ -202,7 +208,7 @@ mod tests {
         // Long: other tests hold the host lock (one for the process) for a while on a loaded machine.
         let now = || Instant::now() + Duration::from_secs(30);
         // Nobody to ask: answered at once.
-        let n = ask(&h, now()).unwrap();
+        let n = ask(&h, now()).unwrap().0;
         let t = Instant::now();
         assert!(wait(&run, n, now()));
         assert!(t.elapsed() < Duration::from_secs(1));
@@ -222,17 +228,17 @@ mod tests {
         assert_eq!(released.load(Ordering::SeqCst), 0, "a request made before it joined is not its");
         // Waits for the release (a poll and 20 ms), not for the deadline.
         forget_release(&run);
-        let n = ask(&h, now()).unwrap();
-        let repeated = ask(&h, now()).expect("a caller within the gap must still wait for outstanding answers");
+        let n = ask(&h, now()).unwrap().0;
+        let repeated = ask(&h, now()).expect("a caller within the gap must still wait for outstanding answers").0;
         assert_eq!(repeated, n);
         let t = Instant::now();
         assert!(wait(&run, repeated, Instant::now() + Duration::from_secs(10)));
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         assert_eq!(released.load(Ordering::SeqCst), 1);
         // Within a second of the last: reuse the answered request without asking again.
-        assert_eq!(ask(&h, now()), Some(n));
+        assert_eq!(ask(&h, now()).map(|r| r.0), Some(n));
         forget_release(&run);
-        let n = ask(&h, now()).unwrap();
+        let n = ask(&h, now()).unwrap().0;
         assert!(wait(&run, n, now()));
         assert_eq!(released.load(Ordering::SeqCst), 2);
         // A member that runs and does not answer: given up on at the deadline, and it stays a member.
@@ -241,7 +247,7 @@ mod tests {
         let silent = Ident::of(pid).unwrap();
         member(&run, &silent, 0);
         forget_release(&run);
-        let n = ask(&h, now()).unwrap();
+        let n = ask(&h, now()).unwrap().0;
         let t = Instant::now();
         assert!(!wait(&run, n, Instant::now() + Duration::from_millis(50)), "the silent one did not answer");
         assert!(t.elapsed() < Duration::from_secs(2));
@@ -276,15 +282,39 @@ mod tests {
         let at = 10_000;
         crate::host::pin_clock(at);
         member(&h.run, &Ident::me(), 0);
-        let n = ask(&h, by).unwrap();
+        let n = ask(&h, by).unwrap().0;
         crate::host::pin_clock(at + RELEASE_GAP_MS - 1);
-        assert_eq!(ask(&h, by), Some(n));
+        assert_eq!(ask(&h, by).map(|r| r.0), Some(n));
         assert_eq!(last(&h.run), Some((n, at)), "reusing a request does not extend its gap");
         assert!(!wait(&h.run, n, Instant::now()), "the outstanding answer is still required");
         member(&h.run, &Ident::me(), n);
-        assert!(wait(&h.run, ask(&h, by).unwrap(), by));
+        assert!(wait(&h.run, ask(&h, by).unwrap().0, by));
         crate::host::pin_clock(at + RELEASE_GAP_MS);
-        assert_eq!(ask(&h, by), Some(n + 1), "a fresh request at the gap boundary");
+        assert_eq!(ask(&h, by).map(|r| r.0), Some(n + 1), "a fresh request at the gap boundary");
+    }
+
+    #[test]
+    fn joining_a_request_shares_its_remaining_wait() {
+        let (_dir, h) = crate::host::tests::host("hostmem-deadline");
+        let at = 10_000;
+        crate::host::pin_clock(at);
+        let by = Instant::now() + Duration::from_secs(30);
+        let (n, first) = ask(&h, by).unwrap();
+        assert!(first <= Instant::now() + RELEASE_WAIT);
+        crate::host::pin_clock(at + 150);
+        let before = Instant::now();
+        let (same, shared) = ask(&h, by).unwrap();
+        assert_eq!(same, n);
+        assert!(shared >= before + Duration::from_millis(50));
+        assert!(shared <= Instant::now() + Duration::from_millis(50));
+        crate::host::pin_clock(at + 200);
+        let (same, expired) = ask(&h, by).unwrap();
+        assert_eq!(same, n);
+        assert!(expired <= Instant::now(), "joining an expired request does not wait again");
+        crate::host::pin_clock(at + 100);
+        pin_release(Some(Duration::from_secs(30)), None);
+        let sooner = Instant::now() + Duration::from_secs(10);
+        assert_eq!(ask(&h, sooner).unwrap().1, sooner);
     }
 
     /// A request's number only grows (it is raised under the host lock), so an answer to a later one answers it too.
@@ -295,9 +325,9 @@ mod tests {
         let by = Instant::now() + Duration::from_secs(30);
         let at = 10_000;
         crate::host::pin_clock(at);
-        let a = ask(&h, by).unwrap();
+        let a = ask(&h, by).unwrap().0;
         crate::host::pin_clock(at + RELEASE_GAP_MS);
-        let b = ask(&h, by).unwrap();
+        let b = ask(&h, by).unwrap().0;
         assert_eq!(b, a + 1);
         member(&h.run, &Ident::me(), b);
         assert!(wait(&h.run, a, Instant::now()), "a later answer answers it without waiting");
