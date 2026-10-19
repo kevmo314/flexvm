@@ -2109,6 +2109,22 @@ def same_host_late_handover():
     udp_across_migrations("same host late handover", "ft-late", "release_late")
 
 
+def same_host_qdisc_backlog():
+    """#817: a sender that looked the route up just before the source's hold hands its packet
+    to the tap's qdisc, not yet to the tap, when the tap goes down after the pause
+    (`tap_qdisc_backlog`: the tap's qdisc holds what reaches it from 3 ms before the hold
+    until after the pause).
+    The link-down's qdisc reset would free it uncounted: the source lets the qdisc empty into
+    the tap's queue first, which it takes with the rest, so nothing is lost. Each source but
+    the first has our released plug at the root of its tap (the first, a default qdisc,
+    which the fault leaves alone)."""
+    logs = udp_across_migrations("same host qdisc backlog", "ft-qdisc-backlog", source_fault="tap_qdisc_backlog")
+    # Each source's log once (the last, B's, is the final target's): the second and third sources engage it,
+    # each holding packets past its pause.
+    held = [int(m) for t in logs[:-1] for m in re.findall(r"its tap's qdisc held (\d+) packets after the pause", t)]
+    check("same host qdisc backlog: each later source's qdisc held packets past the pause", len(held) == 2 and all(held), held)
+
+
 def same_host_hold_route_fail():
     """#512: the target's hold fails to take the address over from the source's
     (`hold_route_fail`: its route change fails). It routes the address to its
@@ -2353,12 +2369,24 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     missing = sorted(set(range(sent[0])) - set(got))
     runs = [[a, b] for a, b in zip([m for i, m in enumerate(missing) if i == 0 or missing[i - 1] != m - 1],
                                   [m for i, m in enumerate(missing) if i + 1 == len(missing) or missing[i + 1] != m + 1])]
-    udp = sh(B, n, "grep Udp: /proc/net/snmp; pidof socat >/dev/null && echo receiving")[1].splitlines()
+    udp = sh(B, n, "grep Udp: /proc/net/snmp; grep Ip: /proc/net/snmp; cd /sys/class/net/eth0/statistics && echo Eth: rx_packets rx_dropped && "
+                   "echo Eth: $(cat rx_packets rx_dropped); pidof socat >/dev/null && echo receiving")[1].splitlines()
     guest = {k: v for k, v in zip(udp[0].split()[1:], udp[1].split()[1:]) if k in ("InDatagrams", "NoPorts", "RcvbufErrors")} if len(udp) >= 2 else udp
+    # Where else the guest would have counted one: a bad checksum, or the IP layer.
+    if len(udp) >= 4:
+        seen = {**dict(zip(udp[0].split()[1:], udp[1].split()[1:])), **dict(zip(udp[2].split()[1:], udp[3].split()[1:]))}
+        guest.update({k: v for k, v in seen.items() if k in ("InErrors", "InCsumErrors", "InHdrErrors", "InAddrErrors", "InDiscards") and v != "0"})
+    # Frames its eth0 took (a datagram's, and the few others), and dropped.
+    if len(udp) >= 6 and udp[4].startswith("Eth:"):
+        guest.update(dict(zip(udp[4].split()[1:], udp[5].split()[1:])))
     detail = (f"sent {sent[0]}, migrations began at {at}, {len(missing)} missing, runs {runs[:10]}; the guest: {guest}, "
               f"{'socat receiving' if udp[-1:] == ['receiving'] else 'socat gone'}")
     dropped = {h: [l for l in log(h, n).splitlines() if "dropped" in l or "dropping" in l] for h in (A, B)}
     dropped["earlier sources"] = [l for t in logs for l in t.splitlines() if "dropped" in l or "dropping" in l]
+    # A tap's own drops (its queue full, or no Firecracker reading it): each VM process logs its tap's as it
+    # leaves it; the last one's is asked for.
+    taps = list(dict.fromkeys(l for ls in dropped.values() for l in ls if "its tap dropped" in l))
+    detail += f"; taps dropped: {taps}, the last one {vms(B).get(n, {}).get('tap_dropped')}"
     if burst == 1:
         late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
         check(f"{label}: none reordered", not late, late[:10])
@@ -10152,7 +10180,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died, fc_died_starting=fc_died_starting,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
-    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_qdisc_backlog=same_host_qdisc_backlog, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, arrival_bind_fail=arrival_bind_fail, back_to_back=back_to_back, app_abort=app_abort,
