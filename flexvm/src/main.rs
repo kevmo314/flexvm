@@ -468,6 +468,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
             "publish",
         ],
     ),
+    ("standby-refill", 2, &[]), // Internal delayed refill worker.
     ("ps", 1, &["all", "json", "quiet", "filter", "format"]),
     ("exec", 2, &["detach", "interactive", "tty", "env", "workdir", "user"]),
     ("attach", 2, &[]),
@@ -656,6 +657,7 @@ fn real_main(args: &Args) -> Result<()> {
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
     let call = |req: Value| print(vmproc::call(&open_host(args)?, name, req, None)?);
     match pos.first().copied() {
+        Some("standby-refill") => standby::retry(&open_host(args)?, &template::name_of(name)?),
         Some("pull") => pull(args, name),
         Some("images") => images(&open_host(args)?, &paths(args)?, args),
         Some("tag") => print(template::tag(&paths(args)?, name, arg2.ok_or("tag needs SRC DST")?)?),
