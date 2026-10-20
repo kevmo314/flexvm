@@ -969,7 +969,9 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   check. A busy ranker
   defers the check, without blocking claims or triggering private scans. The
   lock and snapshot live beside the refill lock, outside the removable pool,
-  and work without a listener. Commands and refills still scan live records.
+  and work without a listener. Each elected ranker removes its template's
+  abandoned snapshot temporary files under the rank lock before publishing.
+  Commands and refills still scan live records.
 - **Generations.** `flexvm pull` publishes each build as an immutable
   `templates/.gen/<content id>/` and points `templates/NAME` at it with one
   atomic symlink swap, all through the templates directory as opened and

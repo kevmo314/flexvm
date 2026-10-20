@@ -147,6 +147,16 @@ fn extra_with(base: &std::path::Path, me: &Ident, target: usize, scan: impl FnOn
     if read_rank(&path, me).is_some_and(|i| i < target) {
         return Some(false);
     }
+    // Under this pool's rank lock, every unpublished snapshot of it is abandoned, even a live pid's:
+    // `write_file`'s `.NAME.TAG.tmp`, any `write_tag`, or an older version's bare pid. Once per scan, not per check.
+    let name = path.file_name()?.to_str()?;
+    for e in std::fs::read_dir(path.parent()?).into_iter().flatten().flatten() {
+        let n = e.file_name();
+        let tag = n.to_str().and_then(|n| n.strip_prefix('.')?.strip_prefix(name)?.strip_prefix('.')?.strip_suffix(".tmp"));
+        if tag.is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     let ids = scan();
     let bytes: Vec<u8> = ids.iter().flat_map(rank_entry).collect();
     // Unpublished, the scan still decides for this standby.
@@ -1656,6 +1666,75 @@ mod tests {
         assert_eq!(extra_with(&base, &ids[1], 1, || panic!("a fresh snapshot keeps the oldest")), Some(false));
         assert_eq!(extra_with(&base, &ids[0], 0, || panic!("no target needs no rank")), Some(true));
         assert_eq!(extra_with(&base.with_file_name("other"), &ids[0], 1, Vec::new), Some(true));
+    }
+
+    #[test]
+    fn ranker_removes_only_its_abandoned_snapshots_under_the_lock() {
+        let root = crate::test_util::TempDir::new("rank-debris");
+        let base = root.join(".locks/default");
+        let lock = Flock::new(crate::host::private_file(&base.with_extension("rank")).unwrap(), libc::LOCK_EX).unwrap();
+        let d = base.parent().unwrap();
+        let debris = [
+            ".default.ranks.123.tmp".to_string(),
+            ".default.ranks.123-456-abcdef01.tmp".to_string(),
+            format!(".default.ranks.{}.tmp", crate::util::write_tag()),
+        ];
+        let kept = [
+            ".other.ranks.123.tmp",
+            ".default.ranksx.123.tmp",
+            "default.ranks.123.tmp",
+            ".default.ranks.123",
+            ".default.123.tmp",
+            "default",
+            ".default.ranks..tmp",
+            ".default.ranks.not-a-tag.tmp",
+        ];
+        for n in debris.iter().map(String::as_str).chain(kept) {
+            std::fs::write(d.join(n), b"unchanged").unwrap();
+        }
+        // A link is removed, never followed.
+        std::os::unix::fs::symlink(d.join("default"), d.join(".default.ranks.1-2.tmp")).unwrap();
+        let directory = d.join(".default.ranks.directory.tmp");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("keep"), b"unchanged").unwrap();
+        let me = Ident::me();
+        assert_eq!(extra_with(&base, &me, 1, || panic!("ranker holds lock")), None);
+        for n in &debris {
+            assert!(d.join(n).exists(), "{n} removed without the rank lock");
+        }
+        drop(lock);
+        assert_eq!(
+            extra_with(&base, &me, 1, || {
+                for n in &debris {
+                    assert!(!d.join(n).exists(), "{n} survived the next ranker");
+                }
+                vec![me.clone()]
+            }),
+            Some(false)
+        );
+        for n in kept {
+            assert_eq!(std::fs::read(d.join(n)).unwrap(), b"unchanged", "{n}");
+        }
+        assert!(d.join(".default.ranks.1-2.tmp").symlink_metadata().is_err());
+        assert_eq!(std::fs::read(directory.join("keep")).unwrap(), b"unchanged");
+        assert_eq!(read_rank(&base.with_extension("ranks"), &me), Some(0));
+        assert!(base.with_extension("rank").exists());
+    }
+
+    #[test]
+    fn cached_ranks_leave_temporary_snapshots_for_the_next_ranker() {
+        let root = crate::test_util::TempDir::new("cached-rank-debris");
+        let base = root.join(".locks/default");
+        let me = Ident::me();
+        assert_eq!(extra_with(&base, &me, 1, || vec![me.clone()]), Some(false));
+        let tmp = base.parent().unwrap().join(".default.ranks.123.tmp");
+        std::fs::write(&tmp, b"partial").unwrap();
+        assert_eq!(extra_with(&base, &me, 0, || panic!("no target needs no rank")), Some(true));
+        assert_eq!(extra_with(&base, &me, 1, || panic!("fresh ranks need no scan")), Some(false));
+        assert!(tmp.exists());
+        File::options().write(true).open(base.with_extension("ranks")).unwrap().set_modified(std::time::SystemTime::now() - RANK_TTL).unwrap();
+        assert_eq!(extra_with(&base, &me, 1, || vec![me.clone()]), Some(false));
+        assert!(!tmp.exists());
     }
 
     #[test]
