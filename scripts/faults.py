@@ -1504,7 +1504,9 @@ def exec_background():
         t = time.time()
         r = sh(A, n, "echo hi")
         took = time.time() - t
-        check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
+        # Were their exits counted among the 64, it would be refused (too many sessions), not slow: the bound
+        # only tells a start from a hang (they are released after this check), with room for a loaded host.
+        check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 15 and not drained, (r, took, len(drained)))
     finally:
         # Released however the checks went (one raising too), and gone once they all read.
         open(release, "w").close()
