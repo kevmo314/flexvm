@@ -2862,7 +2862,11 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
         return stopped > 0;
     }
     let Ok(lock) = crate::standby::stop_lock(host) else { return false };
-    let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return true };
+    let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else {
+        // Test marker `relief_waits`: relief holds eviction off for a refill whose standby is not listed yet.
+        crate::host::tripped("relief_waits");
+        return true;
+    };
     let fds: Vec<_> =
         crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).filter_map(|id| crate::standby::stop(&id)).collect();
     if fds.is_empty() {

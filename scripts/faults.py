@@ -8374,7 +8374,7 @@ def standby_stalled():
 
 def standby_refill_race():
     """A refill granted just before pressure starts, whose standby has not
-    created its lock file yet (`standby_lock_stall`, 3 s): relief does not
+    created its lock file yet (held before it: `standby_lock_gate`): relief does not
     pass it by, but holds eviction off until the standby is listed, then
     signals it and marks the pressure, before any eviction starts."""
     t, n = args.template, "ft-sb-refill-race"
@@ -8384,17 +8384,22 @@ def standby_refill_race():
         if os.path.exists(f):
             os.remove(f)
     fault(A, "no_evict", 600000)
-    # Armed until the refill is done, however long its standby takes to get to the stall: pressure starts
-    # once it stalls there (3 s, before its lock file), not after a guessed delay.
-    clear_gate(A, "standby_lock_stall")
-    fault(A, "standby_lock_stall", 600000)
+    # The refill's standby held before its lock file (`standby_lock_gate`) until relief, under pressure, is seen
+    # holding eviction off for it (`relief_waits`): the race, whatever the timing. The refill waits for that lock
+    # as long as the test needs (`long_locked`), not its 5 s.
+    for g in ("standby_lock_gate", "relief_waits", "long_locked"):
+        clear_gate(A, g)
+        fault(A, g, 600000)
     res, seen = {}, {}
     th = start_thread(target=lambda: res.update(r=set_standby(A, t, 1)))
     try:
-        check("standby refill race: the refill's standby stalls before its lock file", wait_for(lambda: reached(A, "standby_lock_stall"), 30),
-              reached(A, "standby_lock_stall"))
+        check("standby refill race: the refill's standby is held before its lock file", wait_for(lambda: reached(A, "standby_lock_gate"), 30),
+              reached(A, "standby_lock_gate"))
         avail = mem_available()
         with marks(avail + 4096, avail + 4608):
+            relief = wait_for(lambda: reached(A, "relief_waits"), 30)
+            release(A, "standby_lock_gate")
+            check("standby refill race: relief held eviction off for the unlisted standby", relief, reached(A, "relief_waits"))
             start = time.time()
             while time.time() - start < 15 and len(seen) < 2:
                 for k, f in (("pressure", pressure), ("active", active)):
@@ -8404,7 +8409,9 @@ def standby_refill_race():
             pids = standby_pids(A, t)
             th.join()
     finally:
-        fault(A, "standby_lock_stall", 0)
+        release(A, "standby_lock_gate")
+        fault(A, "relief_waits", 0)
+        fault(A, "long_locked", 0)
         fault(A, "no_evict", 0)
     check("standby refill race: the standby being started is stopped, and marks the pressure", "pressure" in seen, seen)
     check("standby refill race: eviction waits for it", "active" in seen and "pressure" in seen and seen["active"] > seen["pressure"], seen)
