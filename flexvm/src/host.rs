@@ -1468,20 +1468,29 @@ impl Host {
         if gen > a.seen {
             return self.newer_gen(&a, ip, gen);
         }
+        let from = |allowed: &[IpAddr]| allowed.iter().any(|t| sender.iter().any(|s| s.to_canonical() == t.to_canonical()));
+        let newest = a.rev.max(self.live_of(ip, &a).unwrap_or(0));
+        // One location per revision: its next hop changes only by the host it names (by any of its addresses),
+        // never by another peer announcing the same revision via itself (`observe` takes an equal one).
+        if let (Some(v), Some(old)) = (via, a.via) {
+            if gen == a.seen && !a.withdrawn && rev == newest && v != old && !from(&[IpAddr::V4(old)]) {
+                bail!("{ip} generation {gen} revision {rev} is routed via {old}: only that host changes its next hop");
+            }
+        }
         let here = self.held(&a) && a.held == a.seen && !a.withdrawn;
-        let moves = via.is_none() || rev > a.rev.max(self.live_of(ip, &a).unwrap_or(0));
+        // A move: a withdrawal, a newer revision, or the newest one somewhere other than recorded.
+        let moves = via.is_none() || rev > newest || (rev == newest && via != a.via);
         if gen < a.seen || !here || !moves {
             return Ok(());
         }
         let what = if via.is_some() { format!("revision {rev} elsewhere") } else { "its withdrawal".into() };
         let holder = a.holder.as_deref().unwrap_or("?");
-        let from = |allowed: &[IpAddr]| allowed.iter().any(|t| sender.iter().any(|s| s.to_canonical() == t.to_canonical()));
         if let Some(mig) = a.arriving {
-            // Until it commits the VM is its source's (its resume after an abort, say); from then until
-            // the record is released, only its source (the connection it came over) has a say in it.
+            // Until its record is released, the VM is its source's (the connection it came over): its resume
+            // after an abort, or its withdrawal, is taken from it alone. No record: aborted, the claim going.
             let source = match load::<Mig>(&self.mig_path(mig))? {
-                None | Some(Mig::Pending { .. }) => return Ok(()),
-                Some(Mig::Committed { peer, .. } | Mig::Released { peer, .. }) => peer,
+                None => return Ok(()),
+                Some(Mig::Pending { peer, .. } | Mig::Committed { peer, .. } | Mig::Released { peer, .. }) => peer,
             };
             if !source.is_some_and(|p| from(&[p])) {
                 bail!("{ip} generation {gen} is held by vm {holder} here, arrived by migration {mig}: {what} is taken only from its source");
@@ -2091,12 +2100,18 @@ impl Host {
     /// when it never says it is done with a released record.
     /// `ip`: the VM's address, whose peer route comes back if the arrival dies before it commits.
     pub fn mig_begin(&self, id: u64, source: &str, by: Option<Ident>, ip: Option<Ipv4Addr>) -> Result<MigRecord> {
+        self.mig_begin_from(id, source, by, ip, None)
+    }
+
+    /// `mig_begin`, from a source at `peer` (the arrival's connection): recorded from the start.
+    pub fn mig_begin_from(&self, id: u64, source: &str, by: Option<Ident>, ip: Option<Ipv4Addr>, peer: Option<IpAddr>) -> Result<MigRecord> {
         let _l = self.lock()?;
         if load::<Mig>(&self.mig_path(id))?.is_some() {
             bail!("migration {id} was already seen here");
         }
-        store(&self.mig_path(id), &Mig::Pending { owner: Ident::me(), ip }, true)?;
-        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), peer: None, by, ip })
+        let peer = peer.map(|p| p.to_canonical());
+        store(&self.mig_path(id), &Mig::Pending { owner: Ident::me(), ip, peer }, true)?;
+        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), peer, by, ip })
     }
 
     /// A record whose process died becomes aborted once its Firecrackers are
@@ -2109,7 +2124,7 @@ impl Host {
             Some(Mig::Released { .. }) => return Ok("released"),
             Some(Mig::Pending { owner, .. }) if owner.alive() => return Ok("pending"),
             Some(Mig::Committed { owner, .. }) if owner.alive() => return Ok("committed"),
-            Some(Mig::Pending { owner, ip }) => (owner, ip),
+            Some(Mig::Pending { owner, ip, .. }) => (owner, ip),
             Some(Mig::Committed { owner, .. }) => (owner, None),
         };
         reap(&self.run, &owner)?;
@@ -2690,6 +2705,9 @@ pub enum Mig {
         owner: Ident,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ip: Option<Ipv4Addr>,
+        /// The address the source migrates from (`Mig::Committed::peer`). None from an older binary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<IpAddr>,
     },
     /// The source must never run it again.
     Committed {
@@ -5792,7 +5810,7 @@ pub(crate) mod tests {
         assert!(!h.owes(&gone));
         drop(l);
         h.withdraw_dead(false).unwrap();
-        store(&h.mig_path(3), &Mig::Pending { owner: gone, ip: Some(x) }, false).unwrap();
+        store(&h.mig_path(3), &Mig::Pending { owner: gone, ip: Some(x), peer: None }, false).unwrap();
         assert_eq!(h.mig_status(3).unwrap(), "aborted");
         let l = h.lock().unwrap();
         let c = h.claim_new(&l, "b", Some(x)).unwrap();
@@ -5918,7 +5936,7 @@ pub(crate) mod tests {
         let mig = |id: u64, m: Mig| store(&h.mig_path(id), &m, false).unwrap();
         let (pending, committed) = (dead(999_999_941), dead(999_999_942));
         claim(ips[12], "pending", Some(pending.clone()), 4, &|_| ());
-        mig(20, Mig::Pending { owner: pending, ip: None });
+        mig(20, Mig::Pending { owner: pending, ip: None, peer: None });
         claim(ips[13], "committed", Some(committed.clone()), 4, &|_| ());
         mig(21, Mig::Committed { owner: committed, peer: None });
         // Released, then killed before its address was settled: its own VM, a loan of it too (it came home).
@@ -5989,8 +6007,8 @@ pub(crate) mod tests {
         // look superseded (a resume refused, an aborted source destroyed).
         assert!(h.peer_update(&l, x, (g, 1), c4, &[c], none).is_err());
         assert!(h.peer_update(&l, x, (g, 0), None, &[c], none).is_err());
-        // An announcement no newer than its revision is stale, for `observe` to say.
-        h.peer_update(&l, x, (g, 0), c4, &[c], none).unwrap();
+        // Nor puts its revision elsewhere (`observe` takes an equal one, replacing the next hop).
+        assert!(h.peer_update(&l, x, (g, 0), c4, &[c], none).is_err());
         // Migrating to T, reached at t: T's move and withdrawal are taken, C's are not.
         assert!(h.lend_at(&l, x, g, 1, "t:7070", &[t]).unwrap());
         h.peer_update(&l, x, (g, 1), t4, &[t], none).unwrap();
@@ -6042,14 +6060,18 @@ pub(crate) mod tests {
         let c4 = Some(ip("192.0.2.8"));
         let none = |_: &str| Vec::new();
         let _names = ["arrival", "old", "vm"].map(|n| h.take_name(n, false).unwrap());
-        // Arriving by migration 5 (another host's address): any peer's while it is pending; once it
-        // commits (its background pull under way), C can neither withdraw nor move it, so no newer
-        // generation of C's gets past its claim either. Its source can.
+        // Arriving by migration 5 (another host's address), pending or committed (its background pull
+        // under way): C can neither withdraw nor move it, so no newer generation of C's gets past its
+        // claim either. Its source can: its resume after an abort, its withdrawal.
         let x = ip("10.9.2.4");
         let _a = h.claim_arrival(&l, "arrival", x, 8, 2, 5).unwrap();
-        store(&h.mig_path(5), &Mig::Pending { owner: Ident::me(), ip: Some(x) }, true).unwrap();
-        h.peer_update(&l, x, (8, 0), None, &[c], none).unwrap();
-        h.peer_update(&l, x, (8, u64::MAX), c4, &[c], none).unwrap();
+        store(&h.mig_path(5), &Mig::Pending { owner: Ident::me(), ip: Some(x), peer: Some(src) }, true).unwrap();
+        for (rev, via) in [(0, None), (u64::MAX, c4)] {
+            let e = h.peer_update(&l, x, (8, rev), via, &[c], none).unwrap_err().to_string();
+            assert!(e.contains("only from its source"), "{e}");
+        }
+        h.peer_update(&l, x, (8, 3), Some(ip("192.0.2.7")), &[src], none).unwrap();
+        h.peer_update(&l, x, (8, 0), None, &[src], none).unwrap();
         store(&h.mig_path(5), &Mig::Committed { owner: Ident::me(), peer: Some(src) }, true).unwrap();
         for (rev, via) in [(u64::MAX, None), (u64::MAX, c4)] {
             let e = h.peer_update(&l, x, (8, rev), via, &[c], none).unwrap_err().to_string();
@@ -6083,6 +6105,27 @@ pub(crate) mod tests {
         assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, g).is_err(), "nor one handed out for another address");
         h.newer_gen(&h.addr(&l, y).unwrap(), y, g).unwrap();
         drop(claim);
+    }
+
+    /// #914 review: one location per revision. A peer announcing the newest revision via itself does not
+    /// take over the next hop recorded for it (which `observe` would replace on an equal revision), so the
+    /// host it names still withdraws it; that host may change it, by another of its addresses.
+    #[test]
+    fn an_equal_revision_elsewhere_is_only_its_hosts() {
+        let (_d, h) = host("equal-revision");
+        let l = h.lock().unwrap();
+        let (b, b2, c): (IpAddr, IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "198.51.100.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        let (b4, b24, c4) = (Some(ip("192.0.2.7")), Some(ip("198.51.100.7")), Some(ip("192.0.2.8")));
+        let none = |_: &str| Vec::new();
+        // A's VM went to B, which announced revision 1 (A is no longer its holder: lent only).
+        let x = ip("10.9.2.5");
+        assert!(h.observe(&l, x, 4, 1, b4).unwrap());
+        let e = h.peer_update(&l, x, (4, 1), c4, &[c], none).unwrap_err().to_string();
+        assert!(e.contains("only that host changes its next hop"), "{e}");
+        // Repeated by B, or by B's other address, it is taken; a newer revision is any peer's (a move on).
+        h.peer_update(&l, x, (4, 1), b4, &[b], none).unwrap();
+        h.peer_update(&l, x, (4, 1), b24, &[b, b2], none).unwrap();
+        h.peer_update(&l, x, (4, 2), c4, &[c], none).unwrap();
     }
 
     #[test]
@@ -7705,7 +7748,7 @@ pub(crate) mod tests {
             h.update(&l, y, false, |a| a.holder_id = Some(owner.clone())).unwrap();
             h.claim_arrival(&l, "other-owner", z, 8, 2, 7).unwrap().keep();
             let unchanged = [h.addr(&l, y).unwrap(), h.addr(&l, z).unwrap()];
-            let record = if committed { Mig::Committed { owner, peer: None } } else { Mig::Pending { owner, ip: Some(x) } };
+            let record = if committed { Mig::Committed { owner, peer: None } } else { Mig::Pending { owner, ip: Some(x), peer: None } };
             store(&h.mig_path(7), &record, false).unwrap();
             drop(l);
             assert_eq!(h.mig_status(7).unwrap(), "aborted");
@@ -8033,12 +8076,12 @@ pub(crate) mod tests {
         h.mig_done(3).unwrap();
         assert!(matches!(rec(3), Some(Mig::Released { done_until_ms: Some(_), .. })));
         let mut r = h.mig_begin(4, "", None, None).unwrap();
-        store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]), ip: None }, false).unwrap();
+        store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]), ip: None, peer: None }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
         // A dead arrival's route that cannot be put back yet keeps its record, for the next query.
         let back = ip("10.9.0.4");
         std::fs::write(h.addr_path(back), "{").unwrap();
-        store(&h.mig_path(10), &Mig::Pending { owner: dead_owner(&h, 999_999_910, &[]), ip: Some(back) }, false).unwrap();
+        store(&h.mig_path(10), &Mig::Pending { owner: dead_owner(&h, 999_999_910, &[]), ip: Some(back), peer: None }, false).unwrap();
         assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_some(), "kept while its route cannot be put back");
         std::fs::remove_file(h.addr_path(back)).unwrap();
         assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_none());

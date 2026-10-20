@@ -1330,6 +1330,26 @@ mod tests {
         assert_eq!(host.addr(&l, claim.ip).unwrap(), before);
     }
 
+    /// #914 review: C announcing B's newest revision via itself leaves B's next hop recorded, so B's
+    /// withdrawal at that revision is still taken (and A's loan of it ends).
+    #[test]
+    fn an_equal_revision_via_another_peer_leaves_the_withdrawal_its_hosts() {
+        let root = crate::test_util::TempDir::new("route-equal-rev");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let (b, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        let l = host.lock().unwrap();
+        let x: Ipv4Addr = "10.200.0.11".parse().unwrap();
+        host.lend_new(&l, x, "b", false).unwrap();
+        let gen = host.addr(&l, x).unwrap().seen;
+        assert!(host.observe(&l, x, gen, 1, Some("192.0.2.7".parse().unwrap())).unwrap());
+        let e = route(&host, &json!({"ip": x.to_string(), "gen": gen, "rev": 1, "via": "192.0.2.8"}), &[b, c], &[c]).unwrap_err().to_string();
+        assert!(e.contains("only that host changes its next hop"), "{e}");
+        assert_eq!(host.addr(&l, x).unwrap().via, Some("192.0.2.7".parse().unwrap()));
+        route(&host, &json!({"ip": x.to_string(), "gen": gen, "rev": 1}), &[b, c], &[b]).unwrap();
+        let a = host.addr(&l, x).unwrap();
+        assert!(a.withdrawn && a.lent.is_none(), "{a:?}");
+    }
+
     /// A peer's configured underlays (`peer_underlays`) are its next hops, and no VM's address;
     /// a peer no longer configured has none.
     #[test]
