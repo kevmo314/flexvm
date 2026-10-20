@@ -4112,9 +4112,11 @@ def signals():
     after SIGTERM."""
     n = "ft-signals"
     setup(n)
-    fault(A, "pages", 3000)
-    ok(migrate(A, n, B))
-    signal_vm(A, n, signal.SIGTERM)
+    # Every page reply a second late until the SIGTERM is in: the target cannot finish its pull first.
+    with armed_fault(A, "pages_slow", 600000):
+        ok(migrate(A, n, B))
+        check("signals: still the source when SIGTERM comes", vms(A).get(n, {}).get("state") == "source", where(n))
+        signal_vm(A, n, signal.SIGTERM)
     st = wait_released(B, n)
     check("signals: SIGTERM on a source: no suspend, released", st["released"] is True and not os.path.exists(
         os.path.join(A.state, "suspended", n)), st)
