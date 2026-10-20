@@ -617,16 +617,17 @@ fn inherited_grant() -> Option<u64> {
     id
 }
 
-/// A superseded standby leaving: unlisted (`files` removed) and its grant given back, so neither
-/// counts against the refill it then asks for.
-fn refill_departed(host: &Host, template: &str, files: Vec<PathBuf>, grant: Option<u64>) -> Result<usize> {
-    for f in files {
+/// A standby leaving the pool short (superseded, or its VM lost to a failed claim): its VM freed
+/// (the standby's, or one a claim adopted before its guest setup failed), unlisted (`files` removed)
+/// and its grant given back, so none counts against the refill it then asks for.
+fn refill_departed(p: &Proc, template: &str) -> Result<usize> {
+    drop(p.standby.lock().unwrap().take());
+    p.kill_vm();
+    for f in std::mem::take(&mut *p.files.lock().unwrap()) {
         let _ = std::fs::remove_file(f);
     }
-    if let Some(id) = grant {
-        host.refund(id);
-    }
-    refill_later(host, template)
+    p.refund_standby();
+    refill_later(&p.host, template)
 }
 
 /// Never let relief pass an unlisted live child, including on a partial or invalid reply.
@@ -739,7 +740,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // The key of the generation opened, not of whatever the name resolves to now: a
     // rebuild in between would publish this snapshot under the new generation's key.
     let mine = dir_key(&tpl.dir);
-    let grant = inherited_grant();
+    p.standby_grant.store(inherited_grant().unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
     let d = create_dir(host, template)?;
     let me = Ident::me();
     let id = me.key();
@@ -830,13 +831,12 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 if superseded {
                     // It may have outlived `superseded`'s wait. Unlist and free its VM before
                     // recounting, even without a listener; a busy refill takes over the request.
-                    drop(p.standby.lock().unwrap().take());
-                    drop(low);
-                    let files = std::mem::take(&mut *p.files.lock().unwrap());
-                    if let Err(e) = refill_departed(host, template, files, grant) {
+                    if let Err(e) = refill_departed(p, template) {
                         crate::log!("standby {template}: {e}");
                     }
                 }
+                // `low`, the stop lock, is held through its cleanup to its exit: the next standby
+                // under the reserve reads MemAvailable once all of this one's memory is back (#891).
                 p.finish(op, End::NotStarted, code, None);
             }
         }
@@ -881,6 +881,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         p.attacher.store(req["attacher"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         match claim(p, &req) {
             Ok(v) => {
+                // The VM's now: its memory is in MemAvailable already, and its grant expires on its own.
+                p.standby_grant.store(0, std::sync::atomic::Ordering::SeqCst);
                 p.forget_stop();
                 crate::host::gate("claim_stall");
                 let _ = std::fs::remove_file(&sock);
@@ -951,7 +953,12 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 // Nor its caps (`--memory` included): the next claim sets its own.
                 let _ = p.keep_resources(crate::vm::Resources::default());
                 let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": retry}));
+                // Its VM gone (a failed resume, or one no `--cpus` claim can take): it leaves, its
+                // place refilled, rather than stay listed for every claim to try first (#948).
                 if p.standby.lock().unwrap().is_none() {
+                    if let Err(e) = refill_departed(p, template) {
+                        crate::log!("standby {template}: {e}");
+                    }
                     p.finish(op, End::NotStarted, crate::vmproc::FAILED, None);
                 }
             }
@@ -984,11 +991,20 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     // Taken ahead of any claim: every claim sets its cgroup's cap, `max` for none, so one an
     // earlier claim that failed set (after this point) never carries over to this VM.
     {
-        let s = p.standby.lock().unwrap();
+        let mut s = p.standby.lock().unwrap();
         let fc = s.as_ref().ok_or_else(|| ("standby vm gone".into(), true))?.firecracker();
         // Before its name is taken: another standby, or a cold start, may still hold the cap.
         match fc.set_cpu_max(&resources.cpu_max()) {
-            Err(e) if resources.cpus.is_some() => return Err((e, true)),
+            Err(e) if resources.cpus.is_some() => {
+                // Its Firecracker failed to join its cgroup at load: no `--cpus` claim can ever take
+                // it, so it is given up (`serve` retires it) rather than tried by each one (#948).
+                if fc.lost_cgroup() {
+                    let gone = s.take();
+                    drop(s);
+                    drop(gone);
+                }
+                return Err((e, true));
+            }
             _ => {}
         }
     }
@@ -1891,7 +1907,8 @@ mod tests {
 
     #[test]
     fn a_late_superseded_departure_is_unlisted_before_its_recount() {
-        let (_root, host, _paths, d) = pool("refill-late-departure");
+        let (root, host, _paths, d) = pool("refill-late-departure");
+        let p = Proc::new(host.clone(), Paths::new(&root)).unwrap();
         crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
         let me = Ident::me();
         let record = crate::host::locks(&d).join(format!("{}.lock", me.key()));
@@ -1905,7 +1922,8 @@ mod tests {
             if rounds == 1 {
                 assert_eq!(live(&host, "default"), [me.clone()]);
                 // Like a standby that was still counted when the pull's five-second wait ended.
-                assert_eq!(refill_departed(&host, "default", vec![record.clone()], None).unwrap(), 0);
+                p.files.lock().unwrap().push(record.clone());
+                assert_eq!(refill_departed(&p, "default").unwrap(), 0);
             } else {
                 assert!(live(&host, "default").is_empty());
                 assert_eq!(target(&host, "default"), 1);
@@ -1918,8 +1936,8 @@ mod tests {
     }
 
     #[test]
-    fn a_superseded_standbys_grant_no_longer_counts() {
-        let (_root, mut host, _paths, _d) = pool("refill-departed-grant");
+    fn a_departing_standbys_grant_and_listing_no_longer_count() {
+        let (root, mut host, _paths, _d) = pool("refill-departed-grant");
         host.cfg.reserve_mib = Some(0);
         let grants =
             |h: &Host| -> Vec<u64> { crate::host::load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default().into_iter().map(|g| g.2).collect() };
@@ -1929,9 +1947,35 @@ mod tests {
         let grant = inherited_grant();
         assert_eq!(grant, Some(mine));
         assert!(std::env::var_os(GRANT_ENV).is_none());
-        // Its count is 0 here: only the grant is under test.
-        assert_eq!(refill_departed(&host, "default", Vec::new(), grant).unwrap(), 0);
+        let p = Proc::new(host.clone(), Paths::new(&root)).unwrap();
+        p.standby_grant.store(grant.unwrap(), std::sync::atomic::Ordering::SeqCst);
+        let listed = root.join("listed.lock");
+        std::fs::write(&listed, b"").unwrap();
+        p.files.lock().unwrap().push(listed.clone());
+        // Its count is 0 here: only the grant and its listing are under test.
+        assert_eq!(refill_departed(&p, "default").unwrap(), 0);
         assert_eq!(grants(&host), [other]);
+        assert!(!listed.exists());
+        // Taken: `finish` does not give it back again.
+        assert_eq!(p.standby_grant.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn any_unclaimed_departure_gives_its_grant_back_once() {
+        let (root, mut host, _paths, _d) = pool("departed-grant-once");
+        host.cfg.reserve_mib = Some(0);
+        let grants =
+            |h: &Host| -> Vec<u64> { crate::host::load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default().into_iter().map(|g| g.2).collect() };
+        let mine = host.grant_above(MIN_GRANT_MIB, crate::host::Floor::Reserve, None).unwrap().unwrap();
+        let p = Proc::new(host.clone(), Paths::new(&root)).unwrap();
+        p.standby_grant.store(mine, std::sync::atomic::Ordering::SeqCst);
+        // What `finish` does for any departure (extra, under the reserve, died, stopped), not only a superseded one.
+        p.refund_standby();
+        assert!(grants(&host).is_empty());
+        // Taken: a second departure path (`finish` after `refill_departed`) gives back nothing more.
+        let later = host.grant_above(MIN_GRANT_MIB, crate::host::Floor::Reserve, None).unwrap().unwrap();
+        p.refund_standby();
+        assert_eq!(grants(&host), [later]);
     }
 
     #[test]

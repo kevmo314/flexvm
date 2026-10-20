@@ -588,6 +588,8 @@ pub struct Runtime {
     held_grant: Mutex<Option<crate::host::Hold>>,
     /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
     pub sizes: Mutex<Option<(u64, u64)>>,
+    /// An unclaimed standby's refill grant (`standby::serve`; 0: none), given back however it leaves.
+    pub standby_grant: AtomicU64,
     /// Set once the control socket is bound (a failed bind is tried again).
     serving: Mutex<bool>,
     /// SIGTSTP and SIGCONT, off the signal thread (which a later SIGINT needs).
@@ -653,7 +655,7 @@ impl Ticks {
 }
 
 impl Proc {
-    fn new(host: Host, paths: Paths) -> Result<Arc<Proc>> {
+    pub(crate) fn new(host: Host, paths: Paths) -> Result<Arc<Proc>> {
         let ident = Ident::me();
         let work = ident.work_dir(&host.run);
         if let Some(old) = crate::host::load(&work.join("owner"))? {
@@ -845,6 +847,21 @@ impl Proc {
     /// pages in count in MemAvailable already (#162).
     pub fn wait_pulled(&self, vm: &Vm) -> bool {
         vm.pager.wait_pulled_every(Duration::from_secs(1), |mib| drop(self.host.shrink_hold(&self.held_grant, mib)))
+    }
+
+    /// Its VM, if adopted, killed and its Firecracker reaped (again a no-op).
+    pub(crate) fn kill_vm(&self) {
+        if let Some(vm) = self.vm.get() {
+            vm.kill();
+        }
+    }
+
+    /// An unclaimed standby's refill grant given back, once: it counts only within its window, and its VM is gone.
+    pub(crate) fn refund_standby(&self) {
+        let id = self.standby_grant.swap(0, Ordering::SeqCst);
+        if id > 0 {
+            self.host.refund(id);
+        }
     }
 
     /// A start that did not happen gives its admission back.
@@ -1203,11 +1220,11 @@ impl Proc {
         self.drop_ports();
         self.drop_held_in();
         self.set_leaving(true);
-        if let Some(vm) = self.vm.get() {
-            vm.kill();
-        }
+        self.kill_vm();
         self.release_hold();
         drop(self.standby.lock().unwrap().take());
+        // Once its VM is gone, however it leaves (#948).
+        self.refund_standby();
         // An arrival still pulling that dies leaves its source's copy to run
         // again (see `Host::mig_status`): its address is not withdrawn.
         let source_runs = matches!(end, End::Died) && self.arrived.lock().unwrap().is_some();
@@ -1567,6 +1584,10 @@ impl Proc {
         let running = t.total();
         // Test gate: published running, its guest not set up yet (a death here ends it as a death, #730).
         crate::host::gate("guest_net_gate");
+        // Test fault `guest_setup_fail`: its guest setup fails, its Firecracker still running.
+        if crate::host::fault("guest_setup_fail") {
+            bail!("injected fault: setting up its guest failed");
+        }
         vm.guest_net(vm.ip, self.host.config_now().dns.as_deref())?;
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();

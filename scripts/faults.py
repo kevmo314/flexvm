@@ -8572,6 +8572,81 @@ def standby_claim_caps():
         cleanup(n)
 
 
+def standby_lost_cgroup():
+    """A standby whose Firecracker failed to join its cgroup (#948) can take no --cpus claim: the
+    first such claim goes on without it (a cold start) and retires it, its place refilled, so the
+    next --cpus claim takes a standby rather than trying the broken one first again."""
+    t = args.template
+    ctl = "/sys/fs/cgroup/flexvm/cgroup.subtree_control"
+    if not os.path.exists(ctl) or "cpu" not in open(ctl).read().split():
+        raise Skip("no cgroup cpu controller")
+    first, second = "ft-sblc-1", "ft-sblc-2"
+    scenario_vms.update([first, second])
+    try:
+        with armed_fault(A, "cgroup_join_fail", 120000):
+            check("standby lost cgroup: a standby ready", fresh_standby(A, t, 1), standby_pids(A, t))
+            broken = standby_pids(A, t)
+        r = ok(cli_json(A, "run", "--name", first, "-d", "--cpus", "0.5", t))
+        check("standby lost cgroup: the capped run starts cold", r["standby"] is not True, r)
+        check("standby lost cgroup: the broken standby leaves", wait_for(lambda: not any(alive(p) for p in broken), 30), broken)
+        claimable = lambda: [p for p in standby_pids(A, t) if p not in broken and alive(p) and os.path.exists(os.path.join(standby_dir(A.run, t), f"{p}.sock"))]
+        check("standby lost cgroup: refilled", wait_for(lambda: len(claimable()) == 1, 60), standby_pids(A, t))
+        ready = claimable()
+        r = ok(cli_json(A, "run", "--name", second, "-d", "--cpus", "0.5", t))
+        check("standby lost cgroup: the next capped run takes the new standby", r["standby"] is True and r["pid"] in ready, (r, ready))
+    finally:
+        ok(set_standby(A, t, 0))
+        for n in (first, second):
+            cleanup(n)
+
+
+def standby_claim_setup_fail():
+    """A claim whose guest setup fails after its VM was adopted, its Firecracker still running
+    (#948): the standby leaves with that VM killed before it asks for a refill, so the replacement
+    is admitted against memory the failed VM no longer holds, and the pool is refilled. The
+    replacement is held before its lock (`standby_lock_gate`, `long_locked`), so the departing
+    standby waits in its refill: the order is seen whatever the timing."""
+    t, name = args.template, "ft-sbsf"
+    scenario_vms.add(name)
+
+    def firecrackers(pid):
+        out = []
+        for task in glob.glob(f"/proc/{pid}/task/*/children"):
+            try:
+                out += [int(c) for c in open(task).read().split()]
+            except OSError:
+                pass
+        return [c for c in out if alive(c) and open(f"/proc/{c}/comm").read().strip() == "firecracker"]
+
+    gates = ("standby_lock_gate", "long_locked", "guest_setup_fail")
+    try:
+        check("standby claim setup fail: a standby ready", fresh_standby(A, t, 1), standby_pids(A, t))
+        old = standby_pids(A, t)
+        fcs = firecrackers(old[0])
+        check("standby claim setup fail: its firecracker found", len(fcs) == 1, fcs)
+        for g in gates:
+            clear_gate(A, g)
+            fault(A, g, 120000)
+        r = cli_json(A, "run", "--name", name, "-d", t)
+        check("standby claim setup fail: the run fails with the injected setup error", not r["ok"] and "setting up its guest failed" in r["error"], r)
+        fault(A, "guest_setup_fail", 0)
+        held = wait_for(lambda: reached(A, "standby_lock_gate"), 30)
+        check("standby claim setup fail: the departing standby's replacement is held before its lock", held, reached(A, "standby_lock_gate"))
+        # Usually the departing standby's own refill, waiting on it (a listener's round may take the request instead).
+        check("standby claim setup fail: the failed vm's firecracker is already gone", not any(alive(f) for f in fcs), (fcs, old, [alive(p) for p in old]))
+        release(A, "standby_lock_gate")
+        fault(A, "long_locked", 0)
+        check("standby claim setup fail: the departing standby exits", wait_for(lambda: not any(alive(p) for p in old), 30), old)
+        check("standby claim setup fail: refilled", wait_for(lambda: len(standby_socks(A, t)) == 1, 60), standby_pids(A, t))
+        check("standby claim setup fail: the name is free again", wait_for(lambda: name not in vms(A), 30), vms(A).get(name))
+    finally:
+        release(A, "standby_lock_gate")
+        for g in gates:
+            fault(A, g, 0)
+        ok(set_standby(A, t, 0))
+        cleanup(name)
+
+
 def standby_concurrent_claims():
     """Concurrent runs claim different standby VMs at once: none queues on
     another's claim (each parks at the `claim_stall` gate, and both get there
@@ -10872,7 +10947,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
-    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_claim_cgroupns=standby_claim_cgroupns, standby_claim_orphan_migrating=standby_claim_orphan_migrating, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, evict_latency=evict_latency,
+    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_claim_cgroupns=standby_claim_cgroupns, standby_claim_orphan_migrating=standby_claim_orphan_migrating, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, standby_lost_cgroup=standby_lost_cgroup, standby_claim_setup_fail=standby_claim_setup_fail, evict_latency=evict_latency,
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),

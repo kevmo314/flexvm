@@ -1,6 +1,6 @@
 //! A Firecracker process and a minimal client for its HTTP-over-UDS API.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -53,6 +53,8 @@ pub struct Firecracker {
     joining: RefCell<Option<std::thread::JoinHandle<std::io::Result<()>>>>,
     /// Under a `--cpus` cap (`Spawner::cap_cpus`): one it cannot be held to is an error.
     capped: bool,
+    /// Its cgroup move failed (`join_cgroup`): not one the host lacks, so no `--cpus` cap can be set on it.
+    lost_cgroup: Cell<bool>,
     /// Drained after exit, before reading diagnostics or removing the directory.
     logging: RefCell<Option<std::thread::JoinHandle<()>>>,
 }
@@ -90,6 +92,7 @@ impl Firecracker {
             api: Api { bin: bin.into(), ..Api::default() },
             joining: RefCell::new(None),
             capped: false,
+            lost_cgroup: Cell::new(false),
             logging: RefCell::new(Some(logging)),
         };
         let id = crate::host::Ident::of(fc.pid()).ok_or_else(|| fc.post_mortem())?;
@@ -200,6 +203,7 @@ impl Firecracker {
         };
         if joined.is_err() {
             if let Some(cg) = self.cgroup.borrow_mut().take() {
+                self.lost_cgroup.set(true);
                 let _ = std::fs::remove_dir(cg);
             }
         }
@@ -223,8 +227,14 @@ impl Firecracker {
         let pid = self.pid();
         *self.cgroup.get_mut() = Some(cg.clone());
         *self.joining.get_mut() = Some(std::thread::spawn(move || {
+            // Test fault `cgroup_join_fail`: its cgroup move fails.
+            let made = match (crate::host::fault("cgroup_join_fail"), made) {
+                (true, _) => Err(std::io::Error::other("injected fault: joining its cgroup failed")),
+                (false, true) => Ok(()),
+                (false, false) => std::fs::create_dir(&cg),
+            };
             // Like ordinary starts: throttle at memory.high, without swapping.
-            let joined = if made { Ok(()) } else { std::fs::create_dir(&cg) }.and_then(|()| {
+            let joined = made.and_then(|()| {
                 if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0") {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         crate::log!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
@@ -239,6 +249,12 @@ impl Firecracker {
         }));
     }
 
+    /// Whether it was to have a cgroup of its own but failed to join it (and so never will).
+    pub fn lost_cgroup(&self) -> bool {
+        let _ = self.join_cgroup();
+        self.lost_cgroup.get()
+    }
+
     pub fn cgroup(&self) -> Option<PathBuf> {
         let _ = self.join_cgroup();
         self.cgroup.borrow().clone()
@@ -248,7 +264,10 @@ impl Firecracker {
     pub fn set_cpu_max(&self, max: &str) -> Result<()> {
         self.join_cgroup()?;
         let cgroup = self.cgroup.borrow();
-        let cg = cgroup.as_ref().ok_or("--cpus needs per-VM cgroups, which this host does not have")?;
+        let cg = cgroup.as_ref().ok_or_else(|| match self.lost_cgroup.get() {
+            true => format!("--cpus not applied: firecracker {} failed to join its cgroup", self.pid()),
+            false => "--cpus needs per-VM cgroups, which this host does not have".into(),
+        })?;
         std::fs::write(cg.join("cpu.max"), max).map_err(|e| format!("--cpus not applied: {}: {e}", cg.join("cpu.max").display()))?;
         Ok(())
     }
@@ -677,10 +696,12 @@ mod tests {
                 api: Api::default(),
                 joining: RefCell::new(Some(std::thread::spawn(|| Err(std::io::Error::from_raw_os_error(libc::EACCES))))),
                 capped,
+                lost_cgroup: Cell::new(false),
                 logging: RefCell::new(None),
             };
             assert_eq!(fc.join_cgroup().is_err(), capped);
             assert_eq!(fc.cgroup(), None);
+            assert!(fc.lost_cgroup());
             assert!(!cg.exists());
             assert!(fc.set_cpu_max("100000 100000").is_err());
             let limit = crate::limit::Limit::new(fc.cgroup());
@@ -688,6 +709,22 @@ mod tests {
             assert_eq!(limit.used(), None);
             assert_eq!(limit.admitted(), 0);
         }
+        // None to join (the host has no per-VM cgroups): none lost, so a standby is not given up for it.
+        let dir = crate::test_util::TempDir::new("fc-no-cgroups");
+        let fc = Firecracker {
+            child: Command::new("sleep").arg("30").spawn().unwrap(),
+            sockets: SocketRoot::from_bases(&[dir.join("s")], &dir).unwrap().allocate().unwrap(),
+            dir: dir.to_path_buf(),
+            cgroup: RefCell::new(None),
+            tap: String::new(),
+            api: Api::default(),
+            joining: RefCell::new(None),
+            capped: false,
+            lost_cgroup: Cell::new(false),
+            logging: RefCell::new(None),
+        };
+        assert!(fc.set_cpu_max("100000 100000").is_err());
+        assert!(!fc.lost_cgroup());
     }
 
     #[test]
