@@ -3138,7 +3138,9 @@ def announce_arp_timer():
     check("announce arp timer: both ARPs went out", len(arps) == 2, arps)
     if len(arps) == 2:
         gap = arps[1] - arps[0]
-        check("announce arp timer: the second within 1 s of the first", 0.15 < gap < 1, f"{gap:.2f} s")
+        # Held up with the announcement, the second would wait out `tell`'s retry (about 5 s): under half of
+        # that is its own 200 ms timer, however late a loaded host wakes its thread.
+        check("announce arp timer: the second on its own timer, not held up with the announcement", 0.15 < gap < 2.5, f"{gap:.2f} s")
     check("announce arp timer: B handled it", wait_for(lambda: len(held_routes(B, addr_a, since)["answered"]) == held_routes(B, addr_a, since)["held"] >= 1, 10),
           held_routes(B, addr_a, since))
     kill(A, n)
