@@ -532,12 +532,15 @@ def addr(host, ip):
 
 
 # --- a third peer, down -------------------------------------------------------------------------
-# A peer's route next hop must be one of its peers' addresses (#591). Scenarios that
-# need a route the kernel really installs, via a host other than A or B, use this one: an address in a
-# network namespace of its own behind a veth, on-link here and not ours, where nothing listens (a peer
-# that is down: what is sent to it is refused at once). Listed as a peer of A and B only while such a
+# A peer's route next hop must be one of its own addresses (#591, #914). Scenarios that
+# need a route the kernel really installs, via a host other than A or B, use this one: its underlay is an
+# address in a network namespace of its own behind a veth, on-link here and not ours, where nothing
+# listens (a peer that is down: what is sent to it is refused at once). Its `peers` address is a loopback
+# one of its own (`THIRD["peer"]`), which what it sends here comes from (`as_third`), its underlay listed in
+# `peer_underlays` (a data-plane network of its own). Listed as a peer of A and B only while such a
 # scenario runs (`with_third_peer`).
 EXTRA_PEERS = []
+EXTRA_UNDERLAYS = {}
 THIRD = {}
 
 
@@ -552,7 +555,7 @@ def third_peer():
         subprocess.run(["ip", "link", "del", dev], capture_output=True)
         subprocess.run(["ip", "netns", "del", ns], capture_output=True)
         subprocess.run(["ip", "netns", "add", ns], check=True)
-        THIRD.update(ns=ns, dev=dev, addr=str(base + 1))
+        THIRD.update(ns=ns, dev=dev, addr=str(base + 1), peer=f"127.77.{(slot >> 8) & 255}.{slot & 255}")
         subprocess.run(["ip", "link", "add", dev, "type", "veth", "peer", "name", "eth0", "netns", ns], check=True)
         subprocess.run(["ip", "addr", "add", f"{base}/31", "dev", dev], check=True)
         subprocess.run(["ip", "link", "set", dev, "up"], check=True)
@@ -560,6 +563,12 @@ def third_peer():
         for d in ("eth0", "lo"):
             subprocess.run(["ip", "-n", ns, "link", "set", d, "up"], check=True)
     return THIRD["addr"]
+
+
+def as_third(host, req):
+    """One request to `host`'s peer listener from the third peer (its `peers` address)."""
+    third_peer()
+    return peer(host, req, source=THIRD["peer"])
 
 
 def remove_third_peer():
@@ -573,17 +582,20 @@ def remove_third_peer():
 def listing_third_peer(*hosts):
     """The third peer listed by `hosts` (and by a listener restarted meanwhile), their own peer lists
     as they were afterwards. Not across a restart of a loopback listener: one refuses a peer elsewhere."""
-    peer = f"{third_peer()}:7070"
-    before = {h: host_config(h).get("peers", []) for h in hosts}
+    gw = third_peer()
+    peer = f"{THIRD['peer']}:7070"
+    before = {h: host_config(h) for h in hosts}
     EXTRA_PEERS.append(peer)
+    EXTRA_UNDERLAYS[peer] = [gw]
     try:
         for h in hosts:
-            configure(h, peers=before[h] + [peer])
+            configure(h, peers=before[h].get("peers", []) + [peer], peer_underlays={**before[h].get("peer_underlays", {}), peer: [gw]})
         yield
     finally:
         EXTRA_PEERS.remove(peer)
+        EXTRA_UNDERLAYS.pop(peer, None)
         for h in hosts:
-            configure(h, peers=before[h])
+            configure(h, peers=before[h].get("peers", []), peer_underlays=before[h].get("peer_underlays", {}))
 
 
 def with_third_peer(scenario):
@@ -606,6 +618,7 @@ def start_listener(h, listen=None, extra=None, peer=None, wait=True):
     nets = [ipaddress.IPv4Network(f"{ip}/24", strict=False) for host in (h, other) for ip in host.ips.split("-")]
     first, last = min(n.network_address for n in nets) + 1, max(n.broadcast_address for n in nets) - 1
     extra = dict(extra or {})
+    extra.setdefault("peer_underlays", dict(EXTRA_UNDERLAYS))
     configure(h, peers=[peer or other.addr, *EXTRA_PEERS, *extra.pop("peers", [])], vm_ips=h.ips,
               cluster_ips=f"{first}-{last}", reserve_mib=512, **extra)
     listeners[h.addr] = spawn_cli(h, "listen", listen or h.addr, stdout=lg, stderr=lg)
@@ -1556,16 +1569,39 @@ def guest_hang():
     check("guest hang: migrates afterwards, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
 
 
+def own_address(host, ip):
+    """Whether `ip` is in `host`'s range: the addresses whose generations it hands out."""
+    first, last = (ipaddress.IPv4Address(a) for a in host.ips.split("-"))
+    return first <= ipaddress.IPv4Address(ip) <= last
+
+
+def issued_gen(host, ip):
+    """A generation `host` handed out (#914: of its own addresses, no other arrives), newer than its record
+    of `ip`: the last it handed out, after it hands out one more (a VM started and killed) if that is not."""
+    def issued():
+        try:
+            with open(os.path.join(host.run, ".gens.next")) as f:
+                return json.load(f)["next"] - 1
+        except (OSError, ValueError, KeyError):
+            return 0
+    if issued() <= addr(host, ip).get("seen", 0):
+        n = "ft-gen-issue"
+        ok(run(host, n))
+        kill(host, n)
+    return issued()
+
+
 def migrate_in_raw(host, name, ip, source, gen=None, template=None):
     """Asks `host` to prepare an incoming migration as a source would, for a
     VM like `source` (its template id and memory regions, from `source_vm`).
     Returns the open socket and the prepare reply."""
     template_id, regions = source
+    # Newer than any the host has seen for it, as an arriving VM's is; one it handed out, for an address of its own (#914).
+    if gen is None:
+        gen = issued_gen(host, ip) if own_address(host, ip) else addr(host, ip).get("seen", 0) + 1
     h, port = host.addr.rsplit(":", 1)
     s = socket.create_connection((h, int(port)), timeout=60)
     mig = int.from_bytes(os.urandom(6), "little")
-    # Newer than any the host has seen for it, as an arriving VM's is.
-    gen = addr(host, ip).get("seen", 0) + 1 if gen is None else gen
     # The rate its state was saved at: the template's, as a VM restored on its build host runs at.
     # A forged template name (forged_peer) has none: the real template's then.
     with open(os.path.join(host.state, "templates", args.template, "meta.json")) as f:
@@ -1668,6 +1704,8 @@ def arrival_flood():
     m = setup(n)
     src = source_vm()
     names = [(f"ft-flood-{i}", spare(B, 10 + i)) for i in range(4)]
+    # Before the host lock is held here: finding one may start a VM on B.
+    gens = {ip: issued_gen(B, ip) for _, ip in names}
     replies = {}
     # The listener takes an arrival's place before it makes its log (`.incoming-*.log`).
     arrivals = lambda: {f for f in os.listdir(os.path.join(B.run, "vms")) if f.startswith(".incoming-")}
@@ -1676,7 +1714,7 @@ def arrival_flood():
         fcntl.flock(lock, fcntl.LOCK_EX)
         started = time.time()
         def arrive(name, ip):
-            s, r, _ = migrate_in_raw(B, name, ip, src)
+            s, r, _ = migrate_in_raw(B, name, ip, src, gen=gens[ip])
             replies[name] = (r, time.time() - started)
             s.close()
         ts = [threading.Thread(target=arrive, args=a) for a in names]
@@ -1740,25 +1778,29 @@ def arrival_cap_restart():
 @with_third_peer
 def abort_superseded():
     """A migration that aborts after the source paused does not resume the
-    source if a newer generation of its address was recorded meanwhile (the
-    address went to another VM): the copy is destroyed instead, and the
-    route the newer VM's host announced replaces the hold."""
+    source if its generation went meanwhile (its target withdrew it: the VM
+    ran there and ended): the copy is destroyed instead. Another peer cannot
+    bring that about (#914): its newer generation of the address, while the
+    source holds it here at home, is refused and changes nothing."""
     n = "ft-superseded"
     setup(n)
     v = vms(A)[n]
-    ip, gen = v["ip"], v["gen"]
-    # The replacement's host: the third peer, on-link and not ours, so the
-    # route is really installed.
+    ip, gen, tap = v["ip"], v["gen"], v["tap"]
+    # The other peer's next hop: the third peer's, on-link and not ours, so a route would really be installed.
     gw = third_peer()
     with armed_fault(A, "pages", 30000):
         res, t = background(lambda: migrate(A, n, B))
         # While the target probes the dead page server, the address moves on.
         wait_for(lambda: vms(A).get(n, {}).get("state") == "source", 20)
-        r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
-        check("abort superseded: the newer generation is taken, the source keeps the route",
-              r.get("ok") and not r["result"].get("stale") and r["result"].get("local"), r)
-        # The target hears of it too (its arrival does not commit then).
-        peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+        before = addr(A, ip)
+        r = as_third(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+        check("abort superseded: another peer's newer generation is refused, the record kept",
+              not r.get("ok") and "held by vm" in r.get("error", "") and addr(A, ip) == before, (r, addr(A, ip)))
+        # Its target's withdrawal is taken, there (its arrival does not commit then) and here.
+        r = peer(B, {"op": "route", "ip": ip, "gen": gen})
+        check("abort superseded: the target withdraws it on its own host", r.get("ok"), r)
+        r = peer(A, {"op": "route", "ip": ip, "gen": gen})
+        check("abort superseded: and on the source's, where it migrates to", r.get("ok") and addr(A, ip).get("withdrawn"), (r, addr(A, ip)))
         t.join()
     r = res.get("r", {})
     check("abort superseded: migration failed", not r.get("ok"), r)
@@ -1766,10 +1808,8 @@ def abort_superseded():
     # Not just "superseded": the VM's name (ft-superseded) is on every line.
     check("abort superseded: says why", "was superseded meanwhile" in log(A, n), log(A, n)[-300:])
     check("abort superseded: running nowhere", where(n) == {}, where(n))
-    route = subprocess.run(["ip", "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
-    check("abort superseded: the address routes to the replacement, not the hold", f"via {gw}" in route, route)
-    check("abort superseded: the source put that route back itself", f"put back route {ip} via {gw} (generation {gen + 1})" in log(A, n), log(A, n)[-300:])
-    subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+    route = peer_route(ip)
+    check("abort superseded: the address routes neither to the hold nor via the other peer", tap not in route and f"via {gw}" not in route, route)
 
 
 # --- migration failure boundaries (#460) ---------------------------------------
@@ -2144,11 +2184,11 @@ def abort_stay_fail():
     try:
         check("abort stay fail: B took its announcement, past the target's revision",
               wait_for(lambda: addr(B, ip).get("rev") == rev + 2 and addr(B, ip).get("via") == "127.0.0.1", 10), addr(B, ip))
-        late = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
+        late = as_third(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
         check("abort stay fail: the target's revision is stale on B", late.get("ok") and late["result"].get("stale"), late)
         check("abort stay fail: A records its revision once the write goes through (#499)",
               wait_for(lambda: addr(A, ip).get("rev") == rev + 2 and "recorded its revision" in log(A, n)[seen:], 10), addr(A, ip))
-        late = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
+        late = as_third(A, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
         check("abort stay fail: the target's revision is stale on A, the route on its tap",
               late.get("ok") and late["result"].get("stale") and f"dev {tap}" in peer_route(ip), (late, peer_route(ip)))
         check("abort stay fail: still the one owner", where(n) == {A: "running"} and addr(A, ip).get("holder") == n, (where(n), addr(A, ip)))
@@ -2647,8 +2687,9 @@ def rx_stall():
 @with_third_peer
 def handoff_superseded():
     """A same-host arrival routes its address only after the held packets
-    (`handoff_stall` delays that by 3 s). A newer generation of the address
-    announced meanwhile keeps its route: the late handoff leaves it alone."""
+    (`handoff_stall` delays that by 3 s). Another peer's newer generation of
+    the address announced meanwhile is refused (#914: no peer brings one of an
+    address a VM here holds), so the late handoff takes the address over all the same."""
     n = "ft-handoff-superseded"
     ok(run(A, n))
     v = vms(A)[n]
@@ -2658,14 +2699,14 @@ def handoff_superseded():
         clear_log(B, n)
         r = migrate(A, n, B)
         check("handoff superseded: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
-        r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
-        check("handoff superseded: the newer generation is taken", r.get("ok") and not r["result"].get("stale"), r)
-        check("handoff superseded: the late handoff says it left the address alone",
-              wait_for(lambda: "went to a newer vm" in log(B, n), 10), log(B, n)[-300:])
-    time.sleep(0.5)
-    check("handoff superseded: the address routes to the newer vm's host", f"via {gw}" in peer_route(ip), peer_route(ip))
+        r = as_third(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+        check("handoff superseded: another peer's newer generation is refused", not r.get("ok") and "held by vm" in r.get("error", ""), r)
+        check("handoff superseded: B keeps the arrival's generation", addr(B, ip).get("seen") == gen, addr(B, ip))
+        tap = vms(B)[n]["tap"]
+        check("handoff superseded: the late handoff takes the address over", wait_for(lambda: f"dev {tap}" in peer_route(ip), 10), peer_route(ip))
+    check("handoff superseded: never as if it went to a newer vm", "went to a newer vm" not in log(B, n), log(B, n)[-300:])
+    check("handoff superseded: never via the other peer", f"via {gw}" not in peer_route(ip), peer_route(ip))
     kill(B, n)
-    forget_peer_route(ip, gen + 1)
 
 
 def delayed_announce():
@@ -3194,7 +3235,7 @@ def arrival_with_peer_route(n, ip):
     load and preloaded pages it never sends. Returns (socket, mig, gateway)."""
     gw = third_peer()
     gen = addr(B, ip).get("seen", 0) + 1
-    r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": 0})
+    r = as_third(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": 0})
     assert r.get("ok"), r
     assert f"via {gw}" in peer_route(ip), peer_route(ip)
     s, r, mig = migrate_in_raw(B, n, ip, source_vm(), gen=gen)
@@ -7329,12 +7370,21 @@ def forged_peer():
     check("forged gen zero: name free again", name_free(B, n), vms(B).get(n))
     r = peer(B, {"op": "route", "ip": ip, "via": "127.0.0.9"})
     check("forged gen zero: a route message without one is refused", not r.get("ok"), r)
-    newest = addr(B, ip).get("seen", 0) + 10
-    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest)
+    # #914: B hands out its own addresses' generations, so none it never handed out arrives.
+    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=addr(B, ip).get("seen", 0) + 10)
     s.close()
-    check("forged gen: a newer one is taken", r.get("ok"), r)
+    check("forged gen: a newer one than B handed out is refused", not r.get("ok") and "never handed out here" in r.get("error", ""), r)
     nothing_left("forged gen", n, ip)
-    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest - 1)
+    # An address in the cluster range no host hands out: a newer generation is taken, an older one then refused.
+    n2, away = "ft-forged-gen-away", A.ips.split("-")[1].rsplit(".", 1)[0] + ".206"
+    scenario_vms.add(n2)
+    newest = addr(B, away).get("seen", 0) + 10
+    s, r, _ = migrate_in_raw(B, n2, away, tid, gen=newest)
+    s.close()
+    check("forged gen: a newer one of another's address is taken", r.get("ok"), r)
+    check("forged gen: name free on B", wait_for(lambda: name_free(B, n2), 10), vms(B).get(n2))
+    check("forged gen: address free on B", wait_for(lambda: not addr(B, away).get("holder"), 10), addr(B, away))
+    s, r, _ = migrate_in_raw(B, n2, away, tid, gen=newest - 1)
     s.close()
     check("forged gen: an older one than recorded is refused", not r.get("ok") and "newer generation" in r.get("error", ""), r)
     # A template name and id are file names in the templates directory, never paths.
@@ -9981,54 +10031,43 @@ class RouteWatch:
 
 @with_third_peer
 def restore_route_fence():
-    """#534: a restore installs its address's route only under its generation
-    fence, paused (--paused) or not. Held at restore_prepared_gate (Firecracker
-    up, nothing loaded), the address moves on to a newer generation routed via
-    a peer; let go, the restore fails at the fence, and the newer route is
-    never replaced by one to the restore's tap, then or as it exits."""
+    """#534, #914: a restore holds its address's generation from its claim. Held at
+    restore_prepared_gate (Firecracker up, nothing loaded), another peer's newer
+    generation of the address is refused, the record and the route left as they were;
+    let go, the restore runs, its address routed to its tap, paused (--paused) or not."""
     n, path = "ft-route-fence", ckpt_path("ft-route-fence")
     setup(n, mib=8)
     ip = vms(A)[n]["ip"]
-    ok(checkpoint(A, n, path, stop=True))
-    check("route fence: checkpointed, the vm gone", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
     gw = third_peer()
-    marker = A.ips.split("-")[1].rsplit(".", 1)[0] + ".249"
     gate = "restore_prepared_gate"
     for paused in (False, True):
         label = f"route fence{' (paused)' if paused else ''}"
-        watch, gen = RouteWatch(ip, marker, gw), 0
+        ok(checkpoint(A, n, path, stop=True))
+        check(f"{label}: checkpointed, the vm gone", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
         try:
-            check(f"{label}: watching route changes", watch.sync(), watch.lines[-5:])
             clear_gate(A, gate)
             fault(A, gate, 600000)
             res, th = background(lambda: restore(A, path, paused=paused))
             check(f"{label}: the restore parked at {gate}, its address claimed",
                   wait_for(lambda: len(reached(A, gate)) == 1, 60), reached(A, gate))
-            gen = addr(A, ip).get("held", 0)
-            check(f"{label}: the restore holds a generation of {ip}", gen > 0 and addr(A, ip).get("holder") == n, addr(A, ip))
-            r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
-            check(f"{label}: the newer generation is taken, routed via the peer",
-                  r.get("ok") and not r["result"].get("stale") and not r["result"].get("local") and f"via {gw}" in peer_route(ip), (r, peer_route(ip)))
-            # B hears of it too (as every peer does): the restore's withdrawal of its own generation, told to B as it
-            # fails, is then stale there, and leaves the route both hosts share here alone.
-            r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
-            check(f"{label}: and so is the peer's", r.get("ok") and not r["result"].get("stale"), r)
+            before = addr(A, ip)
+            gen = before.get("held", 0)
+            check(f"{label}: the restore holds a generation of {ip}", gen > 0 and before.get("holder") == n, before)
+            r = as_third(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+            check(f"{label}: another peer's newer generation is refused, the record kept",
+                  not r.get("ok") and "held by vm" in r.get("error", "") and addr(A, ip) == before, (r, addr(A, ip)))
+            check(f"{label}: nothing routed via that peer", f"via {gw}" not in peer_route(ip), peer_route(ip))
             release(A, gate)
             th.join(120)
             r = res.get("r") or {"ok": False, "error": "restore did not return"}
-            check(f"{label}: the restore fails at the fence", not r["ok"] and "withdrawn or given out again" in r.get("error", ""), r)
-            check(f"{label}: it runs nowhere", wait_for(lambda: where(n) == {}, 30), where(n))
-            check(f"{label}: all route changes seen", watch.sync(), watch.lines[-5:])
-            check(f"{label}: the address was never routed to the restore's tap", not watch.to_tap(), watch.to_tap())
-            check(f"{label}: the newer route survives", f"via {gw}" in peer_route(ip), peer_route(ip))
-            check(f"{label}: the newer generation stays recorded", addr(A, ip).get("seen") == gen + 1, addr(A, ip))
+            check(f"{label}: the restore runs", r["ok"] and where(n) == {A: "paused" if paused else "running"}, (r, where(n)))
+            if not paused:
+                tap = vms(A)[n]["tap"]
+                check(f"{label}: its address routed to its tap", wait_for(lambda: f"dev {tap}" in peer_route(ip), 10), peer_route(ip))
         finally:
-            watch.close()
             disarm()
-            kill(A, n)
-            if gen:
-                forget_peer_route(ip, gen + 1)
-    rm_ckpt(path)
+        rm_ckpt(path)
+    kill(A, n)
 
 
 def kill_tree(pid):
@@ -10071,7 +10110,7 @@ def reboot():
     third_listed.enter_context(listing_third_peer(B))
     ip_peer = A.ips.split("-")[1].rsplit(".", 1)[0] + ".203"
     gen = addr(B, ip_peer).get("seen", 0) + 1
-    r = peer(B, {"op": "route", "ip": ip_peer, "via": gw, "gen": gen, "rev": 0})
+    r = as_third(B, {"op": "route", "ip": ip_peer, "via": gw, "gen": gen, "rev": 0})
     check("reboot: B routes the peer's vm", r.get("ok") and f"via {gw}" in peer_route(ip_peer), (r, peer_route(ip_peer)))
     other = tempfile.mkdtemp(prefix="fvp-other-", dir="/var/tmp")
     other_run = None

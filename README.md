@@ -595,7 +595,15 @@ allowlist in `derived.cluster_ips`. Withdrawals of previously recorded
 addresses remain accepted after the allowlist narrows. A generation routed
 via a peer is withdrawn only by that peer (its addresses and
 `peer_underlays`), or by one that had the VM later (a newer revision of the
-generation: it migrated on) or a newer generation. The hosts must list each
+generation: it migrated on) or a newer generation. A peer announces routes
+via its own addresses only (its `peers` address, or its `peer_underlays`),
+never via another host. While a VM here holds an address, no peer brings a
+newer generation of it, and only the host it is migrating to moves or
+withdraws its generation; for an address of this host's own `vm_ips`, which
+only this host hands out, no peer brings a newer generation while it is lent
+from here, nor one this host never handed out (a VM arriving with one is
+refused too). A refused update is retried by its sender, so one that comes
+before the withdrawal it follows is taken once that has. The hosts must list each
 other in `peers` (each peer's listen address): a listener serves its peers'
 addresses only, and tells any other it is not a peer. A reported route next
 hop (including a migration target's underlay) must be the connection's peer
@@ -990,7 +998,11 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
 - IPv4 only; peers form a full mesh; address ranges are per host and set by hand.
 - The peer protocol is plain TCP, served to the peers' addresses only, without
   authentication: trusted networks only. A listed peer can claim any VM
-  address and reserve this host's addresses and disk.
+  address for itself (as a newer revision or generation; see Migrate) and
+  reserve this host's addresses and disk. It cannot point a route at another
+  host, take an address a VM here holds, or bring this host's own addresses
+  a generation this host did not hand out; only owner-signed generations
+  would stop the rest.
 - An address lent to a restore elsewhere expires if the restore does not
   claim it within five minutes; a peer can hold at most 64 loans whose VMs are
   not running yet. A claimed loan (or one to a host older than this release,

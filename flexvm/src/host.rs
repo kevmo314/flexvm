@@ -1374,10 +1374,15 @@ impl Host {
     /// whether an address in use is tracked, so a range that drops it and later
     /// takes it back never hands it out while the VM runs elsewhere (#521).
     pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64, mig: u64, to: &str) -> Result<bool> {
+        self.lend_at(l, ip, gen, mig, to, &[])
+    }
+
+    /// `lend`, to a target reached at `at` (`Leaving::at`).
+    pub fn lend_at(&self, l: &Locked, ip: Ipv4Addr, gen: u64, mig: u64, to: &str, at: &[IpAddr]) -> Result<bool> {
         let me = Ident::me();
         self.update(l, ip, true, |a| {
             if a.holder_id.as_ref() == Some(&me) {
-                a.leaving = Some(Leaving { mig, to: to.into() });
+                a.leaving = Some(Leaving { mig, to: to.into(), at: at.iter().map(|a| a.to_canonical()).collect() });
             }
             a.lent.replace(gen) != Some(gen)
         })
@@ -1433,6 +1438,87 @@ impl Host {
             return Ok(false);
         }
         self.observe_and(l, ip, gen, rev, via, |_| ())
+    }
+
+    /// Whether a peer at `sender` may make this route update of `ip` (`via` None: a withdrawal),
+    /// before `observe` records it (#914). Only the host that can make an update is taken:
+    /// - a newer generation: none while a VM here holds the current one (its address's home hands
+    ///   out no other until it is withdrawn); for an address of this host's own range (which only
+    ///   this host hands out), none while it is lent from here, and never one this host has not
+    ///   handed out yet;
+    /// - a move (a newer revision) or a withdrawal of the generation a VM here holds (an arrival
+    ///   aside): only from the target it is migrating to (`Leaving::at`, or its `to` by `named`).
+    ///
+    /// Refused updates are errors, which their senders retry: one that comes too early (before
+    /// the withdrawal that frees the address here) is taken once that has.
+    pub fn peer_update(
+        &self,
+        l: &Locked,
+        ip: Ipv4Addr,
+        (gen, rev): GenRev,
+        via: Option<Ipv4Addr>,
+        sender: &[IpAddr],
+        named: impl FnOnce(&str) -> Vec<IpAddr>,
+    ) -> Result<()> {
+        let a = self.addr(l, ip)?;
+        // Past the peer bound: stale (`observe`).
+        if gen > RECV_MAX {
+            return Ok(());
+        }
+        if gen > a.seen {
+            return self.newer_gen(&a, ip, gen);
+        }
+        let here = self.held(&a) && a.held == a.seen && !a.withdrawn && a.arriving.is_none();
+        let moves = via.is_none() || rev > a.rev.max(self.live_of(ip, &a).unwrap_or(0));
+        if gen < a.seen || !here || !moves {
+            return Ok(());
+        }
+        let target = a.leaving.as_ref().map(|t| [t.at.clone(), named(&t.to)].concat()).unwrap_or_default();
+        if !target.iter().any(|t| sender.iter().any(|s| s.to_canonical() == t.to_canonical())) {
+            let what = if via.is_some() { format!("revision {rev} elsewhere") } else { "its withdrawal".into() };
+            bail!(
+                "{ip} generation {gen} is held by vm {} here{}: {what} is taken only from the host it migrates to",
+                a.holder.as_deref().unwrap_or("?"),
+                a.leaving.as_ref().map_or(String::new(), |t| format!(" (migrating to {})", t.to))
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a peer may bring `ip` generation `gen`, newer than `a` (its record) has: as an
+    /// update (`peer_update`) or with an arriving VM.
+    pub fn newer_gen(&self, a: &Addr, ip: Ipv4Addr, gen: u64) -> Result<()> {
+        if gen <= a.seen {
+            return Ok(());
+        }
+        if self.held(a) && a.held == a.seen && !a.withdrawn {
+            bail!(
+                "{ip} generation {} is held by vm {} here: no newer one (not {gen}) is handed out until it is withdrawn",
+                a.seen,
+                a.holder.as_deref().unwrap_or("?")
+            );
+        }
+        if !self.config_now().range().is_ok_and(|r| r.allocatable(ip)) {
+            return Ok(());
+        }
+        if a.lent == Some(a.seen) && !a.withdrawn {
+            bail!("{ip} is this host's to hand out and is lent from here with generation {}: no newer one (not {gen}) exists until it is withdrawn", a.seen);
+        }
+        let unissued = self.unissued()?;
+        if gen >= unissued {
+            bail!("{ip} is this host's to hand out, and generation {gen} was never handed out here (none at or past {unissued} yet)");
+        }
+        Ok(())
+    }
+
+    /// The lowest generation `next_gen` has never handed out: every one it handed out is below it.
+    fn unissued(&self) -> Result<u64> {
+        let Some(g) = load::<Gens>(&self.gens_path())? else { return Ok(1) };
+        let cursor = std::fs::read(self.run.join(".gens.next")).ok().and_then(|b| serde_json::from_slice::<Gens>(&b).ok());
+        Ok(match cursor.filter(|c| c.boot == boot_id() && c.reserved == g.reserved) {
+            Some(c) => c.next.max(g.next),
+            None => g.next.max(g.reserved),
+        })
     }
 
     /// `observe`, with `also` applied to the record in the same write.
@@ -2610,6 +2696,11 @@ pub enum Mig {
 pub struct Leaving {
     pub mig: u64,
     pub to: String,
+    /// The target's addresses as the source reached it (its connection's and its underlay): a peer
+    /// update of the generation held here is taken from these alone (`Host::peer_update`). None
+    /// recorded (an older source process's): `to` by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub at: Vec<IpAddr>,
 }
 
 /// A loan: its generation, and the migrations (id, target) whose outcome is owed for it.
@@ -5793,7 +5884,7 @@ pub(crate) mod tests {
         claim(ips[10], "owing", Some(owing.clone()), 4, &|_| ());
         h.owe(3, &Owed { to: "t".into(), ip: ips[10], gen: 4, by: owing.clone() }).unwrap();
         // A source that may have handed its VM on.
-        let leaving = |mig| Some(Leaving { mig, to: "c".into() });
+        let leaving = |mig| Some(Leaving { mig, to: "c".into(), at: Vec::new() });
         claim(ips[11], "leaving", Some(dead(999_999_940)), 4, &|a| a.leaving = leaving(40));
         // Its migration record says it was still arriving, whatever the address says.
         let mig = |id: u64, m: Mig| store(&h.mig_path(id), &m, false).unwrap();
@@ -5848,6 +5939,68 @@ pub(crate) mod tests {
         let withdrawn = h.withdraw_dead(false).unwrap();
         assert!(h.addr(&h.lock().unwrap(), ips[6]).unwrap().withdrawn);
         assert_eq!(withdrawn, vec![("quarantined".to_string(), ips[6], 4)]);
+    }
+
+    /// #914: a peer's route update, or an arrival's generation, is taken only from the host that can make it.
+    #[test]
+    fn peer_updates_come_only_from_the_host_that_can_make_them() {
+        let (_d, h) = host("peer-update");
+        let l = h.lock().unwrap();
+        let (t, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        let (t4, c4) = (Some(ip("192.0.2.7")), Some(ip("192.0.2.8")));
+        let none = |_: &str| Vec::new();
+        let _names = ["vm", "vm2", "vm3", "arrival"].map(|n| h.take_name(n, false).unwrap());
+        // Held here: no peer brings a newer generation, announced or withdrawn.
+        let claim = h.claim_new(&l, "vm", Some(ip("10.9.0.1"))).unwrap();
+        let (x, g) = (claim.ip, claim.gen);
+        for via in [c4, None] {
+            let e = h.peer_update(&l, x, (g + 1, 0), via, &[c], none).unwrap_err().to_string();
+            assert!(e.contains("held by vm vm here"), "{e}");
+        }
+        // Nor moves or withdraws its generation while it is not migrating: C cannot make its copy
+        // look superseded (a resume refused, an aborted source destroyed).
+        assert!(h.peer_update(&l, x, (g, 1), c4, &[c], none).is_err());
+        assert!(h.peer_update(&l, x, (g, 0), None, &[c], none).is_err());
+        // An announcement no newer than its revision is stale, for `observe` to say.
+        h.peer_update(&l, x, (g, 0), c4, &[c], none).unwrap();
+        // Migrating to T, reached at t: T's move and withdrawal are taken, C's are not.
+        assert!(h.lend_at(&l, x, g, 1, "t:7070", &[t]).unwrap());
+        h.peer_update(&l, x, (g, 1), t4, &[t], none).unwrap();
+        h.peer_update(&l, x, (g, 0), None, &[t], none).unwrap();
+        assert!(h.peer_update(&l, x, (g, 1), c4, &[c], none).unwrap_err().to_string().contains("migrating to t:7070"));
+        assert!(h.peer_update(&l, x, (g, 0), None, &[c], none).is_err());
+        // A source process from before targets were recorded: T by the name it was given.
+        h.lend(&l, x, g, 2, "t").unwrap();
+        assert!(h.peer_update(&l, x, (g, 1), t4, &[t], none).is_err());
+        h.peer_update(&l, x, (g, 1), t4, &[t], |to: &str| if to == "t" { vec![t] } else { vec![] }).unwrap();
+        // Let go, it stays lent from its home here: same-generation moves are any peer's, newer generations nobody's.
+        claim.release(&l).unwrap();
+        h.peer_update(&l, x, (g, 5), c4, &[c], none).unwrap();
+        assert!(h.peer_update(&l, x, (g + 1, 0), c4, &[c], none).unwrap_err().to_string().contains("lent from here"));
+        assert!(h.newer_gen(&h.addr(&l, x).unwrap(), x, g + 1).is_err(), "nor arrives with one");
+        h.newer_gen(&h.addr(&l, x).unwrap(), x, g).unwrap();
+        // Withdrawn (the VM ended where it went): one this host never handed out is refused, as
+        // C's jump to the peer bound (which would leave the home none to hand out) is.
+        assert!(h.observe(&l, x, g, 0, None).unwrap());
+        for gen in [g + 1, RECV_MAX] {
+            assert!(h.peer_update(&l, x, (gen, 0), c4, &[c], none).unwrap_err().to_string().contains("never handed out here"), "{gen}");
+            assert!(h.newer_gen(&h.addr(&l, x).unwrap(), x, gen).is_err());
+        }
+        // One it did hand out (for another of its addresses meanwhile, say) is taken.
+        let other = h.claim_new(&l, "vm3", Some(ip("10.9.0.2"))).unwrap();
+        h.peer_update(&l, x, (other.gen, 0), c4, &[c], none).unwrap();
+        // Another host's address: no bound here, unless a VM here holds it (it migrated in).
+        let away = ip("10.9.2.1");
+        h.peer_update(&l, away, (1 << 40, 0), c4, &[c], none).unwrap();
+        let _held = h.claim_incoming(&l, "vm2", away, 7, None).unwrap();
+        assert!(h.peer_update(&l, away, (8, 0), c4, &[c], none).is_err());
+        h.newer_gen(&h.addr(&l, ip("10.9.2.2")).unwrap(), ip("10.9.2.2"), 1 << 40).unwrap();
+        // An arrival's claim is its source's until it commits: its resume after an abort is taken.
+        let arriving = ip("10.9.2.3");
+        let _a = h.claim_arrival(&l, "arrival", arriving, 8, 2, 5).unwrap();
+        h.peer_update(&l, arriving, (8, 3), c4, &[c], none).unwrap();
+        h.peer_update(&l, arriving, (8, 0), None, &[c], none).unwrap();
+        assert!(h.peer_update(&l, arriving, (9, 0), c4, &[c], none).is_err());
     }
 
     #[test]
@@ -5932,7 +6085,7 @@ pub(crate) mod tests {
             holder: Some("vm2".into()),
             holder_id: Some(gone.clone()),
             held: 3,
-            leaving: Some(Leaving { mig: 8, to: "b".into() }),
+            leaving: Some(Leaving { mig: 8, to: "b".into(), at: Vec::new() }),
             ..Addr::default()
         };
         h.put_addr(y, &a, false).unwrap();
@@ -5956,7 +6109,7 @@ pub(crate) mod tests {
             holder: Some("vm".into()),
             holder_id: Some(gone.clone()),
             held: 3,
-            leaving: Some(Leaving { mig: 9, to: "b".into() }),
+            leaving: Some(Leaving { mig: 9, to: "b".into(), at: Vec::new() }),
             ..Addr::default()
         };
         h.put_addr(x, &a, false).unwrap();
@@ -5992,7 +6145,7 @@ pub(crate) mod tests {
             holder: Some("vm2".into()),
             holder_id: Some(gone.clone()),
             held: 5,
-            leaving: Some(Leaving { mig: 10, to: "b".into() }),
+            leaving: Some(Leaving { mig: 10, to: "b".into(), at: Vec::new() }),
             ..Addr::default()
         };
         h.put_addr(y, &a, false).unwrap();
@@ -6072,7 +6225,7 @@ pub(crate) mod tests {
                 held: 4,
                 holder: Some("failed".into()),
                 holder_id: Some(gone.clone()),
-                leaving: (case != "withdrawal").then(|| Leaving { mig: 10, to: "peer".into() }),
+                leaving: (case != "withdrawal").then(|| Leaving { mig: 10, to: "peer".into(), at: Vec::new() }),
                 ..Addr::default()
             };
             h.put_addr(x, &a, false).unwrap();
@@ -6329,7 +6482,7 @@ pub(crate) mod tests {
             holder: Some("vm".into()),
             holder_id: Some(gone.clone()),
             held: 4,
-            leaving: Some(Leaving { mig: 50, to: "c".into() }),
+            leaving: Some(Leaving { mig: 50, to: "c".into(), at: Vec::new() }),
             ..Addr::default()
         };
         h.put_addr(x, &a, false).unwrap();
@@ -6346,8 +6499,14 @@ pub(crate) mod tests {
         // Had c resumed it, the VM would be c's: released, nothing withdrawn.
         let y = ip("10.9.1.2");
         let gone = dead_owner(&h, 999_999_955, &[]);
-        let a =
-            Addr { seen: 4, holder: Some("vm2".into()), holder_id: Some(gone), held: 4, leaving: Some(Leaving { mig: 51, to: "c".into() }), ..Addr::default() };
+        let a = Addr {
+            seen: 4,
+            holder: Some("vm2".into()),
+            holder_id: Some(gone),
+            held: 4,
+            leaving: Some(Leaving { mig: 51, to: "c".into(), at: Vec::new() }),
+            ..Addr::default()
+        };
         h.put_addr(y, &a, false).unwrap();
         h.withdraw_dead(false).unwrap();
         h.settle_owed_with(5, |_, id| Ok(if id == 51 { "released" } else { "pending" }.into()), |_, _| (), |_, _| ());
@@ -6370,7 +6529,7 @@ pub(crate) mod tests {
                 holder: Some(format!("vm{mig}")),
                 holder_id: Some(gone.clone()),
                 held: 4,
-                leaving: Some(Leaving { mig, to: "b".into() }),
+                leaving: Some(Leaving { mig, to: "b".into(), at: Vec::new() }),
                 ..Addr::default()
             };
             h.put_addr(ip(x), &a, false).unwrap();
