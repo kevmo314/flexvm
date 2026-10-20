@@ -272,6 +272,11 @@ struct Direction {
     /// It has ended: its source finished (a FIN, or a failure once what came before is written) and
     /// that end was passed on as a FIN, or its sink failed and its source has finished since.
     done: bool,
+    /// While it holds data: when it began to, or its sink last took some (a write, or the sink's TCP
+    /// acknowledging more of what the kernel holds). Its source sending more is not that.
+    delivered: Option<Instant>,
+    /// What the sink's TCP had acknowledged when last looked at.
+    acked: u64,
 }
 
 impl Direction {
@@ -283,7 +288,7 @@ impl Direction {
     /// still writes what came before it (a reply the guest sent before resetting); a write error
     /// ends only this direction.
     fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> bool {
-        let (mut moved, mut taken) = (false, 0);
+        let (mut moved, mut taken, holding) = (false, 0, self.start < self.end);
         while !self.eof && self.end < BUFFER && taken < BUFFER {
             self.bytes.resize(BUFFER, 0);
             match from.read(&mut self.bytes[self.end..]) {
@@ -305,7 +310,7 @@ impl Direction {
         while self.start < self.end {
             match to.write(&self.bytes[self.start..self.end]) {
                 Ok(n) if n > 0 => {
-                    self.start += n;
+                    (self.start, self.delivered) = (self.start + n, Some(idle_now()));
                     moved = true;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -315,6 +320,10 @@ impl Direction {
                     break;
                 }
             }
+        }
+        if !holding && self.start < self.end {
+            // Only what its sink acknowledges from now on is progress.
+            (self.delivered, self.acked) = (Some(idle_now()), bytes_acked(to).unwrap_or(0));
         }
         if self.start == self.end {
             (self.start, self.end) = (0, 0);
@@ -328,6 +337,33 @@ impl Direction {
         }
         moved
     }
+
+    /// Notes its sink's TCP taking more of what the kernel holds for it: a reader slowly emptying its
+    /// receive queue makes progress there long before the proxy's socket is writable again.
+    fn delivering(&mut self, sink: &TcpStream) {
+        if self.start == self.end {
+            return;
+        }
+        let Some(acked) = bytes_acked(sink) else { return };
+        if acked > self.acked {
+            (self.acked, self.delivered) = (acked, Some(idle_now()));
+        }
+    }
+
+    /// Holding data its sink has taken none of for `bound`.
+    fn stalled(&self, bound: Duration) -> bool {
+        self.start < self.end && self.delivered.is_some_and(|t| idle_now().duration_since(t) >= bound)
+    }
+}
+
+/// How much of what `s` sent its peer has acknowledged (tcp_info's tcpi_bytes_acked).
+fn bytes_acked(s: &TcpStream) -> Option<u64> {
+    // libc's tcp_info stops short of it: tcpi_bytes_acked is at byte 120, after 8 one-byte fields,
+    // 24 u32s, and the two u64 pacing rates.
+    let mut info = [0u64; 32];
+    let mut size = size_of_val(&info) as libc::socklen_t;
+    let got = unsafe { libc::getsockopt(s.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_INFO, info.as_mut_ptr().cast(), &mut size) };
+    (got == 0 && size >= 128).then_some(info[15])
 }
 
 fn rest(e: &io::Error, resting: &mut Option<Instant>) -> bool {
@@ -390,10 +426,21 @@ impl Connection {
         self.out.start < self.out.end || self.incoming.start < self.incoming.end
     }
 
-    /// Connected, and nothing relayed for `idle`, or for `STALLED` times that if it holds data its reader
-    /// has stopped taking.
+    /// Connected, and nothing relayed for `idle`; or, holding data, a sink that has taken none of what it
+    /// is owed for `STALLED` times that (whatever its other direction does).
     fn idle(&self, idle: Duration) -> bool {
-        self.connected && idle_now().duration_since(self.active) >= if self.queued() { idle * STALLED } else { idle }
+        self.connected
+            && if self.queued() {
+                self.out.stalled(idle * STALLED) || self.incoming.stalled(idle * STALLED)
+            } else {
+                idle_now().duration_since(self.active) >= idle
+            }
+    }
+
+    /// Since when it has been idle, or (holding data) its stalled sink has taken nothing.
+    fn quiet(&self) -> Instant {
+        let held = [&self.out, &self.incoming].into_iter().filter(|d| d.start < d.end).filter_map(|d| d.delivered).min();
+        held.unwrap_or(self.active)
     }
 
     /// Its client failed: reset, or a socket error pending (POLLERR), or both directions closed (POLLHUP).
@@ -428,7 +475,7 @@ const DOWN: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
 /// The connected forward idle longest, if for at least `idle` (a stalled one only once none is idle):
 /// the one to close for a new client at the cap.
 fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
-    connections.iter().enumerate().filter(|(_, c)| c.idle(idle)).min_by_key(|(_, c)| (c.queued(), c.active)).map(|(i, _)| i)
+    connections.iter().enumerate().filter(|(_, c)| c.idle(idle)).min_by_key(|(_, c)| (c.queued(), c.quiet())).map(|(i, _)| i)
 }
 
 /// How many connected forwards have been idle for `idle`: each may make way for one more client.
@@ -495,6 +542,8 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 (c.fresh, c.active) = (true, idle_now());
                 return true;
             }
+            c.out.delivering(&c.guest);
+            c.incoming.delivering(&c.client);
             c.forward(client.revents, guest.revents)
         });
         // Only now: a replacement whose connect fails closes nothing.
@@ -907,8 +956,9 @@ mod tests {
         // What it still holds for a stalled reader would be lost: it is not idle.
         connections[3].incoming.end = 1;
         assert_eq!((idlest(&connections, IDLE), spare(&connections, IDLE)), (Some(2), 1));
-        // Unless its reader has taken none of it for long: then it may go, but only once none is idle.
-        connections[3].active = ago(IDLE * STALLED);
+        // Unless its reader has taken none of it for long, however busy its other direction: then it
+        // may go, but only once none is idle.
+        connections[3].incoming.delivered = Some(ago(IDLE * STALLED));
         assert_eq!((idlest(&connections, IDLE), spare(&connections, IDLE)), (Some(2), 2));
         connections.swap_remove(2);
         assert_eq!(idlest(&connections, IDLE), Some(2));
@@ -1607,6 +1657,15 @@ mod tests {
 
     #[test]
     fn a_reader_that_stalls_is_reset_to_admit_a_client_at_the_cap_once_stalled_for_long() {
+        reader_that_stalls(false);
+    }
+
+    #[test]
+    fn a_reader_that_stalls_while_it_keeps_uploading_is_reset_all_the_same() {
+        reader_that_stalls(true);
+    }
+
+    fn reader_that_stalls(uploading: bool) {
         let start = Instant::now();
         let clock = Arc::new(std::sync::Mutex::new(start));
         let (addr, guest, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
@@ -1621,17 +1680,46 @@ mod tests {
             thread::sleep(Duration::from_millis(200));
             server.write(&chunk).is_err_and(|e| transient(&e))
         });
+        // A pass or two for the worker to see the last of what the client's TCP acknowledged, before time moves.
+        thread::sleep(Duration::from_millis(TICK as u64) * 2);
         guest.set_nonblocking(true).unwrap();
+        // Uploading, the client keeps the forward relaying, with its reply still blocked. Writing may
+        // take the reset that ends it (once it comes) before a read can.
+        let mut upload_reset = false;
+        let mut upload = |stalled: &mut TcpStream, server: &mut TcpStream| {
+            if uploading {
+                match stalled.write(b"u") {
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => upload_reset = true,
+                    _ => {}
+                }
+                while server.read(&mut [0; 4096]).is_ok_and(|n| n > 0) {}
+            }
+        };
         let mut waiting = TcpStream::connect(addr).unwrap();
         waiting.write_all(b"w").unwrap();
         // Quiet for IDLE, a forward holding data is not idle: the waiting client waits.
         *clock.lock().unwrap() = start + IDLE;
-        thread::sleep(Duration::from_millis(TICK as u64) * 2);
+        let until = Instant::now() + Duration::from_millis(TICK as u64) * 2;
+        while Instant::now() < until {
+            upload(&mut stalled, &mut server);
+            thread::sleep(Duration::from_millis(50));
+        }
         assert!(guest.accept().is_err_and(|e| transient(&e)), "a forward holding data was closed once quiet for IDLE");
-        *clock.lock().unwrap() = start + IDLE * STALLED;
+        // Its client's TCP may still take a segment or so (an upload's ACK can open its window a little):
+        // time moves on until it has taken nothing for STALLED times IDLE, however busy the upload.
+        let (mut now, mut moved) = (start + IDLE * STALLED, Instant::now());
+        *clock.lock().unwrap() = now;
         let mut accepted = None;
         wait_until("the waiting client to replace the stalled forward", || {
             accepted = guest.accept().ok();
+            if accepted.is_none() {
+                upload(&mut stalled, &mut server);
+                if moved.elapsed() > Duration::from_millis(TICK as u64) * 2 {
+                    (now, moved) = (now + IDLE, Instant::now());
+                    assert!(now <= start + IDLE * (STALLED + 4), "the stalled forward was never closed");
+                    *clock.lock().unwrap() = now;
+                }
+            }
             accepted.is_some()
         });
         let (mut replacement, _) = accepted.unwrap();
@@ -1641,8 +1729,69 @@ mod tests {
         replacement.read_exact(&mut b).unwrap();
         assert_eq!(&b, b"w");
         // Its reply was cut off: a reset, not a FIN as if it were complete.
-        assert_eq!(read_until_closed(&mut stalled).map_err(|e| e.kind()), Err(io::ErrorKind::ConnectionReset));
+        let read = read_until_closed(&mut stalled).map_err(|e| e.kind());
+        assert!(read == Err(io::ErrorKind::ConnectionReset) || upload_reset, "the stalled forward ended in {read:?}");
         worker.halt();
+    }
+
+    #[test]
+    fn a_reader_taking_only_what_its_kernel_holds_is_not_stalled() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (host, _) = crate::test_util::accept_tcp(&listener);
+        let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _server = crate::test_util::accept_tcp(&listener);
+        host.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        for (socket, name) in [(&host, libc::SO_SNDBUF), (&client, libc::SO_RCVBUF)] {
+            assert_eq!(
+                unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, name, (&size as *const libc::c_int).cast(), size_of_val(&size) as _) },
+                0
+            );
+        }
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        pin_clock(clock.clone());
+        let mut connection = Connection {
+            client: host,
+            guest,
+            connected: true,
+            fresh: false,
+            since: start,
+            active: start,
+            out: Direction::default(),
+            incoming: Direction::default(),
+            client_down: 0,
+            guest_down: 0,
+            lingering: None,
+        };
+        // A reply the client does not read: it blocks, and the kernels settle.
+        wait_until("the reply to block", || {
+            (connection.incoming.start, connection.incoming.end) = (0, BUFFER);
+            connection.incoming.bytes.resize(BUFFER, 42);
+            !connection.incoming.pump(&connection.guest, &connection.client)
+        });
+        let mut acked = bytes_acked(&connection.client).unwrap();
+        assert!(acked > 0);
+        wait_until("the acknowledgements to settle", || {
+            thread::sleep(Duration::from_millis(200));
+            std::mem::replace(&mut acked, bytes_acked(&connection.client).unwrap()) == acked
+        });
+        connection.incoming.delivering(&connection.client);
+        *clock.lock().unwrap() = start + IDLE * STALLED;
+        tick_clock();
+        connection.incoming.delivering(&connection.client);
+        assert!(connection.idle(IDLE), "a reader that took nothing for long is stalled");
+        // It reads a little at a time, from what its kernel already holds: the proxy's socket need not
+        // be writable for that to be progress.
+        client.set_nonblocking(true).unwrap();
+        wait_until("the reader's progress to be seen", || {
+            let _ = client.read(&mut [0; 512]);
+            connection.incoming.delivering(&connection.client);
+            !connection.idle(IDLE)
+        });
+        assert_eq!(connection.incoming.delivered, Some(start + IDLE * STALLED));
+        CLOCK.with(|c| *c.borrow_mut() = None);
     }
 
     /// Until all `s` sent is acknowledged: a reset discards what its kernel still holds (a small write
