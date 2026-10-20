@@ -3081,10 +3081,12 @@ def reconcile_kill():
     setup(n, mib=100)
     ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
     # The arrival parked preparing (`incoming_gate`) until the source has taken the SIGINT and waits
-    # for the migration (`destroy_wait`), not for a guessed stall.
+    # for the migration (`destroy_wait`), not for a guessed stall: both sides' preparation deadlines made
+    # long (`long_preflight`), so the gate outlasts them.
     clear_gate(B, "incoming_gate")
     clear_gate(A, "destroy_wait")
-    with armed_fault(A, "pages_slow", 600000), armed_fault(A, "destroy_wait", 600000), armed_fault(B, "incoming_gate", 600000):
+    with armed_fault(A, "pages_slow", 600000), armed_fault(A, "destroy_wait", 600000), armed_fault(A, "long_preflight", 600000), \
+            armed_fault(B, "long_preflight", 600000), armed_fault(B, "incoming_gate", 600000):
         with armed_fault(B, "lost_ack", 600000):
             fault(B, "status", 600000)
             r = [None]
