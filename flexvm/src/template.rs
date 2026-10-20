@@ -1173,8 +1173,9 @@ pub fn note_shared(paths: &Paths, state: &Path) -> std::io::Result<()> {
 /// while one is recorded but cannot be read or is gone (moved, or on a filesystem not mounted now), or the
 /// directory was marked shared before states were recorded (`RECORDED`), unless `force` (`--force-shared`):
 /// then the record is taken as right, gone states are forgotten and the marker is brought up to date. A
-/// recorded state whose `templates` is another directory now uses none (its record stays).
-fn shared_users(paths: &Paths, force: bool) -> BTreeSet<String> {
+/// recorded state whose `templates` is another directory now uses none (its record stays). Without
+/// `checkpoints`, only the record is read: none of the states' VMs or checkpoints.
+fn shared_users(paths: &Paths, force: bool, checkpoints: bool) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let keep = |ids: &mut BTreeSet<String>, why: String| {
         ids.insert(format!("{KEEP_ALL}{why}"));
@@ -1249,7 +1250,8 @@ fn shared_users(paths: &Paths, force: bool) -> BTreeSet<String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Ok(m) if (m.dev(), m.ino()) != here => {}
             Err(e) => keep(&mut ids, format!("{}, linked to these templates, cannot be read ({e})", state.display())),
-            Ok(_) => ids.extend(crate::host::recorded_template_users(&state, &format!("in {}", state.display()))),
+            Ok(_) if checkpoints => ids.extend(crate::host::recorded_template_users(&state, &format!("in {}", state.display()))),
+            Ok(_) => {}
         }
     }
     ids
@@ -2037,8 +2039,9 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
     }
     sweep_locked(paths)?;
     // `--force-shared` brings the record up to date (the marker, gone states) whether or not anything is pruned.
+    // Only the record's failures end it: a state's unreadable checkpoint keeps every generation, as without it.
     if force_shared {
-        let shared = shared_users(paths, true);
+        let shared = shared_users(paths, true, false);
         if let Some(why) = shared.iter().find_map(|u| u.strip_prefix(KEEP_ALL)) {
             bail!("image prune --force-shared: {why}");
         }
@@ -2087,7 +2090,7 @@ const PRUNE_BATCH: usize = 64;
 /// templates directory (`shared_users`).
 fn users(paths: &Paths, in_use: &dyn Fn() -> BTreeSet<String>, force_shared: bool) -> BTreeSet<String> {
     let mut users = in_use();
-    users.extend(shared_users(paths, force_shared));
+    users.extend(shared_users(paths, force_shared, true));
     users
 }
 
@@ -2192,7 +2195,7 @@ fn delete_unused(paths: &Paths, id: &str, in_use: &dyn Fn() -> BTreeSet<String>)
     let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else {
         return Ok(Err(("open in a VM process here".into(), format!("image {id} is open in a VM process here"))));
     };
-    let (here, shared) = (in_use(), shared_users(paths, false));
+    let (here, shared) = (in_use(), shared_users(paths, false, true));
     if let Some(why) = here.iter().chain(&shared).find_map(|u| u.strip_prefix(KEEP_ALL)) {
         return Ok(Err((format!("{KEPT_ALL}{why}"), format!("image {id} is {KEPT_ALL}{why}"))));
     }
@@ -3164,6 +3167,25 @@ pub(crate) mod tests {
             let error = prune(&f.paths, None, &BTreeSet::new, true).unwrap_err().to_string();
             assert!(error.contains("image prune --force-shared") && error.contains(broken) && error.contains(why), "{error}");
         }
+    }
+
+    #[test]
+    fn force_shared_keeps_all_for_a_sharing_states_unreadable_checkpoint() {
+        let f = Fixture::new();
+        let gen = |id: &str| Meta { id: id.into(), image: Some(image("sha256:a", "")), ..f.meta.clone() };
+        publish_as(&f, "t", &gen("aaaa1111"));
+        let old = publish_as(&f, "t", &gen("bbbb2222")).unwrap();
+        let other = crate::test_util::TempDir::new("template-sharer-unreadable");
+        std::os::unix::fs::symlink(&f.paths.templates, other.join("templates")).unwrap();
+        note_shared(&Paths { templates: other.join("templates"), ..f.paths.clone() }, &other).unwrap();
+        std::fs::create_dir_all(other.join("suspended/web")).unwrap();
+        std::fs::write(other.join("suspended/web/manifest.json"), b"not json").unwrap();
+        // Not a registry failure: the prune runs, and keeps every unused generation.
+        assert!(prune(&f.paths, None, &BTreeSet::new, true).unwrap().is_empty());
+        assert!(Template::generation(&f.paths, &old).is_some());
+        std::fs::remove_dir_all(other.join("suspended/web")).unwrap();
+        assert!(!prune(&f.paths, None, &BTreeSet::new, true).unwrap().is_empty());
+        assert!(Template::generation(&f.paths, &old).is_none());
     }
 
     #[test]
