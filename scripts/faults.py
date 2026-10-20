@@ -1221,10 +1221,12 @@ def guest_calls():
     # A clock step the guest carried out but whose answer was lost goes again.
     before = vms(B)[n]["guest_retries"].get("CLOCK", 0)
     pause(B, n)
-    fault(B, "guest_lose_reply", 300)
-    resume(B, n)
+    # Armed until the step was seen going again, however long the resume takes to get to it.
     retried = lambda: vms(B)[n]["guest_retries"].get("CLOCK", 0) > before
-    check("guest calls: a clock step with its reply lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
+    with armed_fault(B, "guest_lose_reply", 600000):
+        resume(B, n)
+        went_again = wait_for(retried, 30)
+    check("guest calls: a clock step with its reply lost went again", went_again, vms(B)[n]["guest_retries"])
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
 
 
