@@ -8901,11 +8901,20 @@ def suspend_killed():
     setup(n, mib=20)
     ip = vms(A)[n]["ip"]
     pid = vm_pid(A, n)
-    with armed_fault(A, "suspend_stall", 10000):
-        os.kill(pid, signal.SIGTERM)
-        d = os.path.join(A.state, "suspended", n)
-        check("suspend killed: published", wait_for(lambda: os.path.exists(os.path.join(d, "manifest.json")), 30), d)
-        os.kill(pid, signal.SIGINT)
+    # Held once published (`suspend_gate`) until the SIGINT is seen taken (its destroy waiting for the
+    # suspend: `destroy_wait`), however long either takes.
+    clear_gate(A, "suspend_gate")
+    clear_gate(A, "destroy_wait")
+    with armed_fault(A, "suspend_gate", 600000), armed_fault(A, "destroy_wait", 600000):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            d = os.path.join(A.state, "suspended", n)
+            check("suspend killed: published, and held", wait_for(lambda: pid in reached(A, "suspend_gate"), 60) and os.path.exists(os.path.join(d, "manifest.json")),
+                  (reached(A, "suspend_gate"), d))
+            os.kill(pid, signal.SIGINT)
+            check("suspend killed: the kill is taken while it is held", wait_for(lambda: pid in reached(A, "destroy_wait"), 30), reached(A, "destroy_wait"))
+        finally:
+            release(A, "suspend_gate")
         check("suspend killed: the process ends", wait_for(lambda: not alive(pid), 30), pid)
     check("suspend killed: no suspended vm left", n not in vms(A) and not os.path.exists(d), (vms(A).get(n), os.path.exists(d)))
     check("suspend killed: address withdrawn", not addr(A, ip).get("holder") and addr(A, ip).get("withdrawn"), addr(A, ip))
