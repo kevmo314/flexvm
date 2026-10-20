@@ -189,7 +189,8 @@ const SWITCHES: &[&str] = &[
     "lifecycle",
 ];
 
-/// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`.
+/// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`;
+/// run and exec still take their IMAGE or NAME after `--`.
 pub struct Args {
     positional: Vec<String>,
     flags: Vec<(String, String)>,
@@ -315,7 +316,20 @@ impl Args {
                         bail!("-- must follow the command");
                     }
                     if matches!(cmd, Some("run" | "exec")) {
-                        a.rest.extend(it.by_ref());
+                        // `run -- IMAGE` and `exec -- NAME`: the first word is still IMAGE or NAME,
+                        // and as without the `--`, a `--` right after it is dropped.
+                        let mut words = it.by_ref().peekable();
+                        // `run --checkpoint DIR` has no IMAGE: the words are a (refused) CMD.
+                        if a.positional.len() == 1 && !a.has("checkpoint") {
+                            if let Some(word) = words.next() {
+                                a.child_args.push(word.clone());
+                                a.positional.push(word);
+                                if let Some(dashdash) = words.next_if_eq("--") {
+                                    a.child_args.push(dashdash);
+                                }
+                            }
+                        }
+                        a.rest.extend(words);
                         a.child_args.extend(a.rest.iter().cloned());
                     } else {
                         let words: Vec<_> = it.by_ref().collect();
@@ -351,7 +365,10 @@ impl Args {
                     // `exec NAME CMD` and `run IMAGE CMD`: the rest is the command's (a `--` first is dropped).
                     if a.positional.len() == 2 && matches!(a.positional[0].as_str(), "exec" | "run") {
                         let mut cmd = it.by_ref().peekable();
-                        cmd.next_if_eq("--");
+                        // Kept in child_args, so the VM process drops the same one.
+                        if let Some(dashdash) = cmd.next_if_eq("--") {
+                            a.child_args.push(dashdash);
+                        }
                         a.rest.extend(cmd);
                         a.child_args.extend(a.rest.iter().cloned());
                     }
@@ -1111,15 +1128,19 @@ fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
     Ok(ports)
 }
 
-/// A bare `-e K` takes this environment's value, if present, for both run and exec.
-fn env_flags(args: &Args) -> Vec<String> {
-    args.all("env")
+/// A bare env key takes this environment's value, if present, for run, exec and pull.
+fn env_flags(args: &Args) -> Result<Vec<String>> {
+    let env = args.all("env");
+    for kv in &env {
+        app::validate_env(kv)?;
+    }
+    Ok(env
         .into_iter()
         .filter_map(|kv| match kv.contains('=') {
             true => Some(kv),
             false => std::env::var(&kv).ok().map(|v| format!("{kv}={v}")),
         })
-        .collect()
+        .collect())
 }
 
 /// `-e`, `--env-file`, `--entrypoint`, `--keep`, `--rm`, `-p` (and the `--ip` asked for, for a rerun).
@@ -1131,7 +1152,7 @@ fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec>
         env.extend(app::parse_env_file(&text, lookup).map_err(|e| format!("--env-file {f}: {e}"))?);
     }
     // After the files, as docker: `-e` wins. A bare `K` is this environment's, if it has one.
-    env.extend(env_flags(args));
+    env.extend(env_flags(args)?);
     let (stdin, tty) = (args.has("interactive"), args.has("tty"));
     let entrypoint = match args.get("entrypoint") {
         Some(e) => Some(image::parse_argv(e)?),
@@ -1806,7 +1827,13 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
     let warm = args.has("warm");
     let ready = match (args.get("ready-port"), args.get("ready-cmd")) {
         (Some(_), Some(_)) => return Err("pass --ready-port or --ready-cmd, not both".into()),
-        (Some(_), None) => Some(image::Ready::Port(args.parse_or("ready-port", 0)?)),
+        (Some(_), None) => {
+            let port = args.parse_or::<u16>("ready-port", 0)?;
+            if port == 0 {
+                bail!("--ready-port must be 1..65535");
+            }
+            Some(image::Ready::Port(port))
+        }
         (None, Some(c)) => Some(image::Ready::Cmd(c.into())),
         (None, None) => None,
     };
@@ -1820,7 +1847,7 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
         image: src.into(),
         entrypoint: args.get("entrypoint").map(image::parse_argv).transpose()?,
         cmd: args.get("cmd").map(image::parse_argv).transpose()?,
-        env: args.all("env"),
+        env: env_flags(args)?,
         workdir: args.get("workdir").map(String::from),
         user: args.get("user").map(String::from),
         warm,
@@ -1859,12 +1886,7 @@ fn exec_command(args: &Args) -> Result<Value> {
     if args.rest.first().is_none_or(|s| s.is_empty()) {
         bail!("exec needs CMD");
     }
-    for kv in args.all("env") {
-        if kv.split('=').next().is_none_or(str::is_empty) || kv.contains('\0') {
-            bail!("exec -e needs K or K=V: {kv:?}");
-        }
-    }
-    let env = env_flags(args);
+    let env = env_flags(args)?;
     // As with docker exec; a relative one would be resolved against a directory the user cannot see.
     if args.get("workdir").is_some_and(|w| !w.starts_with('/')) {
         bail!("exec -w needs an absolute path");
@@ -3013,7 +3035,7 @@ mod exec_tests {
     }
 
     #[test]
-    fn run_and_exec_share_bare_environment_keys() {
+    fn run_exec_and_pull_share_bare_environment_keys() {
         // Read an existing variable: no process-wide environment mutation while tests run.
         let key = "PATH";
         let value = std::env::var(key).unwrap();
@@ -3023,8 +3045,49 @@ mod exec_tests {
         let expected = vec!["PATH=first".to_string(), format!("PATH={value}"), "EMPTY=".into(), "PATH=last".into()];
         assert_eq!(run_spec(&run, None).unwrap().env, expected);
         assert_eq!(exec_command(&exec).unwrap()["env"], json!(expected));
+        let options: Vec<_> = options.iter().map(|v| if *v == "-e" { "--env" } else { *v }).collect();
+        let pull = parse(&[&["pull", "img"][..], &options].concat());
+        assert_eq!(image_options(&pull, "img").unwrap().env, expected);
+        let pull = parse(&["pull", "--env", key, "--env", "FLEXVM_TEST_UNSET_VAR", "img"]);
+        assert_eq!(image_options(&pull, "img").unwrap().env, [format!("PATH={value}")]);
         for value in ["", "=bad", "K\0", "K=bad\0value"] {
             assert!(exec_command(&parse(&["exec", "-e", value, "vm", "true"])).is_err());
+            assert!(run_spec(&parse(&["run", "-e", value, "img"]), None).is_err());
+            assert!(image_options(&parse(&["pull", "--env", value, "img"]), "img").is_err());
+        }
+    }
+
+    #[test]
+    fn separator_before_run_image_or_exec_name() {
+        for (words, positional, rest) in [
+            (vec!["exec", "--", "web", "ls", "--all"], vec!["exec", "web"], vec!["ls", "--all"]),
+            (vec!["run", "--rm", "--", "alpine", "echo", "hi"], vec!["run", "alpine"], vec!["echo", "hi"]),
+            (vec!["run", "--", "--image", "--", "hi"], vec!["run", "--image"], vec!["hi"]),
+            (vec!["exec", "--", "web", "--", "--", "-x"], vec!["exec", "web"], vec!["--", "-x"]),
+            (vec!["exec", "web", "--", "--", "-x"], vec!["exec", "web"], vec!["--", "-x"]),
+            (vec!["exec", "web", "--", "-flag"], vec!["exec", "web"], vec!["-flag"]),
+            (vec!["run", "img", "--", "cmd"], vec!["run", "img"], vec!["cmd"]),
+            (vec!["exec", "--", "web"], vec!["exec", "web"], vec![]),
+            (vec!["run", "--"], vec!["run"], vec![]),
+        ] {
+            let args = parse(&words);
+            assert_eq!(args.positional, positional);
+            assert_eq!(args.rest, rest);
+            assert_eq!(args.child_args, words);
+            // A detached run's VM process parses its child_args to the same command.
+            let child = Args::parse(args.child_args.clone()).unwrap();
+            assert_eq!((child.positional, child.rest), (args.positional, args.rest));
+        }
+    }
+
+    #[test]
+    fn pull_ready_port_must_be_nonzero() {
+        for port in ["0", "65536", "-1", "bad"] {
+            assert!(image_options(&parse(&["pull", "--warm", "--ready-port", port, "img"]), "img").is_err(), "{port}");
+        }
+        for port in [1, 65535] {
+            let options = image_options(&parse(&["pull", "--warm", "--ready-port", &port.to_string(), "img"]), "img").unwrap();
+            assert!(matches!(options.ready, Some(image::Ready::Port(p)) if p == port));
         }
     }
 

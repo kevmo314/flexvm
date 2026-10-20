@@ -97,8 +97,8 @@ impl RunSpec {
         if self.entrypoint.as_ref().is_some_and(|e| e.is_empty() || e[0].is_empty()) {
             bail!("--entrypoint needs a program");
         }
-        if let Some(kv) = self.env.iter().find(|kv| kv.split('=').next().is_none_or(str::is_empty)) {
-            bail!("bad environment variable {kv:?}: give KEY=VALUE");
+        for kv in &self.env {
+            validate_env(kv)?;
         }
         if !self.changes_app() {
             return Ok(());
@@ -159,6 +159,14 @@ impl Exited {
         let bytes = std::fs::read(path)?;
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()).into())
     }
+}
+
+/// Environment overrides: a nonempty key, with or without a value; neither may contain NUL.
+pub fn validate_env(kv: &str) -> Result<()> {
+    if kv.split('=').next().is_none_or(str::is_empty) || kv.contains('\0') {
+        bail!("bad environment variable {kv:?}: give K or K=V");
+    }
+    Ok(())
 }
 
 /// `--env-file`: docker's form. `K=V` lines; `#` comment lines and blank ones are skipped; a bare
@@ -278,7 +286,7 @@ mod tests {
         for bad in [vec![], vec![String::new()]] {
             assert!(RunSpec { entrypoint: Some(bad), ..Default::default() }.check(Some(&image(&[], false))).is_err());
         }
-        for bad in ["=1", "", "=", "NOVALUE"] {
+        for bad in ["=1", "", "=", "K\0", "K=bad\0value", "NOVALUE"] {
             let r = RunSpec { env: vec![bad.into()], ..Default::default() }.check(Some(&image(&[], false)));
             assert_eq!(r.is_err(), bad != "NOVALUE", "{bad:?}");
         }

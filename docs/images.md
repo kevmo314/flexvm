@@ -15,7 +15,8 @@ uncompressed `docker save` / OCI archive, or an OCI image layout directory
 Names, pulling again, `images` and `rmi` are in the README
 ([Images](../README.md#images)). Overrides follow `docker run`:
 `--entrypoint` and `--cmd` (words, or a JSON array; a new entrypoint drops
-the image's command), `--env K=V` (repeatable), `--workdir`,
+the image's command), `--env K[=V]` (repeatable; a bare key takes the host's
+value, or is left out if unset; an empty key is refused), `--workdir`,
 `--user name|uid[:group|gid]`. An image left with no entrypoint and no
 command has no app: its VMs idle (`--warm` refuses it).
 
@@ -144,7 +145,8 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   guest and `run` sends `APP` after the address is set (`app_start`, ~17 ms
   for nginx), then the app starts as it would anywhere. With `--warm` the
   template starts the app, waits until it is ready (`--ready-port N`: something
-  accepts on 127.0.0.1:N in the guest, default the lowest exposed TCP port;
+  accepts on 127.0.0.1:N in the guest, 1–65535, default the lowest exposed TCP port;
+  an exposed port 0 is skipped;
   `--ready-cmd CMD`: a shell command exits 0, killed when the deadline passes; `--ready-timeout S`, default 120)
   and snapshots it running.
 
