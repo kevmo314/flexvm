@@ -209,6 +209,36 @@ impl Firecracker {
         }
     }
 
+    /// A builder owns its tap and directory, but needs the same per-VM memory cgroup.
+    pub fn isolate(&mut self) -> Result<()> {
+        if let Some(root) = crate::vmproc::cgroup_root() {
+            let cg = root.join(format!("idle-{}-{}", crate::host::Ident::me().key(), self.pid()));
+            self.attach_cgroup(cg, false);
+            self.join_cgroup()?;
+        }
+        Ok(())
+    }
+
+    fn attach_cgroup(&mut self, cg: PathBuf, made: bool) {
+        let pid = self.pid();
+        *self.cgroup.get_mut() = Some(cg.clone());
+        *self.joining.get_mut() = Some(std::thread::spawn(move || {
+            // Like ordinary starts: throttle at memory.high, without swapping.
+            let joined = if made { Ok(()) } else { std::fs::create_dir(&cg) }.and_then(|()| {
+                if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0") {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        crate::log!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
+                    }
+                }
+                std::fs::write(cg.join("cgroup.procs"), pid.to_string())
+            });
+            if let Err(e) = &joined {
+                crate::log!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
+            }
+            joined
+        }));
+    }
+
     pub fn cgroup(&self) -> Option<PathBuf> {
         let _ = self.join_cgroup();
         self.cgroup.borrow().clone()
@@ -486,6 +516,8 @@ impl Drop for Firecracker {
         self.join_log();
         if !self.tap.is_empty() {
             release(Some(&self.tap), self.cgroup.get_mut().as_deref(), &self.dir);
+        } else if let Some(cg) = self.cgroup.get_mut().take() {
+            let _ = remove_cgroup(&cg);
         }
     }
 }
@@ -614,28 +646,9 @@ impl Spawner {
             std::fs::create_dir(cg).map_err(|e| format!("--cpus not applied: {}: {e}", cg.join("cpu.max").display()))?;
             fc.set_cpu_max(max)?;
         }
-        if let Some(cg) = cgroup.clone() {
-            let pid = fc.pid();
-            let made = cap.is_some();
-            *fc.joining.get_mut() = Some(std::thread::spawn(move || {
-                // Never swapped: at its mark the VM is throttled (sleeps a migration's or
-                // checkpoint's lift waits out), not paged out to swap, whose reads would hold
-                // up its pauses. Without swap accounting the file is missing: nothing to do.
-                let joined = if made { Ok(()) } else { std::fs::create_dir(&cg) }.and_then(|()| {
-                    if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0") {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            crate::log!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
-                        }
-                    }
-                    std::fs::write(cg.join("cgroup.procs"), pid.to_string())
-                });
-                if let Err(e) = &joined {
-                    crate::log!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
-                }
-                joined
-            }));
+        if let Some(cg) = cgroup {
+            fc.attach_cgroup(cg, cap.is_some());
         }
-        *fc.cgroup.get_mut() = cgroup;
         fc.tap = tap;
         Ok(fc)
     }

@@ -834,13 +834,16 @@ fn sparsify(path: &Path) -> Result<u64> {
 }
 
 /// Records the pages a restore touches until its agent answers; restores prefetch them.
-fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<SocketRoot>) -> Result<usize> {
+fn record_working_set(host: &crate::host::Host, paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<SocketRoot>) -> Result<usize> {
     let tpl = Template::open_dir("(building)", dir.to_path_buf())?;
     let run = tpl.dir.join("record");
-    let load = || -> Result<crate::vm::Prepared> {
+    // One admission for the recording, whichever Firecracker it takes: each joins its own cgroup.
+    let mut admission = crate::limit::Building::admit(host, tpl.working_set_mib())?;
+    let mut load = || -> Result<crate::vm::Prepared> {
         let _ = std::fs::remove_dir_all(&run);
         std::fs::create_dir_all(&run)?;
-        let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
+        let mut fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
+        admission.start(&mut fc, tpl.meta.mem_mib + tpl.meta.plugged_mib)?;
         let p = crate::vm::Prepared::new(fc, tpl.clone())?;
         // Like VM restores: stepping the clock touches pages of its own. Loaded paused.
         p.firecracker().load_snapshot(&tpl.vmstate(), &tpl, tap, Some(true), crate::fc::API_TIMEOUT)?;
@@ -869,9 +872,12 @@ fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<Socket
     if guest::exec(&fc.sockets.vsock, "true", EXEC_TIMEOUT).is_err() {
         guest::ping(&fc.sockets.vsock)?;
     }
+    let lifted = admission.lift(fc.pid());
     fc.pause(crate::fc::API_TIMEOUT)?;
     let runs = pad_runs(p.pager.present_runs(), crate::uffd::FAULT_AROUND as u64);
+    drop(lifted);
     drop(p);
+    drop(admission);
     let _ = std::fs::remove_dir_all(&run);
     std::fs::write(tpl.dir.join("wset"), serde_json::to_vec(&runs)?)?;
     Ok(runs.iter().map(|r| r.1 as usize).sum::<usize>() * PAGE_SIZE)
@@ -1274,11 +1280,11 @@ fn shared_users(paths: &Paths, force: bool, checkpoints: bool) -> BTreeSet<Strin
 
 /// Builds `name` from an image's root filesystem and publishes it as a new generation; returns
 /// the generation the name linked to before, for the caller to delete if nothing uses it.
-pub fn create(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: ImageMeta, tap: &str) -> Result<Option<String>> {
+pub fn create(host: &crate::host::Host, paths: &Paths, name: &str, size: Size, rootfs: &Path, image: ImageMeta, tap: &str) -> Result<Option<String>> {
     // The caller owns `tap` through image preparation and the build.
     // Running VMs map the old files, which must not be rewritten under them.
     let staging = Staging::new(paths, name)?;
-    build(paths, &staging.dir, name, size, rootfs, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
+    build(host, paths, &staging.dir, name, size, rootfs, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
     interrupted()?;
     let paths = &Paths { templates: staging.parent.path.clone(), ..paths.clone() };
     publish(paths, name, &staging.dir, interrupted)
@@ -1786,7 +1792,8 @@ fn receive_file(
     Ok((Component { hash, metadata: Stamp::of(&file.metadata()?) }, digest))
 }
 
-fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: &str, image: ImageMeta) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: &str, image: ImageMeta) -> Result<()> {
     let Size { vcpus, mem_mib, max_mib, plug_mib } = size;
     let run = dir.join("boot");
     std::fs::create_dir_all(&run)?;
@@ -1798,7 +1805,10 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
     let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
     let sockets = SocketRoot::new(&std::fs::canonicalize(dir)?)?;
     let start = Instant::now();
-    let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
+    let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
+    let mut admission = crate::limit::Building::admit(host, mem_mib)?;
+    let mut fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
+    admission.start(&mut fc, mem_mib + plug_mib.min(hotplug) / STEP_MIB * STEP_MIB)?;
     let vsock = fc.sockets.vsock.clone();
     let metrics = run.join("metrics.json");
     File::create(&metrics)?;
@@ -1808,7 +1818,6 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
     fc.link_rootfs(&rootfs)?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": ROOTFS, "root_device": true, "read_only": true}))?;
     fc.put("/balloon", json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}))?;
-    let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
     if hotplug > 0 {
         fc.put("/hotplug/memory", json!({"total_size_mib": hotplug, "slot_size_mib": SLOT_MIB}))?;
     }
@@ -1840,6 +1849,7 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
              plugged); VMs will report the rest after restore, at some RSS each"
         );
     }
+    let lifted = admission.lift(fc.pid());
     fc.pause(crate::fc::API_TIMEOUT)?;
     let snapshotting = Instant::now();
     fc.request_within(
@@ -1850,7 +1860,9 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
     )?;
     let snapshotted = snapshotting.elapsed();
     let compatibility = crate::compat::local(fc.pid())?;
+    drop(lifted);
     drop(fc);
+    drop(admission);
     interrupted()?;
     let sparsifying = Instant::now();
     let punched = sparsify(&dir.join("mem"))?;
@@ -1879,7 +1891,7 @@ fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: 
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     let _ = std::fs::remove_file(dir.join("wset"));
     interrupted()?;
-    let wset = record_working_set(paths, dir, tap, &sockets)?;
+    let wset = record_working_set(host, paths, dir, tap, &sockets)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
     crate::output(format_args!(
         "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged, \
@@ -2348,7 +2360,8 @@ pub(crate) mod tests {
         let paths = Paths::new(&dir);
         std::fs::write(dir.join("rootfs"), b"rootfs").unwrap();
         let size = Size { vcpus: 1, mem_mib: 256, max_mib: 256, plug_mib: 256 };
-        let error = build(&paths, &dir.join("build"), "test", size, &dir.join("rootfs"), "unused", image("sha256:a", "")).unwrap_err().to_string();
+        let host = crate::host::Host::open(&dir.join("state"), &dir.join("run")).unwrap();
+        let error = build(&host, &paths, &dir.join("build"), "test", size, &dir.join("rootfs"), "unused", image("sha256:a", "")).unwrap_err().to_string();
         assert!(error.starts_with(&format!("{}:", paths.kernel.display())), "{error}");
         assert!(error.contains("scripts/fetch.sh"), "{error}");
     }

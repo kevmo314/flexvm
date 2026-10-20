@@ -517,6 +517,9 @@ fn check_applies(args: &Args) -> Result<()> {
         if let Some(image) = first {
             bail!("run --checkpoint takes no IMAGE ({image:?}): the checkpoint has its own");
         }
+        if !args.rest.is_empty() {
+            bail!("run --checkpoint takes no CMD: the checkpoint's command cannot be replaced");
+        }
         if let Some(f) = ["env", "env-file", "entrypoint", "keep", "rm", "interactive", "tty"].into_iter().find(|f| args.has(f)) {
             bail!("--{f} does not apply to run --checkpoint: the checkpoint's app runs already");
         }
@@ -1690,7 +1693,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
             output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)))?;
             return Ok(None);
         }
-        template::create(&paths, &name, size, &rootfs, meta, &tap)
+        template::create(&host, &paths, &name, size, &rootfs, meta, &tap)
     })();
     net::delete_tap(&tap);
     // The generation the name linked to before, unless a VM here (or another name) still uses it.
@@ -3151,6 +3154,10 @@ mod exec_tests {
         assert_eq!(err(&["run", "--mem", "512", "web"]).unwrap(), "--mem does not apply to run (see flexvm --help)");
         assert!(err(&["start", "--ip", "10.0.0.1", "web"]).is_some());
         assert!(err(&["run", "--checkpoint", "/d", "ubuntu"]).unwrap().contains("takes no IMAGE"));
+        assert_eq!(
+            err(&["run", "--checkpoint", "saved", "--", "/bin/sh"]).unwrap(),
+            "run --checkpoint takes no CMD: the checkpoint's command cannot be replaced"
+        );
         assert_eq!(err(&["run", "--paused", "ubuntu"]).unwrap(), "--paused applies to run --checkpoint");
         assert_eq!(err(&["kill", "web", "--", "x"]), None);
         assert_eq!(err(&["run", "--warm", "t"]).unwrap(), "--warm does not apply to run (see flexvm --help)");
