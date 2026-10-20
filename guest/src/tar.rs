@@ -413,6 +413,8 @@ impl Reader<'_> {
                 }
             }
             match b[156] {
+                // Its sparse map can extend past the header in blocks not counted in size.
+                b'S' => return Err(invalid("old-GNU sparse entries are not supported")),
                 b'x' => {
                     let rec = self.record(size)?;
                     let mut rest = &rec[..];
@@ -449,7 +451,7 @@ impl Reader<'_> {
                 mtime: num(&b[136..148])? as i64,
                 dev: (num(&b[329..337])? as u32, num(&b[337..345])? as u32),
             };
-            if &b[257..262] == b"ustar" && b[345] != 0 {
+            if &b[257..263] == b"ustar\0" && b[345] != 0 {
                 h.path = [field(&b[345..500]), b"/".to_vec(), h.path].concat();
             }
             h.path = path.unwrap_or(h.path);
@@ -1467,10 +1469,63 @@ mod tests {
         let mut v = Vec::new();
         write_header(&mut v, &Header { path: name.into(), kind, mode: 0o644, ..Default::default() }).unwrap();
         v[124..136].copy_from_slice(size);
-        v[148..156].fill(b' ');
-        let sum: u32 = v.iter().map(|&x| u32::from(x)).sum();
-        v[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        checksum(&mut v);
         v
+    }
+
+    fn checksum(b: &mut [u8]) {
+        b[148..156].fill(b' ');
+        let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+        b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    }
+
+    #[test]
+    fn gnu_timestamps_are_not_a_name_prefix() {
+        let mut b = raw_header("plain", b'0', b"00000000000\0");
+        b[257..265].copy_from_slice(b"ustar  \0");
+        octal(&mut b[345..357], 1_700_000_000);
+        octal(&mut b[357..369], 1_700_000_001);
+        checksum(&mut b);
+        let mut r = &b[..];
+        let h = Reader { r: &mut r, left: 0 }.next().unwrap().unwrap();
+        assert_eq!(h.path, b"plain");
+    }
+
+    #[test]
+    fn posix_ustar_prefix_is_joined() {
+        let mut b = raw_header("plain", b'0', b"00000000000\0");
+        b[257..263].copy_from_slice(b"ustar\0");
+        b[345..351].copy_from_slice(b"parent");
+        checksum(&mut b);
+        let mut r = &b[..];
+        let h = Reader { r: &mut r, left: 0 }.next().unwrap().unwrap();
+        assert_eq!(h.path, b"parent/plain");
+    }
+
+    #[test]
+    fn old_gnu_sparse_with_extensions_is_refused_clearly() {
+        let t = Tmp::new("sparse");
+        let mut b = raw_header("sparse", b'S', b"00000000005\0");
+        b[257..265].copy_from_slice(b"ustar  \0");
+        // Four sparse extents in the header, and a fifth in an extension block.
+        for i in 0..4 {
+            octal(&mut b[386 + i * 24..398 + i * 24], (i * 2) as u64);
+            octal(&mut b[398 + i * 24..410 + i * 24], 1);
+        }
+        b[482] = 1;
+        octal(&mut b[483..495], 9);
+        checksum(&mut b);
+        let mut ext = [0; BLOCK];
+        octal(&mut ext[..12], 8);
+        octal(&mut ext[12..24], 1);
+        b.extend_from_slice(&ext);
+        b.extend_from_slice(b"abcde");
+        b.resize(BLOCK * 3, 0);
+        b.extend(archive(&[("after", b'0', "kept")]));
+        let e = unpack_to(&b, Dest::Into(t.0.to_str().unwrap())).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("old-GNU sparse entries are not supported"), "{e}");
+        assert!(!e.to_string().contains("checksum"), "{e}");
     }
 
     #[test]
