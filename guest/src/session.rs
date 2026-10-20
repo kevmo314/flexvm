@@ -372,6 +372,9 @@ struct Attachment {
 
 #[derive(Default)]
 pub(crate) struct Output {
+    /// Lets tests synchronize with the pump's backpressure wait.
+    #[cfg(test)]
+    waiting: bool,
     chunks: VecDeque<Chunk>,
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -772,7 +775,16 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
     ring.reservation.grow(need);
     let start = Instant::now();
     while ring.must_wait() && !ring.closed {
+        #[cfg(test)]
+        {
+            ring.waiting = true;
+            output.1.notify_all();
+        }
         ring = output.1.wait_timeout(ring, Duration::from_secs(1)).unwrap().0;
+    }
+    #[cfg(test)]
+    {
+        ring.waiting = false;
     }
     let waited = start.elapsed();
     if !ring.closed && !ring.detached {
@@ -1274,19 +1286,28 @@ mod tests {
     #[test]
     fn exit_is_kept_by_token_when_the_pid_is_reused_while_the_pump_waits() {
         let (sessions, statuses) = (Sessions::default(), statuses());
+        let dir = crate::test_util::TempDir::new("pid-reuse-exit");
+        let go = dir.join("go");
         // Half the ring, then more: with its client away but within GRACE, the pump waits for it
         // before taking the rest, and the shell exits meanwhile (the rest fits the pipe).
-        let (output, group) = start(&sessions, &statuses, "slow", b"head -c 65536 /dev/zero; sleep 0.5; echo more; exit 3");
-        let status = reap(&statuses, group);
-        assert_eq!(libc::WEXITSTATUS(status), 3);
+        let command =
+            format!("head -c 65536 /dev/zero; while [ -d '{}' ] && [ ! -e '{}' ]; do sleep 0.01; done; echo more; exit 3", dir.display(), go.display());
+        let (output, group) = start(&sessions, &statuses, "slow", command.as_bytes());
         // The first half comes in; the pump waits for the client there, well within GRACE.
         let ring = output.0.lock().unwrap();
         let (ring, timeout) = output.1.wait_timeout_while(ring, Duration::from_secs(20), |r| r.end < 65536 && r.exit.is_none()).unwrap();
         assert!(!timeout.timed_out(), "the first half never came: {} bytes", ring.end);
+        assert_eq!(ring.end, 65536);
         drop(ring);
-        // Then it takes no more (one that did not wait would take the rest at once).
-        thread::sleep(Duration::from_millis(100));
+        // Only now may the shell write more, so the pump cannot merge it into the first half.
+        std::fs::write(&go, b"").unwrap();
+        let status = reap(&statuses, group);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 3);
+        // Wait for the pump to block on that output before simulating pid reuse.
         let ring = output.0.lock().unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, Duration::from_secs(20), |r| !r.waiting && r.exit.is_none()).unwrap();
+        assert!(!timeout.timed_out(), "the pump never waited");
         assert!(ring.exit.is_none() && ring.end == 65536, "the pump did not wait: {} bytes", ring.end);
         drop(ring);
         let newer = u64::MAX;

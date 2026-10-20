@@ -493,8 +493,17 @@ fn lock_holder(path: &Path) -> Result<Option<Ident>> {
 }
 
 pub fn store<T: Serialize>(path: &Path, v: &T, durable: bool) -> Result<()> {
+    store_mode(path, v, durable, 0o644)
+}
+
+/// VM run records contain environment values needed by restart and inspect.
+pub fn store_private<T: Serialize>(path: &Path, v: &T, durable: bool) -> Result<()> {
+    store_mode(path, v, durable, 0o600)
+}
+
+fn store_mode<T: Serialize>(path: &Path, v: &T, durable: bool, mode: u32) -> Result<()> {
     let (dir, name) = (path.parent().ok_or("no directory")?, path.file_name().ok_or("no name")?);
-    crate::util::write_file(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable).map_err(|e| format!("{}: {e}", path.display()).into())
+    crate::util::write_file_mode(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable, mode).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
 #[derive(Clone)]
@@ -859,10 +868,10 @@ impl Host {
         if !resuming && self.has_record(name, "exited") {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
-        // A new VM of a failed or lost one's name starts a fresh log; a resume (`start`) keeps its VM's.
+        // A new VM of a failed, lost or moved one's name starts a fresh log; a resume (`start`) keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
-        if !resuming && ["failed", "lost"].iter().any(|ext| self.has_record(name, ext)) {
-            let _ = self.remove_logs(name);
+        if !resuming && ["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) {
+            let _ = self.retire_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
         // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log.
@@ -916,8 +925,58 @@ impl Host {
         Ok(())
     }
 
-    /// Both of `name`'s logs, those missing too; under its name and the logs lock (shared).
-    fn remove_logs(&self, name: &str) -> Result<()> {
+    /// `RUN/vms/NAME.logs`, made if missing, opened: a lifetime of `name`'s logs (`log`, and
+    /// `log.1` before its last rotation). Its writers (its VM's process: `output::append_in`)
+    /// and followers (`logs -f`) hold the directory, never its path, so one retired is never
+    /// written or read for the name again, and while held its inode is never a later one's.
+    /// `NAME.log` and `NAME.log.1` link into it, for people (and the paths documented); logs
+    /// there from before these directories are moved into it. Under the name.
+    pub fn open_logs(&self, name: &str) -> Result<File> {
+        let dir = self.vms(name, "logs")?;
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+            _ => {}
+        }
+        for ext in ["log", "log.1"] {
+            let (link, target) = (self.vms(name, ext)?, PathBuf::from(format!("{name}.logs/{ext}")));
+            let ours = || std::fs::read_link(&link).is_ok_and(|t| t == target);
+            match std::fs::symlink_metadata(&link) {
+                Ok(m) if m.is_file() => {
+                    if !crate::util::rename_noreplace(&link, &dir.join(ext))? {
+                        bail!("{}: a log from before {name}.logs/, which has its own; remove one", link.display());
+                    }
+                }
+                Ok(_) if ours() => continue,
+                Ok(_) => bail!("{}: not a link to {}", link.display(), target.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            match std::os::unix::fs::symlink(&target, &link) {
+                Err(e) if !(e.kind() == std::io::ErrorKind::AlreadyExists && ours()) => return Err(format!("{}: {e}", link.display()).into()),
+                _ => {}
+            }
+        }
+        Ok(crate::util::output::open_dir(&dir)?)
+    }
+
+    /// Tests: writes `name`'s `log` or `log.1` (in its logs' directory, made if missing).
+    #[cfg(test)]
+    pub fn write_log(&self, name: &str, file: &str, data: impl AsRef<[u8]>) {
+        drop(self.open_logs(name).unwrap());
+        std::fs::write(self.vms(name, "logs").unwrap().join(file), data).unwrap();
+    }
+
+    /// Ends `name`'s logs' lifetime without waiting on anyone: their directory renamed away in
+    /// one step (so a later one of the name is a new directory), then removed, with its links.
+    /// One a writer still adds to meanwhile is left to garbage collection (`.NAME.logs.*.gone`).
+    pub fn retire_logs(&self, name: &str) -> Result<()> {
+        let gone = self.run.join("vms").join(format!(".{name}.logs.{}.gone", crate::util::random_hex(8)?));
+        match std::fs::rename(self.vms(name, "logs")?, &gone) {
+            Ok(()) => drop(std::fs::remove_dir_all(&gone)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // The links, and logs at their paths from before these directories.
         for ext in ["log", "log.1"] {
             match std::fs::remove_file(self.vms(name, ext)?) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
@@ -1365,10 +1424,15 @@ impl Host {
     /// whether an address in use is tracked, so a range that drops it and later
     /// takes it back never hands it out while the VM runs elsewhere (#521).
     pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64, mig: u64, to: &str) -> Result<bool> {
+        self.lend_at(l, ip, gen, mig, to, &[])
+    }
+
+    /// `lend`, to a target reached at `at` (`Leaving::at`).
+    pub fn lend_at(&self, l: &Locked, ip: Ipv4Addr, gen: u64, mig: u64, to: &str, at: &[IpAddr]) -> Result<bool> {
         let me = Ident::me();
         self.update(l, ip, true, |a| {
             if a.holder_id.as_ref() == Some(&me) {
-                a.leaving = Some(Leaving { mig, to: to.into() });
+                a.leaving = Some(Leaving { mig, to: to.into(), at: at.iter().map(|a| a.to_canonical()).collect() });
             }
             a.lent.replace(gen) != Some(gen)
         })
@@ -1424,6 +1488,118 @@ impl Host {
             return Ok(false);
         }
         self.observe_and(l, ip, gen, rev, via, |_| ())
+    }
+
+    /// Whether a peer at `sender` may make this route update of `ip` (`via` None: a withdrawal),
+    /// before `observe` records it (#914). Only the host that can make an update is taken:
+    /// - a newer generation: none while a VM here holds the current one (its address's home hands
+    ///   out no other until it is withdrawn); for an address of this host's own range (which only
+    ///   this host hands out), none while it is lent from here, and never one this host has not
+    ///   handed out yet;
+    /// - a move (a newer revision) or a withdrawal of the generation a VM here holds (an arrival
+    ///   aside): only from the target it is migrating to (`Leaving::at`, or its `to` by `named`).
+    ///
+    /// Refused updates are errors, which their senders retry: one that comes too early (before
+    /// the withdrawal that frees the address here) is taken once that has.
+    pub fn peer_update(
+        &self,
+        l: &Locked,
+        ip: Ipv4Addr,
+        (gen, rev): GenRev,
+        via: Option<Ipv4Addr>,
+        sender: &[IpAddr],
+        named: impl FnOnce(&str) -> Vec<IpAddr>,
+    ) -> Result<()> {
+        let a = self.addr(l, ip)?;
+        // Past the peer bound: stale (`observe`).
+        if gen > RECV_MAX {
+            return Ok(());
+        }
+        if gen > a.seen {
+            return self.newer_gen(&a, ip, gen);
+        }
+        let from = |allowed: &[IpAddr]| allowed.iter().any(|t| sender.iter().any(|s| s.to_canonical() == t.to_canonical()));
+        let newest = a.rev.max(self.live_of(ip, &a).unwrap_or(0));
+        // One location per revision: its next hop changes only by the host it names (by any of its addresses),
+        // never by another peer announcing the same revision via itself (`observe` takes an equal one).
+        if let (Some(v), Some(old)) = (via, a.via) {
+            if gen == a.seen && !a.withdrawn && rev == newest && v != old && !from(&[IpAddr::V4(old)]) {
+                bail!("{ip} generation {gen} revision {rev} is routed via {old}: only that host changes its next hop");
+            }
+        }
+        let here = self.held(&a) && a.held == a.seen && !a.withdrawn;
+        // A move: a withdrawal, a newer revision, or the newest one somewhere other than recorded.
+        let moves = via.is_none() || rev > newest || (rev == newest && via != a.via);
+        if gen < a.seen || !here || !moves {
+            return Ok(());
+        }
+        let what = if via.is_some() { format!("revision {rev} elsewhere") } else { "its withdrawal".into() };
+        let holder = a.holder.as_deref().unwrap_or("?");
+        if let Some(mig) = a.arriving {
+            // Until its record is released, the VM is its source's (the connection it came over): its resume
+            // after an abort, or its withdrawal, is taken from it alone. No record: aborted, the claim going.
+            let source = match load::<Mig>(&self.mig_path(mig))? {
+                None => return Ok(()),
+                Some(Mig::Pending { peer, .. } | Mig::Committed { peer, .. } | Mig::Released { peer, .. }) => peer,
+            };
+            if !source.is_some_and(|p| from(&[p])) {
+                bail!("{ip} generation {gen} is held by vm {holder} here, arrived by migration {mig}: {what} is taken only from its source");
+            }
+            return Ok(());
+        }
+        // The target as the source reached it; a source process from before that was recorded: by its name.
+        let target = a.leaving.as_ref().map(|t| if t.at.is_empty() { named(&t.to) } else { t.at.clone() }).unwrap_or_default();
+        if !from(&target) {
+            bail!(
+                "{ip} generation {gen} is held by vm {holder} here{}: {what} is taken only from the host it migrates to",
+                a.leaving.as_ref().map_or(String::new(), |t| format!(" (migrating to {})", t.to))
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a peer may bring `ip` generation `gen`, newer than `a` (its record) has: as an
+    /// update (`peer_update`) or with an arriving VM.
+    pub fn newer_gen(&self, a: &Addr, ip: Ipv4Addr, gen: u64) -> Result<()> {
+        if gen <= a.seen {
+            return Ok(());
+        }
+        if self.held(a) && a.held == a.seen && !a.withdrawn {
+            bail!(
+                "{ip} generation {} is held by vm {} here: no newer one (not {gen}) is handed out until it is withdrawn",
+                a.seen,
+                a.holder.as_deref().unwrap_or("?")
+            );
+        }
+        if !self.config_now().range().is_ok_and(|r| r.allocatable(ip)) {
+            return Ok(());
+        }
+        if a.lent == Some(a.seen) && !a.withdrawn {
+            bail!("{ip} is this host's to hand out and is lent from here with generation {}: no newer one (not {gen}) exists until it is withdrawn", a.seen);
+        }
+        match self.unissued()? {
+            Some(unissued) if gen >= unissued => {
+                bail!("{ip} is this host's to hand out, and generation {gen} was never handed out here (none at or past {unissued} yet)")
+            }
+            Some(_) => Ok(()),
+            // No cursor of this boot: its record is the proof. Each generation handed out for it is written there
+            // (durably, but a start's, whose loss in a crash took its VM too), and only lent ones leave with a VM.
+            None => bail!(
+                "{ip} is this host's to hand out, and generation {gen} is newer than its record here ({}): not handed out here since this host started",
+                a.seen
+            ),
+        }
+    }
+
+    /// The lowest generation `next_gen` has not handed out in this boot, by its cursor (`RUN/.gens.next`), if
+    /// that is this boot's and goes with the high-water mark: every one handed out is below it. The mark itself
+    /// proves nothing (`next_gen` reserves `GEN_BLOCK` past what it hands out), so without the cursor, None.
+    /// A generation below it handed out for another address is taken for this one too: it brings no
+    /// address past what this host hands out next, which outranks it.
+    fn unissued(&self) -> Result<Option<u64>> {
+        let Some(g) = load::<Gens>(&self.gens_path())? else { return Ok(None) };
+        let cursor = std::fs::read(self.run.join(".gens.next")).ok().and_then(|b| serde_json::from_slice::<Gens>(&b).ok());
+        Ok(cursor.filter(|c| c.boot == boot_id() && c.reserved == g.reserved).map(|c| c.next.max(g.next)))
     }
 
     /// `observe`, with `also` applied to the record in the same write.
@@ -1974,12 +2150,18 @@ impl Host {
     /// when it never says it is done with a released record.
     /// `ip`: the VM's address, whose peer route comes back if the arrival dies before it commits.
     pub fn mig_begin(&self, id: u64, source: &str, by: Option<Ident>, ip: Option<Ipv4Addr>) -> Result<MigRecord> {
+        self.mig_begin_from(id, source, by, ip, None)
+    }
+
+    /// `mig_begin`, from a source at `peer` (the arrival's connection): recorded from the start.
+    pub fn mig_begin_from(&self, id: u64, source: &str, by: Option<Ident>, ip: Option<Ipv4Addr>, peer: Option<IpAddr>) -> Result<MigRecord> {
         let _l = self.lock()?;
         if load::<Mig>(&self.mig_path(id))?.is_some() {
             bail!("migration {id} was already seen here");
         }
-        store(&self.mig_path(id), &Mig::Pending { owner: Ident::me(), ip }, true)?;
-        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), peer: None, by, ip })
+        let peer = peer.map(|p| p.to_canonical());
+        store(&self.mig_path(id), &Mig::Pending { owner: Ident::me(), ip, peer }, true)?;
+        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), peer, by, ip })
     }
 
     /// A record whose process died becomes aborted once its Firecrackers are
@@ -1991,9 +2173,9 @@ impl Host {
             None => return Ok("aborted"),
             Some(Mig::Released { .. }) => return Ok("released"),
             Some(Mig::Pending { owner, .. }) if owner.alive() => return Ok("pending"),
-            Some(Mig::Committed { owner }) if owner.alive() => return Ok("committed"),
-            Some(Mig::Pending { owner, ip }) => (owner, ip),
-            Some(Mig::Committed { owner }) => (owner, None),
+            Some(Mig::Committed { owner, .. }) if owner.alive() => return Ok("committed"),
+            Some(Mig::Pending { owner, ip, .. }) => (owner, ip),
+            Some(Mig::Committed { owner, .. }) => (owner, None),
         };
         reap(&self.run, &owner)?;
         // Killed before it committed, it never ran here: the newest route a peer
@@ -2573,9 +2755,18 @@ pub enum Mig {
         owner: Ident,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ip: Option<Ipv4Addr>,
+        /// The address the source migrates from (`Mig::Committed::peer`). None from an older binary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<IpAddr>,
     },
     /// The source must never run it again.
-    Committed { owner: Ident },
+    Committed {
+        owner: Ident,
+        /// The address the source migrated from: until the record is released, only it moves or
+        /// withdraws the arrival's generation here (`Host::peer_update`). None from an older binary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<IpAddr>,
+    },
     /// All memory is here, or the VM is gone: the source may exit.
     Released {
         #[serde(default)]
@@ -2601,6 +2792,11 @@ pub enum Mig {
 pub struct Leaving {
     pub mig: u64,
     pub to: String,
+    /// The target's addresses as the source reached it (its connection's and its underlay): a peer
+    /// update of the generation held here is taken from these alone (`Host::peer_update`). None
+    /// recorded (an older source process's): `to` by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub at: Vec<IpAddr>,
 }
 
 /// A loan: its generation, and the migrations (id, target) whose outcome is owed for it.
@@ -2641,7 +2837,7 @@ impl MigRecord {
             // Committed's contents durable before rename; the migs directory fsync
             // makes that replacement durable. Overlapping them could recover Pending
             // (or an empty record) after the target has run and the source has left.
-            Some(Mig::Pending { owner, .. }) if owner == Ident::me() => store(&path, &Mig::Committed { owner }, true)?,
+            Some(Mig::Pending { owner, .. }) if owner == Ident::me() => store(&path, &Mig::Committed { owner, peer: self.peer }, true)?,
             m => bail!("migration {} was fenced off meanwhile ({m:?})", self.id),
         }
         self.committed = true;
@@ -2793,11 +2989,11 @@ impl NameLock {
     /// opens its log before the child takes the name, so clearing at the child's start is too late.
     pub fn remove_logs(&self) -> Result<()> {
         let _logs = self.host.logs_lock(libc::LOCK_SH)?;
-        self.host.remove_logs(&self.name)
+        self.host.retire_logs(&self.name)
     }
 
     pub fn publish(&self, e: &Entry) -> Result<()> {
-        store(&self.host.vms(&self.name, "json")?, e, false)
+        store_private(&self.host.vms(&self.name, "json")?, e, false)
     }
 }
 
@@ -3345,7 +3541,7 @@ impl Host {
         let pulling: Vec<Ident> = migs
             .iter()
             .filter_map(|(_, m)| match m {
-                Mig::Pending { owner, .. } | Mig::Committed { owner } => Some(owner.clone()),
+                Mig::Pending { owner, .. } | Mig::Committed { owner, .. } => Some(owner.clone()),
                 Mig::Released { .. } => None,
             })
             .collect();
@@ -4393,6 +4589,18 @@ pub fn tripped(name: &str) -> bool {
     armed
 }
 
+/// Test fault `name`, armed: true only for the first of this process's threads to get here since a test removed its
+/// reached-marker (RUN/gates/NAME.PID, made here), so a test loses exactly one reply and knows when it was.
+pub fn tripped_once(name: &str) -> bool {
+    if !fault(name) {
+        return false;
+    }
+    let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) else { return false };
+    let _ = host_dir(&dir, 0o700);
+    let marker = dir.join(format!("{name}.{}", std::process::id()));
+    File::options().write(true).create_new(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(marker).is_ok()
+}
+
 /// Test hook: parks here, if `name` is armed when reached, until the test removes this process's
 /// reached-marker (RUN/gates/NAME.PID; `rm -rf RUN/gates` releases every one), or for at most 10 minutes.
 /// Neither the arming's expiry nor the host lock releases it: it parks under the lock too.
@@ -4910,6 +5118,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn vm_run_records_are_private_and_keep_environment_values() {
+        let base = crate::test_util::TempDir::new("private-run-records");
+        let spec = crate::app::RunSpec { env: vec!["TOKEN=secret=with=equals".into()], ..Default::default() };
+        let entry = Entry { name: "private".into(), ident: Ident::me(), spec: spec.clone(), ..Default::default() };
+        let exited = crate::app::Exited::new(0, "image".into(), None, Default::default(), spec.clone(), 1);
+        for ext in ["json", "exited"] {
+            let path = base.join(format!("private.{ext}"));
+            // Upgrade a public record and a leftover public temporary file, too.
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let tmp = path.parent().unwrap().join(format!(".private.{ext}.{}.tmp", crate::util::write_tag()));
+            std::fs::write(&tmp, b"old temporary data").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+            if ext == "json" {
+                store_private(&path, &entry, false).unwrap();
+                assert_eq!(load::<Entry>(&path).unwrap().unwrap().spec, spec);
+            } else {
+                store_private(&path, &exited, true).unwrap();
+                assert_eq!(crate::app::Exited::read(&path).unwrap().spec, spec);
+            }
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+            assert!(!tmp.exists());
+        }
+    }
+
+    #[test]
     fn name_paths_refuse_bad_names() {
         let (_base, h) = host("name-paths");
         for name in ["../x", "../../var/run/docker", "a/b", "/etc/passwd", "", ".", "..", ".lock", "x\0y"] {
@@ -5331,21 +5565,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reusing_a_failed_or_lost_name_removes_both_logs() {
+    fn reusing_a_failed_lost_or_moved_name_removes_both_logs() {
         let (_dir, h) = host("reuse-logs");
-        for record in ["failed", "lost"] {
-            for ext in [record, "log", "log.1"] {
-                std::fs::write(h.vms("web", ext).unwrap(), "old vm").unwrap();
+        for record in ["failed", "lost", "moved"] {
+            std::fs::write(h.vms("web", record).unwrap(), "old vm").unwrap();
+            h.write_log("web", "log", "old vm");
+            h.write_log("web", "log.1", "old vm");
+            if record != "moved" {
+                assert!(h.take_unrecorded_name("web").is_err());
             }
-            assert!(h.take_unrecorded_name("web").is_err());
             assert!(h.has_record("web", "log") && h.has_record("web", "log.1"));
+            let held = crate::util::output::open_dir(&h.vms("web", "logs").unwrap()).unwrap();
             let _name = h.take_name("web", false).unwrap();
-            for ext in [record, "log", "log.1"] {
-                assert!(!h.has_record("web", ext), "{ext}");
+            for ext in [record, "log", "log.1", "logs"] {
+                assert!(!h.has_record("web", ext), "{record}: {ext}");
             }
+            assert_eq!(held.metadata().unwrap().nlink(), 0, "{record}: retired whole");
         }
         // `start` of a failed VM with no checkpoint: refused after, so its record stays for the next `run`.
-        std::fs::write(h.vms("web", "log").unwrap(), "died").unwrap();
+        h.write_log("web", "log", "died");
         std::fs::write(h.vms("web", "failed").unwrap(), "died").unwrap();
         drop(h.take_name("web", true).unwrap());
         assert!(h.has_record("web", "failed") && h.has_record("web", "log"));
@@ -5355,7 +5593,7 @@ pub(crate) mod tests {
         let dir = h.suspended("web").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("manifest.json"), "{}").unwrap();
-        std::fs::write(h.vms("web", "log").unwrap(), "resume").unwrap();
+        h.write_log("web", "log", "resume");
         std::fs::write(h.vms("web", "failed").unwrap(), "died resuming").unwrap();
         let _name = h.take_name("web", true).unwrap();
         assert!(!h.has_record("web", "failed"));
@@ -5638,7 +5876,7 @@ pub(crate) mod tests {
         assert!(!h.owes(&gone));
         drop(l);
         h.withdraw_dead(false).unwrap();
-        store(&h.mig_path(3), &Mig::Pending { owner: gone, ip: Some(x) }, false).unwrap();
+        store(&h.mig_path(3), &Mig::Pending { owner: gone, ip: Some(x), peer: None }, false).unwrap();
         assert_eq!(h.mig_status(3).unwrap(), "aborted");
         let l = h.lock().unwrap();
         let c = h.claim_new(&l, "b", Some(x)).unwrap();
@@ -5758,15 +5996,15 @@ pub(crate) mod tests {
         claim(ips[10], "owing", Some(owing.clone()), 4, &|_| ());
         h.owe(3, &Owed { to: "t".into(), ip: ips[10], gen: 4, by: owing.clone() }).unwrap();
         // A source that may have handed its VM on.
-        let leaving = |mig| Some(Leaving { mig, to: "c".into() });
+        let leaving = |mig| Some(Leaving { mig, to: "c".into(), at: Vec::new() });
         claim(ips[11], "leaving", Some(dead(999_999_940)), 4, &|a| a.leaving = leaving(40));
         // Its migration record says it was still arriving, whatever the address says.
         let mig = |id: u64, m: Mig| store(&h.mig_path(id), &m, false).unwrap();
         let (pending, committed) = (dead(999_999_941), dead(999_999_942));
         claim(ips[12], "pending", Some(pending.clone()), 4, &|_| ());
-        mig(20, Mig::Pending { owner: pending, ip: None });
+        mig(20, Mig::Pending { owner: pending, ip: None, peer: None });
         claim(ips[13], "committed", Some(committed.clone()), 4, &|_| ());
-        mig(21, Mig::Committed { owner: committed });
+        mig(21, Mig::Committed { owner: committed, peer: None });
         // Released, then killed before its address was settled: its own VM, a loan of it too (it came home).
         claim(ips[14], "released", Some(dead(999_999_943)), 4, &|a| a.arriving = Some(22));
         mig(22, Mig::Released { source: String::new(), peer: None, by: None, ip: Some(ips[14]), done_until_ms: None });
@@ -5813,6 +6051,147 @@ pub(crate) mod tests {
         let withdrawn = h.withdraw_dead(false).unwrap();
         assert!(h.addr(&h.lock().unwrap(), ips[6]).unwrap().withdrawn);
         assert_eq!(withdrawn, vec![("quarantined".to_string(), ips[6], 4)]);
+    }
+
+    /// #914: a peer's route update, or an arrival's generation, is taken only from the host that can make it.
+    #[test]
+    fn peer_updates_come_only_from_the_host_that_can_make_them() {
+        let (_d, h) = host("peer-update");
+        let l = h.lock().unwrap();
+        let (t, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        let (t4, c4) = (Some(ip("192.0.2.7")), Some(ip("192.0.2.8")));
+        let none = |_: &str| Vec::new();
+        let _names = ["vm", "vm2", "vm3", "arrival"].map(|n| h.take_name(n, false).unwrap());
+        // Held here: no peer brings a newer generation, announced or withdrawn.
+        let claim = h.claim_new(&l, "vm", Some(ip("10.9.0.1"))).unwrap();
+        let (x, g) = (claim.ip, claim.gen);
+        for via in [c4, None] {
+            let e = h.peer_update(&l, x, (g + 1, 0), via, &[c], none).unwrap_err().to_string();
+            assert!(e.contains("held by vm vm here"), "{e}");
+        }
+        // Nor moves or withdraws its generation while it is not migrating: C cannot make its copy
+        // look superseded (a resume refused, an aborted source destroyed).
+        assert!(h.peer_update(&l, x, (g, 1), c4, &[c], none).is_err());
+        assert!(h.peer_update(&l, x, (g, 0), None, &[c], none).is_err());
+        // Nor puts its revision elsewhere (`observe` takes an equal one, replacing the next hop).
+        assert!(h.peer_update(&l, x, (g, 0), c4, &[c], none).is_err());
+        // Migrating to T, reached at t: T's move and withdrawal are taken, C's are not.
+        assert!(h.lend_at(&l, x, g, 1, "t:7070", &[t]).unwrap());
+        h.peer_update(&l, x, (g, 1), t4, &[t], none).unwrap();
+        h.peer_update(&l, x, (g, 0), None, &[t], none).unwrap();
+        assert!(h.peer_update(&l, x, (g, 1), c4, &[c], none).unwrap_err().to_string().contains("migrating to t:7070"));
+        assert!(h.peer_update(&l, x, (g, 0), None, &[c], none).is_err());
+        // A source process from before targets were recorded: T by the name it was given.
+        h.lend(&l, x, g, 2, "t").unwrap();
+        assert!(h.peer_update(&l, x, (g, 1), t4, &[t], none).is_err());
+        h.peer_update(&l, x, (g, 1), t4, &[t], |to: &str| if to == "t" { vec![t] } else { vec![] }).unwrap();
+        // Let go, it stays lent from its home here: same-generation moves are any peer's, newer generations nobody's.
+        claim.release(&l).unwrap();
+        h.peer_update(&l, x, (g, 5), c4, &[c], none).unwrap();
+        assert!(h.peer_update(&l, x, (g + 1, 0), c4, &[c], none).unwrap_err().to_string().contains("lent from here"));
+        assert!(h.newer_gen(&h.addr(&l, x).unwrap(), x, g + 1).is_err(), "nor arrives with one");
+        h.newer_gen(&h.addr(&l, x).unwrap(), x, g).unwrap();
+        // Withdrawn (the VM ended where it went): one this host never handed out is refused, as
+        // C's jump to the peer bound (which would leave the home none to hand out) is.
+        assert!(h.observe(&l, x, g, 0, None).unwrap());
+        for gen in [g + 1, RECV_MAX] {
+            assert!(h.peer_update(&l, x, (gen, 0), c4, &[c], none).unwrap_err().to_string().contains("never handed out here"), "{gen}");
+            assert!(h.newer_gen(&h.addr(&l, x).unwrap(), x, gen).is_err());
+        }
+        // One it did hand out (for another of its addresses meanwhile, say) is taken.
+        let other = h.claim_new(&l, "vm3", Some(ip("10.9.0.2"))).unwrap();
+        h.peer_update(&l, x, (other.gen, 0), c4, &[c], none).unwrap();
+        // Another host's address: no bound here, unless a VM here holds it (it migrated in).
+        let away = ip("10.9.2.1");
+        h.peer_update(&l, away, (1 << 40, 0), c4, &[c], none).unwrap();
+        let _held = h.claim_incoming(&l, "vm2", away, 7, None).unwrap();
+        assert!(h.peer_update(&l, away, (8, 0), c4, &[c], none).is_err());
+        h.newer_gen(&h.addr(&l, ip("10.9.2.2")).unwrap(), ip("10.9.2.2"), 1 << 40).unwrap();
+        // An arrival's claim is its source's until it commits: its resume after an abort is taken.
+        let arriving = ip("10.9.2.3");
+        let _a = h.claim_arrival(&l, "arrival", arriving, 8, 2, 5).unwrap();
+        h.peer_update(&l, arriving, (8, 3), c4, &[c], none).unwrap();
+        h.peer_update(&l, arriving, (8, 0), None, &[c], none).unwrap();
+        assert!(h.peer_update(&l, arriving, (9, 0), c4, &[c], none).is_err());
+    }
+
+    /// #914 review: a committed arrival is its source's alone until released; a recorded target's
+    /// addresses are not widened by what its name resolves to now; without this boot's cursor, the
+    /// high-water mark proves no generation was handed out.
+    #[test]
+    fn committed_arrivals_targets_and_unissued_generations_are_not_any_peers() {
+        let (_d, h) = host("peer-update-review");
+        let l = h.lock().unwrap();
+        let (src, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        let c4 = Some(ip("192.0.2.8"));
+        let none = |_: &str| Vec::new();
+        let _names = ["arrival", "old", "vm"].map(|n| h.take_name(n, false).unwrap());
+        // Arriving by migration 5 (another host's address), pending or committed (its background pull
+        // under way): C can neither withdraw nor move it, so no newer generation of C's gets past its
+        // claim either. Its source can: its resume after an abort, its withdrawal.
+        let x = ip("10.9.2.4");
+        let _a = h.claim_arrival(&l, "arrival", x, 8, 2, 5).unwrap();
+        store(&h.mig_path(5), &Mig::Pending { owner: Ident::me(), ip: Some(x), peer: Some(src) }, true).unwrap();
+        for (rev, via) in [(0, None), (u64::MAX, c4)] {
+            let e = h.peer_update(&l, x, (8, rev), via, &[c], none).unwrap_err().to_string();
+            assert!(e.contains("only from its source"), "{e}");
+        }
+        h.peer_update(&l, x, (8, 3), Some(ip("192.0.2.7")), &[src], none).unwrap();
+        h.peer_update(&l, x, (8, 0), None, &[src], none).unwrap();
+        store(&h.mig_path(5), &Mig::Committed { owner: Ident::me(), peer: Some(src) }, true).unwrap();
+        for (rev, via) in [(u64::MAX, None), (u64::MAX, c4)] {
+            let e = h.peer_update(&l, x, (8, rev), via, &[c], none).unwrap_err().to_string();
+            assert!(e.contains("arrived by migration 5") && e.contains("only from its source"), "{e}");
+        }
+        assert!(h.peer_update(&l, x, (9, 0), c4, &[c], none).is_err(), "nor a newer generation");
+        h.peer_update(&l, x, (8, 0), None, &[src], none).unwrap();
+        // An older binary's committed record names no source: nobody, until it is released.
+        store(&h.mig_path(5), &Mig::Committed { owner: Ident::me(), peer: None }, true).unwrap();
+        assert!(h.peer_update(&l, x, (8, 0), None, &[src], none).is_err());
+        // The target as reached: its name resolving to C now gives C nothing. Only a record without
+        // addresses (an older source process's) goes by the name.
+        let claim = h.claim_new(&l, "vm", Some(ip("10.9.0.1"))).unwrap();
+        let (y, g) = (claim.ip, claim.gen);
+        h.lend_at(&l, y, g, 6, "t:7070", &[src]).unwrap();
+        let to_c = |_: &str| vec![c];
+        assert!(h.peer_update(&l, y, (g, 0), None, &[c], to_c).is_err());
+        h.peer_update(&l, y, (g, 0), None, &[src], to_c).unwrap();
+        h.lend(&l, y, g, 7, "t:7070").unwrap();
+        h.peer_update(&l, y, (g, 1), c4, &[c], to_c).unwrap();
+        // This boot's cursor gone (as after a reboot): the mark reserved past generation g proves no
+        // newer one of a free address of this host's, though g + 1 is below it; its record decides.
+        let z = ip("10.9.0.2");
+        let reserved = load::<Gens>(&h.gens_path()).unwrap().unwrap().reserved;
+        assert!(g + 1 < reserved);
+        h.peer_update(&l, z, (g, 0), c4, &[c], none).unwrap();
+        std::fs::remove_file(h.run.join(".gens.next")).unwrap();
+        let e = h.peer_update(&l, z, (g + 1, 0), c4, &[c], none).unwrap_err().to_string();
+        assert!(e.contains("newer than its record here"), "{e}");
+        assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, reserved - 1).is_err(), "nor arrives");
+        assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, g).is_err(), "nor one handed out for another address");
+        h.newer_gen(&h.addr(&l, y).unwrap(), y, g).unwrap();
+        drop(claim);
+    }
+
+    /// #914 review: one location per revision. A peer announcing the newest revision via itself does not
+    /// take over the next hop recorded for it (which `observe` would replace on an equal revision), so the
+    /// host it names still withdraws it; that host may change it, by another of its addresses.
+    #[test]
+    fn an_equal_revision_elsewhere_is_only_its_hosts() {
+        let (_d, h) = host("equal-revision");
+        let l = h.lock().unwrap();
+        let (b, b2, c): (IpAddr, IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "198.51.100.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        let (b4, b24, c4) = (Some(ip("192.0.2.7")), Some(ip("198.51.100.7")), Some(ip("192.0.2.8")));
+        let none = |_: &str| Vec::new();
+        // A's VM went to B, which announced revision 1 (A is no longer its holder: lent only).
+        let x = ip("10.9.2.5");
+        assert!(h.observe(&l, x, 4, 1, b4).unwrap());
+        let e = h.peer_update(&l, x, (4, 1), c4, &[c], none).unwrap_err().to_string();
+        assert!(e.contains("only that host changes its next hop"), "{e}");
+        // Repeated by B, or by B's other address, it is taken; a newer revision is any peer's (a move on).
+        h.peer_update(&l, x, (4, 1), b4, &[b], none).unwrap();
+        h.peer_update(&l, x, (4, 1), b24, &[b, b2], none).unwrap();
+        h.peer_update(&l, x, (4, 2), c4, &[c], none).unwrap();
     }
 
     #[test]
@@ -5897,7 +6276,7 @@ pub(crate) mod tests {
             holder: Some("vm2".into()),
             holder_id: Some(gone.clone()),
             held: 3,
-            leaving: Some(Leaving { mig: 8, to: "b".into() }),
+            leaving: Some(Leaving { mig: 8, to: "b".into(), at: Vec::new() }),
             ..Addr::default()
         };
         h.put_addr(y, &a, false).unwrap();
@@ -5921,7 +6300,7 @@ pub(crate) mod tests {
             holder: Some("vm".into()),
             holder_id: Some(gone.clone()),
             held: 3,
-            leaving: Some(Leaving { mig: 9, to: "b".into() }),
+            leaving: Some(Leaving { mig: 9, to: "b".into(), at: Vec::new() }),
             ..Addr::default()
         };
         h.put_addr(x, &a, false).unwrap();
@@ -5957,7 +6336,7 @@ pub(crate) mod tests {
             holder: Some("vm2".into()),
             holder_id: Some(gone.clone()),
             held: 5,
-            leaving: Some(Leaving { mig: 10, to: "b".into() }),
+            leaving: Some(Leaving { mig: 10, to: "b".into(), at: Vec::new() }),
             ..Addr::default()
         };
         h.put_addr(y, &a, false).unwrap();
@@ -6037,7 +6416,7 @@ pub(crate) mod tests {
                 held: 4,
                 holder: Some("failed".into()),
                 holder_id: Some(gone.clone()),
-                leaving: (case != "withdrawal").then(|| Leaving { mig: 10, to: "peer".into() }),
+                leaving: (case != "withdrawal").then(|| Leaving { mig: 10, to: "peer".into(), at: Vec::new() }),
                 ..Addr::default()
             };
             h.put_addr(x, &a, false).unwrap();
@@ -6294,7 +6673,7 @@ pub(crate) mod tests {
             holder: Some("vm".into()),
             holder_id: Some(gone.clone()),
             held: 4,
-            leaving: Some(Leaving { mig: 50, to: "c".into() }),
+            leaving: Some(Leaving { mig: 50, to: "c".into(), at: Vec::new() }),
             ..Addr::default()
         };
         h.put_addr(x, &a, false).unwrap();
@@ -6311,8 +6690,14 @@ pub(crate) mod tests {
         // Had c resumed it, the VM would be c's: released, nothing withdrawn.
         let y = ip("10.9.1.2");
         let gone = dead_owner(&h, 999_999_955, &[]);
-        let a =
-            Addr { seen: 4, holder: Some("vm2".into()), holder_id: Some(gone), held: 4, leaving: Some(Leaving { mig: 51, to: "c".into() }), ..Addr::default() };
+        let a = Addr {
+            seen: 4,
+            holder: Some("vm2".into()),
+            holder_id: Some(gone),
+            held: 4,
+            leaving: Some(Leaving { mig: 51, to: "c".into(), at: Vec::new() }),
+            ..Addr::default()
+        };
         h.put_addr(y, &a, false).unwrap();
         h.withdraw_dead(false).unwrap();
         h.settle_owed_with(5, |_, id| Ok(if id == 51 { "released" } else { "pending" }.into()), |_, _| (), |_, _| ());
@@ -6335,7 +6720,7 @@ pub(crate) mod tests {
                 holder: Some(format!("vm{mig}")),
                 holder_id: Some(gone.clone()),
                 held: 4,
-                leaving: Some(Leaving { mig, to: "b".into() }),
+                leaving: Some(Leaving { mig, to: "b".into(), at: Vec::new() }),
                 ..Addr::default()
             };
             h.put_addr(ip(x), &a, false).unwrap();
@@ -7429,7 +7814,7 @@ pub(crate) mod tests {
             h.update(&l, y, false, |a| a.holder_id = Some(owner.clone())).unwrap();
             h.claim_arrival(&l, "other-owner", z, 8, 2, 7).unwrap().keep();
             let unchanged = [h.addr(&l, y).unwrap(), h.addr(&l, z).unwrap()];
-            let record = if committed { Mig::Committed { owner } } else { Mig::Pending { owner, ip: Some(x) } };
+            let record = if committed { Mig::Committed { owner, peer: None } } else { Mig::Pending { owner, ip: Some(x), peer: None } };
             store(&h.mig_path(7), &record, false).unwrap();
             drop(l);
             assert_eq!(h.mig_status(7).unwrap(), "aborted");
@@ -7725,7 +8110,7 @@ pub(crate) mod tests {
         let mut crashed = before.clone();
         crashed.holder_id = Some(dead.clone());
         h.put_addr(x, &crashed, true).unwrap();
-        store(&h.mig_path(1), &Mig::Committed { owner: dead }, true).unwrap();
+        store(&h.mig_path(1), &Mig::Committed { owner: dead, peer: None }, true).unwrap();
         drop(l);
         assert_eq!(h.mig_status(1).unwrap(), "aborted");
         let recovered = h.addr(&h.lock().unwrap(), x).unwrap();
@@ -7757,17 +8142,17 @@ pub(crate) mod tests {
         h.mig_done(3).unwrap();
         assert!(matches!(rec(3), Some(Mig::Released { done_until_ms: Some(_), .. })));
         let mut r = h.mig_begin(4, "", None, None).unwrap();
-        store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]), ip: None }, false).unwrap();
+        store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]), ip: None, peer: None }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
         // A dead arrival's route that cannot be put back yet keeps its record, for the next query.
         let back = ip("10.9.0.4");
         std::fs::write(h.addr_path(back), "{").unwrap();
-        store(&h.mig_path(10), &Mig::Pending { owner: dead_owner(&h, 999_999_910, &[]), ip: Some(back) }, false).unwrap();
+        store(&h.mig_path(10), &Mig::Pending { owner: dead_owner(&h, 999_999_910, &[]), ip: Some(back), peer: None }, false).unwrap();
         assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_some(), "kept while its route cannot be put back");
         std::fs::remove_file(h.addr_path(back)).unwrap();
         assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_none());
         let fc = Sleeper::new();
-        store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]) }, false).unwrap();
+        store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]), peer: None }, false).unwrap();
         assert!(h.mig_status(5).unwrap() == "aborted" && fc.done() && rec(5).is_none());
         let mut r = h.mig_begin(7, "", None, None).unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
@@ -7816,7 +8201,7 @@ pub(crate) mod tests {
         assert_eq!(pid_liveness_by(1, esrch).0, Liveness::Unknown, "a bare pid may be another process's by now");
         assert_eq!(liveness_by(&me, boot_id(), esrch), Liveness::Gone);
         // A dead owner's goes, as asking would make it go.
-        store(&h.mig_path(9), &Mig::Committed { owner: dead_owner(&h, 999_999_909, &[]) }, false).unwrap();
+        store(&h.mig_path(9), &Mig::Committed { owner: dead_owner(&h, 999_999_909, &[]), peer: None }, false).unwrap();
         h.retire_migrations();
         assert!(h.mig_status(8).unwrap() == "released" && rec(9).is_none());
         std::fs::write(h.mig_path(6), "{").unwrap();

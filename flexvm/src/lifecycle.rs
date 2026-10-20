@@ -244,6 +244,8 @@ impl Proc {
         // A kill asked for meanwhile (SIGINT means destroy) revokes what was published.
         if saved.is_ok() {
             crate::host::stall("suspend_stall");
+            // Test gate `suspend_gate`: held here, published, until the test lets it go (a kill it sent seen first).
+            crate::host::hold("suspend_gate");
         }
         // As `flexvm rm` does to a suspended VM; one that cannot be revoked stays suspended.
         // Its Firecracker dying meanwhile cancels it too: then it ends as a death does.

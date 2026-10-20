@@ -49,8 +49,8 @@ p.add_argument("--lanes", help="the lanes' ports and address ranges, as PORT:NET
                "--net-a, --net-b and --jobs)")
 p.add_argument("--tag", default="fvci", help="prefix of this run's own directories under /run and /var/tmp")
 p.add_argument("--template", default="ci", help="name of the template the cases pull (from the test image) and use")
-p.add_argument("--test-image", help="the test image's OCI layout: made there (scripts/test-image.py) unless it holds the "
-               "image of the state's base.squashfs already (default: in the run's own directory)")
+p.add_argument("--test-image", default="/var/lib/flexvm-test-image", help="the test image's OCI layout: made there (scripts/test-image.py) unless it holds the "
+               "image of the state's base.squashfs already (default: /var/lib/flexvm-test-image)")
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
 p.add_argument("--no-image", action="store_true", help="skip the image-template case (needs registry access)")
@@ -390,6 +390,8 @@ class Host:
     def save_logs(self):
         """Copies the VM and Firecracker logs out of the run directory."""
         for log in glob.glob(f"{self.run_dir}/**/*.log", recursive=True) + glob.glob(f"{self.run_dir}/**/*.log.1", recursive=True):
+            if not os.path.exists(log):  # a link to a log not made yet (NAME.log.1 before a rotation)
+                continue
             dest = os.path.join(args.log_dir, f"run-{self.label}", os.path.relpath(log, self.run_dir))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy(log, dest)
@@ -697,9 +699,12 @@ def app_lifecycle():
     # --rm: no record once it exits.
     run_d("e2e-app-rm", "--rm", *entry("exit 0"))
     check("--rm: gone once its app exits", wait_for(lambda: "e2e-app-rm" not in A.ps(), 30), A.ps().get("e2e-app-rm"))
-    # -d -i: no client to wait for, so it exits as soon as its app does.
+    # -d -i: no client to wait for, so it exits as soon as its app does, not after the 10 s an app's end
+    # waits for a foreground client (vmproc's ATTACH_WAIT). The app ends only once told, after the timer
+    # starts: however long the start took on a loaded host is not part of it, and all of a wait is.
+    run_d("e2e-app-di", "-i", *entry("while [ ! -e /tmp/di-go ]; do sleep 0.05; done; exit 2"))
     began = time.monotonic()
-    run_d("e2e-app-di", "-i", *entry("exit 2"))
+    A.exec("e2e-app-di", "touch /tmp/di-go")
     check("-d -i: exited at once", wait_for(lambda: exited("e2e-app-di"), 30) and time.monotonic() - began < 8, (time.monotonic() - began, A.ps().get("e2e-app-di")))
     A.rm("e2e-app-di")
 
@@ -779,7 +784,8 @@ def pause_resume():
     # The guest runs again some time after the resume: polled until its counter moves, within a functional timeout.
     check("resume: guest process continues", wait_for(lambda: count(A, vm) > c1, 30), (c1, count(A, vm)))
     check("resume: same process (pid, start time)", marker_id(A, vm) == proc)
-    err = wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 5)
+    # Each sample an exec: polled within a functional timeout, as a loaded host's slow execs take few in 5 s.
+    err = wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 30)
     check("resume: guest clock right after 3 s paused", err, clock_error(A, vm))
     A.kill(vm)
 
@@ -1024,8 +1030,9 @@ def checkpoint_restore():
     check("restore: RAM intact", md5(A, vm) == m)
     check("restore: same process", marker_id(A, vm) == proc)
     c1 = count(A, vm)
-    check("restore: process runs on", wait_for(lambda: count(A, vm) > c1, 5))
-    check("restore: guest clock right", wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 5), clock_error(A, vm))
+    # Polled (each sample an exec) within functional timeouts.
+    check("restore: process runs on", wait_for(lambda: count(A, vm) > c1, 30), (c1, count(A, vm)))
+    check("restore: guest clock right", wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 30), clock_error(A, vm))
     # Keep-running checkpoint: the VM goes on; its copy restores as a second VM.
     path2 = ckpt_dir(vm + "-live")
     A.checkpoint(vm, path2)
@@ -1280,7 +1287,7 @@ def suspend_resume():
     check("start: RAM intact", md5(A, vm) == m)
     check("start: same process", marker_id(A, vm) == proc)
     c1 = count(A, vm)
-    check("start: process runs on", wait_for(lambda: count(A, vm) > c1, 5))
+    check("start: process runs on", wait_for(lambda: count(A, vm) > c1, 30), (c1, count(A, vm)))
     r = A.rm(vm, check=False)
     check("rm: a running VM is refused", r.returncode != 0 and f"vm {vm} is running" in r.stderr, (r.returncode, r.stderr))
     A.suspend(vm)
@@ -1567,10 +1574,15 @@ def containers():
     moved = renamed + "-x"
     A.vms.add(moved)
     cli = [BIN, "--state", A.state_dir, "--run", A.run_dir, "exec"]
-    e = subprocess.Popen(cli + [renamed, "sh", "-c", "sleep 4; echo exec-done"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
-    time.sleep(1)
+    # Its command runs from before the rename until after the checkpoint (it ends once told), however long
+    # the CLI takes to start it.
+    must(A, renamed, "rm -f /tmp/exec-started /tmp/exec-go")
+    e = subprocess.Popen(cli + [renamed, "sh", "-c", "touch /tmp/exec-started; while [ ! -e /tmp/exec-go ]; do sleep 0.05; done; echo exec-done"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+    check("rename: the separate exec client's command runs", wait_for(lambda: must(A, renamed, "ls /tmp/exec-started 2>/dev/null || :") != "", 60))
     A.cli("rename", renamed, moved)
     A.cli("checkpoint", "create", moved)
+    must(A, moved, "touch /tmp/exec-go")
     out, err = e.communicate(timeout=120)
     check("rename: a separate exec client reattaches under the new name", e.returncode == 0 and out == "exec-done\n", (e.returncode, out, err[-500:]))
     # How many run (`must`: an exec that fails raises, never reads as none).
@@ -1714,6 +1726,22 @@ def typed(p, line, want, timeout=30):
     return p.expect(want, timeout, p.expect(re.escape(line[-12:]), timeout, since))
 
 
+def size_follows(p, rows, cols, timeout=30):
+    """Types `stty size` until it reads `rows` `cols`: a resize reaches the guest's pty in its own time
+    (SIGWINCH to the CLI, then to the guest), so one read right after it may still see the old size."""
+    deadline = time.time() + timeout
+    while True:
+        since = len(p.out)
+        p.send("stty size\r")
+        start = p.expect(re.escape("stty size"), 30, since)
+        p.expect(r"\d+ \d+\r\n", 30, start)
+        got = re.search(rb"(\d+) (\d+)\r\n", p.out[start:]).group(0).strip().decode()
+        if got == f"{rows} {cols}":
+            return
+        assert time.time() < deadline, f"stty size still {got!r}, not {rows} {cols}, {timeout} s after the resize"
+        time.sleep(0.2)
+
+
 @case
 def interactive():
     """exec -i streams stdin, exec -it a shell on a pty (echo, stty size following resizes, Ctrl-C to its
@@ -1760,8 +1788,7 @@ def interactive():
         check("exec -it: the terminal is raw", p.raw())
         typed(p, "stty size", r"24 80\r\n")
         p.resize(40, 120)
-        time.sleep(0.5)
-        typed(p, "stty size", r"40 120\r\n")
+        size_follows(p, 40, 120)
         check("exec -it: stty size follows a resize", True)
         typed(p, "tty", r"/dev/pts/\d+\r\n")
         p.send("sleep 100\r")
@@ -1933,15 +1960,16 @@ def interactive():
         pts = re.findall(rb"/dev/pts/\d+", p.out[since:])[-1].decode()
         q = Pty(A, "attach", vm, rows=30, cols=100).wait_raw()
         try:
-            time.sleep(1)
+            # Once the newest one's size reached the pty (in its own time), it keeps it.
+            size = lambda: A.exec(vm, f"stty size < {pts}")[1]
+            check("two attaches: the pty takes the newest one's size", wait_for(lambda: size() == "30 100\n", 30), size())
             _, sizes, _ = A.exec(vm, f"for i in $(seq 40); do stty size < {pts}; sleep 0.05; done | sort -u")
             check("two attaches: idle, the pty keeps the newest one's size", sizes == "30 100\n", sizes)
             typed(p, "stty size", r"30 100\r\n")
             check("two attaches: typing takes stdin, without a resize", True)
             typed(q, "echo from-$((5 * 5))", r"from-25\r\n")
             p.resize(40, 120)
-            time.sleep(0.5)
-            typed(p, "stty size", r"40 120\r\n")
+            size_follows(p, 40, 120)
             check("two attaches: a SIGWINCH resizes", True)
         finally:
             q.close()
@@ -2369,7 +2397,7 @@ def shared_state(state):
 # Where templates are built (and images pulled, unpacked in its staging/).
 BUILD = os.path.join(WORK, "build")
 # The OCI layout the cases' templates are pulled from.
-TEST_IMAGE = os.path.abspath(args.test_image) if args.test_image else os.path.join(WORK, "test-image")
+TEST_IMAGE = os.path.abspath(args.test_image)
 shared_state(BUILD)
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"

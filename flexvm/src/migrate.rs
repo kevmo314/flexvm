@@ -36,6 +36,10 @@ const INCOMING_WAIT: Duration = Duration::from_secs(30);
 const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_HEADER: u64 = 256 << 20;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Test fault `long_preflight`: both sides' preflight deadlines (`PREFLIGHT_TIMEOUT`, `listen::PREPARE_WAIT`), and the
+/// target's wait for its source after answering it (`INCOMING_WAIT`), this long instead, so a test parked in the
+/// preflight (`incoming_gate`) or right after it (`leave_gate`) lets it go when it is done, not against them.
+pub const LONG_PREFLIGHT: Duration = Duration::from_secs(300);
 const HOLD_FENCE: Duration = Duration::from_millis(250);
 const HELD_STREAM: Duration = Duration::from_secs(2);
 /// How long a same-host target's hold, let go, watches for a packet sent along the old route
@@ -225,7 +229,9 @@ impl Proc {
         // A kill that came while this prepared wins (#567): its connection dropped, the target's arrival goes.
         self.not_destroyed()?;
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
-        self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen, mig, to)?, Ordering::SeqCst);
+        // With where the target was reached: only it moves or withdraws the generation here meanwhile (#914).
+        let at: Vec<IpAddr> = conn.peer_addr().ok().map(|a| a.ip()).into_iter().chain(prepared["underlay"].as_str().and_then(|u| u.parse().ok())).collect();
+        self.lent_here.fetch_or(self.host.lend_at(&self.host.lock()?, vm.ip, gen, mig, to, &at)?, Ordering::SeqCst);
         // Test gate: lent, not yet leaving.
         crate::host::gate("leave_gate");
         self.drop_held_in();
@@ -354,7 +360,7 @@ impl Proc {
         let (conn, prepared) = crate::util::rpc(
             to,
             Duration::from_secs(2),
-            Instant::now() + PREFLIGHT_TIMEOUT,
+            Instant::now() + if fault("long_preflight") { LONG_PREFLIGHT } else { PREFLIGHT_TIMEOUT },
             &json!({
                 "op": "migrate_in",
                 "name": vm.name,
@@ -682,7 +688,12 @@ impl Proc {
         // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app; `attaches`: -i and -t too.
         let result = json!({"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true, "attaches": true});
         send_json(&mut w, &json!({"ok": true, "result": result}))?;
-        let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
+        let deadline = Instant::now()
+            + match () {
+                _ if fault("short_incoming") => Duration::from_secs(2),
+                _ if fault("long_preflight") => LONG_PREFLIGHT,
+                _ => INCOMING_WAIT,
+            };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
         // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
@@ -732,7 +743,7 @@ impl Proc {
         };
         let revoked = Arc::new(Mutex::new(false));
         *self.held_in.lock().unwrap() = Some(revoked.clone());
-        if fault("lost_ack") {
+        if tripped("lost_ack") {
             let _ = w.shutdown(std::net::Shutdown::Both);
         } else {
             let _ = answer(json!({"ok": true, "result": {
@@ -970,10 +981,13 @@ impl Proc {
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo. Never past the guest's size.
         self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req), Some(until)).map_err(late)?;
         let l = self.host.lock_by(Some(until)).map_err(late)?;
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?.with_peer(from));
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin_from(mig, &source.addr, by, Some(ip), Some(from))?);
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
-        let claim = self.host.claim_arrival(&l, &name, ip, req["gen"].as_u64().unwrap_or(0), rev, mig)?;
+        let gen = req["gen"].as_u64().unwrap_or(0);
+        // Not a generation newer than the record's where no peer can have one (#914).
+        self.host.newer_gen(&self.host.addr(&l, ip)?, ip, gen)?;
+        let claim = self.host.claim_arrival(&l, &name, ip, gen, rev, mig)?;
         drop(l);
         self.set_addr(claim);
         t.mark("claim_ip");
@@ -1515,13 +1529,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopped = stop.clone();
         let reader = thread::spawn(move || {
             let mut buf = [0; 4096];
             let mut drained = 0;
             peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            while !stopped.load(Ordering::SeqCst) {
+            // Drain to EOF so the reader never closes with unread data and resets the connection.
+            loop {
                 let n = peer.read(&mut buf).unwrap();
                 if n == 0 {
                     break;
@@ -1537,7 +1550,6 @@ mod tests {
         let budget = Duration::from_millis(200);
         let result = send_paused(&conn, &header, &[0], &data, start + budget, &mut Phases::new());
         let elapsed = start.elapsed();
-        stop.store(true, Ordering::SeqCst);
         drop(conn);
         let drained = reader.join().unwrap();
         assert_eq!(result.unwrap_err().downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
@@ -1553,7 +1565,8 @@ mod tests {
         // Takes everything at once, then never answers.
         let reader = thread::spawn(move || std::io::copy(&mut peer, &mut std::io::sink()).unwrap());
         let header = Header { runs: &[], vmstate_len: 1, preload: &[], paused: false, app_log: 0 };
-        let data = vec![7; 1 << 20];
+        // Fit in the socket buffers so the deadline tests the reply, even if the reader is delayed.
+        let data = vec![7; 32 << 10];
         let start = Instant::now();
         let budget = Duration::from_millis(300);
         let result = send_paused(&conn, &header, &[0], &data, start + budget, &mut Phases::new());

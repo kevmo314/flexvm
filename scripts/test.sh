@@ -7,6 +7,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 flexvm=$root/target/release/flexvm
 netlab=$root/scripts/netlab.sh
+source "$root/scripts/net-common.sh"
+lab_cgroups=()
 host_A=192.168.100.1:7070
 host_B=192.168.100.2:7070
 name=fv-test-$$
@@ -52,12 +54,11 @@ wait_for() {
 }
 
 # Nothing of the lab's is left: no process with its state directories, no
-# namespace, no state directory.
+# namespace, no state directory or cgroup.
 resources_gone() {
-    local p ns
-    for p in /proc/[0-9]*; do
-        { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && return 1
-    done
+    local ns cg
+    [[ -z $(state_processes /run/flexvm-lab-A /run/flexvm-lab-B) ]] || return 1
+    for cg in "${lab_cgroups[@]}"; do [[ ! -d $cg ]] || return 1; done
     while read -r ns _; do
         case "$ns" in fvA|fvB|fvC|fvlan) return 1 ;; esac
     done < <(ip netns list)
@@ -80,6 +81,7 @@ finish() {
         mkdir -p "$work/log/"{A,B}
         cp /run/flexvm-lab-A/run/vms/*.log "$work/log/A/" 2>/dev/null
         cp /run/flexvm-lab-B/run/vms/*.log "$work/log/B/" 2>/dev/null
+        mapfile -t lab_cgroups < <(process_cgroups $(state_processes /run/flexvm-lab-A /run/flexvm-lab-B))
         if ! "$netlab" down; then
             results[5]=FAIL
             echo 'FAIL: netlab.sh down'

@@ -400,6 +400,15 @@ impl<T: Transport> Transport for Deadlined<T> {
     }
 }
 
+/// A bounded, terminal-safe diagnostic from an untrusted registry's response body: control and bidi
+/// characters are escaped (`\u{1b}`), the rest (a JSON body's quotes) is kept as sent.
+fn error_body(reader: impl Read) -> String {
+    let mut body = Vec::new();
+    let _ = reader.take(300).read_to_end(&mut body);
+    let hidden = |c: char| c.is_control() || matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    String::from_utf8_lossy(&body).trim().chars().map(|c| if hidden(c) { c.escape_debug().to_string() } else { c.into() }).collect()
+}
+
 /// URLs in diagnostics must not expose signed queries or userinfo.
 fn log_url(url: &str) -> String {
     let url = url.split(['?', '#']).next().unwrap_or("");
@@ -693,9 +702,7 @@ impl Registry {
                     bail!("GET {shown}: unauthorized{}", if self.basic.is_none() { " (no credentials in docker config)" } else { "" })
                 }
                 code => {
-                    let mut body = Vec::new();
-                    let _ = resp.into_body().into_reader().take(300).read_to_end(&mut body);
-                    bail!("GET {shown}: HTTP {code}: {}", String::from_utf8_lossy(&body).trim())
+                    bail!("GET {shown}: HTTP {code}: {}", error_body(resp.into_body().into_reader()))
                 }
             }
         }
@@ -1544,6 +1551,15 @@ pub(super) mod tests {
         let blob_requests = blob_requests.lock().unwrap();
         assert_eq!(blob_requests.len(), 1);
         assert!(!blob_requests[0].1.contains_key("authorization"));
+    }
+
+    #[test]
+    fn registry_errors_escape_terminal_controls_and_bound_the_body() {
+        let body = format!("{{\"denied\"}}\x1b[31m\x1b]0;title\x07\r\n\t\u{009b}\u{202e}\u{061c}\u{2066}\u{200f}{}TAIL", "x".repeat(400));
+        let err = error_body(body.as_bytes());
+        assert!(err.starts_with("{\"denied\"}\\u{1b}[31m\\u{1b}]0;title\\u{7}\\r\\n\\t\\u{9b}\\u{202e}\\u{61c}\\u{2066}\\u{200f}"), "{err}");
+        assert!(!err.chars().any(char::is_control), "{err:?}");
+        assert!(!err.contains("TAIL"), "{err}");
     }
 
     #[test]

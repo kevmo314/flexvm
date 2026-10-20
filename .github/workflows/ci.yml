@@ -92,6 +92,9 @@ jobs:
       - name: e2e scheduler self-test
         # Fake templates and workers, one of which cannot be spawned: its cases must fail.
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
+      - name: lab teardown self-test
+        # The lab scripts' process matching and cgroup cleanup (scripts/net-common.sh): rootless, no VM.
+        run: ./scripts/net-common-test.sh
 
   e2e:
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
@@ -136,7 +139,7 @@ jobs:
 
       # The caches below restore into it as the runner's user.
       - name: State directory
-        run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$STATE/artifacts"
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$STATE/artifacts" /var/lib/flexvm-test-image
 
       # Cache keys: the build inputs in the repo, what fetch.sh resolves (versions and
       # URLs, plus the ETags of the unversioned S3 objects), and the build environment
@@ -220,8 +223,10 @@ jobs:
         id: test-image-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/test-image
+          path: /var/lib/flexvm-test-image
           key: test-image-base${{ steps.fetch.outputs.base }}-${{ hashFiles('scripts/test-image.py') }}
+      - name: Own test image
+        run: sudo chown -R root:root /var/lib/flexvm-test-image
       - name: squashfs-tools
         if: steps.test-image-cache.outputs.cache-hit != 'true'
         run: command -v unsquashfs > /dev/null || { sudo apt-get update -q; sudo apt-get install -y -q --no-install-recommends squashfs-tools; }
@@ -256,16 +261,16 @@ jobs:
           # "pr 2/4": shard pr, its second of four splits.
           set -- $SHARD
           jobs=4; if [ "$1" = heavy ]; then jobs=1; fi
-          sudo python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "$RUNNER_TEMP/test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
+          sudo python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
       - name: Test image made
         id: test-image-made
         if: always() && steps.test-image-cache.outputs.cache-hit != 'true'
-        run: if [ -e "$RUNNER_TEMP/test-image/index.json" ]; then echo "made=true" >> "$GITHUB_OUTPUT"; fi
+        run: if [ -e "/var/lib/flexvm-test-image/index.json" ]; then echo "made=true" >> "$GITHUB_OUTPUT"; fi
       - name: Save test image
         if: always() && steps.test-image-made.outputs.made == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/test-image
+          path: /var/lib/flexvm-test-image
           key: ${{ steps.test-image-cache.outputs.cache-primary-key }}
 
       - name: Image digest

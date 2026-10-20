@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -177,9 +177,9 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
         Some(init) => std::fs::read(init).map_err(|e| format!("flexvm-init at {init:?}: {e}"))?,
         None => crate::artifacts::INIT.to_vec(),
     };
-    // Rebuild older cached images with Docker's explicit-group semantics and protected app config.
+    // Rebuild older cached images that lost the image root's metadata.
     let key = json!({
-        "v": 3, "config": img.config_digest, "diff_ids": img.diff_ids,
+        "v": 4, "config": img.config_digest, "diff_ids": img.diff_ids,
         "init": sha256_hex(&init_bytes), "options": o,
     });
     let key = sha256_hex(key.to_string().as_bytes());
@@ -329,6 +329,10 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         let tmp = cached.with_extension(format!("tmp{}", random_hex(8)?));
         let res = build(&tmp).and_then(|conf| {
             interrupted()?;
+            // Before its marker: an entry with none is one an older flexvm built (`LEGACY`).
+            if private {
+                users_dir(&pinned, cached, true, false)?;
+            }
             publish_rootfs(&tmp, cached, &conf, &sync)
         });
         let _ = std::fs::remove_file(&tmp);
@@ -346,25 +350,140 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
 #[derive(Debug, PartialEq, Eq)]
 pub enum Removal {
     Removed,
-    /// Not in the cache (gone already, or never one of its entries): nothing to do.
+    /// Gone, outside the cache, or kept for other or unknown states: nothing to do.
     Absent,
     /// A pull checks, builds or holds it (its key's lock or its use lock): asked again later.
     InUse,
 }
 
-/// Removes the cache entry `rootfs` (a `rootfs/KEY.ext4` of `cache`) under its key's lock, its
-/// marker first, so a build that waits for the lock builds it again. The caller knows no template
-/// uses it. Neither lock is waited for: a pull holding either is one of its users (`Removal::InUse`).
-pub fn remove_rootfs(cache: &Path, rootfs: &Path) -> Result<Removal> {
-    let dir = cache.join("rootfs");
-    let (Ok(dir), Some(parent)) = (std::fs::canonicalize(&dir), rootfs.parent()) else { return Ok(Removal::Absent) };
-    if std::fs::canonicalize(parent).ok().as_deref() != Some(dir.as_path()) || rootfs.extension() != Some("ext4".as_ref()) {
-        return Ok(Removal::Absent);
+/// In a `KEY.users` directory, the record of the states that used a shared entry before records
+/// were kept: it stays until `image prune --force-shared`.
+const LEGACY: &str = "legacy";
+
+/// `KEY.users` of the pinned cache directory, made (0700) if `create` and missing, holding `LEGACY`
+/// if `legacy`: made whole as `KEY.newusers` (one left by a crash goes first), then renamed into
+/// place, so no `.users` without it is ever seen. The caller holds the key's lock.
+fn users_dir(pinned: &crate::host::Directory, cached: &Path, create: bool, legacy: bool) -> Result<Option<crate::host::Directory>> {
+    let fd = pinned.fd.as_raw_fd();
+    let name = cpath(Path::new(cached.with_extension("users").file_name().unwrap()))?;
+    let open = |name: &std::ffi::CStr| crate::util::openat(fd, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let dir = match open(&name) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let new = cached.with_extension("newusers");
+            match std::fs::remove_dir_all(&new) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r?,
+            }
+            let new_name = cpath(Path::new(new.file_name().unwrap()))?;
+            crate::util::check(unsafe { libc::mkdirat(fd, new_name.as_ptr(), 0o700) })?;
+            let dir = crate::host::Directory::from_fd(open(&new_name)?);
+            make_private(&dir.fd, 0o700)?;
+            if legacy {
+                crate::util::write_file_mode(&dir.path, LEGACY, b"", true, 0o600)?;
+            }
+            sync_dir(&dir.path)?;
+            crate::util::check(unsafe { libc::renameat(fd, new_name.as_ptr(), fd, name.as_ptr()) })?;
+            sync_dir(&pinned.path)?;
+            return Ok(Some(dir));
+        }
+        r => crate::host::Directory::from_fd(r?),
+    };
+    make_private(&dir.fd, 0o700)?;
+    Ok(Some(dir))
+}
+
+/// Records that the generations of the (canonical) templates directory `templates` use the cache
+/// entry `rootfs`, under the same key lock as removal: a file named by its `state_key` holding its
+/// path. An entry built before records were kept gets `LEGACY` too in a symlinked (shared) cache.
+pub fn note_rootfs(cache: &Path, rootfs: &Path, templates: &Path) -> Result<()> {
+    let Some(pinned) = rootfs_directory(cache, rootfs)? else { return Ok(()) };
+    let cached = pinned.path.join(rootfs.file_name().unwrap());
+    let _lock = crate::host::lock_at(crate::host::host_locks()?, &key_lock(&pinned, &cached)?, libc::LOCK_EX)?;
+    let users = users_dir(&pinned, &cached, true, cache.is_symlink())?.unwrap();
+    crate::util::write_file_mode(&users.path, &crate::template::state_key(templates), templates.as_os_str().as_bytes(), true, 0o600)?;
+    Ok(sync_dir(&pinned.path)?)
+}
+
+/// The cache's `rootfs` directory, pinned and by its canonical path, unless it is a symlink (or
+/// missing): records are kept, and entries removed, only in one reached through no symlink.
+fn rootfs_dir(cache: &Path) -> Result<Option<(crate::host::Directory, PathBuf)>> {
+    let Ok(root) = std::fs::canonicalize(cache) else { return Ok(None) };
+    let root_fd = crate::util::openat(libc::AT_FDCWD, &cpath(&root)?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    match crate::util::openat(root_fd.as_raw_fd(), c"rootfs", libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => Ok(None),
+        fd => Ok(Some((crate::host::Directory::from_fd(fd?), root.join("rootfs")))),
     }
-    let pinned = crate::host::Directory::open(&dir)?;
+}
+
+/// Only entries in this cache can acquire records or be removed.
+fn rootfs_directory(cache: &Path, rootfs: &Path) -> Result<Option<crate::host::Directory>> {
+    let (Some((pinned, dir)), Some(parent)) = (rootfs_dir(cache)?, rootfs.parent()) else { return Ok(None) };
+    if std::fs::canonicalize(parent).ok().as_deref() != Some(dir.as_path()) || rootfs.extension() != Some("ext4".as_ref()) {
+        return Ok(None);
+    }
+    Ok(Some(pinned))
+}
+
+/// The entries of the cache `rootfs` directory that have records (`KEY.users`), as `KEY.ext4`, and
+/// with `force` (`--force-shared`) complete ones without too (`LEGACY` or never recorded).
+pub fn recorded_rootfs(cache: &Path, force: bool) -> Result<Vec<PathBuf>> {
+    let Some((pinned, dir)) = rootfs_dir(cache)? else { return Ok(vec![]) };
+    let mut found = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&pinned.path)? {
+        let path = dir.join(entry?.file_name());
+        if path.extension() == Some("users".as_ref()) || force && path.extension() == Some("ok".as_ref()) {
+            found.insert(path.with_extension("ext4"));
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+/// Whether the templates directory a record holds is gone: only on ENOENT or ENOTDIR, not
+/// another error (an unreadable or failing filesystem may still hold a state).
+fn gone(record: &[u8]) -> bool {
+    !record.is_empty()
+        && std::fs::metadata(std::ffi::OsStr::from_bytes(record))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR))
+}
+
+/// Removes the cache entry `rootfs` (a `rootfs/KEY.ext4` of `cache`) under its key's lock, its
+/// marker first, so a build that waits for the lock builds it again. The caller knows no generation
+/// of `templates` (canonical) uses it: its record goes, and the entry is kept while other records
+/// remain (or a legacy shared entry has none). `force` (`--force-shared`) drops `LEGACY` and the
+/// records of templates directories that are gone, and removes a legacy shared entry without records. Neither lock is waited for: a pull holding
+/// either means `Removal::InUse`.
+pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool) -> Result<Removal> {
+    let Some(pinned) = rootfs_directory(cache, rootfs)? else { return Ok(Removal::Absent) };
     let cached = pinned.path.join(rootfs.file_name().unwrap());
     let key = key_lock(&pinned, &cached)?;
     let Some(_lock) = crate::host::try_lock_at(crate::host::host_locks()?, &key)? else { return Ok(Removal::InUse) };
+    let users = users_dir(&pinned, &cached, false, false)?;
+    if let Some(dir) = &users {
+        let me = crate::template::state_key(templates);
+        let mut kept = false;
+        for entry in std::fs::read_dir(&dir.path)? {
+            let name = entry?.file_name();
+            let path = dir.path.join(&name);
+            // A record's temporary (`write_file_mode`), the record of these templates, or one `force` forgets.
+            let drop = name.as_bytes().starts_with(b".") || name == me.as_str() || force && (name == LEGACY || std::fs::read(&path).is_ok_and(|p| gone(&p)));
+            if drop {
+                match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    r => r?,
+                }
+            } else {
+                kept = true;
+            }
+        }
+        sync_dir(&dir.path)?;
+        if kept {
+            return Ok(Removal::Absent);
+        }
+    } else if cache.is_symlink() && !force {
+        // A legacy shared entry may have users that have not pulled with records yet.
+        return Ok(Removal::Absent);
+    }
     let st = match File::open(&cached) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Absent),
         f => crate::util::fstat(f?.as_raw_fd())?,
@@ -379,6 +498,9 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path) -> Result<Removal> {
         if ext == "ok" {
             sync_dir(&pinned.path)?;
         }
+    }
+    if users.is_some() {
+        std::fs::remove_dir(cached.with_extension("users"))?;
     }
     sync_dir(&pinned.path)?;
     Ok(Removal::Removed)
@@ -712,6 +834,7 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
             let mut root = Root::from_fd(work, *limits);
             unpack_layers(&mut root, img)?;
             let conf = inject(&mut root, app, init)?;
+            root.restore_root_metadata()?;
             interrupted()?;
             mkfs(&path, root.entries, dest)?;
             Ok(conf)
@@ -842,12 +965,25 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
     let image = create_new(dest)?;
     image.set_len(mib << 20)?;
+    let meta = std::fs::metadata(dir)?;
+    // root_owner is in every mke2fs we support; root_perms only since e2fsprogs 1.47.1.
+    let root = format!("root_owner={}:{}", meta.uid(), meta.gid());
+    let image_path = format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd());
     let mut cmd = Command::new("mkfs.ext4");
     cmd.args(["-q", "-F", "-b", "4096", "-I", "256", "-L", "flexroot", "-N", &inodes.to_string(), "-d"]);
-    cmd.arg(dir).arg(format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd()));
+    cmd.arg(dir).args(["-E", &root]).arg(&image_path);
     let out = run_until(&mut cmd, interrupted).map_err(|e| format!("mkfs.ext4: {e}"))?;
     if !out.status.success() {
         bail!("mkfs.ext4 failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    // Root xattrs come with -d (from 1.45.7); its mode and mtime are set here, as older mke2fs can't.
+    for (field, value) in [("mode", format!("0{:o}", libc::S_IFDIR | (meta.mode() & 0o7777))), ("mtime", format!("@{}", meta.mtime()))] {
+        let out = run_until(Command::new("debugfs").args(["-w", "-R", &format!("set_inode_field / {field} {value}"), &image_path]), interrupted)?;
+        // debugfs also reports command errors on stderr with a successful exit status.
+        let errors = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() || errors.lines().any(|line| !line.starts_with("debugfs ")) {
+            bail!("debugfs setting root {field} failed: {}", errors.trim());
+        }
     }
     crate::log!("image: root filesystem built ({mib} MiB, {entries} entries)");
     Ok(())
@@ -1051,6 +1187,77 @@ mod tests {
         }
         // 24 bytes for dot entries, 264 per long name, doubled for headroom.
         assert_eq!(ext4_extra_kib(&dir).unwrap(), 52);
+    }
+
+    #[test]
+    fn layer_root_metadata_survives_ext4_build() {
+        let dir = tmpdir("root-metadata");
+        let staging = dir.join("root");
+        std::fs::create_dir(&staging).unwrap();
+        let mut root = Root::open(&staging, Limits::default()).unwrap();
+        // Exercise 1000:1000 as root or the usual developer user; other users use their own IDs.
+        let uid = if unsafe { libc::geteuid() } == 0 { 1000 } else { unsafe { libc::geteuid() } };
+        let gid = if unsafe { libc::geteuid() } == 0 { 1000 } else { unsafe { libc::getegid() } };
+        for (path, mode, mtime, note) in [("./", 0o750, 1234567890, "first"), (".", 0o770, 1234567891, "middle"), ("/", 0o700, 1234567892, "last")] {
+            let mut layer = tar::Builder::new(Vec::new());
+            let acl = |mask| {
+                let mut acl = 2u32.to_le_bytes().to_vec();
+                for (tag, perm, id) in [(1u16, 7u16, u32::MAX), (2, 5, uid), (4, 5, u32::MAX), (16, mask, u32::MAX), (32, 0, u32::MAX)] {
+                    acl.extend_from_slice(&tag.to_le_bytes());
+                    acl.extend_from_slice(&perm.to_le_bytes());
+                    acl.extend_from_slice(&id.to_le_bytes());
+                }
+                acl
+            };
+            let (access, default) = (acl((mode >> 3) as u16 & 7), acl(5));
+            layer
+                .append_pax_extensions([
+                    ("SCHILY.xattr.user.note", note.as_bytes()),
+                    ("SCHILY.xattr.system.posix_acl_access", access.as_slice()),
+                    ("SCHILY.xattr.system.posix_acl_default", default.as_slice()),
+                ])
+                .unwrap();
+            let mut h = tar::Header::new_ustar();
+            // The tar builder refuses absolute paths, so spell the root header verbatim.
+            h.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_mode(mode);
+            h.set_uid(uid as u64);
+            h.set_gid(gid as u64);
+            h.set_mtime(mtime);
+            h.set_size(0);
+            h.set_cksum();
+            layer.get_mut().extend_from_slice(h.as_bytes());
+            layer.get_mut().extend_from_slice(&unpack::tests::layer(&[("child", 'f', "data")]));
+            root.apply_layer(layer.into_inner().unwrap().as_slice()).unwrap();
+            let expected = (uid, gid, mode, mtime as i64);
+            let metadata = || {
+                let meta = std::fs::metadata(&staging).unwrap();
+                (meta.uid(), meta.gid(), meta.mode() & 0o7777, meta.mtime())
+            };
+            assert_eq!(metadata(), expected);
+            // A layer without a root entry keeps the previous layer's root metadata.
+            root.apply_layer(unpack::tests::layer(&[("later", 'f', "data")]).as_slice()).unwrap();
+            assert_eq!(metadata(), expected);
+            // Injection must not change the final root timestamp either.
+            root.write_file("injected", b"init", 0o755).unwrap();
+            root.restore_root_metadata().unwrap();
+            assert_eq!(metadata(), expected);
+            let dest = dir.join(format!("{note}.ext4"));
+            mkfs(&staging, root.entries, &dest).unwrap();
+            // debugfs's root edits keep the inode checksum valid.
+            let fsck = Command::new("e2fsck").arg("-fn").arg(&dest).output().unwrap();
+            assert!(fsck.status.success(), "{}", String::from_utf8_lossy(&fsck.stdout));
+            let out = Command::new("debugfs").args(["-R", "stat /"]).arg(&dest).output().unwrap();
+            assert!(out.status.success());
+            let stat = String::from_utf8(out.stdout).unwrap();
+            assert!(stat.contains(&format!("Mode:  {mode:04o}")), "{stat}");
+            assert!(stat.contains(&format!("User: {uid:5}   Group: {gid:5}")), "{stat}");
+            assert!(stat.contains(&format!("mtime: 0x{mtime:08x}")), "{stat}");
+            assert!(stat.contains("system.posix_acl_default"), "{stat}");
+            assert!(stat.contains("system.posix_acl_access"), "{stat}");
+            assert!(stat.contains(&format!("user.note ({}) = \"{note}\"", note.len())), "{stat}");
+        }
     }
 
     #[test]
@@ -1752,7 +1959,7 @@ mod tests {
         std::fs::write(&init, b"init").unwrap();
         let o = Options { image, ..Options::default() };
         let config_value: Value = serde_json::from_str(&config).unwrap();
-        let key = json!({"v": 3, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
+        let key = json!({"v": 4, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();
@@ -1812,23 +2019,23 @@ mod tests {
         }
         std::fs::write(root.join("k.ext4"), "elsewhere").unwrap();
         let images = root.join("images");
-        assert_eq!(remove_rootfs(&images, &root.join("k.ext4")).unwrap(), Removal::Absent);
-        assert_eq!(remove_rootfs(&images, &dir.join("k.conf")).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &root.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.conf"), Path::new("/test"), false).unwrap(), Removal::Absent);
         assert!(root.join("k.ext4").exists() && entry_complete(&dir.join("k.ext4")));
         // A pull building a template of it holds it until it is published.
         let building = cached_rootfs(&dir.join("k.ext4"), never, sync_dir).unwrap();
         assert_eq!(building.conf, "conf");
-        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4")).unwrap(), Removal::InUse);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::InUse);
         assert!(entry_complete(&dir.join("k.ext4")));
         drop(building);
         // One checking or building it holds its key's lock: not waited for.
         let pinned = crate::host::Directory::open(&dir).unwrap();
         let key = crate::host::lock_at(crate::host::host_locks().unwrap(), &key_lock(&pinned, &pinned.path.join("k.ext4")).unwrap(), libc::LOCK_EX).unwrap();
-        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4")).unwrap(), Removal::InUse);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::InUse);
         drop(key);
-        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4")).unwrap(), Removal::Removed);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::Removed);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4")).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::Absent);
     }
 
     /// #631: an rmi between the cache check and reading `.conf` (or reserving) made the pull fail.
@@ -1858,7 +2065,7 @@ mod tests {
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let start = Instant::now();
-                    if remove_rootfs(&images, &cached).unwrap() == Removal::Removed {
+                    if remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap() == Removal::Removed {
                         removed.fetch_add(1, Ordering::SeqCst);
                     }
                     tries.fetch_add(1, Ordering::SeqCst);
@@ -1874,7 +2081,7 @@ mod tests {
             std::thread::spawn(move || {
                 // Called under the pull's key lock, after its cache check (and in a publication): refused there.
                 let sync = |dir: &Path| {
-                    assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
+                    assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::InUse);
                     sync_dir(dir)
                 };
                 // A time budget (a slow disk slows the remover tenfold), but past one removal at least.
@@ -1883,7 +2090,7 @@ mod tests {
                 while round < 300 && (Instant::now() < until || removed.load(Ordering::SeqCst) == 0) {
                     let got = cached_rootfs(&cached, build("built"), sync).unwrap();
                     assert_eq!(got.conf, "built config");
-                    assert_eq!(remove_rootfs(&images, &cached).unwrap(), Removal::InUse);
+                    assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::InUse);
                     assert_eq!(read(&got.path), "built image");
                     drop(got);
                     // Every other round, a removal tried wholly after the entry is let go.

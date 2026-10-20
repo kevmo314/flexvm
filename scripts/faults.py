@@ -15,8 +15,8 @@ directories of this run's own.
 
 --template names a template of the test image, whose guests have what the
 scenarios run (python3, socat, iproute2):
-    sudo scripts/test-image.py /var/tmp/test-image
-    sudo flexvm pull /var/tmp/test-image --tag small --vcpus 2 --max 2048
+    sudo scripts/test-image.py /var/lib/flexvm-test-image
+    sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --max 2048
 (scripts/e2e.py's heavy shard builds it with --max 10240: scenarios that set
 up 1500 MiB or more, such as pages_dead, need that.)
 
@@ -26,7 +26,7 @@ a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
 """
 from contextlib import ExitStack, contextmanager, suppress
 
-import argparse, base64, fcntl, glob, ipaddress, json, shlex, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, base64, fcntl, glob, ipaddress, json, shlex, shutil, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -109,14 +109,17 @@ listeners = {}
 # What `rm` deleted of a VM's NAME.log, by (run directory, name): `log` reads it first, so it reads
 # on as from one file across the removal (a VM's last words, written as `rm -f` kills it, included).
 REMOVED_LOGS = {}
+# The same of NAME.log.1, its previous rotation: only failure dumps (`dump_logs`) read it.
+REMOVED_PREV = {}
 
 
 class HeldLogs:
-    """`rm [-f] NAME...` deletes the VMs' logs. Each NAME.log there while it runs is held open (one
-    a rotation made as the VM ended too), so `kept` reads what the removal unlinked, in order."""
+    """`rm [-f] NAME...` deletes the VMs' logs. Each NAME.log.1 and NAME.log there while it runs is
+    held open (one a rotation made as the VM ended too), so `kept` reads what the removal unlinked, in order."""
 
     def __init__(self, vms_dir, names):
-        self.paths = {n: os.path.join(vms_dir, f"{n}.log") for n in names}
+        # The previous rotation first: what is held is read back in the order first seen.
+        self.paths = {n: [(ext, os.path.join(vms_dir, f"{n}{ext}")) for ext in (".log.1", ".log")] for n in names}
         self.held = {n: {} for n in names}
         self.done = threading.Event()
         self.look()
@@ -124,31 +127,33 @@ class HeldLogs:
         self.watcher.start()
 
     def look(self):
-        for n, path in self.paths.items():
-            try:
-                f = open(path, errors="replace")
-            except OSError:
-                continue
-            ino = os.fstat(f.fileno()).st_ino
-            if ino in self.held[n]:
-                f.close()
-            else:
-                self.held[n][ino] = f
+        for n, paths in self.paths.items():
+            for ext, path in paths:
+                try:
+                    f = open(path, errors="replace")
+                except OSError:
+                    continue
+                ino = os.fstat(f.fileno()).st_ino
+                if ino in self.held[n]:
+                    f.close()
+                else:
+                    # Under the name it was first seen by: a NAME.log rotated meanwhile is still the log's.
+                    self.held[n][ino] = (ext, f)
 
     def watch(self):
         while not self.done.wait(0.005):
             self.look()
 
     def kept(self):
-        """{name: what its logs held}, of those `rm` unlinked."""
+        """{(name, ".log" or ".log.1"): what those logs held}, of those `rm` unlinked."""
         self.done.set()
         self.watcher.join()
         kept = {}
         for n, files in self.held.items():
-            for f in files.values():
+            for ext, f in files.values():
                 with f:
                     if os.fstat(f.fileno()).st_nlink == 0:
-                        kept[n] = kept.get(n, "") + f.read()
+                        kept[(n, ext)] = kept.get((n, ext), "") + f.read()
         return kept
 
 
@@ -158,8 +163,9 @@ def cli(host, *a, timeout=120):
     try:
         r = subprocess.run([BIN, "--state", host.state, "--run", host.run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
     finally:
-        for n, text in (held.kept() if held else {}).items():
-            REMOVED_LOGS[(host.run, n)] = REMOVED_LOGS.get((host.run, n), "") + text
+        for (n, ext), text in (held.kept() if held else {}).items():
+            removed = REMOVED_LOGS if ext == ".log" else REMOVED_PREV
+            removed[(host.run, n)] = removed.get((host.run, n), "") + text
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -344,7 +350,7 @@ def vms(host):
                          guest_mib=d["describe"]["guest_mib"], admitted_mib=d["describe"]["admitted_mib"],
                          throttled=d["describe"]["throttled"], tap_dropped=d["describe"].get("tap_dropped"),
                          checkpoint_copy=d["describe"]["checkpoint_copy"], checkpoint_copy_stats=d["checkpoint_copy_stats"],
-                         background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"],
+                         background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"], clock_syncs=d.get("clock_syncs"),
                          remote_left=d["remote_left"], settling=d.get("settling"))
     return out
 
@@ -517,10 +523,55 @@ def log(host, name):
     return REMOVED_LOGS.get((host.run, name), "") + cur
 
 
+def dump_logs(names, tail=6000):
+    """Prints the last `tail` bytes of what each of `names` logged on each host, its previous rotation
+    (NAME.log.1) first and removed logs included: `rm -f` deletes a VM's logs, and a VM that died says
+    why only there. Best effort: a log it cannot read or print is noted, never raised."""
+    def read(path):
+        try:
+            with open(path, errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    for n in sorted(names):
+        for h in (A, B):
+            try:
+                vd = os.path.join(h.run, "vms")
+                text = (REMOVED_PREV.get((h.run, n), "") + read(os.path.join(vd, f"{n}.log.1"))
+                        + REMOVED_LOGS.get((h.run, n), "") + read(os.path.join(vd, f"{n}.log")))
+                data = text.encode("utf-8", errors="replace")
+                if not data:
+                    continue
+                cut = data[-tail:].decode("utf-8", errors="replace").rstrip()
+                more = f" (its last {tail} of {len(data)} bytes)" if len(data) > tail else ""
+                print(f"--- {n} on {h}{more}:\n{cut}\n--- end of {n} on {h}", flush=True)
+            except Exception as e:
+                with suppress(Exception):
+                    print(f"--- {n} on {h}: its logs could not be printed: {type(e).__name__}: {e}", flush=True)
+
+
+def whole_log(host, name):
+    """`log`, after what its rotation kept (NAME.log.1), as `flexvm logs` prints it."""
+    text = ""
+    for f, removed in ((f"{name}.log.1", REMOVED_PREV), (f"{name}.log", REMOVED_LOGS)):
+        text += removed.get((host.run, name), "")
+        with suppress(OSError):
+            text += open(os.path.join(host.run, "vms", f), errors="replace").read()
+    return text
+
+
+def remove_logs(vms_dir, name):
+    """`name`'s logs: their lifetime's directory (NAME.logs) and its links (NAME.log, NAME.log.1)."""
+    shutil.rmtree(os.path.join(vms_dir, f"{name}.logs"), ignore_errors=True)
+    for f in (f"{name}.log", f"{name}.log.1"):
+        with suppress(OSError):
+            os.unlink(os.path.join(vms_dir, f))
+
+
 def clear_log(host, name):
     REMOVED_LOGS.pop((host.run, name), None)
-    with suppress(OSError):
-        os.unlink(os.path.join(host.run, "vms", f"{name}.log"))
+    remove_logs(os.path.join(host.run, "vms"), name)
 
 
 def addr(host, ip):
@@ -532,12 +583,15 @@ def addr(host, ip):
 
 
 # --- a third peer, down -------------------------------------------------------------------------
-# A peer's route next hop must be one of its peers' addresses (#591). Scenarios that
-# need a route the kernel really installs, via a host other than A or B, use this one: an address in a
-# network namespace of its own behind a veth, on-link here and not ours, where nothing listens (a peer
-# that is down: what is sent to it is refused at once). Listed as a peer of A and B only while such a
+# A peer's route next hop must be one of its own addresses (#591, #914). Scenarios that
+# need a route the kernel really installs, via a host other than A or B, use this one: its underlay is an
+# address in a network namespace of its own behind a veth, on-link here and not ours, where nothing
+# listens (a peer that is down: what is sent to it is refused at once). Its `peers` address is a loopback
+# one of its own (`THIRD["peer"]`), which what it sends here comes from (`as_third`), its underlay listed in
+# `peer_underlays` (a data-plane network of its own). Listed as a peer of A and B only while such a
 # scenario runs (`with_third_peer`).
 EXTRA_PEERS = []
+EXTRA_UNDERLAYS = {}
 THIRD = {}
 
 
@@ -552,7 +606,7 @@ def third_peer():
         subprocess.run(["ip", "link", "del", dev], capture_output=True)
         subprocess.run(["ip", "netns", "del", ns], capture_output=True)
         subprocess.run(["ip", "netns", "add", ns], check=True)
-        THIRD.update(ns=ns, dev=dev, addr=str(base + 1))
+        THIRD.update(ns=ns, dev=dev, addr=str(base + 1), peer=f"127.77.{(slot >> 8) & 255}.{slot & 255}")
         subprocess.run(["ip", "link", "add", dev, "type", "veth", "peer", "name", "eth0", "netns", ns], check=True)
         subprocess.run(["ip", "addr", "add", f"{base}/31", "dev", dev], check=True)
         subprocess.run(["ip", "link", "set", dev, "up"], check=True)
@@ -560,6 +614,12 @@ def third_peer():
         for d in ("eth0", "lo"):
             subprocess.run(["ip", "-n", ns, "link", "set", d, "up"], check=True)
     return THIRD["addr"]
+
+
+def as_third(host, req):
+    """One request to `host`'s peer listener from the third peer (its `peers` address)."""
+    third_peer()
+    return peer(host, req, source=THIRD["peer"])
 
 
 def remove_third_peer():
@@ -573,17 +633,20 @@ def remove_third_peer():
 def listing_third_peer(*hosts):
     """The third peer listed by `hosts` (and by a listener restarted meanwhile), their own peer lists
     as they were afterwards. Not across a restart of a loopback listener: one refuses a peer elsewhere."""
-    peer = f"{third_peer()}:7070"
-    before = {h: host_config(h).get("peers", []) for h in hosts}
+    gw = third_peer()
+    peer = f"{THIRD['peer']}:7070"
+    before = {h: host_config(h) for h in hosts}
     EXTRA_PEERS.append(peer)
+    EXTRA_UNDERLAYS[peer] = [gw]
     try:
         for h in hosts:
-            configure(h, peers=before[h] + [peer])
+            configure(h, peers=before[h].get("peers", []) + [peer], peer_underlays={**before[h].get("peer_underlays", {}), peer: [gw]})
         yield
     finally:
         EXTRA_PEERS.remove(peer)
+        EXTRA_UNDERLAYS.pop(peer, None)
         for h in hosts:
-            configure(h, peers=before[h])
+            configure(h, peers=before[h].get("peers", []), peer_underlays=before[h].get("peer_underlays", {}))
 
 
 def with_third_peer(scenario):
@@ -606,6 +669,7 @@ def start_listener(h, listen=None, extra=None, peer=None, wait=True):
     nets = [ipaddress.IPv4Network(f"{ip}/24", strict=False) for host in (h, other) for ip in host.ips.split("-")]
     first, last = min(n.network_address for n in nets) + 1, max(n.broadcast_address for n in nets) - 1
     extra = dict(extra or {})
+    extra.setdefault("peer_underlays", dict(EXTRA_UNDERLAYS))
     configure(h, peers=[peer or other.addr, *EXTRA_PEERS, *extra.pop("peers", [])], vm_ips=h.ips,
               cluster_ips=f"{first}-{last}", reserve_mib=512, **extra)
     listeners[h.addr] = spawn_cli(h, "listen", listen or h.addr, stdout=lg, stderr=lg)
@@ -743,6 +807,10 @@ def basic(swept=False):
     at a sweep, not at a `done`; each try runs one on A (which settles what it owes) and then on B."""
     n = "ft-basic"
     m = setup(n)
+    # Records this scenario's migrations make: one an earlier scenario left (going at its own pace, at a
+    # sweep or its source's done) is not this one's to wait for, but swept, every one goes.
+    migs = lambda h: set(undone_migs(os.path.join(h.state, "migs")))
+    earlier = {h: set() if swept else migs(h) for h in (A, B)}
     r = ok(migrate(A, n, B))
     st = wait_released(B, n)
     check("basic: released", st["released"] is True, st)
@@ -755,10 +823,10 @@ def basic(swept=False):
     check("basic: md5 intact after round trip", md5(A, n) == m)
     # A target forgets a migration only once its source said it is done
     # with it (it never asks again); until then it says released.
-    migs = lambda h: undone_migs(os.path.join(h.state, "migs"))
+    mine = lambda h: migs(h) - earlier[h]
     swept_ok = lambda: not swept or all(cli(h, "debug", "gc")[0] == 0 for h in (A, B))
-    check("basic: records go once their sources are done", wait_for(lambda: swept_ok() and not migs(A) and not migs(B), 10),
-          (migs(A), migs(B)))
+    check("basic: records go once their sources are done", wait_for(lambda: swept_ok() and not mine(A) and not mine(B), 10),
+          (mine(A), mine(B), earlier))
     s3 = peer(B, {"op": "migration", "mig": 12345})
     check("basic: an unknown id is fenced as aborted", s3["result"]["outcome"] == "aborted", s3)
 
@@ -766,9 +834,10 @@ def basic(swept=False):
 def route():
     n = "ft-route"
     m = setup(n)
-    fault(A, "route", 1000)
-    r = ok(migrate(A, n, B))
-    check("route: migrate reports reroute error but succeeds", r["reroute_error"] is not None, r["reroute_error"])
+    # Armed until the migration answered: its reroute runs after the commit's ack.
+    with armed_fault(A, "route", 600000):
+        r = ok(migrate(A, n, B))
+    check("route: migrate reports reroute error but succeeds", "injected fault: route_via failed" in (r["reroute_error"] or ""), r["reroute_error"])
     w = where(n)
     check("route: source never resumed", w.get(A) in (None, "source") and w.get(B) == "running", w)
     st = wait_released(B, n)
@@ -779,8 +848,11 @@ def route():
 def lost_ack():
     n = "ft-lost-ack"
     m = setup(n)
-    fault(B, "lost_ack", 1000)
-    r = migrate(A, n, B)
+    # Armed until the migration answered, however long it takes to get to its ack.
+    clear_gate(B, "lost_ack")
+    with armed_fault(B, "lost_ack", 600000):
+        r = migrate(A, n, B)
+    check("lost ack: the target dropped its ack", reached(B, "lost_ack"), reached(B, "lost_ack"))
     check("lost ack: source learns the target committed", r["ok"], r)
     st = wait_released(B, n)
     check("lost ack: only on B", where(n) == {B: "running"}, (where(n), st))
@@ -790,13 +862,13 @@ def lost_ack():
 def unknown():
     n = "ft-unknown"
     m = setup(n)
-    fault(B, "lost_ack", 1000)
-    fault(B, "status", 5000)
-    r = migrate(A, n, B)
-    check("unknown: migrate reports unknown outcome", not r["ok"] and "paused" in r["error"], r)
-    w = where(n)
-    # Paused, waiting to learn the outcome: reconciling (#358), or gone once it has.
-    check("unknown: source never resumed", w.get(A) in (None, "reconciling") and w.get(B) == "running", w)
+    # Both armed until the migration answered: the ack lost and the status unavailable for all of it.
+    with armed_fault(B, "lost_ack", 600000), armed_fault(B, "status", 600000):
+        r = migrate(A, n, B)
+        check("unknown: migrate reports unknown outcome", not r["ok"] and "paused" in r["error"], r)
+        w = where(n)
+        # Paused, waiting to learn the outcome: reconciling (#358).
+        check("unknown: source never resumed", w.get(A) == "reconciling" and w.get(B) == "running", w)
     st = wait_released(B, n)
     check("unknown: reconciled and released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("unknown: md5 intact", md5(B, n) == m)
@@ -1025,7 +1097,7 @@ def target_killed():
         w = where(n)
         check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "reconciling", (r, w or "gone everywhere"))
         migs = os.path.join(B.state, "migs")
-        newest = max(os.listdir(migs), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
+        newest = max(migs_of(B), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
         # Asked at once, before the Firecracker can have died of its own accord.
         fault(B, "status", 0)
         st = peer(B, {"op": "migration", "mig": int(newest)})
@@ -1147,13 +1219,24 @@ def guest_calls():
     skews = tsc_skews(B, n)
     check("guest calls: the vCPUs' TSCs agree", tscs_agree(skews), skews)
     check("guest calls: target stepped the guest clock", *guest_clock_right(B, n))
-    # A clock step the guest carried out but whose answer was lost goes again.
+    # A clock step the guest carried out but whose answer was lost goes again: one reply lost
+    # (`tripped_once`), the step it was, and the step then succeeding (its end counted: `clock_syncs`).
     before = vms(B)[n]["guest_retries"].get("CLOCK", 0)
+    # The arrival's own clock check ended first (one so far), so the count below is the resume's.
+    check("guest calls: the arrival's clock check ended", wait_for(lambda: sum(vms(B)[n]["clock_syncs"].values()) >= 1, 30), vms(B)[n]["clock_syncs"])
+    syncs = vms(B)[n]["clock_syncs"]
     pause(B, n)
-    fault(B, "guest_lose_reply", 300)
-    resume(B, n)
+    clear_gate(B, "guest_lose_reply")
+    with armed_fault(B, "guest_lose_reply", 600000):
+        resume(B, n)
+        lost = wait_for(lambda: reached(B, "guest_lose_reply"), 30)
+    check("guest calls: a reply was lost", lost, reached(B, "guest_lose_reply"))
     retried = lambda: vms(B)[n]["guest_retries"].get("CLOCK", 0) > before
-    check("guest calls: a clock step with its reply lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
+    check("guest calls: the clock step whose reply was lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
+    ended = lambda: sum(vms(B)[n]["clock_syncs"].values()) > sum(syncs.values())
+    check("guest calls: and the resume's clock check succeeded", wait_for(ended, 30) and vms(B)[n]["clock_syncs"] == {**syncs, "ok": syncs["ok"] + 1},
+          (syncs, vms(B)[n]["clock_syncs"], log(B, n)[-500:]))
+    check("guest calls: the guest clock is right", *guest_clock_right(B, n))
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
 
 
@@ -1213,7 +1296,7 @@ def exec_background():
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
     session slots; nor do interrupted ones (SIGINT stops the command), or abandoned sessions
     whose client disconnected or was killed outright, nor exits whose client reads its output
-    slowly or stays silent after it; a client that takes no output for 60 s is dropped."""
+    slowly or stays silent after it; a client that takes no output for 60 s keeps all of it."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # The guest's sweeper reads the knob only between its sweeps, which come a minute apart without it:
@@ -1229,8 +1312,8 @@ def exec_background():
         s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": {"argv": ["sh", "-c", cmd]}}) + "\n").encode())
         return s
 
-    # #505. A client that stops reading is dropped after 60 s without progress, freeing its relay and
-    # control slot; its session stays in the guest. Started now, checked after the rest below.
+    # #505, #999. A client that stops reading for over 60 s keeps its relay (the command waits for it)
+    # while the host has session slots to spare. Started now, checked after the rest below.
     stalled_id = os.urandom(16).hex()
     stalled = raw_exec(stalled_id, "head -c 100000000 /dev/zero")
     stalled_at = time.time()
@@ -1316,24 +1399,46 @@ def exec_background():
     big = 200000
     drained = []
 
-    def slow_reader(size, wait):
-        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" sh -c "head -c {size} /dev/zero" | (sleep {wait}; cat) | wc -c'
-        r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n], capture_output=True, text=True, timeout=180, env=ENV)
-        drained.append((size, (r.returncode, r.stdout.strip(), r.stderr.strip()[-200:])))
+    # The 70 readers below read only once `release` exists: after the checks made while they wait, however
+    # long starting 70 CLIs took.
+    release = os.path.join(A.run, "exec-bg-release")
+    with suppress(FileNotFoundError):
+        os.unlink(release)
 
-    readers = [threading.Thread(target=slow_reader, args=(big, 6)) for _ in range(70)]
+    def slow_reader(size, wait):
+        hold = f"sleep {wait}" if wait else f'while [ ! -e "$4" ]; do sleep 0.05; done'
+        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" sh -c "head -c {size} /dev/zero" | ({hold}; cat) | wc -c'
+        # Its own session, so a timeout ends the whole pipeline (the waiting subshell too), not just bash.
+        p = subprocess.Popen(["bash", "-c", cmd, BIN, A.state, A.run, n, release], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, env=ENV, start_new_session=True)
+        try:
+            out, err = p.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+            out, err = p.communicate()
+        drained.append((size, (p.returncode, out.strip(), err.strip()[-200:])))
+
+    readers = [threading.Thread(target=slow_reader, args=(big, None)) for _ in range(70)]
     start = time.time()
-    for r in readers:
-        r.start()
-        time.sleep(0.02)
-    full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
-    check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
-    t = time.time()
-    r = sh(A, n, "echo hi")
-    took = time.time() - t
-    check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
-    for r in readers:
-        r.join()
+    try:
+        for r in readers:
+            r.start()
+            time.sleep(0.02)
+        full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
+        check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
+        t = time.time()
+        r = sh(A, n, "echo hi")
+        took = time.time() - t
+        check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
+    finally:
+        # Released however the checks went (one raising too), and gone once they all read.
+        open(release, "w").close()
+        for r in readers:
+            if r.ident is not None:
+                r.join()
+        with suppress(FileNotFoundError):
+            os.unlink(release)
     bad = [d for d in drained if d[1] != (0, str(d[0]), "")]
     check("exec bg: 70 slow readers all get all their output and status", len(drained) == 70 and not bad, bad[:3])
     # More output than the guest keeps for a session (4 MiB): the command waits for its reader, and the
@@ -1343,15 +1448,31 @@ def exec_background():
     check("exec bg: 6 MB to a reader that stalls for 15 s all arrive", drained == [(6000000, (0, "6000000", ""))], drained)
     check("exec bg: execs still start after the slow readers", sh(A, n, "echo hi") == (0, "hi"))
     time.sleep(max(0, stalled_at + 65 - time.time()))
-    got, t = 0, time.time()
-    stalled.settimeout(10)
+    # Every byte, in order, then its exit, unacknowledged (the client hangs up without SESSION_DONE).
+    got, code, t = 0, None, time.time()
+    stalled.settimeout(30)
+    f = stalled.makefile("rb")
     try:
-        while d := stalled.recv(1 << 20):
-            got += len(d)
+        f.readline()
+        while (head := f.read(5)) and len(head) == 5:
+            kind, size = struct.unpack("<BI", head)
+            data = f.read(size)
+            if kind == 1 and data[:8] == struct.pack("<Q", got):
+                got += size - 8
+            elif kind == 3:
+                code = (struct.unpack("<Q", data[:8])[0], struct.unpack("<i", data[8:12])[0])
+                break
+            elif kind != 4:
+                got = (got, kind, data[:8])
+                break
     except OSError as e:
         got = (got, str(e))
+    f.close()
     stalled.close()
-    check("exec bg: a client that took nothing for 60 s was dropped", isinstance(got, int) and 0 < got < 100000000 and time.time() - t < 10, got)
+    check("exec bg: a client that took nothing for 60 s keeps its relay and gets every byte",
+          got == 100000000 and code == (got, 0) and time.time() - t < 60, (got, code, time.time() - t))
+    # Dropping a stalled client only near the host's session limit (192 of 256) is unit-tested
+    # (vmproc session_relay_tests): 192 sessions at once are past the guest's 64 running ones.
     frames = []
     if isinstance(got, int):
         with socket.socket(socket.AF_UNIX) as s:
@@ -1365,8 +1486,8 @@ def exec_background():
                 data = f.read(size)
                 frames.append((kind, data if kind == 4 else data[:8]))
             f.close()
-    check("exec bg: its session stayed in the guest, for a reattach from where it was dropped",
-          frames[1:] == [(4, stalled_id.encode()), (1, struct.pack("<Q", got))], frames)
+    check("exec bg: its unacknowledged exit stayed in the guest, for a reattach from where it hung up",
+          frames[1:] == [(4, stalled_id.encode()), (3, struct.pack("<Q", got))], frames)
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(30)
         s.connect(sock)
@@ -1556,16 +1677,39 @@ def guest_hang():
     check("guest hang: migrates afterwards, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
 
 
+def own_address(host, ip):
+    """Whether `ip` is in `host`'s range: the addresses whose generations it hands out."""
+    first, last = (ipaddress.IPv4Address(a) for a in host.ips.split("-"))
+    return first <= ipaddress.IPv4Address(ip) <= last
+
+
+def issued_gen(host, ip):
+    """A generation `host` handed out (#914: of its own addresses, no other arrives), newer than its record
+    of `ip`: the last it handed out, after it hands out one more (a VM started and killed) if that is not."""
+    def issued():
+        try:
+            with open(os.path.join(host.run, ".gens.next")) as f:
+                return json.load(f)["next"] - 1
+        except (OSError, ValueError, KeyError):
+            return 0
+    if issued() <= addr(host, ip).get("seen", 0):
+        n = "ft-gen-issue"
+        ok(run(host, n))
+        kill(host, n)
+    return issued()
+
+
 def migrate_in_raw(host, name, ip, source, gen=None, template=None):
     """Asks `host` to prepare an incoming migration as a source would, for a
     VM like `source` (its template id and memory regions, from `source_vm`).
     Returns the open socket and the prepare reply."""
     template_id, regions = source
+    # Newer than any the host has seen for it, as an arriving VM's is; one it handed out, for an address of its own (#914).
+    if gen is None:
+        gen = issued_gen(host, ip) if own_address(host, ip) else addr(host, ip).get("seen", 0) + 1
     h, port = host.addr.rsplit(":", 1)
     s = socket.create_connection((h, int(port)), timeout=60)
     mig = int.from_bytes(os.urandom(6), "little")
-    # Newer than any the host has seen for it, as an arriving VM's is.
-    gen = addr(host, ip).get("seen", 0) + 1 if gen is None else gen
     # The rate its state was saved at: the template's, as a VM restored on its build host runs at.
     # A forged template name (forged_peer) has none: the real template's then.
     with open(os.path.join(host.state, "templates", args.template, "meta.json")) as f:
@@ -1668,6 +1812,8 @@ def arrival_flood():
     m = setup(n)
     src = source_vm()
     names = [(f"ft-flood-{i}", spare(B, 10 + i)) for i in range(4)]
+    # Before the host lock is held here: finding one may start a VM on B.
+    gens = {ip: issued_gen(B, ip) for _, ip in names}
     replies = {}
     # The listener takes an arrival's place before it makes its log (`.incoming-*.log`).
     arrivals = lambda: {f for f in os.listdir(os.path.join(B.run, "vms")) if f.startswith(".incoming-")}
@@ -1676,7 +1822,7 @@ def arrival_flood():
         fcntl.flock(lock, fcntl.LOCK_EX)
         started = time.time()
         def arrive(name, ip):
-            s, r, _ = migrate_in_raw(B, name, ip, src)
+            s, r, _ = migrate_in_raw(B, name, ip, src, gen=gens[ip])
             replies[name] = (r, time.time() - started)
             s.close()
         ts = [threading.Thread(target=arrive, args=a) for a in names]
@@ -1740,25 +1886,29 @@ def arrival_cap_restart():
 @with_third_peer
 def abort_superseded():
     """A migration that aborts after the source paused does not resume the
-    source if a newer generation of its address was recorded meanwhile (the
-    address went to another VM): the copy is destroyed instead, and the
-    route the newer VM's host announced replaces the hold."""
+    source if its generation went meanwhile (its target withdrew it: the VM
+    ran there and ended): the copy is destroyed instead. Another peer cannot
+    bring that about (#914): its newer generation of the address, while the
+    source holds it here at home, is refused and changes nothing."""
     n = "ft-superseded"
     setup(n)
     v = vms(A)[n]
-    ip, gen = v["ip"], v["gen"]
-    # The replacement's host: the third peer, on-link and not ours, so the
-    # route is really installed.
+    ip, gen, tap = v["ip"], v["gen"], v["tap"]
+    # The other peer's next hop: the third peer's, on-link and not ours, so a route would really be installed.
     gw = third_peer()
     with armed_fault(A, "pages", 30000):
         res, t = background(lambda: migrate(A, n, B))
         # While the target probes the dead page server, the address moves on.
         wait_for(lambda: vms(A).get(n, {}).get("state") == "source", 20)
-        r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
-        check("abort superseded: the newer generation is taken, the source keeps the route",
-              r.get("ok") and not r["result"].get("stale") and r["result"].get("local"), r)
-        # The target hears of it too (its arrival does not commit then).
-        peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+        before = addr(A, ip)
+        r = as_third(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+        check("abort superseded: another peer's newer generation is refused, the record kept",
+              not r.get("ok") and "held by vm" in r.get("error", "") and addr(A, ip) == before, (r, addr(A, ip)))
+        # Its target's withdrawal is taken, there (its arrival does not commit then) and here.
+        r = peer(B, {"op": "route", "ip": ip, "gen": gen})
+        check("abort superseded: the target withdraws it on its own host", r.get("ok"), r)
+        r = peer(A, {"op": "route", "ip": ip, "gen": gen})
+        check("abort superseded: and on the source's, where it migrates to", r.get("ok") and addr(A, ip).get("withdrawn"), (r, addr(A, ip)))
         t.join()
     r = res.get("r", {})
     check("abort superseded: migration failed", not r.get("ok"), r)
@@ -1766,10 +1916,8 @@ def abort_superseded():
     # Not just "superseded": the VM's name (ft-superseded) is on every line.
     check("abort superseded: says why", "was superseded meanwhile" in log(A, n), log(A, n)[-300:])
     check("abort superseded: running nowhere", where(n) == {}, where(n))
-    route = subprocess.run(["ip", "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
-    check("abort superseded: the address routes to the replacement, not the hold", f"via {gw}" in route, route)
-    check("abort superseded: the source put that route back itself", f"put back route {ip} via {gw} (generation {gen + 1})" in log(A, n), log(A, n)[-300:])
-    subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+    route = peer_route(ip)
+    check("abort superseded: the address routes neither to the hold nor via the other peer", tap not in route and f"via {gw}" not in route, route)
 
 
 # --- migration failure boundaries (#460) ---------------------------------------
@@ -1787,7 +1935,8 @@ def arrivals(host):
 
 
 def migs_of(host):
-    return set(os.listdir(os.path.join(host.state, "migs")))
+    """`host`'s migration records: not the temporary files (dotfiles) a record is written by."""
+    return {f for f in os.listdir(os.path.join(host.state, "migs")) if not f.startswith(".")}
 
 
 def undone_migs(d):
@@ -1945,22 +2094,27 @@ def commit_fail():
     ip, gen, tap = v["ip"], v["gen"], v["tap"]
     check("commit fail: routed to its tap", f"dev {tap}" in peer_route(ip), peer_route(ip))
     before = boundary(B)
+    clear_gate(B, "commit_gate")
+    clear_gate(B, "commit_fail")
     fault(B, "commit_gate", 60000)
     with armed_fault(B, "commit_fail", 60000):
         res, t = background(lambda: migrate(A, n, B))
+        pid, fcs, states, source = 0, [], None, None
         try:
             check("commit fail: the arrival got to its commit", wait_for(lambda: reached(B, "commit_gate"), 30), reached(B, "commit_gate"))
-            # From here at most 5 s: Rust only gates with 10 s to spare before the deadlines.
-            fault(B, "commit_gate", 5000)
+            # Parked while what the checks below need is read (`finally`). Rust only gates with 10 s to spare before the
+            # deadlines, so what is done here is bounded well within that: /proc and registry reads, and one
+            # Firecracker API call of at most 3 s (no `vms`, whose status calls may take 10 s each).
             pid = (reached(B, "commit_gate") or [0])[0]
             fcs = [c for c in children(pid) if b"--api-sock" in open(f"/proc/{c}/cmdline", "rb").read()]
             sock = lambda c: (lambda a: a[a.index(b"--api-sock") + 1].decode())(open(f"/proc/{c}/cmdline", "rb").read().split(b"\0"))
-            states = [fc_api(sock(c), "GET", "/")["state"] for c in fcs]
-            check("commit fail: the arrival's vm is loaded, never run", states == ["Paused"], (fcs, states))
-            check("commit fail: the source is paused, waiting", vms(A)[n]["state"] == "source", vms(A)[n])
+            states = [(fc_api(sock(c), "GET", "/", timeout=3) or {}).get("state") for c in fcs]
+            source = registry_state(A, n)
         finally:
             fault(B, "commit_gate", 0)
             t.join(90)
+    check("commit fail: the arrival's vm is loaded, never run", states == ["Paused"], (fcs, states))
+    check("commit fail: the source is paused, waiting", source == "source", source)
     r = res.get("r", {})
     check("commit fail: reached", pid in reached(B, "commit_fail"), reached(B, "commit_fail"))
     check("commit fail: migrate refused, saying why", not r.get("ok") and "committing failed" in r.get("error", ""), r)
@@ -2144,11 +2298,11 @@ def abort_stay_fail():
     try:
         check("abort stay fail: B took its announcement, past the target's revision",
               wait_for(lambda: addr(B, ip).get("rev") == rev + 2 and addr(B, ip).get("via") == "127.0.0.1", 10), addr(B, ip))
-        late = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
+        late = as_third(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
         check("abort stay fail: the target's revision is stale on B", late.get("ok") and late["result"].get("stale"), late)
         check("abort stay fail: A records its revision once the write goes through (#499)",
               wait_for(lambda: addr(A, ip).get("rev") == rev + 2 and "recorded its revision" in log(A, n)[seen:], 10), addr(A, ip))
-        late = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
+        late = as_third(A, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
         check("abort stay fail: the target's revision is stale on A, the route on its tap",
               late.get("ok") and late["result"].get("stale") and f"dev {tap}" in peer_route(ip), (late, peer_route(ip)))
         check("abort stay fail: still the one owner", where(n) == {A: "running"} and addr(A, ip).get("holder") == n, (where(n), addr(A, ip)))
@@ -2532,9 +2686,21 @@ def rx_state(host, name):
         st["fc_flushes"] = len(lines)
     except Exception as e:
         st["fc_net"] = f"unavailable: {e}"
-    tap = vms(host)[name].get("tap")
+    tap = vms(host).get(name, {}).get("tap")  # it may be gone meanwhile
     st["tap"] = subprocess.run(["ip", "-s", "link", "show", tap], capture_output=True, text=True).stdout if tap else None
     return st
+
+
+def vm_alive(host, name):
+    """Whether `name` has a live VM process on `host`. `vms` keeps the pid `ps` gave even when the
+    process exited before its status query, so that process is checked, then `ps` asked again."""
+    pid = vms(host).get(name, {}).get("pid")
+    try:
+        if pid:
+            os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return bool(pid) and bool(vms(host).get(name, {}).get("pid"))
 
 
 def rx_stall():
@@ -2543,8 +2709,10 @@ def rx_stall():
     restore, suspend and resume, and pause and resume a VM over and over;
     after each, the guest's InDatagrams must go up again. On a stall it
     records the guest's, Firecracker's and the tap's view, then has the
-    guest send one datagram
-    (an interrupt on the same line) to see whether that wakes its receive.
+    guest send one datagram (an interrupt on the same line) to see whether
+    that wakes its receive. A VM that died instead is no stall: that fails
+    as a death, with the VM's log (a crashed guest's console) printed, as
+    CI's were guests crashing right after a restore (#968).
     RX_ITERS (default 25), RX_RATE (datagrams/s, default 2000) and
     RX_TAP_RATE (frames/s written onto its tap, default 1000) scale it."""
     n = "ft-rx-stall"
@@ -2627,8 +2795,16 @@ def rx_stall():
             check(f"rx stall: {op} {i} succeeded", False, r)
             break
         done[op] = done.get(op, 0) + 1
-        cur_tap[0] = vms(cur)[n].get("tap") or cur_tap[0]
+        cur_tap[0] = vms(cur).get(n, {}).get("tap") or cur_tap[0]
         if not receiving(cur, n):
+            if not vm_alive(cur, n):
+                v = vms(cur).get(n, {})
+                # Not a stall: the VM is gone (#968). Its log ends with how it died, and a guest crash
+                # with the guest's console (#964), which the scenario's later cleanup may not leave behind.
+                check(f"rx stall: the VM lived through {op} {i}", False,
+                      {"state": v.get("state"), "error": v.get("error"), "status": v.get("status")})
+                print(f"rx stall: {cur}'s log of {n}:\n{whole_log(cur, n)}", flush=True)
+                break
             before = rx_state(cur, n)
             code, out = sh(cur, n, "echo wake | socat -u - UDP-SENDTO:169.254.1.1:9")
             woke = receiving(cur, n)
@@ -2647,8 +2823,9 @@ def rx_stall():
 @with_third_peer
 def handoff_superseded():
     """A same-host arrival routes its address only after the held packets
-    (`handoff_stall` delays that by 3 s). A newer generation of the address
-    announced meanwhile keeps its route: the late handoff leaves it alone."""
+    (`handoff_stall` delays that by 3 s). Another peer's newer generation of
+    the address announced meanwhile is refused (#914: no peer brings one of an
+    address a VM here holds), so the late handoff takes the address over all the same."""
     n = "ft-handoff-superseded"
     ok(run(A, n))
     v = vms(A)[n]
@@ -2658,14 +2835,14 @@ def handoff_superseded():
         clear_log(B, n)
         r = migrate(A, n, B)
         check("handoff superseded: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
-        r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
-        check("handoff superseded: the newer generation is taken", r.get("ok") and not r["result"].get("stale"), r)
-        check("handoff superseded: the late handoff says it left the address alone",
-              wait_for(lambda: "went to a newer vm" in log(B, n), 10), log(B, n)[-300:])
-    time.sleep(0.5)
-    check("handoff superseded: the address routes to the newer vm's host", f"via {gw}" in peer_route(ip), peer_route(ip))
+        r = as_third(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+        check("handoff superseded: another peer's newer generation is refused", not r.get("ok") and "held by vm" in r.get("error", ""), r)
+        check("handoff superseded: B keeps the arrival's generation", addr(B, ip).get("seen") == gen, addr(B, ip))
+        tap = vms(B)[n]["tap"]
+        check("handoff superseded: the late handoff takes the address over", wait_for(lambda: f"dev {tap}" in peer_route(ip), 10), peer_route(ip))
+    check("handoff superseded: never as if it went to a newer vm", "went to a newer vm" not in log(B, n), log(B, n)[-300:])
+    check("handoff superseded: never via the other peer", f"via {gw}" not in peer_route(ip), peer_route(ip))
     kill(B, n)
-    forget_peer_route(ip, gen + 1)
 
 
 def delayed_announce():
@@ -2684,7 +2861,8 @@ def delayed_announce():
         r = migrate(A, n, B)
         check("delayed announce: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
         wait_released(B, n)
-        check("delayed announce: B took the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
+        # Recorded after the commit's answer (its fsyncs off the downtime): waited for, not read once.
+        check("delayed announce: B took the next revision", wait_for(lambda: addr(B, ip).get("rev") == 1, 10), addr(B, ip))
         check("delayed announce: A heard of it", wait_for(lambda: addr(A, ip).get("rev") == 1, 10), addr(A, ip))
     check("delayed announce: B handled it, as stale", wait_for(lambda: held_routes(B, ip, since)["answered"], 10)
           and held_routes(B, ip, since)["answered"] == [(gen, 0, "stale")], held_routes(B, ip, since))
@@ -2824,13 +3002,14 @@ def reconcile_announce():
     n = "ft-reconcile-announce"
     setup(n, mib=100)
     ip = vms(A)[n]["ip"]
-    with armed_fault(A, "pages_slow", 120000):
-        # Long enough for the slow pages the commit waits on.
-        with armed_fault(B, "lost_ack", 30000):
-            fault(B, "status", 30000)
+    # Each armed until the scenario disarms it, however long the steps in between take.
+    with armed_fault(A, "pages_slow", 600000):
+        with armed_fault(B, "lost_ack", 600000):
+            fault(B, "status", 600000)
             r = migrate(A, n, B)
         check("reconcile announce: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
-        check("reconcile announce: B committed the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
+        # Recorded after the commit's answer (its fsyncs off the downtime): waited for, not read once.
+        check("reconcile announce: B committed the next revision", wait_for(lambda: addr(B, ip).get("rev") == 1, 10), addr(B, ip))
         os.kill(json.load(open(os.path.join(B.run, "vms", ".locks", f"{n}.lock")))["pid"], signal.SIGKILL)
         fault(B, "status", 0)
         check("reconcile announce: runs on A again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
@@ -2860,10 +3039,12 @@ def reconcile_kill():
         m = setup(n, mib=100)
         ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
         gen = addr(A, ip)["seen"]
+        # Each armed until the scenario disarms it, however long the steps in between take: the
+        # outcome stays unknown until the source is killed, and a slow pull unfinished.
         if slow:
-            fault(A, "pages_slow", 120000)
-        with armed_fault(B, "lost_ack", 30000):
-            fault(B, "status", 30000)
+            fault(A, "pages_slow", 600000)
+        with armed_fault(B, "lost_ack", 600000):
+            fault(B, "status", 600000)
             r = migrate(A, n, B)
         check(f"{what}: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
         check(f"{what}: lent while it waits", addr(A, ip).get("lent") == gen, addr(A, ip))
@@ -2954,15 +3135,21 @@ def reconcile_kill():
     what = f"reconcile kill ({n})"
     setup(n, mib=100)
     ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
-    with armed_fault(A, "pages_slow", 120000):
-        fault(B, "incoming_stall", 2000)
-        with armed_fault(B, "lost_ack", 30000):
-            fault(B, "status", 30000)
+    # The arrival parked preparing (`incoming_gate`) until the source has taken the SIGINT and waits
+    # for the migration (`destroy_wait`), not for a guessed stall: both sides' preparation deadlines made
+    # long (`long_preflight`), so the gate outlasts them.
+    clear_gate(B, "incoming_gate")
+    clear_gate(A, "destroy_wait")
+    with armed_fault(A, "pages_slow", 600000), armed_fault(A, "destroy_wait", 600000), armed_fault(A, "long_preflight", 600000), \
+            armed_fault(B, "long_preflight", 600000), armed_fault(B, "incoming_gate", 600000):
+        with armed_fault(B, "lost_ack", 600000):
+            fault(B, "status", 600000)
             r = [None]
             th = start_thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
-            lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
-            wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
+            check(f"{what}: the arrival parked preparing", wait_for(lambda: reached(B, "incoming_gate"), 30), reached(B, "incoming_gate"))
             os.kill(pid, signal.SIGINT)
+            check(f"{what}: the SIGINT waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 30), reached(A, "destroy_wait"))
+            fault(B, "incoming_gate", 0)
             th.join()
         gone = wait_for(lambda: not alive(pid), 10)
         check(f"{what}: the waiting SIGINT ends the source, the migration giving up", gone and not r[0]["ok"] and "being destroyed" in r[0]["error"] and not owed(A),
@@ -3194,7 +3381,7 @@ def arrival_with_peer_route(n, ip):
     load and preloaded pages it never sends. Returns (socket, mig, gateway)."""
     gw = third_peer()
     gen = addr(B, ip).get("seen", 0) + 1
-    r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": 0})
+    r = as_third(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": 0})
     assert r.get("ok"), r
     assert f"via {gw}" in peer_route(ip), peer_route(ip)
     s, r, mig = migrate_in_raw(B, n, ip, source_vm(), gen=gen)
@@ -3660,7 +3847,9 @@ def guest_tcp_counters(host, name):
 def tcp_server(host, name, port=7000):
     code, out = sh(host, name, f"setsid socat TCP-LISTEN:{port},fork,reuseaddr EXEC:cat >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
-    time.sleep(0.3)
+    # Ready once the guest lists its socket listening, however long socat takes to get there.
+    listening = lambda: sh(host, name, f"ss -Hltn 'sport = :{port}'")[1] != ""
+    assert wait_for(listening, 30), f"socat never listened on {port} in {name}"
 
 
 FV_MASK = (1 << 64) - 1
@@ -3975,9 +4164,21 @@ def signals():
     after SIGTERM."""
     n = "ft-signals"
     setup(n)
-    fault(A, "pages", 3000)
-    ok(migrate(A, n, B))
-    signal_vm(A, n, signal.SIGTERM)
+    # The target's background pull held (`pull_gate`) until the source has taken the SIGTERM (its log says
+    # so): it cannot have every page, so the source is still one, however long each step takes.
+    clear_gate(B, "pull_gate")
+    with armed_fault(B, "pull_gate", 600000):
+        try:
+            ok(migrate(A, n, B))
+            check("signals: the target's pull is held", wait_for(lambda: reached(B, "pull_gate"), 30), reached(B, "pull_gate"))
+            check("signals: still the source when SIGTERM comes", vms(A).get(n, {}).get("state") == "source", where(n))
+            # Only what is logged after this SIGTERM: an earlier run's acknowledgement stays in the log.
+            since = len(log(A, n))
+            signal_vm(A, n, signal.SIGTERM)
+            check("signals: the source took the SIGTERM as one", wait_for(lambda: "migrating away; it ends once the target has its memory" in log(A, n)[since:], 30),
+                  log(A, n)[since:][-500:])
+        finally:
+            release(B, "pull_gate")
     st = wait_released(B, n)
     check("signals: SIGTERM on a source: no suspend, released", st["released"] is True and not os.path.exists(
         os.path.join(A.state, "suspended", n)), st)
@@ -4095,8 +4296,8 @@ def held_restore_frozen():
     rm_ckpt(path)
 
 
-def fc_api(sock, method, path, body=None):
-    cmd = ["curl", "-s", "--unix-socket", sock, "-X", method, f"http://localhost{path}"]
+def fc_api(sock, method, path, body=None, timeout=None):
+    cmd = ["curl", "-s", "--unix-socket", sock, "-X", method, f"http://localhost{path}", *(["--max-time", str(timeout)] if timeout else [])]
     if body is not None:
         cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
     out = subprocess.run(cmd, capture_output=True, text=True).stdout
@@ -4349,12 +4550,21 @@ def kill_prepare():
         ip, pid, recorded = vms(A)[n]["ip"], vm_pid(A, n), migs()
         clear_gate(host, gate)
         clear_gate(A, "destroy_wait")
-        # The gate under the source's 10 s for the target's answer (PREFLIGHT_TIMEOUT).
-        with armed_fault(A, "destroy_wait", 60000), armed_fault(host, gate, 8000):
+        # Parked until the kill is seen waiting, however long that takes: both sides' preflight deadlines and
+        # the target's wait for its source after its answer made long (`long_preflight`), so the gates outlast them.
+        with armed_fault(A, "destroy_wait", 600000), armed_fault(A, "long_preflight", 600000), \
+                armed_fault(B, "long_preflight", 600000), armed_fault(host, gate, 600000):
             moved, mt = background(lambda: migrate(A, n, B))
-            check(f"{what}: the migration got to the gate", wait_for(lambda: reached(host, gate), 8), reached(host, gate))
+            check(f"{what}: the migration got to the gate", wait_for(lambda: reached(host, gate), 30), reached(host, gate))
             killed, kt = background(lambda: cli_json(A, "kill", n))
-            check(f"{what}: the kill waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 8), reached(A, "destroy_wait"))
+            check(f"{what}: the kill waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 30), reached(A, "destroy_wait"))
+            # Its arrival still there to give up, not gone on its own meanwhile.
+            lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
+            try:
+                arrival = json.load(open(lock))["pid"]
+            except (OSError, ValueError, KeyError):
+                arrival = None
+            check(f"{what}: the target's arrival is still alive once the kill waits", arrival is not None and alive(arrival), arrival)
             fault(host, gate, 0)
             mt.join()
             kt.join()
@@ -6098,10 +6308,16 @@ def plug_race():
         r = migrate(src, n, dst)
         check(f"plug race {i}: migrate succeeds", r["ok"], r.get("error"))
         st = wait_released(dst, n, timeout=60)
-        check(f"plug race {i}: pull finished and released", st["released"] is True and st["failed"] is None, st)
-        check(f"plug race {i}: only on target, running", where(n) == {dst: "running"}, where(n))
-        hp = lambda: (vms(dst)[n]["requested_mib"], vms(dst)[n]["plugged_mib"])
-        settled = wait_for(lambda: hp()[0] == hp()[1] and (delta > 8192 or hp()[1] == want), 15)
+        released = check(f"plug race {i}: pull finished and released", st["released"] is True and st["failed"] is None, st)
+        if not check(f"plug race {i}: only on target, running", where(n) == {dst: "running"}, where(n)) or not released:
+            # Its records and both hosts' logs of it: the steps after need it running there.
+            print(f"plug race {i}: migrate said {r.get('result')}; source {vms(src).get(n)}; target {vms(dst).get(n)}")
+            for h in (src, dst):
+                print(f"plug race {i}: {h}'s log of it:\n{log(h, n)[-6000:]}")
+            return
+        # None while its status does not answer (`vms` leaves its fields out then).
+        hp = lambda: (lambda v: (v.get("requested_mib"), v.get("plugged_mib")))(vms(dst).get(n, {}))
+        settled = wait_for(lambda: (lambda r, p: r is not None and r == p and (delta > 8192 or p == want))(*hp()), 15)
         check(f"plug race {i}: hot-plug settled on target", settled, (want, hp()))
         check(f"plug race {i}: md5 intact", md5(dst, n) == m)
         code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
@@ -6387,9 +6603,9 @@ def mem_refused_fill():
 class Watch:
     """While eviction runs on `host`: each of `names`' controller ticks (from
     `debug status`) and its memory requests, asked as its guest does (`MEM`,
-    for a size it needs no change at) every 250 ms; and MemAvailable."""
-    def __init__(self, host, names):
-        self.host, self.stop = host, threading.Event()
+    for a size it needs no change at) every 250 ms; and MemAvailable (`avail`: what the host is shown instead)."""
+    def __init__(self, host, names, avail=None):
+        self.host, self.stop, self.available = host, threading.Event(), avail or mem_available
         self.socks, self.ticks, self.asks, self.avail = {}, {n: [] for n in names}, {n: [] for n in names}, []
         # Polls of its controller that went unanswered while it still ran here (a timeout is one).
         self.stuck = {n: [] for n in names}
@@ -6449,7 +6665,7 @@ class Watch:
 
     def mem(self):
         while not self.stop.wait(0.1):
-            self.avail.append((time.time(), mem_available()))
+            self.avail.append((time.time(), self.available()))
 
     def report(self, label):
         """Per VM: the longest gap between controller ticks seen, and memory requests answered (max ms)."""
@@ -6559,11 +6775,10 @@ def evict_no_pingpong():
     m = setup(n, mib=600)
     time.sleep(11)  # the start's grants age out
     base, rss = mem_available(), cgroup(A, n)[0]
-    # B under its own mark (by a margin: this host's MemAvailable moves by a
-    # GiB or more as other work comes and goes, and must not give it room):
-    # taking the VM would leave it under, and it would only move it back. A's
-    # mark is further up, so A keeps trying.
-    with marks(512, base + 4000, A), marks(512, base + 3000, B) as b:
+    # B under its own mark (by a margin): taking the VM would leave it under, and it would only move it
+    # back. A's mark is further up, so A keeps trying. Both shown `base` MiB available throughout: this
+    # machine's MemAvailable moves by a GiB or more as other work comes and goes.
+    with mem_available_as(A, base), mem_available_as(B, base), marks(512, base + 4000, A), marks(512, base + 3000, B) as b:
         seen = hosts_over(n, 25)
         check("no ping-pong: a peer it would put under its mark refuses it", seen == [A.addr] and where(n) == {A: "running"},
               (seen, where(n), log(A, n)[-1200:]))
@@ -6589,22 +6804,25 @@ def evict_grower():
         raise Skip("its guests need room to grow past 2 GiB (one at its ceiling is starved, and moved for that)")
     sums.update({n: setup(n, mib=900, template=tpl) for n in big})
     time.sleep(11)  # the starts' grants age out
+    # A shown what its VMs' growth leaves of `base`, B `base`: never what other work on this machine does.
     base = mem_available()
     reserve, high = base - 2600, base - 700
+    model = modeled_memory(A, base, big + [g])
+    available = model.now
 
     def rss(n):
         try:
             return cgroup(A, n)[0]
         except (OSError, KeyError, TypeError):
             return None
-    with Watch(A, big + [g]) as w, marks(reserve, high):
+    with model, mem_available_as(B, base), Watch(A, big + [g], avail=available) as w, marks(reserve, high):
         grow(A, g, 1300, 100)
         moved = None
         end = time.time() + 120
         while time.time() < end:
             st = registry_state(A, g)
             if moved is None and st != "running":
-                moved = (time.time(), mem_available(), {n: rss(n) for n in big + [g] if n != g or st == "source"})
+                moved = (time.time(), available(), {n: rss(n) for n in big + [g] if n != g or st == "source"})
             if st is None:
                 break  # released: its copy here is gone
             time.sleep(0.1)
@@ -6831,6 +7049,46 @@ class mem_available_as:
             self.write(self.was)
 
 
+class modeled_memory(mem_available_as):
+    """`host` shown `base` MiB available less what `names`' VMs there have grown by since (their memory.current),
+    re-set every 50 ms: their own growth moves it, never other work on this machine."""
+    def __init__(self, host, base, names):
+        super().__init__(host, base)
+        self.cgroups = {}
+        for n in names:
+            self.cgroups[n] = "/sys/fs/cgroup" + open(f"/proc/{fc_pid(host, n)}/cgroup").read().strip().split(":", 2)[2] + "/memory.current"
+        self.start = self.used()
+        self.done, self.last = threading.Event(), base
+
+    def used(self):
+        total = 0
+        for path in self.cgroups.values():
+            try:
+                total += int(open(path).read()) >> 20
+            except (OSError, ValueError):
+                pass  # moved away (its cgroup gone): it no longer counts here
+        return total
+
+    def now(self):
+        return self.last
+
+    def run(self):
+        while not self.done.wait(0.05):
+            self.last = max(0, self.mib - (self.used() - self.start))
+            self.write(str(self.last))
+
+    def __enter__(self):
+        super().__enter__()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *e):
+        self.done.set()
+        self.thread.join()
+        super().__exit__(*e)
+
+
 def reserve_of(host):
     return ok(cli_json(host, "info"))["derived"]["reserve_mib"]
 
@@ -6871,7 +7129,7 @@ def refused_admission():
     borrows no address from its home host, an arrival records no migration."""
     n, path = "ft-refused-adm", ckpt_path("ft-refused-adm")
     m = setup(n, mib=1)
-    migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+    migs = lambda: sorted(migs_of(B)) if os.path.isdir(os.path.join(B.state, "migs")) else []
     # The start announces its generation to B in the background: in before the snapshot.
     v = vms(A)[n]
     check("refused admission: b saw the start", wait_for(lambda: addr(B, v["ip"]).get("seen", 0) >= v["gen"], 10), addr(B, v["ip"]))
@@ -6909,10 +7167,20 @@ def park_arrival(n):
     """Migrates `n` to B in a thread (its answer in the returned dict's "r"), B parked once it
     has admitted the preflight, before it answers it: the source runs on until `grow_parked`."""
     res = {}
-    # Under the source's 10 s for B's answer (PREFLIGHT_TIMEOUT), should the test never let it go.
-    fault(B, "incoming_gate", 8000)
+    # Parked until `unpark_arrival`, however long the test takes to get there: both sides' preflight
+    # deadlines (the source's 10 s for B's answer, B's 7 s to prepare) made long (`long_preflight`).
+    for h in (A, B):
+        fault(h, "long_preflight", 600000)
+    fault(B, "incoming_gate", 600000)
     t = start_thread(target=lambda: res.update(r=migrate(A, n, B)))
     return t, res
+
+
+def unpark_arrival():
+    """Lets `park_arrival`'s arrival go on, its preflight deadlines as usual again for later migrations."""
+    fault(B, "incoming_gate", 0)
+    for h in (A, B):
+        fault(h, "long_preflight", 0)
 
 
 def grow_parked(n, grow, grant, label):
@@ -6922,8 +7190,8 @@ def grow_parked(n, grow, grant, label):
     hog(A, n, grow)
     want = grant - 256 + 2 * ARRIVAL_MARGIN
     present = lambda: vms(A)[n]["pages_mib"]["present"]
-    check(f"{label}: the guest grew before b went on", wait_for(lambda: present() >= want, 7), (grant, want, present()))
-    fault(B, "incoming_gate", 0)
+    check(f"{label}: the guest grew before b went on", wait_for(lambda: present() >= want, 60), (grant, want, present()))
+    unpark_arrival()
 
 
 def arrival_grew():
@@ -6943,7 +7211,7 @@ def arrival_grew():
     with marks(1024, 1024, host=B), mem_available_as(B, 1024 + ARRIVAL_ROOM):
         hold_dir = os.path.join(B.run, ".locks", "holds")
         holds = lambda: [f for f in os.listdir(hold_dir) if not f.startswith(".")] if os.path.isdir(hold_dir) else []
-        migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+        migs = lambda: sorted(migs_of(B)) if os.path.isdir(os.path.join(B.state, "migs")) else []
         check("arrival grew: b holds nothing before", not holds(), holds())
         recorded = migs()
         time.sleep(11)  # Earlier grants on B age out: its preflight's hold is all it counts.
@@ -6958,7 +7226,7 @@ def arrival_grew():
                 grow_parked(n, grow, grant, "arrival grew")
                 t.join()
         finally:
-            fault(B, "incoming_gate", 0)
+            unpark_arrival()
         r = res["r"]
         check("arrival grew: refused for what it grew by", not r["ok"] and "grew to" in r["error"] and "not enough memory" in r["error"], r)
         check("arrival grew: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
@@ -7016,7 +7284,7 @@ def grew_admitted():
         try:
             grow_parked(n, grow, sum((first or {}).values()), label)
         finally:
-            fault(B, "incoming_gate", 0)
+            unpark_arrival()
         # Admitted at the header: a hold larger than the preflight's, for the 3 s B then stalls.
         more = first and wait_for(lambda: any(holds().get(i, 0) > m for i, m in first.items()), 20) and holds()
         return t, res, first, more
@@ -7110,12 +7378,12 @@ def kill_source():
     pulls from it and releases it); the VM lives on at the target."""
     n = "ft-kill-source"
     m = setup(n, mib=1500)
-    ok(migrate(A, n, B))
-    # Keep the pull from finishing (the target retries for 10 s).
-    fault(A, "pages", 3000)
-    r = cli_json(A, "kill", n)
-    check("kill source: refused", not r["ok"] and "source of a migration" in r.get("error", ""), r)
-    check("kill source: copy still paused on A", vms(A).get(n, {}).get("state") == "source", where(n))
+    # Every page reply a second late from before the migration until the kill was refused: the pull cannot finish first.
+    with armed_fault(A, "pages_slow", 600000):
+        ok(migrate(A, n, B))
+        r = cli_json(A, "kill", n)
+        check("kill source: refused", not r["ok"] and "source of a migration" in r.get("error", ""), r)
+        check("kill source: copy still paused on A", vms(A).get(n, {}).get("state") == "source", where(n))
     st = wait_released(B, n)
     check("kill source: target pulled everything and released it",
           st["released"] is True and st["failed"] is None and where(n) == {B: "running"}, (st, where(n)))
@@ -7323,12 +7591,21 @@ def forged_peer():
     check("forged gen zero: name free again", name_free(B, n), vms(B).get(n))
     r = peer(B, {"op": "route", "ip": ip, "via": "127.0.0.9"})
     check("forged gen zero: a route message without one is refused", not r.get("ok"), r)
-    newest = addr(B, ip).get("seen", 0) + 10
-    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest)
+    # #914: B hands out its own addresses' generations, so none it never handed out arrives.
+    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=addr(B, ip).get("seen", 0) + 10)
     s.close()
-    check("forged gen: a newer one is taken", r.get("ok"), r)
+    check("forged gen: a newer one than B handed out is refused", not r.get("ok") and "is this host's to hand out" in r.get("error", ""), r)
     nothing_left("forged gen", n, ip)
-    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest - 1)
+    # An address in the cluster range no host hands out: a newer generation is taken, an older one then refused.
+    n2, away = "ft-forged-gen-away", A.ips.split("-")[1].rsplit(".", 1)[0] + ".206"
+    scenario_vms.add(n2)
+    newest = addr(B, away).get("seen", 0) + 10
+    s, r, _ = migrate_in_raw(B, n2, away, tid, gen=newest)
+    s.close()
+    check("forged gen: a newer one of another's address is taken", r.get("ok"), r)
+    check("forged gen: name free on B", wait_for(lambda: name_free(B, n2), 10), vms(B).get(n2))
+    check("forged gen: address free on B", wait_for(lambda: not addr(B, away).get("holder"), 10), addr(B, away))
+    s, r, _ = migrate_in_raw(B, n2, away, tid, gen=newest - 1)
     s.close()
     check("forged gen: an older one than recorded is refused", not r.get("ok") and "newer generation" in r.get("error", ""), r)
     # A template name and id are file names in the templates directory, never paths.
@@ -8174,7 +8451,9 @@ def standby_stalled():
         rep = w.report("standby stalled: under the reserve")
         check("standby stalled: under the reserve, one that cannot exit still marks the pressure", marked and alive(pid), (before, mtime(pressure)))
         check("standby stalled: and holds eviction off no longer", evicting)
-        check("standby stalled: the controller ticks on meanwhile", all(r["ticks"] > 0 and not r["stuck"] and r["tick_gap_max_ms"] < 1600 for r in rep.values()), rep)
+        # Its ticks come about a second apart (1.1 s gaps here): a loaded host delays one by some hundreds of ms, a
+        # controller held up by the stopped standby misses several. The bound evict_grower and evict_latency use.
+        check("standby stalled: the controller ticks on meanwhile", all(r["ticks"] > 0 and not r["stuck"] and r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
     finally:
         os.kill(pid, signal.SIGCONT)
     check("standby stalled: it exits once it can", wait_for(lambda: not alive(pid), 10))
@@ -8189,7 +8468,7 @@ def standby_stalled():
 
 def standby_refill_race():
     """A refill granted just before pressure starts, whose standby has not
-    created its lock file yet (`standby_lock_stall`, 3 s): relief does not
+    created its lock file yet (held before it: `standby_lock_gate`): relief does not
     pass it by, but holds eviction off until the standby is listed, then
     signals it and marks the pressure, before any eviction starts."""
     t, n = args.template, "ft-sb-refill-race"
@@ -8199,13 +8478,22 @@ def standby_refill_race():
         if os.path.exists(f):
             os.remove(f)
     fault(A, "no_evict", 600000)
-    fault(A, "standby_lock_stall", 2000)
+    # The refill's standby held before its lock file (`standby_lock_gate`) until relief, under pressure, is seen
+    # holding eviction off for it (`relief_waits`): the race, whatever the timing. The refill waits for that lock
+    # as long as the test needs (`long_locked`), not its 5 s.
+    for g in ("standby_lock_gate", "relief_waits", "long_locked"):
+        clear_gate(A, g)
+        fault(A, g, 600000)
     res, seen = {}, {}
     th = start_thread(target=lambda: res.update(r=set_standby(A, t, 1)))
     try:
-        time.sleep(1)
+        check("standby refill race: the refill's standby is held before its lock file", wait_for(lambda: reached(A, "standby_lock_gate"), 30),
+              reached(A, "standby_lock_gate"))
         avail = mem_available()
         with marks(avail + 4096, avail + 4608):
+            relief = wait_for(lambda: reached(A, "relief_waits"), 30)
+            release(A, "standby_lock_gate")
+            check("standby refill race: relief held eviction off for the unlisted standby", relief, reached(A, "relief_waits"))
             start = time.time()
             while time.time() - start < 15 and len(seen) < 2:
                 for k, f in (("pressure", pressure), ("active", active)):
@@ -8215,7 +8503,9 @@ def standby_refill_race():
             pids = standby_pids(A, t)
             th.join()
     finally:
-        fault(A, "standby_lock_stall", 0)
+        release(A, "standby_lock_gate")
+        fault(A, "relief_waits", 0)
+        fault(A, "long_locked", 0)
         fault(A, "no_evict", 0)
     check("standby refill race: the standby being started is stopped, and marks the pressure", "pressure" in seen, seen)
     check("standby refill race: eviction waits for it", "active" in seen and "pressure" in seen and seen["active"] > seen["pressure"], seen)
@@ -8259,12 +8549,13 @@ def standby_lock_timeout():
         if os.path.exists(f):
             os.remove(f)
     fault(A, "no_evict", 600000)
-    fault(A, "standby_lock_hang", 30000)
+    # Armed until the refill is done (`finally`), however long its steps take.
+    fault(A, "standby_lock_hang", 600000)
     res, seen, began = {}, {}, time.time()
     th = start_thread(target=lambda: res.update(r=set_standby(A, t, 1), took=time.time() - began))
     child = None
     try:
-        wait_for(lambda: standby_starting(A), 5)
+        wait_for(lambda: standby_starting(A), 30)
         child = (standby_starting(A) or [None])[0]
         avail = mem_available()
         with marks(avail + 4096, avail + 4608):
@@ -8405,14 +8696,13 @@ def pull_died():
     source runs on, and is not handed out again."""
     n = "ft-pull-fc-died"
     m = setup(n, mib=1500)
-    stall = threading.Timer(0.2, lambda: fault(A, "pages", 6000))
-    stall.start()
-    ok(migrate(A, n, B))
-    stall.join()
-    fc = vms(B)[n]["firecracker"]
-    os.kill(fc, signal.SIGKILL)
-    check("pull died: the target fails", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed", 10), vms(B).get(n))
-    fault(A, "pages", 0)
+    # Every page reply a second late from before the migration until the target failed: it dies mid-pull.
+    with armed_fault(A, "pages_slow", 600000):
+        ok(migrate(A, n, B))
+        check("pull died: still pulling when its firecracker dies", vms(B)[n].get("background_pull_ms") is None, vms(B).get(n))
+        fc = vms(B)[n]["firecracker"]
+        os.kill(fc, signal.SIGKILL)
+        check("pull died: the target fails", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed", 10), vms(B).get(n))
     check("pull died: the source never lets go, and runs its copy again",
           wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 60), where(n))
     check("pull died: md5 intact on A", md5(A, n) == m)
@@ -8423,13 +8713,13 @@ def pull_died():
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
     wait_released(B, n)
-    stall = threading.Timer(0.2, lambda: fault(B, "pages", 6000))
-    stall.start()
-    ok(migrate(B, n, A))
-    stall.join()
-    pid = json.load(open(os.path.join(A.run, "vms", ".locks", f"{n}.lock")))["pid"]
-    os.kill(pid, signal.SIGKILL)
-    fault(B, "pages", 0)
+    # As above, until the arrival is killed.
+    with armed_fault(B, "pages_slow", 600000):
+        ok(migrate(B, n, A))
+        check("home died: still pulling when it dies", vms(A)[n].get("background_pull_ms") is None, vms(A).get(n))
+        pid = json.load(open(os.path.join(A.run, "vms", ".locks", f"{n}.lock")))["pid"]
+        os.kill(pid, signal.SIGKILL)
+        check("home died: the arrival is gone", wait_for(lambda: not alive(pid), 10), pid)
     check("home died: the source runs its copy again", wait_for(lambda: vms(B).get(n, {}).get("state") == "running", 60), where(n))
     check("home died: md5 intact on B", md5(B, n) == m)
     check("home died: the address is still lent on its home host", addr(A, ip).get("lent") is not None, addr(A, ip))
@@ -8716,11 +9006,20 @@ def suspend_killed():
     setup(n, mib=20)
     ip = vms(A)[n]["ip"]
     pid = vm_pid(A, n)
-    with armed_fault(A, "suspend_stall", 10000):
-        os.kill(pid, signal.SIGTERM)
-        d = os.path.join(A.state, "suspended", n)
-        check("suspend killed: published", wait_for(lambda: os.path.exists(os.path.join(d, "manifest.json")), 30), d)
-        os.kill(pid, signal.SIGINT)
+    # Held once published (`suspend_gate`) until the SIGINT is seen taken (its destroy waiting for the
+    # suspend: `destroy_wait`), however long either takes.
+    clear_gate(A, "suspend_gate")
+    clear_gate(A, "destroy_wait")
+    with armed_fault(A, "suspend_gate", 600000), armed_fault(A, "destroy_wait", 600000):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            d = os.path.join(A.state, "suspended", n)
+            check("suspend killed: published, and held", wait_for(lambda: pid in reached(A, "suspend_gate"), 60) and os.path.exists(os.path.join(d, "manifest.json")),
+                  (reached(A, "suspend_gate"), d))
+            os.kill(pid, signal.SIGINT)
+            check("suspend killed: the kill is taken while it is held", wait_for(lambda: pid in reached(A, "destroy_wait"), 30), reached(A, "destroy_wait"))
+        finally:
+            release(A, "suspend_gate")
         check("suspend killed: the process ends", wait_for(lambda: not alive(pid), 30), pid)
     check("suspend killed: no suspended vm left", n not in vms(A) and not os.path.exists(d), (vms(A).get(n), os.path.exists(d)))
     check("suspend killed: address withdrawn", not addr(A, ip).get("holder") and addr(A, ip).get("withdrawn"), addr(A, ip))
@@ -9443,9 +9742,7 @@ def log_cap():
     n = "ft-logcap"
     scenario_vms.add(n)
     vd = os.path.join(A.run, "vms")
-    for f in (f"{n}.log", f"{n}.log.1"):
-        if os.path.exists(os.path.join(vd, f)):
-            os.unlink(os.path.join(vd, f))
+    remove_logs(vd, n)
     lines = 1_500_000  # ~11 MiB
     r = cli_json(A, "run", "--name", n, "-d", args.template, f"seq 1 {lines}")
     check("log cap: started", r["ok"], r)
@@ -9463,15 +9760,16 @@ def log_cap():
     # cap, the next write rotates it: here, what it logs as it migrates back (its end on SIGINT prints nothing). That migration is served only once its arrival is done and the log published, however long the
     # arrival's tail (held packets, route) takes, so the pad never lands before publication matters.
     m = "ft-logcap-moved"
-    for f in (f"{m}.log", f"{m}.log.1"):
-        if os.path.exists(os.path.join(B.run, "vms", f)):
-            os.unlink(os.path.join(B.run, "vms", f))
+    remove_logs(os.path.join(B.run, "vms"), m)
     ok(run(A, m))
     ok(migrate(A, m, B))
     moved = os.path.join(B.run, "vms", f"{m}.log")
     pid = vm_pid(B, m)
-    # migrate can return before B publishes the arrival's log (renamed over NAME.log): pad only once it is there.
-    check("log cap: the arrival's log published", wait_for(lambda: os.path.exists(moved), 30), moved)
+    # migrate can return before B publishes the arrival's log (renamed into NAME.logs/ as log): pad only once
+    # it is there, its .incoming- file gone (the VM's own early messages may make NAME.logs/log before).
+    vd_b = os.path.join(B.run, "vms")
+    published = lambda: os.path.exists(moved) and not any(f.startswith(".incoming-") for f in os.listdir(vd_b))
+    check("log cap: the arrival's log published", wait_for(published, 30), (moved, os.listdir(vd_b)))
     with open(moved, "a") as f:
         f.write("pad\n" * (2 << 20))
     wait_released(B, m)
@@ -9975,54 +10273,43 @@ class RouteWatch:
 
 @with_third_peer
 def restore_route_fence():
-    """#534: a restore installs its address's route only under its generation
-    fence, paused (--paused) or not. Held at restore_prepared_gate (Firecracker
-    up, nothing loaded), the address moves on to a newer generation routed via
-    a peer; let go, the restore fails at the fence, and the newer route is
-    never replaced by one to the restore's tap, then or as it exits."""
+    """#534, #914: a restore holds its address's generation from its claim. Held at
+    restore_prepared_gate (Firecracker up, nothing loaded), another peer's newer
+    generation of the address is refused, the record and the route left as they were;
+    let go, the restore runs, its address routed to its tap, paused (--paused) or not."""
     n, path = "ft-route-fence", ckpt_path("ft-route-fence")
     setup(n, mib=8)
     ip = vms(A)[n]["ip"]
-    ok(checkpoint(A, n, path, stop=True))
-    check("route fence: checkpointed, the vm gone", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
     gw = third_peer()
-    marker = A.ips.split("-")[1].rsplit(".", 1)[0] + ".249"
     gate = "restore_prepared_gate"
     for paused in (False, True):
         label = f"route fence{' (paused)' if paused else ''}"
-        watch, gen = RouteWatch(ip, marker, gw), 0
+        ok(checkpoint(A, n, path, stop=True))
+        check(f"{label}: checkpointed, the vm gone", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
         try:
-            check(f"{label}: watching route changes", watch.sync(), watch.lines[-5:])
             clear_gate(A, gate)
             fault(A, gate, 600000)
             res, th = background(lambda: restore(A, path, paused=paused))
             check(f"{label}: the restore parked at {gate}, its address claimed",
                   wait_for(lambda: len(reached(A, gate)) == 1, 60), reached(A, gate))
-            gen = addr(A, ip).get("held", 0)
-            check(f"{label}: the restore holds a generation of {ip}", gen > 0 and addr(A, ip).get("holder") == n, addr(A, ip))
-            r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
-            check(f"{label}: the newer generation is taken, routed via the peer",
-                  r.get("ok") and not r["result"].get("stale") and not r["result"].get("local") and f"via {gw}" in peer_route(ip), (r, peer_route(ip)))
-            # B hears of it too (as every peer does): the restore's withdrawal of its own generation, told to B as it
-            # fails, is then stale there, and leaves the route both hosts share here alone.
-            r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
-            check(f"{label}: and so is the peer's", r.get("ok") and not r["result"].get("stale"), r)
+            before = addr(A, ip)
+            gen = before.get("held", 0)
+            check(f"{label}: the restore holds a generation of {ip}", gen > 0 and before.get("holder") == n, before)
+            r = as_third(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
+            check(f"{label}: another peer's newer generation is refused, the record kept",
+                  not r.get("ok") and "held by vm" in r.get("error", "") and addr(A, ip) == before, (r, addr(A, ip)))
+            check(f"{label}: nothing routed via that peer", f"via {gw}" not in peer_route(ip), peer_route(ip))
             release(A, gate)
             th.join(120)
             r = res.get("r") or {"ok": False, "error": "restore did not return"}
-            check(f"{label}: the restore fails at the fence", not r["ok"] and "withdrawn or given out again" in r.get("error", ""), r)
-            check(f"{label}: it runs nowhere", wait_for(lambda: where(n) == {}, 30), where(n))
-            check(f"{label}: all route changes seen", watch.sync(), watch.lines[-5:])
-            check(f"{label}: the address was never routed to the restore's tap", not watch.to_tap(), watch.to_tap())
-            check(f"{label}: the newer route survives", f"via {gw}" in peer_route(ip), peer_route(ip))
-            check(f"{label}: the newer generation stays recorded", addr(A, ip).get("seen") == gen + 1, addr(A, ip))
+            check(f"{label}: the restore runs", r["ok"] and where(n) == {A: "paused" if paused else "running"}, (r, where(n)))
+            if not paused:
+                tap = vms(A)[n]["tap"]
+                check(f"{label}: its address routed to its tap", wait_for(lambda: f"dev {tap}" in peer_route(ip), 10), peer_route(ip))
         finally:
-            watch.close()
             disarm()
-            kill(A, n)
-            if gen:
-                forget_peer_route(ip, gen + 1)
-    rm_ckpt(path)
+        rm_ckpt(path)
+    kill(A, n)
 
 
 def kill_tree(pid):
@@ -10065,7 +10352,7 @@ def reboot():
     third_listed.enter_context(listing_third_peer(B))
     ip_peer = A.ips.split("-")[1].rsplit(".", 1)[0] + ".203"
     gen = addr(B, ip_peer).get("seen", 0) + 1
-    r = peer(B, {"op": "route", "ip": ip_peer, "via": gw, "gen": gen, "rev": 0})
+    r = as_third(B, {"op": "route", "ip": ip_peer, "via": gw, "gen": gen, "rev": 0})
     check("reboot: B routes the peer's vm", r.get("ok") and f"via {gw}" in peer_route(ip_peer), (r, peer_route(ip_peer)))
     other = tempfile.mkdtemp(prefix="fvp-other-", dir="/var/tmp")
     other_run = None
@@ -10430,6 +10717,10 @@ try:
             except Exception as e:
                 traceback.print_exc()
                 check(f"{s}: isolation barrier raised {type(e).__name__}", False, e)
+            # The kills removed the VMs' logs (and any record of a death): a failure, its isolation's
+            # included, keeps only what is printed here.
+            if failures != before:
+                dump_logs(scenario_vms)
             if failures == before and why is not None:
                 skipped.append(s)
                 print(f"scenario {s}: SKIPPED ({why}) in {time.time() - started:.1f} s", flush=True)

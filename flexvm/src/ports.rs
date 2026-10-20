@@ -1,6 +1,6 @@
 //! Host-local proxies. Bound sockets are the reservation and the only external resource:
 //! even SIGKILL releases them, so gc has no kernel rules or port files to sweep.
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -17,13 +17,25 @@ const BUFFER: usize = 65536;
 /// UDP sessions expire after this; a TCP forward this idle is closed only to admit a client at the cap.
 const IDLE: Duration = Duration::from_secs(60);
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
+/// Once either side fails, how long buffered data and the other side's FIN have to finish:
+/// closing on it at once would reset what the kernel has yet to deliver.
+const LINGER: Duration = Duration::from_secs(10);
 /// The most datagrams taken from one socket per wakeup: a flood on one cannot starve the others.
 const BURST: usize = 1024;
 /// Workers wake for their sockets or `Forwarder::drop`'s eventfd; this only bounds when idle
-/// sessions and stalled connects are noticed.
+/// sessions, stalled connects, and failure deadlines are noticed.
 const TICK: libc::c_int = 1000;
 /// How long accepting rests once out of descriptors (or memory).
 const ACCEPT_REST: Duration = Duration::from_millis(100);
+
+/// Idle and failure time can be pinned in a test worker; connect deadlines keep using real time.
+fn idle_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = tests::CLOCK.with(|c| c.borrow().as_ref().map(|(_, now)| *now)) {
+        return now;
+    }
+    Instant::now()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -63,6 +75,17 @@ impl std::str::FromStr for Port {
             },
         };
         Ok(Self { ip, host_port, vm_port: port(vm)?, protocol })
+    }
+}
+
+impl Port {
+    /// Whether both would bind one address and port (no IP: both wildcards; a wildcard takes its family's).
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let ips = |p: &Self| p.ip.map_or_else(|| vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()], |ip| vec![ip]);
+        let covers = |a: IpAddr, b: IpAddr| a == b || (a.is_unspecified() && a.is_ipv4() == b.is_ipv4());
+        self.protocol == other.protocol
+            && self.host_port == other.host_port
+            && ips(self).into_iter().any(|a| ips(other).into_iter().any(|b| covers(a, b) || covers(b, a)))
     }
 }
 
@@ -159,11 +182,6 @@ fn wait(fds: &mut Vec<libc::pollfd>, stop: BorrowedFd, until: Option<Instant>) -
     fds.pop().is_some_and(|s| s.revents == 0)
 }
 
-/// Whether the socket has something for us (data, room, or an error or hangup to find out by trying).
-fn ready(fd: &libc::pollfd) -> bool {
-    fd.revents != 0
-}
-
 fn poll(fd: &impl AsRawFd, events: i16) -> libc::pollfd {
     libc::pollfd { fd: if events == 0 { -1 } else { fd.as_raw_fd() }, events, revents: 0 }
 }
@@ -222,6 +240,7 @@ fn connect(target: SocketAddrV4) -> io::Result<TcpStream> {
         return Err(io::Error::last_os_error());
     }
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    stream.set_nodelay(true)?;
     let addr = libc::sockaddr_in {
         sin_family: libc::AF_INET as _,
         sin_port: target.port().to_be(),
@@ -239,52 +258,73 @@ fn connect(target: SocketAddrV4) -> io::Result<TcpStream> {
 
 #[derive(Default)]
 struct Direction {
-    bytes: VecDeque<u8>,
+    bytes: Vec<u8>,
+    start: usize,
+    end: usize,
     eof: bool,
-    shut: bool,
+    /// Its source failed (a reset, say): it ends once what was read before is written.
+    failed: bool,
+    /// Its sink failed: what it held is dropped, and what its source still sends is read and dropped.
+    broken: bool,
+    /// It has ended: its source finished (a FIN, or a failure once what came before is written) and
+    /// that end was passed on as a FIN, or its sink failed and its source has finished since.
+    done: bool,
 }
 
 impl Direction {
     fn events(&self, reverse: &Self) -> i16 {
-        (if !self.eof && self.bytes.len() < BUFFER { libc::POLLIN } else { 0 }) | (if !reverse.bytes.is_empty() { libc::POLLOUT } else { 0 })
+        (if !self.eof && self.end < BUFFER { libc::POLLIN } else { 0 }) | (if reverse.start < reverse.end { libc::POLLOUT } else { 0 })
     }
 
-    /// True if it moved anything.
-    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> io::Result<bool> {
-        let (mut buf, mut moved) = ([0; 16384], false);
-        let room = (BUFFER - self.bytes.len()).min(buf.len());
-        if !self.eof && room > 0 {
-            match from.read(&mut buf[..room]) {
-                Ok(0) => (self.eof, moved) = (true, true),
+    /// True if it relayed data. Each pass takes at most BUFFER bytes per direction. A read error
+    /// still writes what came before it (a reply the guest sent before resetting); a write error
+    /// ends only this direction.
+    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> bool {
+        let (mut moved, mut taken) = (false, 0);
+        while !self.eof && self.end < BUFFER && taken < BUFFER {
+            self.bytes.resize(BUFFER, 0);
+            match from.read(&mut self.bytes[self.end..]) {
+                Ok(0) => self.eof = true,
                 Ok(n) => {
-                    self.bytes.extend(&buf[..n]);
-                    moved = true;
+                    taken += n;
+                    // Broken, it reads only to discard: closing a socket with data unread would reset
+                    // it, and the peer would lose what the other direction has yet to deliver.
+                    if !self.broken {
+                        self.end += n;
+                        moved = true;
+                    }
                 }
-                Err(e) if transient(&e) => {}
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => (self.eof, self.failed) = (true, true),
             }
         }
-        if !self.bytes.is_empty() {
-            match to.write(self.bytes.make_contiguous()) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => {
-                    self.bytes.drain(..n);
+        while self.start < self.end {
+            match to.write(&self.bytes[self.start..self.end]) {
+                Ok(n) if n > 0 => {
+                    self.start += n;
                     moved = true;
                 }
-                Err(e) if transient(&e) => {}
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                _ => {
+                    (self.broken, self.start, self.end) = (true, 0, 0);
+                    break;
+                }
             }
         }
-        if self.eof && self.bytes.is_empty() && !self.shut {
-            to.shutdown(Shutdown::Write)?;
-            self.shut = true;
+        if self.start == self.end {
+            (self.start, self.end) = (0, 0);
+            // A failed source ends as a FIN too: the sink gets all that came before, cleanly.
+            if self.eof && !self.done {
+                if !self.broken {
+                    let _ = to.shutdown(Shutdown::Write);
+                }
+                self.done = true;
+            }
         }
-        Ok(moved)
+        moved
     }
-}
-
-fn transient(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
 }
 
 fn rest(e: &io::Error, resting: &mut Option<Instant>) -> bool {
@@ -302,28 +342,80 @@ struct Connection {
     /// Connected on this pass, not yet admitted: it has moved nothing.
     fresh: bool,
     since: Instant,
-    /// When it last moved data (or connected).
+    /// When it last moved data (or connected). Data it holds for a stalled reader keeps it from idling.
     active: Instant,
     out: Direction,
     incoming: Direction,
+    /// The error and hangup bits each socket has reported (they stay set): such a socket is polled
+    /// only for what its directions still want of it, or poll would return at once every pass.
+    client_down: i16,
+    guest_down: i16,
+    /// Since either side failed, or it last relayed data after: drainage and the other side's FIN
+    /// have LINGER to make progress.
+    lingering: Option<Instant>,
 }
+
+impl Connection {
+    /// Relays one connected forward, bounding failures even if buffered data cannot drain.
+    fn forward(&mut self, client: i16, guest: i16) -> bool {
+        if self.lingering.is_some_and(|t| idle_now().duration_since(t) > LINGER) {
+            return false;
+        }
+        if client == 0 && guest == 0 {
+            return true;
+        }
+        (self.client_down, self.guest_down) = (self.client_down | client & DOWN, self.guest_down | guest & DOWN);
+        // Both directions: what one socket sent before failing still goes out the other way.
+        let (out, incoming) = (self.out.pump(&self.client, &self.guest), self.incoming.pump(&self.guest, &self.client));
+        if out || incoming {
+            self.active = idle_now();
+            // What is still delivered keeps it: a slow reader gets the rest, and LINGER for its FIN after.
+            self.lingering = self.lingering.and(Some(self.active));
+        }
+        // A failed socket (an error polled, or found reading or writing it): nothing reaches it any
+        // more. Allow buffered data to drain, but bound each stall even if the sink never reads.
+        let failed = |down: i16, from: &Direction, to: &Direction| down & (libc::POLLERR | libc::POLLNVAL) != 0 || from.failed || to.broken;
+        let client_failed = failed(self.client_down, &self.out, &self.incoming);
+        if client_failed || failed(self.guest_down, &self.incoming, &self.out) {
+            self.lingering.get_or_insert_with(idle_now);
+        }
+        !self.out.done || !self.incoming.done && !client_failed
+    }
+
+    /// Connected, with nothing it holds yet to deliver, and nothing relayed for `idle`.
+    fn idle(&self, idle: Duration) -> bool {
+        let queued = |d: &Direction| d.start < d.end;
+        self.connected && !queued(&self.out) && !queued(&self.incoming) && idle_now().duration_since(self.active) >= idle
+    }
+
+    /// Its client failed: reset, or a socket error pending (POLLERR), or both directions closed (POLLHUP).
+    /// A FIN alone is not that: a half-closed client may still wait for its reply. At the cap, a gone
+    /// one takes over no live forward.
+    fn client_gone(&self) -> bool {
+        let mut p = libc::pollfd { fd: self.client.as_raw_fd(), events: 0, revents: 0 };
+        (unsafe { libc::poll(&mut p, 1, 0) }) > 0 && p.revents & (libc::POLLERR | libc::POLLHUP) != 0
+    }
+}
+
+const DOWN: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
 
 /// The connected forward idle longest, if for at least `idle`: the one to close for a new client at the cap.
 fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
-    let (i, c) = connections.iter().enumerate().filter(|(_, c)| c.connected).min_by_key(|(_, c)| c.active)?;
-    (c.active.elapsed() >= idle).then_some(i)
+    connections.iter().enumerate().filter(|(_, c)| c.idle(idle)).min_by_key(|(_, c)| c.active).map(|(i, _)| i)
 }
 
 /// How many connected forwards have been idle for `idle`: each may make way for one more client.
 fn spare(connections: &[Connection], idle: Duration) -> usize {
-    connections.iter().filter(|c| c.connected && c.active.elapsed() >= idle).count()
+    connections.iter().filter(|c| c.idle(idle)).count()
 }
 
 /// Keeps at most `cap` connected: each fresh one over it replaces the idlest, or else is closed itself.
-/// Only fresh ones take it over, so there is always one to close.
+/// Only fresh ones take it over, so there is always one to close. One whose client is gone already
+/// (it hung up while its guest connected) goes first: it takes over no live forward.
 fn admit(connections: &mut Vec<Connection>, cap: usize, idle: Duration) {
     while connections.iter().filter(|c| c.connected).count() > cap {
-        let Some(i) = idlest(connections, idle).or_else(|| connections.iter().position(|c| c.fresh)) else { break };
+        let gone = connections.iter().position(|c| c.fresh && c.client_gone());
+        let Some(i) = gone.or_else(|| idlest(connections, idle)).or_else(|| connections.iter().position(|c| c.fresh)) else { break };
         connections.swap_remove(i);
     }
     for c in connections.iter_mut() {
@@ -335,25 +427,34 @@ fn admit(connections: &mut Vec<Connection>, cap: usize, idle: Duration) {
 /// connected, or is closed if none is idle by then.
 fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap: usize, idle: Duration) {
     let mut connections: Vec<Connection> = Vec::new();
+    let mut fds = Vec::new();
     // Out of descriptors, accepting rests a while (the forwards go on): a pending client would wake it at once.
     let mut resting: Option<Instant> = None;
     loop {
         resting = resting.filter(|&r| r > Instant::now());
         // Idle forwards cannot hold the cap: at it, a waiting client replaces the idlest once it connects.
         let room = if resting.is_none() && connections.len() < cap + spare(&connections, idle) { libc::POLLIN } else { 0 };
-        let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, room)).collect();
+        fds.clear();
+        fds.extend(listeners.iter().map(|l| poll(l, room)));
         for c in &connections {
-            fds.push(poll(&c.client, if c.connected { c.out.events(&c.incoming) } else { 0 }));
-            fds.push(poll(&c.guest, if c.connected { c.incoming.events(&c.out) } else { libc::POLLOUT }));
+            // Connected sockets stay polled for errors and hangups after read EOF (a half-closed
+            // client that resets), until they report one.
+            let (client, guest) = if c.connected { (c.out.events(&c.incoming), c.incoming.events(&c.out)) } else { (0, libc::POLLOUT) };
+            let fd = |s: &TcpStream, events: i16, down: i16| if down != 0 && events == 0 { -1 } else { s.as_raw_fd() };
+            fds.push(libc::pollfd { fd: if c.connected { fd(&c.client, client, c.client_down) } else { -1 }, events: client, revents: 0 });
+            fds.push(libc::pollfd { fd: fd(&c.guest, guest, c.guest_down), events: guest, revents: 0 });
         }
         if !wait(&mut fds, stop, resting) {
             return;
         }
-        let (accepting, mut each) = (fds[..listeners.len()].to_vec(), fds[listeners.len()..].chunks(2));
+        #[cfg(test)]
+        tests::tick_clock();
+        let (accepting, forwarding) = fds.split_at(listeners.len());
+        let mut each = forwarding.chunks(2);
         connections.retain_mut(|c| {
             let [client, guest] = each.next().unwrap() else { unreachable!() };
             if !c.connected {
-                if !ready(guest) {
+                if guest.revents == 0 {
                     return c.since.elapsed() <= CONNECT_WAIT;
                 }
                 if c.guest.take_error().ok().flatten().is_some() {
@@ -364,25 +465,18 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                     return c.since.elapsed() <= CONNECT_WAIT;
                 }
                 // It moves nothing until it is admitted below.
-                (c.fresh, c.active) = (true, Instant::now());
-                return true;
-            } else if !ready(client) && !ready(guest) {
+                (c.fresh, c.active) = (true, idle_now());
                 return true;
             }
-            let Ok(out) = c.out.pump(&c.client, &c.guest) else { return false };
-            let Ok(incoming) = c.incoming.pump(&c.guest, &c.client) else { return false };
-            if out || incoming {
-                c.active = Instant::now();
-            }
-            !(c.out.shut && c.incoming.shut)
+            c.forward(client.revents, guest.revents)
         });
         // Only now: a replacement whose connect fails closes nothing.
         admit(&mut connections, cap, idle);
         let spare = spare(&connections, idle);
-        for (listener, fd) in listeners.iter().zip(&accepting) {
+        for (listener, fd) in listeners.iter().zip(accepting) {
             // Attempts are bounded too: a client whose guest connect fails (EMFILE, say) is dropped,
             // and a flood of them must still let the loop see its stop.
-            if resting.is_some() || !ready(fd) {
+            if resting.is_some() || fd.revents == 0 {
                 continue;
             }
             for _ in 0..CONNECTIONS {
@@ -397,16 +491,19 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
                 };
                 match connect(target) {
                     Err(e) if rest(&e, &mut resting) => break,
-                    Ok(guest) if client.set_nonblocking(true).is_ok() => {
+                    Ok(guest) if client.set_nonblocking(true).is_ok() && client.set_nodelay(true).is_ok() => {
                         connections.push(Connection {
                             client,
                             guest,
                             connected: false,
                             fresh: false,
                             since: Instant::now(),
-                            active: Instant::now(),
+                            active: idle_now(),
                             out: Direction::default(),
                             incoming: Direction::default(),
+                            client_down: 0,
+                            guest_down: 0,
+                            lingering: None,
                         });
                     }
                     _ => {}
@@ -523,14 +620,18 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
         if !wait(&mut fds, stop, None) {
             return;
         }
+        #[cfg(test)]
+        tests::tick_clock();
         // Replies first: the sessions polled are those in `peers`, before any is added below.
         for (peer, fd) in peers.iter().zip(&fds[listeners.len()..]) {
-            let Some((s, at, i)) = clients.get_mut(peer).filter(|_| ready(fd)) else { continue };
+            let Some((s, at, i)) = clients.get_mut(peer).filter(|_| fd.revents != 0) else { continue };
             for _ in 0..BURST {
                 match s.recv(&mut buf) {
                     Ok(n) => {
+                        #[cfg(test)]
+                        tests::tick_clock();
                         let _ = send_datagram(&listeners[*i], &buf[..n], peer.0, peer.1);
-                        *at = Instant::now();
+                        *at = idle_now();
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     // WouldBlock, or the guest refused one (ICMP): the session goes on.
@@ -539,7 +640,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
             }
         }
         for ((i, listener), fd) in listeners.iter().enumerate().zip(&fds) {
-            if !ready(fd) {
+            if fd.revents == 0 {
                 continue;
             }
             for _ in 0..BURST {
@@ -548,28 +649,30 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
+                #[cfg(test)]
+                tests::tick_clock();
                 if !clients.contains_key(&peer) {
                     // Half the expiry protects recent traffic while letting new clients through.
                     // Admitted (in place of the victim, if any) only once its socket is ready.
-                    let admit = if clients.len() < cap { Some(None) } else { udp_idle(&clients, Instant::now(), idle / 2).map(Some) };
+                    let admit = if clients.len() < cap { Some(None) } else { udp_idle(&clients, idle_now(), idle / 2).map(Some) };
                     if let Some(victim) = admit {
                         if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
                             if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
                                 if let Some(v) = victim {
                                     clients.remove(&v);
                                 }
-                                clients.insert(peer, (s, Instant::now(), i));
+                                clients.insert(peer, (s, idle_now(), i));
                             }
                         }
                     }
                 }
                 if let Some((s, at, _)) = clients.get_mut(&peer) {
                     let _ = s.send(&buf[..n]);
-                    *at = Instant::now();
+                    *at = idle_now();
                 }
             }
         }
-        clients.retain(|_, (_, at, _)| at.elapsed() < idle);
+        clients.retain(|_, (_, at, _)| idle_now().duration_since(*at) < idle);
     }
 }
 
@@ -577,6 +680,29 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    // Snapshot per TCP pass or UDP datagram: advancing time cannot age a timestamp between
+    // relaying bytes and recording their activity. Other workers and tests keep real clocks.
+    thread_local! {
+        pub(super) static CLOCK: std::cell::RefCell<Option<(Arc<std::sync::Mutex<Instant>>, Instant)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn tick_clock() {
+        CLOCK.with(|c| {
+            if let Some((clock, now)) = c.borrow_mut().as_mut() {
+                *now = *clock.lock().unwrap();
+            }
+        });
+    }
+
+    fn pin_clock(clock: Arc<std::sync::Mutex<Instant>>) {
+        let now = *clock.lock().unwrap();
+        CLOCK.with(|c| *c.borrow_mut() = Some((clock, now)));
+    }
+
+    fn transient(e: &io::Error) -> bool {
+        matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
+    }
 
     #[test]
     fn socket_exhaustion_rests_accepting() {
@@ -610,45 +736,51 @@ mod tests {
 
     #[test]
     fn at_the_udp_cap_a_new_client_replaces_only_the_session_quiet_longest() {
-        const IDLE: Duration = Duration::from_secs(4);
         let ip = Ipv4Addr::new(127, 0, 0, 2);
         let guest = UdpSocket::bind((ip, 0)).unwrap();
         let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (addr, target) = (listener.local_addr().unwrap(), SocketAddrV4::new(ip, guest.local_addr().unwrap().port()));
         let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
         let worker = {
             let stop = stop.clone();
-            thread::spawn(move || udp(vec![listener], target, stop.as_fd(), 2, IDLE))
+            let clock = clock.clone();
+            thread::spawn(move || {
+                pin_clock(clock);
+                udp(vec![listener], target, stop.as_fd(), 2, IDLE);
+            })
         };
         let client = || UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let (a, b, c) = (client(), client(), client());
-        // What the guest gets next, and from which session, if anything within `within`.
-        let got = |within: Duration| {
-            guest.set_read_timeout(Some(within)).unwrap();
+        // What the guest gets next, and from which session.
+        let got = || {
+            guest.set_read_timeout(Some(WAIT)).unwrap();
             let mut buf = [0; 16];
-            guest.recv_from(&mut buf).ok().map(|(n, from)| (String::from_utf8_lossy(&buf[..n]).into_owned(), from))
+            let (n, from) = guest.recv_from(&mut buf).unwrap();
+            (String::from_utf8_lossy(&buf[..n]).into_owned(), from)
         };
-        let start = Instant::now();
         a.send_to(b"a", addr).unwrap();
-        let (_, from_a) = got(WAIT).unwrap();
+        let (_, from_a) = got();
         b.send_to(b"b", addr).unwrap();
-        let (_, from_b) = got(WAIT).unwrap();
+        let (_, from_b) = got();
         c.send_to(b"c", addr).unwrap();
-        assert_eq!(got(Duration::from_millis(300)), None, "admitted over the cap with both sessions recent");
-        thread::sleep((start + IDLE * 3 / 8).saturating_duration_since(Instant::now()));
+        // Same listener, in order: b's arrival proves c was processed and refused.
         b.send_to(b"b", addr).unwrap();
-        assert_eq!(got(WAIT).unwrap(), ("b".into(), from_b));
+        assert_eq!(got(), ("b".into(), from_b), "admitted over the cap with both sessions recent");
+        *clock.lock().unwrap() = start + IDLE * 3 / 8;
+        b.send_to(b"b", addr).unwrap();
+        assert_eq!(got(), ("b".into(), from_b));
         // a quiet for half the expiry, b not: a goes for c.
-        thread::sleep((start + IDLE * 5 / 8).saturating_duration_since(Instant::now()));
+        *clock.lock().unwrap() = start + IDLE * 5 / 8;
         c.send_to(b"c", addr).unwrap();
-        let (data, from_c) = got(WAIT).unwrap();
+        let (data, from_c) = got();
         assert!(data == "c" && from_c != from_a && from_c != from_b);
-        assert!(start.elapsed() < IDLE, "too slow to tell eviction from expiry");
+        assert!(clock.lock().unwrap().duration_since(start) < IDLE, "replacement must precede expiry");
         a.send_to(b"a", addr).unwrap();
-        assert_eq!(got(Duration::from_millis(300)), None, "a's session was not the one replaced");
         b.send_to(b"b", addr).unwrap();
-        assert_eq!(got(WAIT).unwrap(), ("b".into(), from_b), "b's busy session was replaced");
+        assert_eq!(got(), ("b".into(), from_b), "a was not replaced or b's busy session was replaced");
         unsafe { libc::write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
         worker.join_within().unwrap();
     }
@@ -706,13 +838,75 @@ mod tests {
         let connection = |connected, active| {
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            Connection { client, guest, connected, fresh: false, since: active, active, out: Direction::default(), incoming: Direction::default() }
+            Connection {
+                client,
+                guest,
+                connected,
+                fresh: false,
+                since: active,
+                active,
+                out: Direction::default(),
+                incoming: Direction::default(),
+                client_down: 0,
+                guest_down: 0,
+                lingering: None,
+            }
         };
         let mut connections = vec![connection(true, ago(IDLE / 2)), connection(false, ago(IDLE * 3))];
         assert_eq!(idlest(&connections, IDLE), None, "a busy forward and a pending connect stay");
         connections.push(connection(true, ago(IDLE)));
         connections.push(connection(true, ago(IDLE * 2)));
         assert_eq!(idlest(&connections, IDLE), Some(3));
+        // What it still holds for a stalled reader would be lost: it is not idle.
+        connections[3].incoming.end = 1;
+        assert_eq!((idlest(&connections, IDLE), spare(&connections, IDLE)), (Some(2), 1));
+    }
+
+    #[test]
+    fn a_replacement_whose_client_hung_up_while_connecting_closes_no_idle_forward() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ago = |d: Duration| Instant::now().checked_sub(d).unwrap();
+        let connection = |since, fresh| {
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            Connection {
+                client,
+                guest,
+                connected: true,
+                fresh,
+                since,
+                active: since,
+                out: Direction::default(),
+                incoming: Direction::default(),
+                client_down: 0,
+                guest_down: 0,
+                lingering: None,
+            }
+        };
+        let (old, new) = (ago(IDLE * 2), ago(Duration::ZERO));
+        let mut connections = vec![connection(old, false), connection(new, true)];
+        // Accepted in connect order: the third is the fresh one's client. A FIN alone is no hangup (a
+        // half-closed client may wait for its reply); a reset is.
+        let mut peers: Vec<_> = (0..4).map(|_| listener.accept().unwrap().0).collect();
+        peers[2].shutdown(std::net::Shutdown::Write).unwrap();
+        wait_until("the FIN to arrive", || {
+            let mut b = 0u8;
+            (unsafe { libc::recv(connections[1].client.as_raw_fd(), (&mut b as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) }) == 0
+        });
+        assert!(!connections[1].client_gone(), "half-closed, it still waits for its reply");
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        let size = std::mem::size_of::<libc::linger>() as libc::socklen_t;
+        assert_eq!(unsafe { libc::setsockopt(peers[2].as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size) }, 0);
+        drop(peers.remove(2));
+        let fresh = &connections[1];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fresh.client_gone() {
+            assert!(Instant::now() < deadline, "the hangup never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!connections[0].client_gone());
+        admit(&mut connections, 1, IDLE);
+        assert_eq!(connections.iter().map(|c| c.since).collect::<Vec<_>>(), [old], "the idle forward stays");
     }
 
     #[test]
@@ -722,7 +916,19 @@ mod tests {
         let connection = |since, fresh| {
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            Connection { client, guest, connected: true, fresh, since, active: Instant::now(), out: Direction::default(), incoming: Direction::default() }
+            Connection {
+                client,
+                guest,
+                connected: true,
+                fresh,
+                since,
+                active: Instant::now(),
+                out: Direction::default(),
+                incoming: Direction::default(),
+                client_down: 0,
+                guest_down: 0,
+                lingering: None,
+            }
         };
         // Replacements a and then b were accepted for two idle forwards; b connected first and replaced
         // one, the other is busy again, and now a connects.
@@ -735,8 +941,38 @@ mod tests {
         assert!(connections.iter().all(|c| !c.fresh));
     }
 
-    /// A TCP worker of `cap` connections to a new guest listener: its address, the guest, and its stop.
-    fn worker(cap: usize, idle: Duration) -> (SocketAddr, TcpListener, Arc<OwnedFd>, JoinHandle<()>) {
+    /// A running TCP worker: `halt` stops it and checks it ended; dropped (a failed test), it is stopped all the same.
+    struct Worker {
+        stop: Arc<OwnedFd>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Worker {
+        fn signal(&self) {
+            unsafe { libc::write(self.stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
+        }
+
+        fn halt(mut self) {
+            self.signal();
+            self.thread.take().unwrap().join_within().unwrap();
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            if let Some(t) = self.thread.take() {
+                self.signal();
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// A TCP worker of `cap` connections to a new guest listener: its address, the guest, and the worker.
+    fn worker(cap: usize, idle: Duration) -> (SocketAddr, TcpListener, Worker) {
+        worker_with_clock(cap, idle, None)
+    }
+
+    fn worker_with_clock(cap: usize, idle: Duration, clock: Option<Arc<std::sync::Mutex<Instant>>>) -> (SocketAddr, TcpListener, Worker) {
         // Unrelated localhost RPC retries must not enter the guest's accept queue.
         let ip = Ipv4Addr::new(127, 0, 0, 2);
         let guest = TcpListener::bind((ip, 0)).unwrap();
@@ -746,14 +982,14 @@ mod tests {
         let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
         let worker = {
             let stop = stop.clone();
-            thread::spawn(move || tcp(vec![listener], target, stop.as_fd(), cap, idle))
+            thread::spawn(move || {
+                if let Some(clock) = clock {
+                    pin_clock(clock);
+                }
+                tcp(vec![listener], target, stop.as_fd(), cap, idle)
+            })
         };
-        (addr, guest, stop, worker)
-    }
-
-    fn halt(stop: &OwnedFd, worker: JoinHandle<()>) {
-        unsafe { libc::write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
-        worker.join_within().unwrap();
+        (addr, guest, Worker { stop, thread: Some(worker) })
     }
 
     fn echo(c: &mut TcpStream, s: &mut TcpStream) {
@@ -773,14 +1009,15 @@ mod tests {
 
     #[test]
     fn a_replacement_that_finds_none_idle_once_connected_is_closed() {
-        const IDLE: Duration = Duration::from_secs(1);
-        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        let (addr, guest, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
         echo(&mut client, &mut server);
         let _filler = fill(&guest);
-        thread::sleep(IDLE + Duration::from_millis(200));
+        *clock.lock().unwrap() = start + IDLE;
         // Admitted while the forward is idle, it is still connecting when the forward is busy again.
         let replacement = TcpStream::connect(addr).unwrap();
         thread::sleep(Duration::from_millis(TICK as u64) * 2);
@@ -801,7 +1038,7 @@ mod tests {
         }
         assert!(!accepted.is_empty(), "the replacement never connected");
         echo(&mut client, &mut server);
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
@@ -825,7 +1062,7 @@ mod tests {
             limit.rlim_cur = limit.rlim_cur.min(1024);
             assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
         }
-        let (addr, guest, stop, worker) = worker(CONNECTIONS, IDLE);
+        let (addr, guest, worker) = worker(CONNECTIONS, IDLE);
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
@@ -853,13 +1090,13 @@ mod tests {
         drop(fillers);
         let _retry = (stage == "connect").then(|| TcpStream::connect(addr).unwrap());
         let _accepted = crate::test_util::accept_tcp(&guest);
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
     fn a_replacement_still_connecting_closes_nothing() {
         const IDLE: Duration = Duration::from_millis(500);
-        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let (addr, guest, worker) = worker(1, IDLE);
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
@@ -869,13 +1106,13 @@ mod tests {
         let _waiting = TcpStream::connect(addr).unwrap();
         thread::sleep(Duration::from_millis(TICK as u64) * 2);
         echo(&mut client, &mut server);
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
     fn at_the_cap_a_waiting_client_replaces_the_idlest_forward_once_it_is_idle() {
         const IDLE: Duration = Duration::from_secs(2);
-        let (addr, guest, stop, worker) = worker(2, IDLE);
+        let (addr, guest, worker) = worker(2, IDLE);
         let at = Instant::now();
         let mut forwards = Vec::new();
         for _ in 0..2 {
@@ -911,7 +1148,52 @@ mod tests {
         }
         let (client, server) = &mut forwards[1];
         echo(client, server);
-        halt(&stop, worker);
+        worker.halt();
+    }
+
+    #[test]
+    fn a_half_closed_client_admitted_at_the_cap_still_gets_its_reply() {
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        let (addr, guest, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut client, &mut server);
+        *clock.lock().unwrap() = start + IDLE;
+        // An empty request, ended by its FIN before its guest connect completes: the guest's full accept
+        // queue holds the connect until the FIN is acknowledged.
+        let filler = fill(&guest);
+        let mut asking = TcpStream::connect(addr).unwrap();
+        asking.shutdown(std::net::Shutdown::Write).unwrap();
+        asking.set_read_timeout(Some(WAIT)).unwrap();
+        wait_until("the FIN to be acknowledged", || {
+            let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+            let mut size = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+            let got = unsafe { libc::getsockopt(asking.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_INFO, (&mut info as *mut libc::tcp_info).cast(), &mut size) };
+            // TCP_FIN_WAIT2: its FIN is acknowledged, the other end still open.
+            got == 0 && info.tcpi_state == 5
+        });
+        // Now the guest takes the fillers, then the forward's connect (its SYN, sent again).
+        let fillers: Vec<SocketAddr> = filler.iter().map(|f| f.local_addr().unwrap()).collect();
+        let mut replying = loop {
+            let (s, from) = crate::test_util::accept_tcp(&guest);
+            if !fillers.contains(&from) {
+                break s;
+            }
+        };
+        replying.set_read_timeout(Some(WAIT)).unwrap();
+        assert_eq!(replying.read(&mut [0]).unwrap(), 0, "the FIN is passed on");
+        replying.write_all(b"reply").unwrap();
+        drop(replying);
+        let mut got = Vec::new();
+        asking.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"reply");
+        match client.read(&mut [0]) {
+            Ok(n) => assert_eq!(n, 0, "the idle forward made way"),
+            Err(e) => assert!(!transient(&e) && e.kind() != io::ErrorKind::TimedOut, "the idle forward stayed open: {e}"),
+        }
+        worker.halt();
     }
 
     #[test]
@@ -1056,6 +1338,264 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn duplicate_port_specs_are_rejected_before_binding() {
+        let specs = |a: &str, b: &str| {
+            let args = crate::Args::parse(["run", "-p", a, "-p", b, "image"].map(String::from)).unwrap();
+            crate::port_specs(&args)
+        };
+        for (a, b) in [
+            ("8080:80", "8080:80/tcp"),
+            ("127.0.0.1:8080:80", "127.0.0.1:8080:81"),
+            ("[::1]:8080:80", "[0:0:0:0:0:0:0:1]:8080:80"),
+            // A wildcard overlaps its family's addresses: the second bind would fail.
+            ("8080:80", "127.0.0.1:8080:80"),
+            ("[::]:8080:80", "8080:80"),
+            ("0.0.0.0:8080:80/udp", "127.0.0.1:8080:9/udp"),
+        ] {
+            assert!(specs(a, b).unwrap_err().to_string().contains("duplicate port mapping"));
+        }
+        for (a, b) in [
+            ("8080:80", "8080:80/udp"),
+            ("127.0.0.1:8080:80", "127.0.0.2:8080:80"),
+            ("8080:80", "8081:80"),
+            ("0.0.0.0:8080:80", "[::1]:8080:80"),
+            ("[::]:8080:80", "127.0.0.1:8080:80"),
+        ] {
+            assert_eq!(specs(a, b).unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn pump_drains_more_than_one_read_and_reuses_its_buffer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut source = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (from, _) = listener.accept().unwrap();
+        let to = connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port())).unwrap();
+        assert!(to.nodelay().unwrap());
+        let (mut sink, _) = crate::test_util::accept_tcp(&listener);
+        from.set_nonblocking(true).unwrap();
+        sink.set_read_timeout(Some(WAIT)).unwrap();
+        let mut direction = Direction::default();
+        for byte in [42, 17] {
+            let data = vec![byte; BUFFER];
+            source.write_all(&data).unwrap();
+            wait_until("the source bytes to arrive", || {
+                let mut available: libc::c_int = 0;
+                assert_eq!(unsafe { libc::ioctl(from.as_raw_fd(), libc::FIONREAD, &mut available) }, 0);
+                available as usize == BUFFER
+            });
+            assert!(direction.pump(&from, &to));
+            assert_eq!((direction.start, direction.end), (0, 0));
+            let mut received = vec![0; BUFFER];
+            sink.read_exact(&mut received).unwrap();
+            assert_eq!(received, data);
+        }
+    }
+
+    #[test]
+    fn a_reset_after_client_half_close_releases_the_slot_without_guest_writes() {
+        let (addr, guest, worker) = worker(1, IDLE);
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        server.set_read_timeout(Some(WAIT)).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(server.read(&mut [0]).unwrap(), 0);
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size_of_val(&linger) as _)
+            },
+            0
+        );
+        drop(client);
+        let mut replacement = TcpStream::connect(addr).unwrap();
+        replacement.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut accepted, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut replacement, &mut accepted);
+        worker.halt();
+    }
+
+    fn reset(s: TcpStream) {
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        let set =
+            unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size_of_val(&linger) as _) };
+        assert_eq!(set, 0);
+    }
+
+    #[test]
+    fn discarded_requests_cannot_keep_a_failed_guest_with_a_blocked_reply_alive() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (host, _) = crate::test_util::accept_tcp(&listener);
+        let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = crate::test_util::accept_tcp(&listener);
+        client.set_write_timeout(Some(WAIT)).unwrap();
+        host.set_nonblocking(true).unwrap();
+        guest.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        for (socket, name) in [(&host, libc::SO_SNDBUF), (&client, libc::SO_RCVBUF)] {
+            assert_eq!(
+                unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, name, (&size as *const libc::c_int).cast(), size_of_val(&size) as _) },
+                0
+            );
+        }
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        pin_clock(clock.clone());
+        let mut connection = Connection {
+            client: host,
+            guest,
+            connected: true,
+            fresh: false,
+            since: start,
+            active: start,
+            out: Direction::default(),
+            incoming: Direction { bytes: vec![42; BUFFER], end: BUFFER, ..Direction::default() },
+            client_down: 0,
+            guest_down: 0,
+            lingering: None,
+        };
+        // The client never reads: fill its receive queue and the proxy's send queue and buffer. ACKs
+        // still due may free a little more later: the deadline is checked against relays as seen.
+        wait_until("the reply to block", || {
+            connection.incoming.start = 0;
+            connection.incoming.end = BUFFER;
+            !connection.incoming.pump(&connection.guest, &connection.client)
+        });
+        reset(server);
+        let mut fd = poll(&connection.guest, libc::POLLIN);
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
+        assert_ne!(fd.revents & libc::POLLERR, 0);
+        assert!(connection.forward(0, fd.revents));
+        assert_eq!(connection.lingering, Some(start), "failure starts the deadline before the reply drains");
+        // Discover the broken outgoing direction before checking subsequent discarded requests.
+        client.write_all(b"request after reset").unwrap();
+        let mut fd = poll(&connection.client, libc::POLLIN);
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
+        assert!(connection.forward(fd.revents, 0));
+        assert!(connection.out.broken);
+        // Only the reply can relay now (to the client): note when it does, and hold the deadline to that.
+        let step = Duration::from_secs(1);
+        let reply = |c: &Connection| (c.incoming.start, c.incoming.end, c.incoming.done);
+        let (mut seen, mut relayed, mut now) = (reply(&connection), start, start);
+        let mut taken = [0; 4096];
+        let closed = loop {
+            now += step;
+            assert!(now < start + 100 * LINGER, "the forward never closed");
+            *clock.lock().unwrap() = now;
+            tick_clock();
+            if now == start + LINGER {
+                // A client that reads a little is still being delivered to: its deadline restarts.
+                client.set_nonblocking(true).unwrap();
+                wait_until("the reply to move again", || {
+                    let _ = client.read(&mut taken);
+                    assert!(connection.forward(libc::POLLOUT, 0));
+                    reply(&connection) != seen
+                });
+                client.set_nonblocking(false).unwrap();
+            }
+            client.write_all(b"discarded request").unwrap();
+            let mut fd = poll(&connection.client, libc::POLLIN);
+            assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
+            if !connection.forward(fd.revents, 0) {
+                break now;
+            }
+            if reply(&connection) != seen {
+                (seen, relayed) = (reply(&connection), now);
+            }
+            assert_eq!(connection.active, relayed, "discarded bytes are not activity");
+            assert_eq!(connection.lingering, Some(relayed), "only relays move the deadline");
+        };
+        assert!(relayed >= start + LINGER, "reading restarted the deadline");
+        assert!(closed > relayed + LINGER, "closed before LINGER past the last relay");
+        assert!(closed <= relayed + LINGER + step, "a blocked reply must not prevent expiry");
+        CLOCK.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
+    fn what_arrives_before_a_reset_is_still_relayed_both_ways() {
+        let (addr, guest, worker) = worker(4, IDLE);
+        let reply: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        for _ in 0..20 {
+            // The guest replies and resets at once: the proxy finds the data and the error together.
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            server.set_read_timeout(Some(WAIT)).unwrap();
+            echo(&mut client, &mut server);
+            server.write_all(&reply).unwrap();
+            reset(server);
+            let mut got = Vec::new();
+            let _ = client.read_to_end(&mut got);
+            assert_eq!(got.len(), reply.len());
+            // And a client's last request before its reset reaches the guest.
+            let mut client = TcpStream::connect(addr).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            server.set_read_timeout(Some(WAIT)).unwrap();
+            client.write_all(&reply).unwrap();
+            reset(client);
+            let mut got = Vec::new();
+            let _ = server.read_to_end(&mut got);
+            assert_eq!(got.len(), reply.len());
+        }
+        worker.halt();
+    }
+
+    #[test]
+    fn a_reply_held_for_a_slow_client_survives_the_guest_resetting() {
+        let (addr, guest, worker) = worker(4, IDLE);
+        // Small enough for the proxy to hand all of it to the kernel at once (and be done with the
+        // guest before the client's next request comes), and too big for that.
+        for len in [10_000u32, 100_000] {
+            // A small receive window: most of the reply waits in the proxy.
+            let client = unsafe { OwnedFd::from_raw_fd(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)) };
+            let size: libc::c_int = 4096;
+            let set = unsafe {
+                libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&size as *const libc::c_int).cast(), size_of_val(&size) as _)
+            };
+            assert_eq!(set, 0);
+            let SocketAddr::V4(at) = addr else { unreachable!() };
+            let sa = libc::sockaddr_in {
+                sin_family: libc::AF_INET as _,
+                sin_port: at.port().to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from(*at.ip()).to_be() },
+                sin_zero: [0; 8],
+            };
+            assert_eq!(unsafe { libc::connect(client.as_raw_fd(), (&sa as *const libc::sockaddr_in).cast(), size_of_val(&sa) as _) }, 0);
+            let mut client = TcpStream::from(client);
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            echo(&mut client, &mut server);
+            let reply: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            server.write_all(&reply).unwrap();
+            wait_until("the proxy to take the whole reply", || {
+                let mut queued: libc::c_int = 0;
+                assert_eq!(unsafe { libc::ioctl(server.as_raw_fd(), libc::TIOCOUTQ, &mut queued) }, 0);
+                queued == 0
+            });
+            reset(server);
+            thread::sleep(Duration::from_millis(50));
+            // A request the reset guest cannot take: that direction ends, the reply still goes out.
+            client.write_all(b"next request").unwrap();
+            thread::sleep(Duration::from_millis(50));
+            // Slowly: the proxy writes the last of the reply long before it is read.
+            let (mut got, mut chunk) = (Vec::new(), [0; 2048]);
+            loop {
+                match client.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&chunk[..n]),
+                    // A reset: the proxy closed with the request unread, or before it came.
+                    Err(e) => panic!("after {} of the {len}-byte reply: {e}", got.len()),
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(got.len(), reply.len());
+            assert!(got == reply);
+        }
+        worker.halt();
     }
 
     #[test]

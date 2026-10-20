@@ -56,7 +56,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      is the app: its argv, as docker's); -t, --tty: on a pty, this terminal
                                      raw (Ctrl-P Ctrl-Q detaches); with -d, to attach to later
       -p [IP:]HOST_PORT:VM_PORT[/tcp|/udp]
-                                     forward a host port here (repeatable; default IP 0.0.0.0, TCP)
+                                     forward a host port here (repeatable; default 0.0.0.0 and [::], TCP)
+                                     IP: IPv4 or [IPv6]; IPv4 alone if IPv6 is unavailable
       --ip IP                        its address (without: the next free one)
       --cpus N                       cap its CPU time at N CPUs (1.5: one and a half); its vCPUs are IMAGE's
       --memory SIZE                  cap its memory growth (512m, 2g; plain bytes, as docker): from IMAGE's
@@ -96,8 +97,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm rename OLD NEW              rename a running, stopped or exited VM (not while it checkpoints or migrates)
   flexvm kill NAME...                destroy a running VM (Ctrl-C or Ctrl-\\ in the foreground)
   flexvm kill -s SIGNAL NAME...      send SIGNAL (TERM, HUP, 9, ...) to the VM's app instead
-  flexvm rm [-f] NAME...             remove a stopped VM (suspended, exited, failed or lost); -f: a running
-                                     one too
+  flexvm rm [-f] NAME...             remove a stopped VM (suspended, quarantined, exited, failed or lost);
+                                     -f: a running one too
   flexvm checkpoint create VM [NAME] [--stop] [--incremental]
                                      store the VM's state in STATE/checkpoints, named NAME if given;
                                      --incremental: as a delta on its last stored checkpoint
@@ -141,7 +142,14 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      derived for those unset
   flexvm reclaim IP [--force GEN]    take back an address lent out with a VM that migrated away,
                                      once its target is gone for good (without --force: say what)
-  flexvm bench ...                   latency benchmarks, for development (see README)
+  flexvm bench ...                   latency benchmarks; needs a Git checkout, writes bench/ at its top level
+      --timeout SECONDS              state/pull/readiness waits (default 120, minimum 1)
+      --iterations N                 measured trials (positive, default 50; lifecycle: default 5, minimum 1)
+      --warmup N                     unmeasured run trials (default 3; unused with --lifecycle)
+      --settle-ms MS                 sleep after each run trial (default 100; unused with --lifecycle)
+      --ready-port PORT              wait for TCP after run (unused with --lifecycle)
+      --ready-http PORT              GET / and wait for a response byte (unused with --lifecycle);
+                                     mutually exclusive with --ready-port; see README for other flags
 
 options: --state DIR (",
     env!("FLEXVM_DEFAULT_STATE"),
@@ -1032,7 +1040,8 @@ fn run_as(
         (Some(_), Some(_)) if attached => run_attached(host, &name, args.has("keep")),
         (Some((v, _)), Some(_)) => print(v),
         (Some((v, conn)), None) => {
-            util::output::fall_back_to(host.vms(&name, "log")?);
+            // Its terminal gone, this client's own output is dropped: only the VM's process
+            // writes the VM's logs.
             crate::info!("{v}");
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
@@ -1078,7 +1087,15 @@ fn run_attached(host: &Host, name: &str, keep: bool) -> Result<()> {
 }
 
 fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
-    args.all("publish").iter().map(|s| s.parse()).collect()
+    let mut ports = Vec::new();
+    for s in args.all("publish") {
+        let p: ports::Port = s.parse()?;
+        if let Some(old) = ports.iter().find(|old: &&ports::Port| old.overlaps(&p)) {
+            crate::bail!("duplicate port mapping {p}: {old} already publishes that host address and port");
+        }
+        ports.push(p);
+    }
+    Ok(ports)
 }
 
 /// `-e`, `--env-file`, `--entrypoint`, `--keep`, `--rm`, `-p` (and the `--ip` asked for, for a rerun).
@@ -1185,8 +1202,7 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     // Opened and marked written holding the logs lock (shared): garbage
     // collection removes only a quiet log, holding it exclusively.
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(host.vms(name, "log")?)?;
+    let f = util::output::open_in(&host.open_logs(name)?, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT)?;
     f.set_modified(std::time::SystemTime::now())?;
     Ok(f)
 }
@@ -2447,7 +2463,7 @@ mod exec_tests {
         drop(name);
         for record in ["failed", "lost"] {
             std::fs::write(host.vms("web", record).unwrap(), "old vm").unwrap();
-            std::fs::write(host.vms("web", "log.1").unwrap(), "older vm").unwrap();
+            host.write_log("web", "log.1", "older vm");
             let mut out = new_run_log(&host, "web").unwrap();
             let _name = host.take_name("web", false).unwrap();
             out.write_all(b"new vm").unwrap();
@@ -2462,9 +2478,16 @@ mod exec_tests {
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let victim = root.join("victim");
         std::fs::write(&victim, "keep").unwrap();
-        std::os::unix::fs::symlink(&victim, host.vms("vm", "log").unwrap()).unwrap();
+        // Its logs' directory, or the log in it, a link elsewhere: refused.
+        std::os::unix::fs::symlink(root.join("elsewhere"), host.vms("vm", "logs").unwrap()).unwrap();
+        std::fs::create_dir(root.join("elsewhere")).unwrap();
+        assert!(log_file(&host, "vm").is_err());
+        std::fs::remove_file(host.vms("vm", "logs").unwrap()).unwrap();
+        drop(host.open_logs("vm").unwrap());
+        std::os::unix::fs::symlink(&victim, host.vms("vm", "logs").unwrap().join("log")).unwrap();
         assert!(log_file(&host, "vm").is_err());
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep");
+        assert!(!root.join("elsewhere/log").exists());
     }
 
     #[test]

@@ -181,6 +181,8 @@ enum Step {
     Listed,
     /// It is opened (`O_PATH`) and typed; its contents are not read yet.
     Typed,
+    /// A cp's DST is a link, opened (`O_PATH`) and its owner approved; its target is not read yet.
+    Approved,
 }
 
 #[cfg(test)]
@@ -543,11 +545,6 @@ fn components(path: &[u8], into: bool) -> io::Result<Vec<Vec<u8>>> {
     Ok(v)
 }
 
-fn open_dir(path: &str) -> io::Result<OwnedFd> {
-    let fd = os(unsafe { libc::open(cstr(path.as_bytes())?.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) }).map_err(|e| with(path, e))?;
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
 /// The directory at `comps` below `base`, each component opened without following a symlink; missing ones made if `make`.
 fn walk_dir(base: &OwnedFd, comps: &[Vec<u8>], make: Option<Option<(u32, u32)>>) -> io::Result<OwnedFd> {
     let mut fd = base.try_clone()?;
@@ -574,36 +571,111 @@ fn walk_dir(base: &OwnedFd, comps: &[Vec<u8>], make: Option<Option<(u32, u32)>>)
 /// (None: the contents go into the directory).
 type Target = (OwnedFd, Option<(Vec<u8>, Vec<u8>)>);
 
+#[cfg(test)]
+thread_local! {
+    /// Who `extract` follows DST links of, in place of its euid.
+    static AS_UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// DST pinned: the directory it is in (its path followed), its name there, and what it is (None: missing), all
+/// opened once (`O_PATH`), so what is checked is what is unpacked into. A link at DST itself (with a trailing slash
+/// too) is followed only if root or whoever unpacks made it (merged /usr's /bin, /var/run): one that someone else
+/// planted in a directory they may write does not redirect the copy. The approved link's target is read from the
+/// link opened, and resolved from the pinned directory: a link swapped in after it was checked is never read.
+struct Pinned {
+    parent: OwnedFd,
+    leaf: CString,
+    node: Option<Node>,
+}
+
+fn pin(dst: &str) -> io::Result<Pinned> {
+    let trimmed = dst.trim_end_matches('/');
+    let (parent, leaf) = match trimmed.rsplit_once('/') {
+        Some((p, l)) => (if p.is_empty() { "/" } else { p }, l),
+        None if trimmed.is_empty() && dst.starts_with('/') => ("/", "."),
+        None => (".", trimmed),
+    };
+    let fd = os(unsafe { libc::open(cstr(parent.as_bytes())?.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) })?;
+    let (parent, leaf) = (unsafe { OwnedFd::from_raw_fd(fd) }, cstr(leaf.as_bytes())?);
+    let missing = |e: &io::Error| e.raw_os_error() == Some(libc::ENOENT);
+    let node = match Node::open(parent.as_raw_fd(), &leaf, libc::O_NOFOLLOW) {
+        Err(e) if missing(&e) => None,
+        Err(e) => return Err(e),
+        Ok(link) if link.kind() == libc::S_IFLNK => {
+            let me = unsafe { libc::geteuid() };
+            #[cfg(test)]
+            let me = AS_UID.with(|u| u.get()).unwrap_or(me);
+            if link.st.st_uid != 0 && link.st.st_uid != me {
+                return Err(io::Error::other(format!("a link that uid {} made, not followed: give its target", link.st.st_uid)));
+            }
+            hook(Step::Approved, Path::new(dst));
+            let mut to = vec![0u8; libc::PATH_MAX as usize];
+            let n = unsafe { libc::readlinkat(link.fd.as_raw_fd(), c"".as_ptr(), to.as_mut_ptr().cast(), to.len()) };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            to.truncate(n as usize);
+            // The rest of the way is followed, as the link would be; a dangling one is as missing as before.
+            match Node::open(parent.as_raw_fd(), &cstr(&to)?, 0) {
+                Err(e) if missing(&e) => None,
+                r => Some(r?),
+            }
+        }
+        Ok(node) => Some(node),
+    };
+    // A trailing slash asks for a directory, as the kernel's lookup of `x/` does: a file (or a link to one) is not
+    // replaced through it.
+    if dst.ends_with('/') && node.as_ref().is_some_and(|n| n.kind() != libc::S_IFDIR) {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    Ok(Pinned { parent, leaf, node })
+}
+
+/// A directory opened for writing into, from its `O_PATH` fd: the same inode, no name looked up again.
+fn reopen_dir(fd: &OwnedFd) -> io::Result<OwnedFd> {
+    let fd = os(unsafe { libc::openat(fd.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// DST for unpacking into: an existing directory.
+fn into_dir(dst: &str) -> io::Result<OwnedFd> {
+    match pin(dst)?.node {
+        Some(n) if n.kind() == libc::S_IFDIR => reopen_dir(&n.fd),
+        Some(_) => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+        None => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+    }
+}
+
 /// DST for a directory's contents: made if missing.
 fn contents(dst: &str) -> io::Result<Target> {
-    match std::fs::metadata(dst) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => return Err(with(dst, io::Error::from_raw_os_error(libc::ENOTDIR))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(dst).map_err(|e| with(dst, e))?,
-        Err(e) => return Err(with(dst, e)),
-    }
-    Ok((open_dir(dst)?, None))
+    let p = pin(dst).map_err(|e| with(dst, e))?;
+    let dir = match &p.node {
+        Some(n) if n.kind() == libc::S_IFDIR => reopen_dir(&n.fd),
+        Some(_) => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+        None => {
+            let (at, name) = (p.parent.as_raw_fd(), p.leaf.as_ptr());
+            os(unsafe { libc::mkdirat(at, name, 0o777) })
+                .and_then(|_| os(unsafe { libc::openat(at, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) }))
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    };
+    Ok((dir.map_err(|e| with(dst, e))?, None))
 }
 
 fn target(dst: &str, comps: &[Vec<u8>], first: &Header) -> io::Result<Target> {
     let Some(root) = comps.first() else { return contents(dst) };
     let is_dir = comps.len() > 1 || first.kind == b'5';
-    match std::fs::metadata(dst) {
-        Ok(m) if m.is_dir() => return Ok((open_dir(dst)?, Some((root.clone(), root.clone())))),
-        Ok(_) if is_dir => return Err(io::Error::other(format!("cannot copy a directory onto a file: {dst}"))),
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(with(dst, e)),
-        Err(_) if dst.ends_with('/') && !is_dir => return Err(io::Error::other(format!("no such directory: {dst}"))),
+    let p = pin(dst).map_err(|e| with(dst, e))?;
+    match &p.node {
+        Some(n) if n.kind() == libc::S_IFDIR => return Ok((reopen_dir(&n.fd)?, Some((root.clone(), root.clone())))),
+        Some(_) if is_dir => return Err(io::Error::other(format!("cannot copy a directory onto a file: {dst}"))),
+        None if dst.ends_with('/') && !is_dir => return Err(io::Error::other(format!("no such directory: {dst}"))),
         _ => {}
     }
-    let trimmed = dst.trim_end_matches('/');
-    let (parent, leaf) = match trimmed.rsplit_once('/') {
-        Some((p, l)) => (if p.is_empty() { "/" } else { p }, l),
-        None => (".", trimmed),
-    };
-    if matches!(leaf, "" | "." | "..") {
+    if matches!(p.leaf.as_bytes(), b"" | b"." | b"..") {
         return Err(io::Error::other(format!("bad destination {dst}")));
     }
-    Ok((open_dir(parent)?, Some((root.clone(), leaf.as_bytes().to_vec()))))
+    Ok((reopen_dir(&p.parent)?, Some((root.clone(), p.leaf.into_bytes()))))
 }
 
 /// Unpacks `input` at `dest`. `owner`: everything is chowned to it (lchown for links); None leaves the files
@@ -614,7 +686,7 @@ pub fn extract(input: &mut dyn Read, dest: Dest, owner: Option<(u32, u32)>) -> i
     let Some(first) = rd.next()? else { return Ok(()) };
     let into = matches!(dest, Dest::Into(_));
     let (base, top) = match dest {
-        Dest::Into(dir) => (open_dir(dir)?, None),
+        Dest::Into(dir) => (into_dir(dir).map_err(|e| with(dir, e))?, None),
         Dest::Cp(dst) => target(dst, &components(&first.path, false)?, &first)?,
         Dest::Guest(dst, Top::Contents) => {
             components(&first.path, false)?;
@@ -1035,6 +1107,116 @@ mod tests {
         let got = race(&src, &d, Step::Typed, swap(&d, &t.s("elsewhere")));
         assert!(!leaked(&got), "{got:?}");
         assert!(!got.iter().any(|(p, ..)| p.ends_with(b"hidden")), "{got:?}");
+    }
+
+    #[test]
+    fn copy_follows_only_its_own_or_roots_destination_links() {
+        let t = Tmp::new("destination-symlinks");
+        std::fs::create_dir(t.s("outside")).unwrap();
+        std::fs::write(t.s("outside/file"), b"original").unwrap();
+        // As root, the links are someone's: root's would be followed.
+        let owner = match unsafe { libc::geteuid() } {
+            0 => 65534,
+            me => me,
+        };
+        // Someone else's links: refused.
+        AS_UID.with(|u| u.set(Some(owner ^ 1)));
+        for (leaf, to) in [("dir-link", "outside"), ("file-link", "outside/file"), ("dangling", "missing")] {
+            symlink(to, t.s(leaf)).unwrap();
+            std::os::unix::fs::lchown(t.s(leaf), Some(owner), None).unwrap();
+            for suffix in ["", "/", "///"] {
+                let dst = format!("{}{suffix}", t.s(leaf));
+                for entries in [vec![("file", b'0', "replacement")], vec![("dir", b'5', ""), ("dir/new", b'0', "new")]] {
+                    let data = archive(&entries);
+                    let e = unpack_to(&data, Dest::Cp(&dst)).unwrap_err();
+                    assert!(e.to_string().contains("not followed"), "{dst}: {e}");
+                    let top = Top::Named(entries[0].0.as_bytes().to_vec());
+                    assert!(unpack_to(&data, Dest::Guest(&dst, &top)).is_err(), "{dst}");
+                    assert!(unpack_to(&data, Dest::Guest(&dst, &Top::Contents)).is_err(), "{dst}");
+                    assert!(unpack_to(&data, Dest::Into(&dst)).is_err(), "{dst}");
+                }
+            }
+        }
+        assert_eq!(std::fs::read(t.s("outside/file")).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(t.s("outside")).unwrap().count(), 1);
+        assert!(!t.0.join("missing").exists());
+        // Its own (or root's, as /bin of a merged /usr): followed, as docker cp does.
+        AS_UID.with(|u| u.set(Some(owner)));
+        let data = archive(&[("file", b'0', "new")]);
+        unpack_to(&data, Dest::Cp(&t.s("dir-link"))).unwrap();
+        unpack_to(&data, Dest::Guest(&format!("{}/", t.s("dir-link")), &Top::Contents)).unwrap();
+        unpack_to(&archive(&[("into", b'0', "new")]), Dest::Into(&t.s("dir-link"))).unwrap();
+        assert_eq!(std::fs::read(t.s("outside/file")).unwrap(), b"new");
+        assert_eq!(std::fs::read(t.s("outside/into")).unwrap(), b"new");
+        // With a trailing slash, its link to a file (or the file itself) is no directory: not replaced.
+        for leaf in ["file-link", "outside/file"] {
+            for suffix in ["/", "//"] {
+                let dst = format!("{}{suffix}", t.s(leaf));
+                let e = unpack_to(&data, Dest::Cp(&dst)).unwrap_err();
+                assert!(e.to_string().contains("Not a directory"), "{dst}: {e}");
+                assert!(unpack_to(&data, Dest::Guest(&dst, &Top::Named(b"file".to_vec()))).is_err(), "{dst}");
+                assert!(unpack_to(&data, Dest::Guest(&dst, &Top::Contents)).is_err(), "{dst}");
+            }
+        }
+        assert!(std::fs::symlink_metadata(t.s("file-link")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(t.s("outside/file")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_destination_link_swapped_after_its_check_is_never_read() {
+        let t = Tmp::new("destination-swap");
+        for d in ["pinned", "elsewhere"] {
+            std::fs::create_dir(t.s(d)).unwrap();
+        }
+        let (link, data) = (t.s("link"), archive(&[("file", b'0', "new")]));
+        let dsts = [link.clone(), format!("{link}/")];
+        let tops = [None, Some(Top::Contents), Some(Top::Named(b"file".to_vec()))];
+        for (n, (dst, top)) in dsts.iter().flat_map(|d| tops.iter().map(move |t| (d, t))).enumerate() {
+            let _ = std::fs::remove_file(&link);
+            symlink("pinned", &link).unwrap();
+            let (at, swapped) = (dst.clone(), std::rc::Rc::new(std::cell::Cell::new(false)));
+            let (now, link) = (swapped.clone(), link.clone());
+            let elsewhere = t.s("elsewhere");
+            HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |s, p| {
+                    if s == Step::Approved && p == Path::new(&at) && !now.replace(true) {
+                        // Atomically, as an attacker would: the checked link's name now names another link.
+                        let new = format!("{link}.new");
+                        symlink(&elsewhere, &new).unwrap();
+                        std::fs::rename(&new, &link).unwrap();
+                    }
+                }))
+            });
+            let r = match top {
+                None => unpack_to(&data, Dest::Cp(dst)),
+                Some(top) => unpack_to(&data, Dest::Guest(dst, top)),
+            };
+            HOOK.with(|h| h.borrow_mut().take());
+            r.unwrap();
+            assert!(swapped.get(), "case {n}: {dst}");
+            assert_eq!(std::fs::read_link(t.s("link")).unwrap(), Path::new(&t.s("elsewhere")), "case {n}");
+            assert_eq!(std::fs::read(t.s("pinned/file")).unwrap(), b"new", "case {n}: {dst}");
+            std::fs::remove_file(t.s("pinned/file")).unwrap();
+            assert_eq!(std::fs::read_dir(t.s("elsewhere")).unwrap().count(), 0, "case {n}: {dst}");
+        }
+        // Into: the same.
+        std::fs::remove_file(t.s("link")).unwrap();
+        symlink("pinned", t.s("link")).unwrap();
+        let (link, elsewhere) = (t.s("link"), t.s("elsewhere"));
+        let at = link.clone();
+        HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |s, p| {
+                if s == Step::Approved && p == Path::new(&at) {
+                    std::fs::remove_file(&at).unwrap();
+                    symlink(&elsewhere, &at).unwrap();
+                }
+            }))
+        });
+        let r = unpack_to(&data, Dest::Into(&link));
+        HOOK.with(|h| h.borrow_mut().take());
+        r.unwrap();
+        assert_eq!(std::fs::read(t.s("pinned/file")).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(t.s("elsewhere")).unwrap().count(), 0);
     }
 
     #[test]

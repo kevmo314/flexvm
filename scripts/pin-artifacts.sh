@@ -20,7 +20,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 checksums=$root/scripts/checksums.sha256
-REPO=kevmo314/flexvm
+REPO=numerataz/flexvm
 ASSETS=(firecracker vmlinux inputs.txt)
 # How long main may name an unpinned ARTIFACTS_TAG: tag, release and pin take well under an hour.
 RELEASE_WINDOW_HOURS=24

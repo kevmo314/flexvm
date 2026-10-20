@@ -57,9 +57,11 @@ a suspend that published meanwhile is revoked and ends as a death, not a kill;
 a start not yet done once its VM ran is one too, watched from the moment it runs:
 its starter, a standby's claimer or `run -d`, exits 124 as well),
 then cleaned up as a
-kill, with why (Firecracker's exit status and the end of its log, the
-guest's console) in `RUN/vms/NAME.failed`, which `ps -a` shows as `failed`
-until `flexvm rm NAME`.
+kill, with why (Firecracker's exit status and its post-mortem summary: the
+last lines, plus the start of a guest crash report) in `RUN/vms/NAME.failed`,
+which `ps -a` shows as `failed` until `flexvm rm NAME`. The full Firecracker
+log tail (up to 64 KiB, including the guest console) is in the VM log,
+read with `flexvm logs NAME`.
 
 Ownership is held in guards that give back exactly what they took: the name
 lock (`NameLock`), the address claim (`AddrClaim`: dropped, it releases the
@@ -142,13 +144,8 @@ a source killed with SIGKILL, which records nothing.
 
 ## On-disk state
 
-Two directories, both overridable (`--state`, `--run`):
-each state directory is bound to one canonical run path on first open.
-A different `--run` for the same state directory is refused, including after a reboot.
-Without `--run`, a state's run directory follows from its path alone (`/run/flexvm` for the default
-state, `/run/flexvm-PREFIX`, its tap prefix, for any other), so no state defaults into a run directory
-another may own; one bound to another run directory (`run.json`) is refused without that `--run`.
-`/run/flexvm` is the default state's alone: any other state is refused it, bound or claimed (`reserved_run`).
+Two directories, both overridable (`--state`, `--run`): see
+[README Setup](../README.md#setup) for their defaults and permanent binding.
 
 ```
 STATE (default /var/lib/flexvm, on disk)
@@ -159,7 +156,7 @@ STATE (default /var/lib/flexvm, on disk)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   checkpoints/           stored checkpoints: ID/ and names/NAME -> ../ID
   auth.json              saved registry credentials (`flexvm login`), root-owned, mode 0600
-  host.json              host config, edited by hand (listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
+  host.json              host config, edited by hand (listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, peer_underlays, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
   run.json               canonical run path, bound on first open under `.locks/open`'s flock; fsynced
   .locks/                root's locks (0700): open (held while a root `Host::open` binds or repairs the root),
                          host (the host lock, held for short critical sections only), evict (one eviction
@@ -182,14 +179,16 @@ STATE (default /var/lib/flexvm, on disk)
   staging/               where image layers unpack (`pull`); its ancestry must be root-owned
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{json,sock}            registry entry, control socket (0600)
-  vms/NAME.{log,log.1}            current log and previous rotation of background VMs (0600)
-  vms/.locks/NAME.lock            liveness lock; NAME.log, a log's writers' lock; .incoming-*.log, an arrival's lock
+  vms/NAME.logs/{log,log.1}       a lifetime of the name's logs: current log and previous rotation (0700, 0600)
+  vms/NAME.{log,log.1}            links into NAME.logs/
+  vms/.NAME.logs.X.gone           a retired lifetime being removed (swept if a writer added to it meanwhile)
+  vms/.locks/NAME.lock            liveness lock; .incoming-*.log, an arrival's lock
   vms/NAME.{failed,moved}         why a VM died (until `rm` or name reuse); where it migrated to (an hour)
   vms/NAME.exit                   the process's exit status and identity (`flexvm wait`)
   vms/NAME.exited                 a background VM's app exit status and run config (until `start` or `rm`)
   vms/NAME.lost                   a VM lost with the host, recorded before its address is withdrawn (until `rm` or name reuse)
   .boot                  the boot id once this boot's recovery completed (`gc::after_boot`)
-  vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
+  vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.logs/log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc                   when garbage was last swept periodically
   .X.PID-START-BOOT.tmp   `util::write_file`'s temporary files here and in STATE: swept once their writer is
@@ -231,12 +230,16 @@ RUN (default /run/flexvm, tmpfs)
 Write it atomically (a temp file in `STATE`, renamed over it). It must be a
 regular file, not a symlink, owned by root or the user and writable by no
 one else; an unknown key is refused. Every load validates it
-(`Config::validate`: `vm_ips` inside `cluster_ips`, peers `HOST:PORT`,
-`peer_underlays` unicast and not local, `dns` IPv4, `announce_dev` not
-empty). An invalid one makes every command refuse (`STATE/host.json: ...
-(see README: Configuration)`); running processes re-read it when its mtime
-or inode changes and keep the last valid one meanwhile. `flexvm info` shows
-what is set, what is derived for the rest, and warnings.
+(`Config::validate`: `vm_ips` inside `cluster_ips`, peers and `listen`
+`HOST:PORT` with nonzero ports, `peer_underlays` non-loopback and unicast,
+`dns` IPv4, `announce_dev` not empty). A validation error makes every command
+refuse (`STATE/host.json: ... (see README: Configuration)`); running processes
+re-read it when its mtime or inode changes and keep the last valid one
+meanwhile. An explicit loopback or non-unicast `underlay` is refused on
+write; on read it is ignored with a warning and derived instead. Local
+`peer_underlays` addresses are accepted with a warning; locality depends on
+the current interfaces. `flexvm info` shows what is set, what is derived for
+the rest, and warnings.
 
 Every lock flexvm flocks is a 0600 file in a directory only root may enter
 (0700, root's), opened relative to that directory's descriptor once it was
@@ -298,20 +301,28 @@ Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a 
 VM, suspended VM, `failed`, `lost`, `exited` or `moved` record go once unwritten for an hour,
 decided and removed holding `RUN/.locks/logs`, which a start holds (shared)
 while it opens and marks its log (whether a VM holds the name is read from its lock's record, never by probing the lock a start takes without waiting); `NAME.moved` goes after an hour.
-Explicit `rm`, including `rm -f` of a running VM (once its process has exited, so
-its last words are in the log removed), removes `NAME.log` and
-`NAME.log.1` while holding the name and `RUN/.locks/logs` shared, before
-another VM can take the name; `kill` and a foreground `run -i`/`-t`'s end keep them. Logs remain available for stopped and exited
+A VM's logs are a lifetime's directory, `NAME.logs` (`Host::open_logs`), made as its VM
+takes the name. Only the VM's own process writes them (a foreground client whose terminal
+is gone drops its own output), and it and `logs -f` hold the directory, never its path:
+they open, rotate and read only in it. So a lifetime ends in one step, without waiting on
+anyone: explicit `rm` (including `rm -f` of a running VM, once its process has exited, so
+its last words are in the log removed), or a new VM of a `failed`, `lost` or `moved` name
+renames the directory away (`.NAME.logs.X.gone`) and removes it, holding the name and
+`RUN/.locks/logs` shared; `rename` moves it to the new name. An accepted arrival's log is
+published as `log` in the directory its VM made as it took the name. Logs at `NAME.log`
+and `NAME.log.1` from before these directories are moved into it when it is made. A writer
+still running then goes on only in its own directory, and `logs -f` ends once the directory
+at the path is not the one it holds (its inode, held, is never a later one's). `kill` and a
+foreground `run -i`/`-t`'s end keep the logs. Logs remain available for stopped and exited
 VMs until removal; `start` keeps them. A detached `run` opens its log in the
 parent before the child takes the name, so removal clears the logs before
 that parent opens them. Released migration records are retired as below.
 Logs are capped by their
-writers, not swept (`output::append_capped`): a VM process's output relay
-tries the log's lock (`.locks/NAME.log` in its directory, never the log itself)
-for up to a second, then appends to the file at the log's path. With the lock,
-a write past 8 MiB renames it `NAME.log.1`; the next write starts a new one.
-Without the lock, it appends without rotating, so a concurrent rotation may
-carry that write into `NAME.log.1`. Writes are never retried.
+writers, not swept (`output::append_in`): a writer tries the directory's lock (a flock
+of its own open of it) for up to a second, then appends to `log` in it, making it if
+missing. With the lock, a write past 8 MiB renames it `log.1`; the next write starts a
+new one (one interrupted between leaves `log.1`, which `logs` reads). Without the lock,
+it appends without rotating. Writes are never retried.
 
 **The tap prefix** names taps and hold devices: `f` and five base-36 digits
 of a hash of the state directory (`Host::tap_prefix`), so it never changes
@@ -623,7 +634,7 @@ an operation. Busy here is what the VM process's own checks say (its reply
 sets `busy`), never a peer's text: any peer's refusal, whatever it says, is
 a refusal (#599). A refused VM and peer pair is not tried again for 5 s, doubling
 to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
-log is removed; an accepted one becomes `NAME.log`.
+log is removed; an accepted one becomes `NAME.logs/log`.
 Announcements and `lend` requests go to all peers at once, by the peers
 configured now (`Host::config_now`); the listener re-reads them too, so
 an edit of host.json's `peers` reaches running processes.
