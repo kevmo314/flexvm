@@ -4537,12 +4537,21 @@ def kill_prepare():
         ip, pid, recorded = vms(A)[n]["ip"], vm_pid(A, n), migs()
         clear_gate(host, gate)
         clear_gate(A, "destroy_wait")
-        # The gate under the source's 10 s for the target's answer (PREFLIGHT_TIMEOUT).
-        with armed_fault(A, "destroy_wait", 60000), armed_fault(host, gate, 8000):
+        # Parked until the kill is seen waiting, however long that takes: both sides' preflight deadlines and
+        # the target's wait for its source after its answer made long (`long_preflight`), so the gates outlast them.
+        with armed_fault(A, "destroy_wait", 600000), armed_fault(A, "long_preflight", 600000), \
+                armed_fault(B, "long_preflight", 600000), armed_fault(host, gate, 600000):
             moved, mt = background(lambda: migrate(A, n, B))
-            check(f"{what}: the migration got to the gate", wait_for(lambda: reached(host, gate), 8), reached(host, gate))
+            check(f"{what}: the migration got to the gate", wait_for(lambda: reached(host, gate), 30), reached(host, gate))
             killed, kt = background(lambda: cli_json(A, "kill", n))
-            check(f"{what}: the kill waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 8), reached(A, "destroy_wait"))
+            check(f"{what}: the kill waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 30), reached(A, "destroy_wait"))
+            # Its arrival still there to give up, not gone on its own meanwhile.
+            lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
+            try:
+                arrival = json.load(open(lock))["pid"]
+            except (OSError, ValueError, KeyError):
+                arrival = None
+            check(f"{what}: the target's arrival is still alive once the kill waits", arrival is not None and alive(arrival), arrival)
             fault(host, gate, 0)
             mt.join()
             kt.join()
@@ -7145,10 +7154,20 @@ def park_arrival(n):
     """Migrates `n` to B in a thread (its answer in the returned dict's "r"), B parked once it
     has admitted the preflight, before it answers it: the source runs on until `grow_parked`."""
     res = {}
-    # Under the source's 10 s for B's answer (PREFLIGHT_TIMEOUT), should the test never let it go.
-    fault(B, "incoming_gate", 8000)
+    # Parked until `unpark_arrival`, however long the test takes to get there: both sides' preflight
+    # deadlines (the source's 10 s for B's answer, B's 7 s to prepare) made long (`long_preflight`).
+    for h in (A, B):
+        fault(h, "long_preflight", 600000)
+    fault(B, "incoming_gate", 600000)
     t = start_thread(target=lambda: res.update(r=migrate(A, n, B)))
     return t, res
+
+
+def unpark_arrival():
+    """Lets `park_arrival`'s arrival go on, its preflight deadlines as usual again for later migrations."""
+    fault(B, "incoming_gate", 0)
+    for h in (A, B):
+        fault(h, "long_preflight", 0)
 
 
 def grow_parked(n, grow, grant, label):
@@ -7158,8 +7177,8 @@ def grow_parked(n, grow, grant, label):
     hog(A, n, grow)
     want = grant - 256 + 2 * ARRIVAL_MARGIN
     present = lambda: vms(A)[n]["pages_mib"]["present"]
-    check(f"{label}: the guest grew before b went on", wait_for(lambda: present() >= want, 7), (grant, want, present()))
-    fault(B, "incoming_gate", 0)
+    check(f"{label}: the guest grew before b went on", wait_for(lambda: present() >= want, 60), (grant, want, present()))
+    unpark_arrival()
 
 
 def arrival_grew():
@@ -7194,7 +7213,7 @@ def arrival_grew():
                 grow_parked(n, grow, grant, "arrival grew")
                 t.join()
         finally:
-            fault(B, "incoming_gate", 0)
+            unpark_arrival()
         r = res["r"]
         check("arrival grew: refused for what it grew by", not r["ok"] and "grew to" in r["error"] and "not enough memory" in r["error"], r)
         check("arrival grew: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
@@ -7252,7 +7271,7 @@ def grew_admitted():
         try:
             grow_parked(n, grow, sum((first or {}).values()), label)
         finally:
-            fault(B, "incoming_gate", 0)
+            unpark_arrival()
         # Admitted at the header: a hold larger than the preflight's, for the 3 s B then stalls.
         more = first and wait_for(lambda: any(holds().get(i, 0) > m for i, m in first.items()), 20) and holds()
         return t, res, first, more

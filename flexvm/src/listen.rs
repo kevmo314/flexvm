@@ -647,7 +647,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
         // Checked by the arrival (`check_vm_ip`) against these, as route and lend are: a name
         // with no addresses yet, its lookup under way (a peer just added), is waited for.
         "migrate_in" => {
-            let by = deadline - REQUEST_DEADLINE + PREPARE_WAIT;
+            let by = deadline - REQUEST_DEADLINE + if fault("long_preflight") { crate::migrate::LONG_PREFLIGHT } else { PREPARE_WAIT };
             return match peers.all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT) {
                 Ok(peers) => incoming(host, &req, &line, conn, by, &peers),
                 Err(e) => send_json(&mut conn, &json!({"ok": false, "error": e.to_string()})).map_err(Into::into),
