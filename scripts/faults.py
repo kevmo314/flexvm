@@ -758,6 +758,23 @@ def fc_pid(host, name):
     return vms(host)[name]["firecracker"]
 
 
+def died_with_process(label, host, name, pid, fc, killed):
+    """After a SIGKILL of `name`'s VM process `pid` (at `killed`): its Firecracker `fc` dies (PDEATHSIG), and the name
+    is let go. Each is waited for (#653): the name's lock goes with the dying process's last file, which can be a
+    moment after Firecracker's PDEATHSIG, when its main thread exited."""
+    died = wait_for(lambda: not alive(fc), 15)
+    detail = {"firecracker gone within": f"{time.time() - killed:.1f} s of the kill"}
+    if not died:
+        # What its threads and the VM process's wait on, and how long Firecracker outlived the kill.
+        detail = {"firecracker": threads_of(fc), "vm process": threads_of(pid)}
+        gone = wait_for(lambda: not alive(fc), 60)
+        detail["firecracker outlived its kill by"] = f"{time.time() - killed:.1f} s" + ("" if gone else ", and lives on")
+    left = wait_for(lambda: name not in vms(host), 15)
+    if not left:
+        detail.update(listed=vms(host).get(name), threads=threads_of(pid))
+    check(f"{label}: the VM died with its process", died and left, detail)
+
+
 def api_sock(host, name):
     """The API socket of `name`'s Firecracker on `host`."""
     argv = open(f"/proc/{fc_pid(host, name)}/cmdline", "rb").read().split(b"\0")
@@ -4102,9 +4119,10 @@ def checkpoint_crash():
     check("crash: caught the checkpoint mid-write", caught)
     pid, fc = vm_pid(A, n), fc_pid(A, n)
     os.kill(pid, signal.SIGKILL)
+    killed = time.time()
     t.join()
     fault(A, "ckpt_slow", 0)
-    check("crash: the VM died with its process", wait_for(lambda: not alive(fc), 15) and n not in vms(A), vms(A).get(n))
+    died_with_process("crash", A, n, pid, fc, killed)
     check("crash: no checkpoint published", not os.path.exists(path))
     r = restore(B, path, ip="auto")
     check("crash: nothing to restore", not r["ok"], r)
@@ -5628,17 +5646,7 @@ def cow_crash():
     for f in partial:
         r = restore(B, f, ip="auto")
         check("cow crash: the partial directory does not restore", not r["ok"], r)
-    died = wait_for(lambda: not alive(fc), 15)
-    if died:
-        detail = vms(A).get(n)
-    else:
-        # #653: PDEATHSIG comes only once the VM process's main thread gets to exit_notify, after its exit_mm and the
-        # last close of its files (which releases its registry lock): what its threads and Firecracker's wait on, and
-        # how long Firecracker outlived it.
-        detail = {"firecracker": threads_of(fc), "vm process": threads_of(pid)}
-        gone = wait_for(lambda: not alive(fc), 60)
-        detail["firecracker outlived its kill by"] = f"{time.time() - killed:.1f} s" + ("" if gone else ", and lives on")
-    check("cow crash: the VM died with its process", died and n not in vms(A), detail)
+    died_with_process("cow crash", A, n, pid, fc, killed)
     ok(run(A, n))
     start_writer(A, n, mib=16)
     ok(checkpoint(A, n, path))
