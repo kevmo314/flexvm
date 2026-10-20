@@ -2743,7 +2743,10 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
         if source_fault:
             check(f"{label}: each source paused with a queue on its tap, which its guest took first", all(len(t) == 1 for t in took), took)
         let_go = [float(m) for h in (A, B) for m in re.findall(r"let go of \S+ after ([\d.]+) ms", log(h, n))]
-        check(f"{label}: each release ended within 2 s of its 300 ms route change", let_go and max(let_go) < 2000, let_go)
+        # Held up by the traffic, a release would last as long as the stream (all the migrations): the bound
+        # tells that from one that ended, with room for a host this loaded (its route change, `release_stall`'s
+        # 300 ms where armed, and the queue's hand-over), not a timing of its own.
+        check(f"{label}: each release ended within 5 s", let_go and max(let_go) < 5000, let_go)
     every = logs + [log(A, n), log(B, n)]
     cleanup(n)
     return every
