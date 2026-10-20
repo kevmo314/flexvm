@@ -12,8 +12,11 @@ lab_cgroups=()
 host_A=192.168.100.1:7070
 host_B=192.168.100.2:7070
 name=fv-test-$$
-checks=('lab setup' 'run/exec/kill and address release' 'four migrations preserve RAM and process' 'TCP through two migrations' 'pressure migration' 'teardown leaves no resources')
-results=(SKIP SKIP SKIP SKIP SKIP SKIP)
+# Migration under memory pressure is faults.py's (mem_high_evict, evict_*: pressure injected, not forced
+# on a host whose namespaces share its RAM).
+checks=('lab setup' 'run/exec/kill and address release' 'four migrations preserve RAM and process' 'TCP through two migrations' 'teardown leaves no resources')
+results=(SKIP SKIP SKIP SKIP SKIP)
+teardown=$((${#checks[@]} - 1))
 current=0
 work=
 client_pid=
@@ -83,7 +86,7 @@ finish() {
         cp /run/flexvm-lab-B/run/vms/*.log "$work/log/B/" 2>/dev/null
         mapfile -t lab_cgroups < <(process_cgroups $(state_processes /run/flexvm-lab-A /run/flexvm-lab-B))
         if ! "$netlab" down; then
-            results[5]=FAIL
+            results[teardown]=FAIL
             echo 'FAIL: netlab.sh down'
         fi
         deadline=$((SECONDS + 10))
@@ -91,12 +94,12 @@ finish() {
             (( SECONDS < deadline )) || break
             sleep 0.2
         done
-        if resources_gone && [[ ${results[5]} != FAIL ]]; then
-            results[5]=PASS
-            printf 'PASS: %s\n' "${checks[5]}"
+        if resources_gone && [[ ${results[teardown]} != FAIL ]]; then
+            results[teardown]=PASS
+            printf 'PASS: %s\n' "${checks[teardown]}"
         else
-            results[5]=FAIL
-            printf 'FAIL: %s\n' "${checks[5]}"
+            results[teardown]=FAIL
+            printf 'FAIL: %s\n' "${checks[teardown]}"
             ip netns list
             ls -d /run/flexvm-lab-* 2>/dev/null
         fi
@@ -107,11 +110,7 @@ finish() {
             FAIL) failed=$((failed + 1)) ;;
             SKIP)
                 skipped=$((skipped + 1))
-                if (( i == 4 )); then
-                    echo 'SKIP: pressure migration (namespaces share host RAM; forcing pressure risks host OOM)'
-                else
-                    printf 'SKIP: %s (prerequisite failed)\n' "${checks[i]}"
-                fi ;;
+                printf 'SKIP: %s (prerequisite failed)\n' "${checks[i]}" ;;
         esac
     done
     printf 'Summary: %d PASS, %d FAIL, %d SKIP\n' "$passed" "$failed" "$skipped"
@@ -278,4 +277,4 @@ cat "$work/client.log"
 verify_guest fvA "$host_A"
 pass
 # Leave the VM and warm pool alive: the EXIT trap must prove down cleans them up.
-current=5
+current=$teardown

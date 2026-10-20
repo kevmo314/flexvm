@@ -337,6 +337,7 @@ def vms(host):
     code, out, err = cli(host, "ps", "-a", "--json")
     assert code == 0, err
     out = {v["name"]: v for v in json.loads(out)}
+    seen(out.values())
     for n, v in out.items():
         if v.get("pid"):
             try:
@@ -377,10 +378,14 @@ def signal_vm(host, name, sig):
 
 
 def wait_for(cond, timeout):
+    """`cond()`'s first true value within `timeout` s, else its last: never evaluated again once true (a
+    transient condition seen is not failed by a second look)."""
     end = time.time() + timeout
-    while not cond() and time.time() < end:
+    while True:
+        v = cond()
+        if v or time.time() > end:
+            return v
         time.sleep(0.1)
-    return cond()
 
 
 def name_free(host, name, timeout=10):
@@ -404,6 +409,14 @@ def wait_released(target, name, source=None, timeout=120):
                     "background_pull_ms": v.get("background_pull_ms") if v else None}
         time.sleep(0.1)
     return {"released": None, "state": None}
+
+
+def assert_released(target, name, source=None, timeout=120):
+    """`wait_released`, checked: a migration its caller waits out before going on, whose release (never
+    seen within `timeout`) would otherwise fail a later check, under that one's label."""
+    st = wait_released(target, name, source, timeout)
+    check(f"{name}: let go by {source or (A if target is B else B)} for {target} within {timeout} s", st["released"] is True, st)
+    return st
 
 
 def fault(host, f, ms):
@@ -689,11 +702,25 @@ def start_listeners():
         start_listener(h)
 
 
+LISTENER_STOP_S = 60
+
+
 def stop_listener(h):
+    """SIGTERMs `h`'s listener and waits for it, at most LISTENER_STOP_S (then SIGKILLs it, a failure); one that
+    had exited already, unasked, failed too: a crash is not hidden by the stop that would have followed."""
     p = listeners.pop(h.addr, None)
-    if p:
-        p.terminate()
+    if not p:
+        return
+    if p.poll() is not None:
+        check(f"{h}'s listener ran until stopped", False, f"exit {p.returncode}; see {h.listen_log}")
+        return
+    p.terminate()
+    try:
+        p.wait(LISTENER_STOP_S)
+    except subprocess.TimeoutExpired:
+        p.kill()
         p.wait()
+        check(f"{h}'s listener stops within {LISTENER_STOP_S} s of SIGTERM", False, f"SIGKILLed; see {h.listen_log}")
 
 
 def stop_listeners():
@@ -788,16 +815,19 @@ def vsock_path(host, name):
 
 
 def pause(host, name):
+    """SIGTSTP; returns whether the VM is listed paused within 10 s (callers check it)."""
     signal_vm(host, name, signal.SIGTSTP)
     return wait_for(lambda: vms(host)[name]["state"] == "paused", 10)
 
 
 def resume(host, name):
-    """SIGCONT (`flexvm unpause` of a paused VM); returns how long until it runs (s)."""
+    """SIGCONT (`flexvm unpause` of a paused VM); returns how long until it runs (s). Raises if it does not
+    run within 60 s, under its own message rather than a later check's."""
     t = time.time()
     code, out, err = cli(host, "unpause", name)
-    assert code == 0, err
-    wait_for(lambda: vms(host)[name]["state"] == "running", 60)
+    assert code == 0, f"unpause {name} on {host} exited {code}: {err}"
+    running = wait_for(lambda: vms(host).get(name, {}).get("state") == "running", 60)
+    assert running, f"{name} on {host} not running 60 s after unpause: {vms(host).get(name)}"
     return time.time() - t
 
 
@@ -837,7 +867,7 @@ def basic(swept=False):
     check("basic: md5 intact on B", md5(B, n) == m)
     # And back.
     r2 = ok(migrate(B, n, A))
-    wait_released(A, n)
+    assert_released(A, n)
     check("basic: back on A only", where(n) == {A: "running"}, where(n))
     check("basic: md5 intact after round trip", md5(A, n) == m)
     # A target forgets a migration only once its source said it is done
@@ -924,7 +954,7 @@ def pages_blip():
     # no realtime clock. It must still migrate (issue #50).
     r = migrate(B, n, A)
     check("pages blip: migrates back", r["ok"], r)
-    wait_released(A, n)
+    assert_released(A, n)
     w, back = where(n), md5(A, n)
     check("pages blip: back on A only, md5 intact", w == {A: "running"} and back == m, (w, back))
 
@@ -1170,10 +1200,10 @@ def exec_race():
     try:
         time.sleep(0.5)
         ok(migrate(A, n, B))
-        wait_released(B, n)
+        assert_released(B, n)
         time.sleep(0.3)
         ok(migrate(B, n, A))
-        wait_released(A, n)
+        assert_released(A, n)
         time.sleep(0.3)
     finally:
         stop.set()
@@ -1224,7 +1254,7 @@ def guest_calls():
             w = start_thread(target=worker, args=(B,))
             workers.append(w)
         got = md5(B, n)
-        wait_released(B, n)
+        assert_released(B, n)
         time.sleep(0.3)
     finally:
         stop.set()
@@ -1244,7 +1274,7 @@ def guest_calls():
     # The arrival's own clock check ended first (one so far), so the count below is the resume's.
     check("guest calls: the arrival's clock check ended", wait_for(lambda: sum(vms(B)[n]["clock_syncs"].values()) >= 1, 30), vms(B)[n]["clock_syncs"])
     syncs = vms(B)[n]["clock_syncs"]
-    pause(B, n)
+    check("guest calls: paused", pause(B, n), vms(B).get(n))
     clear_gate(B, "guest_lose_reply")
     with armed_fault(B, "guest_lose_reply", 600000):
         resume(B, n)
@@ -1792,7 +1822,7 @@ def guest_hang():
     check("guest hang: every CLI exec gave up within its deadline", all(t is not None and t < 40 and c != 0 for t, c in times), times)
     check("guest hang: exec works again", sh(A, n, "echo hi") == (0, "hi"))
     ok(migrate(A, n, B))
-    wait_released(B, n)
+    assert_released(B, n)
     check("guest hang: migrates afterwards, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
 
 
@@ -1919,7 +1949,7 @@ def prepare_fail():
     check("prepare fail: target holds nothing", n not in vms(B) and not addr(B, ip).get("holder"), addr(B, ip))
     r = migrate(A, n, B)
     check("prepare fail: a later migration works", r["ok"] and where(n).get(B) == "running", r)
-    wait_released(B, n)
+    assert_released(B, n)
     check("prepare fail: md5 intact on B", md5(B, n) == m)
 
 
@@ -1969,7 +1999,7 @@ def arrival_flood():
     check("arrival flood: idle arrivals give up once their source hangs up", wait_for(gone, 10))
     r = migrate(A, n, B)
     check("arrival flood: a later migration works", r["ok"] and where(n).get(B) == "running", r)
-    wait_released(B, n)
+    assert_released(B, n)
     check("arrival flood: md5 intact on B", md5(B, n) == m)
 
 
@@ -2573,7 +2603,7 @@ def same_host_bulk_tcp():
     for src, dst in ((A, B), (B, A)):
         r = migrate(src, n, dst)
         held.append((r.get("result") or {}).get("held") or r.get("error"))
-        wait_released(dst, n, src)
+        assert_released(dst, n, src)
         moved.append(flowing(sent[0]))
     stop.set()
     t.join(15)
@@ -2712,7 +2742,7 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
             if source_fault:
                 fault(src, source_fault, 0)
             held.append((r.get("result") or {}).get("held") or r.get("error"))
-            wait_released(dst, n, src)
+            assert_released(dst, n, src)
             # The source's log once its process is gone (what it dropped as it left is in it),
             # before the VM arrives there again and starts a new one (each host's last log is
             # read at the end).
@@ -2907,7 +2937,7 @@ def rx_stall():
             if not r["ok"]:
                 check(f"rx stall: migration {i} succeeded", False, r)
                 break
-            wait_released(other, n, cur)
+            assert_released(other, n, cur)
             cur = other
         elif op == "checkpoint":
             r = checkpoint(cur, n, ckpt_path(f"{n}-{i}"))
@@ -2994,7 +3024,7 @@ def delayed_announce():
         check("delayed announce: B holds up A's announcement", wait_for(lambda: held_routes(B, ip, since)["held"] == 1, 10), held_routes(B, ip, since))
         r = migrate(A, n, B)
         check("delayed announce: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
-        wait_released(B, n)
+        assert_released(B, n)
         # Recorded after the commit's answer (its fsyncs off the downtime): waited for, not read once.
         check("delayed announce: B took the next revision", wait_for(lambda: addr(B, ip).get("rev") == 1, 10), addr(B, ip))
         check("delayed announce: A heard of it", wait_for(lambda: addr(A, ip).get("rev") == 1, 10), addr(A, ip))
@@ -3034,7 +3064,7 @@ def delayed_announce_handoff():
               and held_routes(B, ip, since)["answered"] == [(gen, 0, "stale")], held_routes(B, ip, since))
         a = addr(B, ip)
         check("delayed handoff: A's late one is stale", a.get("seen") == gen and a.get("rev") == 0 and a.get("via") is None, a)
-    wait_released(B, n)
+    assert_released(B, n)
     check("delayed handoff: the arrival's revision recorded after the handoff",
           wait_for(lambda: addr(B, ip).get("rev") == 1, 10) and addr(B, ip).get("via") is None, addr(B, ip))
     check("delayed handoff: running on B", where(n) == {B: "running"}, where(n))
@@ -3053,7 +3083,7 @@ def handoff_onward():
         r = migrate(A, n, B)
         check("handoff onward: migrated to B", r["ok"] and where(n).get(B) == "running", (r, where(n)))
         check("handoff onward: B's hand-off is held", wait_for(lambda: reached(B, "handoff_gate"), 5), reached(B, "handoff_gate"))
-        wait_released(B, n, timeout=30)
+        assert_released(B, n, timeout=30)
         t = time.time()
         r = migrate(B, n, A)
         check("handoff onward: refused while the hand-off runs", not r["ok"] and "held packets" in r.get("error", ""), r)
@@ -3066,7 +3096,7 @@ def handoff_onward():
         check("handoff onward: B->A waits", mover.is_alive() and where(n) == {B: "running"}, (out, where(n)))
     mover.join(120)
     check("handoff onward: moved back once the hand-off ended", not mover.is_alive() and out.get("r", {}).get("ok"), out)
-    wait_released(A, n)
+    assert_released(A, n)
     check("handoff onward: running on A", where(n) == {A: "running"}, where(n))
     check("handoff onward: memory intact", md5(A, n, tries=3) == m)
     kill(A, n)
@@ -3088,7 +3118,7 @@ def handoff_rename():
         r = migrate(A, n, B)
         check("handoff rename: migrated to B", r["ok"] and where(n).get(B) == "running", (r, where(n)))
         check("handoff rename: B's hand-off is held", wait_for(lambda: reached(B, "handoff_gate"), 5), reached(B, "handoff_gate"))
-        wait_released(B, n, timeout=30)
+        assert_released(B, n, timeout=30)
         renamer = threading.Thread(target=lambda: out.update(r=cli(B, "rename", n, to)))
         renamer.start()
         time.sleep(1.5)
@@ -3424,7 +3454,7 @@ def resume_pull_lock():
         took = time.time() - t
         check("resume pull lock: a run on B is not held up by the resume's wait", r["ok"] and took < 15, (r, f"{took:.1f}s"))
         check("resume pull lock: the resume was still waiting meanwhile", vms(B)[n]["state"] == "paused" and arriving(), vms(B).get(n))
-    wait_released(B, n)
+    assert_released(B, n)
     if not wait_for(lambda: vms(B)[n]["state"] == "running", 35):
         resume(B, n)
     check("resume pull lock: runs on B only, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
@@ -3913,7 +3943,7 @@ def bad_preload():
     check("bad preload: md5 intact on A", md5(A, n) == m)
     r = migrate(A, n, B)
     check("bad preload: a later migration works", r["ok"] and where(n).get(B) == "running", r)
-    wait_released(B, n)
+    assert_released(B, n)
     check("bad preload: md5 intact on B", md5(B, n) == m)
 
 
@@ -3929,10 +3959,21 @@ def ckpt_path(label):
 
 
 def rm_ckpt(path):
-    """Removes `path`, and the stored checkpoint it links to (`checkpoint`)."""
-    if os.path.islink(path):
-        subprocess.run(["rm", "-rf", os.path.realpath(path)])
-    subprocess.run(["rm", "-rf", path])
+    """Removes `path`, and the stored checkpoint it links to (`checkpoint`): by its owner, the CLI of the host
+    whose store holds it (`checkpoint rm`); by hand where that refuses (one built on it is still there, or a
+    scenario made it unreadable) and for anything else, a directory of a scenario's own."""
+    target = os.path.realpath(path) if os.path.islink(path) else None
+    subprocess.run(["rm", "-rf", path])  # a link itself, never what it points to
+    if not target or not os.path.isdir(target):
+        return
+    for h in (A, B):
+        if os.path.dirname(target) == os.path.realpath(store(h)):
+            code, _, err = cli(h, "checkpoint", "rm", os.path.basename(target))
+            if code == 0:
+                return
+            if "built on it" not in err:
+                print(f"checkpoint rm {os.path.basename(target)} on {h} refused ({err}): removed by hand", flush=True)
+    subprocess.run(["rm", "-rf", target])
 
 
 def memhash(host, name):
@@ -4141,6 +4182,9 @@ def checkpoint_corrupt():
     n, path = "ft-corrupt", ckpt_path("ft-corrupt")
     setup(n)
     ok(checkpoint(A, n, path, stop=True))
+    # `reset` replaces the link with a copy: the stored checkpoint keeps a link of its own, to be removed by.
+    stored = ckpt_path("ft-corrupt-stored")
+    os.symlink(os.path.realpath(path), stored)
     pristine = path + ".orig"
     subprocess.run(["cp", "-aL", path, pristine], check=True)
 
@@ -4194,6 +4238,7 @@ def checkpoint_corrupt():
     check("corrupt page data: nothing left once killed", n not in vms(B), vms(B).get(n))
     rm_ckpt(path)
     rm_ckpt(pristine)
+    rm_ckpt(stored)
 
 
 def staged_mib():
@@ -4273,7 +4318,7 @@ def pause_resume():
     signal_vm(A, n, signal.SIGCONT)
     check("pause: a stray SIGSTOP/SIGCONT leaves a running vm running", vms(A)[n]["state"] == "running"
           and sh(A, n, "echo hi") == (0, "hi"), vms(A)[n]["state"])
-    pause(A, n)
+    check("pause: paused again", pause(A, n), vms(A).get(n))
     # The target's pull held (`pull_gate`) until released: a resume there must wait for all its memory, in that order.
     clear_gate(B, "pull_gate")
     with armed_fault(B, "pull_gate", 600000):
@@ -4857,7 +4902,7 @@ def arrival_bind_fail():
     check("arrival bind fails: the address is not lent, nor left", a.get("lent") is None and not a.get("leaving") and a.get("holder") == n, a)
     r = migrate(A, n, B)
     check("arrival bind fails: a later migration works", r["ok"] and where(n).get(B) == "running", r)
-    wait_released(B, n)
+    assert_released(B, n)
     check("arrival bind fails: md5 intact on B", md5(B, n) == m)
     kill(B, n)
     # Prepared, then abandoned by its source: bound while it prepares, unlinked as it goes.
@@ -4930,7 +4975,7 @@ def back_to_back():
     check("back to back: every migration done", len(results) == 2 * rounds and not failed, failed)
     check("back to back: none found a socket missing", not any(re.search(r"No such file|ENOENT|socket is unavailable", e) for e in failed + errors), errors[-5:])
     check("back to back: a running holder's socket was always there", not missing, missing[:5])
-    wait_released(A, n)
+    assert_released(A, n)
     check("back to back: running on A only", where(n) == {A: "running"}, where(n))
     check("back to back: socket there on A, none on B", os.path.exists(os.path.join(A.run, "vms", f"{n}.sock"))
           and not os.path.exists(os.path.join(B.run, "vms", f"{n}.sock")))
@@ -4982,7 +5027,7 @@ def abort_link_fail():
     check("link fails after a checkpoint: flexvm unpause runs it", vms(A)[n]["state"] == "running" and md5(A, n) == m, vms(A)[n])
     r = migrate(A, n, B)
     check("link fails: a later migration works", r["ok"] and where(n).get(B) == "running", r)
-    wait_released(B, n)
+    assert_released(B, n)
     check("link fails: md5 intact on B", md5(B, n) == m)
     cleanup(n)
     rm_ckpt(path)
@@ -6734,7 +6779,7 @@ def mem_refused_headroom():
         # At its mark, the same refusal is starvation, and the host moves it.
         hog(A, n, v["guest_mib"] - 384)
         check("mem headroom: at its mark it is moved", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-1500:]))
-    wait_released(B, n, timeout=60)
+    assert_released(B, n, timeout=60)
     check("mem headroom: md5 intact", md5(B, n) == m)
 
 
@@ -7666,7 +7711,7 @@ def wildcard_listen():
             check(f"wildcard listen {wild}: md5 intact", md5(B, n) == m)
             # And back: the wildcard listener takes a migration from its IPv4 peer.
             r = migrate(B, n, A)
-            wait_released(A, n)
+            assert_released(A, n)
             check(f"wildcard listen {wild}: a migration to it arrives", r["ok"] and where(n) == {A: "running"}, (r, where(n)))
             check(f"wildcard listen {wild}: md5 intact after the round trip", md5(A, n) == m)
             cleanup(n)
@@ -7993,7 +8038,7 @@ def spoof_filter():
     got = send(A, n, [mine])
     check("spoof: the original VM still sends from its own", got.get(mine) == {mine}, got)
     ok(migrate(A, n2, B))
-    wait_released(B, n2)
+    assert_released(B, n2)
     got = send(B, n2, [new, mine, theirs])
     check("spoof: after a migration its address gets through", got.get(new) == {new}, got)
     check("spoof: after a migration others are dropped", mine not in got and theirs not in got, got)
@@ -8041,7 +8086,7 @@ def late_withdrawal():
     setup(n, mib=1)
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
-    wait_released(B, n)
+    assert_released(B, n)
     old = lent(ip)
     check("late withdrawal: lent while away", old is not None, addr(A, ip))
     kill(B, n)
@@ -8049,7 +8094,7 @@ def late_withdrawal():
     n2 = "ft-late-2"
     ok(run(A, n2, ip=ip))
     ok(migrate(A, n2, B))
-    wait_released(B, n2)
+    assert_released(B, n2)
     new = lent(ip)
     check("late withdrawal: lent again, a newer generation", new is not None and old is not None and new > old, (old, new))
     time.sleep(1)
@@ -8083,7 +8128,7 @@ def killed_migrated():
     m = setup(n, mib=1)
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
-    wait_released(B, n)
+    assert_released(B, n)
     check("killed migrated: lent while away", lent(ip) is not None, addr(A, ip))
     check("killed migrated: A routes it via B", wait_for(lambda: addr(A, ip).get("via") is not None, 10), addr(A, ip))
     check("killed migrated: md5 intact on B", md5(B, n) == m)
@@ -8106,7 +8151,7 @@ def killed_migrated():
     m3 = setup(n3, mib=1)
     ip3 = vms(A)[n3]["ip"]
     ok(migrate(A, n3, B))
-    wait_released(B, n3)
+    assert_released(B, n3)
     suspend(B, n3)
     ok(cli_json(B, "debug", "gc"))
     check("suspended migrated: still lent, still B's", lent(ip3) is not None and addr(B, ip3).get("holder") == n3 and not addr(B, ip3).get("withdrawn"),
@@ -8120,7 +8165,7 @@ def killed_migrated():
     setup(n4, mib=1)
     ip4 = vms(A)[n4]["ip"]
     ok(migrate(A, n4, B))
-    wait_released(B, n4)
+    assert_released(B, n4)
     pid, fc = vm_pid(B, n4), fc_pid(B, n4)
     with armed_fault(A, "route_refuse", 60000):
         os.kill(pid, signal.SIGKILL)
@@ -8993,7 +9038,7 @@ def pull_died():
     m = setup(n, mib=1500)
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
-    wait_released(B, n)
+    assert_released(B, n)
     # As above, until the arrival is killed.
     with armed_fault(B, "pages_slow", 600000):
         ok(migrate(B, n, A))
@@ -9125,7 +9170,7 @@ def arrival_overtaken():
     m = setup(n, mib=mib)
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
-    wait_released(B, n)
+    assert_released(B, n)
     with armed_fault(B, "pages_slow", 120000):
         ok(migrate(B, n, A))
         check("migrate on mid-arrival: caught arriving on A", arriving(A, n), vms(A).get(n))
@@ -9133,7 +9178,7 @@ def arrival_overtaken():
         check("migrate on mid-arrival: refused", not r["ok"] and "still arriving" in r.get("error", ""), r)
         check("migrate on mid-arrival: the arrival goes on", arriving(A, n), vms(A).get(n))
         check("migrate on mid-arrival: the loan stays until it settles", lent(ip) is not None, addr(A, ip))
-    wait_released(A, n, source=B)
+    assert_released(A, n, source=B)
     check("migrate on mid-arrival: one copy, home on A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
     check("migrate on mid-arrival: home, so no longer lent", wait_for(lambda: lent(ip) is None, 10), addr(A, ip))
     cleanup(n)
@@ -9142,7 +9187,7 @@ def arrival_overtaken():
     m = setup(n, mib=mib)
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
-    wait_released(B, n)
+    assert_released(B, n)
     fault(B, "pages_slow", 120000)
     ok(migrate(B, n, A))
     check("migrate on after the arrival: caught arriving on A", arriving(A, n), vms(A).get(n))
@@ -9162,7 +9207,7 @@ def arrival_overtaken():
     fault(B, "pages_slow", 0)
     t.join(180)
     check("migrate on after the arrival: it goes", res.get("r", {}).get("ok"), res)
-    wait_released(B, n, source=A)
+    assert_released(B, n, source=A)
     check("migrate on after the arrival: one copy, on B", where(n) == {B: "running"} and md5(B, n) == m, where(n))
     check("migrate on after the arrival: lent by its home host", lent(ip) is not None, addr(A, ip))
 
@@ -9850,7 +9895,7 @@ def app_log():
     cleanup(fork)
     # Migrated, the target goes on where the source stopped.
     ok(migrate(A, n, B))
-    wait_released(B, n)
+    assert_released(B, n)
     last = max(app_lines(log(A, n)))
     check("app log: printing after a migration", wait_for(lambda: max(app_lines(log(B, n)), default=-1) >= last + 20, 60), log(B, n)[-500:])
     lines = app_lines(log(A, n)) + app_lines(log(B, n))
@@ -9873,7 +9918,7 @@ def bad_app_log():
     with armed_fault(A, "bad_app_log", 10000):
         r = migrate(A, n, B)
     check("bad app log: migrated", r["ok"], r)
-    wait_released(B, n)
+    assert_released(B, n)
     last = max(app_lines(log(A, n)))
     check("bad app log: printing after the migration", wait_for(lambda: max(app_lines(log(B, n)), default=-1) >= last + 20, 60), log(B, n)[-500:])
     check("bad app log: the skip is logged", "is past the guest's end" in log(B, n), log(B, n)[-500:])
@@ -10060,7 +10105,7 @@ def log_cap():
     check("log cap: the arrival's log published", wait_for(published, 30), (moved, os.listdir(vd_b)))
     with open(moved, "a") as f:
         f.write("pad\n" * (2 << 20))
-    wait_released(B, m)
+    assert_released(B, m)
     ok(migrate(B, m, A))
     check("log cap: the migrated vm moved on", wait_for(lambda: not alive(pid), 60), pid)
     check("log cap: a migrated vm's log rotates", size(moved + ".1") is not None and size(moved + ".1") > 8 << 20 and (size(moved) or 0) < 65536,
@@ -10645,7 +10690,7 @@ def reboot():
     setup(moved, mib=1)
     ip_moved = vms(A)[moved]["ip"]
     ok(migrate(A, moved, B))
-    wait_released(B, moved)
+    assert_released(B, moved)
     check("reboot: lent while away", lent(ip_moved) is not None, addr(A, ip_moved))
     # A peer's VM that B routes to (via the third peer, not an address of ours, so the route is really made),
     # listed by B until the route is back: B's loopback listener, restarted after, refuses a peer elsewhere.
@@ -10729,6 +10774,9 @@ def reboot():
 # nothing of it is left; past ISOLATE_S it fails the scenario with a dump of what was, and clears that
 # by force so the next one still starts clean.
 ISOLATE_S = 30
+CGROUP_ROOT = "/sys/fs/cgroup/flexvm"
+SEEN = set()  # (pid, start) of the VM processes `ps` listed on A or B
+STORE_BASELINE = {}  # host -> what its checkpoint store held before the first scenario (an earlier e2e case's)
 SWEPT = {}  # scenario -> what it left that only a sweep removed
 BASELINE = {}  # host -> its host.json before the first scenario
 PREFIXES = {}  # host -> its taps' prefix (derived from its state directory, so fixed)
@@ -10748,13 +10796,49 @@ def isolation_baseline():
     for h in (A, B):
         BASELINE[h] = host_config(h)
         PREFIXES[h] = ok(cli_json(h, "info"))["derived"]["prefix"]
+        STORE_BASELINE[h] = stored(h)
 
 
 def listed(host):
     """`ps -a`'s names and states (no `debug status` per VM, as `vms` asks)."""
     code, out, err = cli(host, "ps", "-a", "--json")
     assert code == 0, err
-    return {v["name"]: v.get("state") for v in json.loads(out)}
+    rows = json.loads(out)
+    seen(rows)
+    return {v["name"]: v.get("state") for v in rows}
+
+
+def seen(rows):
+    """Records the (pid, start) of each VM process `ps` listed: its Firecracker's cgroup is named by it."""
+    SEEN.update((v["pid"], v["start"]) for v in rows if v.get("pid") and v.get("start"))
+
+
+def owned_cgroups():
+    """Firecracker cgroups (`idle-PID-START-N`) of VM processes seen on A or B; and their VM processes' scopes
+    (`vm-PID-START`) that something still populates. A dead process's empty scope is a sweep's to remove
+    (no process can remove its own), so it is not counted."""
+    out = []
+    for e in os.listdir(CGROUP_ROOT) if os.path.isdir(CGROUP_ROOT) else []:
+        m = re.fullmatch(r"(idle|vm)-(\d+)-(\d+)(-\d+)?", e)
+        if not m or (int(m[2]), int(m[3])) not in SEEN or (m[1] == "idle") != bool(m[4]):
+            continue
+        if m[1] == "vm":
+            try:
+                if "populated 1" not in open(os.path.join(CGROUP_ROOT, e, "cgroup.events")).read().splitlines():
+                    continue
+            except OSError:
+                continue
+        out.append(e)
+    return sorted(out)
+
+
+def stored(host):
+    """What `host`'s checkpoint store holds: checkpoints, names and staging directories (not its locks)."""
+    d = store(host)
+    names = os.path.join(d, "names")
+    out = {f for f in (os.listdir(d) if os.path.isdir(d) else []) if f not in ("names", ".locks")}
+    out |= {f"names/{f}" for f in (os.listdir(names) if os.path.isdir(names) else [])}
+    return out
 
 
 def own_pids():
@@ -10839,11 +10923,16 @@ def left_behind(skip):
     """What the last scenario left on A and B, by kind; empty once nothing is."""
     left = {}
     procs = host_processes(skip)
+    SEEN.update((pid, start) for pid, start, _ in procs)
     if procs:
         left["processes"] = procs
     for h in (A, B):
         if (vm := listed(h)):
             left[f"vms on {h}"] = vm
+        # A name's lock (a SIGKILLed process's stays, for a sweep) that no listed VM explains.
+        locks = os.path.join(h.run, "vms", ".locks")
+        if (lk := sorted(f for f in (os.listdir(locks) if os.path.isdir(locks) else []) if f.endswith(".lock") and f[:-5] not in vm)):
+            left[f"vm locks of {h}"] = lk
         if (t := sorted(d for d in os.listdir("/sys/class/net") if d.startswith(PREFIXES[h]))):
             left[f"taps of {h}"] = t
         if (c := conns(h)):
@@ -10853,8 +10942,12 @@ def left_behind(skip):
         armed += [f"gates/{g}" for g in (os.listdir(gates) if os.path.isdir(gates) else [])]
         if armed:
             left[f"armed on {h}"] = armed
+        if (ck := sorted(stored(h) - STORE_BASELINE.get(h, set()))):
+            left[f"checkpoint store of {h} (checkpoints, names, staging)"] = ck
     if (r := host_routes()):
         left["routes"] = r
+    if (cg := owned_cgroups()):
+        left["cgroups"] = cg
     return left
 
 
@@ -10878,8 +10971,11 @@ def isolate(scenario):
             now = host_config(h)
             notes.append(f"host.json of {h}: {settings(now)}")
             write_host_config(h, {**BASELINE[h], **({"listen": now["listen"]} if now.get("listen") else {})})
+        # A listener that died under the scenario (a panic, say) fails it; the next one gets a new one.
         if not args.no_listeners and (h.addr not in listeners or listeners[h.addr].poll() is not None):
-            notes.append(f"{h}'s listener was not running")
+            p = listeners.pop(h.addr, None)
+            check(f"{scenario}: {h}'s listener runs to its end", False,
+                  f"exit {p.returncode}; see {h.listen_log}" if p else "not running (stopped and not started again)")
             start_listener(h)
     end, left, removed, swept = time.time() + ISOLATE_S, {}, set(), None
     while True:
@@ -10927,6 +11023,13 @@ def isolate(scenario):
         subprocess.run(["ip", "route", "del", line.split()[0] + "/32"], capture_output=True)
     for h in (A, B):
         cli(h, "debug", "gc")
+        # Its checkpoints by the CLI (the store's owner), the rest (staging, a name of none) by hand.
+        extra = stored(h) - STORE_BASELINE.get(h, set())
+        ids = [f for f in extra if not f.startswith((".", "names/"))]
+        if ids:
+            cli(h, "checkpoint", "rm", "-f", *ids)
+        for f in stored(h) - STORE_BASELINE.get(h, set()):
+            subprocess.run(["rm", "-rf", os.path.join(store(h), f)])
     return False
 
 
