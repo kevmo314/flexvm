@@ -357,7 +357,8 @@ fn failure_history_follows_the_pages() {
     }
 }
 
-/// An install failure cuts the fetch and releases the unread tail for retry.
+/// A streamed install that fails installs nothing more and asks for nothing more of the fetch (a link drains the rest
+/// of its reply itself); its unread tail is released for the retry.
 #[test]
 fn failed_install_stops_the_fetch() {
     for stopped in [false, true] {
@@ -543,6 +544,54 @@ fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
     assert_eq!(rx.recv().unwrap(), [vec![(page(3), sz), (page(4), sz)], rest.clone()].concat());
     drop((link, lane));
     assert_eq!(rx.recv().unwrap(), rest);
+}
+
+/// A caller that wants no more of a reply (a failed install) is told nothing more, but the link reads the rest of it,
+/// so the connection serves the retry (#252); only a stop cuts it.
+#[test]
+fn a_reply_the_caller_wants_no_more_of_is_drained_unless_stopped() {
+    let (listener, source) = listen();
+    let conns = Arc::new(AtomicUsize::new(0));
+    let counted = conns.clone();
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let (mut r, mut w) = accept_hello(s.unwrap());
+            thread::spawn(move || {
+                let mut req = [0u8; 12];
+                while r.read_exact(&mut req).is_ok() {
+                    let (off, len) = request(&req);
+                    let _ = w.write_all(&[0]);
+                    for p in (off..off + len as u64).step_by(PAGE_SIZE) {
+                        if w.write_all(&[(p / PAGE_SIZE as u64) as u8; PAGE_SIZE]).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let mut link = Link::new(source);
+    let stop = AtomicBool::new(false);
+    let n = 64;
+    let mut buf = vec![0u8; n * PAGE_SIZE];
+    let mut calls = 0;
+    let e = link.fetch_with(None, 0, &mut buf, &|| stop.load(Ordering::SeqCst), &mut |_| {
+        calls += 1;
+        false
+    });
+    assert!(matches!(e.as_ref().map_err(fetch_failure), Err(Some(FetchFailure::Cancelled))), "{e:?}");
+    assert_eq!(calls, 1, "told nothing more");
+    // The next reply is read from the same connection, in step.
+    link.fetch_with(None, (n * PAGE_SIZE) as u64, &mut buf[..PAGE_SIZE], &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
+    assert!(buf[..PAGE_SIZE].iter().all(|&b| b as usize == n));
+    assert_eq!(conns.load(Ordering::SeqCst), 1);
+    // Stopped: cut, and the next fetch connects again.
+    let e = link.fetch_with(None, 0, &mut buf, &|| stop.swap(true, Ordering::SeqCst), &mut |_| false);
+    assert!(matches!(e.as_ref().map_err(fetch_failure), Err(Some(FetchFailure::Cancelled))), "{e:?}");
+    stop.store(false, Ordering::SeqCst);
+    link.fetch_with(None, 0, &mut buf[..PAGE_SIZE], &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
+    assert_eq!(conns.load(Ordering::SeqCst), 2);
 }
 
 #[test]

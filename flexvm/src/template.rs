@@ -837,16 +837,27 @@ fn sparsify(path: &Path) -> Result<u64> {
 fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<SocketRoot>) -> Result<usize> {
     let tpl = Template::open_dir("(building)", dir.to_path_buf())?;
     let run = tpl.dir.join("record");
-    let _ = std::fs::remove_dir_all(&run);
-    std::fs::create_dir_all(&run)?;
-    let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
-    let p = crate::vm::Prepared::new(fc, tpl.clone())?;
+    let load = || -> Result<crate::vm::Prepared> {
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run)?;
+        let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
+        let p = crate::vm::Prepared::new(fc, tpl.clone())?;
+        // Like VM restores: stepping the clock touches pages of its own. Loaded paused.
+        p.firecracker().load_snapshot(&tpl.vmstate(), &tpl, tap, Some(true), crate::fc::API_TIMEOUT)?;
+        p.pager.wait_ready(Duration::from_secs(5))?;
+        // As for a restore: memory mapped behind the pager's back would be recorded from zeroes (#949).
+        p.pager.check_foreign(Duration::from_secs(10))?;
+        Ok(p)
+    };
+    let p = match load() {
+        // Its memory was read while being mapped: a fresh Firecracker maps it again.
+        Err(e) if e.to_string().starts_with(crate::uffd::FOREIGN) => {
+            crate::log!("template: recording the working set: {e}; once more on a fresh firecracker");
+            load()?
+        }
+        r => r?,
+    };
     let fc = p.firecracker();
-    // Like VM restores: stepping the clock touches pages of its own.
-    fc.load_snapshot(&tpl.vmstate(), &tpl, tap, Some(true), crate::fc::API_TIMEOUT)?;
-    fc.pause(crate::fc::API_TIMEOUT)?;
-    p.pager.wait_ready(Duration::from_secs(5))?;
-    p.pager.check_foreign(Duration::from_secs(10))?;
     fc.resume(crate::fc::API_TIMEOUT)?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;

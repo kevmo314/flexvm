@@ -453,6 +453,8 @@ def disarm():
             with suppress(OSError):
                 os.unlink(os.path.join(h.run, f))
         subprocess.run(["rm", "-rf", os.path.join(h.run, "gates")])
+    # As `debug fault` does: running processes check faults.json at most every 10 ms (`host::armed_until`).
+    time.sleep(0.02)
 
 
 def reached(host, gate):

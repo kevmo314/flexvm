@@ -28,6 +28,8 @@ const PM_SWAP: u64 = 1 << 62;
 /// Regions per `PAGEMAP_SCAN` call, and pages per pagemap read where it is missing.
 const SCAN_REGIONS: usize = 512;
 const READ_PAGES: usize = 64 << 10;
+/// Where pagemap entries are read, the most pages between two runs of interest that one read spans.
+const READ_GAP: usize = 512;
 
 #[repr(C)]
 #[derive(Default)]
@@ -56,11 +58,16 @@ struct PageRegion {
 
 /// The pages in `[start, start + len)` (host addresses, page aligned) that `pagemap` (some process's
 /// `/proc/PID/pagemap`) has mapped or swapped out, as `[first, end)` page offsets from `start`.
-pub(super) fn mapped_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(usize, usize)>> {
+#[cfg(test)]
+fn mapped_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(usize, usize)>> {
     match scan_runs(pagemap, start, len) {
-        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::EINVAL | libc::EOPNOTSUPP)) => read_runs(pagemap, start, len),
+        Err(e) if unsupported(&e) => read_runs(pagemap, start, len),
         r => r,
     }
+}
+
+fn unsupported(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::EINVAL | libc::EOPNOTSUPP))
 }
 
 fn scan_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(usize, usize)>> {
@@ -137,19 +144,38 @@ impl Pager {
             let mut mapped = Vec::new();
             for m in self.mappings() {
                 let (first, end) = m.span();
-                // Skip pages the pager installed and template holes, including on kernels without PAGEMAP_SCAN.
-                let mut runs = Vec::new();
-                for p in first..end.min(pages.len()) {
-                    let state = pages.get(p);
-                    if state == INFLIGHT || foreign(state, self.base.has_data(p)) {
-                        push_run(&mut runs, p, p + 1);
-                    }
+                let end = end.min(pages.len());
+                if end <= first {
+                    continue;
                 }
-                for (a, b) in runs {
-                    let start = m.base_host_virt_addr + ((a - first) * PAGE_SIZE) as u64;
-                    for (lo, hi) in mapped_runs(pagemap, start, ((b - a) * PAGE_SIZE) as u64)? {
-                        mapped.extend(a + lo..a + hi);
+                // Only pages the pager never installed (claimed ones too, being installed) can be foreign.
+                let unsettled = |p: usize| {
+                    let state = pages.get(p);
+                    state == INFLIGHT || foreign(state, self.base.has_data(p))
+                };
+                // One PAGEMAP_SCAN of the mapping lists what is mapped, the pager's own pages included: a few
+                // calls. Without it, only the runs of unsettled pages are read (8 bytes a page), gaps of up to
+                // READ_GAP pages bridged so that a fragmented template takes few reads.
+                let found = match scan_runs(pagemap, m.base_host_virt_addr, ((end - first) * PAGE_SIZE) as u64) {
+                    Err(e) if unsupported(&e) => {
+                        let mut runs: Vec<(usize, usize)> = Vec::new();
+                        for p in (first..end).filter(|&p| unsettled(p)) {
+                            match runs.last_mut() {
+                                Some(last) if p - last.1 <= READ_GAP => last.1 = p + 1,
+                                _ => runs.push((p, p + 1)),
+                            }
+                        }
+                        let mut found = Vec::new();
+                        for (a, b) in runs {
+                            let start = m.base_host_virt_addr + ((a - first) * PAGE_SIZE) as u64;
+                            found.extend(read_runs(pagemap, start, ((b - a) * PAGE_SIZE) as u64)?.into_iter().map(|(lo, hi)| (a - first + lo, a - first + hi)));
+                        }
+                        found
                     }
+                    r => r?,
+                };
+                for (lo, hi) in found {
+                    mapped.extend((first + lo..first + hi).filter(|&p| unsettled(p)));
                 }
             }
             Ok(mapped)
