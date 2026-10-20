@@ -1722,6 +1722,38 @@ def exec_pause_grace():
     check("exec grace: then the exit", code == 0 and end == 6 + len(expected), (code, end))
 
 
+def exec_ckpt_stalled():
+    """#1016: a checkpoint (the VM running on) cuts the guest's connections, an exec's whose client has stopped
+    reading too. Its relay attaches again once the VM runs, so the guest goes on holding the output for the
+    client, which stays away past the guest's 30 s grace and 60 s reclaim of an abandoned session: it still gets
+    every byte and the exit status, and its acknowledgement, late, then releases the session (RELEASE)."""
+    n = "ft-exec-ckpt"
+    ok(run(A, n))
+    sessions = lambda: cli_json(A, "debug", n, "sessions").get("result") or {}
+    before = sessions().get("live", 0)
+    lines = 2_000_000
+    p = spawn_cli(A, "exec", n, "sh", "-c", f"seq 1 {lines}; exit 7", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        unread = lambda: struct.unpack("i", fcntl.ioctl(p.stdout.fileno(), termios.FIONREAD, b"\0" * 4))[0]
+        check("exec ckpt: the client's stdout filled up", wait_for(lambda: unread() >= 65536, 30), unread())
+        time.sleep(5)
+        path = ckpt_path("exec-ckpt")
+        r = checkpoint(A, n, path)
+        check("exec ckpt: checkpointed, the VM running on", r.get("ok") and vms(A).get(n, {}).get("state") == "running", (r, vms(A).get(n)))
+        time.sleep(95)
+        data = p.stdout.read()
+        code = wait_process(p, 60, kill_on_timeout=True)
+        err = p.stderr.read().decode(errors="replace")
+    finally:
+        if p.poll() is None:
+            p.kill()
+    expected = b"".join(b"%d\n" % i for i in range(1, lines + 1))
+    check("exec ckpt: a client back after 95 s gets every byte and the exit status", data == expected and code == 7,
+          (len(data), len(expected), code, err[-300:]))
+    check("exec ckpt: its late acknowledgement releases the session", wait_for(lambda: sessions().get("live") == before, 10), sessions())
+    rm_ckpt(path)
+
+
 def guest_hang():
     """A guest that never answers its agent (Firecracker stopped) must not
     hold anything forever: execs fail within their deadline, and once it is
@@ -10846,7 +10878,7 @@ SCENARIOS = dict(
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
-    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_burst=exec_burst, exec_stalled_cap=exec_stalled_cap, exec_pause_grace=exec_pause_grace, guest_hang=guest_hang,
+    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_burst=exec_burst, exec_stalled_cap=exec_stalled_cap, exec_pause_grace=exec_pause_grace, exec_ckpt_stalled=exec_ckpt_stalled, guest_hang=guest_hang,
     source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded,
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,

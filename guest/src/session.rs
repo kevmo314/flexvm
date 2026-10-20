@@ -1,7 +1,10 @@
 //! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ARGV <id> <len>` (its argv and options, NUL-separated fields), `ATTACH <id> <offset>`,
-//! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
+//! `CLOSE <id>`, `RELEASE <id> <end> <code>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
 //! After an exit, the client may send SESSION_DONE on the attachment, within `ACK_WAIT`, to release the
-//! session; without that acknowledgement the exit stays available for reattachment.
+//! session; without that acknowledgement the exit stays available for reattachment. A late one the host passes
+//! on as `RELEASE`, which closes only the session that exited with that code after `end` bytes and has not been
+//! attached since its exit was sent: never a running one, one started under the id since (#1047), nor one another
+//! client took over.
 //! The command runs in a process group of its own; its exit is the shell's, recorded once output stops or
 //! `DRAIN` after the shell exits; background processes that keep its pipes open run on, their later output
 //! read and dropped (by one thread, for at most `MAX_DISCARDED` pipes: past that, a job's next write gets
@@ -448,9 +451,25 @@ impl Output {
 }
 
 pub enum Request<'a> {
-    Start { id: &'a str, len: usize, argv: bool },
-    Attach { id: &'a str, offset: u64 },
-    Close { id: &'a str },
+    Start {
+        id: &'a str,
+        len: usize,
+        argv: bool,
+    },
+    Attach {
+        id: &'a str,
+        offset: u64,
+    },
+    Close {
+        id: &'a str,
+    },
+    /// Closes the session if it exited with `code` after `end` bytes of output and was not attached since its exit
+    /// was sent; any other is kept.
+    Release {
+        id: &'a str,
+        end: u64,
+        code: i32,
+    },
 }
 
 pub fn parse(line: &str) -> io::Result<Request<'_>> {
@@ -466,6 +485,10 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
         },
         ["ATTACH", _, offset] => Ok(Request::Attach { id, offset: offset.parse().map_err(|_| io::Error::other("bad offset"))? }),
         ["CLOSE", _] => Ok(Request::Close { id }),
+        ["RELEASE", _, end, code] => match (end.parse(), code.parse()) {
+            (Ok(end), Ok(code)) => Ok(Request::Release { id, end, code }),
+            _ => Err(io::Error::other("bad release")),
+        },
         _ => Err(io::Error::other("bad session request")),
     }
 }
@@ -702,6 +725,22 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 table.cancel(id);
             }
             table.close(id, Some(statuses));
+            return Ok(None);
+        }
+        Request::Release { id, end, code } => {
+            let mut table = sessions.lock().unwrap();
+            let Some(entry) = table.live.get(id) else { return Ok(None) };
+            let same = {
+                let o = entry.output.0.lock().unwrap();
+                // Sent the exit on its last attachment, none since (`attach` clears `delivered`), as an
+                // acknowledgement on it would close it: a client attached since (from an earlier offset, say) keeps it.
+                o.exit == Some(code) && o.end == end && o.delivered.is_some() && o.attached.is_none()
+            };
+            if !same {
+                return Err(io::Error::other("session kept: not the one that exited so, or attached since"));
+            }
+            // Exited: its shell is reaped, there is nothing to kill.
+            table.close(id, None);
             return Ok(None);
         }
     }))
@@ -1936,12 +1975,62 @@ mod tests {
         assert_eq!(writer.1, 2);
     }
 
+    /// #1047: a late acknowledgement's RELEASE closes only the session that exited so; a running one, one
+    /// with another exit, and one never known are kept (nothing cancelled, nothing killed).
+    #[test]
+    fn release_closes_only_the_exit_it_names() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let (reattached, current) = {
+            let mut table = sessions.lock().unwrap();
+            let done = finished(&mut table, "done", None);
+            {
+                let mut o = done.0.lock().unwrap();
+                (o.end, o.delivered) = (5, Some(0));
+            }
+            live(&mut table, "running", Output::default());
+            // Its exit was sent, then another client attached (from an earlier offset): not yet sent it again.
+            let reattached = finished(&mut table, "reattached", None);
+            reattached.0.lock().unwrap().end = 5;
+            // Sent the exit, and still attached: that client's own acknowledgement may yet come.
+            let current = finished(&mut table, "current", None);
+            {
+                let mut o = current.0.lock().unwrap();
+                (o.end, o.delivered, o.attached) = (5, Some(1), Some(Attachment { id: 2, conn: None }));
+            }
+            (reattached, current)
+        };
+        for line in ["RELEASE done 4 0", "RELEASE done 5 1", "RELEASE running 0 0", "RELEASE reattached 5 0", "RELEASE current 5 0"] {
+            assert!(request(&sessions, &statuses, line, b"").ends_with(b"session kept: not the one that exited so, or attached since"), "{line}");
+        }
+        assert!(request(&sessions, &statuses, "RELEASE nope 0 0", b"").ends_with(b"closed"));
+        assert!(request(&sessions, &statuses, "RELEASE done 5 0", b"").ends_with(b"closed"));
+        let table = sessions.lock().unwrap();
+        assert!(!table.live.contains_key("done") && table.closed.contains_key("done"));
+        assert!(table.live.contains_key("running") && !table.ended("nope"));
+        assert!(table.live.contains_key("reattached") && table.live.contains_key("current"));
+        assert!(!reattached.0.lock().unwrap().closed && !current.0.lock().unwrap().closed);
+    }
+
     #[test]
     fn requests() {
         assert!(matches!(parse("SESSION abc 3\n").unwrap(), Request::Start { id: "abc", len: 3, argv: false }));
         assert!(matches!(parse("ATTACH abc 42").unwrap(), Request::Attach { offset: 42, .. }));
         assert!(matches!(parse("CLOSE abc").unwrap(), Request::Close { .. }));
-        for bad in ["SESSION 3", "SESSION abc -1", "SESSION abc 1048577", "ATTACH abc -1", "ATTACH abc 1 extra", "CLOSE", "CLOSE a/b", "EXEC 3"] {
+        assert!(matches!(parse("RELEASE abc 7 -1").unwrap(), Request::Release { id: "abc", end: 7, code: -1 }));
+        for bad in [
+            "RELEASE abc",
+            "RELEASE abc 7",
+            "RELEASE abc x 0",
+            "RELEASE abc 7 x",
+            "SESSION 3",
+            "SESSION abc -1",
+            "SESSION abc 1048577",
+            "ATTACH abc -1",
+            "ATTACH abc 1 extra",
+            "CLOSE",
+            "CLOSE a/b",
+            "EXEC 3",
+        ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
     }
