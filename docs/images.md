@@ -59,12 +59,18 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   0600, owned by whoever pulled (root, or the user of a state of their
   own). Caches from older versions (0755 and 0644) are repaired as pulls
   reuse them. Ownership is never changed. A symlinked `STATE/images` works
-  (its target is the cache). Root filesystem users are recorded as empty
-  `rootfs/KEY.users/STATE-ID` files, keyed by a hash of the canonical templates
-  directory. Removal drops the local record after the last local generation,
-  and reclaims the entry when no records remain. Legacy entries without records
-  follow the local scan for a regular images directory; with a symlinked one
-  they are kept until pulls reuse them and record their states.
+  (its target is the cache). Each root filesystem's users are files in
+  `rootfs/KEY.users/` (0700, files 0600), one per templates directory whose
+  generations use it, named by a hash of its canonical path and holding it,
+  written under the key's lock as a generation is published or reused. Once
+  no generation here uses it, `rmi` and `image prune` drop this state's file
+  and remove the entry if none is left. An entry older flexvm built has no
+  `.users`: in a regular `STATE/images` it goes once no generation here uses
+  it; in a symlinked one it is kept, and a pull reusing it marks it `legacy`,
+  kept until `image prune --force-shared`, which also drops the files of
+  templates directories that are gone (a moved state's too: it records itself
+  again as it pulls). `image prune` also removes entries only a file of this
+  state's, left by a crash before publication, names.
   Below `STATE/images` every directory is reached
   without following symlinks, and a symlink there is left as it is, with
   nothing under it touched. A mode is changed
@@ -97,8 +103,7 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   are cached in `STATE/images/rootfs/` by image config digest, layer `diff_ids`,
   flexvm-init and overrides, and templates attach the cached file in place, so
   templates of one image share one copy in the page cache (it is never rewritten; `rmi`
-  removes it once no recorded state uses it, subject to the legacy rule above;
-  deleting it by hand breaks those
+  removes it once no state's generation uses it, as above; deleting it by hand breaks those
   templates). Builds of the same cache key are serialized with
   a lock; entries are published with fsync and no-replace rename, with their
   `.ok` marker last. Every reuse also fsyncs the cache directory under the

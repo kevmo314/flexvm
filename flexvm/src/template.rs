@@ -1112,7 +1112,7 @@ pub fn up_to_date(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: &
     }
     // Firecracker, the root filesystem and the snapshot files (rehashed if their stat changed).
     meta.verify(paths, &dir, &mut BTreeMap::new()).ok()?;
-    crate::image::note_rootfs(&paths.images, &meta.rootfs, &state_key(&std::fs::canonicalize(&paths.templates).ok()?)).ok()?;
+    crate::image::note_rootfs(&paths.images, &meta.rootfs, &std::fs::canonicalize(&paths.templates).ok()?).ok()?;
     Some(meta.id)
 }
 
@@ -1127,7 +1127,7 @@ const RECORDED: &[u8] = b"states\n";
 /// hash of the state's canonical path, which it holds.
 const STATES: &str = ".states";
 
-fn state_key(state: &Path) -> String {
+pub(crate) fn state_key(state: &Path) -> String {
     use sha2::Digest;
     use std::os::unix::ffi::OsStrExt;
     format!("{:x}", sha2::Sha256::digest(state.as_os_str().as_bytes()))[..32].to_string()
@@ -1309,7 +1309,7 @@ fn publish_generation(paths: &Paths, staged: &Path, how: i32, check_interrupt: i
     let l = templates_lock(paths, how)?;
     crate::util::sync_dir(staged)?;
     check_interrupt()?;
-    crate::image::note_rootfs(&paths.images, &meta.rootfs, &state_key(&std::fs::canonicalize(&paths.templates)?))?;
+    crate::image::note_rootfs(&paths.images, &meta.rootfs, &std::fs::canonicalize(&paths.templates)?)?;
     match std::fs::rename(staged, gens.path.join(&meta.id)) {
         // An identical build published it already.
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) => {}
@@ -2077,7 +2077,17 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
     let rootfs_used = rootfs_users(paths)?;
     let mut removed = vec![];
     for (id, tombstone) in tombstones {
-        removed.push(json!({"deleted": id, "rootfs": finish_remove_with(paths, &tombstone, &rootfs_used)?}));
+        removed.push(json!({"deleted": id, "rootfs": finish_remove_with(paths, &tombstone, &rootfs_used, force_shared)?}));
+    }
+    // Recorded entries no generation here uses: a record left by a crash before its publication, or
+    // (`--force-shared`) entries kept only for gone states or `LEGACY`.
+    if let (None, Some(used)) = (only, rootfs_users(paths)?) {
+        let templates = std::fs::canonicalize(&paths.templates)?;
+        for rootfs in crate::image::recorded_rootfs(&paths.images)?.into_iter().filter(|r| !used.contains(r)) {
+            if crate::image::remove_rootfs(&paths.images, &rootfs, &templates, force_shared)? == crate::image::Removal::Removed {
+                removed.push(json!({"rootfs": rootfs}));
+            }
+        }
     }
     Ok(removed)
 }
@@ -2216,7 +2226,7 @@ fn delete_unused(paths: &Paths, id: &str, in_use: &dyn Fn() -> BTreeSet<String>)
 /// (`Removal::InUse`), and the next sweep asks again, so a pull that fails leaves no rootfs nothing
 /// will remove. Interrupted, a sweep retries it the same way.
 fn finish_remove(paths: &Paths, tombstone: &Path) -> Result<Option<PathBuf>> {
-    finish_remove_with(paths, tombstone, &rootfs_users(paths)?)
+    finish_remove_with(paths, tombstone, &rootfs_users(paths)?, false)
 }
 
 /// The root filesystems the generations here use; None while one's `meta.json` cannot be read
@@ -2234,7 +2244,7 @@ fn rootfs_users(paths: &Paths) -> Result<Option<BTreeSet<PathBuf>>> {
 }
 
 /// `finish_remove`, given what `rootfs_users` read (under the same hold of the templates lock).
-fn finish_remove_with(paths: &Paths, tombstone: &Path, rootfs_used: &Option<BTreeSet<PathBuf>>) -> Result<Option<PathBuf>> {
+fn finish_remove_with(paths: &Paths, tombstone: &Path, rootfs_used: &Option<BTreeSet<PathBuf>>, force: bool) -> Result<Option<PathBuf>> {
     let gens = paths.templates.join(GENERATIONS);
     let mut removed = None;
     if let Ok(meta) = Meta::read(tombstone) {
@@ -2243,7 +2253,7 @@ fn finish_remove_with(paths: &Paths, tombstone: &Path, rootfs_used: &Option<BTre
         match if used {
             crate::image::Removal::Absent
         } else {
-            crate::image::remove_rootfs(&paths.images, &rootfs, &state_key(&std::fs::canonicalize(&paths.templates)?))?
+            crate::image::remove_rootfs(&paths.images, &rootfs, &std::fs::canonicalize(&paths.templates)?, force)?
         } {
             crate::image::Removal::Removed => removed = Some(rootfs),
             crate::image::Removal::Absent => {}
@@ -3384,6 +3394,8 @@ pub(crate) mod tests {
         for ext in ["ext4", "ok", "conf"] {
             std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
         }
+        // As a build makes it: an entry without one is legacy.
+        std::fs::create_dir(rootfs.with_extension("users")).unwrap();
         for f in [&a, &b] {
             std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
             publish_as(f, "t", &Meta { id: "aaaa1111".into(), rootfs: rootfs.clone(), ..f.meta.clone() });
@@ -3411,6 +3423,8 @@ pub(crate) mod tests {
             for ext in ["ext4", "ok", "conf"] {
                 std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
             }
+            // As a build makes it: an entry without one is legacy.
+            std::fs::create_dir(rootfs.with_extension("users")).unwrap();
             std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
             for (name, id) in [("t", "aaaa1111"), ("u", "bbbb2222")] {
                 publish_as(&f, name, &Meta { id: id.into(), rootfs: rootfs.clone(), ..f.meta.clone() });
@@ -3439,6 +3453,46 @@ pub(crate) mod tests {
                 assert!(!rootfs.with_extension(ext).exists(), "{removal}: {ext}");
             }
         }
+    }
+
+    #[test]
+    fn a_shared_entry_kept_for_legacy_or_gone_states_goes_with_force_shared() {
+        let f = Fixture::new();
+        let other = crate::test_util::TempDir::new("other-templates");
+        let cache = crate::test_util::TempDir::new("shared-images");
+        std::fs::create_dir(cache.join("rootfs")).unwrap();
+        let rootfs = cache.join("rootfs/a.ext4");
+        // Built by an older flexvm: no records, and states that have not pulled since may use it.
+        for ext in ["ext4", "ok", "conf"] {
+            std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+        }
+        std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
+        publish_as(&f, "t", &Meta { id: "aaaa1111".into(), rootfs: rootfs.clone(), ..f.meta.clone() });
+        let users = rootfs.with_extension("users");
+        assert!(users.join("legacy").is_file());
+        for dir in [&*other, Path::new("/nonexistent/templates")] {
+            std::fs::write(users.join(state_key(dir)), dir.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        assert_eq!(remove(&f.paths, Some("t"), "aaaa1111", &BTreeSet::new).unwrap()["rootfs"], Value::Null);
+        assert!(prune(&f.paths, None, &BTreeSet::new, false).unwrap().is_empty());
+        assert!(rootfs.exists() && users.join("legacy").exists());
+        // --force-shared forgets the legacy users and the gone state, not one whose templates are there.
+        assert!(prune(&f.paths, None, &BTreeSet::new, true).unwrap().is_empty());
+        let left: Vec<_> = std::fs::read_dir(&users).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [std::ffi::OsString::from(state_key(&other))]);
+        drop(other);
+        assert_eq!(prune(&f.paths, None, &BTreeSet::new, true).unwrap(), [json!({"rootfs": rootfs})]);
+        for ext in ["ext4", "ok", "conf", "users"] {
+            assert!(!rootfs.with_extension(ext).exists());
+        }
+        // A record a crash left before its generation was published goes with the next prune.
+        for ext in ["ext4", "ok", "conf"] {
+            std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+        }
+        std::fs::create_dir(&users).unwrap();
+        crate::image::note_rootfs(&f.paths.images, &rootfs, &std::fs::canonicalize(&f.paths.templates).unwrap()).unwrap();
+        assert_eq!(prune(&f.paths, None, &BTreeSet::new, false).unwrap(), [json!({"rootfs": rootfs})]);
+        assert!(!rootfs.exists() && !users.exists());
     }
 
     #[test]
@@ -3583,6 +3637,8 @@ pub(crate) mod tests {
         for ext in ["ext4", "ok", "conf"] {
             std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
         }
+        // As a build makes it: an entry without one is legacy.
+        std::fs::create_dir(rootfs.with_extension("users")).unwrap();
         publish_as(&f, "t", &Meta { id: "aaaa1111".into(), rootfs: rootfs.clone(), ..f.meta.clone() });
         let st = crate::util::fstat(File::open(&rootfs).unwrap().as_raw_fd()).unwrap();
         let pulling = crate::host::shared_at(&crate::host::host_locks().unwrap(), &crate::host::use_lock(&st)).unwrap();
