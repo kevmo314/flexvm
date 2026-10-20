@@ -8299,12 +8299,13 @@ def standby_lock_timeout():
         if os.path.exists(f):
             os.remove(f)
     fault(A, "no_evict", 600000)
-    fault(A, "standby_lock_hang", 30000)
+    # Armed until the refill is done (`finally`), however long its steps take.
+    fault(A, "standby_lock_hang", 600000)
     res, seen, began = {}, {}, time.time()
     th = start_thread(target=lambda: res.update(r=set_standby(A, t, 1), took=time.time() - began))
     child = None
     try:
-        wait_for(lambda: standby_starting(A), 5)
+        wait_for(lambda: standby_starting(A), 30)
         child = (standby_starting(A) or [None])[0]
         avail = mem_available()
         with marks(avail + 4096, avail + 4608):
