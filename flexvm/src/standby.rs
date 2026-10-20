@@ -459,7 +459,8 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
             ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--standby".as_ref(), template.as_ref()];
         crate::util::start_reaper()?;
         let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &[("FLEXVM_NOTIFY_FD", "3")])?;
-        let by = Instant::now() + LOCKED_TIMEOUT;
+        // Test fault `long_locked`: a test holding the child before its lock (`standby_lock_gate`) lets it go in its own time.
+        let by = Instant::now() + if crate::host::fault("long_locked") { Duration::from_secs(300) } else { LOCKED_TIMEOUT };
         drop(w);
         let mut r = BufReader::new(r);
         wait_locked(&mut r, &mut child, by)?;
@@ -595,6 +596,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let (lock_path, sock) = (l.join(format!("{id}.lock")), d.join(format!("{}.sock", me.pid)));
     crate::socket::check(&sock)?;
     crate::host::stall("standby_lock_stall");
+    // Test gate `standby_lock_gate`: held before its lock until the test lets it go.
+    crate::host::hold("standby_lock_gate");
     // Test hook: held before its lock for as long as armed (past `LOCKED_TIMEOUT`, say).
     while crate::host::fault("standby_lock_hang") {
         std::thread::sleep(Duration::from_millis(50));
