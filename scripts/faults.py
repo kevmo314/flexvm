@@ -4120,9 +4120,11 @@ def signals():
             ok(migrate(A, n, B))
             check("signals: the target's pull is held", wait_for(lambda: reached(B, "pull_gate"), 30), reached(B, "pull_gate"))
             check("signals: still the source when SIGTERM comes", vms(A).get(n, {}).get("state") == "source", where(n))
+            # Only what is logged after this SIGTERM: an earlier run's acknowledgement stays in the log.
+            since = len(log(A, n))
             signal_vm(A, n, signal.SIGTERM)
-            check("signals: the source took the SIGTERM as one", wait_for(lambda: "migrating away; it ends once the target has its memory" in log(A, n), 30),
-                  log(A, n)[-500:])
+            check("signals: the source took the SIGTERM as one", wait_for(lambda: "migrating away; it ends once the target has its memory" in log(A, n)[since:], 30),
+                  log(A, n)[since:][-500:])
         finally:
             release(B, "pull_gate")
     st = wait_released(B, n)
