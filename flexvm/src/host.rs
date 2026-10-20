@@ -641,6 +641,11 @@ impl Host {
             Err(e) if !unwritable(&e) => Err(root(e))?,
             _ => {}
         }
+        // A reader who may not write the state (a non-root `flexvm ps`) records nothing, quietly.
+        match crate::template::note_rootfs(&crate::template::Paths::new(state)) {
+            Err(e) if !e.downcast_ref::<std::io::Error>().is_some_and(unwritable) => crate::log!("image: recording this state's root filesystems: {e}"),
+            _ => {}
+        }
         let (state, run) = (state.to_path_buf(), run.to_path_buf());
         let binding = state.join("run.json");
         reserved_run(&state, &run, Path::new(RUN_STATE), Path::new(DEFAULT_RUN))?;
