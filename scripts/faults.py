@@ -777,6 +777,10 @@ def basic(swept=False):
     at a sweep, not at a `done`; each try runs one on A (which settles what it owes) and then on B."""
     n = "ft-basic"
     m = setup(n)
+    # Records this scenario's migrations make: one an earlier scenario left (going at its own pace, at a
+    # sweep or its source's done) is not this one's to wait for, but swept, every one goes.
+    migs = lambda h: set(undone_migs(os.path.join(h.state, "migs")))
+    earlier = {h: set() if swept else migs(h) for h in (A, B)}
     r = ok(migrate(A, n, B))
     st = wait_released(B, n)
     check("basic: released", st["released"] is True, st)
@@ -789,10 +793,10 @@ def basic(swept=False):
     check("basic: md5 intact after round trip", md5(A, n) == m)
     # A target forgets a migration only once its source said it is done
     # with it (it never asks again); until then it says released.
-    migs = lambda h: undone_migs(os.path.join(h.state, "migs"))
+    mine = lambda h: migs(h) - earlier[h]
     swept_ok = lambda: not swept or all(cli(h, "debug", "gc")[0] == 0 for h in (A, B))
-    check("basic: records go once their sources are done", wait_for(lambda: swept_ok() and not migs(A) and not migs(B), 10),
-          (migs(A), migs(B)))
+    check("basic: records go once their sources are done", wait_for(lambda: swept_ok() and not mine(A) and not mine(B), 10),
+          (mine(A), mine(B), earlier))
     s3 = peer(B, {"op": "migration", "mig": 12345})
     check("basic: an unknown id is fenced as aborted", s3["result"]["outcome"] == "aborted", s3)
 
