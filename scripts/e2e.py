@@ -390,6 +390,8 @@ class Host:
     def save_logs(self):
         """Copies the VM and Firecracker logs out of the run directory."""
         for log in glob.glob(f"{self.run_dir}/**/*.log", recursive=True) + glob.glob(f"{self.run_dir}/**/*.log.1", recursive=True):
+            if not os.path.exists(log):  # a link to a log not made yet (NAME.log.1 before a rotation)
+                continue
             dest = os.path.join(args.log_dir, f"run-{self.label}", os.path.relpath(log, self.run_dir))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy(log, dest)

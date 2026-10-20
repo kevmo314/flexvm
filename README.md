@@ -269,7 +269,7 @@ shell, so quote a command that has its own quoting:
 belong to CMD; a `--` there is dropped.
 
 A background VM's output (an image app's stdout and stderr, flexvm's own
-messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: past
+messages) goes to `/run/flexvm/vms/web.log` (a link into `web.logs/`). Logs live on tmpfs: past
 8 MiB, `NAME.log` becomes `NAME.log.1` (replacing the one before) and a new
 one is started; the logs of a name with nothing left on
 the host (no VM, stopped VM, `exited`, `failed`, `lost` or moved record) are removed once
@@ -279,12 +279,13 @@ unwritten for an hour, by sweeps that run when a VM starts and about every
 ```sh
 flexvm logs web                 # its log: NAME.log.1 (before the last rotation), then NAME.log
 flexvm logs --tail 20 web       # the last 20 lines
-flexvm logs -f web              # and follow it, until the VM exits or is removed
+flexvm logs -f web              # and follow it, until the VM exits, is removed or renamed
 ```
 
 `logs -f` reads on across rotations (it finishes the rotated log, then
 starts on the new one) and restarts (a VM started again appends to its log);
-it ends once the VM exits or is removed, or its reader is gone. An exited
+it ends once the VM exits, is removed or is renamed (`logs -f` of the new
+name follows it there), or its reader is gone. An exited
 VM's log stays available to read until `rm`. `rm` (including `rm -f` of a
 running VM) deletes both `NAME.log` and `NAME.log.1`, as `docker rm` does, so a
 new VM with the same name starts with a fresh log. For a post-mortem, read

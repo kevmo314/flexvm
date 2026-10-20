@@ -473,9 +473,10 @@ impl Proc {
     }
 
     pub fn set_name(&self, n: NameLock) {
-        // Checked when taken.
-        if let Ok(log) = self.host.vms(&n.name, "log") {
-            crate::util::output::fall_back_to(log);
+        // Its logs' lifetime: this VM's from here (`Host::open_logs`).
+        match self.host.open_logs(&n.name) {
+            Ok(logs) => crate::util::output::fall_back_to(logs),
+            Err(e) => crate::log!("vm {}: its logs: {e}", n.name),
         }
         *self.name.lock().unwrap() = Some(n);
     }
@@ -2293,8 +2294,8 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
             if let Some(log) = log {
                 match crate::listen::finish_incoming_log(&p.host, &p.name(), &log, res.is_ok()) {
                     Ok(()) if res.is_ok() => {
-                        if let Ok(log) = p.host.vms(&p.name(), "log") {
-                            crate::util::output::published(&log)
+                        if let Ok(logs) = p.host.vms(&p.name(), "logs").and_then(|d| Ok(crate::util::output::open_dir(&d)?)) {
+                            crate::util::output::published(logs)
                         }
                     }
                     Ok(()) => {}

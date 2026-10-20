@@ -1040,7 +1040,8 @@ fn run_as(
         (Some(_), Some(_)) if attached => run_attached(host, &name, args.has("keep")),
         (Some((v, _)), Some(_)) => print(v),
         (Some((v, conn)), None) => {
-            util::output::fall_back_to(host.vms(&name, "log")?);
+            // Its terminal gone, this client's own output is dropped: only the VM's process
+            // writes the VM's logs.
             crate::info!("{v}");
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
@@ -1201,8 +1202,7 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     // Opened and marked written holding the logs lock (shared): garbage
     // collection removes only a quiet log, holding it exclusively.
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(host.vms(name, "log")?)?;
+    let f = util::output::open_in(&host.open_logs(name)?, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT)?;
     f.set_modified(std::time::SystemTime::now())?;
     Ok(f)
 }
@@ -2463,7 +2463,7 @@ mod exec_tests {
         drop(name);
         for record in ["failed", "lost"] {
             std::fs::write(host.vms("web", record).unwrap(), "old vm").unwrap();
-            std::fs::write(host.vms("web", "log.1").unwrap(), "older vm").unwrap();
+            host.write_log("web", "log.1", "older vm");
             let mut out = new_run_log(&host, "web").unwrap();
             let _name = host.take_name("web", false).unwrap();
             out.write_all(b"new vm").unwrap();
@@ -2478,9 +2478,16 @@ mod exec_tests {
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let victim = root.join("victim");
         std::fs::write(&victim, "keep").unwrap();
-        std::os::unix::fs::symlink(&victim, host.vms("vm", "log").unwrap()).unwrap();
+        // Its logs' directory, or the log in it, a link elsewhere: refused.
+        std::os::unix::fs::symlink(root.join("elsewhere"), host.vms("vm", "logs").unwrap()).unwrap();
+        std::fs::create_dir(root.join("elsewhere")).unwrap();
+        assert!(log_file(&host, "vm").is_err());
+        std::fs::remove_file(host.vms("vm", "logs").unwrap()).unwrap();
+        drop(host.open_logs("vm").unwrap());
+        std::os::unix::fs::symlink(&victim, host.vms("vm", "logs").unwrap().join("log")).unwrap();
         assert!(log_file(&host, "vm").is_err());
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep");
+        assert!(!root.join("elsewhere/log").exists());
     }
 
     #[test]

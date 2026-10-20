@@ -835,9 +835,13 @@ fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
 /// Its lock goes with it: held, it is the caller's to let go of then.
 pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accepted: bool) -> Result<()> {
     if accepted {
+        // In the lifetime its VM made as it took the name, which its writers and followers hold
+        // already: any earlier log there, and its previous rotation, replaced.
         let _logs = host.logs_lock(libc::LOCK_SH)?;
-        let _ = std::fs::remove_file(host.vms(name, "log.1")?);
-        std::fs::rename(log, host.vms(name, "log")?)?;
+        let dir = host.vms(name, "logs")?;
+        drop(host.open_logs(name)?);
+        let _ = std::fs::remove_file(dir.join("log.1"));
+        std::fs::rename(log, dir.join("log"))?;
     } else {
         std::fs::remove_file(log)?;
     }
@@ -1749,10 +1753,16 @@ mod tests {
         assert_eq!(std::fs::read(&existing).unwrap(), b"existing vm");
         assert_eq!(std::fs::read(&previous).unwrap(), b"earlier stay");
         std::fs::write(&arrival, b"accepted").unwrap();
+        // The lifetime its VM made as it took the name (logs from before such directories moved
+        // in), which its writers and followers hold: published there, never retired.
+        use std::os::unix::fs::MetadataExt;
+        let held = host.open_logs("web").unwrap();
         finish_incoming_log(&host, "web", &arrival, true).unwrap();
         assert!(!arrival.exists());
         assert_eq!(std::fs::read(&existing).unwrap(), b"accepted");
         assert!(!previous.exists());
+        let at = std::fs::metadata(host.vms("web", "logs").unwrap()).unwrap();
+        assert_eq!((held.metadata().unwrap().ino(), held.metadata().unwrap().nlink() > 0), (at.ino(), true));
     }
 
     #[test]

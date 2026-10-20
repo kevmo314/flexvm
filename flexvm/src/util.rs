@@ -2805,8 +2805,11 @@ mod tests {
 /// is given up for the VM's log file, so printing never fails, never aborts
 /// the VM and never holds it up for long; nothing is locked across a write.
 /// A target that is a log in the run directory is kept under `LOG_CAP` by
-/// its writers: past it, `NAME.log` becomes `NAME.log.1` and a new one is
-/// started (`rotate`); a writer whose log was rotated by another follows.
+/// its writers: past it, `log` becomes `log.1` and a new one is started; a
+/// writer whose log was rotated by another follows. A VM's logs are a
+/// lifetime's directory (`Host::open_logs`), which its writers hold: they
+/// write and rotate only in it, so once it is retired (`rm`, `rename`, a new
+/// VM of the name) nothing of theirs reaches the name's later logs.
 pub mod output {
     use std::fs::File;
     use std::io::{Read, Write};
@@ -2822,12 +2825,27 @@ pub mod output {
     pub const LOG_CAP: u64 = 8 << 20;
     static TARGETS: Mutex<[Option<Arc<File>>; 2]> = Mutex::new([None, None]);
     /// The capped log each target writes to, if it is one.
-    static LOGS: Mutex<[Option<PathBuf>; 2]> = Mutex::new([None, None]);
-    static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static LOGS: Mutex<[Option<Log>; 2]> = Mutex::new([None, None]);
+    /// The VM's logs, once its terminal is gone.
+    static LOG: Mutex<Option<Log>> = Mutex::new(None);
     static RELAYS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
-    /// Held by each relay's write (shared), and by `moved` (exclusive): no write goes to a log
-    /// path that is being renamed.
-    static MOVING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// A capped log: a VM's, in its lifetime's directory (held), or one at a path
+    /// (a standby pool's).
+    #[derive(Clone)]
+    enum Log {
+        In(Arc<File>),
+        At(PathBuf),
+    }
+
+    impl Log {
+        fn append(&self, data: &[u8]) -> bool {
+            match self {
+                Log::In(dir) => append_in(dir, data, LOG_CAP),
+                Log::At(path) => append_capped(path, data, LOG_CAP),
+            }
+        }
+    }
 
     pub fn guard() -> std::io::Result<()> {
         for (i, fd) in [1, 2].into_iter().enumerate() {
@@ -2852,12 +2870,11 @@ pub mod output {
 
     /// Diagnostics bypass the app's streams, and are recorded exactly once even in detached mode.
     pub fn diagnostic(data: &[u8], info: bool) {
-        let _moving = MOVING.read().unwrap_or_else(|e| e.into_inner());
         let target_log = LOGS.lock().unwrap()[1].clone();
         // Where stderr goes, if that is a log (a standby's own until claimed); else a terminal's VM log.
         let log = target_log.clone().or_else(|| LOG.lock().unwrap().clone());
         if let Some(log) = &log {
-            append_capped(log, data, LOG_CAP);
+            log.append(data);
         }
         if target_log.is_some() || (info && !super::verbose()) {
             return;
@@ -2871,11 +2888,10 @@ pub mod output {
     }
 
     fn relay(i: usize, data: &[u8]) {
-        let _moving = MOVING.read().unwrap_or_else(|e| e.into_inner());
         // A capped log's output is appended there or dropped, never written twice.
         let log = LOGS.lock().unwrap()[i].clone();
         if let Some(log) = log {
-            append_capped(&log, data, LOG_CAP);
+            log.append(data);
             return;
         }
         let target = TARGETS.lock().unwrap()[i].clone();
@@ -2893,7 +2909,7 @@ pub mod output {
             (targets[i].clone(), LOGS.lock().unwrap()[i].clone())
         };
         if let Some(log) = fallback.1 {
-            append_capped(&log, &data[sent..], LOG_CAP);
+            log.append(&data[sent..]);
         } else if let Some(f) = fallback.0.as_deref() {
             write_within(f, &data[sent..], Instant::now() + STALL);
         }
@@ -2938,9 +2954,10 @@ pub mod output {
         File::options().write(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path).unwrap_or(f)
     }
 
-    /// Where output goes once the terminal is gone.
-    pub fn fall_back_to(log: PathBuf) {
-        *LOG.lock().unwrap() = Some(log);
+    /// Where the VM's output goes once its terminal is gone: its logs (`Host::open_logs`).
+    /// Only a VM's own process writes them; any other's output is its terminal's alone.
+    pub fn fall_back_to(logs: File) {
+        *LOG.lock().unwrap() = Some(Log::In(Arc::new(logs)));
     }
 
     /// A claimed standby's output goes to its claimer's terminal.
@@ -2955,31 +2972,16 @@ pub mod output {
         }
     }
 
-    /// `rename`: the logs at `from` move to `to` (`mv` renames them), with no write of this
-    /// process's in between; its output goes on there.
-    pub fn moved(from: &Path, to: &Path, mv: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
-        let _moving = MOVING.write().unwrap_or_else(|e| e.into_inner());
-        // As a target's path reads (`capped`): through any symlink in the run directory's.
-        let real = from.parent().and_then(|d| Some(std::fs::canonicalize(d).ok()?.join(from.file_name()?)));
-        let was = |p: &Option<PathBuf>| p.as_deref().is_some_and(|p| p == from || Some(p) == real.as_deref());
-        mv()?;
-        for l in LOGS.lock().unwrap().iter_mut().filter(|l| was(l)) {
-            *l = Some(to.into());
-        }
-        let mut log = LOG.lock().unwrap();
-        if was(&log) {
-            *log = Some(to.into());
-        }
-        Ok(())
-    }
-
-    /// An arrival's log was published as `log` (renamed): capped there from now on.
-    pub fn published(log: &Path) {
+    /// An arrival's log was published as `log` in `logs` (`listen::finish_incoming_log`), a new
+    /// lifetime: capped there from now on, and the VM's logs from here.
+    pub fn published(logs: File) {
         let targets = TARGETS.lock().unwrap();
-        let mut logs = LOGS.lock().unwrap();
+        let mut caps = LOGS.lock().unwrap();
+        let logs = Arc::new(logs);
+        *LOG.lock().unwrap() = Some(Log::In(logs.clone()));
         for (i, t) in targets.iter().enumerate() {
-            if t.as_ref().is_some_and(|t| same_file(t, log)) {
-                logs[i] = Some(log.into());
+            if t.as_ref().is_some_and(|t| is_log_in(t, &logs)) {
+                caps[i] = Some(Log::In(logs.clone()));
             }
         }
     }
@@ -2991,15 +2993,75 @@ pub mod output {
         }
     }
 
-    /// The path of `f` if it is a log this process caps: a regular file in
-    /// the run directory, not an arrival's (hidden: renamed once accepted).
-    fn capped(f: &File) -> Option<PathBuf> {
+    /// Whether `f` is the `log` in `dir`.
+    fn is_log_in(f: &File, dir: &File) -> bool {
+        match (f.metadata(), super::stat_at(dir.as_raw_fd(), c"log")) {
+            (Ok(a), Some(b)) => a.ino() == b.st_ino && a.dev() == b.st_dev,
+            _ => false,
+        }
+    }
+
+    /// The log `f` is, if this process caps it: a regular file in the run directory, not an
+    /// arrival's (hidden: published once accepted). A VM's (`log` in `NAME.logs`) by its
+    /// directory, held; any other by its path.
+    fn capped(f: &File) -> Option<Log> {
         if !f.metadata().ok()?.is_file() {
             return None;
         }
         let path = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok()?;
-        let hidden = path.file_name()?.to_str()?.starts_with('.');
-        (path.starts_with(crate::host::run_dir()?) && !hidden && same_file(f, &path)).then_some(path)
+        let hidden = |p: &Path| p.file_name().and_then(|n| n.to_str()).is_none_or(|n| n.starts_with('.'));
+        if !path.starts_with(crate::host::run_dir()?) || hidden(&path) {
+            return None;
+        }
+        match path.parent().filter(|d| !hidden(d) && d.extension().is_some_and(|e| e == "logs") && path.file_name().is_some_and(|n| n == "log")) {
+            Some(dir) => open_dir(dir).ok().filter(|d| is_log_in(f, d)).map(|d| Log::In(Arc::new(d))),
+            None => same_file(f, &path).then_some(Log::At(path)),
+        }
+    }
+
+    /// `dir`, a directory (never through a link), opened to work in.
+    pub fn open_dir(dir: &Path) -> std::io::Result<File> {
+        File::options().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)
+    }
+
+    /// `name` in `dir`, opened with `flags` (and 0600 if made); never through a link.
+    pub fn open_in(dir: &File, name: &std::ffi::CStr, flags: i32) -> std::io::Result<File> {
+        let fd = super::eintr(|| unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o600) })?;
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Appends `data` to `log` in `dir` (a VM's logs), holding the directory's lock (a flock of
+    /// an open of this call's own), so no write goes to a log another writer is rotating. Past
+    /// `cap`, `log` is renamed `log.1` (replacing the one before); the next write starts a new
+    /// `log` (0600), so one interrupted between leaves `log.1` for `logs` to read. A lock not had
+    /// within `STALL` (a stopped holder) is done without: the append is made unlocked and
+    /// nothing rotated. All of it in `dir`: retired, it is never the name's again. Whether
+    /// `data` was written; it is never written twice.
+    pub fn append_in(dir: &File, data: &[u8], cap: u64) -> bool {
+        let deadline = Instant::now() + STALL;
+        let lock = loop {
+            let take = || {
+                let f = open_in(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY)?;
+                crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).map(|()| f)
+            };
+            match take() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                result => break result.ok(),
+            }
+        };
+        let written = open_in(dir, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT).is_ok_and(|mut f| {
+            let written = f.write_all(data).is_ok();
+            if lock.is_some() && f.metadata().is_ok_and(|m| m.len() > cap) {
+                let d = dir.as_raw_fd();
+                unsafe { libc::renameat(d, c"log".as_ptr(), d, c"log.1".as_ptr()) };
+            }
+            written
+        });
+        if let Some(l) = lock {
+            // Unlocked, not only closed: see `host::Flock`.
+            let _ = crate::host::flock(&l, libc::LOCK_UN);
+        }
+        written
     }
 
     /// Appends `data` to the file at `log`, holding `log`'s lock (`log_lock`; never
@@ -3076,17 +3138,21 @@ pub mod output {
         assert_eq!(write_within(&f, b"late", Instant::now()), 0);
     }
 
+    /// A VM's fallback writes its logs' lifetime: rotated (by another writer, or by it past the
+    /// cap) it goes on in a new `log`; retired (`rm`, `rename`, a new VM of the name), all it
+    /// writes, rotations too, stays in the retired directory, never the name's later logs.
     #[test]
-    fn fallback_log_follows_rotation_by_path() {
+    fn fallback_log_follows_rotation_and_never_writes_a_later_lifetime() {
         const CHILD: &str = "FLEXVM_FALLBACK_ROTATION_TEST";
         if let Some(path) = std::env::var_os(CHILD) {
-            let log = PathBuf::from(path);
-            fall_back_to(log.clone());
+            let dir = PathBuf::from(path);
+            std::fs::create_dir(&dir).unwrap();
+            let (log, old) = (dir.join("log"), dir.join("log.1"));
+            fall_back_to(open_dir(&dir).unwrap());
             TARGETS.lock().unwrap()[0] = Some(Arc::new(File::open("/dev/null").unwrap()));
             relay(0, b"first");
-            assert_eq!(LOGS.lock().unwrap()[0].as_ref(), Some(&log));
+            assert!(matches!(LOGS.lock().unwrap()[0], Some(Log::In(_))));
             assert!(TARGETS.lock().unwrap()[0].is_none());
-            let old = log.with_extension("log.1");
             std::fs::rename(&log, &old).unwrap();
             relay(0, b"second");
             assert_eq!(std::fs::read(&old).unwrap(), b"first");
@@ -3096,15 +3162,52 @@ pub mod output {
             assert!(!log.exists());
             relay(0, b"third");
             assert_eq!(std::fs::read(&log).unwrap(), b"third");
+            // Interrupted mid-rotation: `log.1` alone; the next write starts `log`.
+            std::fs::rename(&log, &old).unwrap();
+            relay(0, b"fourth");
+            assert_eq!(std::fs::read(&log).unwrap(), b"fourth");
+            // Retired, and a later VM's logs made at the path: this writer, stale, goes on in its
+            // own, past the cap too.
+            let gone = dir.with_extension("logs.gone");
+            std::fs::rename(&dir, &gone).unwrap();
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(&log, b"replacement").unwrap();
+            relay(0, b"after rm");
+            relay(0, &vec![42; LOG_CAP as usize]);
+            relay(0, b"rotated");
+            assert_eq!(std::fs::read(&log).unwrap(), b"replacement");
+            assert!(!old.exists());
+            assert_eq!(std::fs::read(gone.join("log")).unwrap(), b"rotated");
+            // Removed (its directory gone): nothing is made again.
+            std::fs::remove_dir_all(&gone).unwrap();
+            relay(0, b"after removal");
+            assert!(!gone.exists());
+            assert_eq!(std::fs::read(&log).unwrap(), b"replacement");
             return;
         }
         let dir = crate::test_util::TempDir::new("fallback-rotation");
         let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "util::output::fallback_log_follows_rotation_by_path", "--nocapture"])
-            .env(CHILD, dir.join("vm.log"))
+            .args(["--exact", "util::output::fallback_log_follows_rotation_and_never_writes_a_later_lifetime", "--nocapture"])
+            .env(CHILD, dir.join("vm.logs"))
             .output()
             .unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    /// A log that cannot be made (no inodes left, say) loses that write only: the next makes it.
+    #[test]
+    fn a_log_that_cannot_be_made_is_made_by_the_next_write() {
+        let d = crate::test_util::TempDir::new("log-make");
+        let dir = open_dir(&d).unwrap();
+        std::fs::create_dir(d.join("log")).unwrap();
+        assert!(!append_in(&dir, b"lost\n", 10));
+        std::fs::remove_dir(d.join("log")).unwrap();
+        assert!(append_in(&dir, b"one\n", 10));
+        assert!(append_in(&dir, b"two two two\n", 10));
+        assert_eq!(std::fs::read(d.join("log.1")).unwrap(), b"one\ntwo two two\n");
+        assert!(!d.join("log").exists());
+        assert!(append_in(&dir, b"three\n", 10));
+        assert_eq!(std::fs::read(d.join("log")).unwrap(), b"three\n");
     }
 
     #[test]
@@ -3114,11 +3217,13 @@ pub mod output {
             // Run alone: these targets and the diagnostic writer are process globals.
             super::set_verbose(std::env::var_os("FLEXVM_OUTPUT_TEST_VERBOSE").is_some());
             guard().unwrap();
-            let log = PathBuf::from(log);
+            let logs = PathBuf::from(log);
+            std::fs::create_dir(&logs).unwrap();
+            let open = || open_dir(&logs).unwrap();
             if std::env::var_os("FLEXVM_OUTPUT_TEST_DETACHED").is_some() {
-                *LOGS.lock().unwrap() = [Some(log.clone()), Some(log.clone())];
+                *LOGS.lock().unwrap() = [Some(Log::In(Arc::new(open()))), Some(Log::In(Arc::new(open())))];
             }
-            fall_back_to(log);
+            fall_back_to(open());
             std::io::stdout().write_all(b"app-out-marker\n").unwrap();
             std::io::stderr().write_all(b"app-err-marker\n").unwrap();
             super::info_line("info-marker\n".into());
@@ -3130,7 +3235,7 @@ pub mod output {
         }
         for mode in ["quiet", "flag", "debug", "detached"] {
             let dir = crate::test_util::TempDir::new("output-routing");
-            let log = dir.join("vm.log");
+            let log = dir.join("vm.logs");
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", "util::output::diagnostics_and_app_streams_are_routed_and_logged_once", "--nocapture"])
                 .env(CHILD, &log)
@@ -3153,7 +3258,7 @@ pub mod output {
             assert!(output.status.success(), "{mode}: {output:?}");
             let stdout = String::from_utf8(output.stdout).unwrap();
             let stderr = String::from_utf8(output.stderr).unwrap();
-            let log = std::fs::read_to_string(log).unwrap();
+            let log = std::fs::read_to_string(log.join("log")).unwrap();
             if mode == "detached" {
                 assert!(!stdout.contains("marker") && !stderr.contains("marker"), "{stdout} {stderr}");
             } else {
@@ -3187,7 +3292,7 @@ pub mod output {
     #[test]
     fn a_retargeted_full_pipe_keeps_the_fallback_output() {
         use crate::test_util::{wait_until, JoinWithin};
-        struct Restore(Option<Arc<File>>, Option<PathBuf>);
+        struct Restore(Option<Arc<File>>, Option<Log>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 // Also after a panic, which may have poisoned either lock.

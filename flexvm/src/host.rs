@@ -868,10 +868,10 @@ impl Host {
         if !resuming && self.has_record(name, "exited") {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
-        // A new VM of a failed or lost one's name starts a fresh log; a resume (`start`) keeps its VM's.
+        // A new VM of a failed, lost or moved one's name starts a fresh log; a resume (`start`) keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
-        if !resuming && ["failed", "lost"].iter().any(|ext| self.has_record(name, ext)) {
-            let _ = self.remove_logs(name);
+        if !resuming && ["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) {
+            let _ = self.retire_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
         // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log.
@@ -925,8 +925,58 @@ impl Host {
         Ok(())
     }
 
-    /// Both of `name`'s logs, those missing too; under its name and the logs lock (shared).
-    fn remove_logs(&self, name: &str) -> Result<()> {
+    /// `RUN/vms/NAME.logs`, made if missing, opened: a lifetime of `name`'s logs (`log`, and
+    /// `log.1` before its last rotation). Its writers (its VM's process: `output::append_in`)
+    /// and followers (`logs -f`) hold the directory, never its path, so one retired is never
+    /// written or read for the name again, and while held its inode is never a later one's.
+    /// `NAME.log` and `NAME.log.1` link into it, for people (and the paths documented); logs
+    /// there from before these directories are moved into it. Under the name.
+    pub fn open_logs(&self, name: &str) -> Result<File> {
+        let dir = self.vms(name, "logs")?;
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+            _ => {}
+        }
+        for ext in ["log", "log.1"] {
+            let (link, target) = (self.vms(name, ext)?, PathBuf::from(format!("{name}.logs/{ext}")));
+            let ours = || std::fs::read_link(&link).is_ok_and(|t| t == target);
+            match std::fs::symlink_metadata(&link) {
+                Ok(m) if m.is_file() => {
+                    if !crate::util::rename_noreplace(&link, &dir.join(ext))? {
+                        bail!("{}: a log from before {name}.logs/, which has its own; remove one", link.display());
+                    }
+                }
+                Ok(_) if ours() => continue,
+                Ok(_) => bail!("{}: not a link to {}", link.display(), target.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            match std::os::unix::fs::symlink(&target, &link) {
+                Err(e) if !(e.kind() == std::io::ErrorKind::AlreadyExists && ours()) => return Err(format!("{}: {e}", link.display()).into()),
+                _ => {}
+            }
+        }
+        Ok(crate::util::output::open_dir(&dir)?)
+    }
+
+    /// Tests: writes `name`'s `log` or `log.1` (in its logs' directory, made if missing).
+    #[cfg(test)]
+    pub fn write_log(&self, name: &str, file: &str, data: impl AsRef<[u8]>) {
+        drop(self.open_logs(name).unwrap());
+        std::fs::write(self.vms(name, "logs").unwrap().join(file), data).unwrap();
+    }
+
+    /// Ends `name`'s logs' lifetime without waiting on anyone: their directory renamed away in
+    /// one step (so a later one of the name is a new directory), then removed, with its links.
+    /// One a writer still adds to meanwhile is left to garbage collection (`.NAME.logs.*.gone`).
+    pub fn retire_logs(&self, name: &str) -> Result<()> {
+        let gone = self.run.join("vms").join(format!(".{name}.logs.{}.gone", crate::util::random_hex(8)?));
+        match std::fs::rename(self.vms(name, "logs")?, &gone) {
+            Ok(()) => drop(std::fs::remove_dir_all(&gone)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // The links, and logs at their paths from before these directories.
         for ext in ["log", "log.1"] {
             match std::fs::remove_file(self.vms(name, ext)?) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
@@ -2939,7 +2989,7 @@ impl NameLock {
     /// opens its log before the child takes the name, so clearing at the child's start is too late.
     pub fn remove_logs(&self) -> Result<()> {
         let _logs = self.host.logs_lock(libc::LOCK_SH)?;
-        self.host.remove_logs(&self.name)
+        self.host.retire_logs(&self.name)
     }
 
     pub fn publish(&self, e: &Entry) -> Result<()> {
@@ -5503,21 +5553,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reusing_a_failed_or_lost_name_removes_both_logs() {
+    fn reusing_a_failed_lost_or_moved_name_removes_both_logs() {
         let (_dir, h) = host("reuse-logs");
-        for record in ["failed", "lost"] {
-            for ext in [record, "log", "log.1"] {
-                std::fs::write(h.vms("web", ext).unwrap(), "old vm").unwrap();
+        for record in ["failed", "lost", "moved"] {
+            std::fs::write(h.vms("web", record).unwrap(), "old vm").unwrap();
+            h.write_log("web", "log", "old vm");
+            h.write_log("web", "log.1", "old vm");
+            if record != "moved" {
+                assert!(h.take_unrecorded_name("web").is_err());
             }
-            assert!(h.take_unrecorded_name("web").is_err());
             assert!(h.has_record("web", "log") && h.has_record("web", "log.1"));
+            let held = crate::util::output::open_dir(&h.vms("web", "logs").unwrap()).unwrap();
             let _name = h.take_name("web", false).unwrap();
-            for ext in [record, "log", "log.1"] {
-                assert!(!h.has_record("web", ext), "{ext}");
+            for ext in [record, "log", "log.1", "logs"] {
+                assert!(!h.has_record("web", ext), "{record}: {ext}");
             }
+            assert_eq!(held.metadata().unwrap().nlink(), 0, "{record}: retired whole");
         }
         // `start` of a failed VM with no checkpoint: refused after, so its record stays for the next `run`.
-        std::fs::write(h.vms("web", "log").unwrap(), "died").unwrap();
+        h.write_log("web", "log", "died");
         std::fs::write(h.vms("web", "failed").unwrap(), "died").unwrap();
         drop(h.take_name("web", true).unwrap());
         assert!(h.has_record("web", "failed") && h.has_record("web", "log"));
@@ -5527,7 +5581,7 @@ pub(crate) mod tests {
         let dir = h.suspended("web").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("manifest.json"), "{}").unwrap();
-        std::fs::write(h.vms("web", "log").unwrap(), "resume").unwrap();
+        h.write_log("web", "log", "resume");
         std::fs::write(h.vms("web", "failed").unwrap(), "died resuming").unwrap();
         let _name = h.take_name("web", true).unwrap();
         assert!(!h.has_record("web", "failed"));
