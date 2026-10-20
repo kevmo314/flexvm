@@ -276,7 +276,24 @@ pub fn session_exit(data: &[u8], offset: u64) -> Result<i32> {
     Ok(i32::from_le_bytes(session_output(data, offset)?.try_into()?))
 }
 
-pub fn read_frame(r: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
+/// An owned wire frame: the relay forwards it without copying its payload.
+pub struct WireFrame(Vec<u8>);
+
+impl WireFrame {
+    pub fn kind(&self) -> u8 {
+        self.0[0]
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.0[5..]
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn frame_header(r: &mut impl Read) -> Result<Option<([u8; 5], usize)>> {
     let mut hdr = [0u8; 5];
     match r.read_exact(&mut hdr[..1]) {
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
@@ -287,6 +304,19 @@ pub fn read_frame(r: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
     if len > MAX_BODY {
         bail!("guest frame too large: {len}");
     }
+    Ok(Some((hdr, len)))
+}
+
+pub fn read_wire_frame(r: &mut impl Read) -> Result<Option<WireFrame>> {
+    let Some((hdr, len)) = frame_header(r)? else { return Ok(None) };
+    let mut buf = vec![0u8; 5 + len];
+    buf[..5].copy_from_slice(&hdr);
+    r.read_exact(&mut buf[5..])?;
+    Ok(Some(WireFrame(buf)))
+}
+
+pub fn read_frame(r: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
+    let Some((hdr, len)) = frame_header(r)? else { return Ok(None) };
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(Some((hdr[0], buf)))
@@ -435,22 +465,22 @@ pub fn app_status(uds: &Path) -> Result<String> {
 /// pull is not held for the request's whole timeout.
 fn readiness(uds: &Path, line: &str, timeout: Duration, stop: &(dyn Fn() -> Result<()> + Sync)) -> Result<String> {
     let deadline = Instant::now().checked_add(timeout).ok_or("guest timeout is too large")?;
-    let done = &std::sync::atomic::AtomicBool::new(false);
+    let (done, finished) = std::sync::mpsc::channel::<()>();
     let reply = std::thread::scope(|scope| {
         let reply = ask_watched(uds, line, deadline, |s| {
             let s = s.try_clone()?;
-            scope.spawn(move || {
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    if stop().is_err() {
-                        let _ = s.shutdown(std::net::Shutdown::Both);
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
+            scope.spawn(move || loop {
+                if stop().is_err() {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                if finished.recv_timeout(Duration::from_millis(50)) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    return;
                 }
             });
             Ok(())
         });
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(done);
         reply
     });
     stop()?;
@@ -620,6 +650,75 @@ mod tests {
         for error in [clock(path, Duration::MAX).unwrap_err(), check(path, "true", Duration::MAX, &|| Ok(())).unwrap_err()] {
             assert_eq!(error.to_string(), "guest timeout is too large");
         }
+    }
+
+    #[test]
+    fn fast_readiness_replies_wake_the_watcher() {
+        let (_dir, path, listener) = agent("readiness-fast");
+        let (watching, watched) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for _ in 0..20 {
+                let (mut stream, _) = accept(&listener);
+                watched.recv_timeout(TIMEOUT).unwrap();
+                stream.get_mut().write_all(b"OK 1\n").unwrap();
+                write_frame(stream.get_mut(), FRAME_MSG, b"ok").unwrap();
+            }
+        });
+        let start = Instant::now();
+        for i in 0..20 {
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let stop = || {
+                if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    watching.send(()).unwrap();
+                }
+                Ok(())
+            };
+            assert!(match i % 2 {
+                0 => probe(&path, 80, &stop).unwrap(),
+                _ => check(&path, "true", Duration::from_secs(1), &stop).unwrap(),
+            });
+        }
+        assert!(start.elapsed() < Duration::from_millis(750), "watchers waited out their polling intervals");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn readiness_cancellation_shuts_down_an_unanswered_request() {
+        let (_dir, path, listener) = agent("readiness-cancel");
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let client = scope.spawn(|| {
+                readiness(&path, "PROBE 80", Duration::from_secs(60), &|| {
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        bail!("cancelled");
+                    }
+                    Ok(())
+                })
+            });
+            let (mut stream, line) = accept(&listener);
+            assert_eq!(line, "PROBE 80\n");
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+            assert_eq!(client.join().unwrap().unwrap_err().to_string(), "cancelled");
+        });
+    }
+
+    #[test]
+    fn readiness_errors_also_stop_the_watcher() {
+        let (_dir, path, listener) = agent("readiness-error");
+        let server = std::thread::spawn(move || {
+            for reply in [None, Some(FRAME_STDOUT)] {
+                let (mut stream, _) = accept(&listener);
+                stream.get_mut().write_all(b"OK 1\n").unwrap();
+                if let Some(kind) = reply {
+                    write_frame(stream.get_mut(), kind, b"bad reply").unwrap();
+                }
+            }
+        });
+        assert!(readiness(&path, "PROBE 80", TIMEOUT, &|| Ok(())).is_err());
+        assert!(readiness(&path, "CHECK 1 78", TIMEOUT, &|| Ok(())).unwrap_err().to_string().contains("unexpected reply"));
+        server.join().unwrap();
     }
 
     #[test]
@@ -838,6 +937,23 @@ mod tests {
         let start = Instant::now();
         let e = ping(&uds).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(5) && !dropped(&e), "{e}");
+    }
+
+    #[test]
+    fn wire_frames_keep_the_header_and_bound_the_payload() {
+        for (kind, data) in [(FRAME_STDOUT, b"abc".to_vec()), (255, vec![]), (FRAME_STDERR, vec![42; MAX_BODY])] {
+            let wire = frame(kind, &[&data]);
+            let mut input = wire.as_slice();
+            let got = read_wire_frame(&mut input).unwrap().unwrap();
+            assert_eq!((got.kind(), got.data(), got.bytes()), (kind, data.as_slice(), wire.as_slice()));
+            assert!(read_wire_frame(&mut input).unwrap().is_none());
+            for end in [1, 3, wire.len() - 1] {
+                assert!(read_wire_frame(&mut &wire[..end]).is_err());
+            }
+        }
+        let mut oversized = &[1, 255, 255, 255, 255, 42][..];
+        assert!(read_wire_frame(&mut oversized).is_err());
+        assert_eq!(oversized, [42], "refused before reading the payload");
     }
 
     #[test]

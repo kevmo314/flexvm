@@ -64,7 +64,7 @@ fn relay_session<G: Read + Write>(
     loop {
         let frame = match pending.pop_front() {
             Some(frame) => frame,
-            None => match guest::read_frame(guest) {
+            None => match guest::read_wire_frame(guest) {
                 Ok(Some(frame)) => frame,
                 // Cut while it was read (a partial frame is read again).
                 end if echoed && rejoin.is_some() && (wait.cut)() => {
@@ -76,16 +76,16 @@ fn relay_session<G: Read + Write>(
                 Err(e) => return Err(e),
             },
         };
-        let (kind, data) = frame;
+        let (kind, data) = (frame.kind(), frame.data());
         let at = Instant::now();
         match kind {
             guest::FRAME_EXIT => (wait.exited)(),
             guest::FRAME_MSG if rejoin.is_some_and(|r| data == r.id.as_bytes()) => echoed = true,
-            guest::FRAME_MSG if guest::at_session_cap(&String::from_utf8_lossy(&data)) => *REFUSED.lock().unwrap() = Some(Instant::now()),
-            guest::FRAME_STDOUT | guest::FRAME_STDERR => next = next.max(output_end(&data)),
+            guest::FRAME_MSG if guest::at_session_cap(&String::from_utf8_lossy(data)) => *REFUSED.lock().unwrap() = Some(Instant::now()),
+            guest::FRAME_STDOUT | guest::FRAME_STDERR => next = next.max(output_end(data)),
             _ => {}
         }
-        let bytes = guest::frame(kind, &[&data]);
+        let bytes = frame.bytes();
         let mut sent = 0;
         loop {
             match relay_output(client, &bytes[sent..], wait)? {
@@ -94,13 +94,13 @@ fn relay_session<G: Read + Write>(
                     (sent, waited) = (sent + n, waited | w);
                     let Some(rejoin) = rejoin.filter(|_| echoed) else { bail!("the guest's connection was cut") };
                     // Queued before the cut, it is still there to read; then the guest has the rest.
-                    while let Ok(Some(frame)) = guest::read_frame(guest) {
-                        if matches!(frame.0, guest::FRAME_STDOUT | guest::FRAME_STDERR) {
-                            next = next.max(output_end(&frame.1));
+                    while let Ok(Some(frame)) = guest::read_wire_frame(guest) {
+                        if matches!(frame.kind(), guest::FRAME_STDOUT | guest::FRAME_STDERR) {
+                            next = next.max(output_end(frame.data()));
                         }
                         pending.push_back(frame);
                     }
-                    match pending.iter().any(|(kind, _)| *kind == guest::FRAME_EXIT) {
+                    match pending.iter().any(|frame| frame.kind() == guest::FRAME_EXIT) {
                         false => rejoin_guest(guest, client, wait, rejoin, next)?,
                         // All there is to send is here: nothing more to watch.
                         true => wait.guest.set(-1),
@@ -6045,6 +6045,18 @@ mod session_relay_tests {
         agent.set_write_timeout(Some(WAIT)).unwrap();
         let save_state = relay_end.try_clone().unwrap();
         (relay_end, agent, save_state)
+    }
+
+    #[test]
+    fn relay_preserves_wire_frames_including_unknown_and_empty_kinds() {
+        let frames = [guest::frame(255, &[b"unknown"]), guest::frame(guest::FRAME_STDERR, &[b""]), guest::frame(guest::FRAME_MSG, &[b"waiting"])].concat();
+        let (relay, mut client) = UnixStream::pair().unwrap();
+        let mut guest = BufReader::new(std::io::Cursor::new(frames.clone()));
+        assert!(relay_session(&mut guest, &mut &relay, &idle(), false, None).unwrap().is_none());
+        drop(relay);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+        assert_eq!(got, frames);
     }
 
     fn out(offset: u64, data: &[u8]) -> Vec<u8> {
