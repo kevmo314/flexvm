@@ -67,10 +67,9 @@ impl Pages {
                     failed = res.err();
                     done = ready;
                 }
-                // After a failed install, the rest of the reply is read and dropped rather than cut short: the
-                // connection then serves the retry (cutting it would reconnect on every retry, as memory is short).
-                // Only a stop cuts it.
-                failed.is_none() || !stop.load(Ordering::SeqCst)
+                // After a failed install, nothing more: a link reads the rest of its reply and drops it (only a
+                // stop cuts it), a file read stops.
+                failed.is_none()
             });
             match fetched {
                 _ if failed.is_some() => break,
@@ -425,10 +424,17 @@ impl Link {
                 continue;
             };
             let at = Instant::now() + FETCH_DEADLINE;
-            let mut got = 0;
+            let (mut got, mut draining) = (0, false);
+            // A caller that wants no more of the reply (a failed install) is told nothing more, but the rest of
+            // the reply is read and dropped: the connection then serves the retry (cutting it would reconnect on
+            // every retry, as memory is short). Only a stop cuts it.
             let mut counted = |data: &[u8]| {
                 got = data.len();
-                progress(data)
+                if !draining && !progress(data) {
+                    draining = true;
+                }
+                // A stop cuts a reply being drained too, at whatever chunk it comes.
+                !(draining && stopped())
             };
             let res = match lane {
                 Some(lane) if buf.is_empty() => lane.flush(&client.stream.s.s, None, at),
@@ -439,6 +445,9 @@ impl Link {
                 Ok(()) => {
                     self.down = None;
                     self.backoff = BACKOFF_MIN;
+                    if draining {
+                        return Err(io::Error::other(FetchFailure::Cancelled));
+                    }
                     return Ok(());
                 }
                 Err(e) => {

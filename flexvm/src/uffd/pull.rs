@@ -262,6 +262,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_file_install_skips_the_rest_of_the_run() {
+        let n = PULL_RUN;
+        let mut pages = Pages::new(n);
+        pages.fill(0, n, REMOTE);
+        assert_eq!(pages.claim(0, n, REMOTE, |_| true), n);
+        let stop = AtomicBool::new(false);
+        let mut reads = 0;
+        let mut fetch = |off, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| {
+            read_file(off, buf, stop, progress, |_, _| {
+                reads += 1;
+                Ok(())
+            })
+        };
+        let (resolved, result) = pages.fetch_install(0, n, &mut vec![0; n * PAGE_SIZE], &mut fetch, &stop, &mut |_| false, |_, _, _| Err(os(libc::ENOMEM)));
+        assert_eq!(resolved, 0);
+        assert!(matches!(result, Err(Failed::Install(_))));
+        assert_eq!(reads, 1);
+        assert!((0..n).all(|p| pages.get(p) == REMOTE));
+    }
+
+    #[test]
     fn file_read_stops_between_chunks() {
         for stop_before in [false, true] {
             let stop = AtomicBool::new(stop_before);
