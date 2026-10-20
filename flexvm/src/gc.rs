@@ -58,7 +58,6 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(false);
     }
-    crate::checkpoint::sweep_staging(&host.state);
     let complete = match host.after_boot() {
         Ok(Some(complete)) => complete,
         Ok(None) => return Ok(false),

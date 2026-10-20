@@ -397,7 +397,13 @@ pub(crate) fn clear_stale(dir: &Path) {
     clear_stale_fd(&parent);
 }
 
+/// The stale staging of flexvm's own checkpoint directories (`STATE/checkpoints`, `STATE/suspended`), never a user's
+/// (#329): nothing here waits, for the directory's lock or a staging directory's. Test fault `keep_staging`: none, so a
+/// test can look at what a killed checkpoint left (`Staging::new` still clears it).
 pub(crate) fn sweep_staging(state: &Path) {
+    if crate::host::fault("keep_staging") {
+        return;
+    }
     for dir in [state.join("checkpoints"), state.join("suspended")] {
         clear_stale(&dir);
     }
