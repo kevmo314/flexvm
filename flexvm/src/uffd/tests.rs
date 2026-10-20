@@ -861,6 +861,83 @@ fn eagain_retries_only_with_a_stop_flag() {
 }
 
 #[test]
+fn freeze_waits_for_prefetch_to_publish_dirty_pages() {
+    let dir = crate::test_util::TempDir::new("prefetch-freeze");
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "compatibility": {"cpu": "test", "tsc_khz": 2000000, "tsc_control": false,
+                "msrs": [], "firecracker": "test", "features": {}, "xsave": {}},
+            "vcpus": 1, "mem_mib": 1, "max_mib": 64, "plugged_mib": 0,
+            "kernel": "/k", "rootfs": "/r", "id": "a", "components": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::File::create(dir.join("mem")).unwrap().set_len(PAGE_SIZE as u64).unwrap();
+    let mut base = crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap();
+    Arc::get_mut(&mut base).unwrap().working_set = vec![(0, 1)];
+    let pager = Pager {
+        base,
+        runtime: Runtime {
+            pages: Pages::new(1).into(),
+            mappings: vec![Mapping { offset: 0, size: PAGE_SIZE, base_host_virt_addr: 0 }].into(),
+            tracking: true.into(),
+            fail_protect: true.into(),
+            ..Runtime::default()
+        },
+        fault_stats: FaultStats::new(),
+        lanes: Default::default(),
+        steer: Mutex::new((0, 0)),
+        collapse_report: Mutex::new(None),
+        collapse_gate: Default::default(),
+    };
+    let (marked, marked_rx) = std::sync::mpsc::channel();
+    let (publish, publish_rx) = std::sync::mpsc::channel();
+    let publish_rx = Mutex::new(publish_rx);
+    assert!(pager
+        .pages()
+        .before_present
+        .set(Box::new(move |_| {
+            marked.send(()).unwrap();
+            publish_rx.lock().unwrap().recv_timeout(crate::test_util::WAIT).unwrap();
+        }))
+        .is_ok());
+    let finished = AtomicBool::new(false);
+    let (started, started_rx) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        let prefetch = scope.spawn(|| pager.prefetch_pass_with(|_, n, _| Ok(n)));
+        marked_rx.recv_timeout(crate::test_util::WAIT).unwrap();
+        assert_eq!(pager.pages().get(0), INFLIGHT);
+        assert!(pager.pages().is_dirty(0));
+        let freeze = scope.spawn(|| {
+            started.send(unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t).unwrap();
+            let result = pager.freeze(&vec![], true, true);
+            finished.store(true, Ordering::SeqCst);
+            result
+        });
+        let tid = started_rx.recv_timeout(crate::test_util::WAIT).unwrap();
+        crate::test_util::wait_until("freeze to block or finish", || finished.load(Ordering::SeqCst) || crate::test_util::asleep(tid));
+        let waited = !finished.load(Ordering::SeqCst);
+        publish.send(()).unwrap();
+        assert!(!prefetch.join().unwrap());
+        let result = freeze.join().unwrap();
+        assert!(waited, "freeze consumed the dirty bit before the prefetch published PRESENT");
+        // No UFFD needed: the injected protect failure proves freeze tried to protect the page. It must restore the
+        // consumed bit on failure; without draining the prefetch, freeze skips INFLIGHT and incorrectly succeeds.
+        assert!(result.is_err());
+        assert!(!pager.fail_protect.load(Ordering::SeqCst));
+        assert_eq!(pager.pages().get(0), PRESENT);
+        assert!(pager.pages().is_dirty(0));
+    });
+    let runs = pager.quiesce_export().unwrap();
+    assert_eq!(runs, [(0, 1, REMOTE)]);
+    pager.pages().states[0].store(BASE, Ordering::SeqCst);
+    assert!(!pager.prefetch_pass_with(|_, _, _| panic!("prefetch claimed after quiesce")));
+    assert!(pager.prefetch_cut.load(Ordering::SeqCst));
+}
+
+#[test]
 fn prefetch_racing_remove() {
     let p = pages(&[BASE; 3]);
     p.claim(0, 3, BASE, |_| true);

@@ -96,6 +96,8 @@ pub struct Pages {
     /// stretches without reading (and faulting in) their part of `states`.
     touched: Vec<AtomicU64>,
     events: RwLock<()>,
+    #[cfg(test)]
+    pub(super) before_present: OnceLock<Box<dyn Fn(usize) + Send + Sync>>,
     /// One bit per page: its contents may have changed since the last checkpoint's pause (written after a write-protect
     /// fault, installed, or discarded). See `Pager::freeze`.
     pub(super) dirty: Vec<AtomicU64>,
@@ -435,6 +437,10 @@ impl Pages {
         if populated {
             // Installed writable: publish dirty before PRESENT, which lets quiesce_export finish and freeze take it.
             self.mark_dirty(page);
+            #[cfg(test)]
+            if let Some(pause) = self.before_present.get() {
+                pause(page);
+            }
         }
         let old = self.states[page]
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
