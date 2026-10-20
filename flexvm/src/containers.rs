@@ -247,7 +247,7 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
         }
     };
     let mut gone_since: Option<Instant> = None;
-    loop {
+    'poll: loop {
         std::thread::sleep(FOLLOW_EVERY);
         if let Some(f) = cur.as_mut() {
             if !drain(f)? {
@@ -259,10 +259,12 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             }
         }
         if dir.is_none() {
-            // A known VM's, not made yet: taken only while the VM it was is the name's, running;
-            // read from its start below (`log.1` first, if it rotated already).
+            // A known VM's, not made yet: taken once made while no other VM has had the name (its
+            // VM may have ended since: read whole, then ended), read from its start below (`log.1`
+            // first, if it rotated already). None made, and its VM gone or another's: ended.
             let made = open_dir(&at).ok();
-            if holder.is_none() || host.name_holder(name).ok().flatten() != holder || !host.alive(name) {
+            let now = host.name_holder(name).ok().flatten();
+            if holder.is_none() || now.is_some() && now != holder || made.is_none() && !host.alive(name) {
                 return Ok(());
             }
             dir = made;
@@ -277,26 +279,33 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
         if retired {
             return Ok(());
         }
-        // Rotated twice since (the second maybe the writer's last, with no log after): the one
-        // in between, neither followed nor read, is read whole first.
-        if let Some(mut between) = open(d, &prev) {
-            let b = ino(&between);
-            if b.is_some_and(|b| Some(b) != cur.as_ref().and_then(ino) && !read.contains(&b)) {
-                mark(&mut read, b);
-                if !cur.as_mut().map_or(Ok(true), &mut drain)? || !drain(&mut between)? {
-                    return Ok(());
+        // Rotated: what was written before the rename is drained, then any log in between, then
+        // the new one; until what is at `log.1` and `log` holds still (a writer may rotate again
+        // as this reads).
+        loop {
+            // A `log.1` neither followed nor read (rotated twice since, the second maybe the
+            // writer's last, with no log after) is older than the current log: read whole first.
+            let unread = |f: &std::fs::File, other: Option<(u64, u64)>| ino(f).filter(|b| Some(*b) != other && !read.contains(b));
+            if let Some(mut between) = open(d, &prev) {
+                if let Some(b) = unread(&between, cur.as_ref().and_then(ino)) {
+                    mark(&mut read, Some(b));
+                    if !cur.as_mut().map_or(Ok(true), &mut drain)? || !drain(&mut between)? {
+                        return Ok(());
+                    }
+                    continue;
                 }
             }
-        }
-        // Rotated: what was written before the rename is drained, then the new one.
-        let now = crate::util::stat_at(std::os::fd::AsRawFd::as_raw_fd(d), &log).map(|st| (st.st_dev, st.st_ino));
-        if now.is_some() && now != cur.as_ref().and_then(ino) {
+            let Some(next) = open(d, &log).filter(|n| ino(n) != cur.as_ref().and_then(ino)) else { break };
+            // Rotated again since that check: what is at `log.1` now comes first.
+            if open(d, &prev).is_some_and(|p| unread(&p, ino(&next)).is_some_and(|b| Some(b) != cur.as_ref().and_then(ino))) {
+                continue;
+            }
             if !cur.as_mut().map_or(Ok(true), &mut drain)? {
                 return Ok(());
             }
             mark(&mut read, cur.as_ref().and_then(ino));
-            cur = open(d, &log);
-            continue;
+            cur = Some(next);
+            continue 'poll;
         }
         // Ended for a while (not a restart's moment between its stop and start).
         match (host.alive(name) || host.is_suspended(name), gone_since) {
@@ -997,6 +1006,64 @@ mod tests {
         drop(name);
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
         assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "first, past the cap\nsecond\n");
+    }
+
+    /// Rotated again while the follower writes out the log in between to a slow reader: the
+    /// log rotated then comes before the one made after it.
+    #[test]
+    fn logs_follow_keeps_order_through_a_rotation_while_it_reads() {
+        let root = TempDir::new("logs-rotation-midread");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        host.write_log("job", "log", b"a\n");
+        let dir = host.vms("job", "logs").unwrap();
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let got = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (h, sink) = (host.clone(), got.clone());
+        std::thread::spawn(move || {
+            let mut out = |d: &[u8]| {
+                sink.lock().unwrap().extend_from_slice(d);
+                if d == b"b\n" {
+                    seen_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                }
+                Ok(true)
+            };
+            tx.send(logs_to(&h, "job", true, None, &mut out).is_ok())
+        });
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        let rotate = |data: &[u8]| {
+            std::fs::rename(dir.join("log"), dir.join("log.1")).unwrap();
+            std::fs::write(dir.join("log"), data).unwrap();
+        };
+        rotate(b"b\n");
+        rotate(b"c\n");
+        seen.recv_timeout(Duration::from_secs(10)).unwrap();
+        rotate(b"d\n");
+        go.send(()).unwrap();
+        std::thread::sleep(FOLLOW_EVERY * 3);
+        drop(name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "a\nb\nc\nd\n");
+    }
+
+    /// A known VM that made its logs, wrote them and ended between the polls of a follower that
+    /// had none: read whole, then ended.
+    #[test]
+    fn logs_follow_reads_the_logs_of_a_vm_that_ended_before_it_took_them() {
+        let root = TempDir::new("logs-ended-unadopted");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        let (got, rx) = follow(&host, "job");
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        let logs = host.open_logs("job").unwrap();
+        assert!(crate::util::output::append_in(&logs, b"first, past the cap\n", 10));
+        assert!(crate::util::output::append_in(&logs, b"done\n", 10));
+        drop(name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "first, past the cap\ndone\n");
     }
 
     #[test]
