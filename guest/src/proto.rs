@@ -41,6 +41,12 @@ pub const MAX_DETACHED: usize = 64;
 pub const TOO_MANY_SESSIONS: &str = "too many sessions: ";
 pub const TOO_MANY_DETACHED: &str = "too many detached or interactive tty sessions: ";
 
+/// `REJOIN <id> <offset> <claim>`'s refusal: an attachment with a higher host claim number (`ATTACH <id> <offset>
+/// <claim>`) came since, which it would have shut down (#1074). An agent older than these forms refuses both as
+/// a bad session request (`BAD_SESSION_REQUEST`); the host then sends the plain `ATTACH <id> <offset>`.
+pub const ATTACHED_SINCE: &str = "a newer client attached since";
+pub const BAD_SESSION_REQUEST: &str = "bad session request";
+
 /// In a refusal that a moment later may not recur (a busy agent, a checkpointing VM): the host
 /// tries the request again rather than give up.
 pub const TRY_AGAIN: &str = "; try again";

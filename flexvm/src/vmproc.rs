@@ -138,7 +138,8 @@ struct Rejoin<'a, G> {
     /// The offset the relay's request started at.
     from: u64,
     /// Attaches again from the offset, its id echo read: None while the VM cannot be reached yet (a checkpoint
-    /// still being taken, a pause); the connection, and its fd to watch for hangups.
+    /// still being taken, a pause) or another client claimed the session (which it checks under the claim's
+    /// lock with its ATTACH: `Claim::while_current`); the connection, and its fd to watch for hangups.
     attach: &'a dyn Fn(u64) -> Result<Option<(BufReader<G>, std::os::fd::RawFd)>>,
 }
 
@@ -285,10 +286,12 @@ fn relay_output(client: &UnixStream, bytes: &[u8], wait: &Wait) -> Result<Sent> 
             if (wait.cut)() {
                 return Ok(Sent::Cut { sent, waited });
             }
-            if (wait.replaced)() {
-                bail!("another client attached to the session");
-            }
             guest = -1;
+        }
+        // Looked at whatever the guest's connection does: with none left to watch (all the session will send
+        // already read, an exit among it), the takeover is not seen as its hangup (#1074).
+        if (wait.replaced)() {
+            bail!("another client attached to the session");
         }
     }
     Ok(Sent::All { waited })
@@ -311,31 +314,122 @@ fn relay_input<T>(guest: UnixStream, client: &UnixStream, relay: impl FnOnce() -
 
 /// Each exec session's newest relay: a client attaching again (or another client on its id) takes the session
 /// over, as the guest does, and an older relay still waiting on its client ends rather than hold it (#1016).
-static CLAIMS: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
+static CLAIMS: Mutex<std::collections::BTreeMap<String, Claims>> = Mutex::new(std::collections::BTreeMap::new());
 static CLAIMED: AtomicU64 = AtomicU64::new(0);
+
+/// A session's claims: the newest (0: it ended), how many are held, and the lock under which a claim is made
+/// newest and an older relay checks it is still newest and attaches again. So that relay's ATTACH reaches the
+/// guest, and its echo is read, before a newer client's claim exists, its ATTACH then following; or it sees
+/// the newer claim and sends none, which would shut the newer attachment down (#1074).
+struct Claims {
+    newest: u64,
+    held: usize,
+    lock: Arc<Mutex<()>>,
+}
 
 struct Claim {
     session: String,
     n: u64,
+    lock: Arc<Mutex<()>>,
 }
 
 impl Claim {
     fn new(session: &str) -> Claim {
+        let lock = {
+            let mut claims = CLAIMS.lock().unwrap();
+            let entry = claims.entry(session.to_string()).or_insert_with(|| Claims { newest: 0, held: 0, lock: Arc::default() });
+            entry.held += 1;
+            entry.lock.clone()
+        };
+        // Not under CLAIMS: an older relay may hold the session's lock across its ATTACH.
+        let _attaching = lock.lock().unwrap_or_else(|e| e.into_inner());
         let n = CLAIMED.fetch_add(1, Ordering::SeqCst) + 1;
-        CLAIMS.lock().unwrap().insert(session.to_string(), n);
-        Claim { session: session.to_string(), n }
+        CLAIMS.lock().unwrap().get_mut(session).expect("held").newest = n;
+        Claim { session: session.to_string(), n, lock: lock.clone() }
     }
 
     fn current(&self) -> bool {
-        CLAIMS.lock().unwrap().get(&self.session) == Some(&self.n)
+        CLAIMS.lock().unwrap().get(&self.session).is_some_and(|c| c.newest == self.n)
+    }
+
+    /// `attach()` while this is the session's newest claim, which no newer one can become meanwhile; None if
+    /// another client claimed it since.
+    fn while_current<T>(&self, attach: impl FnOnce() -> T) -> Option<T> {
+        let _attaching = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.current().then(attach)
     }
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
         let mut claims = CLAIMS.lock().unwrap();
-        if claims.get(&self.session) == Some(&self.n) {
+        let Some(entry) = claims.get_mut(&self.session) else { return };
+        if entry.newest == self.n {
+            entry.newest = 0;
+        }
+        entry.held -= 1;
+        if entry.held == 0 {
             claims.remove(&self.session);
+        }
+    }
+}
+
+/// Whether `vm`'s agent takes the host's claim numbers (`guest::attach_line`), asked once, by `at`. The probe
+/// attaches nothing: a newer agent finds its offset bad, an older one the whole request (`BAD_SESSION_REQUEST`).
+fn fenced(vm: &Vm, at: Instant) -> Result<bool> {
+    match vm.fenced.load(Ordering::SeqCst) {
+        1 => return Ok(true),
+        2 => return Ok(false),
+        _ => {}
+    }
+    let (mut g, id) = vm.exec_by(at, |s| guest::request_by(s, "ATTACH flexvm-claim-probe x 0", at))?;
+    let reply = guest::read_frame(&mut crate::util::By { s: &mut g, at });
+    vm.untrack_exec(id);
+    let fenced = probed(reply?)?;
+    vm.fenced.store(if fenced { 1 } else { 2 }, Ordering::SeqCst);
+    Ok(fenced)
+}
+
+/// The probe's answer: whether the agent took the claim's form (a busy one's refusal is passed on, to try again).
+fn probed(reply: Option<(u8, Vec<u8>)>) -> Result<bool> {
+    match reply {
+        Some((guest::FRAME_MSG, m)) => {
+            let m = String::from_utf8_lossy(&m);
+            if guest::transient(&m) {
+                bail!("{m}");
+            }
+            Ok(!m.contains(guest::BAD_SESSION_REQUEST))
+        }
+        other => bail!("asking the agent for claim numbers: {:?}", other.map(|(kind, _)| kind)),
+    }
+}
+
+/// One try at attaching session `id` again from `offset` for claim `claim`, by `at` (#1074): `open` sends a
+/// request line and returns its connection. A `REJOIN` if the agent takes claim numbers (`fenced`); one that turns
+/// out older after all (it refuses the form) is told `old`, and sent the plain ATTACH. Its id echo read, the agent
+/// has attached it; its refusal for a newer claim is an error, as another client's.
+fn reattach(
+    open: &dyn Fn(&str) -> Result<BufReader<UnixStream>>,
+    fenced: &dyn Fn() -> Result<bool>,
+    old: &dyn Fn(),
+    id: &str,
+    offset: u64,
+    claim: u64,
+    at: Instant,
+) -> Result<BufReader<UnixStream>> {
+    let mut numbered = fenced()?;
+    loop {
+        let mut g = open(&guest::attach_line(id, offset, numbered.then_some(claim), true)?)?;
+        match guest::read_frame(&mut crate::util::By { s: &mut g, at })? {
+            Some((guest::FRAME_MSG, m)) if m == id.as_bytes() => return Ok(g),
+            Some((guest::FRAME_MSG, m)) if numbered && String::from_utf8_lossy(&m).contains(guest::BAD_SESSION_REQUEST) => {
+                old();
+                numbered = false;
+            }
+            Some((guest::FRAME_MSG, m)) if String::from_utf8_lossy(&m).contains(guest::ATTACHED_SINCE) => {
+                bail!("another client attached to the session")
+            }
+            other => bail!("attaching again: {:?}", other.map(|(kind, m)| (kind, String::from_utf8_lossy(&m).into_owned()))),
         }
     }
 }
@@ -1891,11 +1985,19 @@ impl Proc {
         let session = req["session"].as_str().unwrap_or_default();
         // The guest serves the newest attachment only: an older relay waiting for its client gives way.
         let claim = (action != "close").then(|| Claim::new(session));
-        let started = vm.exec(|s| {
-            let cmd = if matches!(action, "start" | "argv") { guest::command_body(&req["cmd"])? } else { String::new() };
-            let id = req["session"].as_str().ok_or("missing session id")?;
-            guest::session(s, action, id, req["offset"].as_u64().unwrap_or(0), &cmd, guest::TIMEOUT)
-        });
+        let started = match (action, &claim) {
+            // With its claim's number where the agent takes one: a relay's later REJOIN under an older claim is
+            // then refused rather than shut this attachment down (#1074).
+            ("attach", Some(claim)) => fenced(vm, Instant::now() + guest::TIMEOUT).and_then(|fenced| {
+                let line = guest::attach_line(session, req["offset"].as_u64().unwrap_or(0), fenced.then_some(claim.n), false)?;
+                vm.exec(|s| guest::request_on(s, &line, guest::TIMEOUT))
+            }),
+            _ => vm.exec(|s| {
+                let cmd = if matches!(action, "start" | "argv") { guest::command_body(&req["cmd"])? } else { String::new() };
+                let id = req["session"].as_str().ok_or("missing session id")?;
+                guest::session(s, action, id, req["offset"].as_u64().unwrap_or(0), &cmd, guest::TIMEOUT)
+            }),
+        };
         let (mut g, id) = match started {
             Ok(g) => g,
             Err(e) => {
@@ -1927,21 +2029,30 @@ impl Proc {
             let exited = || drop(relaying.take());
             let (cut, replaced) = (|| !vm.tracked(track.get()), || claim.as_ref().is_some_and(|c| !c.current()));
             // After a checkpoint: once the VM runs again, attached again in place of the cut connection.
-            let attach = |at: u64| -> Result<Option<(BufReader<UnixStream>, std::os::fd::RawFd)>> {
-                let (mut g, id) = match vm.exec(|s| guest::session(s, "attach", session, at, "", guest::TIMEOUT)) {
-                    Ok(g) => g,
-                    Err(e) if guest::transient(&e.to_string()) => return Ok(None),
-                    Err(e) => return Err(e),
+            // Under the claim's lock, to its echo (the guest attached it), all of it by one deadline: a newer client's
+            // claim waits for it. An agent that takes claim numbers also refuses it once a newer claim attached, even
+            // should it come late (#1074). Replaced meanwhile, it sends none (None: `rejoin_guest` then sees `replaced`).
+            let attach_again = |claim: &Claim, from: u64| -> Result<Option<(BufReader<UnixStream>, std::os::fd::RawFd)>> {
+                let at = Instant::now() + guest::TIMEOUT;
+                let open = |line: &str| -> Result<BufReader<UnixStream>> {
+                    let (g, id) = vm.exec_by(at, |s| guest::request_by(s, line, at))?;
+                    vm.untrack_exec(track.replace(id));
+                    Ok(g)
                 };
-                vm.untrack_exec(track.replace(id));
-                g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
-                match guest::read_frame(&mut g)? {
-                    Some((guest::FRAME_MSG, m)) if m == session.as_bytes() => {
+                let old = || vm.fenced.store(2, Ordering::SeqCst);
+                match reattach(&open, &|| fenced(vm, at), &old, session, from, claim.n, at) {
+                    Ok(g) => {
+                        g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
                         let fd = g.get_ref().as_raw_fd();
                         Ok(Some((g, fd)))
                     }
-                    other => bail!("attaching again: {:?}", other.map(|(kind, m)| (kind, String::from_utf8_lossy(&m).into_owned()))),
+                    Err(e) if guest::transient(&e.to_string()) => Ok(None),
+                    Err(e) => Err(e),
                 }
+            };
+            let attach = |from: u64| -> Result<Option<(BufReader<UnixStream>, std::os::fd::RawFd)>> {
+                let claim = claim.as_ref().ok_or("no claim")?;
+                claim.while_current(|| attach_again(claim, from)).unwrap_or(Ok(None))
             };
             let from = if action == "attach" { req["offset"].as_u64().unwrap_or(0) } else { 0 };
             let rejoin = Rejoin { id: session, from, attach: &attach };
@@ -6054,5 +6165,170 @@ mod session_relay_tests {
         replaced.store(true, Ordering::SeqCst);
         let err = worker.join_within().unwrap().unwrap_err();
         assert!(err.contains("another client"), "{err}");
+    }
+
+    /// A relay with no guest connection left to watch (a cut found the exit among what it still held) yet
+    /// stalled on its client still sees another client take the session over (#1074).
+    #[test]
+    fn a_relay_with_its_exit_buffered_sees_a_takeover() {
+        let (relay, _client) = UnixStream::pair().unwrap();
+        let (polls, replaced) = (Arc::new(AtomicUsize::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let (p, r) = (polls.clone(), replaced.clone());
+        let worker = thread::spawn(move || {
+            let is_replaced = || r.load(Ordering::SeqCst);
+            // `guest` -1: what `relay_session` sets once all the session will send is in `pending`.
+            let wait = Wait { replaced: &is_replaced, polls: Some(&p), ..idle() };
+            relay_output(&relay, &vec![b'x'; 8 * 1024 * 1024], &wait).map_err(|e| e.to_string())
+        });
+        reach(&polls, 1);
+        assert!(!worker.is_finished(), "the relay stopped waiting for its client");
+        replaced.store(true, Ordering::SeqCst);
+        let err = worker.join_within().unwrap().unwrap_err();
+        assert!(err.contains("another client"), "{err}");
+    }
+
+    /// A newer client claiming the session while an older relay attaches again waits for that ATTACH to be
+    /// done, so its own ATTACH is the guest's last; the older relay attaches no more after (#1074).
+    #[test]
+    fn a_newer_claim_waits_for_an_older_relays_attach() {
+        let first = Claim::new("interleaved-attach");
+        // The guest's attachment: whoever's ATTACH came last.
+        let owner = Arc::new(Mutex::new("none"));
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (o, c) = (owner.clone(), claimed.clone());
+        let newer = thread::spawn(move || {
+            entered.recv().unwrap();
+            let second = Claim::new("interleaved-attach");
+            c.store(true, Ordering::SeqCst);
+            // Its ATTACH, once claimed.
+            *o.lock().unwrap() = "second";
+            second
+        });
+        let (client, _peer) = UnixStream::pair().unwrap();
+        let (old, _agent) = UnixStream::pair().unwrap();
+        let mut guest = BufReader::new(old);
+        let (fresh, _agent2) = UnixStream::pair().unwrap();
+        let fresh = Mutex::new(Some(fresh));
+        let attaches = AtomicUsize::new(0);
+        let attach = |_: u64| -> Result<Option<(BufReader<UnixStream>, std::os::fd::RawFd)>> {
+            first
+                .while_current(|| {
+                    attaches.fetch_add(1, Ordering::SeqCst);
+                    // The newer client claims between this relay's ownership check and its ATTACH.
+                    entered_tx.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(200));
+                    assert!(!claimed.load(Ordering::SeqCst), "a newer claim was made during the ATTACH");
+                    *owner.lock().unwrap() = "first";
+                    let g = fresh.lock().unwrap().take().unwrap();
+                    let fd = g.as_raw_fd();
+                    Ok(Some((BufReader::new(g), fd)))
+                })
+                .unwrap_or(Ok(None))
+        };
+        let rejoin = Rejoin { id: "sid", from: 0, attach: &attach };
+        let replaced = || !first.current();
+        let wait = Wait { replaced: &replaced, ..idle() };
+        rejoin_guest(&mut guest, &client, &wait, &rejoin, 0).unwrap();
+        let second = newer.join_within().unwrap();
+        assert_eq!(*owner.lock().unwrap(), "second", "the older relay's ATTACH came last");
+        assert!(second.current() && !first.current());
+        // Cut again, it no longer attaches.
+        let err = rejoin_guest(&mut guest, &client, &wait, &rejoin, 0).unwrap_err();
+        assert!(err.to_string().contains("another client"), "{err}");
+        assert_eq!(attaches.load(Ordering::SeqCst), 1);
+        // Nor would a check that raced the newer claim: under the lock it sees the claim.
+        assert!(first.while_current(|| ()).is_none());
+        drop((first, second));
+        assert!(!CLAIMS.lock().unwrap().contains_key("interleaved-attach"), "ended claims leave no entry");
+    }
+
+    /// A fake agent's connection: the request line `open` sent is kept, and `reply` is sent back after the OK line,
+    /// a byte every `pace` if given (a guest trickling its answer).
+    fn agent_reply(lines: &Mutex<Vec<String>>, line: &str, reply: Vec<u8>, pace: Option<Duration>) -> Result<BufReader<UnixStream>> {
+        lines.lock().unwrap().push(line.to_string());
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let bytes = [b"OK 1\n".to_vec(), reply].concat();
+        thread::spawn(move || match pace {
+            None => drop(theirs.write_all(&bytes)),
+            Some(pace) => {
+                for b in bytes {
+                    if theirs.write_all(&[b]).is_err() {
+                        return;
+                    }
+                    thread::sleep(pace);
+                }
+            }
+        });
+        guest::request_by(ours, line, Instant::now() + WAIT)
+    }
+
+    /// Attaching again sends a REJOIN with the claim's number to an agent that takes one, falls back to the plain
+    /// ATTACH for one that turns out older, and takes the agent's refusal for a newer claim as a takeover (#1074).
+    #[test]
+    fn attaching_again_is_fenced_by_the_claim() {
+        let lines = Mutex::new(vec![]);
+        let echo = guest::frame(guest::FRAME_MSG, &[b"sid"]);
+        let at = Instant::now() + WAIT;
+        let (yes, no) = (|| -> Result<bool> { Ok(true) }, || -> Result<bool> { Ok(false) });
+        let olds = AtomicUsize::new(0);
+        let old = || {
+            olds.fetch_add(1, Ordering::SeqCst);
+        };
+        let open = |line: &str| agent_reply(&lines, line, echo.clone(), None);
+        reattach(&open, &yes, &old, "sid", 5, 3, at).unwrap();
+        reattach(&open, &no, &old, "sid", 5, 3, at).unwrap();
+        assert_eq!(*lines.lock().unwrap(), ["REJOIN sid 5 3", "ATTACH sid 5"]);
+        // An older agent than it seemed refuses the form: told so, then sent the plain one.
+        lines.lock().unwrap().clear();
+        let bad = guest::frame(guest::FRAME_MSG, &[format!("error: {}", guest::BAD_SESSION_REQUEST).as_bytes()]);
+        let open = |line: &str| agent_reply(&lines, line, if line.starts_with("REJOIN") { bad.clone() } else { echo.clone() }, None);
+        reattach(&open, &yes, &old, "sid", 5, 3, at).unwrap();
+        assert_eq!((&*lines.lock().unwrap(), olds.load(Ordering::SeqCst)), (&vec!["REJOIN sid 5 3".to_string(), "ATTACH sid 5".to_string()], 1));
+        // A newer claim attached first: refused, nothing more sent.
+        lines.lock().unwrap().clear();
+        let since = guest::frame(guest::FRAME_MSG, &[format!("error: {}", guest::ATTACHED_SINCE).as_bytes()]);
+        let open = |line: &str| agent_reply(&lines, line, since.clone(), None);
+        let err = reattach(&open, &yes, &old, "sid", 5, 3, at).err().unwrap();
+        assert!(err.to_string().contains("another client"), "{err}");
+        assert_eq!(lines.lock().unwrap().len(), 1);
+    }
+
+    /// The whole of attaching again keeps to one deadline, however slowly the guest trickles its answer: a newer
+    /// client waiting on the claim's lock waits no longer than that (#1074 review).
+    #[test]
+    fn attaching_again_keeps_to_its_deadline() {
+        let lines = Mutex::new(vec![]);
+        let echo = guest::frame(guest::FRAME_MSG, &[b"sid"]);
+        // Each byte well within any one read's timeout; all of them far past the deadline.
+        let open = |line: &str| agent_reply(&lines, line, echo.clone(), Some(Duration::from_millis(100)));
+        let t = Instant::now();
+        let err = reattach(&open, &|| Ok(true), &|| (), "sid", 0, 1, t + Duration::from_millis(400)).err().unwrap();
+        assert!(t.elapsed() < Duration::from_millis(900), "{err} after {:?}", t.elapsed());
+        // The OK line alone, too.
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let trickle = thread::spawn(move || {
+            for b in b"OK 1\n" {
+                thread::sleep(Duration::from_millis(150));
+                if theirs.write_all(&[*b]).is_err() {
+                    return;
+                }
+            }
+        });
+        let t = Instant::now();
+        assert!(guest::request_by(ours, "ATTACH sid 0", t + Duration::from_millis(300)).is_err());
+        assert!(t.elapsed() < Duration::from_millis(700), "{:?}", t.elapsed());
+        trickle.join().unwrap();
+    }
+
+    /// An agent's answer to the claim probe: a newer one's (a bad offset), an older one's, a busy one's.
+    #[test]
+    fn the_claim_probe_tells_older_agents() {
+        let msg = |m: &str| Some((guest::FRAME_MSG, m.as_bytes().to_vec()));
+        assert!(probed(msg("error: bad offset")).unwrap());
+        assert!(!probed(msg(&format!("error: {}", guest::BAD_SESSION_REQUEST))).unwrap());
+        let busy = probed(msg(&format!("error: busy{}", guest::TRY_AGAIN))).unwrap_err();
+        assert!(guest::transient(&busy.to_string()), "{busy}");
+        assert!(probed(None).is_err());
     }
 }

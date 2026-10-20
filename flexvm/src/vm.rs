@@ -137,6 +137,9 @@ pub struct Vm {
     /// A failed clock request may still reach the guest: `leave` waits it out.
     clock_unsure: AtomicBool,
     next_exec: AtomicU64,
+    /// Whether its agent takes the host's claim numbers on ATTACH and REJOIN (#1074): 0 not known yet, 1 it
+    /// does, 2 it is older (`vmproc::fenced`).
+    pub(crate) fenced: std::sync::atomic::AtomicU8,
     fc: Mutex<Option<Firecracker>>,
     /// Its Firecracker's (pid) tap descriptor, copied (`tap_watch`).
     tap_watch: Mutex<Option<(u32, Arc<OwnedFd>)>>,
@@ -952,8 +955,17 @@ impl Vm {
 
     /// Registers the session (so a checkpoint can close it) before `start` talks to the guest.
     pub fn exec(&self, start: impl FnOnce(UnixStream) -> Result<BufReader<UnixStream>>) -> Result<(BufReader<UnixStream>, u64)> {
+        self.exec_by(Instant::now() + crate::guest::TIMEOUT, start)
+    }
+
+    /// `exec`, connecting by `at`; `start` keeps to it too (`guest::request_by`).
+    pub fn exec_by(&self, at: Instant, start: impl FnOnce(UnixStream) -> Result<BufReader<UnixStream>>) -> Result<(BufReader<UnixStream>, u64)> {
         self.running_here()?;
-        let s = crate::util::connect_unix(&self.vsock, crate::guest::TIMEOUT)?;
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("vm {}: the guest took too long to answer", self.name);
+        }
+        let s = crate::util::connect_unix(&self.vsock, left)?;
         let id = self.track(&s)?;
         let g = start(s).and_then(|g| crate::guest::untimed(&g).map(|()| g)).inspect_err(|_| self.untrack_exec(id))?;
         Ok((g, id))
@@ -1215,6 +1227,7 @@ impl Prepared {
             devices: Mutex::new(()),
             clock_unsure: AtomicBool::new(false),
             next_exec: AtomicU64::new(0),
+            fenced: std::sync::atomic::AtomicU8::new(0),
             vsock: idle.sockets.vsock.clone(),
             fc: Mutex::new(Some(idle)),
             tap_watch: Mutex::new(None),

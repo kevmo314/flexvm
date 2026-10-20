@@ -1,5 +1,5 @@
 //! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ARGV <id> <len>` (its argv and options, NUL-separated fields), `ATTACH <id> <offset>`,
-//! `CLOSE <id>`, `RELEASE <id> <end> <code>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
+//! `ATTACH <id> <offset> <claim>` and `REJOIN <id> <offset> <claim>` (the host's claim fence, #1074), `CLOSE <id>`, `RELEASE <id> <end> <code>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
 //! After an exit, the client may send SESSION_DONE on the attachment, within `ACK_WAIT`, to release the
 //! session; without that acknowledgement the exit stays available for reattachment. A late one the host passes
 //! on as `RELEASE`, which closes only the session that exited with that code after `end` bytes and has not been
@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use crate::input::{feed, Fed, Stdin};
 use crate::proto::{
-    frame, valid_session_id, FRAME_ACK, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, MAX_DETACHED, MAX_LIVE, SESSION_DONE,
-    TOO_MANY_DETACHED, TOO_MANY_SESSIONS,
+    frame, valid_session_id, ATTACHED_SINCE, BAD_SESSION_REQUEST, FRAME_ACK, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY,
+    MAX_DETACHED, MAX_LIVE, SESSION_DONE, TOO_MANY_DETACHED, TOO_MANY_SESSIONS,
 };
 use crate::{fail, kill_running, msg, spawn_watched, wait_exit, Statuses};
 
@@ -384,6 +384,9 @@ pub(crate) struct Output {
     closed: bool,
     attached: Option<Attachment>,
     attachments: u64,
+    /// The host's claim number of the newest attachment (`ATTACH`'s, `REJOIN`'s; 0 when it gave none): a
+    /// `REJOIN` with a lower one is refused (`ATTACHED_SINCE`, #1074).
+    claim: u64,
     /// The attachment's cursor: everything before it has been sent.
     sent: u64,
     /// When it was detached, on the awake clock.
@@ -456,9 +459,13 @@ pub enum Request<'a> {
         len: usize,
         argv: bool,
     },
+    /// `claim`: the host's number for the attachment, None from an older host. `rejoin`: only if no attachment
+    /// with a higher number came since (a relay attaching again after a checkpoint cut it, #1074).
     Attach {
         id: &'a str,
         offset: u64,
+        claim: Option<u64>,
+        rejoin: bool,
     },
     Close {
         id: &'a str,
@@ -472,6 +479,10 @@ pub enum Request<'a> {
     },
 }
 
+fn number(s: &str, bad: &str) -> io::Result<u64> {
+    s.parse().map_err(|_| io::Error::other(bad.to_string()))
+}
+
 pub fn parse(line: &str) -> io::Result<Request<'_>> {
     let parts: Vec<_> = line.split_whitespace().collect();
     let id = parts.get(1).copied().unwrap_or("");
@@ -483,13 +494,16 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
             Ok(len) if len <= MAX_BODY => Ok(Request::Start { id, len, argv: *verb == "ARGV" }),
             _ => Err(io::Error::other("bad command length")),
         },
-        ["ATTACH", _, offset] => Ok(Request::Attach { id, offset: offset.parse().map_err(|_| io::Error::other("bad offset"))? }),
+        ["ATTACH", _, offset] => Ok(Request::Attach { id, offset: number(offset, "bad offset")?, claim: None, rejoin: false }),
+        [verb @ ("ATTACH" | "REJOIN"), _, offset, claim] => {
+            Ok(Request::Attach { id, offset: number(offset, "bad offset")?, claim: Some(number(claim, "bad claim")?), rejoin: *verb == "REJOIN" })
+        }
         ["CLOSE", _] => Ok(Request::Close { id }),
         ["RELEASE", _, end, code] => match (end.parse(), code.parse()) {
             (Ok(end), Ok(code)) => Ok(Request::Release { id, end, code }),
             _ => Err(io::Error::other("bad release")),
         },
-        _ => Err(io::Error::other("bad session request")),
+        _ => Err(io::Error::other(BAD_SESSION_REQUEST)),
     }
 }
 
@@ -710,12 +724,12 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             let _ = tx.send((streams, exited, token));
             (id, 0, attached)
         }
-        Request::Attach { id, offset } => {
+        Request::Attach { id, offset, claim, rejoin } => {
             let table = sessions.lock().unwrap();
             if table.ended(id) {
                 return Err(gone());
             }
-            (id, offset, attach(&table.live.get(id).ok_or_else(unknown)?.output, offset, conn))
+            (id, offset, attach_claimed(&table.live.get(id).ok_or_else(unknown)?.output, offset, conn, claim.unwrap_or(0), rejoin)?)
         }
         Request::Close { id } => {
             let mut table = sessions.lock().unwrap();
@@ -748,10 +762,20 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
 
 /// Makes `conn` the only attachment, streaming from `offset`; shuts down the one it replaces.
 fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
+    attach_claimed(output, offset, conn, 0, false).expect("only a rejoin is refused")
+}
+
+/// `attach` with the host's claim number for it; a `rejoin` is refused once a newer claim attached, which it would
+/// shut down: a relay's REJOIN delayed past a newer client's ATTACH (#1074).
+fn attach_claimed(output: &Session, offset: u64, conn: Option<File>, claim: u64, rejoin: bool) -> io::Result<Attached> {
     let mut ring = output.0.lock().unwrap();
-    if ring.detached {
-        return (output.clone(), 0);
+    if rejoin && ring.claim > claim {
+        return Err(io::Error::other(ATTACHED_SINCE));
     }
+    if ring.detached {
+        return Ok((output.clone(), 0));
+    }
+    ring.claim = claim;
     ring.attachments += 1;
     let id = ring.attachments;
     let previous = ring.attached.replace(Attachment { id, conn });
@@ -764,7 +788,7 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
     if let Some(conn) = previous.and_then(|p| p.conn) {
         unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
     }
-    (output.clone(), id)
+    Ok((output.clone(), id))
 }
 
 /// Feeds attachment `me`'s input frames to the session's stdin while it is the attachment. Detaching
@@ -1202,6 +1226,38 @@ mod tests {
             attach(&output, offset, None);
             assert_eq!(output.0.lock().unwrap().sent, expected);
         }
+    }
+
+    /// A REJOIN that comes after a newer claim's ATTACH (its relay's request delayed) is refused, leaving the
+    /// newer attachment's connection up; one for the newest claim, or after an older host's plain ATTACH, attaches (#1074).
+    #[test]
+    fn a_rejoin_older_than_the_attachment_is_refused() {
+        let output = session(Output::default());
+        let (newer, peer) = UnixStream::pair().unwrap();
+        attach_claimed(&output, 0, None, 3, true).unwrap();
+        let (_, me) = attach_claimed(&output, 0, Some(File::from(OwnedFd::from(newer))), 5, false).unwrap();
+        let err = attach_claimed(&output, 0, None, 3, true).err().unwrap();
+        assert_eq!(err.to_string(), ATTACHED_SINCE);
+        assert!(output.0.lock().unwrap().attached.as_ref().is_some_and(|a| a.id == me));
+        // Not shut down: a write still reaches its peer.
+        (&peer).write_all(b"x").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        assert_ne!((&peer).read(&mut [0]).map_err(|e| e.kind()), Ok(0), "the newer attachment was shut down");
+        // A fresh ATTACH is never refused, whatever its number (another host process's after a move).
+        attach_claimed(&output, 0, None, 1, false).unwrap();
+        attach_claimed(&output, 0, None, 1, true).unwrap();
+        attach_claimed(&output, 0, None, 9, true).unwrap();
+        // An older host's plain ATTACH carries none: a REJOIN after it attaches as before.
+        attach(&output, 0, None);
+        attach_claimed(&output, 0, None, 1, true).unwrap();
+        // Over the protocol: refused as an error message, as is a claim on an older agent's form.
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let output = live(&mut sessions.lock().unwrap(), "s", Output::default());
+        attach_claimed(&output, 0, None, 8, false).unwrap();
+        let refused = request(&sessions, &statuses, "REJOIN s 0 7", b"");
+        assert!(refused.ends_with(format!("error: {ATTACHED_SINCE}").as_bytes()), "{:?}", String::from_utf8_lossy(&refused));
+        // What the host probes an agent with: a newer one finds the offset bad, an older one the whole request.
+        assert!(request(&sessions, &statuses, "ATTACH s x 0", b"").ends_with(b"error: bad offset"));
     }
 
     #[test]
@@ -2014,7 +2070,9 @@ mod tests {
     #[test]
     fn requests() {
         assert!(matches!(parse("SESSION abc 3\n").unwrap(), Request::Start { id: "abc", len: 3, argv: false }));
-        assert!(matches!(parse("ATTACH abc 42").unwrap(), Request::Attach { offset: 42, .. }));
+        assert!(matches!(parse("ATTACH abc 42").unwrap(), Request::Attach { offset: 42, claim: None, rejoin: false, .. }));
+        assert!(matches!(parse("ATTACH abc 42 7").unwrap(), Request::Attach { offset: 42, claim: Some(7), rejoin: false, .. }));
+        assert!(matches!(parse("REJOIN abc 42 7").unwrap(), Request::Attach { offset: 42, claim: Some(7), rejoin: true, .. }));
         assert!(matches!(parse("CLOSE abc").unwrap(), Request::Close { .. }));
         assert!(matches!(parse("RELEASE abc 7 -1").unwrap(), Request::Release { id: "abc", end: 7, code: -1 }));
         for bad in [
@@ -2027,6 +2085,9 @@ mod tests {
             "SESSION abc 1048577",
             "ATTACH abc -1",
             "ATTACH abc 1 extra",
+            "ATTACH abc 1 2 3",
+            "REJOIN abc 1",
+            "REJOIN abc x 1",
             "CLOSE",
             "CLOSE a/b",
             "EXEC 3",
