@@ -7373,7 +7373,7 @@ def forged_peer():
     # #914: B hands out its own addresses' generations, so none it never handed out arrives.
     s, r, _ = migrate_in_raw(B, n, ip, tid, gen=addr(B, ip).get("seen", 0) + 10)
     s.close()
-    check("forged gen: a newer one than B handed out is refused", not r.get("ok") and "never handed out here" in r.get("error", ""), r)
+    check("forged gen: a newer one than B handed out is refused", not r.get("ok") and "is this host's to hand out" in r.get("error", ""), r)
     nothing_left("forged gen", n, ip)
     # An address in the cluster range no host hands out: a newer generation is taken, an older one then refused.
     n2, away = "ft-forged-gen-away", A.ips.split("-")[1].rsplit(".", 1)[0] + ".206"

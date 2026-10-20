@@ -599,10 +599,12 @@ generation: it migrated on) or a newer generation. A peer announces routes
 via its own addresses only (its `peers` address, or its `peer_underlays`),
 never via another host. While a VM here holds an address, no peer brings a
 newer generation of it, and only the host it is migrating to moves or
-withdraws its generation; for an address of this host's own `vm_ips`, which
-only this host hands out, no peer brings a newer generation while it is lent
-from here, nor one this host never handed out (a VM arriving with one is
-refused too). A refused update is retried by its sender, so one that comes
+withdraws its generation (a VM arriving here, once it commits: only the host
+it came from, until its pull is done); for an address of this host's own
+`vm_ips`, which only this host hands out, no peer brings a newer generation
+while it is lent from here, nor one this host never handed out (since a
+reboot, none newer than its record here; a VM arriving with one is refused
+too). A refused update is retried by its sender, so one that comes
 before the withdrawal it follows is taken once that has. The hosts must list each
 other in `peers` (each peer's listen address): a listener serves its peers'
 addresses only, and tells any other it is not a peer. A reported route next
