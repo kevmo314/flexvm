@@ -227,7 +227,7 @@ fn hide(fd: RawFd, name: &CStr, layer: &mut Layer, depth: u32) -> Result<()> {
     }
 }
 
-struct At {
+pub(super) struct At {
     dir: OwnedFd,
     name: CString,
 }
@@ -387,6 +387,13 @@ impl Root {
         Ok(())
     }
 
+    fn create<T>(&mut self, make: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.check_entry_limit()?;
+        let made = make()?;
+        self.entries += 1;
+        Ok(made)
+    }
+
     fn openat2(&self, rel: &[u8], flags: i32) -> io::Result<OwnedFd> {
         let path = CString::new(if rel.is_empty() { b".".as_slice() } else { rel }).map_err(|_| io::Error::other("NUL in path"))?;
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
@@ -539,10 +546,10 @@ impl Root {
         match kind {
             T::Directory => {
                 if !is_type(dfd, &at.name, libc::S_IFDIR) {
-                    self.check_entry_limit()?;
-                    at.remove()?;
-                    check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", rel)?;
-                    self.entries += 1;
+                    self.create(|| {
+                        at.remove()?;
+                        check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", rel)
+                    })?;
                 }
             }
             T::Regular | T::Continuous => {
@@ -552,39 +559,37 @@ impl Root {
                 if e.size() > self.limits.unpacked - self.unpacked {
                     bail!("image exceeds the unpacked size limit (--max-unpacked-mib)");
                 }
-                self.check_entry_limit()?;
                 // No bigger than the file: most are small, and a 256 KiB buffer each would be an mmap.
-                let mut file = BufWriter::with_capacity((e.size() as usize).min(256 << 10), at.create()?);
-                self.entries += 1;
+                let mut file = self.create(|| Ok(BufWriter::with_capacity((e.size() as usize).min(256 << 10), at.create()?)))?;
                 io::copy(e, &mut file).and_then(|_| file.flush()).map_err(|err| format!("write {rel:?}: {err}"))?;
             }
             T::Symlink => {
                 let target = m.link.as_ref().ok_or("symlink without target")?;
-                self.check_entry_limit()?;
-                at.remove()?;
-                check(unsafe { libc::symlinkat(cpath(target)?.as_ptr(), dfd, name) }, "symlink", rel)?;
-                self.entries += 1;
+                self.create(|| {
+                    at.remove()?;
+                    check(unsafe { libc::symlinkat(cpath(target)?.as_ptr(), dfd, name) }, "symlink", rel)
+                })?;
             }
             T::Link => {
                 let src = src.unwrap();
-                self.check_entry_limit()?;
-                at.remove()?;
-                check(unsafe { libc::linkat(src.dir.as_raw_fd(), src.name.as_ptr(), dfd, name, 0) }, "link", rel)?;
+                self.create(|| {
+                    at.remove()?;
+                    check(unsafe { libc::linkat(src.dir.as_raw_fd(), src.name.as_ptr(), dfd, name, 0) }, "link", rel)
+                })?;
                 // A hard link shares its target's inode and metadata.
-                self.entries += 1;
                 return Ok(at);
             }
             T::Char | T::Block | T::Fifo => {
-                self.check_entry_limit()?;
-                at.remove()?;
-                let fmt = match kind {
-                    T::Char => libc::S_IFCHR,
-                    T::Block => libc::S_IFBLK,
-                    _ => libc::S_IFIFO,
-                };
-                let dev = libc::makedev(h.device_major()?.unwrap_or(0), h.device_minor()?.unwrap_or(0));
-                check(unsafe { libc::mknodat(dfd, name, fmt | 0o600, dev) }, "mknod", rel)?;
-                self.entries += 1;
+                self.create(|| {
+                    at.remove()?;
+                    let fmt = match kind {
+                        T::Char => libc::S_IFCHR,
+                        T::Block => libc::S_IFBLK,
+                        _ => libc::S_IFIFO,
+                    };
+                    let dev = libc::makedev(h.device_major()?.unwrap_or(0), h.device_minor()?.unwrap_or(0));
+                    check(unsafe { libc::mknodat(dfd, name, fmt | 0o600, dev) }, "mknod", rel)
+                })?;
             }
             other => bail!("unsupported tar entry type {other:?} at {rel:?}"),
         }
@@ -623,22 +628,19 @@ impl Root {
         Ok(())
     }
 
-    pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
+    pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<At> {
         let at = self.at(Path::new(rel), true)?;
         if stat_at(at.dir.as_raw_fd(), &at.name).is_none() {
-            self.check_entry_limit()?;
             let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
-            check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", Path::new(rel))?;
-            self.entries += 1;
+            self.create(|| check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", Path::new(rel)))?;
             check(unsafe { libc::fchmodat(dfd, name, mode, 0) }, "chmod", Path::new(rel))?;
         }
-        Ok(())
+        Ok(at)
     }
 
     /// An injected config directory must not retain an image user's ownership or write access.
     pub fn secure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
-        self.ensure_dir(rel, mode)?;
-        let at = self.at(Path::new(rel), true)?;
+        let at = self.ensure_dir(rel, mode)?;
         let dir = open_dir_at(at.dir.as_raw_fd(), &at.name)?;
         own(&dir, Path::new(rel))?;
         check(unsafe { libc::fchmod(dir.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
@@ -647,9 +649,7 @@ impl Root {
 
     pub fn write_file(&mut self, rel: &str, data: &[u8], mode: u32) -> Result<()> {
         let at = self.at(Path::new(rel), true)?;
-        self.check_entry_limit()?;
-        let mut f = at.create()?;
-        self.entries += 1;
+        let mut f = self.create(|| at.create())?;
         f.write_all(data)?;
         own(&f, Path::new(rel))?;
         check(unsafe { libc::fchmod(f.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
