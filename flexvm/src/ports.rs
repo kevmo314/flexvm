@@ -1537,6 +1537,16 @@ mod tests {
         CLOCK.with(|c| *c.borrow_mut() = None);
     }
 
+    /// Until all `s` sent is acknowledged: a reset discards what its kernel still holds (a small write
+    /// Nagle keeps back behind an unacknowledged byte, say), which no proxy could relay.
+    fn acknowledged(s: &TcpStream) {
+        wait_until("what was sent to be acknowledged", || {
+            let mut queued: libc::c_int = 0;
+            assert_eq!(unsafe { libc::ioctl(s.as_raw_fd(), libc::TIOCOUTQ, &mut queued) }, 0);
+            queued == 0
+        });
+    }
+
     #[test]
     fn what_arrives_before_a_reset_is_still_relayed_both_ways() {
         let (addr, guest, worker) = worker(4, IDLE);
@@ -1549,6 +1559,7 @@ mod tests {
             server.set_read_timeout(Some(WAIT)).unwrap();
             echo(&mut client, &mut server);
             server.write_all(&reply).unwrap();
+            acknowledged(&server);
             reset(server);
             let mut got = Vec::new();
             let _ = client.read_to_end(&mut got);
@@ -1558,6 +1569,7 @@ mod tests {
             let (mut server, _) = crate::test_util::accept_tcp(&guest);
             server.set_read_timeout(Some(WAIT)).unwrap();
             client.write_all(&reply).unwrap();
+            acknowledged(&client);
             reset(client);
             let mut got = Vec::new();
             let _ = server.read_to_end(&mut got);
@@ -1593,11 +1605,7 @@ mod tests {
             echo(&mut client, &mut server);
             let reply: Vec<u8> = (0..len).map(|i| i as u8).collect();
             server.write_all(&reply).unwrap();
-            wait_until("the proxy to take the whole reply", || {
-                let mut queued: libc::c_int = 0;
-                assert_eq!(unsafe { libc::ioctl(server.as_raw_fd(), libc::TIOCOUTQ, &mut queued) }, 0);
-                queued == 0
-            });
+            acknowledged(&server);
             reset(server);
             thread::sleep(Duration::from_millis(50));
             // A request the reset guest cannot take: that direction ends, the reply still goes out.
