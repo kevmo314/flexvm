@@ -60,7 +60,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      IP: IPv4 or [IPv6]; IPv4 alone if IPv6 is unavailable
       --ip IP                        its address (without: the next free one)
       --cpus N                       cap its CPU time at N CPUs (1.5: one and a half); its vCPUs are IMAGE's
-      --memory SIZE                  cap its memory growth (512m, 2g; plain bytes, as docker): from IMAGE's
+      -m, --memory SIZE              cap its memory growth (512m, 2g; plain bytes, as docker): from IMAGE's
                                      boot memory plus what its snapshot plugged, up to its ceiling
       -e, --env K=V                  set an environment variable of IMAGE's app (again for more; a bare K
                                      takes this one's); --env-file FILE: docker's KEY=VALUE lines
@@ -72,18 +72,19 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --checkpoint NAME|ID           start it from a stored checkpoint instead of IMAGE (its name and
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
-  flexvm ps [-a] [-q] [--json] [--filter KEY=VALUE]... [--format FORMAT]
+  flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
                                      list running VMs (-a: stopped ones too; -q: names only);
                                      --filter name=PART|status=STATE|image=IMAGE|ip=IP (a key again:
                                      either value; a status filter lists stopped VMs too);
                                      --format json (an object per line) or a template, as
                                      '{{.Name}}\t{{.IP}}' ('table ' first: with a header, aligned)
-  flexvm exec [OPTIONS] NAME CMD...  run argv in a VM (-d, -e K=V, -w DIR, -u USER[:GROUP]; -i: stdin
+  flexvm exec [OPTIONS] NAME CMD...  run argv in a VM (-d, -e K[=V], -w DIR, -u USER[:GROUP]; -i: stdin
                                      too; -t: on a pty, this terminal raw, Ctrl-P Ctrl-Q detaches)
   flexvm attach NAME                 a running VM's app: its output from now on, and stdin if run -i
   flexvm cp SRC DST                  copy files or directories between the host and a VM (NAME:PATH, as
                                      docker cp; - for a tar on stdin or stdout); into the VM as root
-  flexvm logs [-f] [--tail N] NAME   a VM's output (its log, the one before its last rotation first);
+  flexvm logs [-f] [-n, --tail N] NAME
+                                     a VM's output (its log, the one before its last rotation first);
                                      -f follows it, across rotations and restarts, until the VM exits or is removed
   flexvm inspect NAME...             a JSON array: per VM, what ps --json says and its config
   flexvm wait NAME...                wait until each VM's process ends, and print its exit status
@@ -218,6 +219,22 @@ fn is_flag(v: &str) -> bool {
         })
 }
 
+/// Short switches, with the command's meaning of overloaded letters.
+fn short_switch(flag: u8, cmd: Option<&str>) -> Option<&'static str> {
+    match flag {
+        b'd' => Some("detach"),
+        b'h' if cmd != Some("run") => Some("help"),
+        b'q' => Some("quiet"),
+        b'v' if cmd != Some("run") => Some("verbose"),
+        b'a' => Some(if cmd == Some("start") { "attach" } else { "all" }),
+        b'i' if matches!(cmd, Some("run" | "exec")) => Some("interactive"),
+        b't' if matches!(cmd, Some("run" | "exec")) => Some("tty"),
+        b'f' if matches!(cmd, Some("rm" | "image" | "system" | "checkpoint")) => Some("force"),
+        b'f' if cmd == Some("logs") => Some("follow"),
+        _ => None,
+    }
+}
+
 impl Args {
     #[cfg(test)]
     fn parse(it: impl IntoIterator<Item = String>) -> Result<Args> {
@@ -241,47 +258,35 @@ impl Args {
         let a = self;
         while let Some(mut arg) = it.next() {
             let cmd = a.positional.first().map(String::as_str);
-            // `-it`, `-dit` and `-itp 80:80`, as docker's: switches, then perhaps a valued flag.
-            let n = arg.bytes().skip(1).take_while(|b| b"dit".contains(b)).count();
-            if matches!(cmd, Some("run" | "exec"))
-                && arg.starts_with('-')
-                && n > 0
-                && (n > 1 && arg.len() == n + 1 || arg[n + 1..].starts_with(['p', 'e', 'u', 'w']))
-            {
-                for b in arg[1..=n].bytes() {
-                    let f = match b {
-                        b'd' => "detach",
-                        b'i' => "interactive",
-                        _ => "tty",
-                    };
-                    if b != b'd' {
+            // Short switches can be bundled, followed by a valued flag (`-aq`, `-itp 80:80`).
+            if arg.starts_with('-') && !arg.starts_with("--") {
+                let mut n = 0;
+                for b in arg.bytes().skip(1) {
+                    let Some(f) = short_switch(b, cmd) else { break };
+                    if f != "detach" {
                         a.child_args.push(format!("-{}", b as char));
                     }
                     a.flags.push((f.into(), "1".into()));
+                    n += 1;
                 }
-                if arg.len() == n + 1 {
-                    continue;
+                if n > 0 {
+                    if arg.len() == n + 1 {
+                        continue;
+                    }
+                    arg = format!("-{}", &arg[n + 1..]);
                 }
-                arg = format!("-{}", &arg[n + 1..]);
             }
-            if arg != "-d" && arg != "--detach" {
+            if arg != "--detach" {
                 a.child_args.push(arg.clone());
             }
-            let short = match arg.as_str() {
-                "-d" => Some("detach"),
-                "-h" => Some("help"),
-                "-q" => Some("quiet"),
-                // docker's volumes: SRC:DST would be taken as the image.
-                "-v" if cmd == Some("run") => bail!("volumes (-v) are not supported (#717); for verbose output, -v or --verbose goes before the command"),
-                "-v" => Some("verbose"),
-                "-a" => Some(if cmd == Some("start") { "attach" } else { "all" }),
-                "-i" if matches!(cmd, Some("run" | "exec")) => Some("interactive"),
-                "-t" if matches!(cmd, Some("run" | "exec")) => Some("tty"),
-                // Not reclaim's `--force GEN`.
-                "-f" if matches!(cmd, Some("rm" | "image" | "system" | "checkpoint")) => Some("force"),
-                "-f" if cmd == Some("logs") => Some("follow"),
-                _ => None,
-            };
+            // Docker's hostname and volumes must not silently become help or verbose output.
+            if cmd == Some("run") {
+                match arg.as_str() {
+                    "-h" => bail!("hostname (-h) is not supported; the hostname is the VM's name (--name); use --help for help"),
+                    "-v" => bail!("volumes (-v) are not supported (#717); for verbose output, -v or --verbose goes before the command"),
+                    _ => {}
+                }
+            }
             // Short flags with a value read as their long ones.
             let (option, attached) = if arg.starts_with("--") {
                 arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v)))
@@ -292,6 +297,9 @@ impl Args {
             };
             let valued = match option {
                 "-p" => Some("publish"),
+                "-m" if cmd == Some("run") => Some("memory"),
+                "-n" if cmd == Some("logs") => Some("tail"),
+                "-f" if cmd == Some("ps") => Some("filter"),
                 "-e" if matches!(cmd, Some("run" | "exec")) => Some("env"),
                 "-w" if cmd == Some("exec") => Some("workdir"),
                 "-u" if cmd == Some("exec") => Some("user"),
@@ -336,7 +344,6 @@ impl Args {
                     };
                     a.flags.push((f.into(), value));
                 }
-                None if short.is_some() => a.flags.push((short.unwrap_or_default().into(), "1".into())),
                 // `-` alone is a word: cp's stdin or stdout.
                 None if arg.starts_with('-') && arg != "-" => bail!("unknown option {arg} (see flexvm --help)"),
                 None => {
@@ -732,10 +739,7 @@ fn real_main(args: &Args) -> Result<()> {
         Some("restart") => {
             let host = open_host(args)?;
             each(args.names(), |n| {
-                // An exited VM has nothing to stop: `start` runs it again.
-                if host.alive(n) || !host.vms(n, "exited")?.exists() {
-                    stop(&host, n)?;
-                }
+                stop(&host, n)?;
                 match resume(&host, n)? {
                     true => output(format_args!("{n}\n")),
                     false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", "--", n]), &log_file(&host, n)?, false)?),
@@ -1107,6 +1111,17 @@ fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
     Ok(ports)
 }
 
+/// A bare `-e K` takes this environment's value, if present, for both run and exec.
+fn env_flags(args: &Args) -> Vec<String> {
+    args.all("env")
+        .into_iter()
+        .filter_map(|kv| match kv.contains('=') {
+            true => Some(kv),
+            false => std::env::var(&kv).ok().map(|v| format!("{kv}={v}")),
+        })
+        .collect()
+}
+
 /// `-e`, `--env-file`, `--entrypoint`, `--keep`, `--rm`, `-p` (and the `--ip` asked for, for a rerun).
 fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec> {
     let lookup = |k: &str| std::env::var(k).ok();
@@ -1116,12 +1131,7 @@ fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec>
         env.extend(app::parse_env_file(&text, lookup).map_err(|e| format!("--env-file {f}: {e}"))?);
     }
     // After the files, as docker: `-e` wins. A bare `K` is this environment's, if it has one.
-    for kv in args.all("env") {
-        match kv.contains('=') {
-            true => env.push(kv),
-            false => env.extend(lookup(&kv).map(|v| format!("{kv}={v}"))),
-        }
-    }
+    env.extend(env_flags(args));
     let (stdin, tty) = (args.has("interactive"), args.has("tty"));
     let entrypoint = match args.get("entrypoint") {
         Some(e) => Some(image::parse_argv(e)?),
@@ -1343,6 +1353,8 @@ fn not_running(host: &Host, name: &str) -> util::Error {
     match host.suspended(name).map(|d| d.exists()) {
         Ok(true) => format!("vm {name} is stopped: flexvm start {name}").into(),
         _ if host.has_record(name, "exited") => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
+        _ if host.has_record(name, "failed") => format!("vm {name} has failed: see flexvm ps -a; flexvm rm {name} clears it").into(),
+        _ if host.has_record(name, "lost") => format!("vm {name} is lost: see flexvm ps -a; flexvm rm {name} clears it").into(),
         _ => format!("no running vm named {name:?}").into(),
     }
 }
@@ -1350,12 +1362,12 @@ fn not_running(host: &Host, name: &str) -> util::Error {
 /// How long `stop` waits for a suspend: its copy of the VM's memory to disk.
 const STOP_WAIT: Duration = Duration::from_secs(600);
 
-/// SIGTERM, and waits until the VM is suspended (its process gone). A stopped VM stays so.
+/// SIGTERM, and waits until the VM is suspended (its process gone). Stopped or exited: a no-op.
 fn stop(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
     let vm = match host.signal(name, libc::SIGTERM) {
         Ok(vm) => vm,
-        Err(_) if !host.alive(name) && host.suspended(name)?.exists() => return Ok(()),
+        Err(_) if !host.alive(name) && (host.suspended(name)?.exists() || host.has_record(name, "exited")) => return Ok(()),
         Err(_) => return Err(not_running(host, name)),
     };
     let (start, mut seen) = (Instant::now(), false);
@@ -1847,12 +1859,12 @@ fn exec_command(args: &Args) -> Result<Value> {
     if args.rest.first().is_none_or(|s| s.is_empty()) {
         bail!("exec needs CMD");
     }
-    let env = args.all("env");
-    for kv in &env {
-        if kv.split_once('=').is_none_or(|(k, _)| k.is_empty()) || kv.contains('\0') {
-            bail!("exec -e needs K=V: {kv:?}");
+    for kv in args.all("env") {
+        if kv.split('=').next().is_none_or(str::is_empty) || kv.contains('\0') {
+            bail!("exec -e needs K or K=V: {kv:?}");
         }
     }
+    let env = env_flags(args);
     // As with docker exec; a relative one would be resolved against a directory the user cannot see.
     if args.get("workdir").is_some_and(|w| !w.starts_with('/')) {
         bail!("exec -w needs an absolute path");
@@ -2391,6 +2403,51 @@ mod exec_tests {
     }
 
     #[test]
+    fn run_hostname_short_flag_is_refused_without_showing_help() {
+        for flag in ["-h", "-dh"] {
+            let (args, error) = Args::parse_partly(["run", flag, "host", "image"].map(String::from));
+            assert!(error.unwrap().to_string().contains("hostname (-h) is not supported"));
+            assert!(!args.has("help"));
+        }
+        assert!(parse(&["-h", "run"]).has("help"));
+        assert!(parse(&["run", "--help"]).has("help"));
+        assert!(parse(&["ps", "-h"]).has("help"));
+        assert_eq!(parse(&["run", "image", "-h"]).rest, ["-h"]);
+    }
+
+    #[test]
+    fn short_bundles_and_value_aliases_follow_the_command() {
+        for (bundled, separate) in [
+            (vec!["ps", "-aq"], vec!["ps", "-a", "-q"]),
+            (vec!["ps", "-qafname=web"], vec!["ps", "-q", "-a", "--filter", "name=web"]),
+            (vec!["ps", "-f", "name=web"], vec!["ps", "--filter", "name=web"]),
+            (vec!["run", "-dm512m", "img"], vec!["run", "-d", "--memory", "512m", "img"]),
+            (vec!["run", "-m", "512m", "img"], vec!["run", "--memory", "512m", "img"]),
+            (vec!["logs", "-fn20", "web"], vec!["logs", "-f", "--tail", "20", "web"]),
+            (vec!["logs", "-n", "20", "web"], vec!["logs", "--tail", "20", "web"]),
+            (vec!["rm", "-fv", "web"], vec!["rm", "-f", "-v", "web"]),
+        ] {
+            let (a, b) = (parse(&bundled), parse(&separate));
+            check_applies(&a).unwrap();
+            assert_eq!(a.flags, b.flags, "{bundled:?}");
+            assert_eq!(a.positional, b.positional);
+            let child = Args::parse(a.child_args).unwrap();
+            assert!(!child.has("detach"));
+            for (flag, value) in &a.flags {
+                if flag != "detach" {
+                    assert_eq!(child.get(flag), Some(value.as_str()));
+                }
+            }
+        }
+        for words in [vec!["ps", "-ax"], vec!["run", "-m"], vec!["logs", "-n"], vec!["ps", "-f"]] {
+            assert!(Args::parse(words.into_iter().map(String::from)).is_err());
+        }
+        for words in [vec!["ps", "-m", "512m"], vec!["run", "-n", "20", "img"], vec!["exec", "-f", "x", "true"]] {
+            assert!(Args::parse(words.into_iter().map(String::from)).is_err());
+        }
+    }
+
+    #[test]
     fn interactive_flags_combine_as_dockers() {
         let args = parse(&["run", "-dit", "--name", "x", "image", "sh", "-it"]);
         assert!(args.has("detach") && args.has("interactive") && args.has("tty"));
@@ -2620,6 +2677,33 @@ mod exec_tests {
             assert!(stop(&host, name).is_err() && pause(&host, name).is_err() && resume(&host, name).is_err());
         }
         assert_eq!(std::fs::read_to_string(failed).unwrap(), "keep");
+    }
+
+    #[test]
+    fn stop_of_stopped_or_exited_is_a_noop_and_failed_or_lost_are_named() {
+        let root = crate::test_util::TempDir::new("stop-records");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let suspended = host.suspended("stopped").unwrap();
+        std::fs::create_dir_all(&suspended).unwrap();
+        stop(&host, "stopped").unwrap();
+        assert!(suspended.exists());
+        let exited = host.vms("done", "exited").unwrap();
+        std::fs::write(&exited, "saved exit").unwrap();
+        for _ in 0..2 {
+            stop(&host, "done").unwrap();
+            assert_eq!(std::fs::read_to_string(&exited).unwrap(), "saved exit");
+        }
+        for state in ["failed", "lost"] {
+            let record = host.vms(state, state).unwrap();
+            std::fs::write(&record, "reason").unwrap();
+            let error = stop(&host, state).unwrap_err().to_string();
+            assert!(error.contains(state) && error.contains(&format!("flexvm rm {state}")), "{error}");
+            // Restart first calls stop, before it tries to restore or spawn anything.
+            let args = parse(&["--state", host.state.to_str().unwrap(), "--run", host.run.to_str().unwrap(), "restart", state]);
+            assert_eq!(real_main(&args).unwrap_err().to_string(), error);
+            assert_eq!(std::fs::read_to_string(record).unwrap(), "reason");
+        }
+        assert_eq!(stop(&host, "missing").unwrap_err().to_string(), r#"no running vm named "missing""#);
     }
 
     #[test]
@@ -2915,11 +2999,27 @@ mod exec_tests {
         assert_eq!(cmd["workdir"], "/srv");
         assert_eq!(cmd["user"], "app:staff");
         assert_eq!(cmd["detach"], true);
-        for words in [&["exec", "vm"][..], &["exec", "vm", ""], &["exec", "-e", "BAD", "vm", "true"], &["exec", "-e", "=bad", "vm", "true"]] {
+        for words in [&["exec", "vm"][..], &["exec", "vm", ""], &["exec", "-e", "=bad", "vm", "true"]] {
             assert!(exec_command(&parse(words)).is_err());
         }
         for flag in ["-e", "-w", "-u"] {
             assert!(Args::parse(["exec", flag].map(String::from)).is_err());
+        }
+    }
+
+    #[test]
+    fn run_and_exec_share_bare_environment_keys() {
+        // Read an existing variable: no process-wide environment mutation while tests run.
+        let key = "PATH";
+        let value = std::env::var(key).unwrap();
+        let options = ["-e", "PATH=first", "-e", key, "-e", "FLEXVM_TEST_UNSET_VAR", "-e", "EMPTY=", "-e", "PATH=last"];
+        let run = parse(&[&["run"][..], &options, &["img"]].concat());
+        let exec = parse(&[&["exec"][..], &options, &["vm", "true"]].concat());
+        let expected = vec!["PATH=first".to_string(), format!("PATH={value}"), "EMPTY=".into(), "PATH=last".into()];
+        assert_eq!(run_spec(&run, None).unwrap().env, expected);
+        assert_eq!(exec_command(&exec).unwrap()["env"], json!(expected));
+        for value in ["", "=bad", "K\0", "K=bad\0value"] {
+            assert!(exec_command(&parse(&["exec", "-e", value, "vm", "true"])).is_err());
         }
     }
 
