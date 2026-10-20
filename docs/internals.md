@@ -1554,15 +1554,35 @@ after a checkpoint cut its connection, is refused with
 `error: a newer client attached since` if its epoch differs from the recorded
 one or its claim is lower. A REJOIN accepted before a checkpoint but not yet
 run cannot steal a fresh attachment after restore or migration, even though
-the new host process's claim counter starts over. Fresh ATTACHes are never
-refused by this fence, whatever their epoch or claim.
+the new host process's claim counter starts over. Fresh ATTACHes in the
+current host epoch may replace an attachment regardless of claim.
 
 The claim-only forms from #1075, `ATTACH <id> <offset> <claim>\n` and
 `REJOIN <id> <offset> <claim>\n`, remain supported. SESSION, ARGV and plain
 ATTACH record claim 0 and no epoch; claim-only ATTACH records no epoch either.
 When no epoch is recorded, an otherwise valid REJOIN establishes its epoch.
 A claim-only REJOIN cannot replace an attachment with a recorded epoch.
-The host probes once per VM process with an invalid offset (attaching nothing),
+Before its first exec attachment, the host serializes initialization per VM
+and sends `FENCE\n`, which returns kind 4 `ok <generation>`. The guest starts
+at generation 0. The host then sends `FENCE <generation+1> <epoch>\n` and waits
+for `ok <generation+1>` before sending any attachment. The guest stores this
+VM-wide fence in snapshot memory, under the same lock as attachment admission.
+An update must advance the generation; repeating the same generation and epoch
+is idempotent. Lower generations or a different epoch at the same generation
+fail with `error: a newer client attached since`, so a delayed pre-checkpoint
+fence cannot undo the restored host's fence. Such a delayed update can still take
+the generation the host read first, so on that refusal the host reads the
+generation again and goes past it, up to three tries. Generation overflow fails
+closed.
+Once fenced, every epoch-bearing ATTACH or REJOIN must match the authorized
+epoch, even for a session with no attachment yet. A delayed fresh ATTACH from
+the previous process therefore cannot replace the restored host's attachment.
+Requests without an epoch retain their legacy behavior.
+
+An older guest's `unknown request "FENCE"` reply skips this initialization;
+other refusals, missing replies and malformed acknowledgements fail the exec.
+The fresh-ATTACH fence requires FENCE support in the guest. The host then
+probes once per VM process with an invalid offset (attaching nothing),
 first for epoch support, then for claim-only support. Agents that reject a
 form with `error: bad session request` receive the next older form, down to
 plain ATTACH for pre-#1075 agents. A REJOIN's form refusal also downgrades the

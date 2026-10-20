@@ -478,6 +478,12 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         let _ = thread::Builder::new().spawn(move || {
             match line.split_whitespace().next() {
                 Some("SESSIONS") => return drop(msg(&stream, session::counts(&sessions))),
+                Some("FENCE") => {
+                    return drop(match session::fence(&line, &sessions) {
+                        Ok(reply) => msg(&stream, reply),
+                        Err(e) => fail(&stream, e),
+                    })
+                }
                 Some("SESSION" | "ARGV" | "ATTACH" | "REJOIN" | "CLOSE" | "RELEASE") => {}
                 // Its input may have come with the request, read ahead into `r`.
                 Some("APPIN") => return drop(app::appin(line.trim_end().split_once(' ').map_or("", |(_, a)| a), &stream, r.buffer())),

@@ -1,4 +1,5 @@
 //! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ARGV <id> <len>` (its argv and options, NUL-separated fields), `ATTACH <id> <offset>`,
+//! `FENCE [generation epoch]` establishes the VM-wide host epoch before attachments.
 //! `ATTACH <id> <offset> <claim> [epoch]` and `REJOIN <id> <offset> <claim> [epoch]` (the host's claim fence, #1074), `CLOSE <id>`, `RELEASE <id> <end> <code>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
 //! After an exit, the client may send SESSION_DONE on the attachment, within `ACK_WAIT`, to release the
 //! session; without that acknowledgement the exit stays available for reattachment. A late one the host passes
@@ -126,6 +127,8 @@ fn session(output: Output) -> Session {
 }
 
 pub struct Table {
+    /// Monotonic fence generation and the host epoch it authorizes.
+    fence: (u64, Option<u64>),
     live: HashMap<String, Entry>,
     closed: HashMap<String, Duration>,
     cancelled: HashMap<String, Duration>,
@@ -134,7 +137,7 @@ pub struct Table {
 
 impl Default for Table {
     fn default() -> Table {
-        Table { live: HashMap::new(), closed: HashMap::new(), cancelled: HashMap::new(), pool: Arc::new(AtomicUsize::new(POOL)) }
+        Table { fence: (0, None), live: HashMap::new(), closed: HashMap::new(), cancelled: HashMap::new(), pool: Arc::new(AtomicUsize::new(POOL)) }
     }
 }
 
@@ -516,6 +519,25 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
     }
 }
 
+/// Read or advance the attachment fence under the same lock used by ATTACH.
+/// Repeating a completed update is safe; an old request can never roll it back.
+pub fn fence(line: &str, sessions: &Sessions) -> io::Result<String> {
+    let mut table = sessions.lock().unwrap();
+    match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["FENCE"] => Ok(format!("ok {}", table.fence.0)),
+        ["FENCE", generation, epoch] => {
+            let generation = number(generation, "bad fence generation")?;
+            let epoch = number(epoch, "bad epoch")?;
+            if generation <= table.fence.0 && (generation, Some(epoch)) != table.fence {
+                return Err(io::Error::other(ATTACHED_SINCE));
+            }
+            table.fence = (generation, Some(epoch));
+            Ok(format!("ok {generation}"))
+        }
+        _ => Err(io::Error::other(BAD_SESSION_REQUEST)),
+    }
+}
+
 /// `SESSIONS`' reply: how many sessions are live, and how many of those are exited and unacknowledged.
 pub fn counts(sessions: &Sessions) -> String {
     let table = sessions.lock().unwrap();
@@ -735,6 +757,9 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
         }
         Request::Attach { id, offset, claim, epoch, rejoin } => {
             let table = sessions.lock().unwrap();
+            if epoch.is_some() && table.fence.1.is_some() && epoch != table.fence.1 {
+                return Err(io::Error::other(ATTACHED_SINCE));
+            }
             if table.ended(id) {
                 return Err(gone());
             }
@@ -1268,6 +1293,55 @@ mod tests {
         assert!(refused.ends_with(format!("error: {ATTACHED_SINCE}").as_bytes()), "{:?}", String::from_utf8_lossy(&refused));
         // What the host probes an agent with: a newer one finds the offset bad, an older one the whole request.
         assert!(request(&sessions, &statuses, "ATTACH s x 0", b"").ends_with(b"error: bad offset"));
+    }
+
+    #[test]
+    fn attachment_fence_survives_delayed_attaches_and_fence_updates() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let output = live(&mut sessions.lock().unwrap(), "s", Output::default());
+        assert_eq!(fence("FENCE", &sessions).unwrap(), "ok 0");
+        assert_eq!(fence("FENCE 1 100", &sessions).unwrap(), "ok 1");
+        open(b"", None, "ATTACH s 0 50 100", &sessions, &statuses).unwrap();
+        // The snapshot contains generation 1; the new process advances it before attaching.
+        assert_eq!(fence("FENCE 2 200", &sessions).unwrap(), "ok 2");
+        // An old ATTACH is refused even before the restored host has attached to this session.
+        assert!(open(b"", None, "ATTACH s 0 51 100", &sessions, &statuses).is_err());
+        let (fresh, mut peer) = UnixStream::pair().unwrap();
+        open(b"", Some(File::from(OwnedFd::from(fresh))), "ATTACH s 0 1 200", &sessions, &statuses).unwrap();
+        let me = output.0.lock().unwrap().attachments;
+        for line in ["ATTACH s 0 51 100", "ATTACH s 0 0 100", "REJOIN s 0 99 100"] {
+            let refused = request(&sessions, &statuses, line, b"");
+            assert!(refused.ends_with(format!("error: {ATTACHED_SINCE}").as_bytes()), "{line}");
+            let ring = output.0.lock().unwrap();
+            assert_eq!((ring.epoch, ring.claim, ring.attachments), (Some(200), 1, me));
+        }
+        for line in ["FENCE 1 100", "FENCE 2 100", "FENCE 0 100"] {
+            assert_eq!(fence(line, &sessions).unwrap_err().to_string(), ATTACHED_SINCE);
+        }
+        assert_eq!(fence("FENCE 2 200", &sessions).unwrap(), "ok 2");
+        assert_eq!(fence("FENCE", &sessions).unwrap(), "ok 2");
+        peer.write_all(b"x").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        assert_ne!(peer.read(&mut [0]).map_err(|e| e.kind()), Ok(0), "fresh attachment shut down");
+        open(b"", None, "REJOIN s 0 1 200", &sessions, &statuses).unwrap();
+        // Another fresh client in the current epoch may still take over with a lower claim.
+        open(b"", None, "ATTACH s 0 0 200", &sessions, &statuses).unwrap();
+        // Hosts predating epochs retain their existing protocol.
+        for line in ["ATTACH s 0 2", "REJOIN s 0 2", "ATTACH s 0"] {
+            open(b"", None, line, &sessions, &statuses).unwrap();
+        }
+        // The fence applies to every session, including sessions created after it was established.
+        live(&mut sessions.lock().unwrap(), "other", Output::default());
+        assert!(open(b"", None, "ATTACH other 0 99 100", &sessions, &statuses).is_err());
+    }
+
+    #[test]
+    fn malformed_fences_do_not_change_the_generation() {
+        let sessions = Sessions::default();
+        for line in ["FENCE x 1", "FENCE 1 x", "FENCE 18446744073709551616 1", "FENCE 1", "FENCE 1 2 extra"] {
+            assert!(fence(line, &sessions).is_err(), "{line}");
+            assert_eq!(fence("FENCE", &sessions).unwrap(), "ok 0");
+        }
     }
 
     /// A request already accepted before the checkpoint may run after a new process's fresh ATTACH.
