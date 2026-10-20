@@ -3660,7 +3660,9 @@ def guest_tcp_counters(host, name):
 def tcp_server(host, name, port=7000):
     code, out = sh(host, name, f"setsid socat TCP-LISTEN:{port},fork,reuseaddr EXEC:cat >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
-    time.sleep(0.3)
+    # Ready once the guest lists its socket listening, however long socat takes to get there.
+    listening = lambda: sh(host, name, f"ss -Hltn 'sport = :{port}'")[1] != ""
+    assert wait_for(listening, 30), f"socat never listened on {port} in {name}"
 
 
 FV_MASK = (1 << 64) - 1
