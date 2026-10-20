@@ -300,7 +300,8 @@ target's reply to them.
    the next build or push sweeps, never a generation. The listener holds the
    generation open for 17 s, until the arrival has opened it itself, so no
    `rmi` or prune removes it in between; from then on the VM holds it as any
-   VM does. Caps: 4 pushes at once (2 from one peer), 64 GiB of data, 2 GiB
+   VM does. A generation already on disk and a have-only ask need no receive
+   slot. Caps: 4 receives at once (2 from one peer), 64 GiB of data, 2 GiB
    left free on the disk (1 GiB of it for local checkpoints and suspends), and
    a transfer budget of 60 s plus 1 s per 8 MiB transferred, enforced on
    both sender and receiver. A push waits up to 10 minutes for another
@@ -1234,7 +1235,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   No VM gets a local, peer, underlay or gateway address (#549), even inside
   `cluster_ips`. What a peer
   asks for (arrival, route, lend) is checked against the listener's own peer
-  lookups, briefly waiting for one under way; a restore or resume, root's own,
+  lookups, using last-known addresses during refresh and briefly waiting only
+  for a name with none yet; a restore or resume, root's own,
   against the listener's last-known peer addresses (`RUN/peers.json`) whatever
   their age, with no DNS wait. Reinstall and boot recovery repeat these checks
   and the next-hop check against current configuration, with no DNS wait; a

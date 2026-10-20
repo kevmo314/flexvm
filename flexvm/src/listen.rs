@@ -342,8 +342,8 @@ struct PeersInner {
 ///
 /// Who asks decides how fresh peer addresses must be. A peer is the attacker #549 guards
 /// against: what a peer asks for (arrival, route, lend) is checked by the listener against
-/// its own lookups, waiting briefly for any under way on a peer name (cached addresses or not)
-/// and refused after. Restore and resume are root's own: they go by this file whatever its age,
+/// its own lookups, using last-known addresses while refreshed, waiting briefly only for a name
+/// with none yet, and refused after. Restore and resume are root's own: they go by this file whatever its age,
 /// never waiting on DNS, and are refused at once only for a name it has no entry for (no
 /// listener looked it up yet). A peer whose name moved since is not caught there.
 const PEER_CACHE: &str = "peers.json";
@@ -483,9 +483,9 @@ impl Peers {
         addrs
     }
 
-    /// `addrs` once no name has its lookup under way (it could give any address, a name with
-    /// addresses a new one too), waiting for one until `by`, then an error: asked again, it may
-    /// have ended. A lookup that ended with none (a name that does not resolve) gives none (#411).
+    /// `addrs` using last-known addresses while refreshed; a name with none yet waits for its
+    /// lookup until `by`, then an error: asked again, it may have ended. A lookup that ended
+    /// with none (a name that does not resolve) gives none (#411).
     fn all_addrs(&self, names: &[String], by: Instant) -> Result<Vec<IpAddr>> {
         loop {
             // Starts a lookup of a name with none; then addresses and lookups under way read
@@ -500,7 +500,7 @@ impl Peers {
                         Ok(a) => addrs.push(a.ip()),
                         Err(_) => {
                             addrs.extend(r.get(n).into_iter().flatten());
-                            pending |= l.get(n) == Some(&None);
+                            pending |= r.get(n).is_none_or(Vec::is_empty) && l.get(n) == Some(&None);
                         }
                     }
                 }
@@ -869,7 +869,7 @@ fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
 /// One held already is answered at once, without a turn or a slot. With `have` set, only asked, and answered
 /// `have` false if it is not here (a source's last check before its prepare, which refreshes the hold, #824). With
 /// `ack` set, its metadata is answered too (`go`, or a refusal: room for its `bytes`, the limits, Firecracker)
-/// before its source sends its data.
+/// before its source sends its data. Only receiving takes a `PUSHES` slot.
 fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let answer = |r: &Result<Value>| send_json(&mut crate::util::By { s: &conn, at: Instant::now() + ANSWER_WAIT }, &crate::util::reply(r));
     let (paths, id) = (crate::template::Paths::new(&host.state), req["id"].as_str().unwrap_or(""));
@@ -895,13 +895,13 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         if let Some(tpl) = held() {
             return Ok(Some(tpl));
         }
-        let _slot = PUSHES.take(conn.peer_addr()?.ip()).ok_or(BUSY)?;
         if let Some(dir) = crate::template::Template::generation(&paths, id) {
             return crate::template::Template::open_dir(id, dir).map(Some);
         }
         if only_ask {
             return Ok(None);
         }
+        let _slot = PUSHES.take(conn.peer_addr()?.ip()).ok_or(BUSY)?;
         answer(&Ok(json!({"have": false, "ack": ack})))?;
         asked = true;
         let (in_use, held) = (|| host.template_users(), || HELD.lock().unwrap().keys().cloned().collect());
@@ -953,7 +953,8 @@ fn hold(tpl: Arc<crate::template::Template>) {
     drop(held);
     std::thread::spawn(move || loop {
         let mut held = HELD.lock().unwrap();
-        let left = held[&id].1.saturating_duration_since(Instant::now());
+        // Gone already (another hold's thread ended it): nothing left to end.
+        let Some(left) = held.get(&id).map(|h| h.1.saturating_duration_since(Instant::now())) else { return };
         if left.is_zero() {
             held.remove(&id);
             return;
@@ -1255,21 +1256,31 @@ mod tests {
         assert!(got["ms"].is_number() && digests == json!(tpl.digests().unwrap()), "{got}");
         assert!(crate::template::Template::generation(&paths, &id).is_some() && HELD.lock().unwrap().contains_key(&id));
         // Held: answered though every slot of this peer is taken and another arrival of it has its turn.
-        let _slots = [PUSHES.take("127.0.0.1".parse().unwrap()), PUSHES.take("127.0.0.1".parse().unwrap())];
+        let _slots: Vec<_> = (0..MAX_PUSHES_FROM).map(|_| PUSHES.take("127.0.0.1".parse().unwrap()).unwrap()).collect();
         let _turn = crate::template::turn(&paths, &id, Instant::now()).unwrap();
         assert!(crate::migrate::push_template(&addr, &tpl, false).unwrap().is_some());
         assert!(crate::migrate::push_template(&addr, &tpl, true).unwrap().is_some());
         // As an old source (no `ack`) asks.
         assert_eq!(ask(json!({"op": "template", "id": id})).1["have"], true);
+        // Hold expired: the generation on disk still answers without a receive slot, on either ask.
+        drop(_turn);
+        HELD.lock().unwrap().remove(&id);
+        assert!(crate::migrate::push_template(&addr, &tpl, false).unwrap().is_some());
+        HELD.lock().unwrap().remove(&id);
+        assert!(crate::migrate::push_template(&addr, &tpl, true).unwrap().is_some());
+        // A missing generation is answered without a slot only on a have-only ask.
+        let other = "0".repeat(16);
+        assert_eq!(ask(json!({"op": "template", "id": other, "have": true})).1, json!({"have": false}));
+        let busy = crate::util::rpc(&addr, Duration::from_secs(2), Instant::now() + Duration::from_secs(10), &json!({"op": "template", "id": other}));
+        assert!(busy.err().unwrap().to_string().contains(BUSY));
         // Waiting for a turn takes a place of its own, so waiters are bounded too: one for another template is busy.
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let _waiters: Vec<_> = (0..2 * MAX_PUSHES_FROM).map(|_| PUSHERS.take(ip)).collect();
-        let other = "0".repeat(16);
         let busy = crate::util::rpc(&addr, Duration::from_secs(2), Instant::now() + Duration::from_secs(10), &json!({"op": "template", "id": other}));
         assert!(busy.err().unwrap().to_string().contains(BUSY));
         drop(_waiters);
         // No such generation, asked only: not here, by any id.
-        drop((_slots, _turn));
+        drop(_slots);
         assert_eq!(ask(json!({"op": "template", "id": "../x", "have": true})).1, json!({"have": false}));
     }
 
@@ -1712,15 +1723,15 @@ mod tests {
         p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), None);
         let e = p.all_addrs(&cfg.peers, soon()).unwrap_err().to_string();
         assert!(e.contains("still being looked up"), "{e}");
+        p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec![]);
+        assert!(p.all_addrs(&cfg.peers, Instant::now()).is_err(), "an empty entry still waits");
         // Ended with no address (it does not resolve): no addresses, not a refusal forever.
         p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), Some(Instant::now()));
         assert_eq!(p.all_addrs(&cfg.peers, soon()).unwrap(), ["10.98.0.1".parse::<IpAddr>().unwrap()]);
-        // Cached, but looked up again (it may come back on a new address): refused after a wait
-        // too, never answered with the old address alone; then with the new one.
+        // Refreshed: uses its last-known addresses at once; then the new ones once published.
         p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.2".parse().unwrap()]);
         p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), None);
-        let e = p.all_addrs(&cfg.peers, soon()).unwrap_err().to_string();
-        assert!(e.contains("still being looked up"), "{e}");
+        assert_eq!(p.all_addrs(&cfg.peers, Instant::now()).unwrap(), ["10.98.0.1".parse::<IpAddr>().unwrap(), "10.94.0.2".parse().unwrap()]);
         p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.1".parse().unwrap()]);
         p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), Some(Instant::now()));
         let peers = [p.all_addrs(&cfg.peers, soon()).unwrap(), vec!["10.95.0.1".parse().unwrap()]].concat();
