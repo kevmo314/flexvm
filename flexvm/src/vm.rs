@@ -1340,7 +1340,10 @@ impl Prepared {
                     fc.pause(left(API_TIMEOUT))?;
                     t.mark("hold_paused");
                 }
-                self.pager.wait_ready(left(Duration::from_secs(5)))
+                self.pager.wait_ready(left(Duration::from_secs(5)))?;
+                // With the pager's view in place, before the guest runs: memory mapped behind its back would read
+                // as zeroes (#949).
+                self.pager.check_foreign().inspect_err(|e| load_failed = Some(e.to_string()))
             });
             let readied = neighbour.map(|r| r.join()).transpose().map_err(|_| "neighbour thread panicked")?;
             held?;
@@ -1354,6 +1357,8 @@ impl Prepared {
                 let idle = self.fc.as_ref().unwrap();
                 let retry = match &load_failed {
                     Some(why) if why.contains(NO_REALTIME) && clock_realtime => Some(false),
+                    // Its memory was read while being mapped: a fresh Firecracker maps it again.
+                    Some(why) if why.starts_with(crate::uffd::FOREIGN) => Some(clock_realtime),
                     // Died on its own, with no page given up.
                     Some(_) if !self.pager.lost_pages() && !idle.alive() => Some(clock_realtime),
                     _ => None,
