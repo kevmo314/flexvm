@@ -927,9 +927,10 @@ and `--memory` cap a VM below them):
 | `--mem MIB` | 256 + max/32, rounded up to 128 | boot memory, which holds kernel memory for the whole ceiling |
 | `--plug MIB` | 4096 | plugged in the snapshot (free until touched); a VM never shrinks below it |
 
-Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K=V`,
+Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K[=V]`
+(repeatable; a bare key takes the host's value, or is left out if unset),
 `--workdir`, `--user` (`run` takes `-e`, `--env-file` and `--entrypoint` per VM). `--warm` snapshots the app once it is ready
-(`--ready-port N` or `--ready-cmd CMD`); every VM from a warm template starts
+(`--ready-port N`, 1–65535, or `--ready-cmd CMD`); every VM from a warm template starts
 with the same userland state (RNG seeds, keys), so use it only for apps that
 hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 

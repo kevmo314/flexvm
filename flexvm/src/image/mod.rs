@@ -129,6 +129,7 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
     let argv: Vec<String> = entrypoint.into_iter().chain(cmd).collect();
     let mut env = strings(&c["Env"]);
     for kv in &o.env {
+        crate::app::validate_env(kv)?;
         env.retain(|e| env_key(e) != env_key(kv));
         env.push(kv.clone());
     }
@@ -137,6 +138,8 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
         .into_iter()
         .flatten()
         .filter_map(|(k, _)| k.strip_suffix("/tcp").or((!k.contains('/')).then_some(k.as_str()))?.parse().ok())
+        // As with entries that do not parse: port 0 is no port to wait on.
+        .filter(|&p| p != 0)
         .collect();
     ports.sort();
     Ok(App {
@@ -1905,6 +1908,27 @@ mod tests {
         assert!(conf.starts_with("arg /bin/app\r\narg \r\narg  a\r\\nb\\\\r \t\r\narg \nenv FOO=bar\r\nenv EMPTY=\nenv CR=\r\n"));
         assert!(conf.contains("\ncwd /srv\r\n"));
         assert_eq!(root.read("etc/flexvm/app.conf").unwrap(), conf.as_bytes());
+    }
+
+    #[test]
+    fn exposed_port_zero_is_skipped() {
+        for port in ["0", "0/tcp", "0/udp", "bad/tcp", "70000"] {
+            let config = json!({"config": {"ExposedPorts": {port: {}, "80/tcp": {}}}});
+            assert_eq!(app_config(&config, &Options::default()).unwrap().ports, [80], "{port}");
+        }
+        let config = json!({"config": {"ExposedPorts": {"1/tcp": {}, "65535/tcp": {}, "53/udp": {}}}});
+        assert_eq!(app_config(&config, &Options::default()).unwrap().ports, [1, 65535]);
+    }
+
+    #[test]
+    fn environment_overrides_keep_other_image_keys() {
+        let config = json!({"config": {"Env": ["PATH=/bin", "K=image"]}});
+        let o = Options { env: vec!["K=host".into(), "EMPTY=".into()], ..Default::default() };
+        assert_eq!(app_config(&config, &o).unwrap().env, ["PATH=/bin", "K=host", "EMPTY="]);
+        for value in ["", "=x", "K\0", "K=x\0"] {
+            let o = Options { env: vec![value.into()], ..Default::default() };
+            assert!(app_config(&config, &o).is_err());
+        }
     }
 
     #[test]
