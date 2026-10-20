@@ -373,9 +373,10 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
     let pending = refill_lock_path(host, template).with_extension("pending");
     // Publish before trying the lock: its holder either sees this, or we get the lock ourselves.
     drop(crate::host::private_file(&pending)?);
-    let (mut started, mut failed) = (0, None);
+    let (mut started, mut failed, mut failures) = (0, None, 0);
     // Until no request is left: each pending one was made after the last recount's snapshot
     // (a departure, a pull), and no one else takes it up on a host with no listener (#921).
+    // Or until a second round fails: then the requests left wait out the failure backoff.
     for round in 0.. {
         // Requests after the first few, from a burst of departures, are taken together.
         if round >= 3 {
@@ -393,11 +394,24 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
         // caller's own (the first) is returned, a recount's is only logged.
         match refill(round > 0) {
             Ok(n) => started += n,
-            Err(e) if round == 0 => failed = Some(e),
-            Err(e) => crate::log!("standby {template}: refill: {e}"),
+            Err(e) => {
+                // At once, not when this returns: maintainers (`refill_round`) back off from now,
+                // and stop asking for recounts that would only start more failing loads.
+                let _ = crate::host::write_record(&d.join(".failed"), b"");
+                failures += 1;
+                match round {
+                    0 => failed = Some(e),
+                    _ => crate::log!("standby {template}: refill: {e}"),
+                }
+            }
         }
         drop(legacy);
         drop(lock);
+        // One recount after a failure (it may have been the superseded generation's load), not
+        // more: the marker stays for whoever refills after the backoff.
+        if failures >= 2 {
+            break;
+        }
         // Check after unlocking too, so a request between the last recount and unlock is not lost.
         if !pending.try_exists()? {
             break;
@@ -1882,6 +1896,29 @@ mod tests {
         );
         assert_eq!(rounds, 6);
         assert!(!refill_lock_path(&host, "default").with_extension("pending").exists());
+    }
+
+    #[test]
+    fn failing_loads_under_continuous_requests_end_the_recounts() {
+        let (_root, host, _paths, d) = pool("refill-failing");
+        let mut rounds = 0;
+        let r = refill_with(&host, "default", true, |_| {
+            rounds += 1;
+            // Like a maintainer asking every round while each load fails after its 5 s.
+            assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
+            if rounds == 1 {
+                // Backed off from the first failure on, before this holder returns.
+                assert!(!d.join(".failed").exists());
+            } else {
+                assert!(recent(&d.join(".failed")));
+            }
+            Err("a standby vm failed to load".into())
+        });
+        assert_eq!(r.unwrap_err().to_string(), "a standby vm failed to load");
+        assert_eq!(rounds, 2);
+        assert!(recent(&d.join(".failed")));
+        // The last request is left for whoever refills after the backoff.
+        assert!(refill_lock_path(&host, "default").with_extension("pending").exists());
     }
 
     #[test]
