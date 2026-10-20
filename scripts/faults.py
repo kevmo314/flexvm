@@ -779,8 +779,10 @@ def route():
 def lost_ack():
     n = "ft-lost-ack"
     m = setup(n)
-    fault(B, "lost_ack", 1000)
-    r = migrate(A, n, B)
+    # Armed until the migration answered, however long it takes to get to its ack.
+    with armed_fault(B, "lost_ack", 600000):
+        r = migrate(A, n, B)
+    check("lost ack: the target dropped its ack", reached(B, "lost_ack"), reached(B, "lost_ack"))
     check("lost ack: source learns the target committed", r["ok"], r)
     st = wait_released(B, n)
     check("lost ack: only on B", where(n) == {B: "running"}, (where(n), st))
