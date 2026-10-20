@@ -2759,35 +2759,40 @@ mod exec_tests {
         let root = crate::test_util::TempDir::new("force-rm-logs");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         for (force, record) in [(false, "none"), (true, "none"), (true, "exited"), (true, "suspended")] {
-            let name = host.take_name("web", false).unwrap();
+            // The fake VM holds its name itself, as a real one does: its lock goes with its
+            // process, before the pidfd `remove` waits on is readable. Held by a thread of this
+            // process instead, it outlived the process by whatever the load made it (#1103).
+            let lock = host::lock_path(&host.vms("web", "lock").unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+            let fd = lock.as_raw_fd();
             let mut command = std::process::Command::new("sleep");
             unsafe {
-                std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
                     libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    // Kept across exec: the child shares the lock's open file description.
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     Ok(())
                 });
             }
             let mut child = crate::test_util::ChildGuard(command.arg("60").spawn().unwrap());
+            drop(lock);
             let entry = host::Entry { name: "web".into(), ident: host::Ident::of(child.id()).unwrap(), state: "running".into(), ..host::Entry::default() };
             std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
-            name.publish(&entry).unwrap();
+            host::store_private(&host.vms("web", "json").unwrap(), &entry, false).unwrap();
             for ext in ["log", "log.1"] {
                 std::fs::write(host.vms("web", ext).unwrap(), "old vm").unwrap();
             }
-            let ended_host = host.clone();
-            let ended = std::thread::spawn(move || {
-                let status = child.wait().unwrap();
-                // Model an app exit or a suspend winning the race with the kill.
-                if record == "exited" {
-                    std::fs::write(ended_host.vms("web", "exited").unwrap(), "{}").unwrap();
-                } else if record == "suspended" {
-                    let dir = ended_host.suspended("web").unwrap();
-                    std::fs::create_dir_all(&dir).unwrap();
-                    std::fs::write(dir.join("manifest.json"), "{}").unwrap();
-                }
-                drop(name);
-                status
-            });
+            // Model an app exit or a suspend winning the race with the kill: recorded by the
+            // VM before its process ends, so before `remove` sees it gone.
+            if record == "exited" {
+                std::fs::write(host.vms("web", "exited").unwrap(), "{}").unwrap();
+            } else if record == "suspended" {
+                let dir = host.suspended("web").unwrap();
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+            }
+            let ended = std::thread::spawn(move || child.wait().unwrap());
             let result = remove(&host, "web", true, force);
             let status = ended.join_within().unwrap();
             result.unwrap();
