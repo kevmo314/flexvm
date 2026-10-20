@@ -1218,15 +1218,20 @@ def guest_calls():
     skews = tsc_skews(B, n)
     check("guest calls: the vCPUs' TSCs agree", tscs_agree(skews), skews)
     check("guest calls: target stepped the guest clock", *guest_clock_right(B, n))
-    # A clock step the guest carried out but whose answer was lost goes again.
+    # A clock step the guest carried out but whose answer was lost goes again: one reply lost
+    # (`tripped_once`), the step it was, and the step then succeeding.
     before = vms(B)[n]["guest_retries"].get("CLOCK", 0)
     pause(B, n)
-    # Armed until the step was seen going again, however long the resume takes to get to it.
-    retried = lambda: vms(B)[n]["guest_retries"].get("CLOCK", 0) > before
+    clear_gate(B, "guest_lose_reply")
+    since = len(log(B, n))
     with armed_fault(B, "guest_lose_reply", 600000):
         resume(B, n)
-        went_again = wait_for(retried, 30)
-    check("guest calls: a clock step with its reply lost went again", went_again, vms(B)[n]["guest_retries"])
+        lost = wait_for(lambda: reached(B, "guest_lose_reply"), 30)
+    check("guest calls: a reply was lost", lost, reached(B, "guest_lose_reply"))
+    retried = lambda: vms(B)[n]["guest_retries"].get("CLOCK", 0) > before
+    check("guest calls: the clock step whose reply was lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
+    check("guest calls: and succeeded", *guest_clock_right(B, n))
+    check("guest calls: no clock step failed", "checking the guest clock" not in log(B, n)[since:], log(B, n)[since:][-500:])
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
 
 
