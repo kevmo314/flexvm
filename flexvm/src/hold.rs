@@ -32,13 +32,16 @@ const VNET_HDR: usize = 10;
 const PASS: usize = 256;
 /// The hold device's queue length (`open_tun`).
 const TXQ: usize = 10000;
-const ACCEPT_WAIT: Duration = Duration::from_secs(1);
-const SYNC_WAIT: Duration = Duration::from_millis(250);
+/// The stream's deadlines are stretched in unit tests: there the target is a thread of a busy
+/// test process, and one that misses a deadline breaks the stream the test checks (#1069).
+const SLACK: u32 = if cfg!(test) { 20 } else { 1 };
+const ACCEPT_WAIT: Duration = Duration::from_secs(1).saturating_mul(SLACK);
+const SYNC_WAIT: Duration = Duration::from_millis(250).saturating_mul(SLACK);
 /// For the target to take the address over: a route change, which waits for RTNL. The
 /// address stays held here meanwhile, so waiting loses nothing.
-const SWITCH_WAIT: Duration = Duration::from_secs(2);
-const FLUSH_WAIT: Duration = Duration::from_millis(400);
-const REPLY_WAIT: Duration = Duration::from_secs(1);
+const SWITCH_WAIT: Duration = Duration::from_secs(2).saturating_mul(SLACK);
+const FLUSH_WAIT: Duration = Duration::from_millis(400).saturating_mul(SLACK);
+const REPLY_WAIT: Duration = Duration::from_secs(1).saturating_mul(SLACK);
 /// How long a let-go address's stragglers (`Holder::gone`) are re-sent or counted.
 const GONE_FOR: Duration = Duration::from_secs(30);
 /// Stragglers are logged at most this often per address after the first report.
@@ -1559,10 +1562,13 @@ mod tests {
     }
 
     /// A fake handoff target on `l`: confirms each `SYNC`, answers `SWITCH` with `switch_ack`,
-    /// and counts the packets it got in its final reply. Returns those packets.
+    /// and counts the packets it got in its final reply. Returns those packets. Its reads are
+    /// bounded: a sender that broke the stream without ending it fails the test, not hangs it
+    /// (#1069).
     fn fake_target(l: std::net::TcpListener, switch_ack: u8) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
         std::thread::spawn(move || {
             let (mut c, _) = l.accept().unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
             let mut got = Vec::new();
             loop {
                 let mut head = [0u8; 4];
@@ -1613,7 +1619,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-            let got = target.join().unwrap();
+            // Ended here, a stream the sender broke off ends the target's read too.
+            drop(conn);
+            let got = target.join().expect("the target got the whole stream");
             assert!(switched.is_ok() && switch.get() == took, "{}: refused, nothing owed or routed here", ack as char);
             assert_eq!(
                 (got.len(), stats.packets, stats.injected, stats.dropped, stats.dropped_target),
