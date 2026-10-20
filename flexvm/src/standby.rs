@@ -459,7 +459,8 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
             ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--standby".as_ref(), template.as_ref()];
         crate::util::start_reaper()?;
         let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &[("FLEXVM_NOTIFY_FD", "3")])?;
-        let by = Instant::now() + LOCKED_TIMEOUT;
+        // Test fault `long_locked`: a test holding the child before its lock (`standby_lock_gate`) lets it go in its own time.
+        let by = Instant::now() + if crate::host::fault("long_locked") { Duration::from_secs(300) } else { LOCKED_TIMEOUT };
         drop(w);
         let mut r = BufReader::new(r);
         wait_locked(&mut r, &mut child, by)?;
@@ -595,6 +596,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let (lock_path, sock) = (l.join(format!("{id}.lock")), d.join(format!("{}.sock", me.pid)));
     crate::socket::check(&sock)?;
     crate::host::stall("standby_lock_stall");
+    // Test gate `standby_lock_gate`: held before its lock until the test lets it go.
+    crate::host::hold("standby_lock_gate");
     // Test hook: held before its lock for as long as armed (past `LOCKED_TIMEOUT`, say).
     while crate::host::fault("standby_lock_hang") {
         std::thread::sleep(Duration::from_millis(50));
@@ -613,7 +616,15 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // A stop while loading (relief, `rmi`) ends it between phases: what it made is torn down
     // first, and its refill is told it stopped, which is no failed start (no `.failed`).
     let stopping = || p.stop_requested().is_some();
-    let loaded = if stopping() { Err(Error::from(STOPPED)) } else { p.spawner.take(None).and_then(|idle| load(idle, tpl.clone(), stopping)) };
+    let load_fresh = || if stopping() { Err(Error::from(STOPPED)) } else { p.spawner.take(None).and_then(|idle| load(idle, tpl.clone(), stopping)) };
+    let loaded = match load_fresh() {
+        // Its memory was read while being mapped: a fresh Firecracker maps it again.
+        Err(e) if e.to_string().starts_with(crate::uffd::FOREIGN) => {
+            crate::log!("standby {template}: {e}; once more on a fresh firecracker");
+            load_fresh()
+        }
+        r => r,
+    };
     let ready = match loaded {
         Ok(ready) => ready,
         Err(e) => match p.stop_requested() {
@@ -1049,6 +1060,8 @@ fn load(idle: Firecracker, template: Arc<Template>, stopping: impl Fn() -> bool)
     fc.pause(API_TIMEOUT)?;
     check_stop()?;
     p.pager.wait_ready(Duration::from_secs(5))?;
+    // With the pager's view in place, before the guest runs: memory mapped behind its back would read as zeroes (#949).
+    p.pager.check_foreign()?;
     check_stop()?;
     let resumed = fc.resume(API_TIMEOUT);
     p.pager.loaded();
