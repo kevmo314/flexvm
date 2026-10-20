@@ -1668,6 +1668,7 @@ impl Proc {
                 "install_eagain": vm.pager.install_eagain(),
                 "describe": vm.describe(),
                 "guest_retries": guest::retries(),
+                "clock_syncs": {"ok": CLOCK_SYNCS[0].load(Ordering::SeqCst), "failed": CLOCK_SYNCS[1].load(Ordering::SeqCst)},
                 "controller": self.ticks.lock().unwrap().json(),
             })),
             w => bail!("unknown debug request {w:?}"),
@@ -2011,7 +2012,7 @@ impl Proc {
         self.leaving.store(v, Ordering::SeqCst);
     }
 
-    /// Under the op lock, so never inside a snapshot.
+    /// Under the op lock, so never inside a snapshot. Each one's end is counted (`CLOCK_SYNCS`, in `debug status`).
     pub fn sync_clock_later(&self) {
         let vm = self.vm().clone();
         let Some(p) = self.me.upgrade().filter(|_| !vm.clock_pending.swap(true, Ordering::SeqCst)) else { return };
@@ -2029,6 +2030,7 @@ impl Proc {
                 }
             };
             vm.clock_pending.store(false, Ordering::SeqCst);
+            let failed = res.is_err();
             match res {
                 Ok(Some(off)) if off.abs() > CLOCK_TOLERANCE.as_secs_f64() * 1e3 => {
                     crate::info!("vm {}: guest clock was {off:.1} ms off after resuming; stepped it", vm.name)
@@ -2036,9 +2038,13 @@ impl Proc {
                 Ok(_) => {}
                 Err(e) => crate::log!("vm {}: checking the guest clock: {e}", vm.name),
             }
+            CLOCK_SYNCS[failed as usize].fetch_add(1, Ordering::SeqCst);
         });
     }
 }
+
+/// Guest clock checks after a resume or an arrival (`sync_clock_later`) that ended: succeeded, failed.
+static CLOCK_SYNCS: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Suspend {
