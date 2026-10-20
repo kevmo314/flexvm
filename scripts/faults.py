@@ -1954,7 +1954,8 @@ def sweep_arrivals(host, mine):
     does once they are 5 s unwritten, so no later scenario sees them."""
     vd = os.path.join(host.run, "vms")
     for f in mine & arrivals(host):
-        os.utime(os.path.join(vd, f), (time.time() - 60,) * 2)
+        with suppress(FileNotFoundError):  # its own sweep got there first
+            os.utime(os.path.join(vd, f), (time.time() - 60,) * 2)
     ok(cli_json(host, "debug", "gc"))
     check(f"swept the killed arrivals' logs on {host}", not (mine & arrivals(host)), arrivals(host))
 
