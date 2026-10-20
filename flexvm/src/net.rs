@@ -201,13 +201,13 @@ fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> 
     let name = claim(&fd)?;
     let name = name.as_str();
     // Until TUNSETPERSIST the tap goes with `fd`, so with this process.
-    let mut alias = ifinfomsg(ifindex(name)?);
+    let index = ifindex(name)?;
+    let mut alias = ifinfomsg(index);
     attr(&mut alias, IFLA_IFALIAS, owner.as_bytes());
     netlink(RTM_SETLINK, 0, &alias).map_err(|e| format!("tap {name}: its owner: {e}"))?;
     crate::syscall_check!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0, "create tap {name}");
     drop(fd);
     let made = (|| -> Result<()> {
-        let index = ifindex(name)?;
         let mut addr = [&[libc::AF_INET as u8, 32, 0, RT_SCOPE_HOST][..], &index.to_ne_bytes()].concat();
         attr(&mut addr, IFA_LOCAL, &TAP_ADDR.octets());
         attr(&mut addr, IFA_ADDRESS, &TAP_ADDR.octets());
@@ -229,12 +229,10 @@ fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> 
     match (&made, udev) {
         (Err(_), _) => delete_tap(name),
         (Ok(()), Some(udev)) => {
-            if let Ok(index) = ifindex(name) {
-                let tap = name.to_string();
-                // Not fatal: neighbour still checks the MAC when the tap is handed to a VM.
-                if let Err(e) = std::thread::Builder::new().name("udev-mac".into()).spawn(move || keep_mac_from_udev(&udev, index, &tap, UDEV_RECHECK)) {
-                    crate::log!("tap {name}: not watching for udev replacing its MAC: {e}");
-                }
+            let tap = name.to_string();
+            // Not fatal: neighbour still checks the MAC when the tap is handed to a VM.
+            if let Err(e) = std::thread::Builder::new().name("udev-mac".into()).spawn(move || keep_mac_from_udev(&udev, index, &tap, UDEV_RECHECK)) {
+                crate::log!("tap {name}: not watching for udev replacing its MAC: {e}");
             }
         }
         (Ok(()), None) => {}
@@ -416,14 +414,14 @@ const TCQ_PLUG_RELEASE_INDEFINITE: i32 = 2;
 const PLUG_LIMIT: u32 = 16 << 20;
 const TCA_STATS: u16 = 3;
 
-/// struct tcmsg (family, pads, ifindex, handle, parent, info) for the root qdisc at `ifindex`, with `handle`.
-fn tcmsg(ifindex: u32, handle: u32) -> Vec<u8> {
-    [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &handle.to_ne_bytes(), &TC_H_ROOT.to_ne_bytes(), &0u32.to_ne_bytes()].concat()
+/// struct tcmsg (family, pads, ifindex, handle, parent, info) at `ifindex`.
+fn tcmsg(ifindex: u32, handle: u32, parent: u32, info: u32) -> Vec<u8> {
+    [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &handle.to_ne_bytes(), &parent.to_ne_bytes(), &info.to_ne_bytes()].concat()
 }
 
 /// The root plug qdisc, with TCA_KIND "plug" and its struct tc_plug_qopt (action, limit).
 fn plug_msg(ifindex: u32, action: i32) -> Vec<u8> {
-    let mut m = tcmsg(ifindex, 0x1_0000);
+    let mut m = tcmsg(ifindex, 0x1_0000, TC_H_ROOT, 0);
     attr(&mut m, TCA_KIND, b"plug\0");
     attr(&mut m, TCA_OPTIONS, &[&action.to_ne_bytes()[..], &PLUG_LIMIT.to_ne_bytes()].concat());
     m
@@ -449,16 +447,13 @@ const TC_ACT_SHOT: u32 = 2;
 /// already there) holds a classic BPF filter in direct-action mode, which a replace swaps at
 /// once, with no gap; both go with the tap.
 fn guard(ifindex: u32, ip: Option<Ipv4Addr>) -> Result<()> {
-    let tc = |handle: u32, parent: u32, info: u32| {
-        [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &handle.to_ne_bytes(), &parent.to_ne_bytes(), &info.to_ne_bytes()].concat()
-    };
     if ip.is_none() {
-        let mut qdisc = tc(CLSACT_HANDLE, TC_H_CLSACT, 0);
+        let mut qdisc = tcmsg(ifindex, CLSACT_HANDLE, TC_H_CLSACT, 0);
         attr(&mut qdisc, TCA_KIND, b"clsact\0");
         netlink(libc::RTM_NEWQDISC, NLM_F_CREATE, &qdisc).map_err(|e| format!("its clsact qdisc (sch_ingress): {e}"))?;
     }
     // Handle 1, priority 1, every protocol (in network order).
-    let mut filter = tc(1, CLSACT_INGRESS, 1 << 16 | u32::from((libc::ETH_P_ALL as u16).to_be()));
+    let mut filter = tcmsg(ifindex, 1, CLSACT_INGRESS, 1 << 16 | u32::from((libc::ETH_P_ALL as u16).to_be()));
     attr(&mut filter, TCA_KIND, b"bpf\0");
     let ops = source_filter(ip);
     let mut opts = Vec::new();
@@ -517,7 +512,7 @@ pub fn plug_tap(tap: &str) -> (bool, Result<()>) {
 /// Our plug at the tap's root (handle 1:, kind "plug"), and nothing else: the kernel
 /// refuses the delete if the root qdisc is not that one.
 fn remove_plug(ifindex: u32) -> Result<()> {
-    let mut m = tcmsg(ifindex, 0x1_0000);
+    let mut m = tcmsg(ifindex, 0x1_0000, TC_H_ROOT, 0);
     attr(&mut m, TCA_KIND, b"plug\0");
     netlink(libc::RTM_DELQDISC, 0, &m)
 }
@@ -620,7 +615,7 @@ fn qdisc_stats(ifindex: u32, handle: u32, wait: std::time::Duration) -> Option<(
     if unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), size) } != 0 {
         return None;
     }
-    let body = tcmsg(ifindex, handle);
+    let body = tcmsg(ifindex, handle, TC_H_ROOT, 0);
     let mut buf = [0u8; 8192];
     let reply = exchange(&sock, libc::RTM_GETQDISC, NLM_F_ECHO, &body, &mut buf).ok()?;
     if reply.len() < 36 || u16::from_ne_bytes([reply[4], reply[5]]) != libc::RTM_NEWQDISC {

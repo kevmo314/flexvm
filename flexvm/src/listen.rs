@@ -440,8 +440,7 @@ impl Peers {
         let r = self.0.resolved.read().unwrap();
         let mut out = vec![from];
         for n in &cfg.peers {
-            let addrs = n.parse::<SocketAddr>().map_or_else(|_| r.get(n).cloned().unwrap_or_default(), |a| vec![a.ip()]);
-            if is_peer(&addrs, from) || cfg.underlays_of(n).iter().any(|&u| IpAddr::V4(u) == from.to_canonical()) {
+            if let Some(addrs) = Self::matching_addrs(&r, cfg, n, from) {
                 out.extend(addrs);
                 out.extend(cfg.underlays_of(n).iter().map(|&u| IpAddr::V4(u)));
             }
@@ -455,15 +454,14 @@ impl Peers {
     fn borrower(&self, cfg: &crate::host::Config, from: IpAddr) -> (String, Vec<IpAddr>) {
         let name = {
             let r = self.0.resolved.read().unwrap();
-            cfg.peers
-                .iter()
-                .find(|n| {
-                    let addrs = n.parse::<SocketAddr>().map_or_else(|_| r.get(*n).cloned().unwrap_or_default(), |a| vec![a.ip()]);
-                    is_peer(&addrs, from) || cfg.underlays_of(n).iter().any(|&u| IpAddr::V4(u) == from.to_canonical())
-                })
-                .cloned()
+            cfg.peers.iter().find(|n| Self::matching_addrs(&r, cfg, n, from).is_some()).cloned()
         };
         (name.unwrap_or_else(|| from.to_canonical().to_string()), self.sender(cfg, from))
+    }
+
+    fn matching_addrs(r: &HashMap<String, Vec<IpAddr>>, cfg: &crate::host::Config, name: &str, from: IpAddr) -> Option<Vec<IpAddr>> {
+        let addrs = name.parse::<SocketAddr>().map_or_else(|_| r.get(name).cloned().unwrap_or_default(), |a| vec![a.ip()]);
+        (is_peer(&addrs, from) || cfg.underlays_of(name).iter().any(|&u| IpAddr::V4(u) == from.to_canonical())).then_some(addrs)
     }
 
     /// The addresses of `names`; a name not resolved yet is looked up.

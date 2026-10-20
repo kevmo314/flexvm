@@ -100,12 +100,7 @@ impl Blob {
 
     fn read_document(&self) -> Result<Vec<u8>> {
         let (r, len) = self.open()?;
-        if len > MAX_DOCUMENT {
-            bail!("document of {len} bytes is over the {MAX_DOCUMENT} byte limit");
-        }
-        let mut data = Vec::with_capacity(len as usize);
-        r.take(MAX_DOCUMENT).read_to_end(&mut data)?;
-        Ok(data)
+        read_document(r, len)
     }
 }
 
@@ -210,15 +205,20 @@ fn diff_ids(config: &[u8], layers: usize) -> Result<Vec<String>> {
     Ok(diff_ids)
 }
 
-/// A cached document: a regular file of exactly `size` bytes (at most `MAX_DOCUMENT`) matching `digest`.
-/// Read from `f` as opened (`path` names it in messages), never reopened by its path.
-pub(super) fn read_verified(path: &Path, f: File, size: u64, digest: &str) -> Result<Vec<u8>> {
-    let len = f.metadata()?.len();
+fn read_document(r: impl Read, len: u64) -> Result<Vec<u8>> {
     if len > MAX_DOCUMENT {
         bail!("document of {len} bytes is over the {MAX_DOCUMENT} byte limit");
     }
     let mut data = Vec::with_capacity(len as usize);
-    f.take(MAX_DOCUMENT).read_to_end(&mut data)?;
+    r.take(MAX_DOCUMENT).read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// A cached document: a regular file of exactly `size` bytes (at most `MAX_DOCUMENT`) matching `digest`.
+/// Read from `f` as opened (`path` names it in messages), never reopened by its path.
+pub(super) fn read_verified(path: &Path, f: File, size: u64, digest: &str) -> Result<Vec<u8>> {
+    let len = f.metadata()?.len();
+    let data = read_document(f, len)?;
     if data.len() as u64 != size || sha256_hex(&data) != digest {
         bail!("cached blob {} does not match {digest} ({size} bytes)", path.display());
     }
