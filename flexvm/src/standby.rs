@@ -1707,7 +1707,7 @@ mod tests {
 
     #[test]
     fn stopped_standbys_share_one_handshake_budget_and_a_live_one_after_them_wins() {
-        use crate::test_util::{JoinWithin, WAIT};
+        use crate::test_util::JoinWithin;
 
         let (_root, host, paths, d) = pool("standby-budget");
         let stopped = ["0", "00"].map(|n| UnixListener::bind(d.join(format!("{n}.sock"))).unwrap());
@@ -1719,8 +1719,9 @@ mod tests {
             send_json(&mut &c, &json!({"claiming": true})).unwrap();
             send_json(&mut &c, &json!({"ok": true, "result": "live"})).unwrap();
         });
-        // Allow a contended helper ample time to answer after the stopped sockets.
-        TAKE_TIMING.with(|t| t.set(Some((Duration::from_millis(50), WAIT))));
+        // Allow a contended helper ample time to answer after the stopped sockets. Each stopped
+        // one waits out this grace too, so it is not `WAIT`, which kept the test 120 s (#1069).
+        TAKE_TIMING.with(|t| t.set(Some((Duration::from_millis(50), Duration::from_secs(5)))));
         let (v, _) = take(&host, &paths, "default", &json!({"name": "test"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!("live"));
         live.join_within().unwrap();
