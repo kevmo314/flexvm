@@ -1716,6 +1716,22 @@ def typed(p, line, want, timeout=30):
     return p.expect(want, timeout, p.expect(re.escape(line[-12:]), timeout, since))
 
 
+def size_follows(p, rows, cols, timeout=30):
+    """Types `stty size` until it reads `rows` `cols`: a resize reaches the guest's pty in its own time
+    (SIGWINCH to the CLI, then to the guest), so one read right after it may still see the old size."""
+    deadline = time.time() + timeout
+    while True:
+        since = len(p.out)
+        p.send("stty size\r")
+        start = p.expect(re.escape("stty size"), 30, since)
+        p.expect(r"\d+ \d+\r\n", 30, start)
+        got = re.search(rb"(\d+) (\d+)\r\n", p.out[start:]).group(0).strip().decode()
+        if got == f"{rows} {cols}":
+            return
+        assert time.time() < deadline, f"stty size still {got!r}, not {rows} {cols}, {timeout} s after the resize"
+        time.sleep(0.2)
+
+
 @case
 def interactive():
     """exec -i streams stdin, exec -it a shell on a pty (echo, stty size following resizes, Ctrl-C to its
@@ -1762,8 +1778,7 @@ def interactive():
         check("exec -it: the terminal is raw", p.raw())
         typed(p, "stty size", r"24 80\r\n")
         p.resize(40, 120)
-        time.sleep(0.5)
-        typed(p, "stty size", r"40 120\r\n")
+        size_follows(p, 40, 120)
         check("exec -it: stty size follows a resize", True)
         typed(p, "tty", r"/dev/pts/\d+\r\n")
         p.send("sleep 100\r")
@@ -1935,15 +1950,16 @@ def interactive():
         pts = re.findall(rb"/dev/pts/\d+", p.out[since:])[-1].decode()
         q = Pty(A, "attach", vm, rows=30, cols=100).wait_raw()
         try:
-            time.sleep(1)
+            # Once the newest one's size reached the pty (in its own time), it keeps it.
+            size = lambda: A.exec(vm, f"stty size < {pts}")[1]
+            check("two attaches: the pty takes the newest one's size", wait_for(lambda: size() == "30 100\n", 30), size())
             _, sizes, _ = A.exec(vm, f"for i in $(seq 40); do stty size < {pts}; sleep 0.05; done | sort -u")
             check("two attaches: idle, the pty keeps the newest one's size", sizes == "30 100\n", sizes)
             typed(p, "stty size", r"30 100\r\n")
             check("two attaches: typing takes stdin, without a resize", True)
             typed(q, "echo from-$((5 * 5))", r"from-25\r\n")
             p.resize(40, 120)
-            time.sleep(0.5)
-            typed(p, "stty size", r"40 120\r\n")
+            size_follows(p, 40, 120)
             check("two attaches: a SIGWINCH resizes", True)
         finally:
             q.close()
