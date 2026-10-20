@@ -816,6 +816,14 @@ is refused until `checkpoint rm`. Checkpoints in other directories than
 `STATE/checkpoints` that pin a removed generation cannot be restored here any more. Layer blobs (`images/blobs/`)
 are a download cache and stay until `system prune`.
 
+To share an images cache, symlink `STATE/images` to it in every state. Each
+root filesystem records the states whose generations use it, and `rmi` and
+`image prune` remove it only after the last of them goes. One an older flexvm
+built in a shared cache is kept until `image prune --force-shared` (when no
+generation here uses it), which also forgets states whose templates directory
+is gone (see
+[Container images](docs/images.md)).
+
 `image prune` removes each `<none>` generation as `rmi ID` would: those a
 VM here (running, paused, standby or stopped) or a checkpoint in
 `STATE/checkpoints` uses stay, and, as with `rmi`, checkpoints elsewhere that
