@@ -263,10 +263,17 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             // only if recorded as that VM's (`Host::own_logs`: a later VM of the name may have
             // come and gone within a poll; its VM may have ended since: read whole, then ended),
             // read from its start below (`log.1` first, if it rotated already). None of its VM's
-            // made, and its VM gone or another's: ended.
-            let made = open_dir(&at).ok().filter(|d| holder.as_ref().is_some_and(|h| host::logs_owner(d).is_some_and(|o| o.of(h))));
+            // made, and its VM gone or another's: ended. Whether its VM runs is read before the
+            // logs are looked for: one that made them, wrote them and ended in between is then
+            // seen to have made them, never taken for one that ended without.
             let now = host.name_holder(name).ok().flatten();
-            if holder.is_none() || now.is_some() && now != holder || made.is_none() && !host.alive(name) {
+            let alive = host.alive(name);
+            #[cfg(test)]
+            if let Some(f) = AMID_LOOK.with(|h| h.borrow_mut().take()) {
+                f();
+            }
+            let made = open_dir(&at).ok().filter(|d| holder.as_ref().is_some_and(|h| host::logs_owner(d).is_some_and(|o| o.of(h))));
+            if holder.is_none() || now.is_some() && now != holder || made.is_none() && !alive {
                 return Ok(());
             }
             dir = made;
@@ -328,6 +335,13 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             (false, Some(_)) => {}
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: run once by a follower whose VM has no logs yet, between reading whether its VM
+    /// runs and looking for its logs.
+    static AMID_LOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// `inspect NAME...`: an array of one object per VM, as docker prints: what `ps --json` says
@@ -1138,6 +1152,36 @@ mod tests {
         assert!(crate::util::output::append_in(&logs, b"first, past the cap\n", 10));
         assert!(crate::util::output::append_in(&logs, b"done\n", 10));
         drop(name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "first, past the cap\ndone\n");
+    }
+
+    /// A known VM that made its logs, wrote them and ended while a follower that had none was
+    /// looking for them: read whole, then ended.
+    #[test]
+    fn logs_follow_reads_the_logs_of_a_vm_that_ended_while_it_looked() {
+        let root = TempDir::new("logs-ended-midlook");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        let got = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (h, sink) = (host.clone(), got.clone());
+        std::thread::spawn(move || {
+            let vm = h.clone();
+            AMID_LOOK.with(|l| {
+                *l.borrow_mut() = Some(Box::new(move || {
+                    let logs = vm.own_logs("job", None).unwrap();
+                    assert!(crate::util::output::append_in(&logs, b"first, past the cap\n", 10));
+                    assert!(crate::util::output::append_in(&logs, b"done\n", 10));
+                    drop(name);
+                }))
+            });
+            let mut out = |d: &[u8]| {
+                sink.lock().unwrap().extend_from_slice(d);
+                Ok(true)
+            };
+            tx.send(logs_to(&h, "job", true, None, &mut out).is_ok())
+        });
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
         assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "first, past the cap\ndone\n");
     }
