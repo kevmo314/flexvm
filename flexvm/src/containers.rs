@@ -994,7 +994,8 @@ mod tests {
         for (owner, ends) in [(Ident { pid: u32::MAX, start: 1, ..Ident::me() }, true), (Ident::me(), false)] {
             for handoff in [false, true] {
                 host.write_log("job", "log", b"old\n");
-                std::fs::write(dir.join(".owner"), serde_json::to_vec(&host::LogsOwner { id: owner.clone(), handoff, to: vec![] }).unwrap()).unwrap();
+                std::fs::write(dir.join(".owner"), serde_json::to_vec(&host::LogsOwner { id: owner.clone(), handoff, to: vec![], by: vec![] }).unwrap())
+                    .unwrap();
                 let (_got, rx) = follow(&host, "job");
                 let ended = rx.recv_timeout(Duration::from_secs(3)).is_ok();
                 assert_eq!(ended, ends && !handoff, "{owner:?} {handoff}");
@@ -1175,7 +1176,7 @@ mod tests {
                 "gone" => drop(name),
                 "came and went" => {
                     drop(name);
-                    let later = host::LogsOwner { id: Ident { pid: 1, start: 1, boot: host::boot_id().into() }, handoff: false, to: vec![] };
+                    let later = host::LogsOwner { id: Ident { pid: 1, start: 1, boot: host::boot_id().into() }, handoff: false, to: vec![], by: vec![] };
                     let made = host.vms("job", ".made").unwrap();
                     std::fs::create_dir(&made).unwrap();
                     std::fs::write(made.join(".owner"), serde_json::to_vec(&later).unwrap()).unwrap();

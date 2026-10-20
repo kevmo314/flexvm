@@ -2506,7 +2506,7 @@ mod exec_tests {
     }
 
     fn tokens(owner: &host::LogsOwner) -> Vec<String> {
-        owner.to.iter().map(|h| h.token.clone()).collect()
+        owner.to.clone()
     }
 
     /// The `run` SIGKILLed after starting its VM process, before that takes the name: the VM
@@ -2522,7 +2522,7 @@ mod exec_tests {
             let mut owner = host::logs_owner(&held).unwrap();
             assert_eq!(tokens(&owner), [out.token.clone()]);
             owner.id = host::Ident { pid: u32::MAX, start: 1, ..host::Ident::me() };
-            owner.to[0].by = owner.id.clone();
+            owner.by = vec![Some(owner.id.clone())];
             std::fs::write(dir.join(".owner"), serde_json::to_vec(&owner).unwrap()).unwrap();
             let token = if theirs { out.token.clone() } else { "another".into() };
             let name = host.take_handed_name("web", Some(&token)).unwrap();
@@ -2549,7 +2549,7 @@ mod exec_tests {
             assert_eq!(tokens(&owner), [outs[0].token.clone(), outs[1].token.clone()]);
             // Both runs SIGKILLed: their identities, the second's last recorded, are gone.
             owner.id = host::Ident { pid: u32::MAX, start: 1, ..host::Ident::me() };
-            owner.to.iter_mut().for_each(|h| h.by = owner.id.clone());
+            owner.by.iter_mut().for_each(|b| *b = Some(owner.id.clone()));
             std::fs::write(dir.join(".owner"), serde_json::to_vec(&owner).unwrap()).unwrap();
             let name = host.take_handed_name("web", Some(&outs[winner].token.clone())).unwrap();
             assert_ne!(std::os::unix::fs::MetadataExt::nlink(&held.metadata().unwrap()), 0, "{winner}");

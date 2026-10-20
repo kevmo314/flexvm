@@ -998,18 +998,26 @@ impl Host {
 
     fn write_owner(&self, name: &str, dir: &File, to: Option<&str>) -> Result<()> {
         let tmp = std::ffi::CString::new(format!("{OWNER}.{}", std::process::id()))?;
-        let mut tokens: Vec<Handoff> = match to {
-            Some(_) => logs_owner(dir).filter(|o| o.handoff).map(|o| o.to).unwrap_or_default(),
-            None => Vec::new(),
+        let pending = to.and_then(|_| logs_owner(dir)).filter(|o| o.handoff);
+        // One `by` per token: unknown (None) for one an earlier version recorded.
+        let (mut tokens, mut by): (Vec<String>, Vec<Option<Ident>>) = match pending {
+            Some(o) => {
+                let by = (0..o.to.len()).map(|i| o.preparer(i).cloned()).collect();
+                (o.to, by)
+            }
+            None => Default::default(),
         };
         // Every pending one is kept, a dead `run`'s too (its VM process may yet take the name by
         // it). Each live one's `run` waits on its VM process, all but one of which will find the
         // name taken: more than a few at once are refused rather than any dropped.
-        if to.is_some() && tokens.iter().filter(|t| t.by.alive()).count() >= MAX_HANDOFFS {
+        if to.is_some() && by.iter().flatten().filter(|b| b.alive()).count() >= MAX_HANDOFFS {
             bail!("vm name {name:?} is taken ({MAX_HANDOFFS} runs are starting a vm of it)");
         }
-        tokens.extend(to.map(|t| Handoff { token: t.into(), by: Ident::me() }));
-        let owner = LogsOwner { id: Ident::me(), handoff: to.is_some(), to: tokens };
+        if let Some(t) = to {
+            tokens.push(t.into());
+            by.push(Some(Ident::me()));
+        }
+        let owner = LogsOwner { id: Ident::me(), handoff: to.is_some(), to: tokens, by };
         let mut f = crate::util::output::open_in(dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
         std::io::Write::write_all(&mut f, &serde_json::to_vec(&owner)?)?;
         drop(f);
@@ -1027,7 +1035,7 @@ impl Host {
     /// handed to this one by `handed`); anything else at their path (not a directory) is retired too.
     /// Under the name.
     fn earlier_logs(&self, name: &str, handed: Option<&str>) -> Result<bool> {
-        let ours = |o: &LogsOwner| o.id == Ident::me() || handed.is_some_and(|t| o.to.iter().any(|h| h.token == t)) || o.preparing();
+        let ours = |o: &LogsOwner| o.id == Ident::me() || handed.is_some_and(|t| o.to.iter().any(|o| o == t)) || o.preparing();
         Ok(match crate::util::output::open_dir(&self.vms(name, "logs")?) {
             Ok(dir) => !logs_owner(&dir).is_some_and(|o| ours(&o)),
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
@@ -3126,27 +3134,29 @@ pub struct LogsOwner {
     /// The tokens of the VM processes they are handed to, pending (`HANDOFF_ENV`, or a standby
     /// claim's `logs_handoff`): one per `run` preparing them before any of those took the name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub to: Vec<Handoff>,
+    pub to: Vec<String>,
+    /// The `run` that prepared each of `to`, by position: a field of its own, so `to` is still
+    /// what earlier versions write and read (a standby of one may be claimed by this one, and
+    /// the other way round); those ignore it, and write none (each token's preparer unknown).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by: Vec<Option<Ident>>,
 }
 
 impl LogsOwner {
+    /// Who prepared the `i`th pending token, if recorded.
+    pub fn preparer(&self, i: usize) -> Option<&Ident> {
+        self.by.get(i).and_then(Option::as_ref)
+    }
+
     /// A handoff's: whether a `run` preparing them is still there (the latest, or an earlier one).
     pub fn preparing(&self) -> bool {
-        self.handoff && (self.id.alive() || self.to.iter().any(|h| h.by.alive()))
+        self.handoff && (self.id.alive() || (0..self.to.len()).filter_map(|i| self.preparer(i)).any(Ident::alive))
     }
 
     /// Whether they are `id`'s: its VM process's, or a handoff `id` prepared.
     pub fn of(&self, id: &Ident) -> bool {
-        self.id == *id || self.handoff && self.to.iter().any(|h| h.by == *id)
+        self.id == *id || self.handoff && (0..self.to.len()).any(|i| self.preparer(i) == Some(id))
     }
-}
-
-/// A pending handoff of a logs' lifetime (`Host::own_logs`): its VM process's token, and the
-/// `run` that prepared it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Handoff {
-    pub token: String,
-    pub by: Ident,
 }
 
 /// Live `run`s at once preparing a handoff of a name's logs (`Host::own_logs`).
@@ -5710,7 +5720,9 @@ pub(crate) mod tests {
             h.write_log("job", "log", "old vm\n");
             let dir = h.vms("job", "logs").unwrap();
             match id {
-                Some(id) => std::fs::write(dir.join(OWNER), serde_json::to_vec(&LogsOwner { id: id.clone(), handoff, to: vec![] }).unwrap()).unwrap(),
+                Some(id) => {
+                    std::fs::write(dir.join(OWNER), serde_json::to_vec(&LogsOwner { id: id.clone(), handoff, to: vec![], by: vec![] }).unwrap()).unwrap()
+                }
                 None => drop(std::fs::remove_file(dir.join(OWNER))),
             }
             crate::util::output::open_dir(&dir).unwrap()
@@ -5749,7 +5761,7 @@ pub(crate) mod tests {
         for (token, retired) in [(Some("tok"), false), (Some("other"), true), (None, true)] {
             let held = owned(Some(&gone), true);
             let dir = h.vms("job", "logs").unwrap();
-            let marker = LogsOwner { id: gone.clone(), handoff: true, to: vec![Handoff { token: "tok".into(), by: gone.clone() }] };
+            let marker = LogsOwner { id: gone.clone(), handoff: true, to: vec!["tok".into()], by: vec![Some(gone.clone())] };
             std::fs::write(dir.join(OWNER), serde_json::to_vec(&marker).unwrap()).unwrap();
             drop(h.take_handed_name("job", token).unwrap());
             assert_eq!(held.metadata().unwrap().nlink() == 0, retired, "{token:?}");
@@ -5758,13 +5770,13 @@ pub(crate) mod tests {
         h.retire_logs("job").unwrap();
         let name = h.take_name("job", false).unwrap();
         let logs = h.own_logs("job", None).unwrap();
-        assert_eq!(logs_owner(&logs), Some(LogsOwner { id: me.clone(), handoff: false, to: vec![] }));
+        assert_eq!(logs_owner(&logs), Some(LogsOwner { id: me.clone(), handoff: false, to: vec![], by: vec![] }));
         drop(name);
         drop(h.take_name("job", false).unwrap());
         assert_ne!(logs.metadata().unwrap().nlink(), 0);
         assert_eq!(
             logs_owner(&h.own_logs("job", Some("t")).unwrap()),
-            Some(LogsOwner { id: me.clone(), handoff: true, to: vec![Handoff { token: "t".into(), by: me }] })
+            Some(LogsOwner { id: me.clone(), handoff: true, to: vec!["t".into()], by: vec![Some(me)] })
         );
     }
 
@@ -5790,24 +5802,69 @@ pub(crate) mod tests {
         };
         // The latest `run` dead, an earlier one live: kept by any VM of the name.
         rewrite(&|o| {
-            o.to.iter_mut().for_each(|t| t.by = gone.clone());
-            o.to[0].by = parent.clone();
+            o.by.iter_mut().for_each(|b| *b = Some(gone.clone()));
+            o.by[0] = Some(parent.clone());
             o.id = gone.clone();
         });
         drop(h.take_name("job", false).unwrap());
         assert_ne!(held.metadata().unwrap().nlink(), 0, "an earlier run is still there");
         // Every `run` dead: no longer refused, and the first's token still keeps them.
-        rewrite(&|o| o.to[0].by = gone.clone());
+        rewrite(&|o| o.by[0] = Some(gone.clone()));
         drop(h.own_logs("job", Some("late")).unwrap());
         rewrite(&|o| {
-            o.to.iter_mut().for_each(|t| t.by = gone.clone());
+            o.by.iter_mut().for_each(|b| *b = Some(gone.clone()));
             o.id = gone.clone();
         });
         let o = logs_owner(&held).unwrap();
-        assert_eq!(o.to.len(), MAX_HANDOFFS + 1);
-        assert_eq!(o.to[0].token, "t0");
+        assert_eq!((o.to.len(), o.by.len()), (MAX_HANDOFFS + 1, MAX_HANDOFFS + 1));
+        assert_eq!(o.to[0], "t0");
         drop(h.take_handed_name("job", Some("t0")).unwrap());
         assert_ne!(held.metadata().unwrap().nlink(), 0, "the first run's vm keeps its logs");
+    }
+
+    /// `.owner` as earlier versions write and read it (before each token's `run` was recorded):
+    /// a standby running one may be claimed by this version, and the other way round. Each
+    /// reads the other's tokens; this one keeps an earlier one's (its `run` unknown) as it adds.
+    #[test]
+    fn logs_owner_records_read_across_versions() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Before {
+            #[serde(flatten)]
+            id: Ident,
+            #[serde(default)]
+            handoff: bool,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            to: Vec<String>,
+        }
+        let me = Ident::me();
+        let gone = Ident { pid: u32::MAX, start: 1, ..me.clone() };
+        // This version's, read by an earlier one.
+        let new = LogsOwner { id: me.clone(), handoff: true, to: vec!["a".into(), "b".into()], by: vec![None, Some(me.clone())] };
+        let old: Before = serde_json::from_slice(&serde_json::to_vec(&new).unwrap()).unwrap();
+        assert_eq!(old, Before { id: me.clone(), handoff: true, to: vec!["a".into(), "b".into()] });
+        // An earlier one's, read by this one: its tokens, none's `run` known.
+        let read: LogsOwner = serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(read, LogsOwner { id: me.clone(), handoff: true, to: vec!["a".into(), "b".into()], by: vec![] });
+        assert_eq!((read.preparer(0), read.preparer(1)), (None, None));
+        let vm: LogsOwner = serde_json::from_slice(&serde_json::to_vec(&Before { id: me.clone(), handoff: false, to: vec![] }).unwrap()).unwrap();
+        assert_eq!(vm, LogsOwner { id: me.clone(), handoff: false, to: vec![], by: vec![] });
+        // On disk: an earlier version's `run` (gone) prepared them; this one's handoff adds to it.
+        let (_dir, h) = host("owner-versions");
+        let dir = h.vms("job", "logs").unwrap();
+        let held = h.own_logs("job", None).unwrap();
+        std::fs::write(dir.join(OWNER), serde_json::to_vec(&Before { id: gone.clone(), handoff: true, to: vec!["old".into()] }).unwrap()).unwrap();
+        drop(h.own_logs("job", Some("new")).unwrap());
+        let o = logs_owner(&held).unwrap();
+        assert_eq!((o.to.clone(), o.by.clone()), (vec!["old".to_string(), "new".into()], vec![None, Some(me.clone())]));
+        let before: Before = serde_json::from_slice(&std::fs::read(dir.join(OWNER)).unwrap()).unwrap();
+        assert_eq!(before, Before { id: me.clone(), handoff: true, to: vec!["old".into(), "new".into()] });
+        // Both `run`s gone: a VM process handed the earlier version's token keeps them by it.
+        let mut o = o;
+        o.id = gone.clone();
+        o.by[1] = Some(gone.clone());
+        std::fs::write(dir.join(OWNER), serde_json::to_vec(&o).unwrap()).unwrap();
+        drop(h.take_handed_name("job", Some("old")).unwrap());
+        assert_ne!(held.metadata().unwrap().nlink(), 0, "kept by the earlier version's token");
     }
 
     #[test]
