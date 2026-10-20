@@ -2044,13 +2044,14 @@ def commit_fail():
     ip, gen, tap = v["ip"], v["gen"], v["tap"]
     check("commit fail: routed to its tap", f"dev {tap}" in peer_route(ip), peer_route(ip))
     before = boundary(B)
+    clear_gate(B, "commit_gate")
+    clear_gate(B, "commit_fail")
     fault(B, "commit_gate", 60000)
     with armed_fault(B, "commit_fail", 60000):
         res, t = background(lambda: migrate(A, n, B))
         try:
             check("commit fail: the arrival got to its commit", wait_for(lambda: reached(B, "commit_gate"), 30), reached(B, "commit_gate"))
-            # From here at most 5 s: Rust only gates with 10 s to spare before the deadlines.
-            fault(B, "commit_gate", 5000)
+            # Parked until the checks below are done (`finally`): Rust only gates with 10 s to spare before the deadlines.
             pid = (reached(B, "commit_gate") or [0])[0]
             fcs = [c for c in children(pid) if b"--api-sock" in open(f"/proc/{c}/cmdline", "rb").read()]
             sock = lambda c: (lambda a: a[a.index(b"--api-sock") + 1].decode())(open(f"/proc/{c}/cmdline", "rb").read().split(b"\0"))
