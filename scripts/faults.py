@@ -6427,9 +6427,9 @@ def mem_refused_fill():
 class Watch:
     """While eviction runs on `host`: each of `names`' controller ticks (from
     `debug status`) and its memory requests, asked as its guest does (`MEM`,
-    for a size it needs no change at) every 250 ms; and MemAvailable."""
-    def __init__(self, host, names):
-        self.host, self.stop = host, threading.Event()
+    for a size it needs no change at) every 250 ms; and MemAvailable (`avail`: what the host is shown instead)."""
+    def __init__(self, host, names, avail=None):
+        self.host, self.stop, self.available = host, threading.Event(), avail or mem_available
         self.socks, self.ticks, self.asks, self.avail = {}, {n: [] for n in names}, {n: [] for n in names}, []
         # Polls of its controller that went unanswered while it still ran here (a timeout is one).
         self.stuck = {n: [] for n in names}
@@ -6489,7 +6489,7 @@ class Watch:
 
     def mem(self):
         while not self.stop.wait(0.1):
-            self.avail.append((time.time(), mem_available()))
+            self.avail.append((time.time(), self.available()))
 
     def report(self, label):
         """Per VM: the longest gap between controller ticks seen, and memory requests answered (max ms)."""
@@ -6599,11 +6599,10 @@ def evict_no_pingpong():
     m = setup(n, mib=600)
     time.sleep(11)  # the start's grants age out
     base, rss = mem_available(), cgroup(A, n)[0]
-    # B under its own mark (by a margin: this host's MemAvailable moves by a
-    # GiB or more as other work comes and goes, and must not give it room):
-    # taking the VM would leave it under, and it would only move it back. A's
-    # mark is further up, so A keeps trying.
-    with marks(512, base + 4000, A), marks(512, base + 3000, B) as b:
+    # B under its own mark (by a margin): taking the VM would leave it under, and it would only move it
+    # back. A's mark is further up, so A keeps trying. Both shown `base` MiB available throughout: this
+    # machine's MemAvailable moves by a GiB or more as other work comes and goes.
+    with mem_available_as(A, base), mem_available_as(B, base), marks(512, base + 4000, A), marks(512, base + 3000, B) as b:
         seen = hosts_over(n, 25)
         check("no ping-pong: a peer it would put under its mark refuses it", seen == [A.addr] and where(n) == {A: "running"},
               (seen, where(n), log(A, n)[-1200:]))
@@ -6629,22 +6628,25 @@ def evict_grower():
         raise Skip("its guests need room to grow past 2 GiB (one at its ceiling is starved, and moved for that)")
     sums.update({n: setup(n, mib=900, template=tpl) for n in big})
     time.sleep(11)  # the starts' grants age out
+    # A shown what its VMs' growth leaves of `base`, B `base`: never what other work on this machine does.
     base = mem_available()
     reserve, high = base - 2600, base - 700
+    model = modeled_memory(A, base, big + [g])
+    available = model.now
 
     def rss(n):
         try:
             return cgroup(A, n)[0]
         except (OSError, KeyError, TypeError):
             return None
-    with Watch(A, big + [g]) as w, marks(reserve, high):
+    with model, mem_available_as(B, base), Watch(A, big + [g], avail=available) as w, marks(reserve, high):
         grow(A, g, 1300, 100)
         moved = None
         end = time.time() + 120
         while time.time() < end:
             st = registry_state(A, g)
             if moved is None and st != "running":
-                moved = (time.time(), mem_available(), {n: rss(n) for n in big + [g] if n != g or st == "source"})
+                moved = (time.time(), available(), {n: rss(n) for n in big + [g] if n != g or st == "source"})
             if st is None:
                 break  # released: its copy here is gone
             time.sleep(0.1)
@@ -6869,6 +6871,46 @@ class mem_available_as:
             os.unlink(self.path)
         else:
             self.write(self.was)
+
+
+class modeled_memory(mem_available_as):
+    """`host` shown `base` MiB available less what `names`' VMs there have grown by since (their memory.current),
+    re-set every 50 ms: their own growth moves it, never other work on this machine."""
+    def __init__(self, host, base, names):
+        super().__init__(host, base)
+        self.cgroups = {}
+        for n in names:
+            self.cgroups[n] = "/sys/fs/cgroup" + open(f"/proc/{fc_pid(host, n)}/cgroup").read().strip().split(":", 2)[2] + "/memory.current"
+        self.start = self.used()
+        self.done, self.last = threading.Event(), base
+
+    def used(self):
+        total = 0
+        for path in self.cgroups.values():
+            try:
+                total += int(open(path).read()) >> 20
+            except (OSError, ValueError):
+                pass  # moved away (its cgroup gone): it no longer counts here
+        return total
+
+    def now(self):
+        return self.last
+
+    def run(self):
+        while not self.done.wait(0.05):
+            self.last = max(0, self.mib - (self.used() - self.start))
+            self.write(str(self.last))
+
+    def __enter__(self):
+        super().__enter__()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *e):
+        self.done.set()
+        self.thread.join()
+        super().__exit__(*e)
 
 
 def reserve_of(host):
