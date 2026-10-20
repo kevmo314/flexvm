@@ -7598,7 +7598,9 @@ def peer_unresolvable():
         check("peer unresolvable: a route message from a peer is taken", r.get("ok"), (r, f"{time.time() - t:.2f}s"))
         t = time.time()
         r = withdraw()
-        check("peer unresolvable: and the next at once", r.get("ok") and time.time() - t < 1, (r, f"{time.time() - t:.2f}s"))
+        # A request waiting on the name's lookup is answered at the listener's ADMIT_WAIT (1.5 s) at the latest:
+        # the bound is that, not a timing of the answer on a loaded host.
+        check("peer unresolvable: and the next at once", r.get("ok") and time.time() - t < 1.5, (r, f"{time.time() - t:.2f}s"))
     finally:
         stop_listener(B)
         start_listener(B)
