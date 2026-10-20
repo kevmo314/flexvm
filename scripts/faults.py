@@ -350,7 +350,7 @@ def vms(host):
                          guest_mib=d["describe"]["guest_mib"], admitted_mib=d["describe"]["admitted_mib"],
                          throttled=d["describe"]["throttled"], tap_dropped=d["describe"].get("tap_dropped"),
                          checkpoint_copy=d["describe"]["checkpoint_copy"], checkpoint_copy_stats=d["checkpoint_copy_stats"],
-                         background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"],
+                         background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"], clock_syncs=d.get("clock_syncs"),
                          remote_left=d["remote_left"], settling=d.get("settling"))
     return out
 
@@ -834,9 +834,10 @@ def basic(swept=False):
 def route():
     n = "ft-route"
     m = setup(n)
-    fault(A, "route", 1000)
-    r = ok(migrate(A, n, B))
-    check("route: migrate reports reroute error but succeeds", r["reroute_error"] is not None, r["reroute_error"])
+    # Armed until the migration answered: its reroute runs after the commit's ack.
+    with armed_fault(A, "route", 600000):
+        r = ok(migrate(A, n, B))
+    check("route: migrate reports reroute error but succeeds", "injected fault: route_via failed" in (r["reroute_error"] or ""), r["reroute_error"])
     w = where(n)
     check("route: source never resumed", w.get(A) in (None, "source") and w.get(B) == "running", w)
     st = wait_released(B, n)
@@ -1218,13 +1219,24 @@ def guest_calls():
     skews = tsc_skews(B, n)
     check("guest calls: the vCPUs' TSCs agree", tscs_agree(skews), skews)
     check("guest calls: target stepped the guest clock", *guest_clock_right(B, n))
-    # A clock step the guest carried out but whose answer was lost goes again.
+    # A clock step the guest carried out but whose answer was lost goes again: one reply lost
+    # (`tripped_once`), the step it was, and the step then succeeding (its end counted: `clock_syncs`).
     before = vms(B)[n]["guest_retries"].get("CLOCK", 0)
+    # The arrival's own clock check ended first (one so far), so the count below is the resume's.
+    check("guest calls: the arrival's clock check ended", wait_for(lambda: sum(vms(B)[n]["clock_syncs"].values()) >= 1, 30), vms(B)[n]["clock_syncs"])
+    syncs = vms(B)[n]["clock_syncs"]
     pause(B, n)
-    fault(B, "guest_lose_reply", 300)
-    resume(B, n)
+    clear_gate(B, "guest_lose_reply")
+    with armed_fault(B, "guest_lose_reply", 600000):
+        resume(B, n)
+        lost = wait_for(lambda: reached(B, "guest_lose_reply"), 30)
+    check("guest calls: a reply was lost", lost, reached(B, "guest_lose_reply"))
     retried = lambda: vms(B)[n]["guest_retries"].get("CLOCK", 0) > before
-    check("guest calls: a clock step with its reply lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
+    check("guest calls: the clock step whose reply was lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
+    ended = lambda: sum(vms(B)[n]["clock_syncs"].values()) > sum(syncs.values())
+    check("guest calls: and the resume's clock check succeeded", wait_for(ended, 30) and vms(B)[n]["clock_syncs"] == {**syncs, "ok": syncs["ok"] + 1},
+          (syncs, vms(B)[n]["clock_syncs"], log(B, n)[-500:]))
+    check("guest calls: the guest clock is right", *guest_clock_right(B, n))
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
 
 
@@ -1284,7 +1296,7 @@ def exec_background():
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
     session slots; nor do interrupted ones (SIGINT stops the command), or abandoned sessions
     whose client disconnected or was killed outright, nor exits whose client reads its output
-    slowly or stays silent after it; a client that takes no output for 60 s is dropped."""
+    slowly or stays silent after it; a client that takes no output for 60 s keeps all of it."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # The guest's sweeper reads the knob only between its sweeps, which come a minute apart without it:
@@ -1300,8 +1312,8 @@ def exec_background():
         s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": {"argv": ["sh", "-c", cmd]}}) + "\n").encode())
         return s
 
-    # #505. A client that stops reading is dropped after 60 s without progress, freeing its relay and
-    # control slot; its session stays in the guest. Started now, checked after the rest below.
+    # #505, #999. A client that stops reading for over 60 s keeps its relay (the command waits for it)
+    # while the host has session slots to spare. Started now, checked after the rest below.
     stalled_id = os.urandom(16).hex()
     stalled = raw_exec(stalled_id, "head -c 100000000 /dev/zero")
     stalled_at = time.time()
@@ -1387,24 +1399,46 @@ def exec_background():
     big = 200000
     drained = []
 
-    def slow_reader(size, wait):
-        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" sh -c "head -c {size} /dev/zero" | (sleep {wait}; cat) | wc -c'
-        r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n], capture_output=True, text=True, timeout=180, env=ENV)
-        drained.append((size, (r.returncode, r.stdout.strip(), r.stderr.strip()[-200:])))
+    # The 70 readers below read only once `release` exists: after the checks made while they wait, however
+    # long starting 70 CLIs took.
+    release = os.path.join(A.run, "exec-bg-release")
+    with suppress(FileNotFoundError):
+        os.unlink(release)
 
-    readers = [threading.Thread(target=slow_reader, args=(big, 6)) for _ in range(70)]
+    def slow_reader(size, wait):
+        hold = f"sleep {wait}" if wait else f'while [ ! -e "$4" ]; do sleep 0.05; done'
+        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" sh -c "head -c {size} /dev/zero" | ({hold}; cat) | wc -c'
+        # Its own session, so a timeout ends the whole pipeline (the waiting subshell too), not just bash.
+        p = subprocess.Popen(["bash", "-c", cmd, BIN, A.state, A.run, n, release], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, env=ENV, start_new_session=True)
+        try:
+            out, err = p.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+            out, err = p.communicate()
+        drained.append((size, (p.returncode, out.strip(), err.strip()[-200:])))
+
+    readers = [threading.Thread(target=slow_reader, args=(big, None)) for _ in range(70)]
     start = time.time()
-    for r in readers:
-        r.start()
-        time.sleep(0.02)
-    full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
-    check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
-    t = time.time()
-    r = sh(A, n, "echo hi")
-    took = time.time() - t
-    check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
-    for r in readers:
-        r.join()
+    try:
+        for r in readers:
+            r.start()
+            time.sleep(0.02)
+        full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
+        check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
+        t = time.time()
+        r = sh(A, n, "echo hi")
+        took = time.time() - t
+        check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
+    finally:
+        # Released however the checks went (one raising too), and gone once they all read.
+        open(release, "w").close()
+        for r in readers:
+            if r.ident is not None:
+                r.join()
+        with suppress(FileNotFoundError):
+            os.unlink(release)
     bad = [d for d in drained if d[1] != (0, str(d[0]), "")]
     check("exec bg: 70 slow readers all get all their output and status", len(drained) == 70 and not bad, bad[:3])
     # More output than the guest keeps for a session (4 MiB): the command waits for its reader, and the
@@ -1414,15 +1448,31 @@ def exec_background():
     check("exec bg: 6 MB to a reader that stalls for 15 s all arrive", drained == [(6000000, (0, "6000000", ""))], drained)
     check("exec bg: execs still start after the slow readers", sh(A, n, "echo hi") == (0, "hi"))
     time.sleep(max(0, stalled_at + 65 - time.time()))
-    got, t = 0, time.time()
-    stalled.settimeout(10)
+    # Every byte, in order, then its exit, unacknowledged (the client hangs up without SESSION_DONE).
+    got, code, t = 0, None, time.time()
+    stalled.settimeout(30)
+    f = stalled.makefile("rb")
     try:
-        while d := stalled.recv(1 << 20):
-            got += len(d)
+        f.readline()
+        while (head := f.read(5)) and len(head) == 5:
+            kind, size = struct.unpack("<BI", head)
+            data = f.read(size)
+            if kind == 1 and data[:8] == struct.pack("<Q", got):
+                got += size - 8
+            elif kind == 3:
+                code = (struct.unpack("<Q", data[:8])[0], struct.unpack("<i", data[8:12])[0])
+                break
+            elif kind != 4:
+                got = (got, kind, data[:8])
+                break
     except OSError as e:
         got = (got, str(e))
+    f.close()
     stalled.close()
-    check("exec bg: a client that took nothing for 60 s was dropped", isinstance(got, int) and 0 < got < 100000000 and time.time() - t < 10, got)
+    check("exec bg: a client that took nothing for 60 s keeps its relay and gets every byte",
+          got == 100000000 and code == (got, 0) and time.time() - t < 60, (got, code, time.time() - t))
+    # Dropping a stalled client only near the host's session limit (192 of 256) is unit-tested
+    # (vmproc session_relay_tests): 192 sessions at once are past the guest's 64 running ones.
     frames = []
     if isinstance(got, int):
         with socket.socket(socket.AF_UNIX) as s:
@@ -1436,8 +1486,8 @@ def exec_background():
                 data = f.read(size)
                 frames.append((kind, data if kind == 4 else data[:8]))
             f.close()
-    check("exec bg: its session stayed in the guest, for a reattach from where it was dropped",
-          frames[1:] == [(4, stalled_id.encode()), (1, struct.pack("<Q", got))], frames)
+    check("exec bg: its unacknowledged exit stayed in the guest, for a reattach from where it hung up",
+          frames[1:] == [(4, stalled_id.encode()), (3, struct.pack("<Q", got))], frames)
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(30)
         s.connect(sock)
@@ -4109,9 +4159,21 @@ def signals():
     after SIGTERM."""
     n = "ft-signals"
     setup(n)
-    fault(A, "pages", 3000)
-    ok(migrate(A, n, B))
-    signal_vm(A, n, signal.SIGTERM)
+    # The target's background pull held (`pull_gate`) until the source has taken the SIGTERM (its log says
+    # so): it cannot have every page, so the source is still one, however long each step takes.
+    clear_gate(B, "pull_gate")
+    with armed_fault(B, "pull_gate", 600000):
+        try:
+            ok(migrate(A, n, B))
+            check("signals: the target's pull is held", wait_for(lambda: reached(B, "pull_gate"), 30), reached(B, "pull_gate"))
+            check("signals: still the source when SIGTERM comes", vms(A).get(n, {}).get("state") == "source", where(n))
+            # Only what is logged after this SIGTERM: an earlier run's acknowledgement stays in the log.
+            since = len(log(A, n))
+            signal_vm(A, n, signal.SIGTERM)
+            check("signals: the source took the SIGTERM as one", wait_for(lambda: "migrating away; it ends once the target has its memory" in log(A, n)[since:], 30),
+                  log(A, n)[since:][-500:])
+        finally:
+            release(B, "pull_gate")
     st = wait_released(B, n)
     check("signals: SIGTERM on a source: no suspend, released", st["released"] is True and not os.path.exists(
         os.path.join(A.state, "suspended", n)), st)
@@ -8401,7 +8463,7 @@ def standby_stalled():
 
 def standby_refill_race():
     """A refill granted just before pressure starts, whose standby has not
-    created its lock file yet (`standby_lock_stall`, 3 s): relief does not
+    created its lock file yet (held before it: `standby_lock_gate`): relief does not
     pass it by, but holds eviction off until the standby is listed, then
     signals it and marks the pressure, before any eviction starts."""
     t, n = args.template, "ft-sb-refill-race"
@@ -8411,13 +8473,22 @@ def standby_refill_race():
         if os.path.exists(f):
             os.remove(f)
     fault(A, "no_evict", 600000)
-    fault(A, "standby_lock_stall", 2000)
+    # The refill's standby held before its lock file (`standby_lock_gate`) until relief, under pressure, is seen
+    # holding eviction off for it (`relief_waits`): the race, whatever the timing. The refill waits for that lock
+    # as long as the test needs (`long_locked`), not its 5 s.
+    for g in ("standby_lock_gate", "relief_waits", "long_locked"):
+        clear_gate(A, g)
+        fault(A, g, 600000)
     res, seen = {}, {}
     th = start_thread(target=lambda: res.update(r=set_standby(A, t, 1)))
     try:
-        time.sleep(1)
+        check("standby refill race: the refill's standby is held before its lock file", wait_for(lambda: reached(A, "standby_lock_gate"), 30),
+              reached(A, "standby_lock_gate"))
         avail = mem_available()
         with marks(avail + 4096, avail + 4608):
+            relief = wait_for(lambda: reached(A, "relief_waits"), 30)
+            release(A, "standby_lock_gate")
+            check("standby refill race: relief held eviction off for the unlisted standby", relief, reached(A, "relief_waits"))
             start = time.time()
             while time.time() - start < 15 and len(seen) < 2:
                 for k, f in (("pressure", pressure), ("active", active)):
@@ -8427,7 +8498,9 @@ def standby_refill_race():
             pids = standby_pids(A, t)
             th.join()
     finally:
-        fault(A, "standby_lock_stall", 0)
+        release(A, "standby_lock_gate")
+        fault(A, "relief_waits", 0)
+        fault(A, "long_locked", 0)
         fault(A, "no_evict", 0)
     check("standby refill race: the standby being started is stopped, and marks the pressure", "pressure" in seen, seen)
     check("standby refill race: eviction waits for it", "active" in seen and "pressure" in seen and seen["active"] > seen["pressure"], seen)
@@ -8928,11 +9001,20 @@ def suspend_killed():
     setup(n, mib=20)
     ip = vms(A)[n]["ip"]
     pid = vm_pid(A, n)
-    with armed_fault(A, "suspend_stall", 10000):
-        os.kill(pid, signal.SIGTERM)
-        d = os.path.join(A.state, "suspended", n)
-        check("suspend killed: published", wait_for(lambda: os.path.exists(os.path.join(d, "manifest.json")), 30), d)
-        os.kill(pid, signal.SIGINT)
+    # Held once published (`suspend_gate`) until the SIGINT is seen taken (its destroy waiting for the
+    # suspend: `destroy_wait`), however long either takes.
+    clear_gate(A, "suspend_gate")
+    clear_gate(A, "destroy_wait")
+    with armed_fault(A, "suspend_gate", 600000), armed_fault(A, "destroy_wait", 600000):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            d = os.path.join(A.state, "suspended", n)
+            check("suspend killed: published, and held", wait_for(lambda: pid in reached(A, "suspend_gate"), 60) and os.path.exists(os.path.join(d, "manifest.json")),
+                  (reached(A, "suspend_gate"), d))
+            os.kill(pid, signal.SIGINT)
+            check("suspend killed: the kill is taken while it is held", wait_for(lambda: pid in reached(A, "destroy_wait"), 30), reached(A, "destroy_wait"))
+        finally:
+            release(A, "suspend_gate")
         check("suspend killed: the process ends", wait_for(lambda: not alive(pid), 30), pid)
     check("suspend killed: no suspended vm left", n not in vms(A) and not os.path.exists(d), (vms(A).get(n), os.path.exists(d)))
     check("suspend killed: address withdrawn", not addr(A, ip).get("holder") and addr(A, ip).get("withdrawn"), addr(A, ip))

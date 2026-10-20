@@ -116,7 +116,18 @@ pub struct Pages {
     /// the deadline.
     pub(super) failing: Mutex<Vec<(usize, Instant)>>,
     pub(super) failing_len: AtomicUsize,
+    /// BASE and REMOTE pages whose install found them already mapped (EEXIST), with the state they were claimed from
+    /// (at most `PRESET_KEPT`; `preset_more` counts the rest): see `Pager::foreign_pages`.
+    pub(super) preset: Mutex<Vec<(usize, u8)>>,
+    pub(super) preset_more: AtomicUsize,
+    /// Whether a BASE page has template data (unset: all do). A hole found mapped is zero either way: not noted.
+    pub(super) base_data: OnceLock<Box<dyn Fn(usize) -> bool + Send + Sync>>,
 }
+
+/// How many `Pages::preset` pages are kept.
+pub(super) const PRESET_KEPT: usize = 1024;
+/// How many of them are logged.
+const PRESET_LOGGED: usize = 4;
 
 /// Pages per `touched` bit: one page of `states`.
 pub(super) const CHUNK: usize = 4096;
@@ -368,6 +379,26 @@ impl Pages {
         resolved
     }
 
+    /// Claimed `page` (from `from`) turned out to be mapped already: no install of ours put it there.
+    fn note_preset(&self, page: usize, from: u8) {
+        if from == BASE && self.base_data.get().is_some_and(|data| !data(page)) {
+            return;
+        }
+        let mut preset = self.preset.lock().unwrap();
+        // The first few of a VM's: enough to show the mechanism (#949) when it recurs (not the unit tests' fakes).
+        if !cfg!(test) && preset.len() < PRESET_LOGGED {
+            crate::log!(
+                "uffd: page {page:#x} (guest memory offset {:#x}, claimed {}) was already mapped in firecracker: not installed by the pager",
+                page * crate::util::PAGE_SIZE,
+                if from == REMOTE { "REMOTE" } else { "BASE" }
+            );
+        }
+        match preset.len() < PRESET_KEPT {
+            true => preset.push((page, from)),
+            false => _ = self.preset_more.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
     /// Claimed REMOTE `page` failed to install: notes since when, unless it already kept failing. Only while it is
     /// claimed, so never after it was resolved.
     fn note_failure(&self, page: usize) {
@@ -477,6 +508,9 @@ impl Pages {
                     i += done;
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    if from == BASE || from == REMOTE {
+                        self.note_preset(i, from);
+                    }
                     resolved += self.settle(i, true, from) as usize;
                     i += 1;
                 }

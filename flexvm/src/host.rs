@@ -4589,6 +4589,18 @@ pub fn tripped(name: &str) -> bool {
     armed
 }
 
+/// Test fault `name`, armed: true only for the first of this process's threads to get here since a test removed its
+/// reached-marker (RUN/gates/NAME.PID, made here), so a test loses exactly one reply and knows when it was.
+pub fn tripped_once(name: &str) -> bool {
+    if !fault(name) {
+        return false;
+    }
+    let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) else { return false };
+    let _ = host_dir(&dir, 0o700);
+    let marker = dir.join(format!("{name}.{}", std::process::id()));
+    File::options().write(true).create_new(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(marker).is_ok()
+}
+
 /// Test hook: parks here, if `name` is armed when reached, until the test removes this process's
 /// reached-marker (RUN/gates/NAME.PID; `rm -rf RUN/gates` releases every one), or for at most 10 minutes.
 /// Neither the arming's expiry nor the host lock releases it: it parks under the lock too.
