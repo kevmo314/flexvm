@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bail;
-use crate::host::fault;
+use crate::host::{fault, tripped_once};
 use crate::util::{By, Error, Result};
 
 #[path = "../../guest/src/proto.rs"]
@@ -74,7 +74,7 @@ pub fn abandon(uds: &Path) {
 }
 
 /// All I/O by `deadline`; nothing is sent once it has passed. Test faults: `guest_drop`,
-/// `guest_lose_reply`.
+/// `guest_lose_reply` (one reply each arming: `tripped_once`).
 fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<(u8, Vec<u8>)> {
     ask_watched(uds, line, deadline, |_| Ok(()))
 }
@@ -95,7 +95,7 @@ fn ask_watched(uds: &Path, line: &str, deadline: Instant, watch: impl FnOnce(&Un
     watch(&s)?;
     let reply = read_frame(&mut handshake(By { s, at: deadline }, line)?)?;
     let reply = reply.ok_or_else(|| lost(format!("guest closed the connection before answering {line:?}")))?;
-    if fault("guest_lose_reply") {
+    if tripped_once("guest_lose_reply") {
         return Err(lost("injected fault: guest reply lost"));
     }
     Ok(reply)

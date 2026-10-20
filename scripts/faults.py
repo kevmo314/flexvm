@@ -350,7 +350,7 @@ def vms(host):
                          guest_mib=d["describe"]["guest_mib"], admitted_mib=d["describe"]["admitted_mib"],
                          throttled=d["describe"]["throttled"], tap_dropped=d["describe"].get("tap_dropped"),
                          checkpoint_copy=d["describe"]["checkpoint_copy"], checkpoint_copy_stats=d["checkpoint_copy_stats"],
-                         background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"],
+                         background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"], clock_syncs=d.get("clock_syncs"),
                          remote_left=d["remote_left"], settling=d.get("settling"))
     return out
 
@@ -1218,13 +1218,24 @@ def guest_calls():
     skews = tsc_skews(B, n)
     check("guest calls: the vCPUs' TSCs agree", tscs_agree(skews), skews)
     check("guest calls: target stepped the guest clock", *guest_clock_right(B, n))
-    # A clock step the guest carried out but whose answer was lost goes again.
+    # A clock step the guest carried out but whose answer was lost goes again: one reply lost
+    # (`tripped_once`), the step it was, and the step then succeeding (its end counted: `clock_syncs`).
     before = vms(B)[n]["guest_retries"].get("CLOCK", 0)
+    # The arrival's own clock check ended first (one so far), so the count below is the resume's.
+    check("guest calls: the arrival's clock check ended", wait_for(lambda: sum(vms(B)[n]["clock_syncs"].values()) >= 1, 30), vms(B)[n]["clock_syncs"])
+    syncs = vms(B)[n]["clock_syncs"]
     pause(B, n)
-    fault(B, "guest_lose_reply", 300)
-    resume(B, n)
+    clear_gate(B, "guest_lose_reply")
+    with armed_fault(B, "guest_lose_reply", 600000):
+        resume(B, n)
+        lost = wait_for(lambda: reached(B, "guest_lose_reply"), 30)
+    check("guest calls: a reply was lost", lost, reached(B, "guest_lose_reply"))
     retried = lambda: vms(B)[n]["guest_retries"].get("CLOCK", 0) > before
-    check("guest calls: a clock step with its reply lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
+    check("guest calls: the clock step whose reply was lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
+    ended = lambda: sum(vms(B)[n]["clock_syncs"].values()) > sum(syncs.values())
+    check("guest calls: and the resume's clock check succeeded", wait_for(ended, 30) and vms(B)[n]["clock_syncs"] == {**syncs, "ok": syncs["ok"] + 1},
+          (syncs, vms(B)[n]["clock_syncs"], log(B, n)[-500:]))
+    check("guest calls: the guest clock is right", *guest_clock_right(B, n))
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
 
 
