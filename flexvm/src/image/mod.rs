@@ -420,10 +420,21 @@ fn note(cache: &Path, rootfs: &Path, templates: &Path, existing: bool) -> Result
         return Ok(());
     }
     let users = users_dir(&pinned, &cached, true, cache.is_symlink())?.unwrap();
-    let (key, path) = (rootfs_user_key(templates)?, templates.as_os_str().as_bytes());
-    // Each open records again: an unchanged record is neither rewritten nor synced.
-    if std::fs::read(users.path.join(&key)).ok().as_deref() == Some(path) {
-        return Ok(());
+    let (me, path) = (rootfs_user_key(templates)?, templates.as_os_str().as_bytes());
+    let record = |key: &str| std::fs::read(users.path.join(key)).ok();
+    let mut key = me.clone();
+    match record(&key) {
+        // Each open records again: an unchanged record is neither rewritten nor synced.
+        Some(p) if p == path => return Ok(()),
+        // Another live state's under this key: a device renumbered since it was written (a reboot). Kept,
+        // and this one's beside it, under a key of its own (removal drops a record naming this directory).
+        Some(p) if rootfs_user_key(Path::new(std::ffi::OsStr::from_bytes(&p))).is_ok_and(|k| k != me) => {
+            key = format!("{me}-{}", crate::template::state_key(templates));
+            if record(&key).as_deref() == Some(path) {
+                return Ok(());
+            }
+        }
+        _ => {}
     }
     crate::util::write_file_mode(&users.path, &key, path, true, 0o600)?;
     Ok(sync_dir(&pinned.path)?)
@@ -1324,6 +1335,37 @@ mod tests {
         }
         assert_eq!(remove_rootfs(&cache, &rootfs, &templates, false).unwrap(), Removal::Removed);
         assert!(!rootfs.exists() && !users.exists());
+    }
+
+    #[test]
+    fn a_renumbered_device_never_overwrites_another_states_record() {
+        let root = crate::test_util::TempDir::new("image-user-collision");
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let cache = root.join("images");
+        std::fs::create_dir_all(cache.join("rootfs")).unwrap();
+        let rootfs = cache.join("rootfs/k.ext4");
+        for ext in ["ext4", "ok", "conf"] {
+            std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+        }
+        let users = rootfs.with_extension("users");
+        std::fs::create_dir(&users).unwrap();
+        // A's record from before a reboot, under the (dev, ino) B has now.
+        let collided = users.join(rootfs_user_key(&b).unwrap());
+        std::fs::write(&collided, a.as_os_str().as_bytes()).unwrap();
+        note_rootfs(&cache, &rootfs, &b).unwrap();
+        assert_eq!(std::fs::read(&collided).unwrap(), a.as_os_str().as_bytes(), "A's record is kept");
+        let own = users.join(format!("{}-{}", rootfs_user_key(&b).unwrap(), crate::template::state_key(&b)));
+        assert_eq!(std::fs::read(&own).unwrap(), b.as_os_str().as_bytes());
+        // Again: unchanged, and no third record.
+        note_rootfs(&cache, &rootfs, &b).unwrap();
+        assert_eq!(std::fs::read_dir(&users).unwrap().count(), 2);
+        // B's last generation goes: its own record does, A's keeps the entry.
+        assert_eq!(remove_rootfs(&cache, &rootfs, &b, false).unwrap(), Removal::Absent);
+        assert!(!own.exists());
+        assert_eq!(std::fs::read(&collided).unwrap(), a.as_os_str().as_bytes());
+        assert!(entry_complete(&rootfs));
     }
 
     #[test]
