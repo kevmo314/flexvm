@@ -109,14 +109,17 @@ listeners = {}
 # What `rm` deleted of a VM's NAME.log, by (run directory, name): `log` reads it first, so it reads
 # on as from one file across the removal (a VM's last words, written as `rm -f` kills it, included).
 REMOVED_LOGS = {}
+# The same of NAME.log.1, its previous rotation: only failure dumps (`dump_logs`) read it.
+REMOVED_PREV = {}
 
 
 class HeldLogs:
-    """`rm [-f] NAME...` deletes the VMs' logs. Each NAME.log there while it runs is held open (one
-    a rotation made as the VM ended too), so `kept` reads what the removal unlinked, in order."""
+    """`rm [-f] NAME...` deletes the VMs' logs. Each NAME.log.1 and NAME.log there while it runs is
+    held open (one a rotation made as the VM ended too), so `kept` reads what the removal unlinked, in order."""
 
     def __init__(self, vms_dir, names):
-        self.paths = {n: os.path.join(vms_dir, f"{n}.log") for n in names}
+        # The previous rotation first: what is held is read back in the order first seen.
+        self.paths = {n: [(ext, os.path.join(vms_dir, f"{n}{ext}")) for ext in (".log.1", ".log")] for n in names}
         self.held = {n: {} for n in names}
         self.done = threading.Event()
         self.look()
@@ -124,31 +127,33 @@ class HeldLogs:
         self.watcher.start()
 
     def look(self):
-        for n, path in self.paths.items():
-            try:
-                f = open(path, errors="replace")
-            except OSError:
-                continue
-            ino = os.fstat(f.fileno()).st_ino
-            if ino in self.held[n]:
-                f.close()
-            else:
-                self.held[n][ino] = f
+        for n, paths in self.paths.items():
+            for ext, path in paths:
+                try:
+                    f = open(path, errors="replace")
+                except OSError:
+                    continue
+                ino = os.fstat(f.fileno()).st_ino
+                if ino in self.held[n]:
+                    f.close()
+                else:
+                    # Under the name it was first seen by: a NAME.log rotated meanwhile is still the log's.
+                    self.held[n][ino] = (ext, f)
 
     def watch(self):
         while not self.done.wait(0.005):
             self.look()
 
     def kept(self):
-        """{name: what its logs held}, of those `rm` unlinked."""
+        """{(name, ".log" or ".log.1"): what those logs held}, of those `rm` unlinked."""
         self.done.set()
         self.watcher.join()
         kept = {}
         for n, files in self.held.items():
-            for f in files.values():
+            for ext, f in files.values():
                 with f:
                     if os.fstat(f.fileno()).st_nlink == 0:
-                        kept[n] = kept.get(n, "") + f.read()
+                        kept[(n, ext)] = kept.get((n, ext), "") + f.read()
         return kept
 
 
@@ -158,8 +163,9 @@ def cli(host, *a, timeout=120):
     try:
         r = subprocess.run([BIN, "--state", host.state, "--run", host.run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
     finally:
-        for n, text in (held.kept() if held else {}).items():
-            REMOVED_LOGS[(host.run, n)] = REMOVED_LOGS.get((host.run, n), "") + text
+        for (n, ext), text in (held.kept() if held else {}).items():
+            removed = REMOVED_LOGS if ext == ".log" else REMOVED_PREV
+            removed[(host.run, n)] = removed.get((host.run, n), "") + text
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -518,14 +524,31 @@ def log(host, name):
 
 
 def dump_logs(names, tail=6000):
-    """Prints the end of what each of `names` logged on each host, removed logs included: `rm -f`
-    deletes a VM's log, and a VM that died says why only there."""
+    """Prints the last `tail` bytes of what each of `names` logged on each host, its previous rotation
+    (NAME.log.1) first and removed logs included: `rm -f` deletes a VM's logs, and a VM that died says
+    why only there. Best effort: a log it cannot read or print is noted, never raised."""
+    def read(path):
+        try:
+            with open(path, errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
     for n in sorted(names):
         for h in (A, B):
-            text = log(h, n)
-            if text:
-                cut = text[-tail:]
-                print(f"--- {n} on {h}{' (its last %d bytes)' % tail if len(text) > tail else ''}:\n{cut.rstrip()}\n--- end of {n} on {h}", flush=True)
+            try:
+                vd = os.path.join(h.run, "vms")
+                text = (REMOVED_PREV.get((h.run, n), "") + read(os.path.join(vd, f"{n}.log.1"))
+                        + REMOVED_LOGS.get((h.run, n), "") + read(os.path.join(vd, f"{n}.log")))
+                data = text.encode("utf-8", errors="replace")
+                if not data:
+                    continue
+                cut = data[-tail:].decode("utf-8", errors="replace").rstrip()
+                more = f" (its last {tail} of {len(data)} bytes)" if len(data) > tail else ""
+                print(f"--- {n} on {h}{more}:\n{cut}\n--- end of {n} on {h}", flush=True)
+            except Exception as e:
+                with suppress(Exception):
+                    print(f"--- {n} on {h}: its logs could not be printed: {type(e).__name__}: {e}", flush=True)
 
 
 def clear_log(host, name):
@@ -10431,9 +10454,6 @@ try:
             for n in scenario_vms:
                 for h in (A, B):
                     kill(h, n)
-            # The kills removed the VMs' logs (and any record of a death): a failure keeps only what is printed here.
-            if failures != before:
-                dump_logs(scenario_vms)
             for path in scenario_checkpoints:
                 rm_ckpt(path)
             try:
@@ -10441,6 +10461,10 @@ try:
             except Exception as e:
                 traceback.print_exc()
                 check(f"{s}: isolation barrier raised {type(e).__name__}", False, e)
+            # The kills removed the VMs' logs (and any record of a death): a failure, its isolation's
+            # included, keeps only what is printed here.
+            if failures != before:
+                dump_logs(scenario_vms)
             if failures == before and why is not None:
                 skipped.append(s)
                 print(f"scenario {s}: SKIPPED ({why}) in {time.time() - started:.1f} s", flush=True)
