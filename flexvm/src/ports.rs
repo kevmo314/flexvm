@@ -889,7 +889,10 @@ mod tests {
         // half-closed client may wait for its reply); a reset is.
         let mut peers: Vec<_> = (0..4).map(|_| listener.accept().unwrap().0).collect();
         peers[2].shutdown(std::net::Shutdown::Write).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        wait_until("the FIN to arrive", || {
+            let mut b = 0u8;
+            (unsafe { libc::recv(connections[1].client.as_raw_fd(), (&mut b as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) }) == 0
+        });
         assert!(!connections[1].client_gone(), "half-closed, it still waits for its reply");
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
         let size = std::mem::size_of::<libc::linger>() as libc::socklen_t;
@@ -938,12 +941,38 @@ mod tests {
         assert!(connections.iter().all(|c| !c.fresh));
     }
 
-    /// A TCP worker of `cap` connections to a new guest listener: its address, the guest, and its stop.
-    fn worker(cap: usize, idle: Duration) -> (SocketAddr, TcpListener, Arc<OwnedFd>, JoinHandle<()>) {
+    /// A running TCP worker: `halt` stops it and checks it ended; dropped (a failed test), it is stopped all the same.
+    struct Worker {
+        stop: Arc<OwnedFd>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Worker {
+        fn signal(&self) {
+            unsafe { libc::write(self.stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
+        }
+
+        fn halt(mut self) {
+            self.signal();
+            self.thread.take().unwrap().join_within().unwrap();
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            if let Some(t) = self.thread.take() {
+                self.signal();
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// A TCP worker of `cap` connections to a new guest listener: its address, the guest, and the worker.
+    fn worker(cap: usize, idle: Duration) -> (SocketAddr, TcpListener, Worker) {
         worker_with_clock(cap, idle, None)
     }
 
-    fn worker_with_clock(cap: usize, idle: Duration, clock: Option<Arc<std::sync::Mutex<Instant>>>) -> (SocketAddr, TcpListener, Arc<OwnedFd>, JoinHandle<()>) {
+    fn worker_with_clock(cap: usize, idle: Duration, clock: Option<Arc<std::sync::Mutex<Instant>>>) -> (SocketAddr, TcpListener, Worker) {
         // Unrelated localhost RPC retries must not enter the guest's accept queue.
         let ip = Ipv4Addr::new(127, 0, 0, 2);
         let guest = TcpListener::bind((ip, 0)).unwrap();
@@ -960,12 +989,7 @@ mod tests {
                 tcp(vec![listener], target, stop.as_fd(), cap, idle)
             })
         };
-        (addr, guest, stop, worker)
-    }
-
-    fn halt(stop: &OwnedFd, worker: JoinHandle<()>) {
-        unsafe { libc::write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
-        worker.join_within().unwrap();
+        (addr, guest, Worker { stop, thread: Some(worker) })
     }
 
     fn echo(c: &mut TcpStream, s: &mut TcpStream) {
@@ -987,7 +1011,7 @@ mod tests {
     fn a_replacement_that_finds_none_idle_once_connected_is_closed() {
         let start = Instant::now();
         let clock = Arc::new(std::sync::Mutex::new(start));
-        let (addr, guest, stop, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
+        let (addr, guest, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
@@ -1014,7 +1038,7 @@ mod tests {
         }
         assert!(!accepted.is_empty(), "the replacement never connected");
         echo(&mut client, &mut server);
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
@@ -1038,7 +1062,7 @@ mod tests {
             limit.rlim_cur = limit.rlim_cur.min(1024);
             assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
         }
-        let (addr, guest, stop, worker) = worker(CONNECTIONS, IDLE);
+        let (addr, guest, worker) = worker(CONNECTIONS, IDLE);
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
@@ -1066,13 +1090,13 @@ mod tests {
         drop(fillers);
         let _retry = (stage == "connect").then(|| TcpStream::connect(addr).unwrap());
         let _accepted = crate::test_util::accept_tcp(&guest);
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
     fn a_replacement_still_connecting_closes_nothing() {
         const IDLE: Duration = Duration::from_millis(500);
-        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let (addr, guest, worker) = worker(1, IDLE);
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
@@ -1082,13 +1106,13 @@ mod tests {
         let _waiting = TcpStream::connect(addr).unwrap();
         thread::sleep(Duration::from_millis(TICK as u64) * 2);
         echo(&mut client, &mut server);
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
     fn at_the_cap_a_waiting_client_replaces_the_idlest_forward_once_it_is_idle() {
         const IDLE: Duration = Duration::from_secs(2);
-        let (addr, guest, stop, worker) = worker(2, IDLE);
+        let (addr, guest, worker) = worker(2, IDLE);
         let at = Instant::now();
         let mut forwards = Vec::new();
         for _ in 0..2 {
@@ -1124,24 +1148,40 @@ mod tests {
         }
         let (client, server) = &mut forwards[1];
         echo(client, server);
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
     fn a_half_closed_client_admitted_at_the_cap_still_gets_its_reply() {
         let start = Instant::now();
         let clock = Arc::new(std::sync::Mutex::new(start));
-        let (addr, guest, stop, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
+        let (addr, guest, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
         echo(&mut client, &mut server);
         *clock.lock().unwrap() = start + IDLE;
-        // An empty request, ended by its FIN before its guest connect completes.
+        // An empty request, ended by its FIN before its guest connect completes: the guest's full accept
+        // queue holds the connect until the FIN is acknowledged.
+        let filler = fill(&guest);
         let mut asking = TcpStream::connect(addr).unwrap();
         asking.shutdown(std::net::Shutdown::Write).unwrap();
         asking.set_read_timeout(Some(WAIT)).unwrap();
-        let (mut replying, _) = crate::test_util::accept_tcp(&guest);
+        wait_until("the FIN to be acknowledged", || {
+            let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+            let mut size = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+            let got = unsafe { libc::getsockopt(asking.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_INFO, (&mut info as *mut libc::tcp_info).cast(), &mut size) };
+            // TCP_FIN_WAIT2: its FIN is acknowledged, the other end still open.
+            got == 0 && info.tcpi_state == 5
+        });
+        // Now the guest takes the fillers, then the forward's connect (its SYN, sent again).
+        let fillers: Vec<SocketAddr> = filler.iter().map(|f| f.local_addr().unwrap()).collect();
+        let mut replying = loop {
+            let (s, from) = crate::test_util::accept_tcp(&guest);
+            if !fillers.contains(&from) {
+                break s;
+            }
+        };
         replying.set_read_timeout(Some(WAIT)).unwrap();
         assert_eq!(replying.read(&mut [0]).unwrap(), 0, "the FIN is passed on");
         replying.write_all(b"reply").unwrap();
@@ -1153,7 +1193,7 @@ mod tests {
             Ok(n) => assert_eq!(n, 0, "the idle forward made way"),
             Err(e) => assert!(!transient(&e) && e.kind() != io::ErrorKind::TimedOut, "the idle forward stayed open: {e}"),
         }
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
@@ -1357,7 +1397,7 @@ mod tests {
 
     #[test]
     fn a_reset_after_client_half_close_releases_the_slot_without_guest_writes() {
-        let (addr, guest, stop, worker) = worker(1, IDLE);
+        let (addr, guest, worker) = worker(1, IDLE);
         let client = TcpStream::connect(addr).unwrap();
         let (mut server, _) = crate::test_util::accept_tcp(&guest);
         server.set_read_timeout(Some(WAIT)).unwrap();
@@ -1375,7 +1415,7 @@ mod tests {
         replacement.set_read_timeout(Some(WAIT)).unwrap();
         let (mut accepted, _) = crate::test_util::accept_tcp(&guest);
         echo(&mut replacement, &mut accepted);
-        halt(&stop, worker);
+        worker.halt();
     }
 
     fn reset(s: TcpStream) {
@@ -1477,7 +1517,7 @@ mod tests {
 
     #[test]
     fn what_arrives_before_a_reset_is_still_relayed_both_ways() {
-        let (addr, guest, stop, worker) = worker(4, IDLE);
+        let (addr, guest, worker) = worker(4, IDLE);
         let reply: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         for _ in 0..20 {
             // The guest replies and resets at once: the proxy finds the data and the error together.
@@ -1501,12 +1541,12 @@ mod tests {
             let _ = server.read_to_end(&mut got);
             assert_eq!(got.len(), reply.len());
         }
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
     fn a_reply_held_for_a_slow_client_survives_the_guest_resetting() {
-        let (addr, guest, stop, worker) = worker(4, IDLE);
+        let (addr, guest, worker) = worker(4, IDLE);
         // Small enough for the proxy to hand all of it to the kernel at once (and be done with the
         // guest before the client's next request comes), and too big for that.
         for len in [10_000u32, 100_000] {
@@ -1555,7 +1595,7 @@ mod tests {
             assert_eq!(got.len(), reply.len());
             assert!(got == reply);
         }
-        halt(&stop, worker);
+        worker.halt();
     }
 
     #[test]
