@@ -31,15 +31,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::input::{feed, Fed, Stdin};
-use crate::proto::{frame, valid_session_id, FRAME_ACK, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, SESSION_DONE};
+use crate::proto::{
+    frame, valid_session_id, FRAME_ACK, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, MAX_DETACHED, MAX_LIVE, SESSION_DONE,
+    TOO_MANY_DETACHED, TOO_MANY_SESSIONS,
+};
 use crate::{fail, kill_running, msg, spawn_watched, wait_exit, Statuses};
 
 const CAPACITY: usize = 4 * 1024 * 1024;
 const MAX_CHUNKS: usize = 4096;
 /// Consecutive output of one kind is coalesced into chunks of up to this size.
 const BLOCK: usize = 16 * 1024;
-const MAX_LIVE: usize = 64;
-const MAX_DETACHED: usize = 64;
 const MAX_UNACKNOWLEDGED: usize = 192;
 const MAX_TOMBSTONES: usize = 4096;
 /// Ids closed before their start arrived; the oldest go first.
@@ -286,15 +287,13 @@ impl Table {
         if !detached && self.running() >= MAX_LIVE {
             self.reclaim(statuses);
             if self.running() >= MAX_LIVE {
-                return Err(io::Error::other(format!("too many sessions: {MAX_LIVE} commands are running or awaiting their client")));
+                return Err(io::Error::other(format!("{TOO_MANY_SESSIONS}{MAX_LIVE} commands are running or awaiting their client")));
             }
         }
         if (detached || detachable) && self.detachable() >= MAX_DETACHED {
             self.reclaim(statuses);
             if self.detachable() >= MAX_DETACHED {
-                return Err(io::Error::other(format!(
-                    "too many detached or interactive tty sessions: {MAX_DETACHED} commands are running or awaiting their client"
-                )));
+                return Err(io::Error::other(format!("{TOO_MANY_DETACHED}{MAX_DETACHED} commands are running or awaiting their client")));
             }
         }
         if self.closed.len() >= MAX_TOMBSTONES {
