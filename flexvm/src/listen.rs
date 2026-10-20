@@ -1011,7 +1011,8 @@ fn lend(host: &Host, req: &Value, peers: &[IpAddr], (borrower, addrs): &(String,
 /// Stale generations and revisions (see `host::Addr`) are ignored; an
 /// address a VM here holds keeps its local route.
 /// Test fault `route_refuse`: refused, as by a listener that is down.
-/// `sender`: the asking peer's own addresses; only the peer a generation is routed via withdraws it.
+/// `sender`: the asking peer's own addresses; only the peer a generation is routed via withdraws it,
+/// an announcement's next hop is one of them, and `Host::peer_update` decides which host may make it.
 fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Result<Value> {
     if fault("route_refuse") {
         bail!("injected fault: route messages refused");
@@ -1022,6 +1023,10 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
     if let Some(via) = via {
         check_vm_ip(host, ip, peers)?;
         check_via(via, peers)?;
+        // Its own: a peer announces where it runs a VM, never that another host does (#914).
+        if !is_peer(sender, IpAddr::V4(via)) {
+            bail!("{ip} via {via}: a peer announces only routes via its own addresses (its peers address, or peer_underlays), not via {via}");
+        }
     }
     let rev = match via {
         Some(_) => req["rev"].as_u64().ok_or("route announcements carry the location's revision")?,
@@ -1052,6 +1057,9 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
                 bail!("{ip} generation {gen} is routed via {owner} at revision {}, not via the asking peer: only that peer, or one with a newer revision, withdraws it", a.rev);
             }
         }
+        // A migration's target named as its source was told it: by the addresses this host's listener knows it by.
+        let named = |to: &str| Cached::read(&host.run, &[to.to_string()]).addrs(to).unwrap_or_default();
+        host.peer_update(&l, ip, (gen, rev), via, sender, named)?;
         if !host.observe(&l, ip, gen, rev, via)? {
             return Ok(json!({"ip": ip.to_string(), "stale": true}));
         }
@@ -1298,6 +1306,48 @@ mod tests {
         route(&host, &json!({"ip": ip.to_string(), "gen": 5}), &[b, c], &[c]).unwrap();
         assert_eq!(host.addr(&l, ip).unwrap().seen, 5);
         assert!(route(&host, &json!({"ip": "10.201.0.8", "gen": 3}), &[], &[]).is_err());
+    }
+
+    /// #914: a peer announces routes via itself only, and does not move or withdraw a VM held here.
+    #[test]
+    fn route_refuses_another_peers_next_hop_and_a_held_vms_address() {
+        let root = crate::test_util::TempDir::new("route-hijack");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let (b, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        // C announces B's VM via B: both are peers, but the next hop is not C's.
+        let e = route(&host, &json!({"ip": "10.200.0.5", "gen": 3, "rev": 0, "via": "192.0.2.7"}), &[b, c], &[c]).unwrap_err().to_string();
+        assert!(e.contains("only routes via its own addresses"), "{e}");
+        assert!(!host.state.join("addrs/10.200.0.5").exists());
+        // A VM here: C neither withdraws its generation nor brings a newer one, and the record stays as it was.
+        let _name = host.take_name("vm", false).unwrap();
+        let l = host.lock().unwrap();
+        let claim = host.claim_new(&l, "vm", Some("10.200.0.9".parse().unwrap())).unwrap();
+        let before = host.addr(&l, claim.ip).unwrap();
+        for gen in [claim.gen, claim.gen + 1] {
+            let e = route(&host, &json!({"ip": "10.200.0.9", "gen": gen, "rev": u64::MAX}), &[b, c], &[c]).unwrap_err().to_string();
+            assert!(e.contains("held by vm vm here"), "{e}");
+        }
+        assert_eq!(host.addr(&l, claim.ip).unwrap(), before);
+    }
+
+    /// #914 review: C announcing B's newest revision via itself leaves B's next hop recorded, so B's
+    /// withdrawal at that revision is still taken (and A's loan of it ends).
+    #[test]
+    fn an_equal_revision_via_another_peer_leaves_the_withdrawal_its_hosts() {
+        let root = crate::test_util::TempDir::new("route-equal-rev");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let (b, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        let l = host.lock().unwrap();
+        let x: Ipv4Addr = "10.200.0.11".parse().unwrap();
+        host.lend_new(&l, x, "b", false).unwrap();
+        let gen = host.addr(&l, x).unwrap().seen;
+        assert!(host.observe(&l, x, gen, 1, Some("192.0.2.7".parse().unwrap())).unwrap());
+        let e = route(&host, &json!({"ip": x.to_string(), "gen": gen, "rev": 1, "via": "192.0.2.8"}), &[b, c], &[c]).unwrap_err().to_string();
+        assert!(e.contains("only that host changes its next hop"), "{e}");
+        assert_eq!(host.addr(&l, x).unwrap().via, Some("192.0.2.7".parse().unwrap()));
+        route(&host, &json!({"ip": x.to_string(), "gen": gen, "rev": 1}), &[b, c], &[b]).unwrap();
+        let a = host.addr(&l, x).unwrap();
+        assert!(a.withdrawn && a.lent.is_none(), "{a:?}");
     }
 
     /// A peer's configured underlays (`peer_underlays`) are its next hops, and no VM's address;

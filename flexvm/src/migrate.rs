@@ -225,7 +225,9 @@ impl Proc {
         // A kill that came while this prepared wins (#567): its connection dropped, the target's arrival goes.
         self.not_destroyed()?;
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
-        self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen, mig, to)?, Ordering::SeqCst);
+        // With where the target was reached: only it moves or withdraws the generation here meanwhile (#914).
+        let at: Vec<IpAddr> = conn.peer_addr().ok().map(|a| a.ip()).into_iter().chain(prepared["underlay"].as_str().and_then(|u| u.parse().ok())).collect();
+        self.lent_here.fetch_or(self.host.lend_at(&self.host.lock()?, vm.ip, gen, mig, to, &at)?, Ordering::SeqCst);
         // Test gate: lent, not yet leaving.
         crate::host::gate("leave_gate");
         self.drop_held_in();
@@ -970,10 +972,13 @@ impl Proc {
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo. Never past the guest's size.
         self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req), Some(until)).map_err(late)?;
         let l = self.host.lock_by(Some(until)).map_err(late)?;
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?.with_peer(from));
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin_from(mig, &source.addr, by, Some(ip), Some(from))?);
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
-        let claim = self.host.claim_arrival(&l, &name, ip, req["gen"].as_u64().unwrap_or(0), rev, mig)?;
+        let gen = req["gen"].as_u64().unwrap_or(0);
+        // Not a generation newer than the record's where no peer can have one (#914).
+        self.host.newer_gen(&self.host.addr(&l, ip)?, ip, gen)?;
+        let claim = self.host.claim_arrival(&l, &name, ip, gen, rev, mig)?;
         drop(l);
         self.set_addr(claim);
         t.mark("claim_ip");
