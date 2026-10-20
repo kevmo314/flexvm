@@ -402,11 +402,14 @@ VM that is busy, paused or suspended.
     checkpoint once every page is in. The pager closes the checkpoint's
     files as soon as the last page has settled (readers still busy finish
     first), so the deletion gives the disk space back while the VM runs on.
+    A resume waiting for an in-progress suspend retries for as long as `stop`
+    waits for one (10 minutes), then reports a timeout with the VM log path; it can be retried once the suspend finishes.
   - **Removal** (`rm`) creates a `DISCARDED` marker the same way before it answers.
   - **Resume** of a checkpoint marked `STARTED` or `DISCARDED` deletes it
     instead: a resumed or killed VM never comes back.
   - **Failed resume.** If it fails before the resume request reaches
-    Firecracker, the VM stays suspended. If it fails after, the checkpoint
+    Firecracker, the VM stays suspended and keeps its address, including if
+    starting a port forward fails. If it fails after, the checkpoint
     is consumed: the VM is gone, as re-arming it would replay what it did.
     If the `STARTED` marker cannot be made durable, it is removed again and
     the directory fsynced before the VM goes back to suspended. If that
@@ -800,11 +803,13 @@ through, so the checkpoint is exactly the memory at the pause.
   where the kernel cannot). Without room for a block of copies, faults ask the writers for
   their pages and wait for them as over budget, and the pause protects
   pages it would have copied hot; no checkpoint fails for it. Under the
-  reserve, under the eviction mark with peers, with the VM starved, or when
+  reserve, under the eviction mark with peers (through the higher exit mark
+  during an active eviction episode), with the VM starved, or when
   another process asks (admission before it refuses, above), the memory kept for the next
   checkpoint is released (rescue chunks, hot pages' memory, and the last
   checkpoint's hot pages, so the next one writes its hot pages without
-  comparing them), and a copy that ends under the reserve keeps none.
+  comparing them). Relief resamples available memory after releasing it, before
+  evicting another VM. A copy that ends under the reserve keeps none.
 - **Hot pages** (#235). Every `UFFDIO_WRITEPROTECT`, protect or unprotect,
   makes KVM zap its mappings of the whole range (6.18 ignores the notifier's
   event type) and flush every vCPU's TLB: after the resume the guest
