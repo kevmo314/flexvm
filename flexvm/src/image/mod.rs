@@ -425,14 +425,19 @@ fn rootfs_directory(cache: &Path, rootfs: &Path) -> Result<Option<crate::host::D
     Ok(Some(pinned))
 }
 
-/// The entries of the cache `rootfs` directory that have records (`KEY.users`, or unfinished `KEY.newusers`), as `KEY.ext4`, and
+/// The entries of the cache `rootfs` directory that have records (`KEY.users`, or an unfinished `KEY.newusers` of a gone entry), as `KEY.ext4`, and
 /// with `force` (`--force-shared`) complete ones without too (`LEGACY` or never recorded).
 pub fn recorded_rootfs(cache: &Path, force: bool) -> Result<Vec<PathBuf>> {
     let Some((pinned, dir)) = rootfs_dir(cache)? else { return Ok(vec![]) };
     let mut found = std::collections::BTreeSet::new();
     for entry in std::fs::read_dir(&pinned.path)? {
         let path = dir.join(entry?.file_name());
-        if matches!(path.extension().and_then(|e| e.to_str()), Some("users" | "newusers")) || force && path.extension() == Some("ok".as_ref()) {
+        // An unfinished `KEY.newusers` only once its entry is gone: beside one, it is no record (the next `users_dir` clears it).
+        let abandoned = || std::fs::symlink_metadata(path.with_extension("ext4")).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if path.extension() == Some("users".as_ref())
+            || path.extension() == Some("newusers".as_ref()) && abandoned()
+            || force && path.extension() == Some("ok".as_ref())
+        {
             found.insert(path.with_extension("ext4"));
         }
     }
@@ -2044,8 +2049,12 @@ mod tests {
         assert_eq!(recorded_rootfs(&images, false).unwrap(), [cached.clone()]);
         assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::Absent);
         assert!(!dir.join("k.newusers").exists());
-        std::fs::create_dir(dir.join("k.users")).unwrap();
+        // Beside a present entry, an unfinished one is no record: such an entry stays as unrecorded.
         std::fs::create_dir(dir.join("k.newusers")).unwrap();
+        std::fs::write(&cached, b"").unwrap();
+        assert!(recorded_rootfs(&images, false).unwrap().is_empty());
+        std::fs::remove_file(&cached).unwrap();
+        std::fs::create_dir(dir.join("k.users")).unwrap();
         std::fs::write(dir.join("k.users/other"), b"/other/templates").unwrap();
         assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::Absent);
         assert!(dir.join("k.users/other").exists());

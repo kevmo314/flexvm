@@ -137,6 +137,9 @@ impl Pager {
             while q - 1 > page && self.pages().is_dirty(q - 1) {
                 q -= 1;
             }
+            // Dirty only once unprotected: a failed unprotect (EAGAIN while a REMOVE is queued) changes nothing, and its
+            // retry must not trim these pages as already unprotected. Marked after is safe: `freeze` takes the dirty
+            // bits under the same lock (`wp`), so it sees both or neither.
             self.writeprotect(p, q - p, false)?;
             (p..q).for_each(|d| self.pages().mark_dirty(d));
             return Ok(Served::Done(WP));

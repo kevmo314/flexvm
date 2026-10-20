@@ -231,14 +231,23 @@ fn save_checkpoint_file(path: &Path, write: impl FnOnce(&mut dyn Write) -> Resul
     let base = path.file_name().ok_or_else(|| format!("bad -o {:?}: give a file", path.display()))?;
     let dir = crate::host::Directory::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     let key = crate::host::keyed("checkpoint-export", &dir.stat()?, &format!("-{:x}", sha2::Sha256::digest(base.as_encoded_bytes())));
-    let _lock = crate::host::lock_at(crate::host::host_locks()?, &key, libc::LOCK_EX | libc::LOCK_NB)?;
+    let Some(_lock) = crate::host::try_lock_at(crate::host::host_locks()?, &key)? else {
+        bail!("{}: another checkpoint save to it is in progress", path.display());
+    };
     let tmp = dir.path.join(format!(".{}.flexvm-partial", base.to_string_lossy()));
+    let partial = || path.with_file_name(format!(".{}.flexvm-partial", base.to_string_lossy())).display().to_string();
     // The key's flock excludes live exports; a fixed name lets the next save reclaim an interrupted one.
     match std::fs::remove_file(&tmp) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        r => r?,
+        r => r.map_err(|e| format!("{}: {e}", partial()))?,
     }
-    let f = std::fs::File::options().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    let f = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|e| format!("{}: {e}", partial()))?;
     let written = (|| {
         let mut out = std::io::BufWriter::with_capacity(1 << 20, &f);
         let saved = write(&mut out)?;
@@ -436,7 +445,8 @@ mod tests {
         let partial = dir.join(".save.tar.flexvm-partial");
         std::fs::write(&partial, b"interrupted").unwrap();
         let saved = save_checkpoint_file(&path, |out| {
-            assert!(save_checkpoint_file(&path, |_| panic!("another export is live")).is_err());
+            let live = save_checkpoint_file(&path, |_| panic!("another export is live")).unwrap_err().to_string();
+            assert!(live.contains("in progress"), "{live}");
             assert!(partial.exists());
             out.write_all(b"complete")?;
             Ok(json!({"saved": true}))
