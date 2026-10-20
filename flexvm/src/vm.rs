@@ -986,6 +986,11 @@ impl Vm {
         crate::guest::signal_app(&self.vsock, sig)
     }
 
+    /// Whether session `id` is still registered: `save_state` drops (and shuts down) them all.
+    pub fn tracked(&self, id: u64) -> bool {
+        self.execs.lock().unwrap().contains_key(&id)
+    }
+
     pub fn untrack_exec(&self, id: u64) {
         self.execs.lock().unwrap().remove(&id);
     }

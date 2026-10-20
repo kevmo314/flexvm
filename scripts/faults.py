@@ -1296,7 +1296,7 @@ def exec_background():
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
     session slots; nor do interrupted ones (SIGINT stops the command), or abandoned sessions
     whose client disconnected or was killed outright, nor exits whose client reads its output
-    slowly or stays silent after it; a client that takes no output for 60 s is dropped."""
+    slowly or stays silent after it; a client that takes no output for 60 s keeps all of it."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # The guest's sweeper reads the knob only between its sweeps, which come a minute apart without it:
@@ -1312,8 +1312,8 @@ def exec_background():
         s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": {"argv": ["sh", "-c", cmd]}}) + "\n").encode())
         return s
 
-    # #505. A client that stops reading is dropped after 60 s without progress, freeing its relay and
-    # control slot; its session stays in the guest. Started now, checked after the rest below.
+    # #505, #999. A client that stops reading for over 60 s keeps its relay (the command waits for it)
+    # while the host has session slots to spare. Started now, checked after the rest below.
     stalled_id = os.urandom(16).hex()
     stalled = raw_exec(stalled_id, "head -c 100000000 /dev/zero")
     stalled_at = time.time()
@@ -1448,15 +1448,31 @@ def exec_background():
     check("exec bg: 6 MB to a reader that stalls for 15 s all arrive", drained == [(6000000, (0, "6000000", ""))], drained)
     check("exec bg: execs still start after the slow readers", sh(A, n, "echo hi") == (0, "hi"))
     time.sleep(max(0, stalled_at + 65 - time.time()))
-    got, t = 0, time.time()
-    stalled.settimeout(10)
+    # Every byte, in order, then its exit, unacknowledged (the client hangs up without SESSION_DONE).
+    got, code, t = 0, None, time.time()
+    stalled.settimeout(30)
+    f = stalled.makefile("rb")
     try:
-        while d := stalled.recv(1 << 20):
-            got += len(d)
+        f.readline()
+        while (head := f.read(5)) and len(head) == 5:
+            kind, size = struct.unpack("<BI", head)
+            data = f.read(size)
+            if kind == 1 and data[:8] == struct.pack("<Q", got):
+                got += size - 8
+            elif kind == 3:
+                code = (struct.unpack("<Q", data[:8])[0], struct.unpack("<i", data[8:12])[0])
+                break
+            elif kind != 4:
+                got = (got, kind, data[:8])
+                break
     except OSError as e:
         got = (got, str(e))
+    f.close()
     stalled.close()
-    check("exec bg: a client that took nothing for 60 s was dropped", isinstance(got, int) and 0 < got < 100000000 and time.time() - t < 10, got)
+    check("exec bg: a client that took nothing for 60 s keeps its relay and gets every byte",
+          got == 100000000 and code == (got, 0) and time.time() - t < 60, (got, code, time.time() - t))
+    # Dropping a stalled client only near the host's session limit (192 of 256) is unit-tested
+    # (vmproc session_relay_tests): 192 sessions at once are past the guest's 64 running ones.
     frames = []
     if isinstance(got, int):
         with socket.socket(socket.AF_UNIX) as s:
@@ -1470,8 +1486,8 @@ def exec_background():
                 data = f.read(size)
                 frames.append((kind, data if kind == 4 else data[:8]))
             f.close()
-    check("exec bg: its session stayed in the guest, for a reattach from where it was dropped",
-          frames[1:] == [(4, stalled_id.encode()), (1, struct.pack("<Q", got))], frames)
+    check("exec bg: its unacknowledged exit stayed in the guest, for a reattach from where it hung up",
+          frames[1:] == [(4, stalled_id.encode()), (3, struct.pack("<Q", got))], frames)
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(30)
         s.connect(sock)
