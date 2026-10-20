@@ -577,7 +577,7 @@ pub struct Spawner {
     tap_owner: String,
     next: AtomicU64,
     /// Taps handed out but not made yet: a concurrent `take` sees none of them in sysfs.
-    making: Mutex<HashSet<String>>,
+    making: Arc<Mutex<HashSet<String>>>,
     /// `cpu.max` for each Firecracker taken from now on (`--cpus`), written before it is handed out.
     cpu_max: Mutex<Option<String>>,
 }
@@ -600,6 +600,59 @@ fn free_tap(prefix: &str, interfaces: &Path, making: &Mutex<HashSet<String>>) ->
     }
 }
 
+/// How many names a take claims before giving up: each but the last failed only as another
+/// process made a tap of that name after `free_tap` looked (one of another PID namespace with
+/// this process's pid, which has the same prefix: `vmproc`).
+const TAP_CLAIMS: usize = 16;
+
+/// Claims `tap` (`net::claim_tap`), and while another process has made a tap of that name since
+/// `free_tap` passed it, the next free name. (the name it holds in `making`, the claimed name)
+fn claim_free_tap(
+    mut tap: String,
+    prefix: &str,
+    interfaces: &Path,
+    making: &Mutex<HashSet<String>>,
+    mut claim: impl FnMut(&str) -> std::io::Result<()>,
+) -> (Option<String>, Result<String>) {
+    let mut claims = 0;
+    loop {
+        claims += 1;
+        match claim(&tap) {
+            Err(e) if crate::net::name_taken(&e) && claims < TAP_CLAIMS => {}
+            Ok(()) => return (Some(tap.clone()), Ok(tap)),
+            Err(e) => return (Some(tap.clone()), Err(format!("create tap {tap}: {e}").into())),
+        }
+        // Taken: sysfs has it now, so `free_tap` passes it by.
+        making.lock().unwrap().remove(&tap);
+        tap = match free_tap(prefix, interfaces, making) {
+            Ok(t) => t,
+            Err(e) => return (None, Err(e)),
+        };
+    }
+}
+
+/// `take`'s tap thread: `make` sets a tap up around `claim_free_tap` (`net::create_tap_with`),
+/// or fails before it claims anything. (the name it holds in `making`, the made tap): `first`,
+/// reserved by `free_tap`, until a claim moves on from it.
+fn make_free_tap<T: ?Sized>(
+    first: String,
+    prefix: &str,
+    interfaces: &Path,
+    making: &Mutex<HashSet<String>>,
+    make: impl FnOnce(&mut dyn FnMut(&T) -> Result<String>) -> Result<String>,
+    claim: impl Fn(&T, &str) -> std::io::Result<()>,
+) -> (Option<String>, Result<String>) {
+    let mut held = Some(first.clone());
+    let mut first = Some(first);
+    let made = make(&mut |t| {
+        let Some(tap) = first.take() else { return Err("tap claimed twice".into()) };
+        let (h, made) = claim_free_tap(tap, prefix, interfaces, making, |name| claim(t, name));
+        held = h;
+        made
+    });
+    (held, made)
+}
+
 impl Spawner {
     pub fn new(bin: &Path, root: &Path, sockets: Arc<SocketRoot>, cgroups: Option<PathBuf>, tap_prefix: &str, tap_owner: &str) -> Spawner {
         Spawner {
@@ -610,7 +663,7 @@ impl Spawner {
             tap_prefix: tap_prefix.into(),
             tap_owner: tap_owner.into(),
             next: AtomicU64::new(0),
-            making: Mutex::default(),
+            making: Arc::default(),
             cpu_max: Mutex::default(),
         }
     }
@@ -632,17 +685,22 @@ impl Spawner {
         let dir = self.root.join(&id);
         let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
         let made = {
-            let (t, owner) = (tap.clone(), self.tap_owner.clone());
-            std::thread::spawn(move || crate::net::create_tap(&t, &owner))
+            let (first, owner, prefix, making) = (tap.clone(), self.tap_owner.clone(), self.tap_prefix.clone(), self.making.clone());
+            std::thread::spawn(move || {
+                let make = |claim: &mut dyn FnMut(&std::os::fd::OwnedFd) -> Result<String>| crate::net::create_tap_with(&owner, claim);
+                make_free_tap(first, &prefix, Path::new("/sys/class/net"), &making, make, crate::net::claim_tap)
+            })
         };
         let fc = crate::host::host_dir(&dir, 0o700).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
-        let made = made.join().unwrap_or_else(|_| Err("tap thread panicked".into()));
-        let owned_tap = made.as_ref().ok().map(|()| tap.as_str());
+        let (held, made) = made.join().unwrap_or_else(|_| (Some(tap), Err("tap thread panicked".into())));
+        let tap = made.as_ref().ok().cloned();
         // A Firecracker without its tap is dropped (killed) here, before `release`.
-        let fc = fc.and_then(|fc| made.map(|()| fc)).inspect_err(|_| release(owned_tap, cgroup.as_deref(), &dir));
+        let fc = fc.and_then(|fc| made.map(|_| fc)).inspect_err(|_| release(tap.as_deref(), cgroup.as_deref(), &dir));
         // Made (sysfs has it now) or released: no longer kept from other takes.
-        self.making.lock().unwrap().remove(&tap);
-        let mut fc = fc?;
+        if let Some(held) = held {
+            self.making.lock().unwrap().remove(&held);
+        }
+        let (mut fc, tap) = (fc?, tap.unwrap_or_default());
         // Under test, each VM's Firecracker keeps its device metrics (`metrics.json` in its
         // directory, appended every 60 s and on `FlushMetrics`), so a test can see what a
         // device did (#149). Metrics can only be configured before a load.
@@ -812,6 +870,68 @@ mod tests {
         assert!(error.contains("abcdefgh3ffffft0") && error.contains("15 bytes"), "{error}");
         std::fs::remove_dir(interfaces.join(format!("{prefix}80"))).unwrap();
         assert_eq!(free_tap(prefix, &interfaces, &Mutex::default()).unwrap(), format!("{prefix}80"));
+    }
+
+    #[test]
+    fn a_tap_another_process_made_first_is_passed_by() {
+        // Another PID namespace's process with this pid made fvt0 after `free_tap` looked.
+        let interfaces = crate::test_util::TempDir::new("tap-taken");
+        let making = Mutex::default();
+        let first = free_tap("fvt", &interfaces, &making).unwrap();
+        let mut claimed = Vec::new();
+        let (held, made) = claim_free_tap(first, "fvt", &interfaces, &making, |name| {
+            claimed.push(name.to_string());
+            if name == "fvt0" {
+                std::fs::create_dir(interfaces.join(name)).unwrap();
+                return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            Ok(())
+        });
+        assert_eq!((held.as_deref(), made.unwrap().as_str(), claimed), (Some("fvt1"), "fvt1", vec!["fvt0".to_string(), "fvt1".to_string()]));
+        // Only fvt1 is still kept from other takes, for the taker to let go.
+        assert_eq!(*making.lock().unwrap(), HashSet::from(["fvt1".to_string()]));
+        // Every name taken: a bounded number of claims, then the error; other errors are not retried.
+        let making = Mutex::default();
+        let mut claims = 0;
+        let (held, made) = claim_free_tap(free_tap("fvu", &interfaces, &making).unwrap(), "fvu", &interfaces, &making, |name| {
+            claims += 1;
+            std::fs::create_dir(interfaces.join(name)).unwrap();
+            Err(std::io::Error::from_raw_os_error(libc::EBUSY))
+        });
+        assert_eq!((claims, held.as_deref()), (TAP_CLAIMS, Some(&*format!("fvu{:x}", TAP_CLAIMS - 1))));
+        assert!(made.unwrap_err().to_string().contains("busy"));
+        let (_, made) = claim_free_tap("fvv0".into(), "fvv", &interfaces, &Mutex::default(), |_| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        assert!(made.unwrap_err().to_string().contains("create tap fvv0"));
+    }
+
+    #[test]
+    fn a_tap_that_fails_before_its_claim_lets_its_reserved_name_go() {
+        let interfaces = crate::test_util::TempDir::new("tap-unclaimed");
+        let making = Mutex::default();
+        // An owner too long, or no /dev/net/tun: nothing claimed, and fvt0 is still the taker's to let go.
+        let first = free_tap("fvt", &interfaces, &making).unwrap();
+        let (held, made) =
+            make_free_tap::<()>(first, "fvt", &interfaces, &making, |_| Err("/dev/net/tun: too many open files".into()), |_, _| panic!("claimed"));
+        assert_eq!((held.as_deref(), made.is_err()), (Some("fvt0"), true));
+        making.lock().unwrap().remove(&held.unwrap());
+        assert!(making.lock().unwrap().is_empty());
+        // A claim moves the hold to the name it made.
+        let first = free_tap("fvt", &interfaces, &making).unwrap();
+        let (held, made) = make_free_tap(
+            first,
+            "fvt",
+            &interfaces,
+            &making,
+            |claim| claim(&()),
+            |_, name| {
+                if name == "fvt0" {
+                    std::fs::create_dir(interfaces.join(name)).unwrap();
+                    return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+                }
+                Ok(())
+            },
+        );
+        assert_eq!((held.as_deref(), made.unwrap().as_str()), (Some("fvt1"), "fvt1"));
     }
 
     #[test]

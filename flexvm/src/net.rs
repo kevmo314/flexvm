@@ -114,26 +114,92 @@ pub const TAP_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
 /// Room for the packets a migration held, injected all at once (default 1000).
 pub const TAP_QUEUE: u32 = 4096;
 
+/// A tap of exactly `name` (`create_tap_with`).
+#[cfg(test)]
+pub fn create_tap(name: &str, owner: &str) -> Result<()> {
+    ifreq(name)?;
+    create_tap_with(owner, |fd| claim_tap(fd, name).map(|()| name.to_string()).map_err(|e| format!("create tap {name}: {e}").into())).map(|_| ())
+}
+
+/// A template tap, trying a free suffix if another PID namespace has the same name.
+pub fn create_free_tap(name: &str, owner: &str) -> Result<String> {
+    ifreq(name)?;
+    create_tap_with(owner, |fd| free_tun(fd, name, TAP_FLAGS).map_err(|e| format!("create tap {name}: {e}").into()))
+}
+
 /// Ioctls and rtnetlink, as spawning `ip` costs tens of milliseconds. `owner` becomes the
 /// tap's alias (`host::tap_alias`), set before the tap is made persistent: a tap left
 /// behind always names its owner, and garbage collection goes by that, never by the name.
-pub fn create_tap(name: &str, owner: &str) -> Result<()> {
+/// `claim` attaches the descriptor it is given to a new tap (`claim_tap`) and names it.
+pub fn create_tap_with(owner: &str, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<String> {
     // Subscribed before the tap exists: udev's event for it cannot come before.
-    make_tap(name, owner, udev_monitor())
+    make_tap(owner, udev_monitor(), claim)
 }
 
-/// `create_tap`, with `udev` (if any) handed to the tap's watcher (`keep_mac_from_udev`).
-fn make_tap(name: &str, owner: &str, udev: Option<OwnedFd>) -> Result<()> {
-    if owner.len() >= 256 {
-        bail!("tap {name}: owner {owner:?} is over 255 bytes (a shorter run directory)");
+/// Never a leaked tap of a dead process with this name, nor its routes.
+const TAP_FLAGS: libc::c_short = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as libc::c_short;
+
+/// Attaches `fd` to a new tap `name`. EBUSY: a device has the name (another process's).
+pub fn claim_tap(fd: &OwnedFd, name: &str) -> std::io::Result<()> {
+    claim_tun(fd, name, TAP_FLAGS)
+}
+
+/// Whether a claim failed only because the name is taken.
+pub fn name_taken(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EBUSY | libc::EEXIST))
+}
+
+fn claim_tun(fd: &OwnedFd, dev: &str, flags: libc::c_short) -> std::io::Result<()> {
+    let mut req = ifreq(dev).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    req.ifr_ifru.ifru_flags = flags | libc::IFF_TUN_EXCL as libc::c_short;
+    crate::util::eintr(|| unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) }).map(|_| ())
+}
+
+/// Claim a new device, never attaching to an existing one, even a persistent TUN.
+pub(crate) fn free_tun(fd: &OwnedFd, name: &str, flags: libc::c_short) -> std::io::Result<String> {
+    free_name(name, |dev| claim_tun(fd, dev, flags))
+}
+
+/// How many hex suffixes a device name tries after its own: a short pid leaves room for more,
+/// but past this many taken names something other than a namesake is refusing them.
+const NAME_SUFFIXES: u64 = 256;
+
+/// The old name first, then hex suffixes. Only a failed claim retries: no sysfs race,
+/// and no retry after a later setup failure might have left a persistent device.
+fn free_name(name: &str, mut claim: impl FnMut(&str) -> std::io::Result<()>) -> std::io::Result<String> {
+    let too_long = |dev: &str| dev.len() >= libc::IFNAMSIZ;
+    if too_long(name) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("interface name {name:?} is over {} bytes", libc::IFNAMSIZ - 1)));
     }
-    let mut req = ifreq(name)?;
+    let mut dev = name.to_string();
+    let mut n = 0u64;
+    loop {
+        match claim(&dev) {
+            Ok(()) => return Ok(dev),
+            Err(e) if name_taken(&e) => {}
+            Err(e) => return Err(e),
+        }
+        dev = format!("{name}{n:x}");
+        n += 1;
+        if n > NAME_SUFFIXES || too_long(&dev) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{name} and its {} suffixes are taken (no free device names within {} bytes)", n - 1, libc::IFNAMSIZ - 1),
+            ));
+        }
+    }
+}
+
+/// `create_tap_with`, with `udev` (if any) handed to the tap's watcher (`keep_mac_from_udev`).
+fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<String> {
+    if owner.len() >= 256 {
+        bail!("tap: owner {owner:?} is over 255 bytes (a shorter run directory)");
+    }
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     crate::syscall_check!(fd < 0, "/dev/net/tun");
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    // Never a leaked tap of a dead process with this name, nor its routes.
-    req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as libc::c_short;
-    crate::syscall_check!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) } < 0, "create tap {name}");
+    let name = claim(&fd)?;
+    let name = name.as_str();
     // Until TUNSETPERSIST the tap goes with `fd`, so with this process.
     let mut alias = ifinfomsg(ifindex(name)?);
     attr(&mut alias, IFLA_IFALIAS, owner.as_bytes());
@@ -173,7 +239,7 @@ fn make_tap(name: &str, owner: &str, udev: Option<OwnedFd>) -> Result<()> {
         }
         (Ok(()), None) => {}
     }
-    made
+    made.map(|()| name.to_string())
 }
 
 /// How often a tap's watcher checks its MAC, and that it is still there, between udev's events.
@@ -960,6 +1026,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_names_keep_the_old_name_then_claim_free_suffixes() {
+        for name in ["f12345x3fffff", "f123453fffffh"] {
+            let mut live = std::collections::HashSet::new();
+            let mut allocate =
+                || free_name(name, |dev| if live.insert(dev.to_string()) { Ok(()) } else { Err(std::io::Error::from_raw_os_error(libc::EBUSY)) }).unwrap();
+            assert_eq!(allocate(), name);
+            for n in 0..256 {
+                let dev = allocate();
+                assert_eq!(dev, format!("{name}{n:x}"));
+                assert!(dev.len() < libc::IFNAMSIZ);
+            }
+            let error = free_name(name, |_| Err(std::io::Error::from_raw_os_error(libc::EEXIST))).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("no free device names"));
+            live.remove(&format!("{name}80"));
+            assert_eq!(
+                free_name(name, |dev| {
+                    if live.contains(dev) {
+                        Err(std::io::Error::from_raw_os_error(libc::EBUSY))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap(),
+                format!("{name}80")
+            );
+        }
+    }
+
+    #[test]
+    fn device_names_retry_only_collisions_and_refuse_truncation() {
+        for errno in [libc::EPERM, libc::ENOENT, libc::EINVAL, libc::EIO] {
+            let mut calls = 0;
+            let error = free_name("f123451h", |_| {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(errno))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(calls, 1);
+        }
+        let error = free_name("0123456789abcdef", |_| panic!("overlong name claimed")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        // A short name stops at the suffix bound, not only at IFNAMSIZ.
+        let mut calls = 0;
+        let error = free_name("f12345x1", |_| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EEXIST))
+        })
+        .unwrap_err();
+        assert_eq!((error.kind(), calls), (std::io::ErrorKind::InvalidInput, 1 + NAME_SUFFIXES));
+        assert!(error.to_string().contains("no free device names"), "{error}");
+    }
+
+    #[test]
     fn tap_queue_drains_nonblocking_frames_and_stops_at_empty() {
         use std::os::unix::net::UnixDatagram;
 
@@ -1194,7 +1315,7 @@ mod tests {
             }
         }
         // Made with no watcher of its own; a udevd here is done with it before the test goes on.
-        make_tap(&tap, "test", None).unwrap();
+        make_tap("test", None, |fd| claim_tap(fd, &tap).map(|()| tap.clone()).map_err(Into::into)).unwrap();
         let _tap = TapGuard(&tap);
         let _ = std::process::Command::new("udevadm").args(["settle", "--timeout=10"]).status();
         let index = ifindex(&tap).unwrap();

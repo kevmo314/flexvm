@@ -1174,13 +1174,20 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   traffic cannot drive the sampling rate; the one-second poll timeout keeps checks
   running without socket activity. Only writes or advancing ACKs count as progress;
   a reader stalled for four idle periods can give up its slot at the connection cap.
+- Template taps (`PREFIXxPID`) and hold devices (`PREFIXPIDh`) try their old
+  names first, then append a free hex suffix if another PID namespace sharing
+  the network namespace has taken the name. Each claim uses `IFF_TUN_EXCL`;
+  only a name collision retries, up to 256 suffixes within `IFNAMSIZ`. Tap ownership and cleanup
+  go by the alias, including taps with older names. A VM process's taps
+  (`PREFIXPIDtN`) skip names sysfs has; one another PID namespace made after
+  that look is passed by for the next free name, a bounded number of times.
 - udev with `MACAddressPolicy=persistent` (systemd's default) can replace a new
   tap's MAC after flexvm set it to the gateway MAC: it read the kernel's random
   one first, and its write lands whenever its worker gets to it. The host then
   drops everything the guest sends (to the gateway MAC), so connections to the VM
   time out (#841). The VM process puts the MAC back (one `RTM_SETLINK`) whenever it
   hands a tap to a VM. Also, when udevd runs and sees flexvm's network namespace,
-  `create_tap` subscribes to udev's monitor before it makes the tap and puts the
+  `create_tap_with` subscribes to udev's monitor before it makes the tap and puts the
   MAC back once udev broadcasts that it is done with the tap (checking it every
   5 s until then, for as long as the tap is there). To stop udev touching the
   taps at all, match their state directory's prefix (`f` and five base-36

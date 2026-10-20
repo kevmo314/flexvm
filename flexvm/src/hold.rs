@@ -150,9 +150,8 @@ enum Switch {
 impl Holder {
     /// None, with a warning, without TUN support: then nothing is held.
     pub fn new(dev: &str) -> Result<Option<Arc<Holder>>> {
-        let dev = dev.to_string();
-        let tun = match open_tun(&dev) {
-            Ok(tun) => tun,
+        let (dev, tun) = match open_tun(dev) {
+            Ok(opened) => opened,
             Err((true, e)) => return Err(e),
             Err((false, e)) => {
                 crate::log!("packets in flight during migrations will be dropped: {e}");
@@ -1043,18 +1042,17 @@ impl Out<'_> {
     }
 }
 
-/// The error flag: another process has it, or the name is too long (rather than no TUN support).
-fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error)> {
-    const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+/// The error flag: a fatal setup error (rather than no TUN support).
+fn open_tun(dev: &str) -> std::result::Result<(String, OwnedFd), (bool, crate::util::Error)> {
     let fd = eintr(|| unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK) })
         .map_err(|e| (false, format!("/dev/net/tun: {e}").into()))?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut req = crate::net::ifreq(dev).map_err(|e| (true, e))?;
-    req.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as libc::c_short;
-    if let Err(e) = eintr(|| unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &req) }) {
-        let busy = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::EEXIST | libc::EPERM));
-        return Err((busy, format!("{dev}: {e}{}", if busy { " (another process has it)" } else { "" }).into()));
-    }
+    let flags = (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as libc::c_short;
+    let dev = crate::net::free_tun(&fd, dev, flags).map_err(|e| {
+        let fatal = (e.raw_os_error().is_none() && e.kind() == std::io::ErrorKind::InvalidInput) || matches!(e.raw_os_error(), Some(libc::EPERM));
+        (fatal, format!("{dev}: {e}").into())
+    })?;
+    let mut req = crate::net::ifreq(&dev).map_err(|e| (true, e))?;
     // TUN_F_CSUM: checksums reach us left to the device (`accept`), never completed by the
     // kernel at whatever offset a guest gave.
     const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
@@ -1067,7 +1065,7 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
         let sock = unsafe { OwnedFd::from_raw_fd(sock) };
         unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &req) };
     }
-    Ok(fd)
+    Ok((dev, fd))
 }
 
 #[cfg(test)]
