@@ -1320,14 +1320,22 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
 /// (it failed) or is suspended. Never true unless its process said so, once the
 /// VM runs: a resume that fails, or a destroy meanwhile, is an error.
 fn resume(host: &Host, name: &str) -> Result<bool> {
+    // A suspend is waited out as long as `stop` waits for one: its copy of the VM's memory to disk.
+    resume_by(host, name, Instant::now() + Duration::from_secs(30), Instant::now() + STOP_WAIT)
+}
+
+fn resume_by(host: &Host, name: &str, deadline: Instant, suspend_by: Instant) -> Result<bool> {
     host::check_name(name)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let req = json!({"op": "resume"});
         let reply = vmproc::connect(host, name, &req, &[], Instant::now() + Duration::from_secs(10), None)
             .map(|c| recv_json(&mut BufReader::new(util::By { s: c, at: Instant::now() + RESUME_ANSWER })));
         match reply {
-            Ok(Ok(Some(v))) if v["ok"] == true && v["result"]["suspending"] == true => {}
+            Ok(Ok(Some(v))) if v["ok"] == true && v["result"]["suspending"] == true => {
+                if Instant::now() >= suspend_by {
+                    bail!("vm {name}: timed out waiting for suspend; see {}; retry when it finishes", host.vms(name, "log")?.display());
+                }
+            }
             Ok(Ok(Some(v))) if v["ok"] == true => return Ok(true),
             // Its control connections are all taken: asked again.
             Ok(Ok(Some(v))) if v["error"] == "busy" && Instant::now() < deadline => {}
@@ -3678,6 +3686,23 @@ mod exec_tests {
         assert!(e.is::<Replaced>() && e.to_string().contains("generation 7, now 10.0.0.2 generation 8"), "{e}");
         assert!(same_instance("web", Instance { ip: "10.0.0.3".parse().unwrap(), gen: 7 }, &mut vm).unwrap_err().is::<Replaced>());
         assert_eq!(vm, Some(Instance { ip, gen: 7 }), "the first stays");
+    }
+
+    #[test]
+    fn resume_times_out_while_suspending() {
+        let root = crate::test_util::TempDir::new("resume-timeout");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let _name = host.take_name("own", false).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(host.sock("own").unwrap()).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut conn = listener.accept().unwrap().0;
+            assert_eq!(recv_json(&mut BufReader::new(&mut conn)).unwrap().unwrap()["op"], "resume");
+            util::send_json(&mut conn, &json!({"ok": true, "result": {"suspending": true}})).unwrap();
+        });
+        let error = resume_by(&host, "own", Instant::now() + Duration::from_secs(30), Instant::now()).unwrap_err().to_string();
+        server.join().unwrap();
+        assert!(error.contains("timed out waiting for suspend"), "{error}");
+        assert!(error.contains("retry when it finishes") && error.contains("log"), "{error}");
     }
 
     #[test]

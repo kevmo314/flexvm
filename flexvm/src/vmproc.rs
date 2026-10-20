@@ -2311,11 +2311,11 @@ impl Proc {
             let mut avail = host_available_mib();
             let cfg = self.host.config_now();
             // Memory VM processes keep for their next checkpoint never moves a VM away: it goes back first (#648).
-            if relief_needs_memory(&cfg, avail) {
+            if relief_needs_memory(&cfg, avail, self.host.run.join("evict.active").exists()) {
                 crate::hostmem::release_kept(&self.host, None);
                 avail = host_available_mib();
             }
-            let short = relief_needs_memory(&cfg, avail) || vm.starving();
+            let short = relief_needs_memory(&cfg, avail, self.host.run.join("evict.active").exists()) || vm.starving();
             self.ready_room(short);
             relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
@@ -2993,9 +2993,14 @@ fn room_sample(reserve: u64, available: impl FnOnce() -> Option<u64>, promised: 
 
 /// Kept checkpoint memory goes back before moving VMs to peers or stopping standby VMs under the reserve.
 /// Without peers, the space between the reserve and eviction mark is still usable for checkpoints.
-fn relief_needs_memory(cfg: &crate::host::Config, avail: Option<u64>) -> bool {
-    let (reserve, at, _) = cfg.evict_marks();
-    avail.is_some_and(|a| a < reserve || (!cfg.peers.is_empty() && a < at))
+fn relief_needs_memory(cfg: &crate::host::Config, avail: Option<u64>, active: bool) -> bool {
+    let (reserve, _, _) = cfg.evict_marks();
+    avail.is_some_and(|a| a < reserve || (!cfg.peers.is_empty() && eviction_pressure(cfg, a, active)))
+}
+
+fn eviction_pressure(cfg: &crate::host::Config, avail: u64, active: bool) -> bool {
+    let (_, at, until) = cfg.evict_marks();
+    avail < until && (active || avail < at)
 }
 
 /// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`;
@@ -3373,7 +3378,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     }
     let Ok(lock) = crate::host::private_file(&crate::host::locks(&host.state).join("evict")) else { return };
     let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
-    let pressure = avail < until && (evicting || avail < at);
+    let pressure = eviction_pressure(&cfg, avail, evicting);
     if pressure && !evicting {
         let _ = crate::host::write_record(&active, b"");
         crate::info!(
@@ -4636,6 +4641,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_resume_setup_keeps_its_address() {
+        use crate::lifecycle::Restore;
+        for uncertain in [false, true] {
+            let (p, _root) = test_proc("resume-setup", Some("stopped"));
+            let claim = p.host.claim_new(&p.host.lock().unwrap(), "stopped", None).unwrap();
+            let (ip, gen) = (claim.ip, claim.gen);
+            claim.keep();
+            let claim = p.host.claim_incoming(&p.host.lock().unwrap(), "stopped", ip, gen, None).unwrap();
+            assert!(!claim.fresh);
+            p.set_addr(claim);
+            let result: std::result::Result<(), _> = p.resume_with(|| {
+                assert_eq!(p.ip(), Some(ip));
+                Err(if uncertain { Restore::Uncertain("marker failed".into()) } else { Restore::NotRun("forward thread failed".into()) })
+            });
+            assert!(result.is_err());
+            p.end_claim(End::NotStarted, false);
+            let l = p.host.lock().unwrap();
+            assert!(p.host.current(&l, ip, gen).unwrap());
+            assert!(p.host.claim_new(&l, "other", Some(ip)).is_err());
+            let retry = p.host.claim_incoming(&l, "stopped", ip, gen, None).unwrap();
+            drop(l);
+            retry.keep();
+        }
+    }
+
+    #[test]
     fn dropping_the_forwards_keeps_the_ports_for_the_vms_records() {
         use std::os::fd::AsRawFd;
         let (p, _root) = test_proc("drop-ports", None);
@@ -5206,13 +5237,27 @@ mod tests {
         for peers in [false, true] {
             cfg.peers = if peers { vec!["127.0.0.1:1".into()] } else { Vec::new() };
             for (avail, expected) in [(None, false), (Some(1023), true), (Some(1024), peers), (Some(1536), peers), (Some(2047), peers), (Some(2048), false)] {
-                assert_eq!(relief_needs_memory(&cfg, avail), expected, "available {avail:?}, peers {peers}");
+                assert_eq!(relief_needs_memory(&cfg, avail, false), expected, "available {avail:?}, peers {peers}");
             }
             cfg.evict_mib = Some(512);
-            assert!(relief_needs_memory(&cfg, Some(1023)), "a mark below the reserve still releases under the reserve");
-            assert!(!relief_needs_memory(&cfg, Some(1024)));
+            assert!(relief_needs_memory(&cfg, Some(1023), false), "a mark below the reserve still releases under the reserve");
+            assert!(!relief_needs_memory(&cfg, Some(1024), false));
             cfg.evict_mib = Some(2048);
         }
+    }
+
+    #[test]
+    fn checkpoint_memory_is_released_through_eviction_hysteresis() {
+        let cfg = crate::host::Config { reserve_mib: Some(1024), evict_mib: Some(2048), peers: vec!["127.0.0.1:1".into()], ..Default::default() };
+        assert!(!relief_needs_memory(&cfg, Some(2300), false));
+        assert!(relief_needs_memory(&cfg, Some(2300), true));
+        assert!(eviction_pressure(&cfg, 2300, true));
+        // Releasing 512 MiB crosses the exit mark: no further VM needs to move.
+        assert!(!relief_needs_memory(&cfg, Some(2300 + 512), true));
+        assert!(!eviction_pressure(&cfg, 2300 + 512, true));
+        assert!(relief_needs_memory(&cfg, Some(2559), true));
+        assert!(!relief_needs_memory(&cfg, Some(2560), true));
+        assert!(!relief_needs_memory(&cfg, None, true));
     }
 
     /// MemAvailable unreadable (None) is no pressure: no standby is stopped

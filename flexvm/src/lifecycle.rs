@@ -331,10 +331,13 @@ impl Proc {
             self.host.claim_incoming(&l, name, ip, gen, None)?
         };
         self.set_addr(claim);
-        self.serve_ports(ip)?;
-        // Before it is published: eviction leaves a CMD VM alone.
-        *self.cmd.lock().unwrap() = cmd.as_ref().map(|(c, _)| c.clone());
-        match self.restore_checkpoint(name, ck, tpl, ip, true, false, &mut t) {
+        let restored = self.resume_with(|| {
+            self.serve_ports(ip).map_err(Restore::NotRun)?;
+            // Before it is published: eviction leaves a CMD VM alone.
+            *self.cmd.lock().unwrap() = cmd.as_ref().map(|(c, _)| c.clone());
+            self.restore_checkpoint(name, ck, tpl, ip, true, false, &mut t)
+        });
+        match restored {
             Ok(mut v) => {
                 v["from"] = json!("suspended");
                 // Its command runs on in the guest: the process reattaches it and ends with it.
@@ -345,12 +348,10 @@ impl Proc {
             }
             Err(Restore::NotRun(e)) => {
                 *self.cmd.lock().unwrap() = None;
-                self.keep_addr();
                 Err(e)
             }
             Err(Restore::Uncertain(e)) => {
                 *self.cmd.lock().unwrap() = None;
-                self.keep_addr();
                 let _ = crate::host::write_record(&dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()).as_bytes());
                 bail!("vm {name} is quarantined: {e}; flexvm rm it to discard its checkpoint")
             }
@@ -367,6 +368,15 @@ impl Proc {
                 bail!("vm {name} failed after it resumed: {e}; it is gone, its checkpoint is consumed")
             }
         }
+    }
+
+    /// A failed resume keeps the suspended VM's address unless it ran.
+    pub(crate) fn resume_with<T>(&self, restore: impl FnOnce() -> std::result::Result<T, Restore>) -> std::result::Result<T, Restore> {
+        let result = restore();
+        if matches!(result, Err(Restore::NotRun(_) | Restore::Uncertain(_))) {
+            self.keep_addr();
+        }
+        result
     }
 
     /// Another host's address is borrowed.
