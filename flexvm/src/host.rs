@@ -972,12 +972,32 @@ impl Host {
     /// (as it takes the name), or, with a `to` token, a `run` opening them for the VM process it
     /// hands them to (a detached child, told in `HANDOFF_ENV`; a claimed standby, in the claim),
     /// which takes the name while this one waits, and keeps them by the token even if this one
-    /// dies meanwhile. A new VM of the name retires any lifetime but those (`take_name`).
+    /// dies meanwhile. A handoff added to one still pending (another `run`'s, whose VM process
+    /// has not taken the name yet) adds its token to it, never replacing that one's: whichever
+    /// VM process takes the name keeps them. A new VM of the name retires any lifetime but
+    /// those (`take_name`). Under the logs' writers' lock (`output::lock_dir`).
     pub fn own_logs(&self, name: &str, to: Option<&str>) -> Result<File> {
         let dir = self.open_logs(name)?;
+        let lock = crate::util::output::lock_dir(&dir);
+        let res = self.write_owner(&dir, to);
+        if let Some(l) = lock {
+            // Unlocked, not only closed: see `Flock`.
+            let _ = flock(&l, libc::LOCK_UN);
+        }
+        res.map(|()| dir)
+    }
+
+    fn write_owner(&self, dir: &File, to: Option<&str>) -> Result<()> {
         let tmp = std::ffi::CString::new(format!("{OWNER}.{}", std::process::id()))?;
-        let owner = LogsOwner { id: Ident::me(), handoff: to.is_some(), to: to.map(Into::into) };
-        let mut f = crate::util::output::open_in(&dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
+        let mut tokens: Vec<String> = match to {
+            Some(_) => logs_owner(dir).filter(|o| o.handoff).map(|o| o.to).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        tokens.extend(to.map(String::from));
+        // The latest few: a pending handoff's run waits on its VM process, so few are at once.
+        tokens.drain(..tokens.len().saturating_sub(MAX_HANDOFFS));
+        let owner = LogsOwner { id: Ident::me(), handoff: to.is_some(), to: tokens };
+        let mut f = crate::util::output::open_in(dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
         std::io::Write::write_all(&mut f, &serde_json::to_vec(&owner)?)?;
         drop(f);
         let (d, from, to) = (dir.as_raw_fd(), tmp.as_ptr(), std::ffi::CString::new(OWNER)?);
@@ -986,7 +1006,7 @@ impl Host {
             unsafe { libc::unlinkat(d, from, 0) };
             return Err(e.into());
         }
-        Ok(dir)
+        Ok(())
     }
 
     /// Whether `name` has logs that are not this process's to go on with (`own_logs`): none
@@ -994,7 +1014,7 @@ impl Host {
     /// this one by `handed`); anything else at their path (not a directory) is retired too.
     /// Under the name.
     fn earlier_logs(&self, name: &str, handed: Option<&str>) -> Result<bool> {
-        let ours = |o: &LogsOwner| o.id == Ident::me() || handed.is_some() && o.to.as_deref() == handed || o.handoff && o.id.alive();
+        let ours = |o: &LogsOwner| o.id == Ident::me() || handed.is_some_and(|t| o.to.iter().any(|o| o == t)) || o.handoff && o.id.alive();
         Ok(match crate::util::output::open_dir(&self.vms(name, "logs")?) {
             Ok(dir) => !logs_owner(&dir).is_some_and(|o| ours(&o)),
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
@@ -3090,10 +3110,14 @@ pub struct LogsOwner {
     /// A `run`'s, for the VM process it hands them to.
     #[serde(default)]
     pub handoff: bool,
-    /// That VM process's token (`HANDOFF_ENV`, or a standby claim's `logs_handoff`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
+    /// The tokens of the VM processes they are handed to, pending (`HANDOFF_ENV`, or a standby
+    /// claim's `logs_handoff`): one per `run` preparing them before any of those took the name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub to: Vec<String>,
 }
+
+/// Pending handoffs kept in a logs' owner record (`Host::own_logs`).
+const MAX_HANDOFFS: usize = 16;
 
 /// Where a `run` tells the VM process it starts the token of the logs it hands it (`own_logs`).
 pub const HANDOFF_ENV: &str = "FLEXVM_LOGS_HANDOFF";
@@ -5652,7 +5676,7 @@ pub(crate) mod tests {
             h.write_log("job", "log", "old vm\n");
             let dir = h.vms("job", "logs").unwrap();
             match id {
-                Some(id) => std::fs::write(dir.join(OWNER), serde_json::to_vec(&LogsOwner { id: id.clone(), handoff, to: None }).unwrap()).unwrap(),
+                Some(id) => std::fs::write(dir.join(OWNER), serde_json::to_vec(&LogsOwner { id: id.clone(), handoff, to: vec![] }).unwrap()).unwrap(),
                 None => drop(std::fs::remove_file(dir.join(OWNER))),
             }
             crate::util::output::open_dir(&dir).unwrap()
@@ -5681,7 +5705,7 @@ pub(crate) mod tests {
         for (token, retired) in [(Some("tok"), false), (Some("other"), true), (None, true)] {
             let held = owned(Some(&gone), true);
             let dir = h.vms("job", "logs").unwrap();
-            let marker = LogsOwner { id: gone.clone(), handoff: true, to: Some("tok".into()) };
+            let marker = LogsOwner { id: gone.clone(), handoff: true, to: vec!["tok".into()] };
             std::fs::write(dir.join(OWNER), serde_json::to_vec(&marker).unwrap()).unwrap();
             drop(h.take_handed_name("job", token).unwrap());
             assert_eq!(held.metadata().unwrap().nlink() == 0, retired, "{token:?}");
@@ -5690,11 +5714,11 @@ pub(crate) mod tests {
         h.retire_logs("job").unwrap();
         let name = h.take_name("job", false).unwrap();
         let logs = h.own_logs("job", None).unwrap();
-        assert_eq!(logs_owner(&logs), Some(LogsOwner { id: me.clone(), handoff: false, to: None }));
+        assert_eq!(logs_owner(&logs), Some(LogsOwner { id: me.clone(), handoff: false, to: vec![] }));
         drop(name);
         drop(h.take_name("job", false).unwrap());
         assert_ne!(logs.metadata().unwrap().nlink(), 0);
-        assert_eq!(logs_owner(&h.own_logs("job", Some("t")).unwrap()), Some(LogsOwner { id: me, handoff: true, to: Some("t".into()) }));
+        assert_eq!(logs_owner(&h.own_logs("job", Some("t")).unwrap()), Some(LogsOwner { id: me, handoff: true, to: vec!["t".into()] }));
     }
 
     #[test]

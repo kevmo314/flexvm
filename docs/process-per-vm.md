@@ -318,7 +318,9 @@ foreground `run -i`/`-t`'s end keep the logs until the name's next VM. `NAME.log
 records whose lifetime it is (`Host::own_logs`): its VM's process, or a `run` that opened it
 for the VM process it hands it to (a detached child, a claimed standby), with a token that
 process is given (`FLEXVM_LOGS_HANDOFF`, or the claim). A new VM keeps only its own, one whose
-token is its own (even if that `run` died meanwhile), or a live `run`'s for another; `logs -f` follows on only while the name's holder
+token is among its pending ones (even if that `run` died meanwhile; a second `run` preparing
+them before either's VM process took the name adds its token, never replacing the first's),
+or a live `run`'s for another; `logs -f` follows on only while the name's holder
 is the one its directory records (or a handing `run`'s child). Logs remain available for stopped and exited
 VMs until removal; `start` keeps them. A detached `run` opens its log in the
 parent before the child takes the name, so removal clears the logs before

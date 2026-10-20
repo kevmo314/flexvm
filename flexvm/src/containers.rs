@@ -989,7 +989,7 @@ mod tests {
         for (owner, ends) in [(Ident { pid: u32::MAX, start: 1, ..Ident::me() }, true), (Ident::me(), false)] {
             for handoff in [false, true] {
                 host.write_log("job", "log", b"old\n");
-                std::fs::write(dir.join(".owner"), serde_json::to_vec(&host::LogsOwner { id: owner.clone(), handoff, to: None }).unwrap()).unwrap();
+                std::fs::write(dir.join(".owner"), serde_json::to_vec(&host::LogsOwner { id: owner.clone(), handoff, to: vec![] }).unwrap()).unwrap();
                 let (_got, rx) = follow(&host, "job");
                 let ended = rx.recv_timeout(Duration::from_secs(3)).is_ok();
                 assert_eq!(ended, ends && !handoff, "{owner:?} {handoff}");

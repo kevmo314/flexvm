@@ -2510,7 +2510,7 @@ mod exec_tests {
             let mut out = new_run_log(&host, "web").unwrap();
             let held = util::output::open_dir(&dir).unwrap();
             let mut owner = host::logs_owner(&held).unwrap();
-            assert_eq!(owner.to.as_deref(), Some(out.token.as_str()));
+            assert_eq!(owner.to, [out.token.clone()]);
             owner.id = host::Ident { pid: u32::MAX, start: 1, ..host::Ident::me() };
             std::fs::write(dir.join(".owner"), serde_json::to_vec(&owner).unwrap()).unwrap();
             let token = if theirs { out.token.clone() } else { "another".into() };
@@ -2518,6 +2518,31 @@ mod exec_tests {
             assert_eq!(std::os::unix::fs::MetadataExt::nlink(&held.metadata().unwrap()) != 0, kept, "{theirs}");
             out.write_all(b"its output").unwrap();
             assert_eq!(std::fs::read_to_string(dir.join("log")).ok().as_deref(), kept.then_some("its output"), "{theirs}");
+            drop(name);
+            host.retire_logs("web").unwrap();
+        }
+    }
+
+    /// Two detached runs of a free name prepare its logs before either's VM process takes it,
+    /// and the second dies: the first's VM process (or the second's) still keeps them by its
+    /// token; the second's never replaced the first's.
+    #[test]
+    fn concurrent_detached_runs_keep_each_others_pending_handoff() {
+        let root = crate::test_util::TempDir::new("run-log-two");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let dir = host.vms("web", "logs").unwrap();
+        for winner in [0, 1] {
+            let mut outs = [new_run_log(&host, "web").unwrap(), new_run_log(&host, "web").unwrap()];
+            let held = util::output::open_dir(&dir).unwrap();
+            let mut owner = host::logs_owner(&held).unwrap();
+            assert_eq!(owner.to, [outs[0].token.clone(), outs[1].token.clone()]);
+            // The second run SIGKILLed: its identity, last recorded, is gone.
+            owner.id = host::Ident { pid: u32::MAX, start: 1, ..host::Ident::me() };
+            std::fs::write(dir.join(".owner"), serde_json::to_vec(&owner).unwrap()).unwrap();
+            let name = host.take_handed_name("web", Some(&outs[winner].token.clone())).unwrap();
+            assert_ne!(std::os::unix::fs::MetadataExt::nlink(&held.metadata().unwrap()), 0, "{winner}");
+            outs[winner].write_all(b"its output").unwrap();
+            assert_eq!(std::fs::read_to_string(dir.join("log")).unwrap(), "its output");
             drop(name);
             host.retire_logs("web").unwrap();
         }

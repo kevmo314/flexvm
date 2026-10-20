@@ -3054,17 +3054,7 @@ pub mod output {
     /// nothing rotated. All of it in `dir`: retired, it is never the name's again. Whether
     /// `data` was written; it is never written twice.
     pub fn append_in(dir: &File, data: &[u8], cap: u64) -> bool {
-        let deadline = Instant::now() + STALL;
-        let lock = loop {
-            let take = || {
-                let f = open_in(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY)?;
-                crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).map(|()| f)
-            };
-            match take() {
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
-                result => break result.ok(),
-            }
-        };
+        let lock = lock_dir(dir);
         let written = open_in(dir, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT).is_ok_and(|mut f| {
             let written = f.write_all(data).is_ok();
             if lock.is_some() && f.metadata().is_ok_and(|m| m.len() > cap) {
@@ -3078,6 +3068,22 @@ pub mod output {
             let _ = crate::host::flock(&l, libc::LOCK_UN);
         }
         written
+    }
+
+    /// `dir`'s (a VM's logs') writers' lock: a flock of an open of this call's own, had within
+    /// `STALL` (else None: a stopped holder, done without). Let go of with `LOCK_UN`.
+    pub fn lock_dir(dir: &File) -> Option<File> {
+        let deadline = Instant::now() + STALL;
+        loop {
+            let take = || {
+                let f = open_in(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY)?;
+                crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).map(|()| f)
+            };
+            match take() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                result => break result.ok(),
+            }
+        }
     }
 
     /// Appends `data` to the file at `log`, holding `log`'s lock (`log_lock`; never
