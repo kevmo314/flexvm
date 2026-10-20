@@ -197,13 +197,32 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
     // The VM it is of: with no logs yet, only this one's are taken once made.
     let holder = host.name_holder(name).ok().flatten();
     let mut dir = open_dir(&at).ok();
+    // With none, logs from before these directories (an earlier version's VM): read where they
+    // are, `NAME.log.1` then `NAME.log` (regular files only: never the links), until moved in.
+    let regular = |ext: &str| host.vms(name, ext).ok().and_then(|p| std::fs::symlink_metadata(p).ok()).is_some_and(|m| m.is_file());
+    let legacy = dir.is_none() && (regular("log") || regular("log.1"));
+    let (log, prev) = match legacy {
+        true => (std::ffi::CString::new(format!("{name}.log"))?, std::ffi::CString::new(format!("{name}.log.1"))?),
+        false => (c"log".to_owned(), c"log.1".to_owned()),
+    };
+    if legacy {
+        dir = open_dir(&host.run.join("vms")).ok();
+    }
     let open = |d: &std::fs::File, file: &std::ffi::CStr| open_in(d, file, libc::O_RDONLY).ok();
     // The current log first: one rotated meanwhile is then the previous one read below.
-    let mut cur = dir.as_ref().and_then(|d| open(d, c"log"));
+    let mut cur = dir.as_ref().and_then(|d| open(d, &log));
     let ino = |f: &std::fs::File| f.metadata().ok().map(|m| (m.dev(), m.ino()));
-    let old = dir.as_ref().and_then(|d| open(d, c"log.1")).filter(|o| cur.as_ref().is_none_or(|c| ino(c) != ino(o)));
-    // The last log read whole: never again as a `log.1`.
-    let mut read = old.as_ref().and_then(ino);
+    let old = dir.as_ref().and_then(|d| open(d, &prev)).filter(|o| cur.as_ref().is_none_or(|c| ino(c) != ino(o)));
+    // The logs read whole (the last few): never again as a `log.1`.
+    let mut read: Vec<(u64, u64)> = old.as_ref().and_then(ino).into_iter().collect();
+    let mark = |read: &mut Vec<_>, f: Option<(u64, u64)>| {
+        if let Some(f) = f.filter(|f| !read.contains(f)) {
+            read.push(f);
+            if read.len() > 4 {
+                read.remove(0);
+            }
+        }
+    };
     let files: Vec<_> = [old.as_ref(), cur.as_ref()].into_iter().flatten().map(|f| (f, f.metadata().map_or(0, |m| m.len()))).collect();
     if cur.is_none() && files.iter().all(|&(_, len)| len == 0) && !known(host, name) {
         bail!("no vm named {name:?}");
@@ -239,39 +258,44 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
                 f.rewind()?;
             }
         }
-        let Some(d) = dir.as_ref() else {
-            // A known VM's, not made yet: taken only while the VM it was is the name's, running.
+        if dir.is_none() {
+            // A known VM's, not made yet: taken only while the VM it was is the name's, running;
+            // read from its start below (`log.1` first, if it rotated already).
             let made = open_dir(&at).ok();
             if holder.is_none() || host.name_holder(name).ok().flatten() != holder || !host.alive(name) {
                 return Ok(());
             }
             dir = made;
-            cur = dir.as_ref().and_then(|d| open(d, c"log"));
-            continue;
+        }
+        let Some(d) = dir.as_ref() else { continue };
+        // Retired: whatever is at its path now is a later VM's (or none). Old logs read where
+        // they were: once moved in (by a later VM of the name), ended too.
+        let retired = match legacy {
+            true => std::fs::symlink_metadata(&at).is_ok(),
+            false => std::fs::metadata(&at).ok().map(|m| (m.dev(), m.ino())) != ino(d),
         };
-        // Retired: whatever is at its path now is a later VM's (or none).
-        if std::fs::metadata(&at).ok().map(|m| (m.dev(), m.ino())) != ino(d) {
+        if retired {
             return Ok(());
         }
         // Rotated twice since (the second maybe the writer's last, with no log after): the one
         // in between, neither followed nor read, is read whole first.
-        if let Some(mut between) = open(d, c"log.1") {
+        if let Some(mut between) = open(d, &prev) {
             let b = ino(&between);
-            if b.is_some() && b != cur.as_ref().and_then(ino) && b != read {
-                read = b;
+            if b.is_some_and(|b| Some(b) != cur.as_ref().and_then(ino) && !read.contains(&b)) {
+                mark(&mut read, b);
                 if !cur.as_mut().map_or(Ok(true), &mut drain)? || !drain(&mut between)? {
                     return Ok(());
                 }
             }
         }
         // Rotated: what was written before the rename is drained, then the new one.
-        let now = crate::util::stat_at(std::os::fd::AsRawFd::as_raw_fd(d), c"log").map(|st| (st.st_dev, st.st_ino));
+        let now = crate::util::stat_at(std::os::fd::AsRawFd::as_raw_fd(d), &log).map(|st| (st.st_dev, st.st_ino));
         if now.is_some() && now != cur.as_ref().and_then(ino) {
             if !cur.as_mut().map_or(Ok(true), &mut drain)? {
                 return Ok(());
             }
-            read = cur.as_ref().and_then(ino).or(read);
-            cur = open(d, c"log");
+            mark(&mut read, cur.as_ref().and_then(ino));
+            cur = open(d, &log);
             continue;
         }
         // Ended for a while (not a restart's moment between its stop and start).
@@ -914,6 +938,67 @@ mod tests {
         (got, rx)
     }
 
+    /// Logs from before these directories, of a VM of an earlier version still writing them:
+    /// followed where they are, and ended once a later VM of the name moves them in.
+    #[test]
+    fn logs_follow_reads_logs_from_before_their_directories() {
+        let root = TempDir::new("logs-legacy");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        let (log, prev) = (host.vms("job", "log").unwrap(), host.vms("job", "log.1").unwrap());
+        std::fs::write(&prev, b"older\n").unwrap();
+        std::fs::write(&log, b"old\n").unwrap();
+        let (got, rx) = follow(&host, "job");
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(b"more\n").unwrap();
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        drop(host.open_logs("job").unwrap());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        drop(name);
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "older\nold\nmore\n");
+    }
+
+    /// Rotated twice between polls, then written on: each log once, in order.
+    #[test]
+    fn logs_follow_reads_each_log_of_a_double_rotation_once() {
+        let root = TempDir::new("logs-double-rotation");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        host.write_log("job", "log", b"a\n");
+        let (got, rx) = follow(&host, "job");
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        let dir = host.vms("job", "logs").unwrap();
+        let append = |data: &[u8]| std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")).unwrap().write_all(data).unwrap();
+        std::fs::rename(dir.join("log"), dir.join("log.1")).unwrap();
+        append(b"b\n");
+        std::fs::rename(dir.join("log"), dir.join("log.1")).unwrap();
+        append(b"c\n");
+        std::thread::sleep(FOLLOW_EVERY * 3);
+        append(b"c2\n");
+        std::thread::sleep(FOLLOW_EVERY * 3);
+        drop(name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "a\nb\nc\nc2\n");
+    }
+
+    /// A known VM's logs made, and rotated, between the polls of a follower that had none:
+    /// both read, in order.
+    #[test]
+    fn logs_follow_takes_logs_made_and_rotated_meanwhile_in_order() {
+        let root = TempDir::new("logs-adopted-rotated");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        let (got, rx) = follow(&host, "job");
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        let logs = host.open_logs("job").unwrap();
+        assert!(crate::util::output::append_in(&logs, b"first, past the cap\n", 10));
+        assert!(crate::util::output::append_in(&logs, b"second\n", 10));
+        std::thread::sleep(FOLLOW_EVERY * 4);
+        drop(name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "first, past the cap\nsecond\n");
+    }
+
     #[test]
     fn logs_follow_reads_a_last_rotation_with_no_log_after_it() {
         let root = TempDir::new("logs-last-rotation");
@@ -970,6 +1055,14 @@ mod tests {
         std::fs::write(host.vms("job", "log.1").unwrap(), b"older\n").unwrap();
         std::fs::write(host.vms("job", "log").unwrap(), b"old\n").unwrap();
         let _name = host.take_name("job", false).unwrap();
+        // Read where they are until moved in.
+        let mut got = Vec::new();
+        let mut sink = |d: &[u8]| {
+            got.extend_from_slice(d);
+            Ok(true)
+        };
+        logs_to(&host, "job", false, None, &mut sink).unwrap();
+        assert_eq!(got, b"older\nold\n");
         drop(host.open_logs("job").unwrap());
         let dir = host.vms("job", "logs").unwrap();
         assert_eq!(std::fs::read(dir.join("log.1")).unwrap(), b"older\n");
