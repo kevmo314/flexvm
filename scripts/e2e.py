@@ -781,7 +781,8 @@ def pause_resume():
     # The guest runs again some time after the resume: polled until its counter moves, within a functional timeout.
     check("resume: guest process continues", wait_for(lambda: count(A, vm) > c1, 30), (c1, count(A, vm)))
     check("resume: same process (pid, start time)", marker_id(A, vm) == proc)
-    err = wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 5)
+    # Each sample an exec: polled within a functional timeout, as a loaded host's slow execs take few in 5 s.
+    err = wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 30)
     check("resume: guest clock right after 3 s paused", err, clock_error(A, vm))
     A.kill(vm)
 
@@ -1026,8 +1027,9 @@ def checkpoint_restore():
     check("restore: RAM intact", md5(A, vm) == m)
     check("restore: same process", marker_id(A, vm) == proc)
     c1 = count(A, vm)
-    check("restore: process runs on", wait_for(lambda: count(A, vm) > c1, 5))
-    check("restore: guest clock right", wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 5), clock_error(A, vm))
+    # Polled (each sample an exec) within functional timeouts.
+    check("restore: process runs on", wait_for(lambda: count(A, vm) > c1, 30), (c1, count(A, vm)))
+    check("restore: guest clock right", wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 30), clock_error(A, vm))
     # Keep-running checkpoint: the VM goes on; its copy restores as a second VM.
     path2 = ckpt_dir(vm + "-live")
     A.checkpoint(vm, path2)
@@ -1282,7 +1284,7 @@ def suspend_resume():
     check("start: RAM intact", md5(A, vm) == m)
     check("start: same process", marker_id(A, vm) == proc)
     c1 = count(A, vm)
-    check("start: process runs on", wait_for(lambda: count(A, vm) > c1, 5))
+    check("start: process runs on", wait_for(lambda: count(A, vm) > c1, 30), (c1, count(A, vm)))
     r = A.rm(vm, check=False)
     check("rm: a running VM is refused", r.returncode != 0 and f"vm {vm} is running" in r.stderr, (r.returncode, r.stderr))
     A.suspend(vm)
