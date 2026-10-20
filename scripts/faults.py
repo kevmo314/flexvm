@@ -8588,14 +8588,13 @@ def pull_died():
     source runs on, and is not handed out again."""
     n = "ft-pull-fc-died"
     m = setup(n, mib=1500)
-    stall = threading.Timer(0.2, lambda: fault(A, "pages", 6000))
-    stall.start()
-    ok(migrate(A, n, B))
-    stall.join()
-    fc = vms(B)[n]["firecracker"]
-    os.kill(fc, signal.SIGKILL)
-    check("pull died: the target fails", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed", 10), vms(B).get(n))
-    fault(A, "pages", 0)
+    # Every page reply a second late from before the migration until the target failed: it dies mid-pull.
+    with armed_fault(A, "pages_slow", 600000):
+        ok(migrate(A, n, B))
+        check("pull died: still pulling when its firecracker dies", vms(B)[n].get("background_pull_ms") is None, vms(B).get(n))
+        fc = vms(B)[n]["firecracker"]
+        os.kill(fc, signal.SIGKILL)
+        check("pull died: the target fails", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed", 10), vms(B).get(n))
     check("pull died: the source never lets go, and runs its copy again",
           wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 60), where(n))
     check("pull died: md5 intact on A", md5(A, n) == m)
@@ -8606,13 +8605,13 @@ def pull_died():
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
     wait_released(B, n)
-    stall = threading.Timer(0.2, lambda: fault(B, "pages", 6000))
-    stall.start()
-    ok(migrate(B, n, A))
-    stall.join()
-    pid = json.load(open(os.path.join(A.run, "vms", ".locks", f"{n}.lock")))["pid"]
-    os.kill(pid, signal.SIGKILL)
-    fault(B, "pages", 0)
+    # As above, until the arrival is killed.
+    with armed_fault(B, "pages_slow", 600000):
+        ok(migrate(B, n, A))
+        check("home died: still pulling when it dies", vms(A)[n].get("background_pull_ms") is None, vms(A).get(n))
+        pid = json.load(open(os.path.join(A.run, "vms", ".locks", f"{n}.lock")))["pid"]
+        os.kill(pid, signal.SIGKILL)
+        check("home died: the arrival is gone", wait_for(lambda: not alive(pid), 10), pid)
     check("home died: the source runs its copy again", wait_for(lambda: vms(B).get(n, {}).get("state") == "running", 60), where(n))
     check("home died: md5 intact on B", md5(B, n) == m)
     check("home died: the address is still lent on its home host", addr(A, ip).get("lent") is not None, addr(A, ip))
