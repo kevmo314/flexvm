@@ -148,6 +148,11 @@ pub fn fits(cmd: &str) -> Result<()> {
     Ok(())
 }
 
+/// The guest refused a session for want of slots (`MAX_LIVE`, `MAX_DETACHED`).
+pub fn at_session_cap(m: &str) -> bool {
+    m.contains(TOO_MANY_SESSIONS) || m.contains(TOO_MANY_DETACHED)
+}
+
 /// A refusal worth another try (`TRY_AGAIN`), not an answer.
 pub fn transient(m: &str) -> bool {
     m.contains(TRY_AGAIN)
@@ -534,6 +539,9 @@ mod tests {
         assert!(transient(&format!("vm a{}", crate::vm::CHECKPOINTING)));
         assert!(transient(&format!("error: too many commands arriving at once{TRY_AGAIN}")));
         assert!(!transient("error: too many sessions: 64 commands are running or awaiting their client"));
+        assert!(at_session_cap("error: too many sessions: 64 commands are running or awaiting their client"));
+        assert!(at_session_cap("error: too many detached or interactive tty sessions: 64 commands are running or awaiting their client"));
+        assert!(!at_session_cap("error: too many sessions finished in the last 30 s"));
     }
 
     #[test]

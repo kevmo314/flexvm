@@ -33,6 +33,14 @@ pub const SESSION_DONE: u8 = b'd';
 
 pub const MAX_BODY: usize = 1024 * 1024;
 
+/// The guest runs at most this many non-detached sessions (`TOO_MANY_SESSIONS` past it), and holds at most
+/// `MAX_DETACHED` detached or detachable (tty) ones (`TOO_MANY_DETACHED`); the host's exec relays are judged against them.
+pub const MAX_LIVE: usize = 64;
+pub const MAX_DETACHED: usize = 64;
+/// How its refusals start.
+pub const TOO_MANY_SESSIONS: &str = "too many sessions: ";
+pub const TOO_MANY_DETACHED: &str = "too many detached or interactive tty sessions: ";
+
 /// In a refusal that a moment later may not recur (a busy agent, a checkpointing VM): the host
 /// tries the request again rather than give up.
 pub const TRY_AGAIN: &str = "; try again";
