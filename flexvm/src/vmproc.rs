@@ -849,6 +849,13 @@ impl Proc {
         vm.pager.wait_pulled_every(Duration::from_secs(1), |mib| drop(self.host.shrink_hold(&self.held_grant, mib)))
     }
 
+    /// Its VM, if adopted, killed and its Firecracker reaped (again a no-op).
+    pub(crate) fn kill_vm(&self) {
+        if let Some(vm) = self.vm.get() {
+            vm.kill();
+        }
+    }
+
     /// An unclaimed standby's refill grant given back, once: it counts only within its window, and its VM is gone.
     pub(crate) fn refund_standby(&self) {
         let id = self.standby_grant.swap(0, Ordering::SeqCst);
@@ -1213,9 +1220,7 @@ impl Proc {
         self.drop_ports();
         self.drop_held_in();
         self.set_leaving(true);
-        if let Some(vm) = self.vm.get() {
-            vm.kill();
-        }
+        self.kill_vm();
         self.release_hold();
         drop(self.standby.lock().unwrap().take());
         // Once its VM is gone, however it leaves (#948).
@@ -1579,6 +1584,10 @@ impl Proc {
         let running = t.total();
         // Test gate: published running, its guest not set up yet (a death here ends it as a death, #730).
         crate::host::gate("guest_net_gate");
+        // Test fault `guest_setup_fail`: its guest setup fails, its Firecracker still running.
+        if crate::host::fault("guest_setup_fail") {
+            bail!("injected fault: setting up its guest failed");
+        }
         vm.guest_net(vm.ip, self.host.config_now().dns.as_deref())?;
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();

@@ -617,10 +617,12 @@ fn inherited_grant() -> Option<u64> {
     id
 }
 
-/// A standby leaving the pool short (superseded, or its VM lost to a failed claim): its VM freed,
-/// unlisted (`files` removed) and its grant given back, so none counts against the refill it then asks for.
+/// A standby leaving the pool short (superseded, or its VM lost to a failed claim): its VM freed
+/// (the standby's, or one a claim adopted before its guest setup failed), unlisted (`files` removed)
+/// and its grant given back, so none counts against the refill it then asks for.
 fn refill_departed(p: &Proc, template: &str) -> Result<usize> {
     drop(p.standby.lock().unwrap().take());
+    p.kill_vm();
     for f in std::mem::take(&mut *p.files.lock().unwrap()) {
         let _ = std::fs::remove_file(f);
     }
