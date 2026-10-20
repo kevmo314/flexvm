@@ -430,6 +430,18 @@ fn note(cache: &Path, rootfs: &Path, templates: &Path, existing: bool) -> Result
         // and this one's beside it, under a key of its own (removal drops a record naming this directory).
         Some(p) if rootfs_user_key(Path::new(std::ffi::OsStr::from_bytes(&p))).is_ok_and(|k| k != me) => {
             key = format!("{me}-{}", crate::template::state_key(templates));
+            // Reuse this identity's fallback after a move, even though its path hash changed.
+            // A fallback naming another live directory belongs to that state, as above.
+            let prefix = format!("{me}-");
+            for entry in std::fs::read_dir(&users.path)? {
+                let name = entry?.file_name();
+                let Some(name) = name.to_str().filter(|n| n.starts_with(&prefix)) else { continue };
+                let Some(p) = record(name) else { continue };
+                if gone(&p) || rootfs_user_key(Path::new(std::ffi::OsStr::from_bytes(&p))).is_ok_and(|k| k == me) {
+                    key = name.to_owned();
+                    break;
+                }
+            }
             if record(&key).as_deref() == Some(path) {
                 return Ok(());
             }
@@ -1366,6 +1378,37 @@ mod tests {
         assert!(!own.exists());
         assert_eq!(std::fs::read(&collided).unwrap(), a.as_os_str().as_bytes());
         assert!(entry_complete(&rootfs));
+    }
+
+    #[test]
+    fn colliding_rootfs_records_follow_repeated_state_moves() {
+        let root = crate::test_util::TempDir::new("image-user-collision-moves");
+        let (a, mut b) = (root.join("a"), root.join("b"));
+        for state in [&a, &b] {
+            std::fs::create_dir_all(state.join("templates")).unwrap();
+        }
+        let cache = root.join("images");
+        std::fs::create_dir_all(cache.join("rootfs")).unwrap();
+        let rootfs = cache.join("rootfs/k.ext4");
+        for ext in ["ext4", "ok", "conf"] {
+            std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+        }
+        let users = rootfs.with_extension("users");
+        std::fs::create_dir(&users).unwrap();
+        let collided = users.join(rootfs_user_key(&b.join("templates")).unwrap());
+        std::fs::write(&collided, a.join("templates").as_os_str().as_bytes()).unwrap();
+        note_published_rootfs(&cache, &rootfs, &b.join("templates")).unwrap();
+        let own = users.join(format!("{}-{}", rootfs_user_key(&b.join("templates")).unwrap(), crate::template::state_key(&b.join("templates"))));
+        assert_eq!(std::fs::read_dir(&users).unwrap().count(), 2);
+        for i in 0..3 {
+            let moved = root.join(format!("b-{i}"));
+            std::fs::rename(&b, &moved).unwrap();
+            b = moved;
+            note_published_rootfs(&cache, &rootfs, &b.join("templates")).unwrap();
+            assert_eq!(std::fs::read_dir(&users).unwrap().count(), 2);
+            assert_eq!(std::fs::read(&own).unwrap(), b.join("templates").as_os_str().as_bytes());
+            assert_eq!(std::fs::read(&collided).unwrap(), a.join("templates").as_os_str().as_bytes());
+        }
     }
 
     #[test]
