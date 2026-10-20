@@ -7230,12 +7230,12 @@ def kill_source():
     pulls from it and releases it); the VM lives on at the target."""
     n = "ft-kill-source"
     m = setup(n, mib=1500)
-    ok(migrate(A, n, B))
-    # Keep the pull from finishing (the target retries for 10 s).
-    fault(A, "pages", 3000)
-    r = cli_json(A, "kill", n)
-    check("kill source: refused", not r["ok"] and "source of a migration" in r.get("error", ""), r)
-    check("kill source: copy still paused on A", vms(A).get(n, {}).get("state") == "source", where(n))
+    # Every page reply a second late from before the migration until the kill was refused: the pull cannot finish first.
+    with armed_fault(A, "pages_slow", 600000):
+        ok(migrate(A, n, B))
+        r = cli_json(A, "kill", n)
+        check("kill source: refused", not r["ok"] and "source of a migration" in r.get("error", ""), r)
+        check("kill source: copy still paused on A", vms(A).get(n, {}).get("state") == "source", where(n))
     st = wait_released(B, n)
     check("kill source: target pulled everything and released it",
           st["released"] is True and st["failed"] is None and where(n) == {B: "running"}, (st, where(n)))
