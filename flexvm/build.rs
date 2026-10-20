@@ -1,13 +1,13 @@
 //! Builds flexvm-init (the guest crate) for the guest and hands its path to `include_bytes!`, and reads the
-//! prebuilt artifacts release flexvm downloads from: its tag (scripts/versions.sh) and the sha256 pinned for
-//! each asset (scripts/checksums.sha256).
+//! prebuilt artifacts release flexvm downloads from: its semver tag (vMAJOR.MINOR.PATCH in scripts/versions.sh)
+//! and the sha256 pinned for each asset (scripts/checksums.sha256).
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The repository whose releases hold the prebuilt artifacts.
-const REPO: &str = "kevmo314/flexvm";
+const REPO: &str = "numerataz/flexvm";
 /// The assets flexvm downloads, and the `rustc-env` each one's pin goes in.
 const ASSETS: [(&str, &str); 2] = [("firecracker", "FLEXVM_PIN_FIRECRACKER"), ("vmlinux", "FLEXVM_PIN_VMLINUX")];
 

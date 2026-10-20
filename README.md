@@ -19,9 +19,9 @@ building (`FLEXVM_STATE_DIR=/srv/flexvm cargo build --release`); `--state`
 still overrides it at run time. This README writes `/var/lib/flexvm` for
 whichever default the binary was built with, except in the run-path rules
 below. The test and lab scripts
-(`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`) take
-`FLEXVM_STATE_DIR` from the environment too; `fetch.sh` and
-`build-firecracker.sh` take `--state`.
+(`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`, `fetch.sh`,
+`build-firecracker.sh`) take `FLEXVM_STATE_DIR` from the environment too;
+`fetch.sh` and `build-firecracker.sh` also take `--state`, which overrides it.
 
 Each state directory is bound to one canonical run directory on first open:
 `STATE/run.json` records its run path, and `RUN/state.json` records its state.
@@ -92,6 +92,11 @@ assume that.
 
 ### Releasing the artifacts
 
+Releases use semver tags `vMAJOR.MINOR.PATCH`: `artifacts-5` was the last
+`artifacts-N` release, and `v0.1.0` the first source release (whose
+Firecracker came from `artifacts-1`), so the first semver artifacts release is
+`v0.2.0`. The version in `flexvm/Cargo.toml` and `guest/Cargo.toml` is the tag
+without its `v` (`scripts/pin-artifacts.sh --check` fails otherwise).
 A release (`ARTIFACTS_TAG` in `scripts/versions.sh`) is built from what
 `scripts/pin-artifacts.sh --inputs` lists: Firecracker's version, the commit
 its tag names (`FC_COMMIT`; the build refuses any other), the patches, the
@@ -105,7 +110,8 @@ otherwise. Then:
 1. Merge it. Main now names a pending tag: flexvm builds from it download
    nothing until step 3 (build.rs warns), and CI warns.
 2. Push the tag at that commit on main:
-   `git tag artifacts-N <commit> && git push origin artifacts-N`.
+   `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`, with the
+   `ARTIFACTS_TAG` it names.
    `.github/workflows/release.yml` checks that `versions.sh` there names it,
    builds the assets with `scripts/release-assets.sh`, attests their build
    provenance and publishes them.

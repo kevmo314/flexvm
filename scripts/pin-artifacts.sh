@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The prebuilt artifacts release (ARTIFACTS_TAG in scripts/versions.sh, built by .github/workflows/release.yml).
+# The semver prebuilt artifacts release (vMAJOR.MINOR.PATCH; ARTIFACTS_TAG in scripts/versions.sh, built by .github/workflows/release.yml).
 # usage: pin-artifacts.sh            downloads the release's assets, verifies their build provenance (release.yml at
 #                                    the release's tag, whose commit must be in this checkout's history, attested by
 #                                    GitHub; needs gh), checks they were built from this checkout's inputs, and pins
@@ -19,6 +19,10 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
+if ! [[ $ARTIFACTS_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "ARTIFACTS_TAG must use vMAJOR.MINOR.PATCH (e.g. v0.2.0), not $ARTIFACTS_TAG" >&2
+  exit 1
+fi
 checksums=$root/scripts/checksums.sha256
 REPO=numerataz/flexvm
 ASSETS=(firecracker vmlinux inputs.txt)
@@ -115,6 +119,14 @@ case "${1:-}" in
   --check)
     # This checkout's inputs must be well-formed whatever the release's state.
     ours=$(inputs) || exit 1
+    # The crates' versions are the tag's, without its v.
+    for manifest in flexvm/Cargo.toml guest/Cargo.toml; do
+      version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/$manifest" | head -1)
+      if [ "v$version" != "$ARTIFACTS_TAG" ]; then
+        echo "$manifest has version ${version:-none}, not ${ARTIFACTS_TAG#v} (ARTIFACTS_TAG $ARTIFACTS_TAG): bump it with the tag (RELEASING in README.md)" >&2
+        exit 1
+      fi
+    done
     pins=0
     for asset in "${ASSETS[@]}"; do
       checksum=$(pinned "$ARTIFACTS_URL/$asset")

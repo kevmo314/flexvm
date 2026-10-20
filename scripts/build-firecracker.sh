@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # Builds Firecracker with the flexvm patches into STATE/artifacts/firecracker.
-# usage: build-firecracker.sh [--state DIR (/var/lib/flexvm)]
+# usage: build-firecracker.sh [--state DIR (${FLEXVM_STATE_DIR:-/var/lib/flexvm})]
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-state=/var/lib/flexvm
-if [ "${1:-}" = --state ]; then state=$(realpath -m "$2"); fi
+state=$(realpath -m "${FLEXVM_STATE_DIR:-/var/lib/flexvm}")
+while (( $# )); do
+  case "$1" in
+    --state)
+      if (( $# < 2 )) || [[ $2 == --* ]]; then echo '--state needs a directory' >&2; exit 2; fi
+      state=$(realpath -m "$2")
+      shift 2
+      ;;
+    *) echo 'usage: build-firecracker.sh [--state DIR]' >&2; exit 2 ;;
+  esac
+done
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 src=${FC_SRC:-$root/build/firecracker-src}
@@ -45,7 +54,13 @@ kh=$root/build/musl-kheaders
 mkdir -p "$kh"
 ln -sfn /usr/include/linux "$kh/linux"
 ln -sfn /usr/include/asm-generic "$kh/asm-generic"
-ln -sfn /usr/include/x86_64-linux-gnu/asm "$kh/asm"
+asm=
+multiarch=$(${CC:-cc} -print-multiarch 2>/dev/null || true)
+for path in "/usr/include/$multiarch/asm" /usr/include/asm /usr/include/x86_64-linux-gnu/asm; do
+  if [ -d "$path" ]; then asm=$path; break; fi
+done
+if [ -z "$asm" ]; then echo 'Cannot find the system asm headers; install the kernel headers.' >&2; exit 1; fi
+ln -sfn "$asm" "$kh/asm"
 export CFLAGS_x86_64_unknown_linux_musl="-idirafter $kh"
 
 cd "$src"
@@ -60,8 +75,15 @@ cargo build --release --target x86_64-unknown-linux-musl --target-dir "$target" 
 built=$target/x86_64-unknown-linux-musl/release/firecracker
 out=$state/artifacts
 sudo mkdir -p "$out"
+# fetch.sh holds this same lock while checking and installing Firecracker.
+sudo touch "$out/.firecracker.lock"
+sudo chmod 644 "$out/.firecracker.lock"
+exec {lock}< "$out/.firecracker.lock"
+flock -x "$lock"
 placing= recording=
 trap 'sudo rm -f -- "$placing" "$recording"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 placing=$(sudo mktemp -p "$out" .firecracker.XXXXXX)
 recording=$(sudo mktemp -p "$out" .firecracker.sha256.XXXXXX)
 sudo install -m 755 "$built" "$placing"
@@ -70,5 +92,6 @@ printf '%s  built by scripts/build-firecracker.sh (%s %s, patches %s)\n' "$(sudo
 sudo chmod 644 "$recording"
 sudo mv -T "$placing" "$out/firecracker"
 sudo mv -T "$recording" "$out/firecracker.sha256"
-trap - EXIT
+trap - EXIT INT TERM
+exec {lock}<&-
 "$target"/x86_64-unknown-linux-musl/release/firecracker --version

@@ -63,10 +63,11 @@ jobs:
         run: |
           sudo modprobe tun
           cargo test -p flexvm -p flexvm-init --config 'target.x86_64-unknown-linux-gnu.runner="sudo -E"' -- --ignored
-      # The artifacts release (what `cargo build` users download) must be built from this checkout's inputs
-      # (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG in the same change, or fails
-      # here, PR or main. A bumped tag is pending until it is released and pinned (RELEASING in README.md): a
-      # warning, but on main (push, nightly) a failure once it has been pending for the release window.
+      # The semver artifacts release (vMAJOR.MINOR.PATCH; what `cargo build` users download) must be built
+      # from this checkout's inputs (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG
+      # in the same change, or fails here, PR or main. --check also validates the semver tag format.
+      # A bumped tag is pending until it is released and pinned (RELEASING in README.md): a warning,
+      # but on main (push, nightly) a failure once it has been pending for the release window.
       - name: Pinned artifacts release
         env:
           REF: ${{ github.ref }}
