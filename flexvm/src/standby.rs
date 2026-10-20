@@ -112,6 +112,71 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     ids
 }
 
+const RANK_TTL: Duration = Duration::from_secs(1);
+const RANK_ENTRY: usize = 44; // start, pid, SHA-256 of boot id.
+
+fn rank_entry(id: &Ident) -> [u8; RANK_ENTRY] {
+    use sha2::Digest;
+    let mut b = [0; RANK_ENTRY];
+    b[..8].copy_from_slice(&id.start.to_be_bytes());
+    b[8..12].copy_from_slice(&id.pid.to_be_bytes());
+    b[12..].copy_from_slice(&sha2::Sha256::digest(id.boot.as_bytes()));
+    b
+}
+
+/// Whether `me` is beyond `target`, or None while another standby ranks. Only the idle loop shares
+/// ranks; commands and refills still list the live pool. The lock and snapshot outlive pool removal,
+/// like the refill lock.
+fn extra(host: &Host, template: &str, me: &Ident, target: usize) -> Option<bool> {
+    extra_with(&refill_lock_path(host, template), me, target, || live(host, template))
+}
+
+/// A snapshot only keeps a standby: one it ranks extra (or misses) recounts before leaving, since an
+/// older standby claimed since publication would over-rank it.
+fn extra_with(base: &std::path::Path, me: &Ident, target: usize, scan: impl FnOnce() -> Vec<Ident>) -> Option<bool> {
+    if target == 0 {
+        return Some(true);
+    }
+    let path = base.with_extension("ranks");
+    let _dir = crate::host::lock_dir(path.parent()?).ok()?;
+    if read_rank(&path, me).is_some_and(|i| i < target) {
+        return Some(false);
+    }
+    // No waiting behind a slow scan, and no fallback to one scan per standby.
+    let _lock = Flock::new(crate::host::private_file(&base.with_extension("rank")).ok()?, libc::LOCK_EX | libc::LOCK_NB).ok()?;
+    if read_rank(&path, me).is_some_and(|i| i < target) {
+        return Some(false);
+    }
+    let ids = scan();
+    let bytes: Vec<u8> = ids.iter().flat_map(rank_entry).collect();
+    // Unpublished, the scan still decides for this standby.
+    let _ = crate::util::write_file(path.parent()?, path.file_name()?.to_str()?, &bytes, false);
+    Some(ids.iter().position(|id| id == me).is_none_or(|i| i >= target))
+}
+
+/// Fixed-size entries let each reader find only its rank, without parsing the pool.
+/// An opened snapshot stays whole across publication; a missing identity ranks last.
+fn read_rank(path: &std::path::Path, me: &Ident) -> Option<usize> {
+    let f = crate::host::open_record(path).ok()?;
+    let m = f.metadata().ok()?;
+    if m.modified().ok()?.elapsed().ok()? >= RANK_TTL || m.len() % RANK_ENTRY as u64 != 0 {
+        return None;
+    }
+    let mine = rank_entry(me);
+    let (mut lo, mut hi) = (0, m.len() / RANK_ENTRY as u64);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mut entry = [0; RANK_ENTRY];
+        f.read_exact_at(&mut entry, mid * RANK_ENTRY as u64).ok()?;
+        match entry[..12].cmp(&mine[..12]) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Some(if entry == mine { mid as usize } else { usize::MAX }),
+        }
+    }
+    Some(usize::MAX)
+}
+
 /// `live`, less those mid-claim (`PID-START.claim` locked; START keeps a reused pid's apart): a stop would not end them.
 pub fn stoppable(host: &Host, template: &str) -> Vec<Ident> {
     let Some(d) = trusted(host, template, true) else { return Vec::new() };
@@ -722,9 +787,9 @@ fn leave_status(died: bool, left_pool: bool) -> Option<i32> {
     }
 }
 
-/// Rank at most once a second, spread by pid; extras leave within 2s plus a check.
+/// Shared ranks age at most a second; extras leave within 2s plus a check.
 fn rank_due(checked: &mut Instant, now: Instant, pid: u32) -> bool {
-    let every = Duration::from_millis(1000 + u64::from(pid) * 137 % 1000);
+    let every = Duration::from_millis(500 + u64::from(pid) * 137 % 500);
     if now.duration_since(*checked) < every {
         return false;
     }
@@ -817,8 +882,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         if checked.is_none_or(|c| c.elapsed() >= CHECK_EVERY) {
             checked = Some(Instant::now());
             let superseded = is_superseded(&key(&p.paths, template), &mine);
-            let extra = rank_due(&mut ranked, Instant::now(), me.pid)
-                && live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
+            let extra = rank_due(&mut ranked, Instant::now(), me.pid) && extra(host, template, &me, target(host, template)) == Some(true);
             let died = p.standby.lock().unwrap().as_ref().map_or(Some("it was given up".to_string()), |s| {
                 s.pager.failed().map(String::from).or((!s.firecracker().alive()).then(|| "its firecracker exited".into()))
             });
@@ -1542,14 +1606,121 @@ mod tests {
     }
 
     #[test]
+    fn rank_snapshots_find_identities_and_reject_stale_or_partial_data() {
+        let root = crate::test_util::TempDir::new("rank-snapshot");
+        let path = root.join("ranks");
+        let ids: Vec<_> = (0..128).map(|i| Ident { start: i / 2, pid: i as u32 + 1, boot: "boot".into() }).collect();
+        crate::host::write_record(&path, &ids.iter().flat_map(rank_entry).collect::<Vec<_>>()).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(read_rank(&path, id), Some(i));
+        }
+        for missing in [Ident { boot: "other".into(), ..ids[0].clone() }, Ident { start: u64::MAX, ..ids[0].clone() }] {
+            assert_eq!(read_rank(&path, &missing), Some(usize::MAX));
+        }
+        File::options().write(true).open(&path).unwrap().set_modified(std::time::SystemTime::now() - RANK_TTL).unwrap();
+        assert_eq!(read_rank(&path, &ids[0]), None);
+        crate::host::write_record(&path, b"partial").unwrap();
+        assert_eq!(read_rank(&path, &ids[0]), None);
+        crate::host::write_record(&path, b"").unwrap();
+        assert_eq!(read_rank(&path, &ids[0]), Some(usize::MAX));
+    }
+
+    #[test]
+    fn standby_ranks_share_one_scan_and_expire() {
+        let root = crate::test_util::TempDir::new("shared-ranks");
+        let base = root.join(".locks/default");
+        let ids: Vec<_> = (0..128).map(|i| Ident { start: i / 2, pid: i as u32 + 1, boot: "boot".into() }).collect();
+        let mut scans = 0;
+        for id in &ids[..64] {
+            let scan = || {
+                scans += 1;
+                ids.clone()
+            };
+            assert_eq!(extra_with(&base, id, 64, scan), Some(false));
+        }
+        assert_eq!(scans, 1, "standbys within the target share one scan");
+        // A snapshot alone never retires one: each beyond the target recounts first.
+        for id in &ids[64..] {
+            assert_eq!(extra_with(&base, id, 64, || ids.clone()), Some(true));
+        }
+        // A claim took the oldest since publication: the youngest is no longer extra.
+        assert_eq!(extra_with(&base, &ids[127], 127, || ids[1..].to_vec()), Some(false));
+        let missing = Ident { boot: "other boot".into(), ..ids[0].clone() };
+        assert_eq!(extra_with(&base, &missing, 64, || ids.clone()), Some(true));
+        let missing = Ident { pid: 999, ..ids[0].clone() };
+        assert_eq!(extra_with(&base, &missing, 64, || ids.clone()), Some(true));
+        let path = base.with_extension("ranks");
+        File::options().write(true).open(&path).unwrap().set_modified(std::time::SystemTime::now() - RANK_TTL).unwrap();
+        // An expired snapshot is recounted.
+        assert_eq!(extra_with(&base, &ids[1], 1, || ids[1..].to_vec()), Some(false));
+        assert_eq!(extra_with(&base, &ids[1], 1, || panic!("a fresh snapshot keeps the oldest")), Some(false));
+        assert_eq!(extra_with(&base, &ids[0], 0, || panic!("no target needs no rank")), Some(true));
+        assert_eq!(extra_with(&base.with_file_name("other"), &ids[0], 1, Vec::new), Some(true));
+    }
+
+    #[test]
+    fn shared_ranking_uses_live_records_oldest_first() {
+        let (_root, host, _paths, d) = pool("rank-live");
+        let ids: Vec<_> = [(2, 1), (1, 2), (1, 1)].into_iter().map(|(start, pid)| Ident { start, pid, boot: "boot".into() }).collect();
+        let mut held = Vec::new();
+        for id in &ids {
+            let path = crate::host::locks(&d).join(format!("{}.lock", id.key()));
+            held.push(Flock::new(crate::host::private_file(&path).unwrap(), libc::LOCK_EX).unwrap());
+            crate::host::write_record(&path, &serde_json::to_vec(id).unwrap()).unwrap();
+        }
+        assert_eq!(extra(&host, "default", &ids[0], 2), Some(true));
+        let path = refill_lock_path(&host, "default").with_extension("ranks");
+        for (i, id) in ids.iter().rev().enumerate() {
+            assert_eq!(read_rank(&path, id), Some(i));
+        }
+        let first = rank_entry(&ids[2]);
+        let snapshot = File::open(&path).unwrap();
+        // A published replacement cannot change what an existing reader has open.
+        drop(held);
+        File::options().write(true).open(&path).unwrap().set_modified(std::time::SystemTime::now() - RANK_TTL).unwrap();
+        assert_eq!(extra(&host, "default", &ids[2], 1), Some(true), "gone from the live records");
+        let mut entry = [0; RANK_ENTRY];
+        snapshot.read_exact_at(&mut entry, 0).unwrap();
+        assert_eq!(entry, first);
+        assert_eq!(read_rank(&path, &ids[2]), Some(usize::MAX));
+        assert!(live(&host, "default").is_empty());
+    }
+
+    #[test]
+    fn a_busy_or_failed_ranker_never_causes_private_scans() {
+        let root = crate::test_util::TempDir::new("busy-ranker");
+        let me = Ident::me();
+        let base = root.join(".locks/default");
+        let lock = Flock::new(crate::host::private_file(&base.with_extension("rank")).unwrap(), libc::LOCK_EX).unwrap();
+        assert_eq!(extra_with(&base, &me, 1, || panic!("ranker holds lock")), None);
+        drop(lock);
+        assert_eq!(extra_with(&base, &me, 1, || vec![me.clone()]), Some(false));
+        let lock = Flock::new(crate::host::private_file(&base.with_extension("rank")).unwrap(), libc::LOCK_EX).unwrap();
+        assert_eq!(extra_with(&base, &me, 1, || panic!("fresh result needs no lock")), Some(false));
+        // Ranked extra, it waits for the lock to recount rather than leave on a snapshot.
+        assert_eq!(extra_with(&base, &Ident { pid: me.pid + 1, ..me.clone() }, 1, || panic!("ranker holds lock")), None);
+        let path = base.with_extension("ranks");
+        std::fs::write(&path, b"partial").unwrap();
+        assert_eq!(extra_with(&base, &me, 1, || panic!("incomplete result and busy ranker")), None);
+        drop(lock);
+        assert_eq!(extra_with(&base, &me, 1, Vec::new), Some(true));
+        std::fs::remove_file(&path).unwrap();
+        let target = base.with_extension("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(extra_with(&base, &me, 1, || vec![me.clone()]), Some(false));
+        assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
+    }
+
+    #[test]
     fn ranking_is_throttled_jittered_and_bounded() {
         let start = Instant::now();
         let mut first = Vec::new();
         for pid in [1000, 1001, 1002, u32::MAX] {
             let mut checked = start;
             let scans: Vec<_> = (0..=60).filter(|tick| rank_due(&mut checked, start + CHECK_EVERY * *tick, pid)).collect();
-            assert!((10..=20).contains(&scans[0]));
-            assert!(scans.windows(2).all(|s| (10..=20).contains(&(s[1] - s[0]))));
+            assert!((5..=10).contains(&scans[0]));
+            assert!(scans.windows(2).all(|s| (5..=10).contains(&(s[1] - s[0]))));
             first.push(scans[0]);
             // A delayed check runs once, without catching up missed scans.
             let later = start + Duration::from_secs(30);

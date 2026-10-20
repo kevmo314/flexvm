@@ -951,7 +951,17 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   available (so a refill never takes the room eviction moves VMs away to
   make), and the memory controller stops them all when the host goes under
   its reserve. A standby VM also checks every 100 ms and leaves by itself
-  under the reserve, so a host with no running VM relieves them too.
+  under the reserve, so a host with no running VM relieves them too. Idle
+  standbys share a one-second ranking snapshot per template: a nonblocking
+  lock elects one scanner, which atomically publishes fixed-size identities
+  sorted oldest first. Each standby binary-searches only its own rank every
+  0.5–1 s (spread by pid). A snapshot only keeps a standby: one it ranks extra
+  (or misses) rescans under the lock before leaving, so a claim since
+  publication cannot retire the wrong one; extras leave within 2 s plus a
+  check. A busy ranker
+  defers the check, without blocking claims or triggering private scans. The
+  lock and snapshot live beside the refill lock, outside the removable pool,
+  and work without a listener. Commands and refills still scan live records.
 - **Generations.** `flexvm pull` publishes each build as an immutable
   `templates/.gen/<content id>/` and points `templates/NAME` at it with one
   atomic symlink swap, all through the templates directory as opened and
