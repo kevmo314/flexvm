@@ -3421,17 +3421,36 @@ fn pid_ns() -> Option<u64> {
 /// cannot see would read as empty: None, and no other namespace is ever proven gone.
 fn pid_ns_census() -> Option<HashSet<u64>> {
     use std::os::unix::fs::MetadataExt;
+    // A /proc that hides processes (`hidepid`, `subset`) lists only some: no census.
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    if mounts.lines().any(|l| l.split(' ').nth(4) == Some("/proc") && ["hidepid=", "subset="].iter().any(|o| l.contains(o))) {
+        return None;
+    }
+    pid_ns_census_in(Path::new("/proc"), pid_ns()?, &|dir| std::fs::metadata(dir.join("ns/pid")).map(|m| m.ino()))
+}
+
+/// `pid_ns_census` of `proc`, reading a process's namespace with `ns_of`. Fails closed: any
+/// entry that cannot be listed, or whose namespace cannot be read but for its process having
+/// exited (ENOENT, ESRCH), means no census, as that process's namespace would read as empty.
+fn pid_ns_census_in(proc: &Path, mine: u64, ns_of: &dyn Fn(&Path) -> std::io::Result<u64>) -> Option<HashSet<u64>> {
     const PF_KTHREAD: u64 = 0x0020_0000;
-    let ns_of = |dir: &Path| std::fs::metadata(dir.join("ns/pid")).ok().map(|m| m.ino());
-    let stat = std::fs::read_to_string("/proc/2/stat").ok()?;
+    let stat = std::fs::read_to_string(proc.join("2/stat")).ok()?;
     let flags: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(6)?.parse().ok()?;
-    if flags & PF_KTHREAD == 0 || ns_of(Path::new("/proc/2"))? != pid_ns()? {
+    if flags & PF_KTHREAD == 0 || ns_of(&proc.join("2")).ok()? != mine {
         return None;
     }
     let mut live = HashSet::new();
-    for e in std::fs::read_dir("/proc").ok()?.flatten() {
-        if e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) {
-            live.extend(ns_of(&e.path()));
+    for e in std::fs::read_dir(proc).ok()? {
+        let e = e.ok()?;
+        if !e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) {
+            continue;
+        }
+        match ns_of(&e.path()) {
+            Ok(ns) => {
+                live.insert(ns);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(_) => return None,
         }
     }
     Some(live)
@@ -7386,6 +7405,41 @@ pub(crate) mod tests {
         if let Some(live) = pid_ns_census() {
             assert!(live.contains(&pid_ns().unwrap()));
         }
+    }
+
+    /// A census only from the initial PID namespace, and failing closed: a process whose
+    /// namespace cannot be read (but for having exited) would make its namespace read as empty.
+    #[test]
+    fn pid_namespace_census_fails_closed() {
+        let d = crate::test_util::TempDir::new("pidns-census");
+        let proc = d.join("proc");
+        for pid in ["1", "2", "30", "40", "50", "self"] {
+            std::fs::create_dir_all(proc.join(pid)).unwrap();
+        }
+        let kthread = "2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0";
+        let user = "2 (init-systemd(Ub)) S 1 0 0 0 -1 4194624 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0";
+        let census = |stat: &str, odd: Option<std::io::Error>| {
+            std::fs::write(proc.join("2/stat"), stat).unwrap();
+            let odd = std::sync::Mutex::new(odd);
+            pid_ns_census_in(&proc, 100, &|dir: &Path| match dir.file_name().unwrap().to_str().unwrap() {
+                "30" => Ok(200),
+                "50" => odd.lock().unwrap().take().map_or(Ok(300), Err),
+                _ => Ok(100),
+            })
+        };
+        assert_eq!(census(kthread, None), Some(HashSet::from([100, 200, 300])));
+        // One that exited meanwhile is no process: its namespace may be gone.
+        assert_eq!(census(kthread, Some(std::io::ErrorKind::NotFound.into())), Some(HashSet::from([100, 200])));
+        assert_eq!(census(kthread, Some(std::io::Error::from_raw_os_error(libc::ESRCH))), Some(HashSet::from([100, 200])));
+        // One that cannot be read may be alive: no census, so no namespace is proven gone.
+        assert_eq!(census(kthread, Some(std::io::ErrorKind::PermissionDenied.into())), None);
+        assert_eq!(census(kthread, Some(std::io::Error::from_raw_os_error(libc::EIO))), None);
+        // Not the initial PID namespace (pid 2 no kernel thread), or not this one's /proc: none.
+        assert_eq!(census(user, None), None);
+        assert_eq!(pid_ns_census_in(&proc, 999, &|_: &Path| Ok(100)), None);
+        assert_eq!(pid_ns_census_in(&d.join("missing"), 100, &|_: &Path| Ok(100)), None);
+        let unknown = || None;
+        assert!(!pidns(Some(100), &unknown).gone(Some(300)));
     }
 
     fn pidns<'a>(mine: Option<u64>, census: &'a dyn Fn() -> Option<HashSet<u64>>) -> PidNs<'a> {
