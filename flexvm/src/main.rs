@@ -1185,10 +1185,7 @@ fn run_checkpoint(args: &Args) -> Result<()> {
         // A detached restore logs to the VM's name, which the checkpoint has without --name.
         let own = checkpoint::read_manifest(&dir)?.name;
         let name = args.get("name").map_or_else(|| own.clone(), String::from);
-        // Refuse a taken name, and clear an earlier VM's logs (under the checkpoint's own name,
-        // the VM goes on in its own: `Host::take_restoring_name`), before opening it for the child.
-        drop(host.take_restoring_name(&name, name == own)?);
-        return print(spawn_detached(&host, &name, &args.child_args, &log_file(&host, &name)?, false)?);
+        return print(spawn_detached(&host, &name, &args.child_args, &restore_run_log(&host, &name, name == own)?, false)?);
     }
     vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }
@@ -1220,6 +1217,14 @@ impl std::ops::DerefMut for RunLog {
 fn new_run_log(host: &Host, name: &str) -> Result<RunLog> {
     // Refuse a taken name and clear a failed VM's logs before opening it for the child.
     let _name = host.take_name(name, false)?;
+    log_file(host, name)
+}
+
+/// `new_run_log` of a detached restore: under the checkpoint's own name (`own`), the VM goes on
+/// in its logs (`Host::take_restoring_name`). The name is held until the log is open, so no
+/// other VM's logs are taken for it meanwhile.
+fn restore_run_log(host: &Host, name: &str, own: bool) -> Result<RunLog> {
+    let _name = host.take_restoring_name(name, own)?;
     log_file(host, name)
 }
 
@@ -2547,6 +2552,25 @@ mod exec_tests {
             drop(name);
             host.retire_logs("web").unwrap();
         }
+    }
+
+    /// A detached restore of a name a VM runs under: refused, that VM's logs left as they are;
+    /// of a free one, its log opened holding the name (let go of once open).
+    #[test]
+    fn a_detached_restore_opens_its_log_holding_the_name() {
+        let root = crate::test_util::TempDir::new("restore-log");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let running = host.take_name("web", false).unwrap();
+        let logs = host.own_logs("web", None).unwrap();
+        let before = host::logs_owner(&logs);
+        for own in [true, false] {
+            assert!(host::name_taken(&restore_run_log(&host, "web", own).unwrap_err()));
+            assert_eq!(host::logs_owner(&logs), before);
+        }
+        drop(running);
+        let out = restore_run_log(&host, "web", true).unwrap();
+        assert_eq!(host::logs_owner(&logs).unwrap().to, [out.token.clone()], "the stopped vm's logs, handed on");
+        drop(host.take_name("web", true).unwrap());
     }
 
     #[test]
