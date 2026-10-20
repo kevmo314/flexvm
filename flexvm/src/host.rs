@@ -812,16 +812,22 @@ impl Host {
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
-        self.take_name_as(name, resuming, false)
+        self.take_name_as(name, resuming, false, handed())
+    }
+
+    /// `take_name` of a new name by the VM process a `run` handed its logs to with `token`
+    /// (`own_logs`): a claimed standby, told in the claim.
+    pub fn take_handed_name(&self, name: &str, token: Option<&str>) -> Result<NameLock> {
+        self.take_name_as(name, false, false, token)
     }
 
     /// `take_name` of a new name for a VM (`rename`): a `failed` or `lost` record of it is
     /// refused, decided holding the name, never cleared.
     pub fn take_unrecorded_name(&self, name: &str) -> Result<NameLock> {
-        self.take_name_as(name, false, true)
+        self.take_name_as(name, false, true, handed())
     }
 
-    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool) -> Result<NameLock> {
+    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool, handed: Option<&str>) -> Result<NameLock> {
         if !resuming {
             check_new_name(name)?;
         }
@@ -870,10 +876,10 @@ impl Host {
         }
         // A new VM of the name starts a fresh log: an earlier VM's (failed, lost, moved, or one
         // that ended leaving only its exit status: killed, `--rm`, a foreground run's) is retired.
-        // Kept: this process's own, and one a live `run` opened to hand to the VM taking the name
-        // (`own_logs`). A resume (`start`) keeps its VM's.
+        // Kept: this process's own, one a `run` handed to it (its token: whether or not that `run`
+        // is still there), and one a live `run` opened to hand to another (`own_logs`). A resume (`start`) keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
-        if !resuming && (["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) || self.earlier_logs(name)?) {
+        if !resuming && (["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) || self.earlier_logs(name, handed)?) {
             let _ = self.retire_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
@@ -963,13 +969,14 @@ impl Host {
     }
 
     /// `open_logs`, recorded as this process's lifetime (`NAME.logs/.owner`): its VM's process
-    /// (as it takes the name), or, `handoff`, a `run` opening them for the VM process it hands
-    /// them to (a detached child, a claimed standby), which takes the name while this one waits.
-    /// A new VM of the name retires any lifetime but those (`take_name`).
-    pub fn own_logs(&self, name: &str, handoff: bool) -> Result<File> {
+    /// (as it takes the name), or, with a `to` token, a `run` opening them for the VM process it
+    /// hands them to (a detached child, told in `HANDOFF_ENV`; a claimed standby, in the claim),
+    /// which takes the name while this one waits, and keeps them by the token even if this one
+    /// dies meanwhile. A new VM of the name retires any lifetime but those (`take_name`).
+    pub fn own_logs(&self, name: &str, to: Option<&str>) -> Result<File> {
         let dir = self.open_logs(name)?;
         let tmp = std::ffi::CString::new(format!("{OWNER}.{}", std::process::id()))?;
-        let owner = LogsOwner { id: Ident::me(), handoff };
+        let owner = LogsOwner { id: Ident::me(), handoff: to.is_some(), to: to.map(Into::into) };
         let mut f = crate::util::output::open_in(&dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
         std::io::Write::write_all(&mut f, &serde_json::to_vec(&owner)?)?;
         drop(f);
@@ -983,11 +990,13 @@ impl Host {
     }
 
     /// Whether `name` has logs that are not this process's to go on with (`own_logs`): none
-    /// recorded, an ended VM's, or a handing `run`'s that is gone; anything else at their path
-    /// (not a directory) is retired too. Under the name.
-    fn earlier_logs(&self, name: &str) -> Result<bool> {
+    /// recorded, an ended VM's, or one a `run` that is gone opened for another (not handed to
+    /// this one by `handed`); anything else at their path (not a directory) is retired too.
+    /// Under the name.
+    fn earlier_logs(&self, name: &str, handed: Option<&str>) -> Result<bool> {
+        let ours = |o: &LogsOwner| o.id == Ident::me() || handed.is_some() && o.to.as_deref() == handed || o.handoff && o.id.alive();
         Ok(match crate::util::output::open_dir(&self.vms(name, "logs")?) {
-            Ok(dir) => !logs_owner(&dir).is_some_and(|o| o.id == Ident::me() || o.handoff && o.id.alive()),
+            Ok(dir) => !logs_owner(&dir).is_some_and(|o| ours(&o)),
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
         })
     }
@@ -3081,6 +3090,19 @@ pub struct LogsOwner {
     /// A `run`'s, for the VM process it hands them to.
     #[serde(default)]
     pub handoff: bool,
+    /// That VM process's token (`HANDOFF_ENV`, or a standby claim's `logs_handoff`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+/// Where a `run` tells the VM process it starts the token of the logs it hands it (`own_logs`).
+pub const HANDOFF_ENV: &str = "FLEXVM_LOGS_HANDOFF";
+
+/// This process's handed logs' token, if a `run` started it with one: read once, at its start
+/// (`main` then clears it, so no process of its own inherits it).
+pub fn handed() -> Option<&'static str> {
+    static HANDED: OnceLock<Option<String>> = OnceLock::new();
+    HANDED.get_or_init(|| std::env::var(HANDOFF_ENV).ok().filter(|t| !t.is_empty())).as_deref()
 }
 
 /// Who the logs' lifetime `dir` (held) is of, if recorded (`Host::own_logs`).
@@ -5630,7 +5652,7 @@ pub(crate) mod tests {
             h.write_log("job", "log", "old vm\n");
             let dir = h.vms("job", "logs").unwrap();
             match id {
-                Some(id) => std::fs::write(dir.join(OWNER), serde_json::to_vec(&LogsOwner { id: id.clone(), handoff }).unwrap()).unwrap(),
+                Some(id) => std::fs::write(dir.join(OWNER), serde_json::to_vec(&LogsOwner { id: id.clone(), handoff, to: None }).unwrap()).unwrap(),
                 None => drop(std::fs::remove_file(dir.join(OWNER))),
             }
             crate::util::output::open_dir(&dir).unwrap()
@@ -5654,15 +5676,25 @@ pub(crate) mod tests {
             drop(h.take_name("job", true).unwrap());
             assert_ne!(held.metadata().unwrap().nlink(), 0, "{id:?} {handoff}: resumed");
         }
+        // Handed by a `run` that died before its VM process took the name (SIGKILLed mid-handoff):
+        // kept by the VM process it was handed to, by its token; any other retires it.
+        for (token, retired) in [(Some("tok"), false), (Some("other"), true), (None, true)] {
+            let held = owned(Some(&gone), true);
+            let dir = h.vms("job", "logs").unwrap();
+            let marker = LogsOwner { id: gone.clone(), handoff: true, to: Some("tok".into()) };
+            std::fs::write(dir.join(OWNER), serde_json::to_vec(&marker).unwrap()).unwrap();
+            drop(h.take_handed_name("job", token).unwrap());
+            assert_eq!(held.metadata().unwrap().nlink() == 0, retired, "{token:?}");
+        }
         // Recorded by whoever opens them as theirs: the next to take the name keeps its own.
         h.retire_logs("job").unwrap();
         let name = h.take_name("job", false).unwrap();
-        let logs = h.own_logs("job", false).unwrap();
-        assert_eq!(logs_owner(&logs), Some(LogsOwner { id: me.clone(), handoff: false }));
+        let logs = h.own_logs("job", None).unwrap();
+        assert_eq!(logs_owner(&logs), Some(LogsOwner { id: me.clone(), handoff: false, to: None }));
         drop(name);
         drop(h.take_name("job", false).unwrap());
         assert_ne!(logs.metadata().unwrap().nlink(), 0);
-        assert_eq!(logs_owner(&h.own_logs("job", true).unwrap()), Some(LogsOwner { id: me, handoff: true }));
+        assert_eq!(logs_owner(&h.own_logs("job", Some("t")).unwrap()), Some(LogsOwner { id: me, handoff: true, to: Some("t".into()) }));
     }
 
     #[test]

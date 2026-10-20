@@ -827,7 +827,8 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
             _ => {}
         }
     }
-    let lock = host.take_name(name, false).map_err(|e| (e, false))?;
+    // Its claimer's logs, opened for it (`Host::own_logs`), kept by their token.
+    let lock = host.take_handed_name(name, req["logs_handoff"].as_str()).map_err(|e| (e, false))?;
     // Its memory is already out of MemAvailable: only the step is charged. Sized
     // as it was loaded (`serve`), and admitted before the address is claimed.
     let held = p.sizes.lock().unwrap().map_or(0, |(held, _)| held);

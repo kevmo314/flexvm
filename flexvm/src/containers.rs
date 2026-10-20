@@ -965,7 +965,7 @@ mod tests {
         let root = TempDir::new("logs-rotated-retired");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let name = host.take_name("job", false).unwrap();
-        let logs = host.own_logs("job", false).unwrap();
+        let logs = host.own_logs("job", None).unwrap();
         assert!(crate::util::output::append_in(&logs, b"old\n", 1 << 20));
         let (got, rx) = follow(&host, "job");
         std::thread::sleep(FOLLOW_EVERY * 2);
@@ -989,7 +989,7 @@ mod tests {
         for (owner, ends) in [(Ident { pid: u32::MAX, start: 1, ..Ident::me() }, true), (Ident::me(), false)] {
             for handoff in [false, true] {
                 host.write_log("job", "log", b"old\n");
-                std::fs::write(dir.join(".owner"), serde_json::to_vec(&host::LogsOwner { id: owner.clone(), handoff }).unwrap()).unwrap();
+                std::fs::write(dir.join(".owner"), serde_json::to_vec(&host::LogsOwner { id: owner.clone(), handoff, to: None }).unwrap()).unwrap();
                 let (_got, rx) = follow(&host, "job");
                 let ended = rx.recv_timeout(Duration::from_secs(3)).is_ok();
                 assert_eq!(ended, ends && !handoff, "{owner:?} {handoff}");

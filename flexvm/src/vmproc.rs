@@ -527,7 +527,7 @@ impl Proc {
 
     pub fn set_name(&self, n: NameLock) {
         // Its logs' lifetime: this VM's from here (`Host::open_logs`).
-        match self.host.own_logs(&n.name, false) {
+        match self.host.own_logs(&n.name, None) {
             Ok(logs) => crate::util::output::fall_back_to(logs),
             Err(e) => crate::log!("vm {}: its logs: {e}", n.name),
         }
