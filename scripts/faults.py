@@ -9374,19 +9374,24 @@ def ctrl_z_long_op():
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", "--name", n, args.template],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
     check("ctrl-z long op: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
-    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=100 iflag=fullblock 2>/dev/null && echo written")
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=300 iflag=fullblock 2>/dev/null && echo written")
     check("ctrl-z long op: memory written", code == 0, out)
     with armed_fault(A, "ckpt_crawl", 120000):
         res, t = background(lambda: checkpoint(A, n, path))
         check("ctrl-z long op: checkpoint copying", wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30), vms(A).get(n))
         os.kill(p.pid, signal.SIGTSTP)
         time.sleep(1)
+        # The copy crawls (500 ms a 1 MiB unit, at most 6 writers: 12 MiB/s), so a Ctrl-C that waited for it
+        # would take longer than the copy has left (of the 300 MiB written, less what is staged).
+        left = max(0, 300 - staged_mib())
         started = time.time()
         os.kill(p.pid, signal.SIGINT)
         code = wait_process(p, 60)
         took = time.time() - started
     t.join(120)
-    check("ctrl-z long op: Ctrl-C destroys it at once, exit status 130", code == 130 and took < 5, (code, took))
+    print(f"ctrl-z long op: exited {took:.2f} s after its Ctrl-C, {left} MiB of the copy left", flush=True)
+    check("ctrl-z long op: Ctrl-C destroys it at once (not waiting for the copy), exit status 130", code == 130 and took < left / 12,
+          (code, took, left))
     check("ctrl-z long op: the checkpoint cancelled, none published", not res.get("r", {}).get("ok") and not os.path.exists(path), res)
     check("ctrl-z long op: nothing left", n not in vms(A), vms(A).get(n))
 
