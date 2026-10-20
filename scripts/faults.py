@@ -2939,13 +2939,14 @@ def reconcile_announce():
     n = "ft-reconcile-announce"
     setup(n, mib=100)
     ip = vms(A)[n]["ip"]
-    with armed_fault(A, "pages_slow", 120000):
-        # Long enough for the slow pages the commit waits on.
-        with armed_fault(B, "lost_ack", 30000):
-            fault(B, "status", 30000)
+    # Each armed until the scenario disarms it, however long the steps in between take.
+    with armed_fault(A, "pages_slow", 600000):
+        with armed_fault(B, "lost_ack", 600000):
+            fault(B, "status", 600000)
             r = migrate(A, n, B)
         check("reconcile announce: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
-        check("reconcile announce: B committed the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
+        # Recorded after the commit's answer (its fsyncs off the downtime): waited for, not read once.
+        check("reconcile announce: B committed the next revision", wait_for(lambda: addr(B, ip).get("rev") == 1, 10), addr(B, ip))
         os.kill(json.load(open(os.path.join(B.run, "vms", ".locks", f"{n}.lock")))["pid"], signal.SIGKILL)
         fault(B, "status", 0)
         check("reconcile announce: runs on A again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
