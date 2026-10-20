@@ -36,6 +36,9 @@ const INCOMING_WAIT: Duration = Duration::from_secs(30);
 const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_HEADER: u64 = 256 << 20;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Test fault `long_preflight`: both sides' preflight deadlines (`PREFLIGHT_TIMEOUT`, `listen::PREPARE_WAIT`) this
+/// long instead, so a test parked in the preflight (`incoming_gate`) lets it go when it is done, not against them.
+pub const LONG_PREFLIGHT: Duration = Duration::from_secs(300);
 const HOLD_FENCE: Duration = Duration::from_millis(250);
 const HELD_STREAM: Duration = Duration::from_secs(2);
 /// How long a same-host target's hold, let go, watches for a packet sent along the old route
@@ -356,7 +359,7 @@ impl Proc {
         let (conn, prepared) = crate::util::rpc(
             to,
             Duration::from_secs(2),
-            Instant::now() + PREFLIGHT_TIMEOUT,
+            Instant::now() + if fault("long_preflight") { LONG_PREFLIGHT } else { PREFLIGHT_TIMEOUT },
             &json!({
                 "op": "migrate_in",
                 "name": vm.name,
