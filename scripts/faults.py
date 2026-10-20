@@ -2049,18 +2049,22 @@ def commit_fail():
     fault(B, "commit_gate", 60000)
     with armed_fault(B, "commit_fail", 60000):
         res, t = background(lambda: migrate(A, n, B))
+        pid, fcs, states, source = 0, [], None, None
         try:
             check("commit fail: the arrival got to its commit", wait_for(lambda: reached(B, "commit_gate"), 30), reached(B, "commit_gate"))
-            # Parked until the checks below are done (`finally`): Rust only gates with 10 s to spare before the deadlines.
+            # Parked while what the checks below need is read (`finally`). Rust only gates with 10 s to spare before the
+            # deadlines, so what is done here is bounded well within that: /proc and registry reads, and one
+            # Firecracker API call of at most 3 s (no `vms`, whose status calls may take 10 s each).
             pid = (reached(B, "commit_gate") or [0])[0]
             fcs = [c for c in children(pid) if b"--api-sock" in open(f"/proc/{c}/cmdline", "rb").read()]
             sock = lambda c: (lambda a: a[a.index(b"--api-sock") + 1].decode())(open(f"/proc/{c}/cmdline", "rb").read().split(b"\0"))
-            states = [fc_api(sock(c), "GET", "/")["state"] for c in fcs]
-            check("commit fail: the arrival's vm is loaded, never run", states == ["Paused"], (fcs, states))
-            check("commit fail: the source is paused, waiting", vms(A)[n]["state"] == "source", vms(A)[n])
+            states = [(fc_api(sock(c), "GET", "/", timeout=3) or {}).get("state") for c in fcs]
+            source = registry_state(A, n)
         finally:
             fault(B, "commit_gate", 0)
             t.join(90)
+    check("commit fail: the arrival's vm is loaded, never run", states == ["Paused"], (fcs, states))
+    check("commit fail: the source is paused, waiting", source == "source", source)
     r = res.get("r", {})
     check("commit fail: reached", pid in reached(B, "commit_fail"), reached(B, "commit_fail"))
     check("commit fail: migrate refused, saying why", not r.get("ok") and "committing failed" in r.get("error", ""), r)
@@ -4222,8 +4226,8 @@ def held_restore_frozen():
     rm_ckpt(path)
 
 
-def fc_api(sock, method, path, body=None):
-    cmd = ["curl", "-s", "--unix-socket", sock, "-X", method, f"http://localhost{path}"]
+def fc_api(sock, method, path, body=None, timeout=None):
+    cmd = ["curl", "-s", "--unix-socket", sock, "-X", method, f"http://localhost{path}", *(["--max-time", str(timeout)] if timeout else [])]
     if body is not None:
         cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
     out = subprocess.run(cmd, capture_output=True, text=True).stdout
