@@ -154,6 +154,24 @@ impl Proc {
         (stats, stats.is_some() && res.is_ok())
     }
 
+    /// Waits out the arrival's packet hand-off (`held_in`): its injections, link-up and route changes must not
+    /// overlap a migration onward, its hold or its device snapshot (#1028). Bounded (the hand-off is, by its
+    /// stream's deadline and its route retries); `if_idle` (eviction) refuses at once instead.
+    pub(crate) fn settle_handoff(&self, if_idle: bool) -> Result<()> {
+        let deadline = Instant::now() + ARRIVAL_WAIT;
+        while self.held_in.lock().unwrap().is_some() {
+            if if_idle {
+                return Err(Busy(format!("vm {} is still receiving its held packets; {BUSY}", self.name())).into());
+            }
+            self.not_destroyed()?;
+            if Instant::now() >= deadline {
+                bail!("vm {} is still receiving its held packets; try again once it has", self.name());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
     /// Everything not needing vmstate is prepared on the target before the
     /// pause. Once the target may have the state, this copy resumes only if
     /// the target says it aborted.
@@ -194,6 +212,7 @@ impl Proc {
         };
         refused()?;
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
+        self.settle_handoff(if_idle)?;
         vm.can_leave()?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
@@ -385,6 +404,8 @@ impl Proc {
                 "msrs": msrs,
                 "tsc_khz": tsc_khz,
                 "evict": evict,
+                // This network namespace's, which the target compares with its own: the same, it shares our routes.
+                "netns": crate::net::netns_id(),
             }),
         )
         .map_err(|e| format!("cannot move vm {} to {e}", vm.name))?;
@@ -583,7 +604,8 @@ impl Proc {
             match conn.map(|c| (c, hold::start(c))) {
                 Some((c, Ok(()))) => {
                     // Sharing our routes, the target takes the address over itself, after the held packets.
-                    let handoff = crate::net::is_local_addr(via).unwrap_or(false);
+                    // As the target decided it from our connection (#1028); an older target's, by its underlay.
+                    let handoff = target["shares_routes"].as_bool().unwrap_or_else(|| crate::net::is_local_addr(via).unwrap_or(false));
                     (held, res) = hold::send(h, ip, mig, c, handoff, || self.switch_route(mig, via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
                 }
                 started => {
@@ -678,7 +700,12 @@ impl Proc {
             }
             Ok(())
         };
-        let prepared = match self.prepare_in(req, mig, w.peer_addr()?.ip(), &mut prep, by, &going) {
+        // Whether the source shares this host's routes: by the network namespace it says it is in, else (an older
+        // source) by where its connection actually comes from (not the address it advertises, which may be a name).
+        // Decided once, for the hold, the commit's route and the hand-off, and told the source with the commit (#1028).
+        let from = w.peer_addr()?.ip();
+        let shared = shares_routes(req["netns"].as_str(), crate::net::netns_id().as_deref(), from);
+        let prepared = match self.prepare_in(req, mig, from, shared, &mut prep, by, &going) {
             Ok(p) => p,
             Err(e) => {
                 send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?;
@@ -698,6 +725,10 @@ impl Proc {
         let pager = prepared.0.pager.clone();
         // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
         let owed = &std::sync::atomic::AtomicU64::new(arrival_owed(u64::MAX, usize::MAX));
+        // Set before the commit adopts the VM, so no operation run from then on (a migration onward, a checkpoint)
+        // misses the hand-off below: it waits for it to end (`settle_handoff`, #1028).
+        let revoked = Arc::new(Mutex::new(false));
+        *self.held_in.lock().unwrap() = Some(revoked.clone());
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
             // A copy: `prepared` goes to `take_in`.
             let regions = &prepared.2.regions.clone();
@@ -730,19 +761,18 @@ impl Proc {
             let preloaded = move || preload.join().unwrap_or_else(|_| Err("preloading panicked".into()));
             let paused = hdr.paused;
             self.paused_by_request.store(paused, Ordering::SeqCst);
-            let vm = self.take_in(prepared, runs, &state, paused, deadline, preloaded, &mut t)?;
+            let vm = self.take_in(prepared, shared, runs, &state, paused, deadline, preloaded, &mut t)?;
             Ok((vm, t.json()))
         });
         let answer = |reply: Value| send_json(&mut By { s: &w, at: deadline }, &reply);
         let (vm, t) = match res {
             Ok(r) => r,
             Err(e) => {
+                self.held_in.lock().unwrap().take();
                 refuse_arrival(&w, &mut r, &json!({"ok": false, "error": e.to_string()}), owed.load(Ordering::SeqCst), deadline);
                 return Err(e);
             }
         };
-        let revoked = Arc::new(Mutex::new(false));
-        *self.held_in.lock().unwrap() = Some(revoked.clone());
         if tripped("lost_ack") {
             let _ = w.shutdown(std::net::Shutdown::Both);
         } else {
@@ -751,6 +781,8 @@ impl Proc {
                 "underlay": self.host.config_now().underlay_known().map(|u| u.to_string()),
                 "timings_ms": t,
                 "resume_error": (vm.state() == State::Failed).then_some("resuming failed"),
+                // Whether the source hands the address over to this side's route (`reroute`).
+                "shares_routes": shared,
             }}));
         }
         // Off the downtime: the source waits for the answer above to reroute.
@@ -759,7 +791,6 @@ impl Proc {
             self.sync_clock_later();
         }
         let p = self.clone();
-        let shared = shares_routes(req["source"].as_str().unwrap_or(""));
         let holder = self.holder().cloned().filter(|_| shared);
         thread::spawn(move || {
             // Sharing the source's routes, the address is routed here only once the
@@ -929,11 +960,13 @@ impl Proc {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_in(
         &self,
         req: &Value,
         mig: u64,
         from: std::net::IpAddr,
+        shared: bool,
         t: &mut Phases,
         until: Instant,
         going: &dyn Fn() -> Result<()>,
@@ -1005,7 +1038,7 @@ impl Proc {
         // All of routing the address here but the route itself, which waits for the commit.
         let ifindex = crate::net::neighbour(ip, &vm.firecracker().tap)?;
         t.mark("neighbour");
-        if shares_routes(&source.addr) {
+        if shared {
             // Ready before the source pauses: it takes the address over from the source's hold.
             self.holder();
             t.mark("holder");
@@ -1026,6 +1059,7 @@ impl Proc {
     fn take_in(
         &self,
         (prepared, ip, source, name, _): (crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>),
+        shared: bool,
         runs: Runs,
         state: &[u8],
         paused: bool,
@@ -1056,7 +1090,6 @@ impl Proc {
         let retry = || before_commit.take().unwrap()().map(drop);
         // Routed here at the commit (sharing the source's routes, after the held packets):
         // until then the route back to the source stays, whatever happens to this arrival.
-        let shared = shares_routes(&source.addr);
         let restored = prepared.load(&self.spawner, &name, Snapshot::Bytes(state), seed, ip, paused, Some(deadline), retry, t);
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         // A load that fails for want of pages says less than the probe of the source does.
@@ -1241,17 +1274,14 @@ fn arrival_floor(req: &Value) -> crate::host::Floor {
     }
 }
 
-/// Whether the host at `addr` (a listener's) is this one, routes and all.
-fn shares_routes(addr: &str) -> bool {
-    let ip = match addr.parse::<std::net::SocketAddr>().map(|a| a.ip()) {
-        Ok(std::net::IpAddr::V4(ip)) => ip,
-        Ok(std::net::IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
-            Some(ip) => ip,
-            None => return ip.is_loopback(),
-        },
-        Err(_) => return false,
-    };
-    crate::net::is_local_addr(ip).unwrap_or(false)
+/// Whether a peer is in this network namespace, routes and all: its namespace's identity (`net::netns_id`) is
+/// `ours`; or, either unknown, its connection comes from `from`, one of this namespace's addresses (IPv4, IPv6 or
+/// IPv4-mapped).
+fn shares_routes(theirs: Option<&str>, ours: Option<&str>, from: IpAddr) -> bool {
+    match (theirs, ours) {
+        (Some(theirs), Some(ours)) => theirs == ours,
+        _ => crate::net::is_local_ip(from).unwrap_or(false),
+    }
 }
 
 /// Tries `f` up to 10 times, 100 ms after the last and doubling to 5 s apart, logging failures as `what`; whether it
@@ -1410,6 +1440,62 @@ mod tests {
                     assert!(e.contains("older flexvm") && e.contains("exit with its app") && e.contains("upgrade it first"), "{e}");
                 }
             }
+        }
+    }
+
+    /// Decided by the namespaces' identities, else by the connection's numeric address (#1028): any of this
+    /// namespace's, IPv4, IPv6 or mapped.
+    #[test]
+    fn shares_routes_by_namespace_else_the_connections_address() {
+        use std::net::Ipv6Addr;
+        for local in ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"] {
+            assert!(shares_routes(None, None, local.parse().unwrap()), "{local}");
+        }
+        for remote in ["192.0.2.7", "::ffff:192.0.2.7", "2001:db8::7", "0.0.0.0", "::"] {
+            assert!(!shares_routes(None, None, remote.parse().unwrap()), "{remote}");
+        }
+        // Every address an interface here has, native IPv6 included (not only loopback).
+        let mut addrs = std::ptr::null_mut();
+        assert_eq!(unsafe { libc::getifaddrs(&mut addrs) }, 0);
+        let (mut current, mut seen) = (addrs, Vec::<IpAddr>::new());
+        while !current.is_null() {
+            let a = unsafe { &*current };
+            if !a.ifa_addr.is_null() {
+                match unsafe { (*a.ifa_addr).sa_family } as i32 {
+                    libc::AF_INET => seen.push(Ipv4Addr::from(unsafe { &*a.ifa_addr.cast::<libc::sockaddr_in>() }.sin_addr.s_addr.to_ne_bytes()).into()),
+                    libc::AF_INET6 => seen.push(Ipv6Addr::from(unsafe { &*a.ifa_addr.cast::<libc::sockaddr_in6>() }.sin6_addr.s6_addr).into()),
+                    _ => {}
+                }
+            }
+            current = a.ifa_next;
+        }
+        unsafe { libc::freeifaddrs(addrs) };
+        for ip in seen {
+            assert!(shares_routes(None, None, ip), "{ip}");
+            if let IpAddr::V4(v4) = ip {
+                assert!(shares_routes(None, None, v4.to_ipv6_mapped().into()), "{ip} mapped");
+            }
+        }
+        // Namespace identities decide when both are known: a hairpin-NATed peer here looks remote by its address, and
+        // a namespace's address can show up as a peer's in another.
+        let ours = crate::net::netns_id().expect("this namespace's identity");
+        assert_eq!(crate::net::netns_id().as_deref(), Some(ours.as_str()));
+        assert!(shares_routes(Some(&ours), Some(&ours), "192.0.2.7".parse().unwrap()));
+        assert!(!shares_routes(Some("other:0:1"), Some(&ours), "127.0.0.1".parse().unwrap()));
+        assert!(shares_routes(Some("other:0:1"), None, "127.0.0.1".parse().unwrap()));
+        assert!(!shares_routes(None, Some(&ours), "192.0.2.7".parse().unwrap()));
+        // Another namespace (where this test may make one) has another identity.
+        let other = thread::spawn(|| (unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0).then(crate::net::netns_id)).join().unwrap();
+        if let Some(other) = other {
+            assert!(other.is_some() && other.as_deref() != Some(ours.as_str()), "{other:?} {ours}");
+        }
+        // A connection's actual peer address, over loopback in either family.
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(l) = std::net::TcpListener::bind(bind) else { continue };
+            let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (s, _) = l.accept().unwrap();
+            assert_eq!(s.peer_addr().unwrap(), c.local_addr().unwrap());
+            assert!(shares_routes(None, None, s.peer_addr().unwrap().ip()), "{bind}");
         }
     }
 

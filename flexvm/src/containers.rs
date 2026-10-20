@@ -563,6 +563,9 @@ impl Proc {
         if self.reconciling.lock().unwrap().is_some() || self.is_leaving() {
             bail!("vm {from} is the source of a migration whose outcome is pending: not renaming it");
         }
+        // Nor while its arrival hands its held packets over: the hand-off's ownership checks go by the name, and one
+        // between the address's new holder and this process's new name would read as the address gone (#1028).
+        self.settle_handoff(false)?;
         let new = self.host.take_unrecorded_name(to)?;
         let (sock, new_sock) = (self.host.sock(&from)?, self.host.sock(to)?);
         std::fs::rename(&sock, &new_sock).map_err(|e| format!("vm {from}: moving its control socket: {e}"))?;
