@@ -77,6 +77,8 @@ pub struct Holder {
 #[derive(Default)]
 struct Stragglers {
     packets: VecDeque<(Ipv4Addr, Gone, Vec<u8>)>,
+    /// What `packets` hold, up to `CAP`: beyond it a straggler is counted as dropped.
+    bytes: usize,
     draining: bool,
 }
 
@@ -607,12 +609,13 @@ impl Holder {
         let Some(g) = gone.get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR) else { return false };
         let fragment = u16::from_be_bytes([p[6], p[7]]) & 0x3fff != 0;
         let zero_id = p[4] == 0 && p[5] == 0;
-        if !g.moved || (fragment && zero_id) || p[8] <= 1 || self.resend.is_none() {
+        let mut q = self.stragglers.lock().unwrap();
+        if !g.moved || (fragment && zero_id) || p[8] <= 1 || self.resend.is_none() || q.bytes + p.len() > CAP {
             g.dropped += 1;
             return false;
         }
         p[8] -= 1;
-        let mut q = self.stragglers.lock().unwrap();
+        q.bytes += p.len();
         q.packets.push_back((ip, Gone { resent: 1, dropped: 0, ..*g }, p.to_vec()));
         !std::mem::replace(&mut q.draining, true)
     }
@@ -624,6 +627,7 @@ impl Holder {
             let next = {
                 let mut q = self.stragglers.lock().unwrap();
                 let next = q.packets.pop_front();
+                q.bytes -= next.as_ref().map_or(0, |(_, _, p)| p.len());
                 q.draining = next.is_some();
                 next
             };
@@ -1161,6 +1165,31 @@ mod tests {
         }
         h.drain_stragglers(|_, _| false);
         assert_eq!(h.gone.lock().unwrap()[&ip].dropped, 1);
+    }
+
+    #[test]
+    fn stragglers_beyond_the_cap_are_counted_as_dropped() {
+        let (mut h, _w) = paired();
+        h.resend = Some(h.tun.try_clone().unwrap());
+        let ip = Ipv4Addr::new(10, 9, 0, 3);
+        h.gone.lock().unwrap().insert(ip, Gone::new(true));
+        let size = udp_to(ip).len();
+        let fit = CAP / size;
+        let _rx = h.rx.lock().unwrap();
+        assert!(h.straggler(ip, &mut udp_to(ip)), "the first reader owns the drain");
+        for _ in 1..fit + 3 {
+            assert!(!h.straggler(ip, &mut udp_to(ip)));
+        }
+        drop(_rx);
+        assert_eq!(h.stragglers.lock().unwrap().bytes, fit * size);
+        assert_eq!(h.gone.lock().unwrap()[&ip].dropped, 3);
+        let mut sent = 0;
+        h.drain_stragglers(|_, _| {
+            sent += 1;
+            true
+        });
+        assert_eq!((sent, h.stragglers.lock().unwrap().bytes), (fit, 0));
+        assert_eq!(h.gone.lock().unwrap()[&ip].resent, fit as u64);
     }
 
     #[test]

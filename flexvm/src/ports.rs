@@ -342,7 +342,7 @@ struct Connection {
     /// Connected on this pass, not yet admitted: it has moved nothing.
     fresh: bool,
     since: Instant,
-    /// When it last moved data (or connected).
+    /// When it last moved data (or connected). Data it holds for a stalled reader keeps it from idling.
     active: Instant,
     out: Direction,
     incoming: Direction,
@@ -381,26 +381,41 @@ impl Connection {
         }
         !self.out.done || !self.incoming.done && !client_failed
     }
+
+    /// Connected, with nothing it holds yet to deliver, and nothing relayed for `idle`.
+    fn idle(&self, idle: Duration) -> bool {
+        let queued = |d: &Direction| d.start < d.end;
+        self.connected && !queued(&self.out) && !queued(&self.incoming) && idle_now().duration_since(self.active) >= idle
+    }
+
+    /// Its client reset, or closed (or shut down its sending side) with nothing sent: at the cap, it
+    /// takes over no live forward.
+    fn client_gone(&self) -> bool {
+        let mut b = 0u8;
+        let n = unsafe { libc::recv(self.client.as_raw_fd(), (&mut b as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+        n == 0 || n < 0 && !matches!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
+    }
 }
 
 const DOWN: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
 
 /// The connected forward idle longest, if for at least `idle`: the one to close for a new client at the cap.
 fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
-    let (i, c) = connections.iter().enumerate().filter(|(_, c)| c.connected).min_by_key(|(_, c)| c.active)?;
-    (idle_now().duration_since(c.active) >= idle).then_some(i)
+    connections.iter().enumerate().filter(|(_, c)| c.idle(idle)).min_by_key(|(_, c)| c.active).map(|(i, _)| i)
 }
 
 /// How many connected forwards have been idle for `idle`: each may make way for one more client.
 fn spare(connections: &[Connection], idle: Duration) -> usize {
-    connections.iter().filter(|c| c.connected && idle_now().duration_since(c.active) >= idle).count()
+    connections.iter().filter(|c| c.idle(idle)).count()
 }
 
 /// Keeps at most `cap` connected: each fresh one over it replaces the idlest, or else is closed itself.
-/// Only fresh ones take it over, so there is always one to close.
+/// Only fresh ones take it over, so there is always one to close. One whose client is gone already
+/// (it hung up while its guest connected) goes first: it takes over no live forward.
 fn admit(connections: &mut Vec<Connection>, cap: usize, idle: Duration) {
     while connections.iter().filter(|c| c.connected).count() > cap {
-        let Some(i) = idlest(connections, idle).or_else(|| connections.iter().position(|c| c.fresh)) else { break };
+        let gone = connections.iter().position(|c| c.fresh && c.client_gone());
+        let Some(i) = gone.or_else(|| idlest(connections, idle)).or_else(|| connections.iter().position(|c| c.fresh)) else { break };
         connections.swap_remove(i);
     }
     for c in connections.iter_mut() {
@@ -842,6 +857,46 @@ mod tests {
         connections.push(connection(true, ago(IDLE)));
         connections.push(connection(true, ago(IDLE * 2)));
         assert_eq!(idlest(&connections, IDLE), Some(3));
+        // What it still holds for a stalled reader would be lost: it is not idle.
+        connections[3].incoming.end = 1;
+        assert_eq!((idlest(&connections, IDLE), spare(&connections, IDLE)), (Some(2), 1));
+    }
+
+    #[test]
+    fn a_replacement_whose_client_hung_up_while_connecting_closes_no_idle_forward() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ago = |d: Duration| Instant::now().checked_sub(d).unwrap();
+        let connection = |since, fresh| {
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            Connection {
+                client,
+                guest,
+                connected: true,
+                fresh,
+                since,
+                active: since,
+                out: Direction::default(),
+                incoming: Direction::default(),
+                client_down: 0,
+                guest_down: 0,
+                lingering: None,
+            }
+        };
+        let (old, new) = (ago(IDLE * 2), ago(Duration::ZERO));
+        let mut connections = vec![connection(old, false), connection(new, true)];
+        // Accepted in connect order: the third is the fresh one's client, and closing it is the client hanging up.
+        let mut peers: Vec<_> = (0..4).map(|_| listener.accept().unwrap().0).collect();
+        drop(peers.remove(2));
+        let fresh = &connections[1];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fresh.client_gone() {
+            assert!(Instant::now() < deadline, "the hangup never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!connections[0].client_gone());
+        admit(&mut connections, 1, IDLE);
+        assert_eq!(connections.iter().map(|c| c.since).collect::<Vec<_>>(), [old], "the idle forward stays");
     }
 
     #[test]
