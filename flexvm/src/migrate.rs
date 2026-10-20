@@ -404,6 +404,8 @@ impl Proc {
                 "msrs": msrs,
                 "tsc_khz": tsc_khz,
                 "evict": evict,
+                // This network namespace's, which the target compares with its own: the same, it shares our routes.
+                "netns": crate::net::netns_id(),
             }),
         )
         .map_err(|e| format!("cannot move vm {} to {e}", vm.name))?;
@@ -698,11 +700,11 @@ impl Proc {
             }
             Ok(())
         };
-        // Whether the source shares this host's routes, from where its connection actually comes from (not the
-        // address it advertises, which may be a name): decided once, for the hold, the commit's route and the
-        // hand-off, and told the source with the commit (#1028).
+        // Whether the source shares this host's routes: by the network namespace it says it is in, else (an older
+        // source) by where its connection actually comes from (not the address it advertises, which may be a name).
+        // Decided once, for the hold, the commit's route and the hand-off, and told the source with the commit (#1028).
         let from = w.peer_addr()?.ip();
-        let shared = shares_routes(from);
+        let shared = shares_routes(req["netns"].as_str(), crate::net::netns_id().as_deref(), from);
         let prepared = match self.prepare_in(req, mig, from, shared, &mut prep, by, &going) {
             Ok(p) => p,
             Err(e) => {
@@ -1272,10 +1274,14 @@ fn arrival_floor(req: &Value) -> crate::host::Floor {
     }
 }
 
-/// Whether a peer whose connection comes from `from` is in this network namespace, routes and all: one of its
-/// addresses, IPv4, IPv6 or IPv4-mapped.
-fn shares_routes(from: IpAddr) -> bool {
-    crate::net::is_local_ip(from).unwrap_or(false)
+/// Whether a peer is in this network namespace, routes and all: its namespace's identity (`net::netns_id`) is
+/// `ours`; or, either unknown, its connection comes from `from`, one of this namespace's addresses (IPv4, IPv6 or
+/// IPv4-mapped).
+fn shares_routes(theirs: Option<&str>, ours: Option<&str>, from: IpAddr) -> bool {
+    match (theirs, ours) {
+        (Some(theirs), Some(ours)) => theirs == ours,
+        _ => crate::net::is_local_ip(from).unwrap_or(false),
+    }
 }
 
 /// Tries `f` up to 10 times, 100 ms after the last and doubling to 5 s apart, logging failures as `what`; whether it
@@ -1437,15 +1443,16 @@ mod tests {
         }
     }
 
-    /// Decided by the connection's numeric address (#1028): any of this namespace's, IPv4, IPv6 or mapped.
+    /// Decided by the namespaces' identities, else by the connection's numeric address (#1028): any of this
+    /// namespace's, IPv4, IPv6 or mapped.
     #[test]
-    fn shares_routes_by_the_connections_address() {
+    fn shares_routes_by_namespace_else_the_connections_address() {
         use std::net::Ipv6Addr;
         for local in ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"] {
-            assert!(shares_routes(local.parse().unwrap()), "{local}");
+            assert!(shares_routes(None, None, local.parse().unwrap()), "{local}");
         }
         for remote in ["192.0.2.7", "::ffff:192.0.2.7", "2001:db8::7", "0.0.0.0", "::"] {
-            assert!(!shares_routes(remote.parse().unwrap()), "{remote}");
+            assert!(!shares_routes(None, None, remote.parse().unwrap()), "{remote}");
         }
         // Every address an interface here has, native IPv6 included (not only loopback).
         let mut addrs = std::ptr::null_mut();
@@ -1464,10 +1471,23 @@ mod tests {
         }
         unsafe { libc::freeifaddrs(addrs) };
         for ip in seen {
-            assert!(shares_routes(ip), "{ip}");
+            assert!(shares_routes(None, None, ip), "{ip}");
             if let IpAddr::V4(v4) = ip {
-                assert!(shares_routes(v4.to_ipv6_mapped().into()), "{ip} mapped");
+                assert!(shares_routes(None, None, v4.to_ipv6_mapped().into()), "{ip} mapped");
             }
+        }
+        // Namespace identities decide when both are known: a hairpin-NATed peer here looks remote by its address, and
+        // a namespace's address can show up as a peer's in another.
+        let ours = crate::net::netns_id().expect("this namespace's identity");
+        assert_eq!(crate::net::netns_id().as_deref(), Some(ours.as_str()));
+        assert!(shares_routes(Some(&ours), Some(&ours), "192.0.2.7".parse().unwrap()));
+        assert!(!shares_routes(Some("other:0:1"), Some(&ours), "127.0.0.1".parse().unwrap()));
+        assert!(shares_routes(Some("other:0:1"), None, "127.0.0.1".parse().unwrap()));
+        assert!(!shares_routes(None, Some(&ours), "192.0.2.7".parse().unwrap()));
+        // Another namespace (where this test may make one) has another identity.
+        let other = thread::spawn(|| (unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0).then(crate::net::netns_id)).join().unwrap();
+        if let Some(other) = other {
+            assert!(other.is_some() && other.as_deref() != Some(ours.as_str()), "{other:?} {ours}");
         }
         // A connection's actual peer address, over loopback in either family.
         for bind in ["127.0.0.1:0", "[::1]:0"] {
@@ -1475,7 +1495,7 @@ mod tests {
             let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
             let (s, _) = l.accept().unwrap();
             assert_eq!(s.peer_addr().unwrap(), c.local_addr().unwrap());
-            assert!(shares_routes(s.peer_addr().unwrap().ip()), "{bind}");
+            assert!(shares_routes(None, None, s.peer_addr().unwrap().ip()), "{bind}");
         }
     }
 

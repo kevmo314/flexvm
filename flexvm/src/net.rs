@@ -593,6 +593,16 @@ pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     is_local_ip(ip.into())
 }
 
+/// This network namespace's identity: the boot's id with the namespace's device and inode, unique on this kernel
+/// while it runs. A peer sharing this host's routes has the same; an address cannot tell (a router's hairpin NAT
+/// shows a peer here as the router's address, #1028).
+pub fn netns_id() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let ns = std::fs::metadata("/proc/thread-self/ns/net").ok()?;
+    Some(format!("{}:{}:{}", boot.trim(), ns.dev(), ns.ino()))
+}
+
 /// Whether `ip` is one of this network namespace's addresses, IPv4 or IPv6 (an IPv4-mapped one as its IPv4).
 pub fn is_local_ip(ip: std::net::IpAddr) -> Result<bool> {
     let ip = ip.to_canonical();
