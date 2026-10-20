@@ -179,6 +179,12 @@ fn rejoin_guest<G>(guest: &mut BufReader<G>, client: &UnixStream, wait: &Wait, r
     }
 }
 
+/// Whether the client sent something not read yet (it may have hung up since).
+fn input_waiting(client: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    unsafe { libc::recv(client.as_raw_fd(), (&raw mut byte).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) > 0 }
+}
+
 /// A client that shut down only its read side is not reported by poll (it may even have room to write
 /// into): an empty send tells (EPIPE), as one does once it has gone altogether.
 fn read_side_gone(client: &UnixStream) -> bool {
@@ -212,7 +218,9 @@ fn drained(client: &UnixStream, wait: &Wait) -> Result<bool> {
             return Ok(true);
         }
         if read_side_gone(client) {
-            return Ok(false);
+            // Gone just after it took the rest (between the poll and this check): its acknowledgement, sent
+            // before it closed, is here to read.
+            return Ok(input_waiting(client));
         }
         // Another client took the session over: it is sent the exit itself.
         if (wait.replaced)() {
@@ -5670,7 +5678,7 @@ mod tests {
 mod session_relay_tests {
     use super::*;
     use crate::test_util::{JoinWithin, WAIT};
-    use std::io::{self, Cursor};
+    use std::io::{self, BufRead, Cursor};
 
     struct Duplex {
         input: Cursor<Vec<u8>>,
@@ -6217,6 +6225,23 @@ mod session_relay_tests {
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     }
 
+    /// A client that acknowledged its exit and hung up between the relay's look at what it left unread and its
+    /// look at the hangup still has its acknowledgement passed on: lost, it would leave the session unacknowledged
+    /// in the guest. (Its read side shut down with the exit unread stands in for that moment.)
+    #[test]
+    fn an_acknowledgement_sent_just_before_a_hangup_is_passed_on() {
+        let exit = guest::frame(guest::FRAME_EXIT, &[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()]);
+        let mut guest = BufReader::new(Duplex { input: Cursor::new(exit), output: Vec::new() });
+        let (relay, mut client) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || relay_session(&mut guest, &mut &relay, &idle(), false, None).map(|late| (late, guest.into_inner().output)));
+        // Once the exit is queued to it, unread: acknowledged, then gone for reading.
+        let mut ready = libc::pollfd { fd: client.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut ready, 1, WAIT.as_millis() as i32) }, 1);
+        client.write_all(&[guest::SESSION_DONE]).unwrap();
+        client.shutdown(std::net::Shutdown::Read).unwrap();
+        assert_eq!(worker.join_within().unwrap().unwrap(), (None, vec![guest::SESSION_DONE]));
+    }
+
     /// A relay whose session another client took over while it waited out a checkpoint never attaches again:
     /// its ATTACH would shut the newer attachment down (#1062 review).
     #[test]
@@ -6334,19 +6359,29 @@ mod session_relay_tests {
     }
 
     /// A fake agent's connection: the request line `open` sent is kept, and `reply` is sent back after the OK line,
-    /// a byte every `pace` if given (a guest trickling its answer).
+    /// a byte every `pace` if given (a guest trickling its answer). Like a real agent, it reads the CONNECT and
+    /// request lines before it answers, so it never hangs up while the request is still being written (EPIPE).
     fn agent_reply(lines: &Mutex<Vec<String>>, line: &str, reply: Vec<u8>, pace: Option<Duration>) -> Result<BufReader<UnixStream>> {
         lines.lock().unwrap().push(line.to_string());
-        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let (ours, theirs) = UnixStream::pair().unwrap();
         let bytes = [b"OK 1\n".to_vec(), reply].concat();
-        thread::spawn(move || match pace {
-            None => drop(theirs.write_all(&bytes)),
-            Some(pace) => {
-                for b in bytes {
-                    if theirs.write_all(&[b]).is_err() {
-                        return;
+        thread::spawn(move || {
+            let mut request = BufReader::new(theirs);
+            for _ in 0..2 {
+                if request.read_line(&mut String::new()).unwrap_or(0) == 0 {
+                    return;
+                }
+            }
+            let mut theirs = request.into_inner();
+            match pace {
+                None => drop(theirs.write_all(&bytes)),
+                Some(pace) => {
+                    for b in bytes {
+                        if theirs.write_all(&[b]).is_err() {
+                            return;
+                        }
+                        thread::sleep(pace);
                     }
-                    thread::sleep(pace);
                 }
             }
         });
