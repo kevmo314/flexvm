@@ -1165,6 +1165,13 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
 - Taps are created with each VM's Firecracker (ahead of time for standby VMs). The
   host route and a permanent neighbour entry are set with rtnetlink while the
   snapshot loads, so networking adds nothing to start time.
+- TCP port forwards (`ports.rs`) track blocked readers with `TCP_INFO` acknowledgements:
+  a reader can drain its kernel queue before the proxy's socket becomes writable.
+  Each direction takes a baseline when it first holds unwritten data, then samples
+  at most once per second while buffered, including failed queries. Other forwards'
+  traffic cannot drive the sampling rate; the one-second poll timeout keeps checks
+  running without socket activity. Only writes or advancing ACKs count as progress;
+  a reader stalled for four idle periods can give up its slot at the connection cap.
 - udev with `MACAddressPolicy=persistent` (systemd's default) can replace a new
   tap's MAC after flexvm set it to the gateway MAC: it read the kernel's random
   one first, and its write lands whenever its worker gets to it. The host then
