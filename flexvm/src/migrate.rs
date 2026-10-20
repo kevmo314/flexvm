@@ -249,7 +249,7 @@ impl Proc {
         self.not_destroyed()?;
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
         // With where the target was reached: only it moves or withdraws the generation here meanwhile (#914).
-        let at: Vec<IpAddr> = conn.peer_addr().ok().map(|a| a.ip()).into_iter().chain(prepared["underlay"].as_str().and_then(|u| u.parse().ok())).collect();
+        let at = target_at(&self.host.config_now(), to, conn.peer_addr().ok().map(|a| a.ip()));
         self.lent_here.fetch_or(self.host.lend_at(&self.host.lock()?, vm.ip, gen, mig, to, &at)?, Ordering::SeqCst);
         // Test gate: lent, not yet leaving.
         crate::host::gate("leave_gate");
@@ -1234,6 +1234,11 @@ fn send_paused(conn: &TcpStream, header: &Header<'_>, state: &[u8], data: &[u8],
     Ok(recv_json(&mut BufReader::new(conn))?.ok_or("target hung up")?)
 }
 
+/// The target's authority comes from its connection and its own configured underlays.
+fn target_at(cfg: &crate::host::Config, to: &str, peer: Option<IpAddr>) -> Vec<IpAddr> {
+    peer.into_iter().chain(cfg.underlays_of(to).iter().copied().map(IpAddr::V4)).collect()
+}
+
 /// Check the target before forwarding held packets or changing any route.
 fn target_via(host: &crate::host::Host, target: &Value, to: &str, peer: Option<IpAddr>) -> Result<Ipv4Addr> {
     let via = target["underlay"].as_str().ok_or("target sent no underlay")?.parse()?;
@@ -1497,6 +1502,17 @@ mod tests {
             assert_eq!(s.peer_addr().unwrap(), c.local_addr().unwrap());
             assert!(shares_routes(None, None, s.peer_addr().unwrap().ip()), "{bind}");
         }
+    }
+
+    #[test]
+    fn leaving_target_authority_uses_only_its_configured_underlays() {
+        let mut cfg = crate::host::Config { peers: vec!["target:7070".into(), "other:7070".into()], ..Default::default() };
+        cfg.peer_underlays.insert("target:7070".into(), vec!["192.0.2.7".parse().unwrap()]);
+        cfg.peer_underlays.insert("other:7070".into(), vec!["192.0.2.8".parse().unwrap()]);
+        let peer = "2001:db8::7".parse().unwrap();
+        assert_eq!(target_at(&cfg, "target:7070", Some(peer)), vec![peer, "192.0.2.7".parse().unwrap()]);
+        assert_eq!(target_at(&cfg, "unconfigured:7070", Some(peer)), vec![peer]);
+        assert_eq!(target_at(&cfg, "target:7070", None), vec!["192.0.2.7".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]

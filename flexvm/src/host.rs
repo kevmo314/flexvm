@@ -1640,7 +1640,7 @@ impl Host {
                 a.holder.as_deref().unwrap_or("?")
             );
         }
-        if !self.config_now().range().is_ok_and(|r| r.allocatable(ip)) {
+        if a.loan.is_none() && !self.config_now().range()?.allocatable(ip) {
             return Ok(());
         }
         if a.lent == Some(a.seen) && !a.withdrawn {
@@ -6290,6 +6290,26 @@ pub(crate) mod tests {
         assert!(h.peer_update(&l, arriving, (9, 0), c4, &[c], none).is_err());
     }
 
+    #[test]
+    fn own_address_authority_survives_range_changes() {
+        for range in ["invalid", "10.9.0.3-10.9.0.3"] {
+            let (_d, mut h) = host("peer-update-range");
+            let l = h.lock().unwrap();
+            let x = ip("10.9.0.1");
+            let gen = h.lend_new(&l, x, "borrower", false).unwrap();
+            h.cfg.vm_ips = range.into();
+            let a = h.addr(&l, x).unwrap();
+            let e = h.newer_gen(&a, x, gen + 1).unwrap_err().to_string();
+            assert!(e.contains("lent from here"), "{range}: {e}");
+            for via in [None, Some(ip("192.0.2.8"))] {
+                assert!(h.peer_update(&l, x, (gen + 1, 0), via, &[], |_| vec![]).is_err());
+            }
+            // Without a loan, an invalid range still cannot bypass the home check.
+            let y = ip("10.9.0.2");
+            assert_eq!(h.newer_gen(&Addr::default(), y, gen + 1).is_ok(), range != "invalid");
+        }
+    }
+
     /// #914 review: a committed arrival is its source's alone until released; a recorded target's
     /// addresses are not widened by what its name resolves to now; without this boot's cursor, the
     /// high-water mark proves no generation was handed out.
@@ -6345,6 +6365,10 @@ pub(crate) mod tests {
         assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, reserved - 1).is_err(), "nor arrives");
         assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, g).is_err(), "nor one handed out for another address");
         h.newer_gen(&h.addr(&l, y).unwrap(), y, g).unwrap();
+        // The first allocation recreates the cursor: the record-only bound ends.
+        let next = h.next_gen(0).unwrap();
+        h.newer_gen(&h.addr(&l, z).unwrap(), z, g + 1).unwrap();
+        assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, next + 1).is_err());
         drop(claim);
     }
 
@@ -8485,8 +8509,11 @@ pub(crate) mod tests {
         let second = h.claim_new(&l, "second", Some(ip("10.9.0.2"))).unwrap();
         for claim in [first, second] {
             assert!(claim.gen > RECV_MAX);
-            // Even the exact recorded generation cannot be withdrawn by a peer above the bound.
+            // Passing the authority check above the bound still leaves the withdrawal stale.
+            let before = h.addr(&l, claim.ip).unwrap();
+            h.peer_update(&l, claim.ip, (claim.gen, 0), None, &[], |_| vec![]).unwrap();
             assert!(!h.observe(&l, claim.ip, claim.gen, 0, None).unwrap());
+            assert_eq!(h.addr(&l, claim.ip).unwrap(), before);
             assert!(h.current(&l, claim.ip, claim.gen).unwrap());
             assert!(h.withdraw_noted(&l, claim.ip, claim.gen).unwrap());
             assert!(!h.current(&l, claim.ip, claim.gen).unwrap());

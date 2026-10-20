@@ -609,10 +609,12 @@ newer generation of it, and only the host it is migrating to moves or
 withdraws its generation (a VM arriving here, once it commits: only the host
 it came from, until its pull is done); for an address of this host's own
 `vm_ips`, which only this host hands out, no peer brings a newer generation
-while it is lent from here, nor one this host never handed out (since a
-reboot, none newer than its record here; a VM arriving with one is refused
-too). A refused update is retried by its sender, so one that comes
-before the withdrawal it follows is taken once that has. The hosts must list each
+while it is lent from here. After a reboot, no generation newer than its
+record here is accepted until the first `next_gen` allocation; after that,
+any generation below this boot's allocation cursor may be taken, even if
+issued for another address. Arriving VMs face the same checks. A refused
+update is retried by its sender, so one that comes before the withdrawal it
+follows is taken once that has. The hosts must list each
 other in `peers` (each peer's listen address): a listener serves its peers'
 addresses only, and tells any other it is not a peer. A reported route next
 hop (including a migration target's underlay) must be the connection's peer
