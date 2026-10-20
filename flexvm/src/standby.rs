@@ -373,9 +373,14 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
     let pending = refill_lock_path(host, template).with_extension("pending");
     // Publish before trying the lock: its holder either sees this, or we get the lock ourselves.
     drop(crate::host::private_file(&pending)?);
-    let mut started = 0;
-    // Bound work under repeated pulls; further requests stay pending for the next refill.
-    for round in 0..3 {
+    let (mut started, mut failed) = (0, None);
+    // Until no request is left: each pending one was made after the last recount's snapshot
+    // (a departure, a pull), and no one else takes it up on a host with no listener (#921).
+    for round in 0.. {
+        // Requests after the first few, from a burst of departures, are taken together.
+        if round >= 3 {
+            std::thread::sleep(PENDING_BACKOFF);
+        }
         let how = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
         let Some(lock) = refill_locked(Flock::new(refill_lock(host, template)?, how), wait)? else { break };
         let d = create_dir(host, template)?;
@@ -384,7 +389,13 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             r => r?,
         }
-        started += refill(round > 0)?;
+        // A failed round still lets the requests that came meanwhile be recounted: this
+        // caller's own (the first) is returned, a recount's is only logged.
+        match refill(round > 0) {
+            Ok(n) => started += n,
+            Err(e) if round == 0 => failed = Some(e),
+            Err(e) => crate::log!("standby {template}: refill: {e}"),
+        }
         drop(legacy);
         drop(lock);
         // Check after unlocking too, so a request between the last recount and unlock is not lost.
@@ -393,8 +404,14 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
         }
         wait = false;
     }
-    Ok(started)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(started),
+    }
 }
+
+/// Between recounts of a refill lock holder past its first few (`refill_with`).
+const PENDING_BACKOFF: Duration = Duration::from_millis(200);
 
 fn refill_once(host: &Host, template: &str, cooldown: bool, ready_wait: bool) -> Result<usize> {
     let d = dir(host, template);
@@ -1847,22 +1864,43 @@ mod tests {
     }
 
     #[test]
-    fn refill_recounts_are_bounded_and_leave_a_pending_request() {
-        let (_root, host, _paths, _d) = pool("refill-bounded");
+    fn refill_recounts_until_no_request_is_pending() {
+        let (_root, host, _paths, _d) = pool("refill-pending");
         let mut rounds = 0;
         assert_eq!(
             refill_with(&host, "default", true, |later| {
                 rounds += 1;
                 assert_eq!(later, rounds > 1);
-                assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
+                // Requests in each of the first five rounds, past the backoff's start: none is dropped.
+                if rounds <= 5 {
+                    assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
+                }
                 Ok(1)
             })
             .unwrap(),
-            3
+            6
         );
-        assert_eq!(rounds, 3);
-        assert!(refill_lock_path(&host, "default").with_extension("pending").exists());
-        assert_eq!(refill_with(&host, "default", false, |_| Ok(0)).unwrap(), 0);
+        assert_eq!(rounds, 6);
+        assert!(!refill_lock_path(&host, "default").with_extension("pending").exists());
+    }
+
+    #[test]
+    fn a_failed_refill_still_recounts_pending_requests() {
+        let (_root, host, _paths, _d) = pool("refill-failed-pending");
+        let mut rounds = 0;
+        let r = refill_with(&host, "default", true, |_| {
+            rounds += 1;
+            match rounds {
+                // Like a superseded standby's request while this round waited on a load that failed.
+                1 => {
+                    assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
+                    Err("a standby vm failed to load".into())
+                }
+                _ => Ok(1),
+            }
+        });
+        assert_eq!(r.unwrap_err().to_string(), "a standby vm failed to load");
+        assert_eq!(rounds, 2);
         assert!(!refill_lock_path(&host, "default").with_extension("pending").exists());
     }
 

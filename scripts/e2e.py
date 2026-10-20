@@ -2335,8 +2335,8 @@ def pull_gc():
                     host.rm(v, force=True, check=False)
 
 
-def standby_pids(run, t):
-    """Pids of the live standby VMs of `t` under `run` (their lock files in RUN/standby/HASH/.locks)."""
+def standby_pids(run, t, ready=False):
+    """Pids of the live standby VMs of `t` under `run` (their lock files in RUN/standby/HASH/.locks); `ready`: only those loaded."""
     m, h = (1 << 64) - 1, 0xcbf29ce484222325
 
     def word(w):
@@ -2349,9 +2349,11 @@ def standby_pids(run, t):
     for i in range(0, full, 8):
         word(int.from_bytes(b[i:i + 8], "little"))
     word(int.from_bytes(b[full:].ljust(8, b"\0"), "little"))
-    d = os.path.join(run, "standby", f"{h:016x}", ".locks")
-    pids = [f[:-5].split("-")[0] for f in os.listdir(d) if f.endswith(".lock")] if os.path.isdir(d) else []
-    return sorted(p for p in pids if alive(p))
+    d = os.path.join(run, "standby", f"{h:016x}")
+    locks = os.path.join(d, ".locks")
+    pids = [f[:-5].split("-")[0] for f in os.listdir(locks) if f.endswith(".lock")] if os.path.isdir(locks) else []
+    # Its socket is bound once its VM is loaded: claimable, and done with whatever generation it loaded.
+    return sorted(p for p in pids if alive(p) and (not ready or os.path.exists(os.path.join(d, f"{p}.sock"))))
 
 
 def generations_open(pid):
@@ -2389,8 +2391,9 @@ def pull_standby():
         return next(v["id"] for v in json.loads(h.cli("images", "--json").stdout) if v["name"] == name)
 
     def pool_on(gen):
+        # Every listed one loaded: one still loading may hold the generation it started on, which the next pull keeps.
         pids = standby_pids(h.run_dir, name)
-        return len(pids) == 2 and all(generations_open(p) == {gen} for p in pids)
+        return len(pids) == 2 and standby_pids(h.run_dir, name, ready=True) == pids and all(generations_open(p) == {gen} for p in pids)
     try:
         pull(1, "--standby", "2")
         first = current()
