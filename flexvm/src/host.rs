@@ -812,22 +812,29 @@ impl Host {
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
-        self.take_name_as(name, resuming, false, handed())
+        self.take_name_as(name, resuming, false, handed(), false)
     }
 
     /// `take_name` of a new name by the VM process a `run` handed its logs to with `token`
     /// (`own_logs`): a claimed standby, told in the claim.
     pub fn take_handed_name(&self, name: &str, token: Option<&str>) -> Result<NameLock> {
-        self.take_name_as(name, false, false, token)
+        self.take_name_as(name, false, false, token, false)
     }
 
     /// `take_name` of a new name for a VM (`rename`): a `failed` or `lost` record of it is
     /// refused, decided holding the name, never cleared.
     pub fn take_unrecorded_name(&self, name: &str) -> Result<NameLock> {
-        self.take_name_as(name, false, true, handed())
+        self.take_name_as(name, false, true, handed(), false)
     }
 
-    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool, handed: Option<&str>) -> Result<NameLock> {
+    /// `take_name` of a new name for a restore: `own`, of the checkpoint's own name, it is that
+    /// VM going on, so it keeps the name's logs as `start` does (a failed, lost or moved VM's
+    /// still go); under another name (a fork), a fresh log.
+    pub fn take_restoring_name(&self, name: &str, own: bool) -> Result<NameLock> {
+        self.take_name_as(name, false, false, handed(), own)
+    }
+
+    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool, handed: Option<&str>, keep_logs: bool) -> Result<NameLock> {
         if !resuming {
             check_new_name(name)?;
         }
@@ -877,9 +884,9 @@ impl Host {
         // A new VM of the name starts a fresh log: an earlier VM's (failed, lost, moved, or one
         // that ended leaving only its exit status: killed, `--rm`, a foreground run's) is retired.
         // Kept: this process's own, one a `run` handed to it (its token: whether or not that `run`
-        // is still there), and one a live `run` opened to hand to another (`own_logs`). A resume (`start`) keeps its VM's.
+        // is still there), and one a live `run` opened to hand to another (`own_logs`). A resume (`start`), or a restore under the checkpoint's own name, keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
-        if !resuming && (["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) || self.earlier_logs(name, handed)?) {
+        if !resuming && (["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) || !keep_logs && self.earlier_logs(name, handed)?) {
             let _ = self.retire_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
@@ -5699,6 +5706,16 @@ pub(crate) mod tests {
             let held = owned(id, handoff);
             drop(h.take_name("job", true).unwrap());
             assert_ne!(held.metadata().unwrap().nlink(), 0, "{id:?} {handoff}: resumed");
+        }
+        // A restore under the checkpoint's own name (`checkpoint --stop`, then `restore`) is
+        // that VM going on in its logs; under another (a fork), or after a failed VM, fresh.
+        for (own, failed, retired) in [(true, false, false), (false, false, true), (true, true, true)] {
+            let held = owned(Some(&gone), false);
+            if failed {
+                std::fs::write(h.vms("job", "failed").unwrap(), "died").unwrap();
+            }
+            drop(h.take_restoring_name("job", own).unwrap());
+            assert_eq!(held.metadata().unwrap().nlink() == 0, retired, "{own} {failed}");
         }
         // Handed by a `run` that died before its VM process took the name (SIGKILLed mid-handoff):
         // kept by the VM process it was handed to, by its token; any other retires it.

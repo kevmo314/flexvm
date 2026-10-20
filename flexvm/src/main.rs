@@ -1183,11 +1183,12 @@ fn run_checkpoint(args: &Args) -> Result<()> {
     if args.has("detach") {
         let host = open_host(args)?;
         // A detached restore logs to the VM's name, which the checkpoint has without --name.
-        let name = match args.get("name") {
-            Some(name) => name.to_string(),
-            None => checkpoint::read_manifest(&dir)?.name,
-        };
-        return print(spawn_detached(&host, &name, &args.child_args, &new_run_log(&host, &name)?, false)?);
+        let own = checkpoint::read_manifest(&dir)?.name;
+        let name = args.get("name").map_or_else(|| own.clone(), String::from);
+        // Refuse a taken name, and clear an earlier VM's logs (under the checkpoint's own name,
+        // the VM goes on in its own: `Host::take_restoring_name`), before opening it for the child.
+        drop(host.take_restoring_name(&name, name == own)?);
+        return print(spawn_detached(&host, &name, &args.child_args, &log_file(&host, &name)?, false)?);
     }
     vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }

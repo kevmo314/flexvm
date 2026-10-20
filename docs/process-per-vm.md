@@ -322,7 +322,8 @@ token is among its pending ones (even if that `run` died meanwhile; a second `ru
 them before either's VM process took the name adds its token, never replacing the first's),
 or a live `run`'s for another; `logs -f` follows on only while the name's holder
 is the one its directory records (or a handing `run`'s child). Logs remain available for stopped and exited
-VMs until removal; `start` keeps them. A detached `run` opens its log in the
+VMs until removal; `start` keeps them, as does a `restore` under the checkpoint's own name
+(that VM going on; under another name, a fork, it starts a fresh log). A detached `run` opens its log in the
 parent before the child takes the name, so removal clears the logs before
 that parent opens them. Released migration records are retired as below.
 Logs are capped by their
