@@ -26,8 +26,10 @@ const LINGER: Duration = Duration::from_secs(10);
 /// The most datagrams taken from one socket per wakeup: a flood on one cannot starve the others.
 const BURST: usize = 1024;
 /// Workers wake for their sockets or `Forwarder::drop`'s eventfd; this only bounds when idle
-/// sessions, stalled connects, and failure deadlines are noticed.
+/// sessions, stalled connects, acknowledgement samples, and failure deadlines are noticed.
 const TICK: libc::c_int = 1000;
+/// Buffered sinks are sampled at most this often, whatever other forwards do.
+const ACK_INTERVAL: Duration = Duration::from_secs(1);
 /// How long accepting rests once out of descriptors (or memory).
 const ACCEPT_REST: Duration = Duration::from_millis(100);
 
@@ -277,6 +279,8 @@ struct Direction {
     delivered: Option<Instant>,
     /// What the sink's TCP had acknowledged when last looked at.
     acked: u64,
+    /// Last acknowledgement query, including a failed one.
+    sampled: Option<Instant>,
 }
 
 impl Direction {
@@ -323,7 +327,8 @@ impl Direction {
         }
         if !holding && self.start < self.end {
             // Only what its sink acknowledges from now on is progress.
-            (self.delivered, self.acked) = (Some(idle_now()), bytes_acked(to).unwrap_or(0));
+            let now = Some(idle_now());
+            (self.delivered, self.sampled, self.acked) = (now, now, bytes_acked(to).unwrap_or(0));
         }
         if self.start == self.end {
             (self.start, self.end) = (0, 0);
@@ -344,9 +349,14 @@ impl Direction {
         if self.start == self.end {
             return;
         }
+        let now = idle_now();
+        if self.sampled.is_some_and(|t| now.duration_since(t) < ACK_INTERVAL) {
+            return;
+        }
+        self.sampled = Some(now);
         let Some(acked) = bytes_acked(sink) else { return };
         if acked > self.acked {
-            (self.acked, self.delivered) = (acked, Some(idle_now()));
+            (self.acked, self.delivered) = (acked, Some(now));
         }
     }
 
@@ -358,6 +368,8 @@ impl Direction {
 
 /// How much of what `s` sent its peer has acknowledged (tcp_info's tcpi_bytes_acked).
 fn bytes_acked(s: &TcpStream) -> Option<u64> {
+    #[cfg(test)]
+    tests::ACK_QUERIES.with(|n| n.set(n.get() + 1));
     // libc's tcp_info stops short of it: tcpi_bytes_acked is at byte 120, after 8 one-byte fields,
     // 24 u32s, and the two u64 pacing rates.
     let mut info = [0u64; 32];
@@ -764,6 +776,7 @@ mod tests {
     thread_local! {
         pub(super) static CLOCK: std::cell::RefCell<Option<(Arc<std::sync::Mutex<Instant>>, Instant)>> = const { std::cell::RefCell::new(None) };
         static UDP_PROCESSED: std::cell::RefCell<Option<std::sync::mpsc::Sender<SocketAddr>>> = const { std::cell::RefCell::new(None) };
+        pub(super) static ACK_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     pub(super) fn udp_processed(peer: SocketAddr) {
@@ -1735,6 +1748,93 @@ mod tests {
     }
 
     #[test]
+    fn a_direction_that_starts_holding_takes_its_baseline_at_once() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut source = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (from, _) = listener.accept().unwrap();
+        let _reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut to, _) = listener.accept().unwrap();
+        let size: libc::c_int = 4096;
+        assert_eq!(
+            unsafe { libc::setsockopt(to.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&size as *const libc::c_int).cast(), size_of_val(&size) as _) },
+            0
+        );
+        from.set_nonblocking(true).unwrap();
+        to.set_nonblocking(true).unwrap();
+        // Fill the sink, whatever its reader's buffers, until a pass after a pause takes nothing more.
+        let fill = |to: &mut TcpStream| {
+            let mut took = 0;
+            loop {
+                match to.write(&[7; 4096]) {
+                    Ok(n) => took += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return took,
+                    Err(e) => panic!("filling the sink: {e}"),
+                }
+            }
+        };
+        while fill(&mut to) > 0 {
+            thread::sleep(Duration::from_millis(20));
+        }
+        source.write_all(&[42; 1024]).unwrap();
+        let start = Instant::now();
+        pin_clock(Arc::new(std::sync::Mutex::new(start)));
+        let mut d = Direction::default();
+        // Only its source's data has to arrive: the sink takes none of it.
+        wait_until("the source's data", || {
+            d.pump(&from, &to);
+            d.end > 0
+        });
+        assert_eq!((d.start, d.end), (0, 1024));
+        assert_eq!((d.sampled, d.delivered), (Some(start), Some(start)), "buffering takes an immediate baseline");
+        let queries = ACK_QUERIES.with(|n| n.get());
+        d.delivering(&to);
+        assert_eq!(ACK_QUERIES.with(|n| n.get()), queries, "the baseline starts the sampling interval");
+        CLOCK.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
+    fn buffered_acknowledgements_are_sampled_on_a_bounded_cadence() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let sink = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _peer = listener.accept().unwrap();
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        pin_clock(clock.clone());
+        let mut directions: Vec<_> = (0..CONNECTIONS * 2).map(|_| Direction { end: 1, ..Direction::default() }).collect();
+        ACK_QUERIES.with(|n| n.set(0));
+        for d in &mut directions {
+            d.delivering(&sink);
+        }
+        assert_eq!(ACK_QUERIES.with(|n| n.get()), directions.len());
+        let delivered: Vec<_> = directions.iter().map(|d| d.delivered).collect();
+        // Unrelated traffic can wake thousands of passes before another sample is due.
+        *clock.lock().unwrap() = start + ACK_INTERVAL - Duration::from_nanos(1);
+        tick_clock();
+        for _ in 0..1000 {
+            for d in &mut directions {
+                d.delivering(&sink);
+            }
+        }
+        assert_eq!(ACK_QUERIES.with(|n| n.get()), directions.len());
+        *clock.lock().unwrap() = start + ACK_INTERVAL;
+        tick_clock();
+        for (d, delivered) in directions.iter_mut().zip(delivered) {
+            d.delivering(&sink);
+            assert_eq!(d.delivered, delivered, "sampling alone is not progress");
+        }
+        assert_eq!(ACK_QUERIES.with(|n| n.get()), directions.len() * 2);
+        // Empty directions need no samples, even after another interval.
+        *clock.lock().unwrap() = start + ACK_INTERVAL * 2;
+        tick_clock();
+        for d in &mut directions {
+            d.end = 0;
+            d.delivering(&sink);
+        }
+        assert_eq!(ACK_QUERIES.with(|n| n.get()), directions.len() * 2);
+        CLOCK.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
     fn a_reader_taking_only_what_its_kernel_holds_is_not_stalled() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1771,14 +1871,22 @@ mod tests {
             connection.incoming.bytes.resize(BUFFER, 42);
             !connection.incoming.pump(&connection.guest, &connection.client)
         });
+        // Filled by hand, it took no baseline: its first check samples at once, and starts the interval.
+        assert_eq!(connection.incoming.sampled, None);
+        let queries = ACK_QUERIES.with(|n| n.get());
+        connection.incoming.delivering(&connection.client);
+        connection.incoming.delivering(&connection.client);
+        assert_eq!((ACK_QUERIES.with(|n| n.get()), connection.incoming.sampled), (queries + 1, Some(start)));
         let mut acked = bytes_acked(&connection.client).unwrap();
         assert!(acked > 0);
         wait_until("the acknowledgements to settle", || {
             thread::sleep(Duration::from_millis(200));
             std::mem::replace(&mut acked, bytes_acked(&connection.client).unwrap()) == acked
         });
+        *clock.lock().unwrap() = start + ACK_INTERVAL;
+        tick_clock();
         connection.incoming.delivering(&connection.client);
-        *clock.lock().unwrap() = start + IDLE * STALLED;
+        *clock.lock().unwrap() = start + ACK_INTERVAL + IDLE * STALLED;
         tick_clock();
         connection.incoming.delivering(&connection.client);
         assert!(connection.idle(IDLE), "a reader that took nothing for long is stalled");
@@ -1787,10 +1895,12 @@ mod tests {
         client.set_nonblocking(true).unwrap();
         wait_until("the reader's progress to be seen", || {
             let _ = client.read(&mut [0; 512]);
+            *clock.lock().unwrap() += ACK_INTERVAL;
+            tick_clock();
             connection.incoming.delivering(&connection.client);
             !connection.idle(IDLE)
         });
-        assert_eq!(connection.incoming.delivered, Some(start + IDLE * STALLED));
+        assert_eq!(connection.incoming.delivered, Some(idle_now()));
         CLOCK.with(|c| *c.borrow_mut() = None);
     }
 
