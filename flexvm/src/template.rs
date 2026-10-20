@@ -938,6 +938,7 @@ fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Res
 /// A template build's tap: the host's tap prefix, `x` and the build's pid
 /// in hex (a VM process's taps have a `t` after theirs), which garbage
 /// collection sweeps once the build is proven gone (by its alias, `host::tap_alias`).
+/// `net::create_free_tap` adds a hex suffix if this name is already taken.
 pub fn tap(prefix: &str) -> String {
     format!("{prefix}x{:x}", std::process::id())
 }

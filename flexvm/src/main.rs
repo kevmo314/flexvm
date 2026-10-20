@@ -1719,7 +1719,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     let me = host::Ident::me();
     host::clear_taps(&host.run, &me);
     let tap = template::tap(&host.tap_prefix());
-    net::create_tap(&tap, &host::tap_alias(&host.run, &me))?;
+    let tap = net::create_free_tap(&tap, &host::tap_alias(&host.run, &me))?;
     let res = (|| {
         let init = args.get("init").map(PathBuf::from);
         // Held until the template is published: `rmi` leaves the root filesystem to this build.

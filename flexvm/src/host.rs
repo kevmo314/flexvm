@@ -698,7 +698,7 @@ impl Host {
     /// hash of the state directory, so hosts on separate ones read apart. Six
     /// bytes leave a VM process's taps (a pid of up to 6 hex digits, `t`) two
     /// suffix digits (`fc::free_tap`). Two hosts that collide still never share
-    /// a name, as each carries its process's pid, and sweeps go by a tap's alias.
+    /// a device: creators skip occupied names, and sweeps go by a tap's alias.
     pub fn tap_prefix(&self) -> String {
         tap_prefix(&self.state)
     }
