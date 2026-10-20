@@ -259,11 +259,22 @@ impl Config {
 
     /// What `flexvm info` and the listener warn of: valid, but likely a mistake.
     pub fn warnings(&self) -> Vec<String> {
-        self.warnings_by(crate::net::is_local_addr)
+        self.warnings_by(crate::net::is_local_addr, here())
     }
 
-    fn warnings_by(&self, local: impl Fn(Ipv4Addr) -> Result<bool>) -> Vec<String> {
+    /// `here`: this host's own addresses and next hops (`here`).
+    fn warnings_by(&self, local: impl Fn(Ipv4Addr) -> Result<bool>, here: Result<Vec<(Ipv4Addr, &str)>>) -> Vec<String> {
         let mut w = Vec::new();
+        // Never handed out (`claim_new_in`), so likely a range meant for elsewhere (#1078).
+        match (self.range(), here) {
+            (Ok(range), Ok(here)) => {
+                for (ip, what) in here.into_iter().filter(|(ip, _)| range.contains(*ip)) {
+                    w.push(format!("flexvm: warning: vm_ips {} covers {ip}, this host's {what}: no vm is given it", self.vm_ips));
+                }
+            }
+            (Ok(_), Err(e)) => w.push(format!("flexvm: warning: cannot check whether vm_ips {} covers this host's addresses: {e}", self.vm_ips)),
+            (Err(_), _) => {}
+        }
         if !self.peers.is_empty() && self.cluster_ips.is_none() {
             w.push(format!("flexvm: warning: cluster_ips is unset; peer VM addresses outside vm_ips {} are refused", self.vm_ips));
         }
@@ -1290,12 +1301,21 @@ impl Host {
     }
 
     /// `claim_new` from `cfg`'s range: a caller that decided by that range claims by it too.
+    /// Never an address this host reaches its network or peers by (`listen::assignable`, #1078).
     pub fn claim_new_in(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
+        let assignable = crate::listen::assignable(&self.run, cfg)?;
+        self.claim_new_by(l, cfg, holder, want, assignable)
+    }
+
+    fn claim_new_by(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>, assignable: impl Fn(Ipv4Addr) -> Result<()>) -> Result<AddrClaim> {
         let range = cfg.range()?;
-        let taken = |ip| self.addr(l, ip).map_or(true, |a| a.lent.is_some() || self.held(&a));
+        let taken = |ip| assignable(ip).is_err() || self.addr(l, ip).map_or(true, |a| a.lent.is_some() || self.held(&a));
         let ip = match want {
             Some(ip) if !range.allocatable(ip) => {
                 bail!("{ip} is not this host's to hand out (range {range}): start the vm on its home host, or let it pick an address")
+            }
+            Some(ip) if assignable(ip).is_err() => {
+                bail!("{}: never given to a vm (pick another address, or let it pick one)", assignable(ip).unwrap_err())
             }
             Some(ip) if self.addr(l, ip)?.lent.is_some() => bail!("{ip} is lent out, with a vm that migrated away"),
             Some(ip) if taken(ip) => bail!("{ip} is in use"),
@@ -3337,37 +3357,90 @@ fn reap_swept(run: &Path, owner: &Ident, swept: bool) -> Result<()> {
     Ok(())
 }
 
-/// The VM process a Firecracker's cgroup (`idle-PID-START-N`) was made by.
-/// Earlier builds' (`idle-PID-N`) are left alone, as their owner cannot be
-/// told by identity: emptied when their Firecrackers exit, gone at a reboot.
-fn cgroup_owner(name: &str) -> Option<Ident> {
+/// A Firecracker cgroup's name, `idle-PID-START-N-NS`: the VM process making it (this one)
+/// and the PID namespace its pid is in (`pid_ns`), so that hosts in other PID namespaces
+/// sharing `/sys/fs/cgroup/flexvm` never judge it (#1082). Without a namespace to name,
+/// the older `idle-PID-START-N`.
+pub fn idle_cgroup(n: impl std::fmt::Display) -> String {
+    idle_cgroup_in(&Ident::me(), n, pid_ns())
+}
+
+fn idle_cgroup_in(owner: &Ident, n: impl std::fmt::Display, ns: Option<u64>) -> String {
+    match ns {
+        Some(ns) => format!("idle-{}-{n}-{ns}", owner.key()),
+        None => format!("idle-{}-{n}", owner.key()),
+    }
+}
+
+/// The VM process a Firecracker's cgroup (`idle_cgroup`) was made by, and its PID namespace
+/// if the name has one. Earlier builds' (`idle-PID-N`) are left alone, as their owner cannot
+/// be told by identity: emptied when their Firecrackers exit, gone at a reboot.
+fn cgroup_owner(name: &str) -> Option<(Ident, Option<u64>)> {
     let parts: Vec<&str> = name.strip_prefix("idle-")?.split('-').collect();
-    let [pid, start, _] = parts[..] else { return None };
-    Some(Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() })
+    let (pid, start, ns) = match parts[..] {
+        [pid, start, n] if n.parse::<u64>().is_ok() => (pid, start, None),
+        [pid, start, n, ns] if n.parse::<u64>().is_ok() => (pid, start, Some(ns.parse().ok()?)),
+        _ => return None,
+    };
+    Some((Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() }, ns))
 }
 
-/// A tap's alias, naming its owner (`net::create_tap`): `flexvm PID START RUN`,
-/// the process that made it and its host's run directory, which no other host
-/// shares. Sweeps go by it alone, never by a tap's name.
+/// Whether a Firecracker cgroup's owner is proven gone, judged only in its own PID namespace
+/// (`ns`, this process's): one of another namespace's, or of none known, is never.
+fn cgroup_owner_gone(name: &str, ns: Option<u64>) -> bool {
+    cgroup_owner(name).is_some_and(|(o, of)| of.is_none_or(|of| Some(of) == ns) && o.liveness() == Liveness::Gone)
+}
+
+/// A tap's alias, naming its owner (`net::create_tap`): `flexvm pidns:NS PID START RUN`,
+/// the process that made it, the PID namespace its pid is in (`pid_ns`) and its host's
+/// run directory, which no other host shares. Sweeps go by it alone, never by a tap's
+/// name. Without a namespace to name it is the older `flexvm PID START RUN`.
 pub fn tap_alias(run: &Path, owner: &Ident) -> String {
-    format!("flexvm {} {} {}", owner.pid, owner.start, run.display())
+    tap_alias_in(run, owner, pid_ns())
 }
 
-fn parse_tap_alias(alias: &str) -> Option<(Ident, &str)> {
-    let mut parts = alias.strip_prefix("flexvm ")?.splitn(3, ' ');
+fn tap_alias_in(run: &Path, owner: &Ident, ns: Option<u64>) -> String {
+    match ns {
+        Some(ns) => format!("flexvm pidns:{ns} {} {} {}", owner.pid, owner.start, run.display()),
+        None => format!("flexvm {} {} {}", owner.pid, owner.start, run.display()),
+    }
+}
+
+/// This process's PID namespace, `/proc/self/ns/pid`'s inode: hosts sharing a network
+/// namespace from different PID namespaces (containers with the host's network) cannot
+/// tell each other's processes apart by pid, so each leaves the others' taps alone (#1078).
+fn pid_ns() -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    static NS: OnceLock<Option<u64>> = OnceLock::new();
+    *NS.get_or_init(|| std::fs::metadata("/proc/self/ns/pid").ok().map(|m| m.ino()))
+}
+
+/// (owner, its PID namespace if the alias names one, run directory). An older build's
+/// alias names none (`flexvm PID START RUN`), which reads as before: by run directory alone.
+fn parse_tap_alias(alias: &str) -> Option<(Ident, Option<u64>, &str)> {
+    let rest = alias.strip_prefix("flexvm ")?;
+    let (ns, rest) = match rest.strip_prefix("pidns:") {
+        Some(r) => {
+            let (ns, rest) = r.split_once(' ')?;
+            (Some(ns.parse().ok()?), rest)
+        }
+        None => (None, rest),
+    };
+    let mut parts = rest.splitn(3, ' ');
     let (pid, start, run) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?);
-    (!run.is_empty()).then(|| (Ident { pid, start, boot: boot_id().into() }, run))
+    (!run.is_empty()).then(|| (Ident { pid, start, boot: boot_id().into() }, ns, run))
 }
 
 /// This host's taps: tun devices whose alias names its run directory (`tap_alias`), with
 /// their index (read before the alias: a tap made since under the name has another) and
-/// owner. A tap without such an alias (another host's, an earlier build's, anyone's) is
-/// never this host's.
+/// owner. A tap without such an alias (another host's, an earlier build's, anyone's), or
+/// one whose alias names another PID namespace than `ns` (this process's, `pid_ns`), is
+/// never this host's; an alias naming none is judged by its run directory alone.
 fn taps_of(run: &Path) -> Vec<(String, u32, Ident)> {
-    taps_of_at(run, Path::new("/sys/class/net"), false)
+    taps_of_at(run, Path::new("/sys/class/net"), false, pid_ns())
 }
 
-fn taps_of_at(run: &Path, net: &Path, orphaned: bool) -> Vec<(String, u32, Ident)> {
+fn taps_of_at(run: &Path, net: &Path, orphaned: bool, ns: Option<u64>) -> Vec<(String, u32, Ident)> {
     let run = run.to_string_lossy();
     let mut taps = Vec::new();
     for e in std::fs::read_dir(net).into_iter().flatten().flatten() {
@@ -3375,7 +3448,11 @@ fn taps_of_at(run: &Path, net: &Path, orphaned: bool) -> Vec<(String, u32, Ident
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
         let Some(index) = read("ifindex").and_then(|i| i.trim().parse().ok()) else { continue };
         let Some(alias) = read("ifalias") else { continue };
-        let Some((owner, of)) = parse_tap_alias(alias.strip_suffix('\n').unwrap_or(&alias)) else { continue };
+        let Some((owner, of_ns, of)) = parse_tap_alias(alias.strip_suffix('\n').unwrap_or(&alias)) else { continue };
+        // Its owner's pid means nothing in this namespace: never judged dead here.
+        if of_ns.is_some_and(|n| Some(n) != ns) {
+            continue;
+        }
         // Only NotFound proves the other run directory is gone; permission and I/O
         // errors leave its taps alone. The owner must still be proven dead by GC.
         let missing = || Path::new(of).metadata().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
@@ -3387,14 +3464,17 @@ fn taps_of_at(run: &Path, net: &Path, orphaned: bool) -> Vec<(String, u32, Ident
 }
 
 /// A dead holder's taps here; a sweep (no holder) also collects taps from deleted run directories.
-fn dead_taps_at(run: &Path, net: &Path, holder: Option<&Ident>) -> Vec<(String, u32, Ident)> {
-    taps_of_at(run, net, holder.is_none()).into_iter().filter(|(_, _, owner)| holder.is_none_or(|h| h == owner) && owner.liveness() == Liveness::Gone).collect()
+fn dead_taps_at(run: &Path, net: &Path, holder: Option<&Ident>, ns: Option<u64>) -> Vec<(String, u32, Ident)> {
+    taps_of_at(run, net, holder.is_none(), ns)
+        .into_iter()
+        .filter(|(_, _, owner)| holder.is_none_or(|h| h == owner) && owner.liveness() == Liveness::Gone)
+        .collect()
 }
 
 /// A holder's taps, or a sweep's (including orphaned hosts). Deleting a tap also
 /// withdraws its routes, without touching a route since moved to another tap.
 fn collect_dead_taps(run: &Path, holder: Option<&Ident>) {
-    for (name, index, _) in dead_taps_at(run, Path::new("/sys/class/net"), holder) {
+    for (name, index, _) in dead_taps_at(run, Path::new("/sys/class/net"), holder, pid_ns()) {
         crate::net::delete_link(index, &name);
     }
 }
@@ -4011,6 +4091,19 @@ fn withdrawal_backoff(tries: u32) -> u64 {
 
 const REPAIR: &str = "; no dead vm's address is withdrawn here until it is repaired or removed by hand (or the address taken back with `flexvm reclaim`)";
 
+/// This network namespace's IPv4 addresses and next hops, each once: what no VM here is given.
+fn here() -> Result<Vec<(Ipv4Addr, &'static str)>> {
+    let local = crate::net::local_ips()?.into_iter().filter_map(|a| match a {
+        IpAddr::V4(v4) => Some((v4, "address")),
+        IpAddr::V6(_) => None,
+    });
+    let gateways = crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?).into_iter().map(|g| (g, "gateway"));
+    let mut all: Vec<_> = local.chain(gateways).collect();
+    all.sort();
+    all.dedup_by_key(|(ip, _)| *ip);
+    Ok(all)
+}
+
 /// Notices outlive boots: wall-clock time.
 fn wall_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -4038,7 +4131,7 @@ fn collect_owned(run: &Path) {
         let n = e.file_name().to_string_lossy().into_owned();
         if n.starts_with("vm-") {
             sweep_scope(&e.path());
-        } else if cgroup_owner(&n).is_some_and(|o| o.liveness() == Liveness::Gone) {
+        } else if cgroup_owner_gone(&n, pid_ns()) {
             let _ = crate::fc::remove_cgroup(&e.path());
         }
     }
@@ -5063,10 +5156,13 @@ pub(crate) mod tests {
         cfg.peers.push("peer:7070".into());
         let check = |local: std::result::Result<bool, &str>| {
             cfg.validate().unwrap();
-            cfg.warnings_by(|a| {
-                assert_eq!(a, ip);
-                local.map_err(Into::into)
-            })
+            cfg.warnings_by(
+                |a| {
+                    assert_eq!(a, ip);
+                    local.map_err(Into::into)
+                },
+                Ok(vec![]),
+            )
             .join("\n")
         };
         assert!(!check(Ok(false)).contains("peer_underlays"));
@@ -6086,6 +6182,41 @@ pub(crate) mod tests {
         // Withdrawn by its borrower: no loan left.
         h.observe_and(&l, n(4), gens[3], 0, None, |_| ()).unwrap();
         assert!(h.addr(&l, n(4)).unwrap().loan.is_none());
+    }
+
+    /// A fresh VM is never given this host's gateway or own address (#1078): allocation skips
+    /// them, and asked for one it is refused, by `routable`'s rules.
+    #[test]
+    fn fresh_addresses_skip_gateways_and_local_addresses() {
+        let (_dir, h) = host("fresh-gateway");
+        let cfg = Config { vm_ips: "10.9.0.1-10.9.0.4".into(), ..Config::default() };
+        let (gw, local) = (ip("10.9.0.1"), ip("10.9.0.3"));
+        let ok = |ip| crate::listen::routable_by(ip, &cfg, &[], &[gw], |ip| Ok(ip == local));
+        let _names = [h.take_name("a", false).unwrap(), h.take_name("b", false).unwrap()];
+        let l = h.lock().unwrap();
+        for want in [gw, local] {
+            let e = h.claim_new_by(&l, &cfg, "x", Some(want), ok).err().unwrap().to_string();
+            assert!(e.contains(&format!("{want} is not a vm's address")) && e.contains("never given to a vm"), "{e}");
+            assert!(h.addr(&l, want).unwrap().holder.is_none(), "no claim is made");
+        }
+        let a = h.claim_new_by(&l, &cfg, "a", None, ok).unwrap();
+        let b = h.claim_new_by(&l, &cfg, "b", None, ok).unwrap();
+        assert_eq!((a.ip, b.ip), (ip("10.9.0.2"), ip("10.9.0.4")));
+        assert!(h.claim_new_by(&l, &cfg, "c", None, ok).err().unwrap().to_string().contains("no free addresses left"));
+        // The real check: this host's loopback is never handed out.
+        let lo = Config { vm_ips: "127.0.0.1-127.0.0.2".into(), ..Config::default() };
+        assert!(h.claim_new_in(&l, &lo, "lo", Some(ip("127.0.0.1"))).err().unwrap().to_string().contains("never given to a vm"));
+    }
+
+    #[test]
+    fn warnings_name_local_and_gateway_addresses_in_vm_ips() {
+        let cfg = Config { vm_ips: "10.9.0.0/24".into(), ..Config::default() };
+        let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(ip("10.9.0.1"), "gateway"), (ip("10.9.0.7"), "address"), (ip("192.0.2.1"), "address")])).join("\n");
+        assert!(w.contains("vm_ips 10.9.0.0/24 covers 10.9.0.1, this host's gateway"), "{w}");
+        assert!(w.contains("covers 10.9.0.7, this host's address") && !w.contains("192.0.2.1"), "{w}");
+        let w = cfg.warnings_by(|_| Ok(false), Err("getifaddrs failed".into())).join("\n");
+        assert!(w.contains("cannot check whether vm_ips 10.9.0.0/24 covers this host's addresses: getifaddrs failed"), "{w}");
+        assert!(!cfg.warnings_by(|_| Ok(false), Ok(vec![])).join("").contains("covers"));
     }
 
     /// The periodic sweep expires loans, and an unreadable record neither fails it nor a loan.
@@ -7153,10 +7284,36 @@ pub(crate) mod tests {
 
     #[test]
     fn cgroups_name_their_process() {
-        assert_eq!(cgroup_owner("idle-4242-77-3"), Some(Ident { pid: 4242, start: 77, boot: boot_id().into() }));
-        for cg in ["vm-4242", "vm-4242-77", "other-42", "idle-", "idle-4242-3", "idle-4242-x-3", "idle-1-2-3-4", "cgroup.procs", "memory.max"] {
+        let owner = Ident { pid: 4242, start: 77, boot: boot_id().into() };
+        // An earlier build's name has no namespace; this one's does (#1082).
+        assert_eq!(cgroup_owner("idle-4242-77-3"), Some((owner.clone(), None)));
+        assert_eq!(cgroup_owner("idle-4242-77-3-4026531836"), Some((owner.clone(), Some(4_026_531_836))));
+        assert_eq!(idle_cgroup_in(&owner, 3, None), "idle-4242-77-3");
+        assert_eq!(idle_cgroup_in(&owner, 3, Some(9)), "idle-4242-77-3-9");
+        assert_eq!(cgroup_owner(&idle_cgroup(5)), Some((Ident::me(), pid_ns())));
+        for cg in [
+            "vm-4242",
+            "vm-4242-77",
+            "other-42",
+            "idle-",
+            "idle-4242-3",
+            "idle-4242-x-3",
+            "idle-4242-77-x",
+            "idle-4242-77-3-x",
+            "idle-4242-77-3-",
+            "idle-1-2-3-4-5",
+            "cgroup.procs",
+            "memory.max",
+        ] {
             assert_eq!(cgroup_owner(cg), None, "{cg}");
         }
+        // A dead owner's: judged gone only in its own namespace, or with none named.
+        let (dead, mine, theirs) = (Ident { pid: 999_999_931, start: 1, boot: boot_id().into() }, Some(11), Some(12));
+        assert!(cgroup_owner_gone(&idle_cgroup_in(&dead, 0, mine), mine));
+        assert!(cgroup_owner_gone(&idle_cgroup_in(&dead, 0, None), mine));
+        assert!(!cgroup_owner_gone(&idle_cgroup_in(&dead, 0, theirs), mine));
+        assert!(!cgroup_owner_gone(&idle_cgroup_in(&dead, 0, theirs), None));
+        assert!(!cgroup_owner_gone(&idle_cgroup_in(&Ident::me(), 0, mine), mine), "a live owner's stays");
     }
 
     /// #553, #555: until a boot's recovery is marked complete, routes to peers' VMs come back from
@@ -7672,11 +7829,28 @@ pub(crate) mod tests {
         let (_h_dir, h) = host("alias");
         let me = Ident::me();
         let alias = tap_alias(&h.run, &me);
-        assert_eq!(parse_tap_alias(&alias), Some((me.clone(), &*h.run.to_string_lossy())));
-        for bad in ["", "flexvm", "flexvm 1 2", "flexvm 1 2 ", "flexvm x 2 /r", "flexvm 1 y /r", "flexvm1 2 /r", "other 1 2 /r"] {
+        assert_eq!(parse_tap_alias(&alias), Some((me.clone(), pid_ns(), &*h.run.to_string_lossy())));
+        for bad in [
+            "",
+            "flexvm",
+            "flexvm 1 2",
+            "flexvm 1 2 ",
+            "flexvm x 2 /r",
+            "flexvm 1 y /r",
+            "flexvm1 2 /r",
+            "other 1 2 /r",
+            "flexvm pidns: 1 2 /r",
+            "flexvm pidns:x 1 2 /r",
+            "flexvm pidns:7 1 2",
+            "flexvm pidns:7",
+        ] {
             assert_eq!(parse_tap_alias(bad), None, "{bad:?}");
         }
-        assert_eq!(parse_tap_alias("flexvm 1 2 /run/a b").map(|(o, r)| (o.pid, o.start, r)), Some((1, 2, "/run/a b")));
+        // An earlier build's alias names no namespace; the run directory may have spaces.
+        assert_eq!(parse_tap_alias("flexvm 1 2 /run/a b").map(|(o, ns, r)| (o.pid, o.start, ns, r)), Some((1, 2, None, "/run/a b")));
+        assert_eq!(parse_tap_alias("flexvm pidns:7 1 2 /run/a b").map(|(o, ns, r)| (o.pid, o.start, ns, r)), Some((1, 2, Some(7), "/run/a b")));
+        assert_eq!(tap_alias_in(Path::new("/run/x"), &Ident { pid: 1, start: 2, boot: String::new() }, None), "flexvm 1 2 /run/x");
+        assert_eq!(tap_alias_in(Path::new("/run/x"), &Ident { pid: 1, start: 2, boot: String::new() }, Some(7)), "flexvm pidns:7 1 2 /run/x");
         let net = h.run.join("net");
         let other = h.run.join("other");
         std::fs::create_dir(&other).unwrap();
@@ -7697,10 +7871,10 @@ pub(crate) mod tests {
         dev("fq21a2ct0", 13, &tap_alias(&other, &dead), true);
         dev("fq1t0", 14, "", true);
         dev("fq2t0", 15, &tap_alias(&h.run, &dead), false);
-        let mut got = taps_of_at(&h.run, &net, false);
+        let mut got = taps_of_at(&h.run, &net, false, pid_ns());
         got.sort_by_key(|t| t.1);
         assert_eq!(got, vec![("fq3e7t0".into(), 10, dead.clone()), ("fqx3e7".into(), 11, me.clone())]);
-        let mut theirs = taps_of_at(&other, &net, false);
+        let mut theirs = taps_of_at(&other, &net, false, pid_ns());
         theirs.sort_by_key(|t| t.1);
         assert_eq!(theirs, vec![("fq21a2bt0".into(), 12, me), ("fq21a2ct0".into(), 13, dead)]);
     }
@@ -7730,12 +7904,12 @@ pub(crate) mod tests {
             std::fs::write(dev.join("ifalias"), tap_alias(run, owner)).unwrap();
             std::fs::write(dev.join("tun_flags"), "0x1802\n").unwrap();
         }
-        let mut taps = dead_taps_at(&run, &net, Some(&dead));
+        let mut taps = dead_taps_at(&run, &net, Some(&dead), pid_ns());
         taps.sort_by_key(|t| t.1);
         assert_eq!(taps, vec![("dead-0".into(), 10, dead.clone()), ("dead-1".into(), 11, dead.clone())]);
-        assert!(dead_taps_at(&run, &net, Some(&live)).is_empty(), "a live holder's taps stay");
-        assert!(dead_taps_at(&run, &net, Some(&Ident { boot: String::new(), ..dead })).is_empty(), "unknown is not proof of death");
-        assert_eq!(dead_taps_at(&run, &net, None).len(), 5, "the sweep also collects other dead holders and orphaned hosts");
+        assert!(dead_taps_at(&run, &net, Some(&live), pid_ns()).is_empty(), "a live holder's taps stay");
+        assert!(dead_taps_at(&run, &net, Some(&Ident { boot: String::new(), ..dead }), pid_ns()).is_empty(), "unknown is not proof of death");
+        assert_eq!(dead_taps_at(&run, &net, None, pid_ns()).len(), 5, "the sweep also collects other dead holders and orphaned hosts");
     }
 
     #[test]
@@ -7755,10 +7929,47 @@ pub(crate) mod tests {
                 std::fs::write(dev.join("tun_flags"), "0x1802\n").unwrap();
             }
         }
-        assert!(dead_taps_at(&run, &net, None).is_empty(), "another existing host's taps stay");
+        assert!(dead_taps_at(&run, &net, None, pid_ns()).is_empty(), "another existing host's taps stay");
         std::fs::remove_dir(&other).unwrap();
-        assert_eq!(dead_taps_at(&run, &net, None), vec![("dead".into(), 10, dead)]);
-        assert!(taps_of_at(&run, &net, false).is_empty(), "pid-reuse cleanup still only selects this host's taps");
+        assert_eq!(dead_taps_at(&run, &net, None, pid_ns()), vec![("dead".into(), 10, dead)]);
+        assert!(taps_of_at(&run, &net, false, pid_ns()).is_empty(), "pid-reuse cleanup still only selects this host's taps");
+    }
+
+    /// Hosts in other PID namespaces sharing this network namespace and run path (#1078): their
+    /// taps' owners read as dead here, but are never judged here; an older alias reads as before.
+    #[test]
+    fn taps_of_another_pid_namespace_are_never_swept() {
+        let d = crate::test_util::TempDir::new("pidns-taps");
+        let run = d.join("run");
+        std::fs::create_dir(&run).unwrap();
+        let (net, orphan) = (d.join("net"), d.join("missing"));
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        let (mine, theirs) = (Some(4_026_531_836), Some(4_026_532_999));
+        for (name, index, run, ns) in [
+            ("mine", 10, &run, mine),
+            ("theirs", 11, &run, theirs),
+            ("old", 12, &run, None),
+            ("theirs-orphan", 13, &orphan, theirs),
+            ("mine-orphan", 14, &orphan, mine),
+        ] {
+            let dev = net.join(name);
+            std::fs::create_dir_all(&dev).unwrap();
+            std::fs::write(dev.join("ifindex"), format!("{index}\n")).unwrap();
+            std::fs::write(dev.join("ifalias"), format!("{}\n", tap_alias_in(run, &dead, ns))).unwrap();
+            std::fs::write(dev.join("tun_flags"), "0x1802\n").unwrap();
+        }
+        let names = |taps: Vec<(String, u32, Ident)>| {
+            let mut n: Vec<_> = taps.into_iter().map(|t| t.0).collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(dead_taps_at(&run, &net, None, mine)), ["mine", "mine-orphan", "old"]);
+        assert_eq!(names(dead_taps_at(&run, &net, Some(&dead), mine)), ["mine", "old"]);
+        assert_eq!(names(taps_of_at(&run, &net, false, mine)), ["mine", "old"]);
+        // From the other namespace: the reverse, and the old alias as before.
+        assert_eq!(names(dead_taps_at(&run, &net, None, theirs)), ["old", "theirs", "theirs-orphan"]);
+        // Its own namespace unknown: only old aliases are judged.
+        assert_eq!(names(dead_taps_at(&run, &net, None, None)), ["old"]);
     }
 
     /// A VM process's own cgroup goes only once empty, whatever its pid
