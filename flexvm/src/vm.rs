@@ -414,7 +414,7 @@ impl Vm {
         t.mark("link_down");
         saved?;
         down?;
-        let runs = self.pager.quiesce_export()?;
+        let runs = self.pager.quiesce_export(|| self.cancel_checkpoint.load(Ordering::SeqCst) != 0)?;
         t.mark("export_runs");
         Ok(runs)
     }

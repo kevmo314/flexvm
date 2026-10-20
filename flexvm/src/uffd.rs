@@ -225,10 +225,13 @@ pub struct Runtime {
     /// Set by the checkpoint barrier: no new prefetch, and the collapse pass ends; cleared if a migration aborts
     /// (`unquiesce`).
     quiesce: AtomicBool,
-    /// Held from the prefetch's quiesce check through settling its claims. Export drains it; freeze holds it before wp.
+    /// Held from the prefetch's final quiesce check through settling its claims; cold reads happen before it.
+    /// Export drains it; freeze holds it before wp.
     prefetch_gate: Mutex<()>,
     #[cfg(test)]
     before_prefetch_claim: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    before_prefetch_read: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// The working-set prefetch ended for `quiesce` before it was done.
     prefetch_cut: AtomicBool,
     /// The page after the last template fault: only sequential template reads copy `FAULT_AROUND` pages, avoiding
@@ -490,6 +493,28 @@ impl Pager {
         let mut cut = false;
         for (mut i, end) in self.chunks(self.working_set(0, 1), PREFETCH_RUN) {
             while i < end {
+                if self.quiesce.load(Ordering::SeqCst) {
+                    cut = true;
+                    break;
+                }
+                if pages.get(i) != BASE {
+                    i += 1;
+                    continue;
+                }
+                // Holes were zero at snapshot time (mostly free memory the guest allocates again); map them too, or
+                // each one costs a fault. Prepare a homogeneous run before claiming it.
+                let data = self.base.has_data(i);
+                let prepared_end = (i + 1..end).find(|&p| pages.get(p) != BASE || self.base.has_data(p) != data).unwrap_or(end);
+                let prepared = data.then(|| {
+                    #[cfg(test)]
+                    if let Some(pause) = self.before_prefetch_read.get() {
+                        pause();
+                    }
+                    // Both prefault and the actual template read can wait on disk. Keep them outside the gate, and
+                    // copy into our own buffer so eviction cannot make the install read the template again.
+                    self.base.prefault(i, prepared_end - i);
+                    self.base.pages(i, prepared_end - i).to_vec()
+                });
                 let _prefetch = self.prefetch_gate.lock().unwrap();
                 if self.quiesce.load(Ordering::SeqCst) {
                     cut = true;
@@ -499,17 +524,13 @@ impl Pager {
                 if let Some(pause) = self.before_prefetch_claim.get() {
                     pause();
                 }
-                // Holes were zero at snapshot time (mostly free memory the guest allocates again); map them too, or
-                // each one costs a fault.
-                let data = self.base.has_data(i);
-                let n = pages.claim(i, end - i, BASE, |p| self.base.has_data(p) == data);
+                let n = pages.claim(i, prepared_end - i, BASE, |p| self.base.has_data(p) == data);
                 if n > 0 {
-                    let src = |p: usize, c: usize| data.then(|| self.base.pages(p, c));
-                    // A cold template read happens here, not under `events`, where it would hold up every fault batch.
-                    let prefault = |p: usize, c: usize| self.base.prefault(p, c);
                     let stop = || self.quiesce.load(Ordering::SeqCst);
-                    let _ =
-                        pages.install_prepared(i, n, BASE, Some(&stop), data.then_some(&prefault as &dyn Fn(usize, usize)), |p, c| populate(p, c, src(p, c)));
+                    let _ = pages.install(i, n, BASE, Some(&stop), |p, c| {
+                        let src = prepared.as_ref().map(|buf| &buf[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE]);
+                        populate(p, c, src)
+                    });
                 }
                 i += n.max(1);
             }
@@ -871,13 +892,21 @@ impl Pager {
     /// cannot write it.
     ///
     /// The export is the run-length encoded page states a migration target needs: PRESENT pages become REMOTE there,
-    /// ZERO stays ZERO and BASE is implied.
-    pub fn quiesce_export(&self) -> Result<Runs> {
+    /// ZERO stays ZERO and BASE is implied. The gate and in-flight waits share one timeout and notice cancellation;
+    /// callers roll back the checkpoint or migration on failure.
+    pub fn quiesce_export(&self, cancelled: impl Fn() -> bool) -> Result<Runs> {
         self.quiesce.store(true, Ordering::SeqCst);
         // Set quiesce first so a copy retrying EAGAIN can give its claims back. Once drained, no prefetch can claim
         // behind the export scan or publish a writable page after freeze takes its dirty bit.
         let start = Instant::now();
+        let check_cancelled = || -> Result<()> {
+            if self.stopped() || cancelled() {
+                bail!("page export cancelled");
+            }
+            Ok(())
+        };
         loop {
+            check_cancelled()?;
             match self.prefetch_gate.try_lock() {
                 Ok(_) => break,
                 Err(TryLockError::WouldBlock) => {
@@ -898,8 +927,10 @@ impl Pager {
             let (first, end) = m.span();
             let mut i = pages.next_not(BASE, first, end);
             while i < end {
+                check_cancelled()?;
                 let mut s = pages.get(i);
                 while (s == INFLIGHT || s == DISCARDED) && start.elapsed() < EXPORT_TIMEOUT {
+                    check_cancelled()?;
                     thread::sleep(Duration::from_micros(20));
                     s = pages.get(i);
                 }
