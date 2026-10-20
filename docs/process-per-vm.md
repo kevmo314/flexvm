@@ -27,8 +27,9 @@ A VM process:
 
 A VM process started in the background (`-d`, an arrival the listener
 spawns, a standby VM) is in a session of its own and, between fork and exec,
-joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID-START` (`util::spawn_self`;
-named after the instance, so one that exists is refused, never joined),
+joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID-START-NS` (`util::spawn_self`;
+named after the instance and its PID namespace's inode, read before the fork, so one that
+exists is refused, never joined),
 so stopping its starter's cgroup (a systemd unit's restart with
 `KillMode=control-group`, a oneshot unit's end, logind's `KillUserProcesses`)
 does not reach it. Its Firecrackers move on to `flexvm/idle-PID-START-N-NS`, NS its PID
@@ -193,8 +194,10 @@ RUN (default /run/flexvm, tmpfs)
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.logs/log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc                   when garbage was last swept periodically
-  .X.PID-START-BOOT.tmp   `util::write_file`'s temporary files here and in STATE: swept once their writer is
-                         gone (or of another boot); a bare PID (older ones) once no such pid runs or older than the boot
+  .X.PID-START-BOOT-NS.tmp `util::write_file`'s temporary files here and in STATE (and wherever it writes): swept once their
+                         writer is gone (or of another boot), one of another PID namespace NS only once that namespace is
+                         (as its taps); `.X.PID-START-BOOT.tmp` (earlier ones) by pid here; a bare PID (older still) once no
+                         such pid runs or older than the boot
   claims/IP              the boot id, written before an address record is written without fsync (a fresh start's
                          claim), removed once a durable write replaces it
   live/IP                a live process's address generation and revision, published before its durable write
@@ -224,8 +227,10 @@ RUN (default /run/flexvm, tmpfs)
                          (one per generation; swept once neither read nor written for a day)
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
   w/PID-START/           a VM process's work directory, named by its whole identity (a later
-                         process with its pid never shares it): `owner` (pid, start time), and per
-                         Firecracker a directory with `fc` (its pid and start time)
+                         process with its pid never shares it): `owner` (pid, start time), `sockets`
+                         (the path of its socket directory, `socket::RECORD`, named by a hash of this
+                         directory and the PID namespace that made it, so a sweep from another removes it),
+                         and per Firecracker a directory with `fc` (its pid and start time)
 ```
 
 **host.json** is edited by hand; only `flexvm listen` writes a key (`listen`).
@@ -297,7 +302,8 @@ taps with no such alias, an earlier version's say, are never touched); a
 process with a reused pid removes its dead namesake's as it starts, as their
 names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>-<pidns>`, by the process's identity in this PID namespace or one naming none; another namespace's, as its taps, only once a census from the initial PID namespace finds none of its processes left), work directories, names, a standby
 VM's socket (its `PID-START.lock` free) and a lock it died before renaming in place (`.PID-START.lock`), an arrival's log (its lock in `vms/.locks` free or gone, 5 s
-old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
+old). A VM process's own cgroup (`vm-PID-START-NS`; an earlier build's `vm-PID-START`, by pid here) goes once empty
+and its owner is gone (another PID namespace's, as its taps, only once that namespace is), never
 killed (`rmdir` refuses a populated cgroup). An earlier version's
 Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a name with no
 VM, suspended VM, `failed`, `lost`, `exited` or `moved` record go once unwritten for an hour,
@@ -732,7 +738,7 @@ committed, never ends the process,
    only as the source of the migration id they name.
 9. **Shared resources have one owner.** Socket roots, work directories, taps
    (`<prefix><pid>t<n>`, a template build's `<prefix>x<pid>`, owned by their alias) and cgroups
-   (`idle-<pid>-<start>-<n>-<pidns>`; a VM process's own `vm-<pid>-<start>`, swept once empty) are named after the owning process and only swept once it is gone; each process has its own
+   (`idle-<pid>-<start>-<n>-<pidns>`; a VM process's own `vm-<pid>-<start>-<pidns>`, swept once empty) are named after the owning process and only swept once it is gone; each process has its own
    hold TUN (not persistent: it goes with the process); `unroute` happens
    under the host lock and only for an address the process still holds;
    checkpoint staging is cleared by owner pid; suspended directories are

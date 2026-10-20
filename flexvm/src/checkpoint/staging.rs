@@ -89,8 +89,8 @@ impl Staging {
         // exclusion below.
         let _parent_lock = parent_lock(&fstat(pfd.as_raw_fd())?, libc::LOCK_EX)?;
         clear_stale_fd(&pfd);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
-        let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
+        // A nonce, not a time: writers in other PID namespaces may have this pid (#1084).
+        let outer_name = cname(&format!("{STAGING_PREFIX}{}-{}", std::process::id(), crate::util::random_hex(8)?));
         check(unsafe { libc::mkdirat(pfd.as_raw_fd(), outer_name.as_ptr(), 0o700) })?;
         let outer = open_dir_at(pfd.as_raw_fd(), &outer_name).inspect_err(|_| remove_staging(pfd.as_raw_fd(), &outer_name, -1, None))?;
         let ck = (|| -> Result<_> {

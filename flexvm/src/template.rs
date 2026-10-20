@@ -1055,7 +1055,7 @@ fn sweep_locked(paths: &Paths) -> Result<()> {
         } else if kind.is_dir() && leftover(&name, "new") && !live(&name) {
             crate::log!("template: removing {}, left by a build that did not finish", entry.path().display());
             if let Ok(key) = std::fs::canonicalize(entry.path()) {
-                crate::socket::remove(&key);
+                crate::socket::remove_left(&key);
             }
             let _ = std::fs::remove_dir_all(entry.path());
         }
@@ -1803,7 +1803,7 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     // Downloaded on first use if missing (`artifacts`): every later VM restores with the Firecracker built with.
     crate::artifacts::ensure(&[(&paths.kernel, &crate::artifacts::KERNEL), (&paths.firecracker, &crate::artifacts::FIRECRACKER)])?;
     let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
-    let sockets = SocketRoot::new(&std::fs::canonicalize(dir)?)?;
+    let sockets = SocketRoot::unique(&std::fs::canonicalize(dir)?)?;
     let start = Instant::now();
     let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
     let mut admission = crate::limit::Building::admit(host, mem_mib)?;

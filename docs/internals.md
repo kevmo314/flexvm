@@ -586,7 +586,7 @@ checkpoints anywhere), so nothing follows a path that user can change:
 
 - **Staging.** The destination's directory is opened and pinned by fd. Files
   are created with `O_EXCL|O_NOFOLLOW` inside a root-only (0700)
-  `.flexvm-staging-<pid>-<n>/ck` directory in it, also pinned by fd.
+  `.flexvm-staging-<pid>-<nonce>/ck` directory in it, also pinned by fd.
   Firecracker writes the VM state into the VM's own run directory, from
   where it is copied in.
 - **Ownership.** Files are fchowned to the destination directory's owner.

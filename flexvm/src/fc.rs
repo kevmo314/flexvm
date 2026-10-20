@@ -686,7 +686,7 @@ mod tests {
             let dir = crate::test_util::TempDir::new("fc-no-cgroup");
             let cg = dir.join("cg");
             std::fs::create_dir(&cg).unwrap();
-            let sockets = SocketRoot::from_bases(&[dir.join("s")], &dir).unwrap().allocate().unwrap();
+            let sockets = SocketRoot::from_bases(&[dir.join("s")], &dir, None).unwrap().allocate().unwrap();
             let fc = Firecracker {
                 child: Command::new("sleep").arg("30").spawn().unwrap(),
                 sockets,
@@ -713,7 +713,7 @@ mod tests {
         let dir = crate::test_util::TempDir::new("fc-no-cgroups");
         let fc = Firecracker {
             child: Command::new("sleep").arg("30").spawn().unwrap(),
-            sockets: SocketRoot::from_bases(&[dir.join("s")], &dir).unwrap().allocate().unwrap(),
+            sockets: SocketRoot::from_bases(&[dir.join("s")], &dir, None).unwrap().allocate().unwrap(),
             dir: dir.to_path_buf(),
             cgroup: RefCell::new(None),
             tap: String::new(),

@@ -1368,10 +1368,12 @@ pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
 /// Characters of the boot id in `write_tag`.
 pub const BOOT_TAG: usize = 8;
 
-/// What names this process in `write_file`'s temporary files: `PID-START-BOOT` (its start time
-/// and the first `BOOT_TAG` characters of the boot id), so a sweep tells a dead writer's from a
-/// live one that got its pid, in this boot or after a reboot (`host::write_debris_of`). A bare
-/// PID if either cannot be read.
+/// What names this process in `write_file`'s temporary files: `PID-START-BOOT-NS` (its start time,
+/// the first `BOOT_TAG` characters of the boot id and its PID namespace, `host::pid_ns`), so a sweep
+/// tells a dead writer's from a live one that got its pid, in this boot or after a reboot
+/// (`host::write_debris_of`), and writers in other PID namespaces with the same pid and start time
+/// (in a directory they share, a templates directory say) never write to one file (#1084). Without a
+/// PID namespace to name, `PID-START-BOOT`; a bare PID if the start time or boot id cannot be read.
 pub fn write_tag() -> String {
     static TAG: std::sync::Mutex<Option<(u32, String)>> = std::sync::Mutex::new(None);
     let pid = std::process::id();
@@ -1380,8 +1382,9 @@ pub fn write_tag() -> String {
         return tag.clone();
     }
     let boot = crate::host::boot_id().get(..BOOT_TAG).filter(|b| !b.contains('-'));
-    let tag = match (crate::host::starttime(pid), boot) {
-        (Some(start), Some(boot)) => format!("{pid}-{start}-{boot}"),
+    let tag = match (crate::host::starttime(pid), boot, crate::host::pid_ns()) {
+        (Some(start), Some(boot), Some(ns)) => format!("{pid}-{start}-{boot}-{ns}"),
+        (Some(start), Some(boot), None) => format!("{pid}-{start}-{boot}"),
         _ => return pid.to_string(),
     };
     *t = Some((pid, tag.clone()));
@@ -1545,7 +1548,7 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
 
 /// A VM process in the background, with `fd3` as its fd 3: it outlives the
 /// caller, so it is in a session of its own and, where flexvm's cgroup tree
-/// is available, a cgroup of its own (`flexvm/vm-PID-START`, `scope`), out of
+/// is available, a cgroup of its own (`flexvm/vm-PID-START-NS`, `scope`), out of
 /// reach of whatever stops the caller's: a systemd unit's restart or stop
 /// (`KillMode=control-group`), logind's `KillUserProcesses`.
 pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<()> {
@@ -1567,13 +1570,15 @@ pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     let cgroups = crate::vmproc::cgroup_root().map(|r| r.join("vm-").as_os_str().as_bytes().to_vec());
+    // Read before the fork: the child is in this PID namespace too, and reads nothing it would allocate for.
+    let ns = crate::host::pid_ns();
     let mut cmd = std::process::Command::new("/proc/self/exe");
     cmd.args(args).envs(env.iter().copied()).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
     unsafe {
         cmd.pre_exec(move || {
             libc::setsid();
             if let Some(prefix) = &cgroups {
-                if !own_start().is_some_and(|start| scope(prefix, libc::getpid() as u32, start)) {
+                if !own_start().is_some_and(|start| scope(prefix, libc::getpid() as u32, start, ns)) {
                     let warn = b"flexvm: WARNING: no cgroup of its own: stopping the caller's cgroup stops this vm\n";
                     libc::write(2, warn.as_ptr().cast(), warn.len());
                 }
@@ -1715,9 +1720,9 @@ fn reaper(wake: RawFd) {
     }
 }
 
-/// `PREFIX` `PID` `-` `START` `SUFFIX` NUL in `buf`, without allocating
-/// (after fork); false if it does not fit.
-fn scope_path(buf: &mut [u8], prefix: &[u8], pid: u32, start: u64, suffix: &[u8]) -> bool {
+/// `PREFIX` `PID` `-` `START` (`-` `NS` with a PID namespace) `SUFFIX` NUL in `buf`, without
+/// allocating (after fork); false if it does not fit.
+fn scope_path(buf: &mut [u8], prefix: &[u8], pid: u32, start: u64, ns: Option<u64>, suffix: &[u8]) -> bool {
     fn digits(mut n: u64, out: &mut [u8; 20]) -> &[u8] {
         let mut i = out.len();
         loop {
@@ -1729,8 +1734,12 @@ fn scope_path(buf: &mut [u8], prefix: &[u8], pid: u32, start: u64, suffix: &[u8]
             }
         }
     }
-    let (mut p, mut s) = ([0u8; 20], [0u8; 20]);
-    let parts: [&[u8]; 5] = [prefix, digits(pid as u64, &mut p), b"-", digits(start, &mut s), suffix];
+    let (mut p, mut s, mut n) = ([0u8; 20], [0u8; 20], [0u8; 20]);
+    let (dash, ns): (&[u8], &[u8]) = match ns {
+        Some(ns) => (b"-", digits(ns, &mut n)),
+        None => (b"", b""),
+    };
+    let parts: [&[u8]; 7] = [prefix, digits(pid as u64, &mut p), b"-", digits(start, &mut s), dash, ns, suffix];
     let len: usize = parts.iter().map(|p| p.len()).sum();
     if len + 1 > buf.len() || prefix.contains(&0) {
         return false;
@@ -1772,20 +1781,22 @@ fn own_start() -> Option<u64> {
     }
 }
 
-/// Moves this process into a new cgroup `PREFIX` `pid-start`, named after
-/// this instance: never one a dead process left (one that exists is
+/// Moves this process into a new cgroup `PREFIX` `pid-start-ns`, named after
+/// this instance and its PID namespace `ns` (`host::pid_ns`, read before the fork), so that
+/// a host in another PID namespace sharing the cgroup tree never judges it by its pid
+/// (`host::sweep_scope`, #1084): never one a dead process left (one that exists is
 /// refused, not joined). Only system calls: it runs between fork and exec.
 /// Garbage collection removes empty ones, so one removed between its
 /// making and its joining is made again.
-fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
+fn scope(prefix: &[u8], pid: u32, start: u64, ns: Option<u64>) -> bool {
     let mut path = [0u8; 512];
     let errno = || unsafe { *libc::__errno_location() };
     for _ in 0..3 {
         unsafe {
-            if !scope_path(&mut path, prefix, pid, start, b"") || libc::mkdir(path.as_ptr().cast(), 0o755) != 0 {
+            if !scope_path(&mut path, prefix, pid, start, ns, b"") || libc::mkdir(path.as_ptr().cast(), 0o755) != 0 {
                 return false;
             }
-            if !scope_path(&mut path, prefix, pid, start, b"/cgroup.procs") {
+            if !scope_path(&mut path, prefix, pid, start, ns, b"/cgroup.procs") {
                 return false;
             }
             let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY | libc::O_CLOEXEC);
@@ -2279,13 +2290,23 @@ mod tests {
 
     #[test]
     fn a_scope_is_named_and_joined_without_allocating() {
-        let mut buf = [0u8; 64];
-        assert!(scope_path(&mut buf, b"/sys/fs/cgroup/flexvm/vm-", 4194304, 1234567, b"/cgroup.procs"));
-        assert_eq!(std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_bytes(), b"/sys/fs/cgroup/flexvm/vm-4194304-1234567/cgroup.procs");
-        assert!(scope_path(&mut buf, b"vm-", 0, 0, b""));
-        assert_eq!(std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_bytes(), b"vm-0-0");
-        assert!(!scope_path(&mut [0u8; 8], b"vm-", 123, 4, b""), "no room for the NUL");
-        assert!(!scope_path(&mut buf, b"v\0m-", 1, 1, b""));
+        let mut buf = [0u8; 80];
+        let text = |buf: &[u8]| std::ffi::CStr::from_bytes_until_nul(buf).unwrap().to_bytes().to_vec();
+        assert!(scope_path(&mut buf, b"/sys/fs/cgroup/flexvm/vm-", 4194304, 1234567, None, b"/cgroup.procs"));
+        assert_eq!(text(&buf), b"/sys/fs/cgroup/flexvm/vm-4194304-1234567/cgroup.procs");
+        // Named with its PID namespace (#1084).
+        assert!(scope_path(&mut buf, b"/sys/fs/cgroup/flexvm/vm-", 4194304, 1234567, Some(4026531836), b"/cgroup.procs"));
+        assert_eq!(text(&buf), b"/sys/fs/cgroup/flexvm/vm-4194304-1234567-4026531836/cgroup.procs");
+        assert!(scope_path(&mut buf, b"vm-", 0, 0, None, b""));
+        assert_eq!(text(&buf), b"vm-0-0");
+        assert!(scope_path(&mut buf, b"vm-", 0, 0, Some(0), b""));
+        assert_eq!(text(&buf), b"vm-0-0-0");
+        assert!(scope_path(&mut buf, b"vm-", u32::MAX, u64::MAX, Some(u64::MAX), b""));
+        assert_eq!(text(&buf), format!("vm-{}-{}-{}", u32::MAX, u64::MAX, u64::MAX).as_bytes());
+        assert!(!scope_path(&mut [0u8; 8], b"vm-", 123, 4, None, b""), "no room for the NUL");
+        assert!(!scope_path(&mut [0u8; 10], b"vm-", 1, 2, Some(345), b""), "nor for the namespace");
+        assert!(scope_path(&mut [0u8; 11], b"vm-", 1, 2, Some(345), b""));
+        assert!(!scope_path(&mut buf, b"v\0m-", 1, 1, None, b""));
         // Named after this instance: its start time as /proc says.
         assert_eq!(own_start(), crate::host::starttime(std::process::id()));
         assert_eq!(stat_start(b"9 (a) b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777 1"), Some(777), "a ')' in the name");
@@ -2294,12 +2315,15 @@ mod tests {
         let root = crate::test_util::TempDir::new("scope");
         let prefix = root.join("vm-");
         let prefix = prefix.as_os_str().as_encoded_bytes();
-        assert!(!scope(prefix, 7, 9), "made, but no cgroup.procs to join");
+        assert!(!scope(prefix, 7, 9, None), "made, but no cgroup.procs to join");
         assert!(root.join("vm-7-9").is_dir());
         // One that exists (say a dead process's, its pid now reused) is never joined.
         std::fs::write(root.join("vm-7-9/cgroup.procs"), b"").unwrap();
-        assert!(!scope(prefix, 7, 9));
+        assert!(!scope(prefix, 7, 9, None));
         assert_eq!(std::fs::read(root.join("vm-7-9/cgroup.procs")).unwrap(), b"");
+        // Another PID namespace's namesake (the same pid and start time there) is another cgroup.
+        assert!(!scope(prefix, 7, 9, Some(11)));
+        assert!(root.join("vm-7-9-11").is_dir() && !root.join("vm-7-9-11/cgroup.procs").exists());
     }
 
     #[test]
