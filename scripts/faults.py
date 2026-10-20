@@ -4158,27 +4158,29 @@ def checkpoint_crash():
     place clears the debris and succeeds."""
     n, path = "ft-crash", ckpt_path("ft-crash")
     setup(n, mib=1200)
-    fault(A, "ckpt_slow", 120000)
-    t = start_thread(target=lambda: checkpoint(A, n, path))
+    # Sweeps (#1000) would clear the killed checkpoint's staging: kept until its checks below are done.
+    with armed_fault(A, "keep_staging", 300000):
+        fault(A, "ckpt_slow", 120000)
+        t = start_thread(target=lambda: checkpoint(A, n, path))
 
-    def writing():
-        return staged_mib() > 100 and vms(A).get(n, {}).get("checkpoint_copy")
+        def writing():
+            return staged_mib() > 100 and vms(A).get(n, {}).get("checkpoint_copy")
 
-    caught = wait_for(writing, 30)
-    check("crash: caught the checkpoint mid-write", caught)
-    pid, fc = vm_pid(A, n), fc_pid(A, n)
-    os.kill(pid, signal.SIGKILL)
-    t.join()
-    fault(A, "ckpt_slow", 0)
-    check("crash: the VM died with its process", wait_for(lambda: not alive(fc), 15) and n not in vms(A), vms(A).get(n))
-    check("crash: no checkpoint published", not os.path.exists(path))
-    r = restore(B, path, ip="auto")
-    check("crash: nothing to restore", not r["ok"], r)
-    partial = [os.path.join(f, "ck") for f in staging()]
-    check("crash: staging left behind (root-only)", len(partial) == 1, partial)
-    for f in partial:
-        r = restore(B, f, ip="auto")
-        check("crash: the partial directory does not restore", not r["ok"], r)
+        caught = wait_for(writing, 30)
+        check("crash: caught the checkpoint mid-write", caught)
+        pid, fc = vm_pid(A, n), fc_pid(A, n)
+        os.kill(pid, signal.SIGKILL)
+        t.join()
+        fault(A, "ckpt_slow", 0)
+        check("crash: the VM died with its process", wait_for(lambda: not alive(fc), 15) and n not in vms(A), vms(A).get(n))
+        check("crash: no checkpoint published", not os.path.exists(path))
+        r = restore(B, path, ip="auto")
+        check("crash: nothing to restore", not r["ok"], r)
+        partial = [os.path.join(f, "ck") for f in staging()]
+        check("crash: staging left behind (root-only)", len(partial) == 1, partial)
+        for f in partial:
+            r = restore(B, f, ip="auto")
+            check("crash: the partial directory does not restore", not r["ok"], r)
     m = setup(n, mib=50)
     ok(checkpoint(A, n, path, stop=True))
     left = staging()
@@ -5677,23 +5679,25 @@ def cow_crash():
     n, path = "ft-cow-crash", ckpt_path("ft-cow-crash")
     ok(run(A, n))
     start_writer(A, n, mib=64)
-    with armed_fault(A, "ckpt_slow", 120000):
-        t = start_thread(target=lambda: checkpoint(A, n, path))
-        check("cow crash: caught the copy in the background", wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30))
-        time.sleep(0.5)
-        pid, fc = vm_pid(A, n), fc_pid(A, n)
-        os.kill(pid, signal.SIGKILL)
-        killed = time.time()
-        t.join()
-    check("cow crash: no checkpoint published", not os.path.exists(path))
-    r = restore(B, path, ip="auto")
-    check("cow crash: nothing to restore", not r["ok"], r)
-    partial = [os.path.join(f, "ck") for f in staging()]
-    # The killed copy's staging is left (nothing ran to remove it): else the checks of it below check nothing.
-    check("cow crash: the killed copy left its staging directory", partial, staging())
-    for f in partial:
-        r = restore(B, f, ip="auto")
-        check("cow crash: the partial directory does not restore", not r["ok"], r)
+    # Sweeps (#1000) would clear the killed copy's staging: kept until its checks below are done.
+    with armed_fault(A, "keep_staging", 300000):
+        with armed_fault(A, "ckpt_slow", 120000):
+            t = start_thread(target=lambda: checkpoint(A, n, path))
+            check("cow crash: caught the copy in the background", wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30))
+            time.sleep(0.5)
+            pid, fc = vm_pid(A, n), fc_pid(A, n)
+            os.kill(pid, signal.SIGKILL)
+            killed = time.time()
+            t.join()
+        check("cow crash: no checkpoint published", not os.path.exists(path))
+        r = restore(B, path, ip="auto")
+        check("cow crash: nothing to restore", not r["ok"], r)
+        partial = [os.path.join(f, "ck") for f in staging()]
+        # Else the checks of it below check nothing.
+        check("cow crash: the killed copy left its staging directory", partial, staging())
+        for f in partial:
+            r = restore(B, f, ip="auto")
+            check("cow crash: the partial directory does not restore", not r["ok"], r)
     died = wait_for(lambda: not alive(fc), 15)
     if died:
         detail = vms(A).get(n)
@@ -9971,23 +9975,37 @@ def gc_debris():
         if os.path.exists(p):
             os.unlink(p)
     cleanup(n)
-    # A VM process killed during a checkpoint leaves its root-only staging in the store: gc leaves it
-    # (#329), and the next checkpoint clears it.
-    n, d = "ft-gc-ck", ckpt_path("ft-gc-ckdir")
+    # A VM process killed during a checkpoint leaves its root-only staging in the store: a sweep clears it
+    # (#1000), not the staging of a checkpoint still being written. Only flexvm's own STATE/checkpoints and
+    # STATE/suspended, never waiting for a lock: a user's checkpoint directory (#329, on NFS) is not walked.
+    n, n2, d = "ft-gc-ck", "ft-gc-ck2", ckpt_path("ft-gc-ckdir")
     os.makedirs(d)
     ok(run(A, n))
-    with armed_fault(A, "ckpt_slow", 120000):
-        t = start_thread(target=lambda: checkpoint(A, n, os.path.join(d, "ck"), timeout=60))
-        copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and staging(), 30)
-        check("gc: a checkpoint is staging", copying, (vms(A).get(n), staging()))
-        signal_vm(A, n, signal.SIGKILL)
-        t.join()
-    ok(cli_json(A, "debug", "gc"))
-    check("gc: the killed checkpoint's staging stays through a sweep", staging())
-    n2 = "ft-gc-ck2"
     ok(run(A, n2))
-    ok(checkpoint(A, n2, os.path.join(d, "ck2")))
-    check("gc: the next checkpoint clears the dead one's staging", not staging() and not os.path.exists(os.path.join(d, "ck")), staging())
+    # Each copy waits once its staging is made, until the sweep is done. The live one first: a checkpoint's
+    # start clears what a dead one left.
+    with armed_fault(A, "ckpt_copy_wait", 120000):
+        # Kept from the background sweeps until both are staged.
+        with armed_fault(A, "keep_staging", 120000):
+            live = {}
+            t2 = start_thread(target=lambda: live.update(r=checkpoint(A, n2, os.path.join(d, "ck2"), timeout=120)))
+            staged = wait_for(lambda: vms(A).get(n2, {}).get("checkpoint_copy") and staging(), 30)
+            check("gc: a checkpoint is staging", staged, (vms(A).get(n2), staging()))
+            others = set(staging())
+            t = start_thread(target=lambda: checkpoint(A, n, os.path.join(d, "ck"), timeout=60))
+            copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and len(staging()) == 2, 30)
+            check("gc: another checkpoint is staging", copying, (vms(A).get(n), staging()))
+            dead = [f for f in staging() if f not in others]
+            signal_vm(A, n, signal.SIGKILL)
+            t.join()
+            check("gc: the killed checkpoint's staging is left", dead and all(os.path.exists(f) for f in dead), (dead, staging()))
+        ok(cli_json(A, "debug", "gc"))
+        left = staging()
+        check("gc: the killed checkpoint's staging goes in a sweep, the live one's stays",
+              len(dead) == 1 and dead[0] not in left and len(left) == 1, (dead, left))
+    t2.join()
+    check("gc: the live checkpoint completes", live.get("r", {}).get("ok"), live)
+    check("gc: nothing staged once it is published", not staging() and not os.path.exists(os.path.join(d, "ck")), staging())
     rm_ckpt(os.path.join(d, "ck2"))
     cleanup(n2)
     cleanup(n)

@@ -361,20 +361,22 @@ impl Pages {
     /// Applies a REMOVE of pages `[first, end)`, a dirty word at a time (its chunk touched first, as `mark_dirty`).
     /// Returns how many REMOTE pages it resolved.
     pub fn discard(&self, _removing: &RwLockWriteGuard<'_, ()>, mut first: usize, end: usize) -> usize {
-        let (end, mut resolved) = (end.min(self.len()), 0);
+        let (start, end, mut resolved) = (first, end.min(self.len()), 0);
         let claimed = |s| s == INFLIGHT || s == DISCARDED;
         while first < end {
             let word = end.min((first / 64 + 1) * 64);
             self.touch(first);
             for page in first..word {
                 let old = self.states[page].fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| Some(if claimed(s) { DISCARDED } else { ZERO }));
-                if !claimed(old.unwrap()) {
-                    self.forget_failure(page);
-                }
                 resolved += (old == Ok(REMOTE)) as usize;
             }
             self.dirty[first / 64].fetch_or((u64::MAX >> (64 - (word - first))) << (first % 64), Ordering::SeqCst);
             first = word;
+        }
+        if self.failing_len.load(Ordering::SeqCst) > 0 {
+            let mut failing = self.failing.lock().unwrap();
+            failing.retain(|(p, _)| !(start..end).contains(p) || self.get(*p) == DISCARDED);
+            self.failing_len.store(failing.len(), Ordering::SeqCst);
         }
         resolved
     }
