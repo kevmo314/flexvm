@@ -140,6 +140,36 @@ pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, ti
     session_on(action, id, offset, cmd, |line| request_on(s, line, timeout))
 }
 
+/// `request_on`, all of it (the reply's OK line read a byte at a time) by `at`, however slowly the guest trickles.
+pub fn request_by(s: UnixStream, line: &str, at: Instant) -> Result<BufReader<UnixStream>> {
+    By { s: &s, at }.write_all(format!("CONNECT {PORT}\n{line}\n").as_bytes())?;
+    let mut r = BufReader::new(s);
+    let (mut ok, mut byte) = (Vec::new(), [0]);
+    while ok.len() < 64 {
+        By { s: &mut r, at }.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        ok.push(byte[0]);
+    }
+    if !ok.starts_with(b"OK") {
+        return Err(lost(format!("vsock connect refused: {:?}", String::from_utf8_lossy(&ok))));
+    }
+    Ok(r)
+}
+
+/// An ATTACH of session `id` from `offset`: plain for an older agent (`claim` None); else with the host's claim
+/// number, as a `REJOIN` (refused once a newer claim attached) if `rejoin` (#1074).
+pub fn attach_line(id: &str, offset: u64, claim: Option<u64>, rejoin: bool) -> Result<String> {
+    if !valid_session_id(id) {
+        bail!("bad session id");
+    }
+    Ok(match claim {
+        None => format!("ATTACH {id} {offset}"),
+        Some(n) => format!("{} {id} {offset} {n}", if rejoin { "REJOIN" } else { "ATTACH" }),
+    })
+}
+
 /// `RELEASE`: closes session `id` only if it exited with `code` after `end` bytes (a late acknowledgement's, #1047).
 pub fn release(s: UnixStream, id: &str, end: u64, code: i32, timeout: Duration) -> Result<BufReader<UnixStream>> {
     if !valid_session_id(id) {
