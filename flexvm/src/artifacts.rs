@@ -1,6 +1,7 @@
 //! The prebuilt patched Firecracker and guest kernel: on first use, a missing `STATE/artifacts/firecracker` or
-//! `vmlinux` is downloaded from the release scripts/versions.sh names (`ARTIFACTS_TAG`), checked against the sha256
-//! scripts/checksums.sha256 pins for it (build.rs), and renamed into place. A file already there must match the pin,
+//! `vmlinux` is downloaded from the semver release scripts/versions.sh names (`ARTIFACTS_TAG`, e.g. `v0.1.0`),
+//! checked against the sha256 scripts/checksums.sha256 pins for it (build.rs), and renamed into place.
+//! A file already there must match the pin,
 //! and a VM process checks its Firecracker against it too (`check_pinned`).
 //! Only a build without a pin accepts a recorded file, built with the scripts or copied in for an offline host: `NAME.sha256`
 //! beside it holds the sha256 of a file the scripts built or verified (scripts/build-firecracker.sh and fetch.sh

@@ -1,6 +1,6 @@
 name: Release artifacts
 
-# Pushing an artifacts-N tag builds the patched Firecracker and re-hosts the pinned guest kernel as the
+# Pushing a semver tag (vMAJOR.MINOR.PATCH) builds the patched Firecracker and re-hosts the pinned guest kernel as the
 # release flexvm downloads from on first use. The tag must be ARTIFACTS_TAG in scripts/versions.sh at the
 # tagged commit. Afterwards, scripts/pin-artifacts.sh pins the assets' sha256 in scripts/checksums.sha256
 # (a follow-up commit) once their build provenance (attested here) verifies: from then on, flexvm builds
@@ -9,7 +9,7 @@ name: Release artifacts
 
 on:
   push:
-    tags: ["artifacts-*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
 permissions:
   contents: read
@@ -38,6 +38,10 @@ jobs:
 
       - name: Check the tag
         run: |
+          if ! [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tags must use vMAJOR.MINOR.PATCH, not $TAG"
+            exit 1
+          fi
           want=$(env -u ARTIFACTS_TAG bash -c 'source scripts/versions.sh; echo "$ARTIFACTS_TAG"')
           if [ "$TAG" != "$want" ]; then
             echo "::error::scripts/versions.sh at this commit names $want, not $TAG"

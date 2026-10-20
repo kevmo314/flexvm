@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The prebuilt artifacts release (ARTIFACTS_TAG in scripts/versions.sh, built by .github/workflows/release.yml).
+# The semver prebuilt artifacts release (vMAJOR.MINOR.PATCH; ARTIFACTS_TAG in scripts/versions.sh, built by .github/workflows/release.yml).
 # usage: pin-artifacts.sh            downloads the release's assets, verifies their build provenance (release.yml at
 #                                    the release's tag, whose commit must be in this checkout's history, attested by
 #                                    GitHub; needs gh), checks they were built from this checkout's inputs, and pins
@@ -19,6 +19,10 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
+if ! [[ $ARTIFACTS_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "ARTIFACTS_TAG must use vMAJOR.MINOR.PATCH (e.g. v0.1.0), not $ARTIFACTS_TAG" >&2
+  exit 1
+fi
 checksums=$root/scripts/checksums.sha256
 REPO=numerataz/flexvm
 ASSETS=(firecracker vmlinux inputs.txt)
