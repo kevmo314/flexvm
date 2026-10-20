@@ -688,11 +688,12 @@ impl Proc {
         // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app; `attaches`: -i and -t too.
         let result = json!({"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true, "attaches": true});
         send_json(&mut w, &json!({"ok": true, "result": result}))?;
-        let deadline = Instant::now() + match () {
-            _ if fault("short_incoming") => Duration::from_secs(2),
-            _ if fault("long_preflight") => LONG_PREFLIGHT,
-            _ => INCOMING_WAIT,
-        };
+        let deadline = Instant::now()
+            + match () {
+                _ if fault("short_incoming") => Duration::from_secs(2),
+                _ if fault("long_preflight") => LONG_PREFLIGHT,
+                _ => INCOMING_WAIT,
+            };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
         // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
