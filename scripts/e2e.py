@@ -1567,10 +1567,15 @@ def containers():
     moved = renamed + "-x"
     A.vms.add(moved)
     cli = [BIN, "--state", A.state_dir, "--run", A.run_dir, "exec"]
-    e = subprocess.Popen(cli + [renamed, "sh", "-c", "sleep 4; echo exec-done"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
-    time.sleep(1)
+    # Its command runs from before the rename until after the checkpoint (it ends once told), however long
+    # the CLI takes to start it.
+    must(A, renamed, "rm -f /tmp/exec-started /tmp/exec-go")
+    e = subprocess.Popen(cli + [renamed, "sh", "-c", "touch /tmp/exec-started; while [ ! -e /tmp/exec-go ]; do sleep 0.05; done; echo exec-done"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+    check("rename: the separate exec client's command runs", wait_for(lambda: must(A, renamed, "ls /tmp/exec-started 2>/dev/null || :") != "", 60))
     A.cli("rename", renamed, moved)
     A.cli("checkpoint", "create", moved)
+    must(A, moved, "touch /tmp/exec-go")
     out, err = e.communicate(timeout=120)
     check("rename: a separate exec client reattaches under the new name", e.returncode == 0 and out == "exec-done\n", (e.returncode, out, err[-500:]))
     # How many run (`must`: an exec that fails raises, never reads as none).
