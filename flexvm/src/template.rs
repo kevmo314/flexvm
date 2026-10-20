@@ -1112,6 +1112,7 @@ pub fn up_to_date(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: &
     }
     // Firecracker, the root filesystem and the snapshot files (rehashed if their stat changed).
     meta.verify(paths, &dir, &mut BTreeMap::new()).ok()?;
+    crate::image::note_rootfs(&paths.images, &meta.rootfs, &state_key(&std::fs::canonicalize(&paths.templates).ok()?)).ok()?;
     Some(meta.id)
 }
 
@@ -1308,6 +1309,7 @@ fn publish_generation(paths: &Paths, staged: &Path, how: i32, check_interrupt: i
     let l = templates_lock(paths, how)?;
     crate::util::sync_dir(staged)?;
     check_interrupt()?;
+    crate::image::note_rootfs(&paths.images, &meta.rootfs, &state_key(&std::fs::canonicalize(&paths.templates)?))?;
     match std::fs::rename(staged, gens.path.join(&meta.id)) {
         // An identical build published it already.
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) => {}
@@ -2238,7 +2240,11 @@ fn finish_remove_with(paths: &Paths, tombstone: &Path, rootfs_used: &Option<BTre
     if let Ok(meta) = Meta::read(tombstone) {
         let rootfs = meta.rootfs;
         let used = rootfs_used.as_ref().is_none_or(|u| u.contains(&rootfs));
-        match if used { crate::image::Removal::Absent } else { crate::image::remove_rootfs(&paths.images, &rootfs)? } {
+        match if used {
+            crate::image::Removal::Absent
+        } else {
+            crate::image::remove_rootfs(&paths.images, &rootfs, &state_key(&std::fs::canonicalize(&paths.templates)?))?
+        } {
             crate::image::Removal::Removed => removed = Some(rootfs),
             crate::image::Removal::Absent => {}
             crate::image::Removal::InUse => {
@@ -3192,14 +3198,21 @@ pub(crate) mod tests {
     #[test]
     fn pulling_again_rebuilds_only_what_changed() {
         let f = Fixture::new();
-        let rootfs = std::fs::canonicalize(&f.meta.rootfs).unwrap();
+        let cache = crate::test_util::TempDir::new("shared-images");
+        std::fs::create_dir(cache.join("rootfs")).unwrap();
+        let rootfs = cache.join("rootfs/a.ext4");
+        std::fs::copy(&f.meta.rootfs, &rootfs).unwrap();
+        std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
         let size = Size { vcpus: 2, mem_mib: 256, max_mib: 256 + 1024 + 100, plug_mib: 4096 };
         let mut meta =
             Meta { rootfs: rootfs.clone(), max_mib: 1280, plugged_mib: 1024, image: Some(image("sha256:a", "arg /x\n")), recipe: recipe(), ..f.meta.clone() };
         meta.identify(&f.paths, &f.dir).unwrap();
         publish_as(&f, "t", &meta);
         let img = image("sha256:a", "arg /x\n");
+        std::fs::remove_dir_all(rootfs.with_extension("users")).unwrap();
         assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), Some(meta.id.clone()));
+        let record = rootfs.with_extension("users").join(state_key(&std::fs::canonicalize(&f.paths.templates).unwrap()));
+        assert!(record.is_file(), "reusing a legacy entry records this state without rebuilding");
         assert_eq!(up_to_date(&f.paths, "other", size, &rootfs, &img), None);
         // A moved tag (another manifest), another app, other sizes or root filesystem.
         assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &image("sha256:b", "arg /x\n")), None);
@@ -3362,6 +3375,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rmi_tracks_rootfs_in_a_symlinked_cache_shared_by_two_states() {
+        let a = Fixture::new();
+        let b = Fixture::new();
+        let cache = crate::test_util::TempDir::new("shared-images");
+        std::fs::create_dir(cache.join("rootfs")).unwrap();
+        let rootfs = cache.join("rootfs/a.ext4");
+        for ext in ["ext4", "ok", "conf"] {
+            std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+        }
+        for f in [&a, &b] {
+            std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
+            publish_as(f, "t", &Meta { id: "aaaa1111".into(), rootfs: rootfs.clone(), ..f.meta.clone() });
+        }
+        assert_eq!(remove(&a.paths, Some("t"), "aaaa1111", &BTreeSet::new).unwrap()["rootfs"], Value::Null);
+        assert!(generation_ids(&a.paths.templates).is_empty());
+        let generation = Template::resolve(&b.paths, "t").unwrap();
+        assert_eq!(Meta::read(&generation).unwrap().rootfs, rootfs);
+        assert_eq!(std::fs::read(&rootfs).unwrap(), b"image");
+        assert_eq!(remove(&b.paths, Some("t"), "aaaa1111", &BTreeSet::new).unwrap()["rootfs"], json!(rootfs));
+        assert!(generation_ids(&b.paths.templates).is_empty());
+        // The last state removes the entry and its records.
+        for ext in ["ext4", "ok", "conf", "users"] {
+            assert!(!rootfs.with_extension(ext).exists());
+        }
+    }
+
+    #[test]
+    fn a_symlinked_cache_frees_rootfs_after_the_last_local_generation() {
+        for removal in ["rmi", "prune", "sweep"] {
+            let f = Fixture::new();
+            let cache = crate::test_util::TempDir::new("shared-images");
+            std::fs::create_dir(cache.join("rootfs")).unwrap();
+            let rootfs = cache.join("rootfs/a.ext4");
+            for ext in ["ext4", "ok", "conf"] {
+                std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+            }
+            std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
+            for (name, id) in [("t", "aaaa1111"), ("u", "bbbb2222")] {
+                publish_as(&f, name, &Meta { id: id.into(), rootfs: rootfs.clone(), ..f.meta.clone() });
+            }
+            let record = rootfs.with_extension("users").join(state_key(&std::fs::canonicalize(&f.paths.templates).unwrap()));
+            assert!(record.is_file());
+            remove(&f.paths, Some("t"), "aaaa1111", &BTreeSet::new).unwrap();
+            assert!(rootfs.exists() && record.exists(), "another local generation still uses it");
+            match removal {
+                "rmi" => {
+                    remove(&f.paths, Some("u"), "bbbb2222", &BTreeSet::new).unwrap();
+                }
+                "prune" => {
+                    std::fs::remove_file(f.paths.templates.join("u")).unwrap();
+                    assert_eq!(prune(&f.paths, None, &BTreeSet::new, false).unwrap().len(), 1);
+                }
+                _ => {
+                    std::fs::remove_file(f.paths.templates.join("u")).unwrap();
+                    let gens = f.paths.templates.join(GENERATIONS);
+                    std::fs::rename(gens.join("bbbb2222"), gens.join(".bbbb2222.rm-0000000000000001")).unwrap();
+                    sweep(&f.paths).unwrap();
+                    assert!(std::fs::read_dir(gens).unwrap().next().is_none());
+                }
+            }
+            for ext in ["ext4", "ok", "conf", "users"] {
+                assert!(!rootfs.with_extension(ext).exists(), "{removal}: {ext}");
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_handles_legacy_rootfs_without_records() {
+        for linked in [false, true] {
+            let f = Fixture::new();
+            let cache = crate::test_util::TempDir::new("shared-images");
+            if linked {
+                std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
+            }
+            let dir = if linked { cache.join("rootfs") } else { f.paths.images.join("rootfs") };
+            std::fs::create_dir_all(&dir).unwrap();
+            let rootfs = dir.join("a.ext4");
+            std::fs::write(&rootfs, b"image").unwrap();
+            let tombstone = f.paths.templates.join(GENERATIONS).join(".aaaa1111.rm-0000000000000001");
+            std::fs::create_dir_all(&tombstone).unwrap();
+            f.write_meta(&Meta { rootfs: rootfs.clone(), ..f.meta.clone() }, &tombstone);
+            sweep(&f.paths).unwrap();
+            assert!(!tombstone.exists());
+            assert_eq!(rootfs.exists(), linked);
+            assert!(!rootfs.with_extension("users").exists());
+        }
+    }
+
+    #[test]
     fn a_tombstone_sweep_cannot_remove_does_not_stop_builds() {
         use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();
@@ -3474,7 +3576,9 @@ pub(crate) mod tests {
     #[test]
     fn a_tombstone_waits_for_a_pull_holding_its_rootfs() {
         let f = Fixture::new();
-        let rootfs = f.paths.images.join("rootfs/a.ext4");
+        let cache = crate::test_util::TempDir::new("shared-images");
+        std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
+        let rootfs = cache.join("rootfs/a.ext4");
         std::fs::create_dir_all(rootfs.parent().unwrap()).unwrap();
         for ext in ["ext4", "ok", "conf"] {
             std::fs::write(rootfs.with_extension(ext), b"image").unwrap();

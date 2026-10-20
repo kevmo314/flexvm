@@ -59,7 +59,13 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   0600, owned by whoever pulled (root, or the user of a state of their
   own). Caches from older versions (0755 and 0644) are repaired as pulls
   reuse them. Ownership is never changed. A symlinked `STATE/images` works
-  (its target is the cache), but below it every directory is reached
+  (its target is the cache). Root filesystem users are recorded as empty
+  `rootfs/KEY.users/STATE-ID` files, keyed by a hash of the canonical templates
+  directory. Removal drops the local record after the last local generation,
+  and reclaims the entry when no records remain. Legacy entries without records
+  follow the local scan for a regular images directory; with a symlinked one
+  they are kept until pulls reuse them and record their states.
+  Below `STATE/images` every directory is reached
   without following symlinks, and a symlink there is left as it is, with
   nothing under it touched. A mode is changed
   only when it differs, because template stamps include the root
@@ -91,7 +97,8 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   are cached in `STATE/images/rootfs/` by image config digest, layer `diff_ids`,
   flexvm-init and overrides, and templates attach the cached file in place, so
   templates of one image share one copy in the page cache (it is never rewritten; `rmi`
-  removes it once no template uses it, and deleting it by hand breaks those
+  removes it once no recorded state uses it, subject to the legacy rule above;
+  deleting it by hand breaks those
   templates). Builds of the same cache key are serialized with
   a lock; entries are published with fsync and no-replace rename, with their
   `.ok` marker last. Every reuse also fsyncs the cache directory under the
