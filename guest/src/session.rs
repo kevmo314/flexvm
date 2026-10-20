@@ -1,7 +1,9 @@
 //! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ARGV <id> <len>` (its argv and options, NUL-separated fields), `ATTACH <id> <offset>`,
-//! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
+//! `CLOSE <id>`, `RELEASE <id> <end> <code>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
 //! After an exit, the client may send SESSION_DONE on the attachment, within `ACK_WAIT`, to release the
-//! session; without that acknowledgement the exit stays available for reattachment.
+//! session; without that acknowledgement the exit stays available for reattachment. A late one the host passes
+//! on as `RELEASE`, which closes only the session that exited with that code after `end` bytes: never a running
+//! one, nor one started under the id since (#1047).
 //! The command runs in a process group of its own; its exit is the shell's, recorded once output stops or
 //! `DRAIN` after the shell exits; background processes that keep its pipes open run on, their later output
 //! read and dropped (by one thread, for at most `MAX_DISCARDED` pipes: past that, a job's next write gets
@@ -448,9 +450,24 @@ impl Output {
 }
 
 pub enum Request<'a> {
-    Start { id: &'a str, len: usize, argv: bool },
-    Attach { id: &'a str, offset: u64 },
-    Close { id: &'a str },
+    Start {
+        id: &'a str,
+        len: usize,
+        argv: bool,
+    },
+    Attach {
+        id: &'a str,
+        offset: u64,
+    },
+    Close {
+        id: &'a str,
+    },
+    /// Closes the session if it exited with `code` after `end` bytes of output; any other is kept.
+    Release {
+        id: &'a str,
+        end: u64,
+        code: i32,
+    },
 }
 
 pub fn parse(line: &str) -> io::Result<Request<'_>> {
@@ -466,6 +483,10 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
         },
         ["ATTACH", _, offset] => Ok(Request::Attach { id, offset: offset.parse().map_err(|_| io::Error::other("bad offset"))? }),
         ["CLOSE", _] => Ok(Request::Close { id }),
+        ["RELEASE", _, end, code] => match (end.parse(), code.parse()) {
+            (Ok(end), Ok(code)) => Ok(Request::Release { id, end, code }),
+            _ => Err(io::Error::other("bad release")),
+        },
         _ => Err(io::Error::other("bad session request")),
     }
 }
@@ -702,6 +723,20 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 table.cancel(id);
             }
             table.close(id, Some(statuses));
+            return Ok(None);
+        }
+        Request::Release { id, end, code } => {
+            let mut table = sessions.lock().unwrap();
+            let Some(entry) = table.live.get(id) else { return Ok(None) };
+            let same = {
+                let o = entry.output.0.lock().unwrap();
+                o.exit == Some(code) && o.end == end
+            };
+            if !same {
+                return Err(io::Error::other("session kept: it is not the one that exited so"));
+            }
+            // Exited: its shell is reaped, there is nothing to kill.
+            table.close(id, None);
             return Ok(None);
         }
     }))
@@ -1936,12 +1971,47 @@ mod tests {
         assert_eq!(writer.1, 2);
     }
 
+    /// #1047: a late acknowledgement's RELEASE closes only the session that exited so; a running one, one
+    /// with another exit, and one never known are kept (nothing cancelled, nothing killed).
+    #[test]
+    fn release_closes_only_the_exit_it_names() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        {
+            let mut table = sessions.lock().unwrap();
+            let done = finished(&mut table, "done", None);
+            done.0.lock().unwrap().end = 5;
+            live(&mut table, "running", Output::default());
+        }
+        for line in ["RELEASE done 4 0", "RELEASE done 5 1", "RELEASE running 0 0"] {
+            assert!(request(&sessions, &statuses, line, b"").ends_with(b"session kept: it is not the one that exited so"), "{line}");
+        }
+        assert!(request(&sessions, &statuses, "RELEASE nope 0 0", b"").ends_with(b"closed"));
+        assert!(request(&sessions, &statuses, "RELEASE done 5 0", b"").ends_with(b"closed"));
+        let table = sessions.lock().unwrap();
+        assert!(!table.live.contains_key("done") && table.closed.contains_key("done"));
+        assert!(table.live.contains_key("running") && !table.ended("nope"));
+    }
+
     #[test]
     fn requests() {
         assert!(matches!(parse("SESSION abc 3\n").unwrap(), Request::Start { id: "abc", len: 3, argv: false }));
         assert!(matches!(parse("ATTACH abc 42").unwrap(), Request::Attach { offset: 42, .. }));
         assert!(matches!(parse("CLOSE abc").unwrap(), Request::Close { .. }));
-        for bad in ["SESSION 3", "SESSION abc -1", "SESSION abc 1048577", "ATTACH abc -1", "ATTACH abc 1 extra", "CLOSE", "CLOSE a/b", "EXEC 3"] {
+        assert!(matches!(parse("RELEASE abc 7 -1").unwrap(), Request::Release { id: "abc", end: 7, code: -1 }));
+        for bad in [
+            "RELEASE abc",
+            "RELEASE abc 7",
+            "RELEASE abc x 0",
+            "RELEASE abc 7 x",
+            "SESSION 3",
+            "SESSION abc -1",
+            "SESSION abc 1048577",
+            "ATTACH abc -1",
+            "ATTACH abc 1 extra",
+            "CLOSE",
+            "CLOSE a/b",
+            "EXEC 3",
+        ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
     }

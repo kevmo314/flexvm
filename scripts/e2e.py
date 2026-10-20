@@ -60,7 +60,7 @@ p.add_argument("--image-cache", help="keep the pulled image here as an OCI layou
 # copy-on-write exactness, growth and a checkpoint during a resize (on a template with little
 # pre-plugged), held packets and devices, signals, standby VMs, resume failures, admission, the
 # exit statuses of foreground runs and image apps' logs.
-FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background exec_burst exec_stalled_cap exec_pause_grace "
+FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background exec_burst exec_stalled_cap exec_pause_grace exec_ckpt_stalled "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_rescue_fail cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare forged_vmstate slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded signals suspend_gen standby standby_vm_ips restore_ip_peer loan_start_retry spoof_filter killed_migrated "
@@ -2567,7 +2567,7 @@ def worker():
 # Unlisted ones count as 2 s.
 COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/plug_race": 45, "faults/guest_hang": 44,
-        "faults/exec_pause_grace": 42, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
+        "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
         "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,

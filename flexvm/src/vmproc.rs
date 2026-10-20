@@ -41,37 +41,149 @@ const APP_LOG_SILENCE: Duration = Duration::from_secs(15);
 /// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
 /// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session: it
 /// comes once the client wrote all output out, so it is waited for from when the client has read the exit.
-/// True: it may have come too late for the guest, which the caller then tells with a CLOSE (harmless for
-/// an exited session). Timing on this side cannot tell for sure: once the relay waited on the client, the
-/// exit may have sat behind output in vsock's buffers, the guest's wait already running.
+/// Some(exit, its offset and code): it may have come too late for the guest, which the caller then tells
+/// with a RELEASE of that exit (a no-op for any other session). Timing on this side cannot tell for sure: once
+/// the relay waited on the client, the exit may have sat behind output in vsock's buffers, the guest's wait
+/// already running. SIOCOUTQ tells when the client took the exit: the CLI reads no further ahead than a frame
+/// header (`exec_stream`), so it has written out all that came before (#1047).
 /// A refusal for want of guest session slots, which comes as a message frame, is noted (`REFUSED`).
 /// `both`: the client's input goes to the guest as well (`relay_input`), which ends the stream itself.
-fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut &UnixStream, wait: &Wait, both: bool) -> Result<bool> {
-    let mut waited = false;
-    while let Some((kind, data)) = guest::read_frame(guest)? {
+/// `rejoin` (an exec's plain relay): a checkpoint's cut (`Wait::cut`) does not end it. What the cut
+/// connection still holds is taken, and the session attached again from there while the client may still be
+/// stalled, so the guest keeps holding its output for it (#1016).
+fn relay_session<G: Read + Write>(
+    guest: &mut BufReader<G>,
+    client: &mut &UnixStream,
+    wait: &Wait,
+    both: bool,
+    rejoin: Option<&Rejoin<G>>,
+) -> Result<Option<(u64, i32)>> {
+    let (mut waited, mut echoed) = (false, false);
+    // Frames read from a cut connection, and the offset after the output read so far.
+    let (mut pending, mut next) = (std::collections::VecDeque::new(), rejoin.map_or(0, |r| r.from));
+    loop {
+        let frame = match pending.pop_front() {
+            Some(frame) => frame,
+            None => match guest::read_frame(guest) {
+                Ok(Some(frame)) => frame,
+                // Cut while it was read (a partial frame is read again).
+                end if echoed && rejoin.is_some() && (wait.cut)() => {
+                    drop(end);
+                    rejoin_guest(guest, client, wait, rejoin.unwrap(), next)?;
+                    continue;
+                }
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            },
+        };
+        let (kind, data) = frame;
         let at = Instant::now();
         match kind {
             guest::FRAME_EXIT => (wait.exited)(),
+            guest::FRAME_MSG if rejoin.is_some_and(|r| data == r.id.as_bytes()) => echoed = true,
             guest::FRAME_MSG if guest::at_session_cap(&String::from_utf8_lossy(&data)) => *REFUSED.lock().unwrap() = Some(Instant::now()),
+            guest::FRAME_STDOUT | guest::FRAME_STDERR => next = next.max(output_end(&data)),
             _ => {}
         }
-        waited |= relay_output(client, &guest::frame(kind, &[&data]), wait)?;
-        if kind == guest::FRAME_EXIT && !both {
-            drained(client, wait)?;
-            let mut ack = [0];
-            if (crate::util::By { s: client, at: Instant::now() + ACK_WAIT }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
-                let passed = guest.get_mut().write_all(&ack).is_ok();
-                return Ok(!passed || waited || at.elapsed() >= GUEST_ACK_WAIT / 2);
+        let bytes = guest::frame(kind, &[&data]);
+        let mut sent = 0;
+        loop {
+            match relay_output(client, &bytes[sent..], wait)? {
+                Sent::All { waited: w } => break waited |= w,
+                Sent::Cut { sent: n, waited: w } => {
+                    (sent, waited) = (sent + n, waited | w);
+                    let Some(rejoin) = rejoin.filter(|_| echoed) else { bail!("the guest's connection was cut") };
+                    // Queued before the cut, it is still there to read; then the guest has the rest.
+                    while let Ok(Some(frame)) = guest::read_frame(guest) {
+                        if matches!(frame.0, guest::FRAME_STDOUT | guest::FRAME_STDERR) {
+                            next = next.max(output_end(&frame.1));
+                        }
+                        pending.push_back(frame);
+                    }
+                    match pending.iter().any(|(kind, _)| *kind == guest::FRAME_EXIT) {
+                        false => rejoin_guest(guest, client, wait, rejoin, next)?,
+                        // All there is to send is here: nothing more to watch.
+                        true => wait.guest.set(-1),
+                    }
+                }
             }
-            break;
+        }
+        if kind == guest::FRAME_EXIT && !both {
+            let exit = (data.len() == 12).then(|| (u64::from_le_bytes(data[..8].try_into().unwrap()), i32::from_le_bytes(data[8..].try_into().unwrap())));
+            if !drained(client, wait)? {
+                return Ok(None);
+            }
+            let mut ack = [0];
+            let late = match (crate::util::By { s: client, at: Instant::now() + ACK_WAIT }).read_exact(&mut ack) {
+                Ok(()) if ack[0] == guest::SESSION_DONE => {
+                    let passed = guest.get_mut().write_all(&ack).is_ok();
+                    !passed || waited || at.elapsed() >= GUEST_ACK_WAIT / 2
+                }
+                _ => false,
+            };
+            return Ok(exit.filter(|_| late));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// Where an output frame's bytes end in the session's stream.
+fn output_end(data: &[u8]) -> u64 {
+    data.get(..8).map_or(0, |o| u64::from_le_bytes(o.try_into().unwrap()) + (data.len() - 8) as u64)
+}
+
+/// An exec's way back to its session after a checkpoint cut its connection.
+struct Rejoin<'a, G> {
+    id: &'a str,
+    /// The offset the relay's request started at.
+    from: u64,
+    /// Attaches again from the offset, its id echo read: None while the VM cannot be reached yet (a checkpoint
+    /// still being taken, a pause); the connection, and its fd to watch for hangups.
+    attach: &'a dyn Fn(u64) -> Result<Option<(BufReader<G>, std::os::fd::RawFd)>>,
+}
+
+/// How long attaching again may fail for other reasons (the VM gone) before the relay ends.
+const REJOIN_GIVE_UP: Duration = Duration::from_secs(5);
+
+/// Until `guest` is the session's attachment again, from `at`; the client's hangup ends it, as does slot
+/// pressure (a VM left paused, say: the client then attaches again itself once it reads).
+fn rejoin_guest<G>(guest: &mut BufReader<G>, client: &UnixStream, wait: &Wait, rejoin: &Rejoin<G>, at: u64) -> Result<()> {
+    let mut failing = None;
+    loop {
+        match (rejoin.attach)(at) {
+            Ok(Some((g, fd))) => {
+                *guest = g;
+                wait.guest.set(fd);
+                return Ok(());
+            }
+            Ok(None) => failing = None,
+            Err(e) if failing.get_or_insert_with(Instant::now).elapsed() >= REJOIN_GIVE_UP => {
+                bail!("the guest's connection was cut, and attaching again failed: {e}")
+            }
+            Err(_) => {}
+        }
+        let mut pfd = libc::pollfd { fd: client.as_raw_fd(), events: 0, revents: 0 };
+        crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, 200) })?;
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 || read_side_gone(client) {
+            bail!("the client hung up");
+        }
+        if (wait.pressed)() {
+            bail!("the guest's connection was cut, and slots run short");
+        }
+    }
+}
+
+/// A client that shut down only its read side is not reported by poll (it may even have room to write
+/// into): an empty send tells (EPIPE), as one does once it has gone altogether.
+fn read_side_gone(client: &UnixStream) -> bool {
+    let sent = unsafe { libc::send(client.as_raw_fd(), [0u8; 0].as_ptr().cast(), 0, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    sent < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
 }
 
 /// Until the client has read all that was sent it (SIOCOUTQ is 0) or hung up (what it read before is not
 /// known: the acknowledgement's read then ends at once); a stall under pressure fails it, as in `relay_output`.
-fn drained(client: &UnixStream, wait: &Wait) -> Result<()> {
+/// False: it can no longer read, so acknowledges nothing.
+fn drained(client: &UnixStream, wait: &Wait) -> Result<bool> {
     let (mut since, mut left) = (Instant::now(), libc::c_int::MAX);
     loop {
         let mut unread: libc::c_int = 0;
@@ -79,7 +191,7 @@ fn drained(client: &UnixStream, wait: &Wait) -> Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
         if unread == 0 {
-            return Ok(());
+            return Ok(true);
         }
         if unread < left {
             (since, left) = (Instant::now(), unread);
@@ -91,37 +203,50 @@ fn drained(client: &UnixStream, wait: &Wait) -> Result<()> {
         let mut pfd = libc::pollfd { fd: client.as_raw_fd(), events: 0, revents: 0 };
         crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, 20) })?;
         if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            return Ok(());
+            return Ok(true);
+        }
+        if read_side_gone(client) {
+            return Ok(false);
         }
     }
 }
 
 /// What ends a relay waiting on a client that takes no output, besides its hangup: a stall of `stall`
-/// while `pressed()` (slots run short: `exec_pressure`, `session_pressure`), or `guest` (-1: none) hanging up with `cut()` true (its VM
-/// pausing: `Vm::save_state` shut it down; the client reattaches). A guest that hangs up on its own
-/// still has its last frames delivered (an exit, say, that the slow client takes past `ACK_WAIT`)
-/// unless a cut comes after.
+/// while `pressed()` (slots run short: `exec_pressure`, `session_pressure`), `guest` (-1: none) hanging up with
+/// `cut()` true (its VM pausing: `Vm::save_state` shut it down; the client, or `Rejoin`, attaches again), or with
+/// `replaced()` true (another client attached to the session, which the guest then serves alone). A guest that
+/// hangs up on its own still has its last frames delivered (an exit, say, that the slow client takes past
+/// `ACK_WAIT`) unless a cut comes after.
 struct Wait<'a> {
     stall: Duration,
     pressed: &'a dyn Fn() -> bool,
-    guest: std::os::fd::RawFd,
+    guest: std::cell::Cell<std::os::fd::RawFd>,
     cut: &'a dyn Fn() -> bool,
+    replaced: &'a dyn Fn() -> bool,
     /// Called on the exit frame: the guest stops counting the session towards `MAX_LIVE` once it sent it.
     exited: &'a dyn Fn(),
     /// Counts the polls (tests: proof the relay is waiting).
     polls: Option<&'a AtomicUsize>,
 }
 
-/// Preserves partial writes and waits for a slow reader; only slot pressure or a cut makes a stall fatal.
-/// True: it waited for the client.
-fn relay_output(client: &UnixStream, mut bytes: &[u8], wait: &Wait) -> Result<bool> {
-    let (mut since, mut guest, mut waited) = (Instant::now(), wait.guest, false);
-    while !bytes.is_empty() {
+#[derive(Debug)]
+enum Sent {
+    /// Whether it waited for the client.
+    All { waited: bool },
+    /// The guest's connection was cut after `sent` bytes went out.
+    Cut { sent: usize, waited: bool },
+}
+
+/// Preserves partial writes and waits for a slow reader; only slot pressure makes a stall fatal.
+fn relay_output(client: &UnixStream, bytes: &[u8], wait: &Wait) -> Result<Sent> {
+    let (mut since, mut guest, mut waited, mut sent) = (Instant::now(), wait.guest.get(), false, 0);
+    while sent < bytes.len() {
         // Per-send nonblocking: relay_input shares this socket and must keep blocking reads.
-        match crate::util::eintr(|| unsafe { libc::send(client.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) }) {
+        let rest = &bytes[sent..];
+        match crate::util::eintr(|| unsafe { libc::send(client.as_raw_fd(), rest.as_ptr().cast(), rest.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) }) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
             Ok(n) => {
-                bytes = &bytes[n as usize..];
+                sent += n as usize;
                 since = Instant::now();
                 continue;
             }
@@ -132,12 +257,11 @@ fn relay_output(client: &UnixStream, mut bytes: &[u8], wait: &Wait) -> Result<bo
         if stalled >= wait.stall && (wait.pressed)() {
             bail!("the client took no output for {} s", stalled.as_secs());
         }
-        // Past its deadline, a stalled client is looked at again each second, in case slots run short.
-        let left = wait.stall.checked_sub(stalled).filter(|d| !d.is_zero()).unwrap_or(wait.stall.min(Duration::from_secs(1)));
-        // A guest that hung up on its own stays checked for a cut each second (a checkpoint after it).
-        let hung = guest < 0 && wait.guest >= 0;
-        let left = if hung { left.min(Duration::from_secs(1)) } else { left };
-        let left = left.as_millis().max(1).min(i32::MAX as u128) as i32;
+        // Looked at again each second: slots may run short past its deadline, its read side may go (not
+        // polled for), and a guest that hung up on its own stays checked for a cut (a checkpoint after it).
+        let left = wait.stall.checked_sub(stalled).filter(|d| !d.is_zero()).unwrap_or(wait.stall).min(Duration::from_secs(1));
+        let left = left.as_millis().max(1) as i32;
+        let hung = guest < 0 && wait.guest.get() >= 0;
         // A negative fd is skipped; hangups are reported whatever the events.
         let mut pfds =
             [libc::pollfd { fd: client.as_raw_fd(), events: libc::POLLOUT, revents: 0 }, libc::pollfd { fd: guest, events: libc::POLLRDHUP, revents: 0 }];
@@ -145,17 +269,20 @@ fn relay_output(client: &UnixStream, mut bytes: &[u8], wait: &Wait) -> Result<bo
             polls.fetch_add(1, Ordering::SeqCst);
         }
         crate::util::eintr(|| unsafe { libc::poll(pfds.as_mut_ptr(), 2, left) })?;
-        if pfds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        if pfds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 || read_side_gone(client) {
             bail!("the client hung up");
         }
         if pfds[1].revents != 0 || hung {
             if (wait.cut)() {
-                bail!("the guest's connection was cut");
+                return Ok(Sent::Cut { sent, waited });
+            }
+            if (wait.replaced)() {
+                bail!("another client attached to the session");
             }
             guest = -1;
         }
     }
-    Ok(waited)
+    Ok(Sent::All { waited })
 }
 
 /// Copies the client's input frames (and a session's SESSION_DONE) to the guest while `relay` relays its
@@ -171,6 +298,67 @@ fn relay_input<T>(guest: UnixStream, client: &UnixStream, relay: impl FnOnce() -
     let _ = (client.shutdown(std::net::Shutdown::Both), guest.shutdown(std::net::Shutdown::Both));
     let _ = copier.join();
     res
+}
+
+/// Each exec session's newest relay: a client attaching again (or another client on its id) takes the session
+/// over, as the guest does, and an older relay still waiting on its client ends rather than hold it (#1016).
+static CLAIMS: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
+static CLAIMED: AtomicU64 = AtomicU64::new(0);
+
+struct Claim {
+    session: String,
+    n: u64,
+}
+
+impl Claim {
+    fn new(session: &str) -> Claim {
+        let n = CLAIMED.fetch_add(1, Ordering::SeqCst) + 1;
+        CLAIMS.lock().unwrap().insert(session.to_string(), n);
+        Claim { session: session.to_string(), n }
+    }
+
+    fn current(&self) -> bool {
+        CLAIMS.lock().unwrap().get(&self.session) == Some(&self.n)
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut claims = CLAIMS.lock().unwrap();
+        if claims.get(&self.session) == Some(&self.n) {
+            claims.remove(&self.session);
+        }
+    }
+}
+
+/// After a late acknowledgement: `RELEASE`, which closes the session only if it is the one that exited with
+/// `code` after `end` bytes, never another under its id since (#1047); an agent without it is sent the CLOSE it
+/// was before. Tried again for a while as a checkpoint turns it away.
+fn release(vm: &Vm, session: &str, end: u64, code: i32) {
+    let ask = |verb: &str| {
+        vm.exec(|s| match verb {
+            "release" => guest::release(s, session, end, code, guest::TIMEOUT),
+            _ => guest::session(s, "close", session, 0, "", guest::TIMEOUT),
+        })
+        .and_then(|(mut g, id)| {
+            let reply = guest::read_frame(&mut crate::util::By { s: &mut g, at: Instant::now() + Duration::from_secs(2) });
+            vm.untrack_exec(id);
+            Ok(reply?.map(|(_, m)| String::from_utf8_lossy(&m).into_owned()).unwrap_or_default())
+        })
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    let reply = loop {
+        match ask("release") {
+            Err(e) if guest::transient(&e.to_string()) && Instant::now() < until => thread::sleep(Duration::from_millis(200)),
+            Ok(m) if m.starts_with("unknown request") => break ask("close"),
+            r => break r,
+        }
+    };
+    match reply {
+        Ok(m) if m == "closed" => {}
+        Ok(m) => crate::log!("vm {}: releasing session {session} after its late acknowledgement: {m}", vm.name),
+        Err(e) => crate::log!("vm {}: releasing session {session} after its late acknowledgement: {e}", vm.name),
+    }
 }
 
 /// A VM process's own exit statuses (`run -- CMD` passes CMD's through):
@@ -1670,6 +1858,9 @@ impl Proc {
         let vm = self.vm();
         let action = req["action"].as_str().unwrap_or("start");
         let action = if action == "start" && req["cmd"].is_object() { "argv" } else { action };
+        let session = req["session"].as_str().unwrap_or_default();
+        // The guest serves the newest attachment only: an older relay waiting for its client gives way.
+        let claim = (action != "close").then(|| Claim::new(session));
         let started = vm.exec(|s| {
             let cmd = if matches!(action, "start" | "argv") { guest::command_body(&req["cmd"])? } else { String::new() };
             let id = req["session"].as_str().ok_or("missing session id")?;
@@ -1685,7 +1876,8 @@ impl Proc {
                 return;
             }
         };
-        let late = (|| -> Result<bool> {
+        let track = std::cell::Cell::new(id);
+        let late = (|| -> Result<Option<(u64, i32)>> {
             if req["action"] == "close" {
                 let reply = guest::read_frame(&mut crate::util::By { s: &mut g, at: Instant::now() + Duration::from_secs(2) })?
                     .map(|(_, m)| String::from_utf8_lossy(&m).into_owned());
@@ -1696,33 +1888,51 @@ impl Proc {
                         r => json!({"ok": false, "error": format!("session close failed: {}", r.unwrap_or_default())}),
                     },
                 )?;
-                return Ok(false);
+                return Ok(None);
             }
             let relaying = std::cell::Cell::new(Slot::take(&EXECS, usize::MAX));
             // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             send_json(&mut w, &json!({"ok": true}))?;
             let exited = || drop(relaying.take());
-            let wait =
-                Wait { stall: CLIENT_STALL, pressed: &exec_pressure, guest: g.get_ref().as_raw_fd(), cut: &|| !vm.tracked(id), exited: &exited, polls: None };
+            let (cut, replaced) = (|| !vm.tracked(track.get()), || claim.as_ref().is_some_and(|c| !c.current()));
+            // After a checkpoint: once the VM runs again, attached again in place of the cut connection.
+            let attach = |at: u64| -> Result<Option<(BufReader<UnixStream>, std::os::fd::RawFd)>> {
+                let (mut g, id) = match vm.exec(|s| guest::session(s, "attach", session, at, "", guest::TIMEOUT)) {
+                    Ok(g) => g,
+                    Err(e) if guest::transient(&e.to_string()) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                vm.untrack_exec(track.replace(id));
+                g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
+                match guest::read_frame(&mut g)? {
+                    Some((guest::FRAME_MSG, m)) if m == session.as_bytes() => {
+                        let fd = g.get_ref().as_raw_fd();
+                        Ok(Some((g, fd)))
+                    }
+                    other => bail!("attaching again: {:?}", other.map(|(kind, m)| (kind, String::from_utf8_lossy(&m).into_owned()))),
+                }
+            };
+            let from = if action == "attach" { req["offset"].as_u64().unwrap_or(0) } else { 0 };
+            let rejoin = Rejoin { id: session, from, attach: &attach };
+            let wait = Wait {
+                stall: CLIENT_STALL,
+                pressed: &exec_pressure,
+                guest: std::cell::Cell::new(g.get_ref().as_raw_fd()),
+                cut: &cut,
+                replaced: &replaced,
+                exited: &exited,
+                polls: None,
+            };
             match req["interactive"] == true {
-                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, &wait, true)),
-                false => relay_session(&mut g, &mut w, &wait, false),
+                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, &wait, true, None)),
+                false => relay_session(&mut g, &mut w, &wait, false, Some(&rejoin)),
             }
         })();
-        vm.untrack_exec(id);
+        vm.untrack_exec(track.get());
         // The guest may have given up waiting for the acknowledgement: the session is released as its client would close it.
-        if matches!(late, Ok(true)) {
-            if let Some(session) = req["session"].as_str() {
-                let closed = vm.exec(|s| guest::session(s, "close", session, 0, "", guest::TIMEOUT)).and_then(|(mut g, id)| {
-                    let reply = guest::read_frame(&mut crate::util::By { s: &mut g, at: Instant::now() + Duration::from_secs(2) });
-                    vm.untrack_exec(id);
-                    reply
-                });
-                if let Err(e) = closed {
-                    crate::log!("vm {}: releasing session {session} after its late acknowledgement: {e}", vm.name);
-                }
-            }
+        if let Ok(Some((end, code))) = late {
+            release(vm, session, end, code);
         }
     }
 
@@ -1753,11 +1963,18 @@ impl Proc {
             // The app's log keeps alive every 5 s; its input says nothing until it takes some.
             g.get_ref().set_read_timeout((!input).then_some(Duration::from_secs(15)))?;
             send_json(&mut w, &json!({"ok": true}))?;
-            let wait =
-                Wait { stall: CLIENT_STALL, pressed: &session_pressure, guest: g.get_ref().as_raw_fd(), cut: &|| !vm.tracked(id), exited: &|| (), polls: None };
+            let wait = Wait {
+                stall: CLIENT_STALL,
+                pressed: &session_pressure,
+                guest: std::cell::Cell::new(g.get_ref().as_raw_fd()),
+                cut: &|| !vm.tracked(id),
+                replaced: &|| false,
+                exited: &|| (),
+                polls: None,
+            };
             match input {
-                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, &wait, true)),
-                false => relay_session(&mut g, &mut w, &wait, true),
+                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, &wait, true, None)),
+                false => relay_session(&mut g, &mut w, &wait, true, None),
             }
             .map(drop)
         })();
@@ -5259,7 +5476,7 @@ mod session_relay_tests {
 
     /// No slot pressure.
     fn idle() -> Wait<'static> {
-        Wait { stall: CLIENT_STALL, pressed: &never, guest: -1, cut: &never, exited: &|| (), polls: None }
+        Wait { stall: CLIENT_STALL, pressed: &never, guest: std::cell::Cell::new(-1), cut: &never, replaced: &never, exited: &|| (), polls: None }
     }
 
     /// Until `count` reaches `n`: the relay entered its poll that often.
@@ -5297,12 +5514,12 @@ mod session_relay_tests {
             client.write_all(&ack).unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
             // The acknowledgement is waited for once the client has read the exit.
-            let worker = thread::spawn(move || relay_session(&mut guest, &mut &relay, &idle(), false).map(|late| (late, guest.into_inner().output)));
+            let worker = thread::spawn(move || relay_session(&mut guest, &mut &relay, &idle(), false, None).map(|late| (late, guest.into_inner().output)));
             let mut got = vec![0; exit.len()];
             client.read_exact(&mut got).unwrap();
             assert_eq!(got, exit);
             let (late, output) = worker.join_within().unwrap().unwrap();
-            assert!(!late);
+            assert!(late.is_none());
             assert_eq!(output, if ack == [guest::SESSION_DONE] { ack } else { vec![] });
         }
     }
@@ -5316,7 +5533,7 @@ mod session_relay_tests {
         let mut guest = BufReader::new(Duplex { input: Cursor::new(exit.clone()), output: Vec::new() });
         let (relay, mut client) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
-        let worker = thread::spawn(move || relay_session(&mut guest, &mut &relay, &idle(), false).map(|late| (late, guest.into_inner().output)));
+        let worker = thread::spawn(move || relay_session(&mut guest, &mut &relay, &idle(), false, None).map(|late| (late, guest.into_inner().output)));
         // Longer than ACK_WAIT before the client reads the exit at all.
         thread::sleep(ACK_WAIT + Duration::from_millis(500));
         assert!(!worker.is_finished(), "the relay stopped waiting for a connected reader");
@@ -5324,7 +5541,7 @@ mod session_relay_tests {
         client.read_exact(&mut got).unwrap();
         assert_eq!(got, exit);
         client.write_all(&[guest::SESSION_DONE]).unwrap();
-        assert_eq!(worker.join_within().unwrap().unwrap(), (true, vec![guest::SESSION_DONE]));
+        assert_eq!(worker.join_within().unwrap().unwrap(), (Some((2, 0)), vec![guest::SESSION_DONE]));
     }
 
     #[test]
@@ -5332,12 +5549,12 @@ mod session_relay_tests {
         let exit = guest::frame(guest::FRAME_EXIT, &[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()]);
         let mut guest = BufReader::new(Duplex { input: Cursor::new(exit), output: Vec::new() });
         let (relay, client) = UnixStream::pair().unwrap();
-        let worker = thread::spawn(move || relay_session(&mut guest, &mut &relay, &idle(), false).map(|late| (late, guest.into_inner().output)));
+        let worker = thread::spawn(move || relay_session(&mut guest, &mut &relay, &idle(), false, None).map(|late| (late, guest.into_inner().output)));
         thread::sleep(Duration::from_millis(100));
         assert!(!worker.is_finished());
         let t = Instant::now();
         drop(client);
-        assert_eq!(worker.join_within().unwrap().unwrap(), (false, vec![]));
+        assert_eq!(worker.join_within().unwrap().unwrap(), (None, vec![]));
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     }
 
@@ -5368,7 +5585,7 @@ mod session_relay_tests {
             let _ = wait.recv_timeout(WAIT);
         });
         let t = Instant::now();
-        relay_session(&mut guest, &mut &relay, &idle(), false).unwrap();
+        assert!(relay_session(&mut guest, &mut &relay, &idle(), false, None).unwrap().is_none());
         assert!(t.elapsed() < Duration::from_secs(4), "the relay waited {:?}", t.elapsed());
         drop(release);
         assert!(guest.get_ref().output.is_empty());
@@ -5401,8 +5618,16 @@ mod session_relay_tests {
         let p = polls.clone();
         let worker = thread::spawn(move || {
             let fd = relay_end.as_raw_fd();
-            let wait = Wait { stall: Duration::from_millis(20), pressed: &never, guest: fd, cut: &never, exited: &|| (), polls: Some(&p) };
-            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false)
+            let wait = Wait {
+                stall: Duration::from_millis(20),
+                pressed: &never,
+                guest: std::cell::Cell::new(fd),
+                cut: &never,
+                replaced: &never,
+                exited: &|| (),
+                polls: Some(&p),
+            };
+            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false, None)
         });
         // Each poll past the first waited out a stall deadline: unread through several of them.
         reach(&polls, 6);
@@ -5417,7 +5642,7 @@ mod session_relay_tests {
         assert_eq!(guest::read_frame(&mut client).unwrap(), Some((guest::FRAME_EXIT, [&(TOTAL as u64).to_le_bytes()[..], &0i32.to_le_bytes()].concat())));
         client.get_mut().write_all(&[guest::SESSION_DONE]).unwrap();
         // Prompt, but the exit may have waited behind the output past the guest's own wait: a CLOSE follows.
-        assert!(worker.join_within().unwrap().unwrap());
+        assert_eq!(worker.join_within().unwrap().unwrap(), Some((TOTAL as u64, 0)));
         writer.join_within().unwrap();
     }
 
@@ -5429,7 +5654,7 @@ mod session_relay_tests {
         let mut guest = BufReader::new(Duplex { input: Cursor::new(guest::frame(guest::FRAME_MSG, &[refusal.as_bytes()])), output: Vec::new() });
         let (relay, mut client) = UnixStream::pair().unwrap();
         let t = Instant::now();
-        assert!(!relay_session(&mut guest, &mut &relay, &idle(), false).unwrap());
+        assert!(relay_session(&mut guest, &mut &relay, &idle(), false, None).unwrap().is_none());
         drop(relay);
         let mut got = Vec::new();
         client.read_to_end(&mut got).unwrap();
@@ -5446,11 +5671,11 @@ mod session_relay_tests {
         drop(agent);
         let (relay, mut client) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
-        let worker = thread::spawn(move || relay_session(&mut BufReader::new(relay_end), &mut &relay, &idle(), false));
+        let worker = thread::spawn(move || relay_session(&mut BufReader::new(relay_end), &mut &relay, &idle(), false, None));
         let mut exit = [0; 5 + 12];
         client.read_exact(&mut exit).unwrap();
         client.write_all(&[guest::SESSION_DONE]).unwrap();
-        assert!(worker.join_within().unwrap().unwrap());
+        assert_eq!(worker.join_within().unwrap().unwrap(), Some((0, 0)));
     }
 
     #[test]
@@ -5461,7 +5686,15 @@ mod session_relay_tests {
         let (on, p) = (pressed.clone(), polls.clone());
         let worker = thread::spawn(move || {
             let pressed = || on.load(Ordering::SeqCst);
-            let wait = Wait { stall: Duration::from_millis(20), pressed: &pressed, guest: -1, cut: &never, exited: &|| (), polls: Some(&p) };
+            let wait = Wait {
+                stall: Duration::from_millis(20),
+                pressed: &pressed,
+                guest: std::cell::Cell::new(-1),
+                cut: &never,
+                replaced: &never,
+                exited: &|| (),
+                polls: Some(&p),
+            };
             relay_output(&relay, &vec![b'x'; 8 * 1024 * 1024], &wait)
         });
         // Past its deadline (the second poll comes after it) without pressure, it stays.
@@ -5505,10 +5738,10 @@ mod session_relay_tests {
                 let copy = relay_end.try_clone()?;
                 let mut g = BufReader::new(relay_end);
                 let is_cut = || c.load(Ordering::SeqCst);
-                let wait = Wait { guest: fd, cut: &is_cut, polls: Some(&p), ..idle() };
+                let wait = Wait { guest: std::cell::Cell::new(fd), cut: &is_cut, polls: Some(&p), ..idle() };
                 match both {
-                    true => relay_input(copy, &relay, || relay_session(&mut g, &mut &relay, &wait, true)),
-                    false => relay_session(&mut g, &mut &relay, &wait, false),
+                    true => relay_input(copy, &relay, || relay_session(&mut g, &mut &relay, &wait, true, None)),
+                    false => relay_session(&mut g, &mut &relay, &wait, false, None),
                 }
             });
             reach(&polls, 1);
@@ -5543,8 +5776,8 @@ mod session_relay_tests {
                 c.fetch_add(1, Ordering::SeqCst);
                 false
             };
-            let wait = Wait { guest: fd, cut: &looked, ..idle() };
-            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false)
+            let wait = Wait { guest: std::cell::Cell::new(fd), cut: &looked, ..idle() };
+            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false, None)
         });
         drop(writer.join_within().unwrap());
         // The relay saw the hangup while it waited on the client, and went on.
@@ -5573,8 +5806,8 @@ mod session_relay_tests {
                 n.fetch_add(1, Ordering::SeqCst);
                 c.load(Ordering::SeqCst)
             };
-            let wait = Wait { guest: fd, cut: &looked, ..idle() };
-            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false)
+            let wait = Wait { guest: std::cell::Cell::new(fd), cut: &looked, ..idle() };
+            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false, None)
         });
         drop(writer.join_within().unwrap());
         // Seen hung up, and looked at again since, while the client stays stalled.
@@ -5584,5 +5817,172 @@ mod session_relay_tests {
         let t = Instant::now();
         let err = worker.join_within().unwrap().unwrap_err();
         assert!(err.to_string().contains("cut") && t.elapsed() < Duration::from_secs(3), "{err} after {:?}", t.elapsed());
+    }
+
+    /// The other end of a relay's guest connection, and a clone of the relay's end (`Vm::save_state` shuts it down).
+    fn agent() -> (UnixStream, UnixStream, UnixStream) {
+        let (relay_end, agent) = UnixStream::pair().unwrap();
+        relay_end.set_read_timeout(Some(WAIT)).unwrap();
+        agent.set_write_timeout(Some(WAIT)).unwrap();
+        let save_state = relay_end.try_clone().unwrap();
+        (relay_end, agent, save_state)
+    }
+
+    fn out(offset: u64, data: &[u8]) -> Vec<u8> {
+        guest::frame(guest::FRAME_STDOUT, &[&offset.to_le_bytes()[..], data])
+    }
+
+    /// #1016: a checkpoint cutting the guest's connection while the client is stalled does not end an exec's
+    /// relay: what the cut connection still held is relayed, the session attached again (once the VM can be
+    /// reached) from where that ended, and the client gets every byte, in order, on its one connection.
+    #[test]
+    fn a_cut_exec_relay_attaches_again_and_keeps_every_byte() {
+        let (relay_end, mut agent, save_state) = agent();
+        let big = vec![b'x'; guest::MAX_BODY - 8];
+        let small = vec![b'y'; 100];
+        let (big_frame, small_frame) = (out(0, &big), out(big.len() as u64, &small));
+        let echo = guest::frame(guest::FRAME_MSG, &[b"sid"]);
+        let sent = [echo.clone(), big_frame.clone(), small_frame.clone()].concat();
+        let writer = thread::spawn(move || agent.write_all(&sent).map(|()| agent));
+        let (relay, client) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let (cut, polls, asked) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(vec![])));
+        let (c, p, a) = (cut.clone(), polls.clone(), asked.clone());
+        let end = (big.len() + small.len()) as u64;
+        let (agent2, mut relay2) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let fd = relay_end.as_raw_fd();
+            let is_cut = || c.load(Ordering::SeqCst);
+            let new = Mutex::new(Some(agent2));
+            // The first try finds the VM still being checkpointed.
+            let attach = |at: u64| -> Result<Option<(BufReader<UnixStream>, std::os::fd::RawFd)>> {
+                let mut asked = a.lock().unwrap();
+                asked.push(at);
+                match asked.len() {
+                    1 => Ok(None),
+                    _ => {
+                        let g = new.lock().unwrap().take().unwrap();
+                        let fd = g.as_raw_fd();
+                        Ok(Some((BufReader::new(g), fd)))
+                    }
+                }
+            };
+            let rejoin = Rejoin { id: "sid", from: 0, attach: &attach };
+            let wait = Wait { guest: std::cell::Cell::new(fd), cut: &is_cut, polls: Some(&p), ..idle() };
+            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false, Some(&rejoin))
+        });
+        // Its writes all queued on the relay's connection, the relay waits on the client.
+        let agent = writer.join_within().unwrap().unwrap();
+        reach(&polls, 1);
+        cut.store(true, Ordering::SeqCst);
+        save_state.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(agent);
+        // Attached again from after the frames it still had, the guest sends the exit there.
+        relay2.write_all(&guest::frame(guest::FRAME_EXIT, &[&end.to_le_bytes()[..], &7i32.to_le_bytes()])).unwrap();
+        let until = Instant::now() + WAIT;
+        while asked.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < until && !worker.is_finished(), "never attached again");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*asked.lock().unwrap(), vec![end, end]);
+        let mut client = BufReader::new(client);
+        assert_eq!(guest::read_frame(&mut client).unwrap(), Some((guest::FRAME_MSG, b"sid".to_vec())));
+        assert_eq!(guest::read_frame(&mut client).unwrap(), Some((guest::FRAME_STDOUT, big_frame[5..].to_vec())));
+        assert_eq!(guest::read_frame(&mut client).unwrap(), Some((guest::FRAME_STDOUT, small_frame[5..].to_vec())));
+        assert_eq!(guest::read_frame(&mut client).unwrap(), Some((guest::FRAME_EXIT, [&end.to_le_bytes()[..], &7i32.to_le_bytes()].concat())));
+        client.get_mut().write_all(&[guest::SESSION_DONE]).unwrap();
+        // It waited on the client: a RELEASE follows.
+        assert_eq!(worker.join_within().unwrap().unwrap(), Some((end, 7)));
+        let mut ack = [0];
+        relay2.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [guest::SESSION_DONE]);
+    }
+
+    /// A cut seen while the relay reads the guest (its client keeping up) attaches again too, from the end of
+    /// the last whole frame.
+    #[test]
+    fn a_cut_while_reading_attaches_again_after_the_last_whole_frame() {
+        let (relay_end, mut agent, save_state) = agent();
+        let first = out(0, b"abc");
+        agent.write_all(&[guest::frame(guest::FRAME_MSG, &[b"sid"]), first.clone(), out(3, b"defg")[..9].to_vec()].concat()).unwrap();
+        let (relay, client) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = cut.clone();
+        let (agent2, mut relay2) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let fd = relay_end.as_raw_fd();
+            let is_cut = || c.load(Ordering::SeqCst);
+            let new = Mutex::new(Some(agent2));
+            let attach = |at: u64| -> Result<Option<(BufReader<UnixStream>, std::os::fd::RawFd)>> {
+                assert_eq!(at, 3);
+                let g = new.lock().unwrap().take().unwrap();
+                let fd = g.as_raw_fd();
+                Ok(Some((BufReader::new(g), fd)))
+            };
+            let rejoin = Rejoin { id: "sid", from: 0, attach: &attach };
+            let wait = Wait { guest: std::cell::Cell::new(fd), cut: &is_cut, ..idle() };
+            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false, Some(&rejoin))
+        });
+        let mut client = BufReader::new(client);
+        assert_eq!(guest::read_frame(&mut client).unwrap(), Some((guest::FRAME_MSG, b"sid".to_vec())));
+        assert_eq!(guest::read_frame(&mut client).unwrap(), Some((guest::FRAME_STDOUT, first[5..].to_vec())));
+        cut.store(true, Ordering::SeqCst);
+        save_state.shutdown(std::net::Shutdown::Both).unwrap();
+        relay2.write_all(&[out(3, b"defg"), guest::frame(guest::FRAME_EXIT, &[&7u64.to_le_bytes()[..], &0i32.to_le_bytes()])].concat()).unwrap();
+        assert_eq!(guest::read_frame(&mut client).unwrap(), Some((guest::FRAME_STDOUT, out(3, b"defg")[5..].to_vec())));
+        assert_eq!(guest::read_frame(&mut client).unwrap().unwrap().0, guest::FRAME_EXIT);
+        client.get_mut().write_all(&[guest::SESSION_DONE]).unwrap();
+        assert_eq!(worker.join_within().unwrap().unwrap(), None);
+        drop(agent);
+    }
+
+    /// A relay whose session another client took over (the guest shut its connection down) gives way
+    /// rather than wait on its own stalled client (#1016).
+    #[test]
+    fn a_replaced_relay_ends_while_its_client_is_stalled() {
+        let (relay_end, writer) = big_frame_then(vec![]);
+        let (relay, _client) = UnixStream::pair().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let p = polls.clone();
+        let first = Claim::new("replaced-relay");
+        let worker = thread::spawn(move || {
+            let fd = relay_end.as_raw_fd();
+            let replaced = || !first.current();
+            let wait = Wait { guest: std::cell::Cell::new(fd), replaced: &replaced, polls: Some(&p), ..idle() };
+            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false, None)
+        });
+        reach(&polls, 1);
+        let second = Claim::new("replaced-relay");
+        drop(writer.join_within().unwrap());
+        let err = worker.join_within().unwrap().unwrap_err();
+        assert!(err.to_string().contains("another client"), "{err}");
+        // The older claim's end leaves the newer one.
+        assert!(second.current());
+    }
+
+    /// A client that shuts down only its read side is seen as gone: poll does not report it (#1016).
+    #[test]
+    fn a_client_that_stops_reading_for_good_is_dropped_promptly() {
+        let (relay, client) = UnixStream::pair().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let p = polls.clone();
+        let worker = thread::spawn(move || {
+            let wait = Wait { polls: Some(&p), ..idle() };
+            relay_output(&relay, &vec![b'x'; 8 * 1024 * 1024], &wait)
+        });
+        reach(&polls, 1);
+        let t = Instant::now();
+        client.shutdown(std::net::Shutdown::Read).unwrap();
+        let err = worker.join_within().unwrap().unwrap_err();
+        assert!(err.to_string().contains("hung up") && t.elapsed() < Duration::from_secs(2), "{err} after {:?}", t.elapsed());
+        // Nor is its acknowledgement waited for once it has read the exit.
+        let exit = guest::frame(guest::FRAME_EXIT, &[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()]);
+        let mut guest = BufReader::new(Duplex { input: Cursor::new(exit), output: Vec::new() });
+        let (relay, client) = UnixStream::pair().unwrap();
+        client.shutdown(std::net::Shutdown::Read).unwrap();
+        let t = Instant::now();
+        assert!(relay_session(&mut guest, &mut &relay, &idle(), false, None).is_err());
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     }
 }

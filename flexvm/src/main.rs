@@ -2131,9 +2131,11 @@ fn same_instance(name: &str, now: Instance, vm: &mut Option<Instance>) -> Result
     Ok(())
 }
 
-/// Keeps frames read ahead with the reply, then switches from its deadline to heartbeat timeouts.
+/// Keeps frames read ahead with the reply, then switches from its deadline to heartbeat timeouts. Reads no
+/// further ahead than a frame header: the exit stays queued until all output before it is written out, so the
+/// relay's SIOCOUTQ tells when its acknowledgement is due (#1047).
 fn exec_stream<S: util::Timed>(c: S, at: Instant) -> Result<BufReader<S>> {
-    let mut r = util::By { s: BufReader::new(c), at };
+    let mut r = util::By { s: BufReader::with_capacity(READ_AHEAD, c), at };
     util::answer(recv_json(&mut r)?, "vm", "exec failed")?;
     r.s.get_ref().read_timeout(Duration::from_secs(3))?;
     Ok(r.s)
@@ -2151,6 +2153,9 @@ fn cannot_run(m: &[u8], stderr: &mut impl Write) -> Result<StreamEnd> {
         None => Err(m.into()),
     }
 }
+
+/// An exec client's read-ahead: one frame header (a frame's body is read straight into it).
+const READ_AHEAD: usize = 5;
 
 enum StreamEnd {
     Exit(i32),
@@ -3410,14 +3415,33 @@ mod exec_tests {
         ]);
         let input = ExecInput::new([b"{\"ok\":true}\n", data.as_slice()].concat());
         let mut r = exec_stream(input, Instant::now() + Duration::from_secs(1)).unwrap();
-        assert_eq!(r.buffer(), data, "the reply and frames should be read together");
-        assert_eq!(r.get_ref().timeouts.borrow().as_slice().len(), 2);
+        assert!(r.buffer().len() < READ_AHEAD && data.starts_with(r.buffer()), "read ahead: {:?}", r.buffer());
         assert_eq!(r.get_ref().timeouts.borrow().last(), Some(&Duration::from_secs(3)));
         let mut stdout = Vec::new();
         let result = exec_frames(&mut r, &session, &mut stdout, &mut Vec::new(), &mut Instant::now(), None).unwrap();
         assert!(matches!(result, StreamEnd::Exit(7)));
         assert_eq!(stdout, b"hello");
-        assert_eq!(r.get_ref().reads, 1, "reply and frames need just one underlying read");
+    }
+
+    /// #1047: a client blocked writing out output must not have read its exit already: the relay takes an
+    /// empty socket queue (SIOCOUTQ) for the client having taken the exit, after all before it.
+    #[test]
+    fn exec_frames_are_not_read_ahead_past_a_header() {
+        let (relay, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let exit = guest::frame(guest::FRAME_EXIT, &[&5u64.to_le_bytes()[..], &0i32.to_le_bytes()]);
+        let small = frames(&[(guest::FRAME_MSG, b"id"), (guest::FRAME_MSG, b"waiting")]);
+        (&relay)
+            .write_all(&[b"{\"ok\":true}\n", &small[..], &guest::frame(guest::FRAME_STDOUT, &[&0u64.to_le_bytes()[..], b"hello"]), &exit].concat())
+            .unwrap();
+        let mut r = exec_stream(&client, Instant::now() + Duration::from_secs(1)).unwrap();
+        for _ in 0..3 {
+            guest::read_frame(&mut r).unwrap().unwrap();
+        }
+        // The client is where it would write out "hello": its exit is still queued, all but a few bytes.
+        let mut queued: libc::c_int = 0;
+        assert_eq!(unsafe { libc::ioctl(relay.as_raw_fd(), libc::TIOCOUTQ as _, &mut queued) }, 0);
+        assert!(queued as usize > exit.len() - READ_AHEAD, "{queued} of the exit's {} bytes queued", exit.len());
+        assert_eq!(guest::read_frame(&mut r).unwrap().unwrap().0, guest::FRAME_EXIT);
     }
 
     #[test]

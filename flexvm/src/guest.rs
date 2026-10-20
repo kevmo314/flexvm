@@ -140,6 +140,14 @@ pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, ti
     session_on(action, id, offset, cmd, |line| request_on(s, line, timeout))
 }
 
+/// `RELEASE`: closes session `id` only if it exited with `code` after `end` bytes (a late acknowledgement's, #1047).
+pub fn release(s: UnixStream, id: &str, end: u64, code: i32, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    if !valid_session_id(id) {
+        bail!("bad session id");
+    }
+    request_on(s, &format!("RELEASE {id} {end} {code}"), timeout)
+}
+
 /// The agent drops a command longer than `MAX_BODY` unread: refused here, before connecting.
 pub fn fits(cmd: &str) -> Result<()> {
     if cmd.len() > MAX_BODY {
