@@ -66,11 +66,13 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   no generation here uses it, `rmi` and `image prune` drop this state's file
   and remove the entry if none is left. An entry older flexvm built has no
   `.users`: in a regular `STATE/images` it goes once no generation here uses
-  it; in a symlinked one it is kept, and a pull reusing it marks it `legacy`,
-  kept until `image prune --force-shared`, which also drops the files of
-  templates directories that are gone (a moved state's too: it records itself
-  again as it pulls). `image prune` also removes entries only a file of this
-  state's, left by a crash before publication, names.
+  it; in a symlinked one it is kept (a pull reusing it marks it `legacy`)
+  until `image prune --force-shared` finds no generation here using it. That
+  also drops the files of templates directories that are gone (ENOENT or
+  ENOTDIR only; a moved state's too: it records itself again as it pulls).
+  `image prune` also removes entries only a file of this state's, left by a
+  crash before publication, names. A symlinked `images/rootfs` gets no records
+  and nothing in it is removed.
   Below `STATE/images` every directory is reached
   without following symlinks, and a symlink there is left as it is, with
   nothing under it touched. A mode is changed

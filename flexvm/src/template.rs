@@ -2080,10 +2080,10 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
         removed.push(json!({"deleted": id, "rootfs": finish_remove_with(paths, &tombstone, &rootfs_used, force_shared)?}));
     }
     // Recorded entries no generation here uses: a record left by a crash before its publication, or
-    // (`--force-shared`) entries kept only for gone states or `LEGACY`.
+    // (`--force-shared`) entries kept only for gone states or as legacy, recorded or not.
     if let (None, Some(used)) = (only, rootfs_users(paths)?) {
         let templates = std::fs::canonicalize(&paths.templates)?;
-        for rootfs in crate::image::recorded_rootfs(&paths.images)?.into_iter().filter(|r| !used.contains(r)) {
+        for rootfs in crate::image::recorded_rootfs(&paths.images, force_shared)?.into_iter().filter(|r| !used.contains(r)) {
             if crate::image::remove_rootfs(&paths.images, &rootfs, &templates, force_shared)? == crate::image::Removal::Removed {
                 removed.push(json!({"rootfs": rootfs}));
             }
@@ -3467,9 +3467,12 @@ pub(crate) mod tests {
             std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
         }
         std::os::unix::fs::symlink(&*cache, &f.paths.images).unwrap();
+        // A crash left a half-made records directory: never renamed into place, it is made again.
+        std::fs::create_dir(rootfs.with_extension("newusers")).unwrap();
+        std::fs::write(rootfs.with_extension("newusers").join("junk"), b"").unwrap();
         publish_as(&f, "t", &Meta { id: "aaaa1111".into(), rootfs: rootfs.clone(), ..f.meta.clone() });
         let users = rootfs.with_extension("users");
-        assert!(users.join("legacy").is_file());
+        assert!(users.join("legacy").is_file() && !users.join("junk").exists() && !rootfs.with_extension("newusers").exists());
         for dir in [&*other, Path::new("/nonexistent/templates")] {
             std::fs::write(users.join(state_key(dir)), dir.as_os_str().as_encoded_bytes()).unwrap();
         }
@@ -3514,7 +3517,41 @@ pub(crate) mod tests {
             assert!(!tombstone.exists());
             assert_eq!(rootfs.exists(), linked);
             assert!(!rootfs.with_extension("users").exists());
+            if linked {
+                // Never recorded: kept by image prune, removed by --force-shared once nothing here uses it.
+                for ext in ["ok", "conf"] {
+                    std::fs::write(rootfs.with_extension(ext), b"").unwrap();
+                }
+                assert!(prune(&f.paths, None, &BTreeSet::new, false).unwrap().is_empty());
+                assert!(rootfs.exists());
+                assert_eq!(prune(&f.paths, None, &BTreeSet::new, true).unwrap(), [json!({"rootfs": rootfs})]);
+                assert!(!rootfs.exists() && !rootfs.with_extension("ok").exists());
+            }
         }
+    }
+
+    #[test]
+    fn a_symlinked_rootfs_directory_is_neither_recorded_nor_pruned() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let outside = crate::test_util::TempDir::new("outside-rootfs");
+        let rootfs = outside.join("a.ext4");
+        for ext in ["ext4", "ok", "conf"] {
+            std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+        }
+        std::fs::create_dir(rootfs.with_extension("users")).unwrap();
+        std::fs::set_permissions(rootfs.with_extension("users"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(&f.paths.images).unwrap();
+        std::os::unix::fs::symlink(&*outside, f.paths.images.join("rootfs")).unwrap();
+        publish_as(&f, "t", &Meta { id: "aaaa1111".into(), rootfs: rootfs.clone(), ..f.meta.clone() });
+        for force in [false, true] {
+            assert!(prune(&f.paths, None, &BTreeSet::new, force).unwrap().is_empty());
+        }
+        assert_eq!(remove(&f.paths, Some("t"), "aaaa1111", &BTreeSet::new).unwrap()["rootfs"], Value::Null);
+        assert!(rootfs.exists() && rootfs.with_extension("ok").exists());
+        let users = rootfs.with_extension("users");
+        assert_eq!(std::fs::read_dir(&users).unwrap().count(), 0);
+        assert_eq!(std::fs::metadata(&users).unwrap().permissions().mode() & 0o777, 0o755);
     }
 
     #[test]

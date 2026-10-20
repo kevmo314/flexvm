@@ -330,7 +330,9 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         let res = build(&tmp).and_then(|conf| {
             interrupted()?;
             // Before its marker: an entry with none is one an older flexvm built (`LEGACY`).
-            users_dir(&pinned, cached, true)?;
+            if private {
+                users_dir(&pinned, cached, true, false)?;
+            }
             publish_rootfs(&tmp, cached, &conf, &sync)
         });
         let _ = std::fs::remove_file(&tmp);
@@ -358,20 +360,37 @@ pub enum Removal {
 /// were kept: it stays until `image prune --force-shared`.
 const LEGACY: &str = "legacy";
 
-/// `KEY.users` of the pinned cache directory, made (0700) if `create`: `(it, whether it was made)`.
-fn users_dir(pinned: &crate::host::Directory, cached: &Path, create: bool) -> Result<Option<(crate::host::Directory, bool)>> {
+/// `KEY.users` of the pinned cache directory, made (0700) if `create` and missing, holding `LEGACY`
+/// if `legacy`: made whole as `KEY.newusers` (one left by a crash goes first), then renamed into
+/// place, so no `.users` without it is ever seen. The caller holds the key's lock.
+fn users_dir(pinned: &crate::host::Directory, cached: &Path, create: bool, legacy: bool) -> Result<Option<crate::host::Directory>> {
+    let fd = pinned.fd.as_raw_fd();
     let name = cpath(Path::new(cached.with_extension("users").file_name().unwrap()))?;
-    let made = create
-        && match crate::util::check(unsafe { libc::mkdirat(pinned.fd.as_raw_fd(), name.as_ptr(), 0o700) }) {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-            r => r.map(|_| true)?,
-        };
-    let fd = match crate::util::openat(pinned.fd.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
+    let open = |name: &std::ffi::CStr| crate::util::openat(fd, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let dir = match open(&name) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
-        fd => fd?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let new = cached.with_extension("newusers");
+            match std::fs::remove_dir_all(&new) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r?,
+            }
+            let new_name = cpath(Path::new(new.file_name().unwrap()))?;
+            crate::util::check(unsafe { libc::mkdirat(fd, new_name.as_ptr(), 0o700) })?;
+            let dir = crate::host::Directory::from_fd(open(&new_name)?);
+            make_private(&dir.fd, 0o700)?;
+            if legacy {
+                crate::util::write_file_mode(&dir.path, LEGACY, b"", true, 0o600)?;
+            }
+            sync_dir(&dir.path)?;
+            crate::util::check(unsafe { libc::renameat(fd, new_name.as_ptr(), fd, name.as_ptr()) })?;
+            sync_dir(&pinned.path)?;
+            return Ok(Some(dir));
+        }
+        r => crate::host::Directory::from_fd(r?),
     };
-    make_private(&fd, 0o700)?;
-    Ok(Some((crate::host::Directory::from_fd(fd), made)))
+    make_private(&dir.fd, 0o700)?;
+    Ok(Some(dir))
 }
 
 /// Records that the generations of the (canonical) templates directory `templates` use the cache
@@ -381,58 +400,73 @@ pub fn note_rootfs(cache: &Path, rootfs: &Path, templates: &Path) -> Result<()> 
     let Some(pinned) = rootfs_directory(cache, rootfs)? else { return Ok(()) };
     let cached = pinned.path.join(rootfs.file_name().unwrap());
     let _lock = crate::host::lock_at(crate::host::host_locks()?, &key_lock(&pinned, &cached)?, libc::LOCK_EX)?;
-    let (users, made) = users_dir(&pinned, &cached, true)?.unwrap();
-    if made && cache.is_symlink() {
-        crate::util::write_file_mode(&users.path, LEGACY, b"", true, 0o600)?;
-    }
+    let users = users_dir(&pinned, &cached, true, cache.is_symlink())?.unwrap();
     crate::util::write_file_mode(&users.path, &crate::template::state_key(templates), templates.as_os_str().as_bytes(), true, 0o600)?;
     Ok(sync_dir(&pinned.path)?)
 }
 
+/// The cache's `rootfs` directory, pinned and by its canonical path, unless it is a symlink (or
+/// missing): records are kept, and entries removed, only in one reached through no symlink.
+fn rootfs_dir(cache: &Path) -> Result<Option<(crate::host::Directory, PathBuf)>> {
+    let Ok(root) = std::fs::canonicalize(cache) else { return Ok(None) };
+    let root_fd = crate::util::openat(libc::AT_FDCWD, &cpath(&root)?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    match crate::util::openat(root_fd.as_raw_fd(), c"rootfs", libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => Ok(None),
+        fd => Ok(Some((crate::host::Directory::from_fd(fd?), root.join("rootfs")))),
+    }
+}
+
 /// Only entries in this cache can acquire records or be removed.
 fn rootfs_directory(cache: &Path, rootfs: &Path) -> Result<Option<crate::host::Directory>> {
-    let (Ok(dir), Some(parent)) = (std::fs::canonicalize(cache.join("rootfs")), rootfs.parent()) else { return Ok(None) };
+    let (Some((pinned, dir)), Some(parent)) = (rootfs_dir(cache)?, rootfs.parent()) else { return Ok(None) };
     if std::fs::canonicalize(parent).ok().as_deref() != Some(dir.as_path()) || rootfs.extension() != Some("ext4".as_ref()) {
         return Ok(None);
     }
-    Ok(Some(crate::host::Directory::open(&dir)?))
+    Ok(Some(pinned))
 }
 
-/// The entries of the cache `rootfs` directory that have records (`KEY.users`), as `KEY.ext4`.
-pub fn recorded_rootfs(cache: &Path) -> Result<Vec<PathBuf>> {
-    let Ok(dir) = std::fs::canonicalize(cache.join("rootfs")) else { return Ok(vec![]) };
-    let mut found = vec![];
-    for entry in std::fs::read_dir(&dir)? {
+/// The entries of the cache `rootfs` directory that have records (`KEY.users`), as `KEY.ext4`, and
+/// with `force` (`--force-shared`) complete ones without too (`LEGACY` or never recorded).
+pub fn recorded_rootfs(cache: &Path, force: bool) -> Result<Vec<PathBuf>> {
+    let Some((pinned, dir)) = rootfs_dir(cache)? else { return Ok(vec![]) };
+    let mut found = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&pinned.path)? {
         let path = dir.join(entry?.file_name());
-        if path.extension() == Some("users".as_ref()) {
-            found.push(path.with_extension("ext4"));
+        if path.extension() == Some("users".as_ref()) || force && path.extension() == Some("ok".as_ref()) {
+            found.insert(path.with_extension("ext4"));
         }
     }
-    Ok(found)
+    Ok(found.into_iter().collect())
+}
+
+/// Whether the templates directory a record holds is gone: only on ENOENT or ENOTDIR, not
+/// another error (an unreadable or failing filesystem may still hold a state).
+fn gone(record: &[u8]) -> bool {
+    !record.is_empty()
+        && std::fs::metadata(std::ffi::OsStr::from_bytes(record))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR))
 }
 
 /// Removes the cache entry `rootfs` (a `rootfs/KEY.ext4` of `cache`) under its key's lock, its
 /// marker first, so a build that waits for the lock builds it again. The caller knows no generation
 /// of `templates` (canonical) uses it: its record goes, and the entry is kept while other records
 /// remain (or a legacy shared entry has none). `force` (`--force-shared`) drops `LEGACY` and the
-/// records of templates directories that are gone. Neither lock is waited for: a pull holding
+/// records of templates directories that are gone, and removes a legacy shared entry without records. Neither lock is waited for: a pull holding
 /// either means `Removal::InUse`.
 pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool) -> Result<Removal> {
     let Some(pinned) = rootfs_directory(cache, rootfs)? else { return Ok(Removal::Absent) };
     let cached = pinned.path.join(rootfs.file_name().unwrap());
     let key = key_lock(&pinned, &cached)?;
     let Some(_lock) = crate::host::try_lock_at(crate::host::host_locks()?, &key)? else { return Ok(Removal::InUse) };
-    let users = users_dir(&pinned, &cached, false)?;
-    if let Some((dir, _)) = &users {
+    let users = users_dir(&pinned, &cached, false, false)?;
+    if let Some(dir) = &users {
         let me = crate::template::state_key(templates);
         let mut kept = false;
         for entry in std::fs::read_dir(&dir.path)? {
             let name = entry?.file_name();
             let path = dir.path.join(&name);
             // A record's temporary (`write_file_mode`), the record of these templates, or one `force` forgets.
-            let drop = name.as_bytes().starts_with(b".")
-                || name == me.as_str()
-                || force && (name == LEGACY || std::fs::read(&path).is_ok_and(|p| !p.is_empty() && !Path::new(std::ffi::OsStr::from_bytes(&p)).is_dir()));
+            let drop = name.as_bytes().starts_with(b".") || name == me.as_str() || force && (name == LEGACY || std::fs::read(&path).is_ok_and(|p| gone(&p)));
             if drop {
                 match std::fs::remove_file(&path) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -446,7 +480,7 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool)
         if kept {
             return Ok(Removal::Absent);
         }
-    } else if cache.is_symlink() {
+    } else if cache.is_symlink() && !force {
         // A legacy shared entry may have users that have not pulled with records yet.
         return Ok(Removal::Absent);
     }
