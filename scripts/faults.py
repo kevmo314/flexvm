@@ -10293,6 +10293,82 @@ def template_tap():
         subprocess.run(["rm", "-rf", os.path.join(tdir, f".{name}.new-{p.pid}"), other])
 
 
+def pidns_names():
+    """#1084: what a host names after a process in what hosts of other PID namespaces may share
+    names that namespace too: a VM process's own cgroup (`vm-PID-START-NS`) and a write's
+    temporary file (`.X.PID-START-BOOT-NS.tmp`). A sweep judges them by pid only in their own
+    namespace; from another (a container whose pid 1 has the owner's pid), never, and from the
+    initial PID namespace only once a census finds that namespace gone. Every sweep here runs in
+    network and mount namespaces of its own, with a private cgroup subtree as its /sys/fs/cgroup:
+    none sees another host's taps or cgroups."""
+    d = tempfile.mkdtemp(prefix="fvci-pidns-", dir=os.path.dirname(os.path.abspath(A.dir)))
+    state, run = os.path.join(d, "state"), os.path.join(d, "run")
+    sub = f"/sys/fs/cgroup/fvci-pidns-{os.getpid()}"
+    if not os.path.exists("/sys/fs/cgroup/cgroup.controllers") or not shutil.which("unshare"):
+        raise Skip("no cgroup2 at /sys/fs/cgroup, or no unshare")
+    os.makedirs(os.path.join(sub, "flexvm"))
+    fv = f"{shlex.quote(BIN)} --state {shlex.quote(state)} --run {shlex.quote(run)}"
+    private = f"mount --bind {shlex.quote(sub)} /sys/fs/cgroup"
+    def gc(*ns):
+        r = subprocess.run(["unshare", "-m", "-n", *ns, "sh", "-c", f"{private} && exec {fv} debug gc"], capture_output=True, text=True, timeout=120, env=ENV)
+        assert r.returncode == 0, (ns, r.stdout, r.stderr)
+    owner = None
+    try:
+        gc()  # Makes the host's directories.
+        # A process in a PID namespace of its own: pid 1 there, as a container's is.
+        owner = subprocess.Popen(["unshare", "-m", "-n", "-p", "-f", "--mount-proc", "sh", "-c",
+                                  f"{private} && echo $$ $(awk '{{print $22}}' /proc/$$/stat) $(stat -L -c %i /proc/$$/ns/pid) && read go"
+                                  f" && {fv} debug gc && echo swept && read end"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=ENV)
+        pid, start, ns = (int(x) for x in owner.stdout.readline().split())
+        check("pid namespaces: the owner is pid 1 of a namespace of its own", pid == 1 and ns != pid_ns()[0], (pid, ns))
+        boot = open("/proc/sys/kernel/random/boot_id").read().strip()[:8]
+        addrs = os.path.join(state, "addrs")
+        # (path, the owner's live process): one of each, with a start time no process there has.
+        made = []
+        for s, live in ((start, True), (start + 1, False)):
+            made.append((os.path.join(sub, "flexvm", f"vm-{pid}-{s}-{ns}"), live))
+            made.append((os.path.join(addrs, f".10.208.0.{9 + live}.{pid}-{s}-{boot}-{ns}.tmp"), live))
+        for path, _ in made:
+            if "/sys/fs/cgroup/" in path:
+                os.mkdir(path)
+            else:
+                open(path, "w").close()
+        there = lambda: [os.path.exists(p) for p, _ in made]
+        # From another PID namespace, whose pid 1 is not the owner: nothing is judged by pid.
+        gc("-p", "-f", "--mount-proc")
+        check("pid namespaces: another namespace's sweep keeps them all", all(there()), there())
+        # From this one: the owner's namespace has a process, so nothing of it goes.
+        gc()
+        check("pid namespaces: a sweep here keeps a live namespace's", all(there()), there())
+        # From the owner's own: by pid, its dead namesake's go.
+        owner.stdin.write("go\n")
+        owner.stdin.flush()
+        check("pid namespaces: the owner's namespace swept", owner.stdout.readline().strip() == "swept")
+        check("pid namespaces: in its own namespace, only a dead owner's go", there() == [live for _, live in made], there())
+        owner.stdin.close()
+        owner.wait(30)
+        # The namespace is gone: only a sweep that can take a census of every process (the initial
+        # PID namespace's) tells, never one from another namespace.
+        gc("-p", "-f", "--mount-proc")
+        check("pid namespaces: a gone namespace's stay for another namespace's sweep", there() == [live for _, live in made], there())
+        census = pid_ns()[1]
+        gc()
+        check(f"pid namespaces: a gone namespace's {'go' if census else 'stay'} here ({'a' if census else 'no'} census)",
+              there() == [live and not census for _, live in made], there())
+    finally:
+        if owner and owner.poll() is None:
+            owner.kill()
+            owner.wait()
+        for e in os.listdir(os.path.join(sub, "flexvm")) if os.path.isdir(os.path.join(sub, "flexvm")) else []:
+            if os.path.isdir(os.path.join(sub, "flexvm", e)):
+                os.rmdir(os.path.join(sub, "flexvm", e))
+        for c in (os.path.join(sub, "flexvm"), sub):
+            with suppress(OSError):
+                os.rmdir(c)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def lock_holders(path):
     """Pids holding a flock on the host lock directory's use lock of `path` (`host::use_lock`)."""
     st = os.stat(path)
@@ -11090,7 +11166,7 @@ SCENARIOS = dict(
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, loan_start_retry=loan_start_retry, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
-    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, rmi_suspend=rmi_suspend,
+    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, pidns_names=pidns_names, rmi_suspend=rmi_suspend,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died, fc_died_starting=fc_died_starting,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,

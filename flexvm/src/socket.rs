@@ -103,19 +103,64 @@ fn bases() -> [PathBuf; 2] {
     [PathBuf::from("/run/flexvm/s"), PathBuf::from(format!("/tmp/flexvm-s-{}", unsafe { libc::geteuid() }))]
 }
 
-/// Named after the key, so a process with the same key finds what its predecessor left.
-fn roots_in(bases: &[PathBuf], key: &Path) -> Vec<PathBuf> {
-    let h = Sha256::digest(key.as_os_str().as_bytes());
-    let name: String = h[..8].iter().map(|b| format!("{b:02x}")).collect();
+/// Named after the key and this process's PID namespace (`host::pid_ns`), so a process with the
+/// same key finds what its predecessor left, and one in another PID namespace whose key reads the
+/// same (a work directory `RUN/w/PID-START` under the same path, in a container with the same pid
+/// and start time) never takes or removes this one's: the bases are shared by every host (#1084).
+/// A key unique however pids read (a template build's staging directory, named by a nonce) is
+/// named without (`SocketRoot::unique`), as every key was by earlier builds.
+fn roots_in(bases: &[PathBuf], key: &Path, ns: Option<u64>) -> Vec<PathBuf> {
+    let mut h = Sha256::new();
+    h.update(key.as_os_str().as_bytes());
+    if let Some(ns) = ns {
+        // A path has no NUL: no key with one hashes as another without.
+        h.update(format!("\0pidns:{ns}"));
+    }
+    let name: String = h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
     // Only under bases that are ours: anything else is not ours to trust or remove.
     bases.iter().filter(|b| private(b).is_ok()).map(|b| b.join(&name)).collect()
 }
 
 /// Their Firecrackers must be gone.
 pub fn remove(key: &Path) {
-    for dir in roots_in(&bases(), key) {
+    for dir in roots_in(&bases(), key, crate::host::pid_ns()) {
         let _ = fs::remove_dir_all(dir);
     }
+}
+
+/// Where `SocketRoot::new` records, in its key's directory, the root it made: the PID namespace
+/// hashed into its name is its creator's, which a sweeper's need not be (a container restarted
+/// with its run directory kept is in another).
+pub const RECORD: &str = "sockets";
+
+/// A dead owner's: the root its key's directory records (`RECORD`), as `remove` names it, as an
+/// earlier build named it and as a unique key's is named (`SocketRoot::unique`): without a PID
+/// namespace.
+pub fn remove_left(key: &Path) {
+    remove_left_in(&bases(), key);
+}
+
+fn remove_left_in(bases: &[PathBuf], key: &Path) {
+    if let Some(dir) = recorded_root(bases, key) {
+        let _ = fs::remove_dir_all(dir);
+    }
+    for dir in roots_in(bases, key, crate::host::pid_ns()).into_iter().chain(roots_in(bases, key, None)) {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// The root `key`'s record names, if it is one `roots_in` could have named: a hash-named
+/// directory right under one of `bases` that is ours, never anything else a record may say. The
+/// path returned is built from the base and the name, never the record's spelling (a trailing `/`
+/// or `/.` would follow a link there), and is no symlink.
+fn recorded_root(bases: &[PathBuf], key: &Path) -> Option<PathBuf> {
+    let record = fs::read(key.join(RECORD)).ok()?;
+    let slash = record.iter().rposition(|&b| b == b'/')?;
+    let (parent, name) = (&record[..slash], &record[slash + 1..]);
+    let hashed = name.len() == 16 && name.iter().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    let base = bases.iter().find(|b| b.as_os_str().as_bytes() == parent && private(b).is_ok())?;
+    let dir = base.join(std::ffi::OsStr::from_bytes(name));
+    (hashed && fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir())).then_some(dir)
 }
 
 /// One VM process or template build. Slots keep it alive until their cleanup.
@@ -125,16 +170,30 @@ pub struct SocketRoot {
 }
 
 impl SocketRoot {
+    /// A process's, by a key that names it (`roots_in`): a directory of its own, which records
+    /// the root (`RECORD`) for whoever sweeps it once the process is gone (`remove_left`).
     pub fn new(key: &Path) -> Result<Arc<Self>> {
-        Self::from_bases(&bases(), key)
+        Self::recorded(&bases(), key, crate::host::pid_ns())
     }
 
-    pub(crate) fn from_bases(bases: &[PathBuf], key: &Path) -> Result<Arc<Self>> {
+    fn recorded(bases: &[PathBuf], key: &Path, ns: Option<u64>) -> Result<Arc<Self>> {
+        let root = Self::from_bases(bases, key, ns)?;
+        crate::util::write_file(key, RECORD, root.dir.as_os_str().as_bytes(), false)
+            .map_err(|e| format!("recording socket directory {} in {}: {e}", root.dir.display(), key.display()))?;
+        Ok(root)
+    }
+
+    /// By a key no other process has, in any PID namespace.
+    pub fn unique(key: &Path) -> Result<Arc<Self>> {
+        Self::from_bases(&bases(), key, None)
+    }
+
+    pub(crate) fn from_bases(bases: &[PathBuf], key: &Path, ns: Option<u64>) -> Result<Arc<Self>> {
         let mut errors = Vec::new();
         for base in bases {
             let attempt = (|| -> Result<Arc<Self>> {
                 base_dir(base)?;
-                let dir = roots_in(std::slice::from_ref(base), key).remove(0);
+                let dir = roots_in(std::slice::from_ref(base), key, ns).remove(0);
                 // The longest slot and Firecracker's vsock port suffix.
                 check(&dir.join("ffffffffffffffff/v.sock_4294967295"))?;
                 let _ = fs::remove_dir_all(&dir);
@@ -251,8 +310,8 @@ mod tests {
         let t = fixture();
         let bases = [t.join("s")];
         let key = Path::new(&"/very/deep/run".repeat(20)).to_path_buf();
-        let root = SocketRoot::from_bases(&bases, &key).unwrap();
-        assert_eq!(roots_in(&bases, &key), [root.dir.clone()]);
+        let root = SocketRoot::from_bases(&bases, &key, None).unwrap();
+        assert_eq!(roots_in(&bases, &key, None), [root.dir.clone()]);
         private(&root.dir).unwrap();
         let a = root.allocate().unwrap();
         root.next.store(u64::MAX, Ordering::Relaxed);
@@ -269,18 +328,98 @@ mod tests {
         drop(a);
         assert!(!dir.exists() && b.dir.exists());
         // A restart with the same key replaces what is left.
-        let again = SocketRoot::from_bases(&bases, &key).unwrap();
+        let again = SocketRoot::from_bases(&bases, &key, None).unwrap();
         assert!(!b.dir.exists());
         drop(again);
         drop(b);
         assert_eq!(fs::read_dir(&bases[0]).unwrap().count(), 0);
     }
 
+    /// #1084: a process of another PID namespace whose key reads the same (its work directory under
+    /// the same run path, the same pid and start time there) has a root of its own, which a restart
+    /// here never replaces; a unique key's is named as earlier builds named every one.
+    #[test]
+    fn roots_of_other_pid_namespaces_are_apart() {
+        let t = fixture();
+        let bases = [t.join("s")];
+        let key = t.join("run/w/42-7");
+        let theirs = SocketRoot::from_bases(&bases, &key, Some(1)).unwrap();
+        let ours = SocketRoot::from_bases(&bases, &key, Some(2)).unwrap();
+        let old = SocketRoot::from_bases(&bases, &key, None).unwrap();
+        assert!(theirs.dir != ours.dir && ours.dir != old.dir && theirs.dir != old.dir);
+        let again = SocketRoot::from_bases(&bases, &key, Some(2)).unwrap();
+        assert_eq!(again.dir, ours.dir);
+        assert!(theirs.dir.is_dir() && old.dir.is_dir(), "a restart replaces only its own");
+        assert_eq!(roots_in(&bases, &key, Some(1)), [theirs.dir.clone()]);
+        // With this process's namespace, as `new` and `remove` name them.
+        let ns = crate::host::pid_ns();
+        assert!(ns.is_some());
+        assert_eq!(roots_in(&bases, &key, ns), roots_in(&bases, &key, ns));
+        assert_ne!(roots_in(&bases, &key, ns), roots_in(&bases, &key, None));
+    }
+
+    /// A root is removed by its key's record whatever PID namespace made it: a container restarted
+    /// with its run directory kept sweeps its predecessor's from another namespace. A record naming
+    /// anything but a root under the bases is never followed.
+    #[test]
+    fn a_dead_owners_root_goes_by_its_record_from_any_namespace() {
+        let t = fixture();
+        let bases = [t.join("s")];
+        let key = t.join("run/w/42-7");
+        DirBuilder::new().recursive(true).mode(0o700).create(&key).unwrap();
+        let other = crate::host::pid_ns().unwrap() + 1;
+        let root = SocketRoot::recorded(&bases, &key, Some(other)).unwrap();
+        let dir = root.dir.clone();
+        assert_eq!(fs::read(key.join(RECORD)).unwrap(), dir.as_os_str().as_bytes());
+        assert!(!roots_in(&bases, &key, crate::host::pid_ns()).contains(&dir) && !roots_in(&bases, &key, None).contains(&dir));
+        std::mem::forget(root);
+        remove_left_in(&bases, &key);
+        assert!(!dir.exists(), "removed by its record, not by this namespace's name");
+        // Earlier builds' and this namespace's names go without a record.
+        fs::remove_file(key.join(RECORD)).unwrap();
+        let (old, ours) = (SocketRoot::from_bases(&bases, &key, None).unwrap(), SocketRoot::from_bases(&bases, &key, crate::host::pid_ns()).unwrap());
+        let (old_dir, our_dir) = (old.dir.clone(), ours.dir.clone());
+        std::mem::forget((old, ours));
+        remove_left_in(&bases, &key);
+        assert!(!old_dir.exists() && !our_dir.exists());
+        // A record naming anything else is not followed.
+        let decoys = [t.join("decoy"), bases[0].join("not-a-hash"), t.join("elsewhere/0123456789abcdef")];
+        for decoy in &decoys {
+            DirBuilder::new().recursive(true).create(decoy).unwrap();
+            fs::write(key.join(RECORD), decoy.as_os_str().as_bytes()).unwrap();
+            remove_left_in(&bases, &key);
+            assert!(decoy.exists(), "{}", decoy.display());
+        }
+        // Nor a hash-named link out of the bases, however the record spells it: a trailing `/` or
+        // `/.` would have the removal follow it.
+        let outside = t.join("outside");
+        DirBuilder::new().create(&outside).unwrap();
+        fs::write(outside.join("precious"), b"keep").unwrap();
+        let link = bases[0].join("0123456789abcdef");
+        symlink(&outside, &link).unwrap();
+        let spelled = link.as_os_str().as_bytes();
+        for record in [spelled.to_vec(), [spelled, b"/"].concat(), [spelled, b"/."].concat(), [spelled, b"//"].concat()] {
+            fs::write(key.join(RECORD), &record).unwrap();
+            assert_eq!(recorded_root(&bases, &key), None, "{:?}", String::from_utf8_lossy(&record));
+            remove_left_in(&bases, &key);
+            assert!(outside.join("precious").exists() && link.is_symlink(), "{:?}", String::from_utf8_lossy(&record));
+        }
+        // A real root recorded with a trailing separator is not taken either (no spelling but its own).
+        fs::remove_file(&link).unwrap();
+        DirBuilder::new().mode(0o700).create(&link).unwrap();
+        fs::write(key.join(RECORD), [spelled, b"/"].concat()).unwrap();
+        assert_eq!(recorded_root(&bases, &key), None);
+        fs::write(key.join(RECORD), spelled).unwrap();
+        assert_eq!(recorded_root(&bases, &key), Some(link.clone()));
+        remove_left_in(&bases, &key);
+        assert!(!link.exists());
+    }
+
     #[test]
     fn a_missing_parent_is_made_0755_or_the_fallback_is_used() {
         let t = fixture();
         let parent = t.join("run");
-        let root = SocketRoot::from_bases(&[parent.join("s"), t.join("fallback")], &t).unwrap();
+        let root = SocketRoot::from_bases(&[parent.join("s"), t.join("fallback")], &t, None).unwrap();
         assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o7777, 0o755);
         assert_eq!(root.dir.parent().unwrap(), parent.join("s"));
         drop(root);
@@ -288,7 +427,7 @@ mod tests {
         let closed = t.join("closed");
         DirBuilder::new().mode(0o555).create(&closed).unwrap();
         if unsafe { libc::geteuid() } != 0 {
-            let root = SocketRoot::from_bases(&[closed.join("run/s"), t.join("fallback")], &t).unwrap();
+            let root = SocketRoot::from_bases(&[closed.join("run/s"), t.join("fallback")], &t, None).unwrap();
             assert!(!closed.join("run").exists());
             assert_eq!(root.dir.parent().unwrap(), t.join("fallback"));
         }
@@ -304,11 +443,11 @@ mod tests {
         symlink(&t, t.join("link")).unwrap();
         // A base inside a directory others can write, a shared base, a symlinked base.
         for base in [shared.join("s"), shared.clone(), t.join("link")] {
-            assert!(SocketRoot::from_bases(&[base.clone()], &t).is_err(), "{}", base.display());
-            assert!(roots_in(&[base], &t).is_empty());
+            assert!(SocketRoot::from_bases(&[base.clone()], &t, None).is_err(), "{}", base.display());
+            assert!(roots_in(&[base], &t, None).is_empty());
         }
         assert_eq!(fs::read_dir(&shared).unwrap().count(), 0);
-        let root = SocketRoot::from_bases(&[shared.clone(), t.join("ok")], &t).unwrap();
+        let root = SocketRoot::from_bases(&[shared.clone(), t.join("ok")], &t, None).unwrap();
         assert_eq!(root.dir.parent().unwrap(), t.join("ok"));
         drop(root);
     }
@@ -322,7 +461,7 @@ mod tests {
         }
         let t = fixture();
         let deep = t.join("x".repeat(80));
-        let e = SocketRoot::from_bases(&[deep.clone()], &t).err().unwrap().to_string();
+        let e = SocketRoot::from_bases(&[deep.clone()], &t, None).err().unwrap().to_string();
         assert!(e.contains("108"), "{e}");
         assert_eq!(fs::read_dir(&deep).unwrap().count(), 0);
     }

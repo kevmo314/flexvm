@@ -3409,7 +3409,7 @@ fn tap_alias_in(run: &Path, owner: &Ident, ns: Option<u64>) -> String {
 /// namespace from different PID namespaces (containers with the host's network) cannot
 /// tell each other's processes apart by pid, so each leaves the others' taps and cgroups
 /// alone (#1078, #1082), until such a namespace is proven gone (`PidNs::gone`).
-fn pid_ns() -> Option<u64> {
+pub(crate) fn pid_ns() -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     static NS: OnceLock<Option<u64>> = OnceLock::new();
     *NS.get_or_init(|| std::fs::metadata("/proc/self/ns/pid").ok().map(|m| m.ino()))
@@ -3565,10 +3565,23 @@ pub type Withdrawn = (String, Ipv4Addr, u64);
 /// process is, or written in another boot. A bare PID (an older flexvm's, or one that could not
 /// name itself) is gone once no process has that pid, or once the file is older than this boot.
 pub(crate) fn write_debris_of(path: &Path) -> bool {
+    write_debris_by(path, &PidNs::now())
+}
+
+/// `write_debris_of`, judging a writer of another PID namespace (`util::write_tag`'s `NS`) by `ns`:
+/// never by its pid, only once its namespace is proven gone (#1084).
+fn write_debris_by(path: &Path, ns: &PidNs) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
     let Some((_, tag)) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")).and_then(|n| n.rsplit_once('.')) else { return false };
     let mut parts = tag.split('-');
-    let (Some(Ok(pid)), start, boot, None) = (parts.next().map(str::parse::<u32>), parts.next(), parts.next(), parts.next()) else { return false };
+    let (Some(Ok(pid)), start, boot, of, None) = (parts.next().map(str::parse::<u32>), parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let of = match of.map(str::parse::<u64>) {
+        None => None,
+        Some(Ok(of)) => Some(of),
+        Some(Err(_)) => return false,
+    };
     match (start.map(str::parse::<u64>), boot) {
         (Some(Ok(start)), Some(boot)) => {
             let now = boot_id();
@@ -3577,7 +3590,7 @@ pub(crate) fn write_debris_of(path: &Path) -> bool {
             } else if !now.starts_with(boot) {
                 true
             } else {
-                Ident { pid, start, boot: now.into() }.liveness() == Liveness::Gone
+                ns.owner_gone(&Ident { pid, start, boot: now.into() }, of)
             }
         }
         (None, None) => !Path::new(&format!("/proc/{pid}")).exists() || older_than_boot(path),
@@ -3598,8 +3611,9 @@ fn older_than_boot(path: &Path) -> bool {
 /// Removes, among `dir`'s entries whose names pass `which`, `write_file` debris (`write_debris_of`):
 /// never a published record (no leading dot) nor a live writer's temporary file.
 fn remove_write_debris(dir: &Path, which: impl Fn(&str) -> bool) {
+    let ns = PidNs::now();
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if e.file_name().to_str().is_some_and(&which) && write_debris_of(&e.path()) {
+        if e.file_name().to_str().is_some_and(&which) && write_debris_by(&e.path(), &ns) {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -3668,21 +3682,32 @@ fn default_run_of(state: &Path) -> PathBuf {
     }
 }
 
-fn sweep_scope(dir: &Path) {
-    sweep_scope_with(dir, |dir| {
+fn sweep_scope(dir: &Path, ns: &PidNs) {
+    sweep_scope_with(dir, ns, |dir| {
         let _ = std::fs::remove_dir(dir);
     });
 }
 
+/// The VM process a VM process's own cgroup (`vm-PID-START-NS`, `util::spawn_self_child`) is of,
+/// and the PID namespace it names (none in an earlier build's `vm-PID-START`).
+fn scope_owner(name: &str) -> Option<(Ident, Option<u64>)> {
+    let parts: Vec<&str> = name.strip_prefix("vm-")?.split('-').collect();
+    let (pid, start, ns) = match parts[..] {
+        [pid, start] => (pid, start, None),
+        [pid, start, ns] => (pid, start, Some(ns.parse().ok()?)),
+        _ => return None,
+    };
+    Some((Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() }, ns))
+}
+
 /// Keep a live owner's scope even when empty: `join_cgroup` may need it for rollback.
 /// Never kill its occupants; `rmdir` also refuses a cgroup populated since the read.
-fn sweep_scope_with(dir: &Path, remove: impl FnOnce(&Path)) {
-    let Some((pid, start)) = dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("vm-")).and_then(|n| n.split_once('-')) else {
+/// One of another PID namespace goes only once that namespace is proven gone (`PidNs`).
+fn sweep_scope_with(dir: &Path, ns: &PidNs, remove: impl FnOnce(&Path)) {
+    let Some((owner, of)) = dir.file_name().and_then(|n| n.to_str()).and_then(scope_owner) else {
         return;
     };
-    let (Ok(pid), Ok(start)) = (pid.parse(), start.parse()) else { return };
-    let owner = Ident { pid, start, boot: boot_id().into() };
-    if owner.liveness() != Liveness::Gone {
+    if !ns.owner_gone(&owner, of) {
         return;
     }
     let events = std::fs::read_to_string(dir.join("cgroup.events")).unwrap_or_default();
@@ -4209,7 +4234,7 @@ fn collect_owned(run: &Path) {
     for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         if n.starts_with("vm-") {
-            sweep_scope(&e.path());
+            sweep_scope(&e.path(), &ns);
         } else if cgroup_owner_gone(&n, &ns) {
             let _ = crate::fc::remove_cgroup(&e.path());
         }
@@ -4217,7 +4242,7 @@ fn collect_owned(run: &Path) {
     for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {
         let owner = load::<Ident>(&e.path().join("owner")).ok().flatten();
         if owner.is_some_and(|o| reap_swept(run, &o, true).is_ok()) {
-            crate::socket::remove(&e.path());
+            crate::socket::remove_left(&e.path());
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
@@ -7665,7 +7690,8 @@ pub(crate) mod tests {
         let me = Ident::me();
         let boot = &boot_id()[..crate::util::BOOT_TAG];
         let mine = crate::util::write_tag();
-        assert_eq!(mine, format!("{}-{}-{boot}", me.pid, me.start));
+        let ns = pid_ns().unwrap();
+        assert_eq!(mine, format!("{}-{}-{boot}-{ns}", me.pid, me.start));
         let claims = h.run.join("claims");
         let dirs = [h.state.join("addrs"), h.run.join("vms"), h.state.join("standby")];
         for dir in &dirs {
@@ -7679,6 +7705,14 @@ pub(crate) mod tests {
             (format!(".10.9.0.5.{}.tmp", me.pid), true),
             ("10.9.0.6".to_string(), true),
             (".10.9.0.7.x-1-2.tmp".to_string(), true),
+            // An earlier build's (no PID namespace), judged by pid here.
+            (format!(".10.9.0.9.{}-{}-{boot}.tmp", me.pid, me.start), true),
+            (format!(".10.9.0.10.{}-{}-{boot}.tmp", me.pid, me.start + 1), false),
+            (format!(".10.9.0.11.{}-{}-{boot}-{ns}.tmp", me.pid, me.start + 1), false),
+            // Another PID namespace's: not by its pid, so kept here (no namespace has inode 1, but this
+            // test may run where no census can be taken); one naming no number is no tag of ours.
+            (format!(".10.9.0.12.{}-{}-{boot}-x.tmp", me.pid, me.start + 1), true),
+            (format!(".10.9.0.13.{}-{}-{boot}-{ns}-1.tmp", me.pid, me.start + 1), true),
         ];
         for (f, _) in &files {
             for dir in std::iter::once(&claims).chain(&dirs) {
@@ -7712,6 +7746,32 @@ pub(crate) mod tests {
         std::fs::write(&live, "").unwrap();
         h.write_debris("owed");
         assert!(!dead.exists() && live.exists());
+    }
+
+    /// #1084: a writer of another PID namespace (a host sharing a templates directory from a
+    /// container, its pid and start time perhaps this one's) is never judged by its pid, only once
+    /// its namespace is proven gone, and never without a census.
+    #[test]
+    fn write_debris_of_another_pid_namespace_waits_for_it() {
+        let d = crate::test_util::TempDir::new("pidns-debris");
+        let (me, boot) = (Ident::me(), &boot_id()[..crate::util::BOOT_TAG]);
+        let census = || Some(HashSet::from([100, 200]));
+        let blind = || None;
+        let (host, contained) = (pidns(Some(100), &census), pidns(Some(100), &blind));
+        let dead = me.start + 1;
+        for (tag, by_host, by_contained) in [
+            (format!("{}-{}-{boot}-100", me.pid, me.start), false, false),
+            (format!("{}-{dead}-{boot}-100", me.pid), true, true),
+            (format!("{}-{dead}-{boot}", me.pid), true, true),
+            (format!("{}-{}-{boot}-200", me.pid, me.start), false, false),
+            (format!("{}-{dead}-{boot}-200", me.pid), false, false),
+            (format!("{}-{}-{boot}-210", me.pid, me.start), true, false),
+            (format!("{}-{dead}-0000beef-210", me.pid), true, true),
+        ] {
+            let f = d.join(format!(".record.{tag}.tmp"));
+            assert_eq!(write_debris_by(&f, &host), by_host, "{tag}");
+            assert_eq!(write_debris_by(&f, &contained), by_contained, "{tag} without a census");
+        }
     }
 
     /// #556: without --run, a state's run directory follows from its path alone, so no state
@@ -8125,8 +8185,8 @@ pub(crate) mod tests {
             std::fs::create_dir_all(cg).unwrap();
         }
         std::fs::write(busy.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
-        sweep_scope(&busy);
-        sweep_scope(&unread);
+        sweep_scope(&busy, &PidNs::now());
+        sweep_scope(&unread, &PidNs::now());
         assert!(busy.exists() && unread.exists(), "populated or unreadable: kept");
         assert!(!busy.join("cgroup.kill").exists(), "never killed");
         std::fs::remove_dir_all(d).unwrap();
@@ -8138,13 +8198,25 @@ pub(crate) mod tests {
         let me = Ident::me();
         // The same pid with another start time is a dead owner, even though the pid is alive.
         let reused = Ident { start: me.start + 1, ..me.clone() };
+        // This host is namespace 100; 200 has a process left, 210 none (#1084).
+        let census = || Some(HashSet::from([100, 200]));
+        let host = pidns(Some(100), &census);
         for (name, events, expected) in [
             (format!("vm-{}", me.key()), Some("populated 0\n"), false),
+            (format!("vm-{}-100", me.key()), Some("populated 0\n"), false),
             (format!("vm-{}", reused.key()), Some("populated 0\n"), true),
+            (format!("vm-{}-100", reused.key()), Some("populated 0\n"), true),
             (format!("vm-{}", reused.key()), Some("populated 1\n"), false),
+            (format!("vm-{}-100", reused.key()), Some("populated 1\n"), false),
             (format!("vm-{}", reused.key()), None, false),
+            // Another namespace's is never judged by its pid here: only once that namespace is gone.
+            (format!("vm-{}-200", reused.key()), Some("populated 0\n"), false),
+            (format!("vm-{}-210", me.key()), Some("populated 0\n"), true),
+            (format!("vm-{}-210", me.key()), Some("populated 1\n"), false),
             ("vm-invalid".into(), Some("populated 0\n"), false),
             (format!("vm-{}-extra", reused.key()), Some("populated 0\n"), false),
+            (format!("vm-{}-100-1", reused.key()), Some("populated 0\n"), false),
+            (format!("vm-{}-", reused.key()), Some("populated 0\n"), false),
         ] {
             let cg = d.join(name);
             std::fs::create_dir_all(&cg).unwrap();
@@ -8153,10 +8225,20 @@ pub(crate) mod tests {
             }
             // Ordinary directories cannot emulate cgroupfs's removal with virtual files present.
             let mut removed = false;
-            sweep_scope_with(&cg, |_| removed = true);
+            sweep_scope_with(&cg, &host, |_| removed = true);
             assert_eq!(removed, expected, "{}", cg.display());
             std::fs::remove_dir_all(&cg).unwrap();
         }
+        // From a namespace that sees no census (a container): another namespace's always stays.
+        let blind = || None;
+        let cg = d.join(format!("vm-{}-210", reused.key()));
+        std::fs::create_dir_all(&cg).unwrap();
+        std::fs::write(cg.join("cgroup.events"), "populated 0\n").unwrap();
+        let mut removed = false;
+        sweep_scope_with(&cg, &pidns(Some(100), &blind), |_| removed = true);
+        assert!(!removed, "never without a census");
+        assert_eq!(scope_owner(&format!("vm-{}-7", me.key())), Some((me.clone(), Some(7))));
+        assert_eq!(scope_owner(&format!("vm-{}", me.key())), Some((me, None)));
     }
 
     #[test]

@@ -738,7 +738,7 @@ first command after a boot; to have that happen at boot, run any root
 command from a oneshot unit (`ExecStart=/usr/local/bin/flexvm ps`).
 
 The VM processes a listener starts (arrivals, standby VMs) move into
-cgroups of their own (`/sys/fs/cgroup/flexvm/vm-PID-START`) as they start, and so
+cgroups of their own (`/sys/fs/cgroup/flexvm/vm-PID-START-NS`) as they start, and so
 do VMs started with `-d` (`run -d`, `start`, `run -d --checkpoint`) and
 standby VMs from any command. So stopping or restarting the unit, with the default
 `KillMode=control-group`, stops only the listener; `KillMode=process` is not
@@ -758,15 +758,19 @@ keeps running under `stty tostop`: its VM process ignores SIGTTOU and SIGTTIN.
 
 Hosts in different PID namespaces should not share `/sys/fs/cgroup/flexvm`.
 Cgroup owners are recorded by PID and start time in the creator's PID namespace.
-Firecracker cgroups (`idle-PID-START-N-NS`) also name that namespace, and
-garbage collection leaves another namespace's alone until that namespace is
-proven gone (as taps, above), but an earlier build's
-(`idle-PID-START-N`) are judged by this namespace's processes and may have
-their Firecrackers killed, and a VM process's own empty `vm-PID-START` may be
-removed. Give each PID namespace its own cgroup subtree, mounted so
+Firecracker cgroups (`idle-PID-START-N-NS`) and a VM process's own
+(`vm-PID-START-NS`) also name that namespace, and garbage collection leaves
+another namespace's alone until that namespace is proven gone (as taps, above),
+but an earlier build's (`idle-PID-START-N`, `vm-PID-START`) are judged by this
+namespace's processes and may have their Firecrackers killed, or be removed
+once empty. Give each PID namespace its own cgroup subtree, mounted so
 that its `/sys/fs/cgroup` is rooted there; a new cgroup namespace or a second
 cgroup2 mount alone still sees the shared hierarchy. Separate state and run
-directories alone do not isolate cgroup collection.
+directories alone do not isolate cgroup collection. What flexvm names after a
+process in directories hosts may share (temporary files in a shared templates
+directory, VM processes' socket directories under `/run/flexvm/s` or
+`/tmp/flexvm-s-UID`) names its PID namespace too, so processes of different
+namespaces with the same pid and start time never write to one another's.
 
 ## Fast starts
 
