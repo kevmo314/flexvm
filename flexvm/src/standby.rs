@@ -340,7 +340,7 @@ pub fn pressure(host: &Host) -> PathBuf {
 }
 
 fn recent(path: &std::path::Path) -> bool {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_secs(60))
+    std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < FAILURE_BACKOFF)
 }
 
 /// Starts standby VMs up to the target and waits for them. Serialised per
@@ -359,6 +359,31 @@ pub(crate) fn refill_later(host: &Host, template: &str) -> Result<usize> {
     refill_by(host, template, false, true, false)
 }
 
+/// A failed holder's handoff: a separate process survives the command (or departing
+/// standby) that asked for it. Each worker waits a full backoff and attempts at most one round.
+fn retry_later(host: &Host, template: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(dir(host, template).join("standby.log"))?;
+    let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "standby-refill".as_ref(), template.as_ref()];
+    let null = File::open("/dev/null")?;
+    crate::util::spawn_self(&args, &log, null.as_raw_fd(), &[])?;
+    Ok(())
+}
+
+/// Internal detached worker. Rechecks the request and backoff under the refill lock:
+/// another caller may have filled the pool or failed again while this one slept.
+pub(crate) fn retry(host: &Host, template: &str) -> Result<()> {
+    // One sleeping worker per template: a handoff while another sleeps is that one's to take up,
+    // so failing holders cannot accumulate chains of workers. Released before its round, so the
+    // successor it may hand off to can take it.
+    let sleeping = crate::host::private_file(&refill_lock_path(host, template).with_extension("retry"))?;
+    let Ok(sleeping) = Flock::new(sleeping, libc::LOCK_EX | libc::LOCK_NB) else { return Ok(()) };
+    std::thread::sleep(FAILURE_BACKOFF);
+    drop(sleeping);
+    refill_with_retry(host, template, false, true, |_| refill_once(host, template, true, true), || retry_later(host, template))?;
+    Ok(())
+}
+
 /// `cooldown`: none while `.pressure` is recent, checked for each standby under the stop
 /// lock, so a refill that waited behind another while relief stopped standbys starts none.
 /// Only a count set by hand (`set`) starts them regardless. `ready_wait`: their readiness replies
@@ -369,14 +394,27 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool, ready_wait
 
 /// `refill(later)`: `later` for a recount another asked for, which keeps pressure's cooldown
 /// whatever this caller's (a `set` must not start standbys relief just stopped).
-fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnMut(bool) -> Result<usize>) -> Result<usize> {
+fn refill_with(host: &Host, template: &str, wait: bool, refill: impl FnMut(bool) -> Result<usize>) -> Result<usize> {
+    refill_with_retry(host, template, wait, false, refill, || retry_later(host, template))
+}
+
+fn refill_with_retry(
+    host: &Host,
+    template: &str,
+    mut wait: bool,
+    delayed: bool,
+    mut refill: impl FnMut(bool) -> Result<usize>,
+    mut retry: impl FnMut() -> Result<()>,
+) -> Result<usize> {
     let pending = refill_lock_path(host, template).with_extension("pending");
     // Publish before trying the lock: its holder either sees this, or we get the lock ourselves.
-    drop(crate::host::private_file(&pending)?);
+    if !delayed {
+        drop(crate::host::private_file(&pending)?);
+    }
     let (mut started, mut failed, mut failures) = (0, None, 0);
     // Until no request is left: each pending one was made after the last recount's snapshot
     // (a departure, a pull), and no one else takes it up on a host with no listener (#921).
-    // Or until a second round fails: then the requests left wait out the failure backoff.
+    // Or until a second round fails: a detached worker takes over after the backoff.
     for round in 0.. {
         // Requests after the first few, from a burst of departures, are taken together.
         if round >= 3 {
@@ -384,8 +422,15 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
         }
         let how = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
         let Some(lock) = refill_locked(Flock::new(refill_lock(host, template)?, how), wait)? else { break };
+        if delayed && !pending.try_exists()? {
+            break;
+        }
         let d = create_dir(host, template)?;
         let Some(legacy) = refill_locked(legacy_refill_lock(&d, how), wait)? else { break };
+        if delayed && recent(&d.join(".failed")) {
+            retry()?;
+            break;
+        }
         match std::fs::remove_file(&pending) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             r => r?,
@@ -399,6 +444,10 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
                 // and stop asking for recounts that would only start more failing loads.
                 let _ = crate::host::write_record(&d.join(".failed"), b"");
                 failures += 1;
+                // Keep this retry alive even if nobody else asked during its failed round.
+                if delayed {
+                    drop(crate::host::private_file(&pending)?);
+                }
                 match round {
                     0 => failed = Some(e),
                     _ => crate::log!("standby {template}: refill: {e}"),
@@ -408,8 +457,12 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
         drop(legacy);
         drop(lock);
         // One recount after a failure (it may have been the superseded generation's load), not
-        // more: the marker stays for whoever refills after the backoff.
-        if failures >= 2 {
+        // more: hand off a pending request to one worker after the failure backoff.
+        // A delayed worker does at most one round, including under continuous requests.
+        if failures >= 2 || delayed {
+            if pending.try_exists()? {
+                retry()?;
+            }
             break;
         }
         // Check after unlocking too, so a request between the last recount and unlock is not lost.
@@ -423,6 +476,9 @@ fn refill_with(host: &Host, template: &str, mut wait: bool, mut refill: impl FnM
         None => Ok(started),
     }
 }
+
+/// Cooldown after pressure or a failed refill; also the detached retry's minimum delay.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Between recounts of a refill lock holder past its first few (`refill_with`).
 const PENDING_BACKOFF: Duration = Duration::from_millis(200);
@@ -1903,23 +1959,123 @@ mod tests {
     fn failing_loads_under_continuous_requests_end_the_recounts() {
         let (_root, host, _paths, d) = pool("refill-failing");
         let mut rounds = 0;
-        let r = refill_with(&host, "default", true, |_| {
-            rounds += 1;
-            // Like a maintainer asking every round while each load fails after its 5 s.
-            assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
-            if rounds == 1 {
-                // Backed off from the first failure on, before this holder returns.
-                assert!(!d.join(".failed").exists());
-            } else {
-                assert!(recent(&d.join(".failed")));
-            }
-            Err("a standby vm failed to load".into())
-        });
+        let mut retries = 0;
+        let r = refill_with_retry(
+            &host,
+            "default",
+            true,
+            false,
+            |_| {
+                rounds += 1;
+                // Like a maintainer asking every round while each load fails after its 5 s.
+                assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
+                if rounds == 1 {
+                    // Backed off from the first failure on, before this holder returns.
+                    assert!(!d.join(".failed").exists());
+                } else {
+                    assert!(recent(&d.join(".failed")));
+                }
+                Err("a standby vm failed to load".into())
+            },
+            || {
+                retries += 1;
+                Ok(())
+            },
+        );
         assert_eq!(r.unwrap_err().to_string(), "a standby vm failed to load");
         assert_eq!(rounds, 2);
+        assert_eq!(retries, 1);
         assert!(recent(&d.join(".failed")));
-        // The last request is left for whoever refills after the backoff.
+        // The last request is handed to a detached retry after the backoff.
         assert!(refill_lock_path(&host, "default").with_extension("pending").exists());
+    }
+
+    #[test]
+    fn delayed_refills_wait_for_backoff_and_hand_off_only_one_failed_round() {
+        let (_root, host, _paths, d) = pool("refill-delayed");
+        let pending = refill_lock_path(&host, "default").with_extension("pending");
+        drop(crate::host::private_file(&pending).unwrap());
+        crate::host::write_record(&d.join(".failed"), b"").unwrap();
+        let mut retries = 0;
+        // A newer failure while the worker slept needs another full delay, without a load.
+        assert_eq!(
+            refill_with_retry(
+                &host,
+                "default",
+                false,
+                true,
+                |_| panic!("backoff still active"),
+                || {
+                    retries += 1;
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(retries, 1);
+        assert!(pending.exists());
+        let expire = || {
+            File::options()
+                .write(true)
+                .open(d.join(".failed"))
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - FAILURE_BACKOFF - Duration::from_secs(1))
+                .unwrap();
+        };
+        expire();
+        let mut rounds = 0;
+        let r = refill_with_retry(
+            &host,
+            "default",
+            false,
+            true,
+            |_| {
+                rounds += 1;
+                // New requests cannot extend a delayed worker beyond one round.
+                assert_eq!(refill_with(&host, "default", false, |_| panic!("refill lock was released")).unwrap(), 0);
+                Err("still failing".into())
+            },
+            || {
+                retries += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(r.unwrap_err().to_string(), "still failing");
+        assert_eq!(rounds, 1);
+        assert_eq!(retries, 2);
+        assert!(pending.exists());
+        assert!(recent(&d.join(".failed")));
+        expire();
+        // A failure without any new caller still retains its request and hands it on.
+        assert!(refill_with_retry(
+            &host,
+            "default",
+            false,
+            true,
+            |_| Err("still failing".into()),
+            || {
+                retries += 1;
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(retries, 3);
+        assert!(pending.exists());
+        expire();
+        // The next worker recounts the current pool. A disabled target starts no VMs.
+        assert_eq!(
+            refill_with_retry(&host, "default", false, true, |_| refill_once(&host, "default", true, true), || { panic!("satisfied request needs no retry") })
+                .unwrap(),
+            0
+        );
+        assert!(!pending.exists());
+        // A stale worker must not create a new request, even with a recent failure.
+        crate::host::write_record(&d.join(".failed"), b"").unwrap();
+        assert_eq!(
+            refill_with_retry(&host, "default", false, true, |_| panic!("request already consumed"), || { panic!("request already consumed") }).unwrap(),
+            0
+        );
     }
 
     #[test]
