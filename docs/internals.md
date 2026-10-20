@@ -1547,15 +1547,27 @@ main command leaves its session open so it can be reattached after a suspend.
 Closed sessions retain the ID as a tombstone until expiry so a delayed
 creation retry cannot execute the command again.
 
-`ATTACH <id> <offset> <claim>\n` attaches as ATTACH does and records the
-host's claim number for the attachment (SESSION, ARGV and the plain ATTACH
-record 0). `REJOIN <id> <offset> <claim>\n`, which an exec relay sends to
-attach again after a checkpoint cut its connection, is refused with
-`error: a newer client attached since` if the session's recorded claim is
-higher: a delayed REJOIN cannot shut down the attachment of a client that
-came after it. Agents older than these forms answer either one with
-`error: bad session request`. The host checks for that once per VM process
-and then sends plain ATTACH instead.
+`ATTACH <id> <offset> <claim> <epoch>\n` attaches as ATTACH does and records
+both the host's claim number and its epoch, a random u64 chosen once per host
+process. `REJOIN <id> <offset> <claim> <epoch>\n`, which an exec relay sends
+after a checkpoint cut its connection, is refused with
+`error: a newer client attached since` if its epoch differs from the recorded
+one or its claim is lower. A REJOIN accepted before a checkpoint but not yet
+run cannot steal a fresh attachment after restore or migration, even though
+the new host process's claim counter starts over. Fresh ATTACHes are never
+refused by this fence, whatever their epoch or claim.
+
+The claim-only forms from #1075, `ATTACH <id> <offset> <claim>\n` and
+`REJOIN <id> <offset> <claim>\n`, remain supported. SESSION, ARGV and plain
+ATTACH record claim 0 and no epoch; claim-only ATTACH records no epoch either.
+When no epoch is recorded, an otherwise valid REJOIN establishes its epoch.
+A claim-only REJOIN cannot replace an attachment with a recorded epoch.
+The host probes once per VM process with an invalid offset (attaching nothing),
+first for epoch support, then for claim-only support. Agents that reject a
+form with `error: bad session request` receive the next older form, down to
+plain ATTACH for pre-#1075 agents. A REJOIN's form refusal also downgrades the
+cached form and retries within the same deadline. Older agents retain their
+existing fencing behavior; the cross-process fence requires epoch support.
 
 Interactive input uses the same frame layout on the session connection after
 the request, or on an `APPIN` connection. `IN_DATA` (kind 1) carries a `u64 LE`

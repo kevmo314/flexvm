@@ -158,15 +158,34 @@ pub fn request_by(s: UnixStream, line: &str, at: Instant) -> Result<BufReader<Un
     Ok(r)
 }
 
-/// An ATTACH of session `id` from `offset`: plain for an older agent (`claim` None); else with the host's claim
-/// number, as a `REJOIN` (refused once a newer claim attached) if `rejoin` (#1074).
-pub fn attach_line(id: &str, offset: u64, claim: Option<u64>, rejoin: bool) -> Result<String> {
+/// The agent's supported attachment form, cached per VM process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AttachForm {
+    Numbered = 1,
+    Plain = 2,
+    Epoch = 3,
+}
+
+impl AttachForm {
+    pub fn older(self) -> Self {
+        match self {
+            Self::Epoch => Self::Numbered,
+            Self::Numbered | Self::Plain => Self::Plain,
+        }
+    }
+}
+
+/// ATTACH or REJOIN with the host process's epoch and claim where supported; plain ATTACH for old agents.
+pub fn attach_line(id: &str, offset: u64, claim: u64, epoch: u64, form: AttachForm, rejoin: bool) -> Result<String> {
     if !valid_session_id(id) {
         bail!("bad session id");
     }
-    Ok(match claim {
-        None => format!("ATTACH {id} {offset}"),
-        Some(n) => format!("{} {id} {offset} {n}", if rejoin { "REJOIN" } else { "ATTACH" }),
+    let verb = if rejoin && form != AttachForm::Plain { "REJOIN" } else { "ATTACH" };
+    Ok(match form {
+        AttachForm::Plain => format!("{verb} {id} {offset}"),
+        AttachForm::Numbered => format!("{verb} {id} {offset} {claim}"),
+        AttachForm::Epoch => format!("{verb} {id} {offset} {claim} {epoch}"),
     })
 }
 
@@ -475,6 +494,19 @@ pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -
 mod tests {
     use super::*;
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn attachment_forms_keep_old_agents_compatible() {
+        for (form, attach, rejoin) in [
+            (AttachForm::Plain, "ATTACH sid 5", "ATTACH sid 5"),
+            (AttachForm::Numbered, "ATTACH sid 5 3", "REJOIN sid 5 3"),
+            (AttachForm::Epoch, "ATTACH sid 5 3 18446744073709551615", "REJOIN sid 5 3 18446744073709551615"),
+        ] {
+            assert_eq!(attach_line("sid", 5, 3, u64::MAX, form, false).unwrap(), attach);
+            assert_eq!(attach_line("sid", 5, 3, u64::MAX, form, true).unwrap(), rejoin);
+            assert!(attach_line("bad/id", 0, 1, 2, form, false).is_err());
+        }
+    }
 
     /// A socket standing in for the guest agent's (through Firecracker's vsock), in a fixture directory.
     fn agent(tag: &str) -> (crate::test_util::TempDir, PathBuf, UnixListener) {

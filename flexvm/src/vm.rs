@@ -138,7 +138,7 @@ pub struct Vm {
     clock_unsure: AtomicBool,
     next_exec: AtomicU64,
     /// Whether its agent takes the host's claim numbers on ATTACH and REJOIN (#1074): 0 not known yet, 1 it
-    /// does, 2 it is older (`vmproc::fenced`).
+    /// does, 2 it is older, 3 it also takes a host epoch (`vmproc::fenced`).
     pub(crate) fenced: std::sync::atomic::AtomicU8,
     fc: Mutex<Option<Firecracker>>,
     /// Its Firecracker's (pid) tap descriptor, copied (`tap_watch`).
