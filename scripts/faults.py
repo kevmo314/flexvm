@@ -769,7 +769,7 @@ def route():
     # Armed until the migration answered: its reroute runs after the commit's ack.
     with armed_fault(A, "route", 600000):
         r = ok(migrate(A, n, B))
-    check("route: migrate reports reroute error but succeeds", r["reroute_error"] is not None, r["reroute_error"])
+    check("route: migrate reports reroute error but succeeds", "injected fault: route_via failed" in (r["reroute_error"] or ""), r["reroute_error"])
     w = where(n)
     check("route: source never resumed", w.get(A) in (None, "source") and w.get(B) == "running", w)
     st = wait_released(B, n)
