@@ -8,7 +8,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-state=${FLEXVM_STATE_DIR:-/var/lib/flexvm}
+state=$(realpath -m "${FLEXVM_STATE_DIR:-/var/lib/flexvm}")
 mode=
 while (( $# )); do
   case "$1" in

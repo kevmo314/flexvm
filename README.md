@@ -92,9 +92,11 @@ assume that.
 
 ### Releasing the artifacts
 
-Releases use semver tags `vMAJOR.MINOR.PATCH`, starting at `v0.1.0` after
-`artifacts-5`, the last `artifacts-N` release. The Cargo version in
-`flexvm/Cargo.toml` matches the tag without its `v` prefix (currently `0.1.0`).
+Releases use semver tags `vMAJOR.MINOR.PATCH`: `artifacts-5` was the last
+`artifacts-N` release, and `v0.1.0` the first source release (whose
+Firecracker came from `artifacts-1`), so the first semver artifacts release is
+`v0.2.0`. The version in `flexvm/Cargo.toml` and `guest/Cargo.toml` is the tag
+without its `v` (`scripts/pin-artifacts.sh --check` fails otherwise).
 A release (`ARTIFACTS_TAG` in `scripts/versions.sh`) is built from what
 `scripts/pin-artifacts.sh --inputs` lists: Firecracker's version, the commit
 its tag names (`FC_COMMIT`; the build refuses any other), the patches, the
@@ -108,8 +110,8 @@ otherwise. Then:
 1. Merge it. Main now names a pending tag: flexvm builds from it download
    nothing until step 3 (build.rs warns), and CI warns.
 2. Push the tag at that commit on main:
-   `git tag v0.1.0 <commit> && git push origin v0.1.0` (use the new
-   `ARTIFACTS_TAG` for subsequent releases).
+   `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`, with the
+   `ARTIFACTS_TAG` it names.
    `.github/workflows/release.yml` checks that `versions.sh` there names it,
    builds the assets with `scripts/release-assets.sh`, attests their build
    provenance and publishes them.

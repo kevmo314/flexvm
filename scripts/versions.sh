@@ -14,7 +14,7 @@ CI=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$CI_VERSION/$ARCH
 # pushed; flexvm and fetch.sh download from it only once scripts/checksums.sha256 pins its assets
 # (scripts/pin-artifacts.sh writes those lines). A change to what a release is built from (scripts/pin-artifacts.sh
 # --inputs: Firecracker's version, commit and patches, the build recipe, the kernel) bumps this in the same change;
-# see RELEASING in README.md. Tags use vMAJOR.MINOR.PATCH (starting at v0.1.0 after artifacts-5).
+# see RELEASING in README.md. Tags use vMAJOR.MINOR.PATCH (artifacts-5 was the last artifacts-N; v0.1.0 was the first source release).
 # A release's assets never change.
-ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.1.0}
+ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.2.0}
 ARTIFACTS_URL=https://github.com/numerataz/flexvm/releases/download/$ARTIFACTS_TAG
