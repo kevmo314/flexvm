@@ -58,7 +58,9 @@ not wait on the host:
   the memory it keeps for its next checkpoint: the request is a number in
   `RUN/.locks/release-BOOT`, raised under the host lock, which each VM
   process looks for every 100 ms, answering in its own file in
-  `RUN/.locks/released-BOOT/`. The request waits up to 200 ms for each that
+  `RUN/.locks/released-BOOT/`. Taking the host lock waits until the caller's
+  deadline, or without a time limit if it has none; the response wait starts
+  after taking the lock. The request waits up to 200 ms for each that
   runs (not for one that is stopped; the files of those proven gone are
   removed), and MemAvailable is read again whoever answered: that memory is
   not admitted, so it never refuses a grant (#648, #677). Eviction and the
@@ -788,8 +790,8 @@ through, so the checkpoint is exactly the memory at the pause.
   where the kernel cannot). Without room for a block of copies, faults ask the writers for
   their pages and wait for them as over budget, and the pause protects
   pages it would have copied hot; no checkpoint fails for it. Under the
-  eviction mark (or with the VM starved), or when another process asks
-  (admission before it refuses, above), the memory kept for the next
+  reserve, under the eviction mark with peers, with the VM starved, or when
+  another process asks (admission before it refuses, above), the memory kept for the next
   checkpoint is released (rescue chunks, hot pages' memory, and the last
   checkpoint's hot pages, so the next one writes its hot pages without
   comparing them), and a copy that ends under the reserve keeps none.

@@ -652,7 +652,11 @@ warns until then). Derived values:
   mark by half the mark's height over the reserve. Default: the reserve plus
   the reserve or 512, whichever is more. A peer takes such a VM only if it
   stays above its own mark, and a host refills standby VMs only above its
-  own; a mark under the reserve counts as the reserve.
+  own; a mark under the reserve counts as the reserve. Before moving VMs,
+  the host asks for kept checkpoint memory back. Without peers, the
+  controller retains that memory until available memory falls below the
+  reserve (or the VM is starved); admission can still ask for it before
+  refusing a grant.
 
 Derived values are never saved: they follow the routes, the peers and the
 host's RAM. A wildcard listener with peers elsewhere and no route toward them

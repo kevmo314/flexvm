@@ -2134,13 +2134,13 @@ impl Proc {
                 self.publish();
             }
             let mut avail = host_available_mib();
-            let (_, at, _) = self.host.config_now().evict_marks();
+            let cfg = self.host.config_now();
             // Memory VM processes keep for their next checkpoint never moves a VM away: it goes back first (#648).
-            if avail.is_some_and(|a| a < at) {
+            if relief_needs_memory(&cfg, avail) {
                 crate::hostmem::release_kept(&self.host, None);
                 avail = host_available_mib();
             }
-            let short = avail.is_some_and(|a| a < at) || vm.starving();
+            let short = relief_needs_memory(&cfg, avail) || vm.starving();
             self.ready_room(short);
             relieve(&self.host, avail, vm.starving(), &mut stopping);
             // A derived announce device follows the routes (one that changed gets proxy ARP).
@@ -2814,6 +2814,13 @@ fn arrival_more(granted: u64, (need, cap): (u64, u64)) -> u64 {
 /// what admission promised guests (none if that cannot be read).
 fn room_sample(reserve: u64, available: impl FnOnce() -> Option<u64>, promised: impl FnOnce() -> Option<u64>) -> impl FnOnce() -> Option<u64> {
     move || Some(available()?.saturating_sub(reserve).saturating_sub(promised().unwrap_or(u64::MAX)))
+}
+
+/// Kept checkpoint memory goes back before moving VMs to peers or stopping standby VMs under the reserve.
+/// Without peers, the space between the reserve and eviction mark is still usable for checkpoints.
+fn relief_needs_memory(cfg: &crate::host::Config, avail: Option<u64>) -> bool {
+    let (reserve, at, _) = cfg.evict_marks();
+    avail.is_some_and(|a| a < reserve || (!cfg.peers.is_empty() && a < at))
 }
 
 /// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`;
@@ -5016,6 +5023,21 @@ mod tests {
         let lock = crate::host::Flock::new(crate::host::private_file(&path).unwrap(), libc::LOCK_EX).unwrap();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         (child, lock)
+    }
+
+    #[test]
+    fn checkpoint_memory_is_released_only_when_relief_can_use_it() {
+        let mut cfg = crate::host::Config { reserve_mib: Some(1024), evict_mib: Some(2048), ..Default::default() };
+        for peers in [false, true] {
+            cfg.peers = if peers { vec!["127.0.0.1:1".into()] } else { Vec::new() };
+            for (avail, expected) in [(None, false), (Some(1023), true), (Some(1024), peers), (Some(1536), peers), (Some(2047), peers), (Some(2048), false)] {
+                assert_eq!(relief_needs_memory(&cfg, avail), expected, "available {avail:?}, peers {peers}");
+            }
+            cfg.evict_mib = Some(512);
+            assert!(relief_needs_memory(&cfg, Some(1023)), "a mark below the reserve still releases under the reserve");
+            assert!(!relief_needs_memory(&cfg, Some(1024)));
+            cfg.evict_mib = Some(2048);
+        }
     }
 
     /// MemAvailable unreadable (None) is no pressure: no standby is stopped

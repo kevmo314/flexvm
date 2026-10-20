@@ -102,6 +102,7 @@ pub fn serve(run: &Path, release: impl Fn()) {
 
 /// Asks every VM process of `host` to release the memory it keeps for its next checkpoint, and waits until each that
 /// runs has, up to `RELEASE_WAIT` (or `deadline`, if sooner). Reuses a request made within `RELEASE_GAP_MS`.
+/// Taking the host lock is bounded only by the caller's deadline, separately from the response wait.
 /// Callers read MemAvailable again after it whatever it found: some may have answered.
 pub fn release_kept(host: &Host, deadline: Option<Instant>) {
     if let Some((n, by)) = ask(host, deadline) {
@@ -112,7 +113,7 @@ pub fn release_kept(host: &Host, deadline: Option<Instant>) {
 /// Raises the request's number under the host lock, or returns the existing number within `RELEASE_GAP_MS`
 /// with its remaining wait, so joining callers share its deadline. None if the lock or write fails.
 fn ask(host: &Host, deadline: Option<Instant>) -> Option<(u64, Instant)> {
-    let _l = host.lock_by(Some(deadline.unwrap_or_else(|| Instant::now() + release_wait()))).ok()?;
+    let _l = host.lock_by(deadline).ok()?;
     let (n, at) = last(&host.run).unwrap_or_default();
     let when = Instant::now();
     let now = crate::host::boottime_ms();
@@ -282,14 +283,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_request_gets_its_wait_after_the_host_lock() {
+    fn a_fresh_request_without_a_deadline_gets_its_wait_after_the_host_lock() {
         let (_dir, h) = crate::host::tests::host("hostmem-lock-wait");
         let lock = h.lock().unwrap();
         let other = h.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             tx.send(()).unwrap();
-            ask(&other, Some(Instant::now() + Duration::from_secs(30))).unwrap()
+            ask(&other, None).unwrap()
         });
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
         std::thread::sleep(RELEASE_WAIT + POLL);
@@ -300,6 +301,20 @@ mod tests {
         assert!(last(&h.run).unwrap().1 >= before, "stamped after taking the lock");
         assert!(by >= when + RELEASE_WAIT, "lock contention does not consume the release wait");
         assert!(RELEASE_WAIT >= POLL + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_callers_deadline_bounds_the_host_lock_wait() {
+        let (_dir, h) = crate::host::tests::host("hostmem-lock-deadline");
+        let _lock = h.lock().unwrap();
+        let other = h.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(ask(&other, Some(Instant::now() + RELEASE_WAIT))).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_none());
+        waiter.join().unwrap();
+        assert_eq!(last(&h.run), None, "no request made after the caller gave up");
     }
 
     #[test]
