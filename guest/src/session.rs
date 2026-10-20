@@ -2,8 +2,9 @@
 //! `CLOSE <id>`, `RELEASE <id> <end> <code>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
 //! After an exit, the client may send SESSION_DONE on the attachment, within `ACK_WAIT`, to release the
 //! session; without that acknowledgement the exit stays available for reattachment. A late one the host passes
-//! on as `RELEASE`, which closes only the session that exited with that code after `end` bytes: never a running
-//! one, nor one started under the id since (#1047).
+//! on as `RELEASE`, which closes only the session that exited with that code after `end` bytes and has not been
+//! attached since its exit was sent: never a running one, one started under the id since (#1047), nor one another
+//! client took over.
 //! The command runs in a process group of its own; its exit is the shell's, recorded once output stops or
 //! `DRAIN` after the shell exits; background processes that keep its pipes open run on, their later output
 //! read and dropped (by one thread, for at most `MAX_DISCARDED` pipes: past that, a job's next write gets
@@ -462,7 +463,8 @@ pub enum Request<'a> {
     Close {
         id: &'a str,
     },
-    /// Closes the session if it exited with `code` after `end` bytes of output; any other is kept.
+    /// Closes the session if it exited with `code` after `end` bytes of output and was not attached since its exit
+    /// was sent; any other is kept.
     Release {
         id: &'a str,
         end: u64,
@@ -730,10 +732,12 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             let Some(entry) = table.live.get(id) else { return Ok(None) };
             let same = {
                 let o = entry.output.0.lock().unwrap();
-                o.exit == Some(code) && o.end == end
+                // Sent the exit on its last attachment, none since (`attach` clears `delivered`), as an
+                // acknowledgement on it would close it: a client attached since (from an earlier offset, say) keeps it.
+                o.exit == Some(code) && o.end == end && o.delivered.is_some() && o.attached.is_none()
             };
             if !same {
-                return Err(io::Error::other("session kept: it is not the one that exited so"));
+                return Err(io::Error::other("session kept: not the one that exited so, or attached since"));
             }
             // Exited: its shell is reaped, there is nothing to kill.
             table.close(id, None);
@@ -1976,20 +1980,35 @@ mod tests {
     #[test]
     fn release_closes_only_the_exit_it_names() {
         let (sessions, statuses) = (Sessions::default(), statuses());
-        {
+        let (reattached, current) = {
             let mut table = sessions.lock().unwrap();
             let done = finished(&mut table, "done", None);
-            done.0.lock().unwrap().end = 5;
+            {
+                let mut o = done.0.lock().unwrap();
+                (o.end, o.delivered) = (5, Some(0));
+            }
             live(&mut table, "running", Output::default());
-        }
-        for line in ["RELEASE done 4 0", "RELEASE done 5 1", "RELEASE running 0 0"] {
-            assert!(request(&sessions, &statuses, line, b"").ends_with(b"session kept: it is not the one that exited so"), "{line}");
+            // Its exit was sent, then another client attached (from an earlier offset): not yet sent it again.
+            let reattached = finished(&mut table, "reattached", None);
+            reattached.0.lock().unwrap().end = 5;
+            // Sent the exit, and still attached: that client's own acknowledgement may yet come.
+            let current = finished(&mut table, "current", None);
+            {
+                let mut o = current.0.lock().unwrap();
+                (o.end, o.delivered, o.attached) = (5, Some(1), Some(Attachment { id: 2, conn: None }));
+            }
+            (reattached, current)
+        };
+        for line in ["RELEASE done 4 0", "RELEASE done 5 1", "RELEASE running 0 0", "RELEASE reattached 5 0", "RELEASE current 5 0"] {
+            assert!(request(&sessions, &statuses, line, b"").ends_with(b"session kept: not the one that exited so, or attached since"), "{line}");
         }
         assert!(request(&sessions, &statuses, "RELEASE nope 0 0", b"").ends_with(b"closed"));
         assert!(request(&sessions, &statuses, "RELEASE done 5 0", b"").ends_with(b"closed"));
         let table = sessions.lock().unwrap();
         assert!(!table.live.contains_key("done") && table.closed.contains_key("done"));
         assert!(table.live.contains_key("running") && !table.ended("nope"));
+        assert!(table.live.contains_key("reattached") && table.live.contains_key("current"));
+        assert!(!reattached.0.lock().unwrap().closed && !current.0.lock().unwrap().closed);
     }
 
     #[test]

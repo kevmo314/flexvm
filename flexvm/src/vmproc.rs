@@ -145,11 +145,16 @@ struct Rejoin<'a, G> {
 /// How long attaching again may fail for other reasons (the VM gone) before the relay ends.
 const REJOIN_GIVE_UP: Duration = Duration::from_secs(5);
 
-/// Until `guest` is the session's attachment again, from `at`; the client's hangup ends it, as does slot
-/// pressure (a VM left paused, say: the client then attaches again itself once it reads).
+/// Until `guest` is the session's attachment again, from `at`; the client's hangup ends it, as do slot
+/// pressure (a VM left paused, say: the client then attaches again itself once it reads) and another client
+/// taking the session over.
 fn rejoin_guest<G>(guest: &mut BufReader<G>, client: &UnixStream, wait: &Wait, rejoin: &Rejoin<G>, at: u64) -> Result<()> {
     let mut failing = None;
     loop {
+        // Another client took the session over meanwhile: an ATTACH from here would shut its attachment down.
+        if (wait.replaced)() {
+            bail!("another client attached to the session");
+        }
         match (rejoin.attach)(at) {
             Ok(Some((g, fd))) => {
                 *guest = g;
@@ -181,8 +186,8 @@ fn read_side_gone(client: &UnixStream) -> bool {
 }
 
 /// Until the client has read all that was sent it (SIOCOUTQ is 0) or hung up (what it read before is not
-/// known: the acknowledgement's read then ends at once); a stall under pressure fails it, as in `relay_output`.
-/// False: it can no longer read, so acknowledges nothing.
+/// known: the acknowledgement's read then ends at once); a stall under pressure fails it, as in `relay_output`,
+/// and so does another client taking the session over. False: it can no longer read, so acknowledges nothing.
 fn drained(client: &UnixStream, wait: &Wait) -> Result<bool> {
     let (mut since, mut left) = (Instant::now(), libc::c_int::MAX);
     loop {
@@ -207,6 +212,10 @@ fn drained(client: &UnixStream, wait: &Wait) -> Result<bool> {
         }
         if read_side_gone(client) {
             return Ok(false);
+        }
+        // Another client took the session over: it is sent the exit itself.
+        if (wait.replaced)() {
+            bail!("another client attached to the session");
         }
     }
 }
@@ -5984,5 +5993,45 @@ mod session_relay_tests {
         let t = Instant::now();
         assert!(relay_session(&mut guest, &mut &relay, &idle(), false, None).is_err());
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    }
+
+    /// A relay whose session another client took over while it waited out a checkpoint never attaches again:
+    /// its ATTACH would shut the newer attachment down (#1062 review).
+    #[test]
+    fn a_replaced_relay_does_not_attach_again() {
+        let (client, _peer) = UnixStream::pair().unwrap();
+        let (old, _agent) = UnixStream::pair().unwrap();
+        let mut guest = BufReader::new(old);
+        let asked = AtomicUsize::new(0);
+        // The first try finds the VM still being checkpointed; another client attaches meanwhile.
+        let attach = |_: u64| -> Result<Option<(BufReader<UnixStream>, std::os::fd::RawFd)>> {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        };
+        let rejoin = Rejoin { id: "sid", from: 0, attach: &attach };
+        let replaced = || asked.load(Ordering::SeqCst) >= 1;
+        let wait = Wait { replaced: &replaced, ..idle() };
+        let err = rejoin_guest(&mut guest, &client, &wait, &rejoin, 0).unwrap_err();
+        assert!(err.to_string().contains("another client"), "{err}");
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// Nor does one whose exit its client has not read yet stay waiting for it once replaced (#1062 review).
+    #[test]
+    fn a_replaced_relay_stops_waiting_for_its_exit_to_be_read() {
+        let (relay, _client) = UnixStream::pair().unwrap();
+        (&relay).write_all(b"unread").unwrap();
+        let replaced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = replaced.clone();
+        let worker = thread::spawn(move || {
+            let is_replaced = || r.load(Ordering::SeqCst);
+            let wait = Wait { replaced: &is_replaced, ..idle() };
+            drained(&relay, &wait).map_err(|e| e.to_string())
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(!worker.is_finished(), "the relay stopped waiting for its client");
+        replaced.store(true, Ordering::SeqCst);
+        let err = worker.join_within().unwrap().unwrap_err();
+        assert!(err.contains("another client"), "{err}");
     }
 }
