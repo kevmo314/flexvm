@@ -217,19 +217,22 @@ impl Pager {
         Err(io::Error::other("injected fault: rescue failed"))
     }
 
+    /// Firecracker's `/proc/PID/pagemap`, opened once.
+    pub(super) fn pagemap_file(&self) -> io::Result<&std::fs::File> {
+        if let Some(f) = self.pagemap.get() {
+            return Ok(f);
+        }
+        // Bound to the memory of the process it was opened for.
+        let f = std::fs::File::open(format!("/proc/{}/pagemap", self.pid.load(Ordering::SeqCst)))?;
+        if self.exited() {
+            return Err(io::Error::other("firecracker exited"));
+        }
+        Ok(self.pagemap.get_or_init(|| f))
+    }
+
     /// The pagemap entries of `n` pages from `page` in Firecracker (`PM_*` bits).
     fn pagemap(&self, page: usize, n: usize) -> io::Result<Vec<u64>> {
-        let f = match self.pagemap.get() {
-            Some(f) => f,
-            None => {
-                // Bound to the memory of the process it was opened for.
-                let f = std::fs::File::open(format!("/proc/{}/pagemap", self.pid.load(Ordering::SeqCst)))?;
-                if self.exited() {
-                    return Err(io::Error::other("firecracker exited"));
-                }
-                self.pagemap.get_or_init(|| f)
-            }
-        };
+        let f = self.pagemap_file()?;
         let mut raw = vec![0u8; n * 8];
         std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, self.addr(page)? / PAGE_SIZE as u64 * 8)?;
         Ok(raw.chunks(8).map(|e| u64::from_le_bytes(e.try_into().unwrap())).collect())
