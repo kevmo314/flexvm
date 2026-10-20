@@ -8384,11 +8384,15 @@ def standby_refill_race():
         if os.path.exists(f):
             os.remove(f)
     fault(A, "no_evict", 600000)
-    fault(A, "standby_lock_stall", 2000)
+    # Armed until the refill is done, however long its standby takes to get to the stall: pressure starts
+    # once it stalls there (3 s, before its lock file), not after a guessed delay.
+    clear_gate(A, "standby_lock_stall")
+    fault(A, "standby_lock_stall", 600000)
     res, seen = {}, {}
     th = start_thread(target=lambda: res.update(r=set_standby(A, t, 1)))
     try:
-        time.sleep(1)
+        check("standby refill race: the refill's standby stalls before its lock file", wait_for(lambda: reached(A, "standby_lock_stall"), 30),
+              reached(A, "standby_lock_stall"))
         avail = mem_available()
         with marks(avail + 4096, avail + 4608):
             start = time.time()
