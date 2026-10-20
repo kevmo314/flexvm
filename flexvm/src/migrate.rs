@@ -734,7 +734,7 @@ impl Proc {
         };
         let revoked = Arc::new(Mutex::new(false));
         *self.held_in.lock().unwrap() = Some(revoked.clone());
-        if fault("lost_ack") {
+        if tripped("lost_ack") {
             let _ = w.shutdown(std::net::Shutdown::Both);
         } else {
             let _ = answer(json!({"ok": true, "result": {
