@@ -383,24 +383,52 @@ fn host_epoch() -> Result<u64> {
         .map_err(Into::into)
 }
 
-/// Which attachment form `vm`'s agent takes, asked once, by `at`. A supported form fails on the bad offset,
-/// an unsupported one on the whole request. Neither probe attaches a session.
+/// Establish the process's VM-wide epoch fence, then cache the supported attachment form, by `at`.
+/// The invalid-offset capability probes never attach a session.
 fn fenced(vm: &Vm, at: Instant) -> Result<guest::AttachForm> {
     use guest::AttachForm;
+    let _guard = vm.attach_fence.lock().unwrap();
     match vm.fenced.load(Ordering::SeqCst) {
         1 => return Ok(AttachForm::Numbered),
         2 => return Ok(AttachForm::Plain),
         3 => return Ok(AttachForm::Epoch),
         _ => {}
     }
-    let form = probe_form(&|line| {
+    let ask = |line: &str| {
         let (mut g, id) = vm.exec_by(at, |s| guest::request_by(s, line, at))?;
         let reply = guest::read_frame(&mut crate::util::By { s: &mut g, at });
         vm.untrack_exec(id);
-        probed(reply?)
-    })?;
+        reply?.ok_or_else(|| "agent closed the fence request".into())
+    };
+    establish_fence(ask, host_epoch()?)?;
+    let form = probe_form(&|line| probed(Some(ask(line)?)))?;
     vm.fenced.store(form as u8, Ordering::SeqCst);
     Ok(form)
+}
+
+/// Read the snapshot's generation, then advance it before sending any attachment.
+/// A delayed update from the previous process has an older number, even if it runs last. One accepted
+/// before the checkpoint can still take the generation this process read: read it again and go past it.
+fn establish_fence(ask: impl Fn(&str) -> Result<(u8, Vec<u8>)>, epoch: u64) -> Result<()> {
+    const TRIES: usize = 3;
+    for tries in 1.. {
+        let (kind, reply) = ask("FENCE")?;
+        let reply = String::from_utf8(reply)?;
+        if tries == 1 && kind == guest::FRAME_MSG && reply == "unknown request \"FENCE\"" {
+            return Ok(()); // Older guests retain their existing attach protocol.
+        }
+        let generation = if kind == guest::FRAME_MSG { reply.strip_prefix("ok ").and_then(|n| n.parse::<u64>().ok()) } else { None };
+        let generation = generation.ok_or_else(|| format!("reading attachment fence: {reply}"))?.checked_add(1).ok_or("attachment fence exhausted")?;
+        let (kind, reply) = ask(&format!("FENCE {generation} {epoch}"))?;
+        if kind == guest::FRAME_MSG && reply == format!("ok {generation}").as_bytes() {
+            return Ok(());
+        }
+        if tries < TRIES && kind == guest::FRAME_MSG && reply == format!("error: {}", guest::ATTACHED_SINCE).as_bytes() {
+            continue;
+        }
+        bail!("establishing attachment fence: {}", String::from_utf8_lossy(&reply));
+    }
+    unreachable!()
 }
 
 fn probe_form(probe: &dyn Fn(&str) -> Result<bool>) -> Result<guest::AttachForm> {
@@ -2010,19 +2038,22 @@ impl Proc {
         let session = req["session"].as_str().unwrap_or_default();
         // The guest serves the newest attachment only: an older relay waiting for its client gives way.
         let claim = (action != "close").then(|| Claim::new(session));
-        let started = match (action, &claim) {
-            // With its claim's number where the agent takes one: a relay's later REJOIN under an older claim is
-            // then refused rather than shut this attachment down (#1074).
-            ("attach", Some(claim)) => fenced(vm, Instant::now() + guest::TIMEOUT).and_then(|fenced| {
-                let line = guest::attach_line(session, req["offset"].as_u64().unwrap_or(0), claim.n, host_epoch()?, fenced, false)?;
-                vm.exec(|s| guest::request_on(s, &line, guest::TIMEOUT))
-            }),
-            _ => vm.exec(|s| {
-                let cmd = if matches!(action, "start" | "argv") { guest::command_body(&req["cmd"])? } else { String::new() };
-                let id = req["session"].as_str().ok_or("missing session id")?;
-                guest::session(s, action, id, req["offset"].as_u64().unwrap_or(0), &cmd, guest::TIMEOUT)
-            }),
-        };
+        let started = (|| {
+            let form = if action == "close" { guest::AttachForm::Plain } else { fenced(vm, Instant::now() + guest::TIMEOUT)? };
+            match (action, &claim) {
+                // With its claim's number where the agent takes one: a relay's later REJOIN under an older claim is
+                // then refused rather than shut this attachment down (#1074).
+                ("attach", Some(claim)) => {
+                    let line = guest::attach_line(session, req["offset"].as_u64().unwrap_or(0), claim.n, host_epoch()?, form, false)?;
+                    vm.exec(|s| guest::request_on(s, &line, guest::TIMEOUT))
+                }
+                _ => vm.exec(|s| {
+                    let cmd = if matches!(action, "start" | "argv") { guest::command_body(&req["cmd"])? } else { String::new() };
+                    let id = req["session"].as_str().ok_or("missing session id")?;
+                    guest::session(s, action, id, req["offset"].as_u64().unwrap_or(0), &cmd, guest::TIMEOUT)
+                }),
+            }
+        })();
         let (mut g, id) = match started {
             Ok(g) => g,
             Err(e) => {
@@ -6375,6 +6406,80 @@ mod session_relay_tests {
         let err = reattach(&open, &|| Ok(AttachForm::Epoch), &|_| panic!("downgraded"), "sid", 0, 99, Instant::now() + WAIT).err().unwrap();
         assert!(err.to_string().contains("another client"));
         assert_eq!(*lines.lock().unwrap(), [format!("REJOIN sid 0 99 {epoch}")]);
+    }
+
+    #[test]
+    fn attachment_fence_requires_matching_acknowledgement() {
+        let lines = Mutex::new(vec![]);
+        let ask = |line: &str| {
+            lines.lock().unwrap().push(line.to_string());
+            let reply = if line == "FENCE" { "ok 41" } else { "ok 42" };
+            Ok((guest::FRAME_MSG, reply.as_bytes().to_vec()))
+        };
+        establish_fence(ask, 200).unwrap();
+        assert_eq!(*lines.lock().unwrap(), ["FENCE", "FENCE 42 200"]);
+        // No attach form fallback is allowed for a malformed reply.
+        for reply in ["ok 41", "unknown request \"FENCE\"", "ok", ""] {
+            let asks = AtomicUsize::new(0);
+            let err = establish_fence(
+                |_| {
+                    let n = asks.fetch_add(1, Ordering::SeqCst);
+                    Ok((guest::FRAME_MSG, if n == 0 { b"ok 41".to_vec() } else { reply.as_bytes().to_vec() }))
+                },
+                200,
+            );
+            assert!(err.is_err(), "{reply}");
+            assert_eq!(asks.load(Ordering::SeqCst), 2);
+        }
+        for reply in ["error: busy", "ok invalid", "ok 18446744073709551615"] {
+            assert!(establish_fence(|_| Ok((guest::FRAME_MSG, reply.as_bytes().to_vec())), 200).is_err());
+        }
+        assert!(establish_fence(|_| Err("deadline passed".into()), 200).is_err());
+        assert!(establish_fence(|_| Ok((guest::FRAME_STDOUT, b"ok 41".to_vec())), 200).is_err());
+    }
+
+    /// A delayed pre-checkpoint update taking the generation read is passed by reading it again (#1090), a
+    /// bounded number of times.
+    #[test]
+    fn attachment_fence_passes_a_delayed_update() {
+        let lines = Mutex::new(vec![]);
+        let generation = AtomicUsize::new(41);
+        let ask = |line: &str| {
+            lines.lock().unwrap().push(line.to_string());
+            if line == "FENCE" {
+                return Ok((guest::FRAME_MSG, format!("ok {}", generation.load(Ordering::SeqCst)).into_bytes()));
+            }
+            // The previous process's update, accepted before the checkpoint, ran first.
+            if generation.load(Ordering::SeqCst) == 41 {
+                generation.store(42, Ordering::SeqCst);
+                return Ok((guest::FRAME_MSG, format!("error: {}", guest::ATTACHED_SINCE).into_bytes()));
+            }
+            Ok((guest::FRAME_MSG, b"ok 43".to_vec()))
+        };
+        establish_fence(ask, 200).unwrap();
+        assert_eq!(*lines.lock().unwrap(), ["FENCE", "FENCE 42 200", "FENCE", "FENCE 43 200"]);
+        let asks = AtomicUsize::new(0);
+        let refused = |line: &str| {
+            asks.fetch_add(1, Ordering::SeqCst);
+            Ok((guest::FRAME_MSG, if line == "FENCE" { b"ok 41".to_vec() } else { format!("error: {}", guest::ATTACHED_SINCE).into_bytes() }))
+        };
+        assert!(establish_fence(refused, 200).is_err());
+        assert_eq!(asks.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn older_agents_skip_the_attachment_fence() {
+        let asks = AtomicUsize::new(0);
+        establish_fence(
+            |line| {
+                asks.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(line, "FENCE");
+                Ok((guest::FRAME_MSG, b"unknown request \"FENCE\"".to_vec()))
+            },
+            200,
+        )
+        .unwrap();
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
     }
 
     #[test]

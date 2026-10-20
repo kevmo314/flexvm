@@ -140,6 +140,8 @@ pub struct Vm {
     /// Whether its agent takes the host's claim numbers on ATTACH and REJOIN (#1074): 0 not known yet, 1 it
     /// does, 2 it is older, 3 it also takes a host epoch (`vmproc::fenced`).
     pub(crate) fenced: std::sync::atomic::AtomicU8,
+    /// Serializes fence establishment and capability probing before any exec attachment.
+    pub(crate) attach_fence: Mutex<()>,
     fc: Mutex<Option<Firecracker>>,
     /// Its Firecracker's (pid) tap descriptor, copied (`tap_watch`).
     tap_watch: Mutex<Option<(u32, Arc<OwnedFd>)>>,
@@ -1228,6 +1230,7 @@ impl Prepared {
             clock_unsure: AtomicBool::new(false),
             next_exec: AtomicU64::new(0),
             fenced: std::sync::atomic::AtomicU8::new(0),
+            attach_fence: Mutex::new(()),
             vsock: idle.sockets.vsock.clone(),
             fc: Mutex::new(Some(idle)),
             tap_watch: Mutex::new(None),
