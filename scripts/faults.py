@@ -790,13 +790,13 @@ def lost_ack():
 def unknown():
     n = "ft-unknown"
     m = setup(n)
-    fault(B, "lost_ack", 1000)
-    fault(B, "status", 5000)
-    r = migrate(A, n, B)
-    check("unknown: migrate reports unknown outcome", not r["ok"] and "paused" in r["error"], r)
-    w = where(n)
-    # Paused, waiting to learn the outcome: reconciling (#358), or gone once it has.
-    check("unknown: source never resumed", w.get(A) in (None, "reconciling") and w.get(B) == "running", w)
+    # Both armed until the migration answered: the ack lost and the status unavailable for all of it.
+    with armed_fault(B, "lost_ack", 600000), armed_fault(B, "status", 600000):
+        r = migrate(A, n, B)
+        check("unknown: migrate reports unknown outcome", not r["ok"] and "paused" in r["error"], r)
+        w = where(n)
+        # Paused, waiting to learn the outcome: reconciling (#358).
+        check("unknown: source never resumed", w.get(A) == "reconciling" and w.get(B) == "running", w)
     st = wait_released(B, n)
     check("unknown: reconciled and released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("unknown: md5 intact", md5(B, n) == m)
