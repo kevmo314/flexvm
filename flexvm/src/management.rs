@@ -223,25 +223,34 @@ fn save_checkpoint(host: &crate::host::Host, args: &Args) -> Result<()> {
         );
         return Ok(());
     };
-    let path = std::path::Path::new(file);
-    let base = path.file_name().ok_or_else(|| format!("bad -o {file:?}: give a file"))?.to_string_lossy();
-    let tmp = path.with_file_name(format!(".{base}.flexvm-{}", crate::util::random_hex(8)?));
-    let written = (|| -> Result<serde_json::Value> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let f = std::fs::File::options().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    crate::print(save_checkpoint_file(Path::new(file), |out| export::save(&host.state, &paths, &what, out))?)
+}
+
+fn save_checkpoint_file(path: &Path, write: impl FnOnce(&mut dyn Write) -> Result<Value>) -> Result<Value> {
+    use sha2::Digest;
+    let base = path.file_name().ok_or_else(|| format!("bad -o {:?}: give a file", path.display()))?;
+    let dir = crate::host::Directory::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+    let key = crate::host::keyed("checkpoint-export", &dir.stat()?, &format!("-{:x}", sha2::Sha256::digest(base.as_encoded_bytes())));
+    let _lock = crate::host::lock_at(crate::host::host_locks()?, &key, libc::LOCK_EX | libc::LOCK_NB)?;
+    let tmp = dir.path.join(format!(".{}.flexvm-partial", base.to_string_lossy()));
+    // The key's flock excludes live exports; a fixed name lets the next save reclaim an interrupted one.
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        r => r?,
+    }
+    let f = std::fs::File::options().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    let written = (|| {
         let mut out = std::io::BufWriter::with_capacity(1 << 20, &f);
-        let saved = export::save(&host.state, &paths, &what, &mut out)?;
+        let saved = write(&mut out)?;
         out.flush()?;
         drop(out);
         f.sync_all()?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("{file}: {e}"))?;
-        crate::util::sync_dir(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")))?;
+        std::fs::rename(&tmp, dir.path.join(base)).map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::util::sync_dir(&dir.path)?;
         Ok(saved)
     })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    crate::print(written?)
+    let _ = std::fs::remove_file(&tmp);
+    written
 }
 
 /// `checkpoint load [-i FILE|DIR] [--name NAME]`: a save from stdin (never a terminal) or FILE, or a checkpoint directory.
@@ -419,6 +428,31 @@ pub fn version(paths: &Paths) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn checkpoint_file_reclaims_stale_partial_and_excludes_live_exports() {
+        let dir = crate::test_util::TempDir::new("checkpoint-export");
+        let path = dir.join("save.tar");
+        let partial = dir.join(".save.tar.flexvm-partial");
+        std::fs::write(&partial, b"interrupted").unwrap();
+        let saved = save_checkpoint_file(&path, |out| {
+            assert!(save_checkpoint_file(&path, |_| panic!("another export is live")).is_err());
+            assert!(partial.exists());
+            out.write_all(b"complete")?;
+            Ok(json!({"saved": true}))
+        })
+        .unwrap();
+        assert_eq!(saved, json!({"saved": true}));
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete");
+        assert!(!partial.exists());
+        assert!(save_checkpoint_file(&path, |out| {
+            out.write_all(b"failed")?;
+            bail!("injected failure")
+        })
+        .is_err());
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete");
+    }
 
     #[test]
     fn checkpoint_name_filters_match_each_whole_name_and_formats_keep_both_fields() {

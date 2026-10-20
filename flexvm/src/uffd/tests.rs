@@ -305,6 +305,28 @@ fn streamed_installs_add_up() {
     assert!(fetches > 5000);
 }
 
+#[test]
+fn discard_forgets_failure_history_over_a_range() {
+    let p = pages(&[REMOTE; 256]);
+    for page in [0, 63, 64, 127, 128, 255] {
+        assert_eq!(p.claim(page, 1, REMOTE, |_| true), 1);
+        assert!(p.install(page, 1, REMOTE, None, |_, _| Err(os(libc::ENOMEM))).1.is_err());
+    }
+    assert_eq!(p.claim(64, 1, REMOTE, |_| true), 1);
+    assert_eq!(p.discard(&p.removing(), 1, 255), 253);
+    assert_eq!(p.failing_len.load(Ordering::SeqCst), 3);
+    for page in [0, 64, 255] {
+        assert!(p.failing_since(page, 1).is_some());
+    }
+    for page in [63, 127, 128] {
+        assert!(p.failing_since(page, 1).is_none());
+    }
+    assert_eq!(p.release(64, 1, REMOTE), 1);
+    assert_eq!(p.failing_len.load(Ordering::SeqCst), 2);
+    assert_eq!(p.discard(&p.removing(), 0, 300), 2);
+    assert_eq!(p.failing_len.load(Ordering::SeqCst), 0);
+}
+
 /// A page that fails to install is remembered (with when it first failed) until it goes in or is discarded, however it
 /// gets claimed again; its neighbours that did go in are not.
 #[test]

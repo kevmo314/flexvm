@@ -388,6 +388,21 @@ fn private_dir(fd: RawFd) -> bool {
     fstat(fd).is_ok_and(|st| st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0)
 }
 
+/// Reclaims interrupted writes, leaving live staging and foreign directories alone.
+pub(crate) fn clear_stale(dir: &Path) {
+    let Ok(name) = CString::new(dir.as_os_str().as_bytes()) else { return };
+    let Ok(parent) = open_dir_at(libc::AT_FDCWD, &name) else { return };
+    let Ok(st) = fstat(parent.as_raw_fd()) else { return };
+    let Ok(_lock) = parent_lock(&st, libc::LOCK_EX | libc::LOCK_NB) else { return };
+    clear_stale_fd(&parent);
+}
+
+pub(crate) fn sweep_staging(state: &Path) {
+    for dir in [state.join("checkpoints"), state.join("suspended")] {
+        clear_stale(&dir);
+    }
+}
+
 fn clear_stale_fd(parent: &OwnedFd) {
     let Ok(dir) = std::fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd())) else { return };
     for e in dir.flatten() {

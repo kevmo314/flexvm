@@ -397,6 +397,39 @@ fn page_sync_and_pagemap_errors_leave_staging_unpublished() {
 }
 
 #[test]
+fn sweeps_reclaim_stale_staging_without_a_new_checkpoint() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = tmp("stage-sweep");
+    for name in ["checkpoints", "suspended"] {
+        let dir = state.join(name);
+        fs::create_dir(&dir).unwrap();
+        let live = Staging::new(&dir.join("live"), dir.join("vmstate")).unwrap();
+        live.add_file("pages", b"live").unwrap();
+        let stale = dir.join(format!("{STAGING_PREFIX}stale"));
+        let make_stale = || {
+            fs::create_dir_all(stale.join("ck")).unwrap();
+            fs::set_permissions(&stale, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(stale.join("ck/pages"), b"stale").unwrap();
+        };
+        make_stale();
+        super::sweep_staging(&state);
+        assert!(!stale.exists());
+        assert_eq!(fs::read(format!("/proc/self/fd/{}/pages", live.ck.as_raw_fd())).unwrap(), b"live");
+        if name == "checkpoints" {
+            for prune in [false, true] {
+                make_stale();
+                if prune {
+                    store::prune(&state, None).unwrap();
+                } else {
+                    store::remove(&state, &[], false).unwrap();
+                }
+                assert!(!stale.exists());
+            }
+        }
+    }
+}
+
+#[test]
 fn staging_is_private_never_overwrites_and_cleans_up() {
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     let dir = tmp("stage");

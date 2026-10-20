@@ -3499,6 +3499,7 @@ impl Host {
         }
         collect_dead_taps(&self.run, None);
         collect_owned(&self.run);
+        crate::checkpoint::sweep_staging(&self.state);
         // What a write killed midway left of the records.
         for dir in [self.run.join("claims"), self.run.join("vms"), self.state.join("addrs"), self.state.join("standby")] {
             remove_write_debris(&dir, |_| true);

@@ -22,6 +22,7 @@ mod write;
 
 pub use chain::{chain_ids, chain_meta_budget, parent_path, read_manifest, Checkpoint, PageFile, MAX_CHAIN};
 pub use format::{Canon, FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL};
+pub(crate) use staging::sweep_staging;
 pub use staging::{CommitError, Staging};
 pub(crate) use write::{Buf, GuestPages};
 
