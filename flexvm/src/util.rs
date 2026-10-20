@@ -2836,6 +2836,8 @@ pub mod output {
     enum Log {
         In(Arc<File>),
         At(PathBuf),
+        /// An arrival's, until published (`arriving`): appended to, never capped.
+        Plain(Arc<File>),
     }
 
     impl Log {
@@ -2843,6 +2845,7 @@ pub mod output {
             match self {
                 Log::In(dir) => append_in(dir, data, LOG_CAP),
                 Log::At(path) => append_capped(path, data, LOG_CAP),
+                Log::Plain(f) => (&**f).write_all(data).is_ok(),
             }
         }
     }
@@ -2972,6 +2975,19 @@ pub mod output {
         }
     }
 
+    /// An arrival's (`listen::incoming`): its output's file is its log until published (`published`),
+    /// so every diagnostic goes there, as to a VM's log, info lines too; none to the name's logs,
+    /// whose `log` the published one replaces.
+    pub fn arriving() {
+        let targets = TARGETS.lock().unwrap();
+        let mut caps = LOGS.lock().unwrap();
+        for (i, t) in targets.iter().enumerate() {
+            if let Some(t) = t.as_ref().filter(|t| caps[i].is_none() && t.metadata().is_ok_and(|m| m.is_file())) {
+                caps[i] = Some(Log::Plain(t.clone()));
+            }
+        }
+    }
+
     /// An arrival's log was published as `log` in `logs` (`listen::finish_incoming_log`), a new
     /// lifetime: capped there from now on, and the VM's logs from here.
     pub fn published(logs: File) {
@@ -3038,17 +3054,7 @@ pub mod output {
     /// nothing rotated. All of it in `dir`: retired, it is never the name's again. Whether
     /// `data` was written; it is never written twice.
     pub fn append_in(dir: &File, data: &[u8], cap: u64) -> bool {
-        let deadline = Instant::now() + STALL;
-        let lock = loop {
-            let take = || {
-                let f = open_in(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY)?;
-                crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).map(|()| f)
-            };
-            match take() {
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
-                result => break result.ok(),
-            }
-        };
+        let lock = lock_dir(dir);
         let written = open_in(dir, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT).is_ok_and(|mut f| {
             let written = f.write_all(data).is_ok();
             if lock.is_some() && f.metadata().is_ok_and(|m| m.len() > cap) {
@@ -3062,6 +3068,22 @@ pub mod output {
             let _ = crate::host::flock(&l, libc::LOCK_UN);
         }
         written
+    }
+
+    /// `dir`'s (a VM's logs') writers' lock: a flock of an open of this call's own, had within
+    /// `STALL` (else None: a stopped holder, done without). Let go of with `LOCK_UN`.
+    pub fn lock_dir(dir: &File) -> Option<File> {
+        let deadline = Instant::now() + STALL;
+        loop {
+            let take = || {
+                let f = open_in(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY)?;
+                crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).map(|()| f)
+            };
+            match take() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                result => break result.ok(),
+            }
+        }
     }
 
     /// Appends `data` to the file at `log`, holding `log`'s lock (`log_lock`; never
@@ -3274,6 +3296,43 @@ pub mod output {
                 assert_eq!(log.matches(marker).count(), want, "{mode} {marker}: {log}");
             }
         }
+    }
+
+    /// An arrival's diagnostics, info lines too, all go to its log (its output's file), once,
+    /// none to the name's logs, whose `log` its log replaces once published.
+    #[test]
+    fn an_arrivals_diagnostics_all_go_to_its_log() {
+        const CHILD: &str = "FLEXVM_OUTPUT_TEST_ARRIVAL";
+        if let Some(log) = std::env::var_os(CHILD) {
+            guard().unwrap();
+            let logs = PathBuf::from(log);
+            std::fs::create_dir(&logs).unwrap();
+            arriving();
+            fall_back_to(open_dir(&logs).unwrap());
+            std::io::stderr().write_all(b"app-err-marker\n").unwrap();
+            super::info_line("info-marker\n".into());
+            super::log_line("error-marker\n".into());
+            super::flush_log(super::LOG_FLUSH);
+            drain();
+            return;
+        }
+        let dir = crate::test_util::TempDir::new("output-arrival");
+        let (logs, arrival) = (dir.join("vm.logs"), dir.join(".incoming.log"));
+        let out = File::create(&arrival).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "util::output::an_arrivals_diagnostics_all_go_to_its_log", "--nocapture"])
+            .env(CHILD, &logs)
+            .env_remove("FLEXVM_LOG")
+            .stdout(out.try_clone().unwrap())
+            .stderr(out)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let got = std::fs::read_to_string(&arrival).unwrap();
+        for marker in ["app-err-marker", "info-marker", "error-marker"] {
+            assert_eq!(got.matches(marker).count(), 1, "{marker}: {got}");
+        }
+        assert!(!logs.join("log").exists(), "{:?}", std::fs::read_to_string(logs.join("log")));
     }
 
     #[test]

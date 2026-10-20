@@ -19,9 +19,9 @@ building (`FLEXVM_STATE_DIR=/srv/flexvm cargo build --release`); `--state`
 still overrides it at run time. This README writes `/var/lib/flexvm` for
 whichever default the binary was built with, except in the run-path rules
 below. The test and lab scripts
-(`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`) take
-`FLEXVM_STATE_DIR` from the environment too; `fetch.sh` and
-`build-firecracker.sh` take `--state`.
+(`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`, `fetch.sh`,
+`build-firecracker.sh`) take `FLEXVM_STATE_DIR` from the environment too;
+`fetch.sh` and `build-firecracker.sh` also take `--state`, which overrides it.
 
 Each state directory is bound to one canonical run directory on first open:
 `STATE/run.json` records its run path, and `RUN/state.json` records its state.
@@ -92,6 +92,11 @@ assume that.
 
 ### Releasing the artifacts
 
+Releases use semver tags `vMAJOR.MINOR.PATCH`: `artifacts-5` was the last
+`artifacts-N` release, and `v0.1.0` the first source release (whose
+Firecracker came from `artifacts-1`), so the first semver artifacts release is
+`v0.2.0`. The version in `flexvm/Cargo.toml` and `guest/Cargo.toml` is the tag
+without its `v` (`scripts/pin-artifacts.sh --check` fails otherwise).
 A release (`ARTIFACTS_TAG` in `scripts/versions.sh`) is built from what
 `scripts/pin-artifacts.sh --inputs` lists: Firecracker's version, the commit
 its tag names (`FC_COMMIT`; the build refuses any other), the patches, the
@@ -105,7 +110,8 @@ otherwise. Then:
 1. Merge it. Main now names a pending tag: flexvm builds from it download
    nothing until step 3 (build.rs warns), and CI warns.
 2. Push the tag at that commit on main:
-   `git tag artifacts-N <commit> && git push origin artifacts-N`.
+   `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`, with the
+   `ARTIFACTS_TAG` it names.
    `.github/workflows/release.yml` checks that `versions.sh` there names it,
    builds the assets with `scripts/release-assets.sh`, attests their build
    provenance and publishes them.
@@ -290,8 +296,8 @@ VM's log stays available to read until `rm`. `rm` (including `rm -f` of a
 running VM) deletes both `NAME.log` and `NAME.log.1`, as `docker rm` does, so a
 new VM with the same name starts with a fresh log. For a post-mortem, read
 `logs` before `rm`, or `kill` first: `kill` keeps the log (with what the VM
-wrote as it ended) until the hourly sweep. A foreground `run -i`/`-t` leaves
-its log too. A foreground VM's output is its
+wrote as it ended) until the hourly sweep or the name's next VM, which starts
+a fresh log. A foreground `run -i`/`-t` leaves its log too. A foreground VM's output is its
 terminal's, so its log holds only what came after a closed terminal. Foreground `run`,
 `start -a` and `attach` print only the app's output, errors and warnings;
 flexvm's and flexvm-init's informational messages go to the log alone, and
@@ -603,10 +609,12 @@ newer generation of it, and only the host it is migrating to moves or
 withdraws its generation (a VM arriving here, once it commits: only the host
 it came from, until its pull is done); for an address of this host's own
 `vm_ips`, which only this host hands out, no peer brings a newer generation
-while it is lent from here, nor one this host never handed out (since a
-reboot, none newer than its record here; a VM arriving with one is refused
-too). A refused update is retried by its sender, so one that comes
-before the withdrawal it follows is taken once that has. The hosts must list each
+while it is lent from here. After a reboot, no generation newer than its
+record here is accepted until the first `next_gen` allocation; after that,
+any generation below this boot's allocation cursor may be taken, even if
+issued for another address. Arriving VMs face the same checks. A refused
+update is retried by its sender, so one that comes before the withdrawal it
+follows is taken once that has. The hosts must list each
 other in `peers` (each peer's listen address): a listener serves its peers'
 addresses only, and tells any other it is not a peer. A reported route next
 hop (including a migration target's underlay) must be the connection's peer

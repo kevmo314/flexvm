@@ -378,6 +378,10 @@ impl Args {
 
 /// A VM's command's statuses are its own: flexvm's failures there exit 125.
 fn main() {
+    // The logs a `run` handed this process, by token: read before any thread starts, and kept
+    // from every process of this one's own.
+    host::handed();
+    std::env::remove_var(host::HANDOFF_ENV);
     // A panic's message is queued after the lines before it, and written
     // (bounded: a stalled stderr does not keep the process from aborting).
     std::panic::set_hook(Box::new(|p| {
@@ -1023,7 +1027,7 @@ fn run_as(
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
     let tty = log.is_none() && std::io::stdin().is_terminal();
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none(), "attacher": attached});
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none(), "attacher": attached, "logs_handoff": log.as_ref().map(|l| l.token.as_str())});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A foreground claim's signals wait from before it is sent: the VM it makes gets them
@@ -1179,11 +1183,9 @@ fn run_checkpoint(args: &Args) -> Result<()> {
     if args.has("detach") {
         let host = open_host(args)?;
         // A detached restore logs to the VM's name, which the checkpoint has without --name.
-        let name = match args.get("name") {
-            Some(name) => name.to_string(),
-            None => checkpoint::read_manifest(&dir)?.name,
-        };
-        return print(spawn_detached(&host, &name, &args.child_args, &new_run_log(&host, &name)?, false)?);
+        let own = checkpoint::read_manifest(&dir)?.name;
+        let name = args.get("name").map_or_else(|| own.clone(), String::from);
+        return print(spawn_detached(&host, &name, &args.child_args, &restore_run_log(&host, &name, name == own)?, false)?);
     }
     vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }
@@ -1191,29 +1193,60 @@ fn run_checkpoint(args: &Args) -> Result<()> {
 /// What a foreground `run` that claimed a standby VM forwards to it (SIGHUP is ignored).
 const FOLLOW_SIGNALS: [i32; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
 
-fn new_run_log(host: &Host, name: &str) -> Result<std::fs::File> {
+/// A log a `run` opened for the VM process it starts (`Host::own_logs`), and the token that
+/// process keeps it by as it takes the name (whether or not this one is still there).
+#[derive(Debug)]
+struct RunLog {
+    file: std::fs::File,
+    token: String,
+}
+
+impl std::ops::Deref for RunLog {
+    type Target = std::fs::File;
+    fn deref(&self) -> &std::fs::File {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for RunLog {
+    fn deref_mut(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+}
+
+fn new_run_log(host: &Host, name: &str) -> Result<RunLog> {
     // Refuse a taken name and clear a failed VM's logs before opening it for the child.
     let _name = host.take_name(name, false)?;
     log_file(host, name)
 }
 
-fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
+/// `new_run_log` of a detached restore: under the checkpoint's own name (`own`), the VM goes on
+/// in its logs (`Host::take_restoring_name`). The name is held until the log is open, so no
+/// other VM's logs are taken for it meanwhile.
+fn restore_run_log(host: &Host, name: &str, own: bool) -> Result<RunLog> {
+    let _name = host.take_restoring_name(name, own)?;
+    log_file(host, name)
+}
+
+fn log_file(host: &Host, name: &str) -> Result<RunLog> {
     host::check_name(name)?;
+    let token = util::random_hex(16)?;
     // Opened and marked written holding the logs lock (shared): garbage
     // collection removes only a quiet log, holding it exclusively.
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    let f = util::output::open_in(&host.open_logs(name)?, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT)?;
+    let f = util::output::open_in(&host.own_logs(name, Some(&token))?, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT)?;
     f.set_modified(std::time::SystemTime::now())?;
-    Ok(f)
+    Ok(RunLog { file: f, token })
 }
 
 /// Starts `child` (this binary's arguments) in the background, and prints its VM's answer.
 /// `attacher`: a foreground `run -i`/`-t` attaches to it (`Proc::attacher`).
-fn spawn_detached(host: &Host, name: &str, child: &[String], log: &std::fs::File, attacher: bool) -> Result<Value> {
+/// The child keeps `log`'s directory by its token (`host::HANDOFF_ENV`).
+fn spawn_detached(host: &Host, name: &str, child: &[String], log: &RunLog, attacher: bool) -> Result<Value> {
     let log_path = host.vms(name, "log")?;
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
-    let env = [("FLEXVM_NOTIFY_FD", "3"), ("FLEXVM_ATTACHER", "1")];
-    util::spawn_self(child, log, w.as_raw_fd(), &env[..1 + usize::from(attacher)])?;
+    let env = [("FLEXVM_NOTIFY_FD", "3"), (host::HANDOFF_ENV, log.token.as_str()), ("FLEXVM_ATTACHER", "1")];
+    util::spawn_self(child, &log.file, w.as_raw_fd(), &env[..2 + usize::from(attacher)])?;
     drop(w);
     let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", log_path.display()))?;
     if reply["ok"] != json!(true) {
@@ -2470,6 +2503,74 @@ mod exec_tests {
             assert_eq!(std::fs::read_to_string(&log).unwrap(), "new vm");
             assert!(!host.has_record("web", "log.1"));
         }
+    }
+
+    /// The `run` SIGKILLed after starting its VM process, before that takes the name: the VM
+    /// process keeps the logs it was handed (and writes to) by their token, not by the `run`.
+    #[test]
+    fn a_detached_runs_log_is_kept_by_its_vm_if_the_run_dies_mid_handoff() {
+        let root = crate::test_util::TempDir::new("run-log-handoff");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let dir = host.vms("web", "logs").unwrap();
+        for (theirs, kept) in [(true, true), (false, false)] {
+            let mut out = new_run_log(&host, "web").unwrap();
+            let held = util::output::open_dir(&dir).unwrap();
+            let mut owner = host::logs_owner(&held).unwrap();
+            assert_eq!(owner.to, [out.token.clone()]);
+            owner.id = host::Ident { pid: u32::MAX, start: 1, ..host::Ident::me() };
+            std::fs::write(dir.join(".owner"), serde_json::to_vec(&owner).unwrap()).unwrap();
+            let token = if theirs { out.token.clone() } else { "another".into() };
+            let name = host.take_handed_name("web", Some(&token)).unwrap();
+            assert_eq!(std::os::unix::fs::MetadataExt::nlink(&held.metadata().unwrap()) != 0, kept, "{theirs}");
+            out.write_all(b"its output").unwrap();
+            assert_eq!(std::fs::read_to_string(dir.join("log")).ok().as_deref(), kept.then_some("its output"), "{theirs}");
+            drop(name);
+            host.retire_logs("web").unwrap();
+        }
+    }
+
+    /// Two detached runs of a free name prepare its logs before either's VM process takes it,
+    /// and the second dies: the first's VM process (or the second's) still keeps them by its
+    /// token; the second's never replaced the first's.
+    #[test]
+    fn concurrent_detached_runs_keep_each_others_pending_handoff() {
+        let root = crate::test_util::TempDir::new("run-log-two");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let dir = host.vms("web", "logs").unwrap();
+        for winner in [0, 1] {
+            let mut outs = [new_run_log(&host, "web").unwrap(), new_run_log(&host, "web").unwrap()];
+            let held = util::output::open_dir(&dir).unwrap();
+            let mut owner = host::logs_owner(&held).unwrap();
+            assert_eq!(owner.to, [outs[0].token.clone(), outs[1].token.clone()]);
+            // The second run SIGKILLed: its identity, last recorded, is gone.
+            owner.id = host::Ident { pid: u32::MAX, start: 1, ..host::Ident::me() };
+            std::fs::write(dir.join(".owner"), serde_json::to_vec(&owner).unwrap()).unwrap();
+            let name = host.take_handed_name("web", Some(&outs[winner].token.clone())).unwrap();
+            assert_ne!(std::os::unix::fs::MetadataExt::nlink(&held.metadata().unwrap()), 0, "{winner}");
+            outs[winner].write_all(b"its output").unwrap();
+            assert_eq!(std::fs::read_to_string(dir.join("log")).unwrap(), "its output");
+            drop(name);
+            host.retire_logs("web").unwrap();
+        }
+    }
+
+    /// A detached restore of a name a VM runs under: refused, that VM's logs left as they are;
+    /// of a free one, its log opened holding the name (let go of once open).
+    #[test]
+    fn a_detached_restore_opens_its_log_holding_the_name() {
+        let root = crate::test_util::TempDir::new("restore-log");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let running = host.take_name("web", false).unwrap();
+        let logs = host.own_logs("web", None).unwrap();
+        let before = host::logs_owner(&logs);
+        for own in [true, false] {
+            assert!(host::name_taken(&restore_run_log(&host, "web", own).unwrap_err()));
+            assert_eq!(host::logs_owner(&logs), before);
+        }
+        drop(running);
+        let out = restore_run_log(&host, "web", true).unwrap();
+        assert_eq!(host::logs_owner(&logs).unwrap().to, [out.token.clone()], "the stopped vm's logs, handed on");
+        drop(host.take_name("web", true).unwrap());
     }
 
     #[test]

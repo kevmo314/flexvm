@@ -253,6 +253,7 @@ pub fn link(state: &Path, name: &str, id: &str) -> Result<()> {
 /// `force`, which removes those too.
 pub fn remove(state: &Path, whats: &[String], force: bool) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
+    super::staging::clear_stale(&dir(state));
     let all = list(state);
     // Names removed alone cannot affect a checkpoint's dependants.
     let (names, whats): (Vec<String>, Vec<String>) =
@@ -291,6 +292,7 @@ fn unname(names: &[PathBuf]) -> Result<Vec<Value>> {
 /// one kept builds on it.
 pub fn prune(state: &Path, before: Option<u64>) -> Result<Vec<Value>> {
     let _lock = lock(state, libc::LOCK_EX)?;
+    super::staging::clear_stale(&dir(state));
     let all = list(state);
     let order = pruning(&all, before)?;
     let names: Vec<PathBuf> = all.dangling.iter().map(|n| all.names.join(n)).chain(all.malformed.keys().cloned()).collect();

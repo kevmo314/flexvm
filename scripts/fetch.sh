@@ -4,12 +4,27 @@
 # until then, the kernel comes from Firecracker's CI bucket and Firecracker is the stock release. flexvm itself
 # downloads the release's on first use; this is for fetching ahead (an offline host, say: --state a directory
 # to copy over).
-# usage: fetch.sh [--state DIR (/var/lib/flexvm)] [--urls | --kernel (the kernel only)]
+# usage: fetch.sh [--state DIR (${FLEXVM_STATE_DIR:-/var/lib/flexvm})] [--urls | --kernel (the kernel only)]
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-state=/var/lib/flexvm
-if [ "${1:-}" = --state ]; then state=$(realpath -m "$2"); shift 2; fi
+state=$(realpath -m "${FLEXVM_STATE_DIR:-/var/lib/flexvm}")
+mode=
+while (( $# )); do
+  case "$1" in
+    --state)
+      if (( $# < 2 )) || [[ $2 == --* ]]; then echo '--state needs a directory' >&2; exit 2; fi
+      state=$(realpath -m "$2")
+      shift 2
+      ;;
+    --urls|--kernel)
+      if [ -n "$mode" ]; then echo 'choose only one of --urls or --kernel' >&2; exit 2; fi
+      mode=$1
+      shift
+      ;;
+    *) echo 'usage: fetch.sh [--state DIR] [--urls | --kernel]' >&2; exit 2 ;;
+  esac
+done
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 
@@ -33,12 +48,12 @@ KERNEL_URL=$CI/$KERNEL
 if pinned "$ARTIFACTS_URL/vmlinux" > /dev/null 2>&1; then KERNEL_URL=$ARTIFACTS_URL/vmlinux; fi
 
 # --urls: print what would be fetched, as `NAME URL` lines (CI keys its caches on them).
-if [ "${1:-}" = --urls ]; then
+if [ "$mode" = --urls ]; then
   printf '%s %s\n' firecracker "$FC_URL" vmlinux "$KERNEL_URL" base.squashfs "$CI/ubuntu-24.04.squashfs"
   exit 0
 fi
 only_kernel=
-if [ "${1:-}" = --kernel ]; then only_kernel=1; fi
+if [ "$mode" = --kernel ]; then only_kernel=1; fi
 
 out=$state/artifacts
 sudo mkdir -p "$out"
@@ -106,6 +121,11 @@ firecracker_fetched() {
 }
 
 if [ -z "$only_kernel" ]; then
+  # Serialize the check and install with local builds, including their checksum records.
+  sudo touch "$out/.firecracker.lock"
+  sudo chmod 644 "$out/.firecracker.lock"
+  exec {lock}< "$out/.firecracker.lock"
+  flock -x "$lock"
   if sudo test -x "$out/firecracker" && firecracker_fetched; then
     # A raw release asset was checked just now, even if fetched before records were kept.
     if [[ $FC_URL != *.tgz ]]; then record firecracker "$(pinned "$FC_URL")" "$FC_URL"; fi
@@ -120,6 +140,7 @@ if [ -z "$only_kernel" ]; then
       place 755 "$work/firecracker" firecracker "$FC_URL"
     fi
   fi
+  exec {lock}<&-
 fi
 
 if ! fetched vmlinux "$KERNEL_URL"; then

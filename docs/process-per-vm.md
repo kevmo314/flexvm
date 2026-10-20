@@ -180,6 +180,7 @@ STATE (default /var/lib/flexvm, on disk)
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{json,sock}            registry entry, control socket (0600)
   vms/NAME.logs/{log,log.1}       a lifetime of the name's logs: current log and previous rotation (0700, 0600)
+  vms/NAME.logs/.owner            whose lifetime it is: its VM's process, or a run handing it to one (JSON)
   vms/NAME.{log,log.1}            links into NAME.logs/
   vms/.NAME.logs.X.gone           a retired lifetime being removed (swept if a writer added to it meanwhile)
   vms/.locks/NAME.lock            liveness lock; .incoming-*.log, an arrival's lock
@@ -306,15 +307,23 @@ takes the name. Only the VM's own process writes them (a foreground client whose
 is gone drops its own output), and it and `logs -f` hold the directory, never its path:
 they open, rotate and read only in it. So a lifetime ends in one step, without waiting on
 anyone: explicit `rm` (including `rm -f` of a running VM, once its process has exited, so
-its last words are in the log removed), or a new VM of a `failed`, `lost` or `moved` name
-renames the directory away (`.NAME.logs.X.gone`) and removes it, holding the name and
+its last words are in the log removed), or a new VM of the name (after a `failed`, `lost`,
+`moved`, killed, `--rm` or foreground VM alike) renames the directory away (`.NAME.logs.X.gone`) and removes it, holding the name and
 `RUN/.locks/logs` shared; `rename` moves it to the new name. An accepted arrival's log is
 published as `log` in the directory its VM made as it took the name. Logs at `NAME.log`
 and `NAME.log.1` from before these directories are moved into it when it is made. A writer
 still running then goes on only in its own directory, and `logs -f` ends once the directory
 at the path is not the one it holds (its inode, held, is never a later one's). `kill` and a
-foreground `run -i`/`-t`'s end keep the logs. Logs remain available for stopped and exited
-VMs until removal; `start` keeps them. A detached `run` opens its log in the
+foreground `run -i`/`-t`'s end keep the logs until the name's next VM. `NAME.logs/.owner`
+records whose lifetime it is (`Host::own_logs`): its VM's process, or a `run` that opened it
+for the VM process it hands it to (a detached child, a claimed standby), with a token that
+process is given (`FLEXVM_LOGS_HANDOFF`, or the claim). A new VM keeps only its own, one whose
+token is among its pending ones (even if that `run` died meanwhile; a second `run` preparing
+them before either's VM process took the name adds its token, never replacing the first's),
+or a live `run`'s for another; `logs -f` follows on only while the name's holder
+is the one its directory records (or a handing `run`'s child). Logs remain available for stopped and exited
+VMs until removal; `start` keeps them, as does a `restore` under the checkpoint's own name
+(that VM going on; under another name, a fork, it starts a fresh log). A detached `run` opens its log in the
 parent before the child takes the name, so removal clears the logs before
 that parent opens them. Released migration records are retired as below.
 Logs are capped by their

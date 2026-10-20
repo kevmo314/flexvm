@@ -1257,6 +1257,63 @@ def guest_calls():
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
 
 
+def exec_stalled_cap():
+    """#1030. 24 abandoned execs (their clients gone, their commands running: held for 10 minutes) and 40 exec
+    clients that stop reading take all of the guest's 64 session slots, so the next exec is refused. The 40
+    relays alone are short of the guest's cap: its refusal is the pressure that drops clients stalled for 60 s,
+    and the guest reclaims their sessions: a new exec runs again within a bound, not never."""
+    n = "ft-exec-cap"
+    ok(run(A, n))
+    sock = os.path.join(A.run, "vms", f"{n}.sock")
+
+    def start(cmd):
+        """Started once the guest echoes the session id; one it asks to try again (its 16 command readers all
+        busy) is started anew, as the CLI would. Returns the client's socket, and whether it started."""
+        for _ in range(20):
+            sid = os.urandom(16).hex()
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(30)
+            s.connect(sock)
+            s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": {"argv": ["sh", "-c", cmd]}}) + "\n").encode())
+            f = s.makefile("rb")
+            reply = f.readline()
+            kind, size = struct.unpack("<BI", f.read(5)) if json.loads(reply).get("ok") else (None, 0)
+            first = f.read(size)
+            f.close()
+            if (kind, first) == (4, sid.encode()):
+                return s, True
+            s.close()
+            time.sleep(0.1)
+        return s, False
+
+    stalled = []
+    try:
+        abandoned = []
+        for _ in range(24):
+            s, started = start("sleep infinity")
+            s.close()
+            abandoned.append(started)
+        check("exec cap: 24 execs abandoned while running", all(abandoned), abandoned.count(False))
+        stalled = [start("head -c 50000000 /dev/zero") for _ in range(40)]
+        started = time.time()
+        check("exec cap: 40 exec clients that never read", all(ok for _, ok in stalled), [ok for _, ok in stalled].count(False))
+        sessions = lambda: cli_json(A, "debug", n, "sessions").get("result") or {}
+        check("exec cap: the guest runs all 64", wait_for(lambda: sessions().get("live") == 64, 10), sessions())
+        code, _, err = cli(A, "exec", n, "true")
+        check("exec cap: the next exec is refused, the guest's slots all taken", code != 0 and "too many sessions" in err, (code, err[-200:]))
+        # Dropped at 60 s; the guest stops waiting for them 30 s later and reclaims the finished sessions 60 s after
+        # the drop. Without the pressure they would hold their slots for as long as their clients live.
+        ran = False
+        while not ran and time.time() - started < 240:
+            time.sleep(2)
+            ran = cli(A, "exec", n, "echo", "hi")[:2] == (0, "hi")
+        check("exec cap: an exec runs again once the stalled clients give way", ran, round(time.time() - started))
+    finally:
+        for s, _ in stalled:
+            s.close()
+    cleanup(n)
+
+
 def exec_burst():
     """#702. 32 execs started at once into one VM all run. The guest reads at most 16 commands at a
     time and asks the rest to try again: with all 16 readers held by commands still arriving, execs
@@ -1458,6 +1515,15 @@ def exec_background():
             os.unlink(release)
     bad = [d for d in drained if d[1] != (0, str(d[0]), "")]
     check("exec bg: 70 slow readers all get all their output and status", len(drained) == 70 and not bad, bad[:3])
+    check("exec bg: their acknowledgements release their sessions", wait_for(lambda: sessions().get("unacknowledged") == before + 1, 10), sessions())
+    # #1030: output that fits the socket buffers, its exit right behind it, to a reader back after 5 s: its
+    # acknowledgement is waited for once it has read the exit, and, too late for the guest by then, is passed
+    # on as a CLOSE, so the session does not stay.
+    drained.clear()
+    slow_reader(150000, 5)
+    check("exec bg: 150 KB to a reader back after 5 s all arrive", drained == [(150000, (0, "150000", ""))], drained)
+    released = wait_for(lambda: sessions().get("unacknowledged") == before + 1, 10)
+    check("exec bg: its late acknowledgement still releases its session", released, sessions())
     # More output than the guest keeps for a session (4 MiB): the command waits for its reader, and the
     # reader, back after 15 s (well past Firecracker's 2 s vsock shutdown expiry), gets all of it.
     drained.clear()
@@ -4109,28 +4175,30 @@ def checkpoint_crash():
     place clears the debris and succeeds."""
     n, path = "ft-crash", ckpt_path("ft-crash")
     setup(n, mib=1200)
-    fault(A, "ckpt_slow", 120000)
-    t = start_thread(target=lambda: checkpoint(A, n, path))
+    # Sweeps (#1000) would clear the killed checkpoint's staging: kept until its checks below are done.
+    with armed_fault(A, "keep_staging", 300000):
+        fault(A, "ckpt_slow", 120000)
+        t = start_thread(target=lambda: checkpoint(A, n, path))
 
-    def writing():
-        return staged_mib() > 100 and vms(A).get(n, {}).get("checkpoint_copy")
+        def writing():
+            return staged_mib() > 100 and vms(A).get(n, {}).get("checkpoint_copy")
 
-    caught = wait_for(writing, 30)
-    check("crash: caught the checkpoint mid-write", caught)
-    pid, fc = vm_pid(A, n), fc_pid(A, n)
-    os.kill(pid, signal.SIGKILL)
-    killed = time.time()
-    t.join()
-    fault(A, "ckpt_slow", 0)
-    died_with_process("crash", A, n, pid, fc, killed)
-    check("crash: no checkpoint published", not os.path.exists(path))
-    r = restore(B, path, ip="auto")
-    check("crash: nothing to restore", not r["ok"], r)
-    partial = [os.path.join(f, "ck") for f in staging()]
-    check("crash: staging left behind (root-only)", len(partial) == 1, partial)
-    for f in partial:
-        r = restore(B, f, ip="auto")
-        check("crash: the partial directory does not restore", not r["ok"], r)
+        caught = wait_for(writing, 30)
+        check("crash: caught the checkpoint mid-write", caught)
+        pid, fc = vm_pid(A, n), fc_pid(A, n)
+        os.kill(pid, signal.SIGKILL)
+        killed = time.time()
+        t.join()
+        fault(A, "ckpt_slow", 0)
+        died_with_process("crash", A, n, pid, fc, killed)
+        check("crash: no checkpoint published", not os.path.exists(path))
+        r = restore(B, path, ip="auto")
+        check("crash: nothing to restore", not r["ok"], r)
+        partial = [os.path.join(f, "ck") for f in staging()]
+        check("crash: staging left behind (root-only)", len(partial) == 1, partial)
+        for f in partial:
+            r = restore(B, f, ip="auto")
+            check("crash: the partial directory does not restore", not r["ok"], r)
     m = setup(n, mib=50)
     ok(checkpoint(A, n, path, stop=True))
     left = staging()
@@ -5629,23 +5697,25 @@ def cow_crash():
     n, path = "ft-cow-crash", ckpt_path("ft-cow-crash")
     ok(run(A, n))
     start_writer(A, n, mib=64)
-    with armed_fault(A, "ckpt_slow", 120000):
-        t = start_thread(target=lambda: checkpoint(A, n, path))
-        check("cow crash: caught the copy in the background", wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30))
-        time.sleep(0.5)
-        pid, fc = vm_pid(A, n), fc_pid(A, n)
-        os.kill(pid, signal.SIGKILL)
-        killed = time.time()
-        t.join()
-    check("cow crash: no checkpoint published", not os.path.exists(path))
-    r = restore(B, path, ip="auto")
-    check("cow crash: nothing to restore", not r["ok"], r)
-    partial = [os.path.join(f, "ck") for f in staging()]
-    # The killed copy's staging is left (nothing ran to remove it): else the checks of it below check nothing.
-    check("cow crash: the killed copy left its staging directory", partial, staging())
-    for f in partial:
-        r = restore(B, f, ip="auto")
-        check("cow crash: the partial directory does not restore", not r["ok"], r)
+    # Sweeps (#1000) would clear the killed copy's staging: kept until its checks below are done.
+    with armed_fault(A, "keep_staging", 300000):
+        with armed_fault(A, "ckpt_slow", 120000):
+            t = start_thread(target=lambda: checkpoint(A, n, path))
+            check("cow crash: caught the copy in the background", wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30))
+            time.sleep(0.5)
+            pid, fc = vm_pid(A, n), fc_pid(A, n)
+            os.kill(pid, signal.SIGKILL)
+            killed = time.time()
+            t.join()
+        check("cow crash: no checkpoint published", not os.path.exists(path))
+        r = restore(B, path, ip="auto")
+        check("cow crash: nothing to restore", not r["ok"], r)
+        partial = [os.path.join(f, "ck") for f in staging()]
+        # Else the checks of it below check nothing.
+        check("cow crash: the killed copy left its staging directory", partial, staging())
+        for f in partial:
+            r = restore(B, f, ip="auto")
+            check("cow crash: the partial directory does not restore", not r["ok"], r)
     died_with_process("cow crash", A, n, pid, fc, killed)
     ok(run(A, n))
     start_writer(A, n, mib=16)
@@ -9913,23 +9983,37 @@ def gc_debris():
         if os.path.exists(p):
             os.unlink(p)
     cleanup(n)
-    # A VM process killed during a checkpoint leaves its root-only staging in the store: gc leaves it
-    # (#329), and the next checkpoint clears it.
-    n, d = "ft-gc-ck", ckpt_path("ft-gc-ckdir")
+    # A VM process killed during a checkpoint leaves its root-only staging in the store: a sweep clears it
+    # (#1000), not the staging of a checkpoint still being written. Only flexvm's own STATE/checkpoints and
+    # STATE/suspended, never waiting for a lock: a user's checkpoint directory (#329, on NFS) is not walked.
+    n, n2, d = "ft-gc-ck", "ft-gc-ck2", ckpt_path("ft-gc-ckdir")
     os.makedirs(d)
     ok(run(A, n))
-    with armed_fault(A, "ckpt_slow", 120000):
-        t = start_thread(target=lambda: checkpoint(A, n, os.path.join(d, "ck"), timeout=60))
-        copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and staging(), 30)
-        check("gc: a checkpoint is staging", copying, (vms(A).get(n), staging()))
-        signal_vm(A, n, signal.SIGKILL)
-        t.join()
-    ok(cli_json(A, "debug", "gc"))
-    check("gc: the killed checkpoint's staging stays through a sweep", staging())
-    n2 = "ft-gc-ck2"
     ok(run(A, n2))
-    ok(checkpoint(A, n2, os.path.join(d, "ck2")))
-    check("gc: the next checkpoint clears the dead one's staging", not staging() and not os.path.exists(os.path.join(d, "ck")), staging())
+    # Each copy waits once its staging is made, until the sweep is done. The live one first: a checkpoint's
+    # start clears what a dead one left.
+    with armed_fault(A, "ckpt_copy_wait", 120000):
+        # Kept from the background sweeps until both are staged.
+        with armed_fault(A, "keep_staging", 120000):
+            live = {}
+            t2 = start_thread(target=lambda: live.update(r=checkpoint(A, n2, os.path.join(d, "ck2"), timeout=120)))
+            staged = wait_for(lambda: vms(A).get(n2, {}).get("checkpoint_copy") and staging(), 30)
+            check("gc: a checkpoint is staging", staged, (vms(A).get(n2), staging()))
+            others = set(staging())
+            t = start_thread(target=lambda: checkpoint(A, n, os.path.join(d, "ck"), timeout=60))
+            copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and len(staging()) == 2, 30)
+            check("gc: another checkpoint is staging", copying, (vms(A).get(n), staging()))
+            dead = [f for f in staging() if f not in others]
+            signal_vm(A, n, signal.SIGKILL)
+            t.join()
+            check("gc: the killed checkpoint's staging is left", dead and all(os.path.exists(f) for f in dead), (dead, staging()))
+        ok(cli_json(A, "debug", "gc"))
+        left = staging()
+        check("gc: the killed checkpoint's staging goes in a sweep, the live one's stays",
+              len(dead) == 1 and dead[0] not in left and len(left) == 1, (dead, left))
+    t2.join()
+    check("gc: the live checkpoint completes", live.get("r", {}).get("ok"), live)
+    check("gc: nothing staged once it is published", not staging() and not os.path.exists(os.path.join(d, "ck")), staging())
     rm_ckpt(os.path.join(d, "ck2"))
     cleanup(n2)
     cleanup(n)
@@ -10746,7 +10830,7 @@ SCENARIOS = dict(
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
-    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_burst=exec_burst, exec_pause_grace=exec_pause_grace, guest_hang=guest_hang,
+    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_burst=exec_burst, exec_stalled_cap=exec_stalled_cap, exec_pause_grace=exec_pause_grace, guest_hang=guest_hang,
     source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded,
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,

@@ -137,8 +137,11 @@ impl Pager {
             while q - 1 > page && self.pages().is_dirty(q - 1) {
                 q -= 1;
             }
-            (p..q).for_each(|d| self.pages().mark_dirty(d));
+            // Dirty only once unprotected: a failed unprotect (EAGAIN while a REMOVE is queued) changes nothing, and its
+            // retry must not trim these pages as already unprotected. Marked after is safe: `freeze` takes the dirty
+            // bits under the same lock (`wp`), so it sees both or neither.
             self.writeprotect(p, q - p, false)?;
+            (p..q).for_each(|d| self.pages().mark_dirty(d));
             return Ok(Served::Done(WP));
         };
         // A writer claimed the faulting page itself (PENDING -> READING) after the check above, so it stayed protected,
@@ -961,6 +964,18 @@ mod tests {
             collapse_gate: Default::default(),
         };
         (dir, pager)
+    }
+
+    #[test]
+    fn failed_unprotect_keeps_the_block_clean_for_retry() {
+        let (_dir, pager) = test_pager(WP_CHUNK);
+        pager.uffd.set(std::fs::File::open("/dev/null").unwrap().into()).unwrap();
+        let m = Mapping { offset: 0, size: WP_CHUNK * PAGE_SIZE, base_host_virt_addr: 0 };
+        for first in [true, false] {
+            assert_eq!(pager.wp_fault(8, &m, first).err().unwrap().raw_os_error(), Some(libc::ENOTTY));
+            assert!((0..WP_CHUNK).all(|p| !pager.pages().is_dirty(p)));
+            assert_eq!(pager.wp_block(8, &m, true), (0, WP_BLOCK));
+        }
     }
 
     #[test]

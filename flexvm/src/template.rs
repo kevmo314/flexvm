@@ -2058,8 +2058,11 @@ pub fn prune(paths: &Paths, only: Option<&str>, in_use: &dyn Fn() -> BTreeSet<St
         for id in batch {
             // Kept while a VM process has it open (one starting has no registry entry yet).
             let st = crate::util::fstat(File::open(gens.join(id))?.as_raw_fd())?;
-            if let Some(held) = crate::host::try_lock_at(locks.try_clone()?, &crate::host::use_lock(&st))? {
-                unused.push((id, held));
+            match crate::host::try_lock_at(locks.try_clone()?, &crate::host::use_lock(&st))? {
+                Some(held) => unused.push((id, held)),
+                // Asked for this one (a pull's superseded generation): say why it stays.
+                None if only.is_some() => crate::log!("flexvm: kept generation {id}: a process here still has it open; image prune removes it once unused"),
+                None => {}
             }
         }
         if unused.is_empty() {

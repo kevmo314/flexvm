@@ -425,14 +425,19 @@ fn rootfs_directory(cache: &Path, rootfs: &Path) -> Result<Option<crate::host::D
     Ok(Some(pinned))
 }
 
-/// The entries of the cache `rootfs` directory that have records (`KEY.users`), as `KEY.ext4`, and
+/// The entries of the cache `rootfs` directory that have records (`KEY.users`, or an unfinished `KEY.newusers` of a gone entry), as `KEY.ext4`, and
 /// with `force` (`--force-shared`) complete ones without too (`LEGACY` or never recorded).
 pub fn recorded_rootfs(cache: &Path, force: bool) -> Result<Vec<PathBuf>> {
     let Some((pinned, dir)) = rootfs_dir(cache)? else { return Ok(vec![]) };
     let mut found = std::collections::BTreeSet::new();
     for entry in std::fs::read_dir(&pinned.path)? {
         let path = dir.join(entry?.file_name());
-        if path.extension() == Some("users".as_ref()) || force && path.extension() == Some("ok".as_ref()) {
+        // An unfinished `KEY.newusers` only once its entry is gone: beside one, it is no record (the next `users_dir` clears it).
+        let abandoned = || std::fs::symlink_metadata(path.with_extension("ext4")).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if path.extension() == Some("users".as_ref())
+            || path.extension() == Some("newusers".as_ref()) && abandoned()
+            || force && path.extension() == Some("ok".as_ref())
+        {
             found.insert(path.with_extension("ext4"));
         }
     }
@@ -459,9 +464,9 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool)
     let key = key_lock(&pinned, &cached)?;
     let Some(_lock) = crate::host::try_lock_at(crate::host::host_locks()?, &key)? else { return Ok(Removal::InUse) };
     let users = users_dir(&pinned, &cached, false, false)?;
+    let mut kept = false;
     if let Some(dir) = &users {
         let me = crate::template::state_key(templates);
-        let mut kept = false;
         for entry in std::fs::read_dir(&dir.path)? {
             let name = entry?.file_name();
             let path = dir.path.join(&name);
@@ -477,17 +482,28 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool)
             }
         }
         sync_dir(&dir.path)?;
-        if kept {
+    }
+    let st = match File::open(&cached) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if users.is_some() && !kept {
+                std::fs::remove_dir(cached.with_extension("users"))?;
+            }
+            match std::fs::remove_dir_all(cached.with_extension("newusers")) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r?,
+            }
+            sync_dir(&pinned.path)?;
             return Ok(Removal::Absent);
         }
-    } else if cache.is_symlink() && !force {
+        f => crate::util::fstat(f?.as_raw_fd())?,
+    };
+    if kept {
+        return Ok(Removal::Absent);
+    }
+    if users.is_none() && cache.is_symlink() && !force {
         // A legacy shared entry may have users that have not pulled with records yet.
         return Ok(Removal::Absent);
     }
-    let st = match File::open(&cached) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Removal::Absent),
-        f => crate::util::fstat(f?.as_raw_fd())?,
-    };
     // Kept while a pull builds a template of it (`Cached::reserved`).
     let Some(_use) = crate::host::try_lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st))? else { return Ok(Removal::InUse) };
     for ext in ["ok", "ext4", "conf"] {
@@ -2007,6 +2023,42 @@ mod tests {
         std::fs::remove_file(cached.with_extension("conf")).unwrap();
         assert!(cached_rootfs(&cached, never, sync_dir).is_err());
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn missing_rootfs_removes_abandoned_users_directories() {
+        let root = crate::test_util::TempDir::new("rmi-users");
+        let images = root.join("images");
+        let dir = images.join("rootfs");
+        std::fs::create_dir_all(&dir).unwrap();
+        for ext in ["users", "newusers"] {
+            std::fs::create_dir(dir.join(format!("k.{ext}"))).unwrap();
+        }
+        std::fs::write(dir.join("k.newusers/legacy"), b"").unwrap();
+        let cached = dir.join("k.ext4");
+        assert_eq!(recorded_rootfs(&images, false).unwrap(), [cached.clone()]);
+        let pinned = crate::host::Directory::open(&dir).unwrap();
+        let key = crate::host::lock_at(crate::host::host_locks().unwrap(), &key_lock(&pinned, &cached).unwrap(), libc::LOCK_EX).unwrap();
+        assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::InUse);
+        assert!(dir.join("k.users").exists() && dir.join("k.newusers").exists());
+        drop(key);
+        assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert!(recorded_rootfs(&images, false).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::create_dir(dir.join("k.newusers")).unwrap();
+        assert_eq!(recorded_rootfs(&images, false).unwrap(), [cached.clone()]);
+        assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert!(!dir.join("k.newusers").exists());
+        // Beside a present entry, an unfinished one is no record: such an entry stays as unrecorded.
+        std::fs::create_dir(dir.join("k.newusers")).unwrap();
+        std::fs::write(&cached, b"").unwrap();
+        assert!(recorded_rootfs(&images, false).unwrap().is_empty());
+        std::fs::remove_file(&cached).unwrap();
+        std::fs::create_dir(dir.join("k.users")).unwrap();
+        std::fs::write(dir.join("k.users/other"), b"/other/templates").unwrap();
+        assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert!(dir.join("k.users/other").exists());
+        assert!(!dir.join("k.newusers").exists());
     }
 
     #[test]

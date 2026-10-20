@@ -812,16 +812,29 @@ impl Host {
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
-        self.take_name_as(name, resuming, false)
+        self.take_name_as(name, resuming, false, handed(), false)
+    }
+
+    /// `take_name` of a new name by the VM process a `run` handed its logs to with `token`
+    /// (`own_logs`): a claimed standby, told in the claim.
+    pub fn take_handed_name(&self, name: &str, token: Option<&str>) -> Result<NameLock> {
+        self.take_name_as(name, false, false, token, false)
     }
 
     /// `take_name` of a new name for a VM (`rename`): a `failed` or `lost` record of it is
     /// refused, decided holding the name, never cleared.
     pub fn take_unrecorded_name(&self, name: &str) -> Result<NameLock> {
-        self.take_name_as(name, false, true)
+        self.take_name_as(name, false, true, handed(), false)
     }
 
-    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool) -> Result<NameLock> {
+    /// `take_name` of a new name for a restore: `own`, of the checkpoint's own name, it is that
+    /// VM going on, so it keeps the name's logs as `start` does (a failed, lost or moved VM's
+    /// still go); under another name (a fork), a fresh log.
+    pub fn take_restoring_name(&self, name: &str, own: bool) -> Result<NameLock> {
+        self.take_name_as(name, false, false, handed(), own)
+    }
+
+    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool, handed: Option<&str>, keep_logs: bool) -> Result<NameLock> {
         if !resuming {
             check_new_name(name)?;
         }
@@ -868,9 +881,12 @@ impl Host {
         if !resuming && self.has_record(name, "exited") {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
-        // A new VM of a failed, lost or moved one's name starts a fresh log; a resume (`start`) keeps its VM's.
+        // A new VM of the name starts a fresh log: an earlier VM's (failed, lost, moved, or one
+        // that ended leaving only its exit status: killed, `--rm`, a foreground run's) is retired.
+        // Kept: this process's own, one a `run` handed to it (its token: whether or not that `run`
+        // is still there), and one a live `run` opened to hand to another (`own_logs`). A resume (`start`), or a restore under the checkpoint's own name, keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
-        if !resuming && ["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) {
+        if !resuming && (["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) || !keep_logs && self.earlier_logs(name, handed)?) {
             let _ = self.retire_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
@@ -957,6 +973,59 @@ impl Host {
             }
         }
         Ok(crate::util::output::open_dir(&dir)?)
+    }
+
+    /// `open_logs`, recorded as this process's lifetime (`NAME.logs/.owner`): its VM's process
+    /// (as it takes the name), or, with a `to` token, a `run` opening them for the VM process it
+    /// hands them to (a detached child, told in `HANDOFF_ENV`; a claimed standby, in the claim),
+    /// which takes the name while this one waits, and keeps them by the token even if this one
+    /// dies meanwhile. A handoff added to one still pending (another `run`'s, whose VM process
+    /// has not taken the name yet) adds its token to it, never replacing that one's: whichever
+    /// VM process takes the name keeps them. A new VM of the name retires any lifetime but
+    /// those (`take_name`). Under the logs' writers' lock (`output::lock_dir`).
+    pub fn own_logs(&self, name: &str, to: Option<&str>) -> Result<File> {
+        let dir = self.open_logs(name)?;
+        let lock = crate::util::output::lock_dir(&dir);
+        let res = self.write_owner(&dir, to);
+        if let Some(l) = lock {
+            // Unlocked, not only closed: see `Flock`.
+            let _ = flock(&l, libc::LOCK_UN);
+        }
+        res.map(|()| dir)
+    }
+
+    fn write_owner(&self, dir: &File, to: Option<&str>) -> Result<()> {
+        let tmp = std::ffi::CString::new(format!("{OWNER}.{}", std::process::id()))?;
+        let mut tokens: Vec<String> = match to {
+            Some(_) => logs_owner(dir).filter(|o| o.handoff).map(|o| o.to).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        tokens.extend(to.map(String::from));
+        // The latest few: a pending handoff's run waits on its VM process, so few are at once.
+        tokens.drain(..tokens.len().saturating_sub(MAX_HANDOFFS));
+        let owner = LogsOwner { id: Ident::me(), handoff: to.is_some(), to: tokens };
+        let mut f = crate::util::output::open_in(dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
+        std::io::Write::write_all(&mut f, &serde_json::to_vec(&owner)?)?;
+        drop(f);
+        let (d, from, to) = (dir.as_raw_fd(), tmp.as_ptr(), std::ffi::CString::new(OWNER)?);
+        if unsafe { libc::renameat(d, from, d, to.as_ptr()) } != 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::unlinkat(d, from, 0) };
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Whether `name` has logs that are not this process's to go on with (`own_logs`): none
+    /// recorded, an ended VM's, or one a `run` that is gone opened for another (not handed to
+    /// this one by `handed`); anything else at their path (not a directory) is retired too.
+    /// Under the name.
+    fn earlier_logs(&self, name: &str, handed: Option<&str>) -> Result<bool> {
+        let ours = |o: &LogsOwner| o.id == Ident::me() || handed.is_some_and(|t| o.to.iter().any(|o| o == t)) || o.handoff && o.id.alive();
+        Ok(match crate::util::output::open_dir(&self.vms(name, "logs")?) {
+            Ok(dir) => !logs_owner(&dir).is_some_and(|o| ours(&o)),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        })
     }
 
     /// Tests: writes `name`'s `log` or `log.1` (in its logs' directory, made if missing).
@@ -1571,7 +1640,7 @@ impl Host {
                 a.holder.as_deref().unwrap_or("?")
             );
         }
-        if !self.config_now().range().is_ok_and(|r| r.allocatable(ip)) {
+        if a.loan.is_none() && !self.config_now().range()?.allocatable(ip) {
             return Ok(());
         }
         if a.lent == Some(a.seen) && !a.withdrawn {
@@ -3038,6 +3107,44 @@ pub struct Entry {
     pub cmd: bool,
 }
 
+/// A logs' lifetime's record of whose it is, in it (`Host::own_logs`).
+const OWNER: &str = ".owner";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsOwner {
+    #[serde(flatten)]
+    pub id: Ident,
+    /// A `run`'s, for the VM process it hands them to.
+    #[serde(default)]
+    pub handoff: bool,
+    /// The tokens of the VM processes they are handed to, pending (`HANDOFF_ENV`, or a standby
+    /// claim's `logs_handoff`): one per `run` preparing them before any of those took the name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub to: Vec<String>,
+}
+
+/// Pending handoffs kept in a logs' owner record (`Host::own_logs`).
+const MAX_HANDOFFS: usize = 16;
+
+/// Where a `run` tells the VM process it starts the token of the logs it hands it (`own_logs`).
+pub const HANDOFF_ENV: &str = "FLEXVM_LOGS_HANDOFF";
+
+/// This process's handed logs' token, if a `run` started it with one: read once, at its start
+/// (`main` then clears it, so no process of its own inherits it).
+pub fn handed() -> Option<&'static str> {
+    static HANDED: OnceLock<Option<String>> = OnceLock::new();
+    HANDED.get_or_init(|| std::env::var(HANDOFF_ENV).ok().filter(|t| !t.is_empty())).as_deref()
+}
+
+/// Who the logs' lifetime `dir` (held) is of, if recorded (`Host::own_logs`).
+pub fn logs_owner(dir: &File) -> Option<LogsOwner> {
+    let c = std::ffi::CString::new(OWNER).ok()?;
+    let mut f = crate::util::output::open_in(dir, &c, libc::O_RDONLY).ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Unique however pids are reused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ident {
@@ -3499,6 +3606,7 @@ impl Host {
         }
         collect_dead_taps(&self.run, None);
         collect_owned(&self.run);
+        crate::checkpoint::sweep_staging(&self.state);
         // What a write killed midway left of the records.
         for dir in [self.run.join("claims"), self.run.join("vms"), self.state.join("addrs"), self.state.join("standby")] {
             remove_write_debris(&dir, |_| true);
@@ -5564,6 +5672,73 @@ pub(crate) mod tests {
         assert!(h.take_name("s", false).is_err() && h.take_name("s", true).is_ok());
     }
 
+    /// A name freed with only its exit status left (killed, `--rm`, a foreground run): the next
+    /// VM of it starts a fresh log; only its own, or a live `run`'s handed to it, are kept.
+    #[test]
+    fn a_new_vm_of_a_freed_name_retires_an_earlier_vms_logs() {
+        let (_dir, h) = host("freed-logs");
+        let me = Ident::me();
+        let parent = Ident::of(std::os::unix::process::parent_id()).unwrap();
+        let gone = Ident { pid: u32::MAX, start: 1, ..me.clone() };
+        let owned = |id: Option<&Ident>, handoff: bool| {
+            h.write_log("job", "log", "old vm\n");
+            let dir = h.vms("job", "logs").unwrap();
+            match id {
+                Some(id) => std::fs::write(dir.join(OWNER), serde_json::to_vec(&LogsOwner { id: id.clone(), handoff, to: vec![] }).unwrap()).unwrap(),
+                None => drop(std::fs::remove_file(dir.join(OWNER))),
+            }
+            crate::util::output::open_dir(&dir).unwrap()
+        };
+        let cases = [
+            (None, false, true),
+            (Some(&gone), false, true),
+            (Some(&gone), true, true),
+            // A live VM process that let go of the name (draining its output as it exits).
+            (Some(&parent), false, true),
+            (Some(&parent), true, false),
+            (Some(&me), false, false),
+        ];
+        for (id, handoff, retired) in cases {
+            let held = owned(id, handoff);
+            drop(h.take_name("job", false).unwrap());
+            assert_eq!(held.metadata().unwrap().nlink() == 0, retired, "{id:?} {handoff}");
+            assert_eq!(h.has_record("job", "log"), !retired, "{id:?} {handoff}");
+            // A resume (`start`) keeps its VM's whoever opened them.
+            let held = owned(id, handoff);
+            drop(h.take_name("job", true).unwrap());
+            assert_ne!(held.metadata().unwrap().nlink(), 0, "{id:?} {handoff}: resumed");
+        }
+        // A restore under the checkpoint's own name (`checkpoint --stop`, then `restore`) is
+        // that VM going on in its logs; under another (a fork), or after a failed VM, fresh.
+        for (own, failed, retired) in [(true, false, false), (false, false, true), (true, true, true)] {
+            let held = owned(Some(&gone), false);
+            if failed {
+                std::fs::write(h.vms("job", "failed").unwrap(), "died").unwrap();
+            }
+            drop(h.take_restoring_name("job", own).unwrap());
+            assert_eq!(held.metadata().unwrap().nlink() == 0, retired, "{own} {failed}");
+        }
+        // Handed by a `run` that died before its VM process took the name (SIGKILLed mid-handoff):
+        // kept by the VM process it was handed to, by its token; any other retires it.
+        for (token, retired) in [(Some("tok"), false), (Some("other"), true), (None, true)] {
+            let held = owned(Some(&gone), true);
+            let dir = h.vms("job", "logs").unwrap();
+            let marker = LogsOwner { id: gone.clone(), handoff: true, to: vec!["tok".into()] };
+            std::fs::write(dir.join(OWNER), serde_json::to_vec(&marker).unwrap()).unwrap();
+            drop(h.take_handed_name("job", token).unwrap());
+            assert_eq!(held.metadata().unwrap().nlink() == 0, retired, "{token:?}");
+        }
+        // Recorded by whoever opens them as theirs: the next to take the name keeps its own.
+        h.retire_logs("job").unwrap();
+        let name = h.take_name("job", false).unwrap();
+        let logs = h.own_logs("job", None).unwrap();
+        assert_eq!(logs_owner(&logs), Some(LogsOwner { id: me.clone(), handoff: false, to: vec![] }));
+        drop(name);
+        drop(h.take_name("job", false).unwrap());
+        assert_ne!(logs.metadata().unwrap().nlink(), 0);
+        assert_eq!(logs_owner(&h.own_logs("job", Some("t")).unwrap()), Some(LogsOwner { id: me, handoff: true, to: vec!["t".into()] }));
+    }
+
     #[test]
     fn reusing_a_failed_lost_or_moved_name_removes_both_logs() {
         let (_dir, h) = host("reuse-logs");
@@ -6115,6 +6290,26 @@ pub(crate) mod tests {
         assert!(h.peer_update(&l, arriving, (9, 0), c4, &[c], none).is_err());
     }
 
+    #[test]
+    fn own_address_authority_survives_range_changes() {
+        for range in ["invalid", "10.9.0.3-10.9.0.3"] {
+            let (_d, mut h) = host("peer-update-range");
+            let l = h.lock().unwrap();
+            let x = ip("10.9.0.1");
+            let gen = h.lend_new(&l, x, "borrower", false).unwrap();
+            h.cfg.vm_ips = range.into();
+            let a = h.addr(&l, x).unwrap();
+            let e = h.newer_gen(&a, x, gen + 1).unwrap_err().to_string();
+            assert!(e.contains("lent from here"), "{range}: {e}");
+            for via in [None, Some(ip("192.0.2.8"))] {
+                assert!(h.peer_update(&l, x, (gen + 1, 0), via, &[], |_| vec![]).is_err());
+            }
+            // Without a loan, an invalid range still cannot bypass the home check.
+            let y = ip("10.9.0.2");
+            assert_eq!(h.newer_gen(&Addr::default(), y, gen + 1).is_ok(), range != "invalid");
+        }
+    }
+
     /// #914 review: a committed arrival is its source's alone until released; a recorded target's
     /// addresses are not widened by what its name resolves to now; without this boot's cursor, the
     /// high-water mark proves no generation was handed out.
@@ -6170,6 +6365,10 @@ pub(crate) mod tests {
         assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, reserved - 1).is_err(), "nor arrives");
         assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, g).is_err(), "nor one handed out for another address");
         h.newer_gen(&h.addr(&l, y).unwrap(), y, g).unwrap();
+        // The first allocation recreates the cursor: the record-only bound ends.
+        let next = h.next_gen(0).unwrap();
+        h.newer_gen(&h.addr(&l, z).unwrap(), z, g + 1).unwrap();
+        assert!(h.newer_gen(&h.addr(&l, z).unwrap(), z, next + 1).is_err());
         drop(claim);
     }
 
@@ -8310,8 +8509,11 @@ pub(crate) mod tests {
         let second = h.claim_new(&l, "second", Some(ip("10.9.0.2"))).unwrap();
         for claim in [first, second] {
             assert!(claim.gen > RECV_MAX);
-            // Even the exact recorded generation cannot be withdrawn by a peer above the bound.
+            // Passing the authority check above the bound still leaves the withdrawal stale.
+            let before = h.addr(&l, claim.ip).unwrap();
+            h.peer_update(&l, claim.ip, (claim.gen, 0), None, &[], |_| vec![]).unwrap();
             assert!(!h.observe(&l, claim.ip, claim.gen, 0, None).unwrap());
+            assert_eq!(h.addr(&l, claim.ip).unwrap(), before);
             assert!(h.current(&l, claim.ip, claim.gen).unwrap());
             assert!(h.withdraw_noted(&l, claim.ip, claim.gen).unwrap());
             assert!(!h.current(&l, claim.ip, claim.gen).unwrap());
