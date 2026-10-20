@@ -1387,12 +1387,19 @@ def exec_background():
     big = 200000
     drained = []
 
+    # The 70 readers below read only once `release` exists: after the checks made while they wait, however
+    # long starting 70 CLIs took.
+    release = os.path.join(A.run, "exec-bg-release")
+    with suppress(FileNotFoundError):
+        os.unlink(release)
+
     def slow_reader(size, wait):
-        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" sh -c "head -c {size} /dev/zero" | (sleep {wait}; cat) | wc -c'
-        r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n], capture_output=True, text=True, timeout=180, env=ENV)
+        hold = f"sleep {wait}" if wait else f'while [ ! -e "$4" ]; do sleep 0.05; done'
+        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" sh -c "head -c {size} /dev/zero" | ({hold}; cat) | wc -c'
+        r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n, release], capture_output=True, text=True, timeout=180, env=ENV)
         drained.append((size, (r.returncode, r.stdout.strip(), r.stderr.strip()[-200:])))
 
-    readers = [threading.Thread(target=slow_reader, args=(big, 6)) for _ in range(70)]
+    readers = [threading.Thread(target=slow_reader, args=(big, None)) for _ in range(70)]
     start = time.time()
     for r in readers:
         r.start()
@@ -1403,6 +1410,7 @@ def exec_background():
     r = sh(A, n, "echo hi")
     took = time.time() - t
     check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
+    open(release, "w").close()
     for r in readers:
         r.join()
     bad = [d for d in drained if d[1] != (0, str(d[0]), "")]
