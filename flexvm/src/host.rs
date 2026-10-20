@@ -3359,8 +3359,8 @@ fn reap_swept(run: &Path, owner: &Ident, swept: bool) -> Result<()> {
 
 /// A Firecracker cgroup's name, `idle-PID-START-N-NS`: the VM process making it (this one)
 /// and the PID namespace its pid is in (`pid_ns`), so that hosts in other PID namespaces
-/// sharing `/sys/fs/cgroup/flexvm` never judge it (#1082). Without a namespace to name,
-/// the older `idle-PID-START-N`.
+/// sharing `/sys/fs/cgroup/flexvm` never judge it by their pids (#1082). Without a namespace
+/// to name, the older `idle-PID-START-N`.
 pub fn idle_cgroup(n: impl std::fmt::Display) -> String {
     idle_cgroup_in(&Ident::me(), n, pid_ns())
 }
@@ -3373,8 +3373,8 @@ fn idle_cgroup_in(owner: &Ident, n: impl std::fmt::Display, ns: Option<u64>) -> 
 }
 
 /// The VM process a Firecracker's cgroup (`idle_cgroup`) was made by, and its PID namespace
-/// if the name has one. Earlier builds' (`idle-PID-N`) are left alone, as their owner cannot
-/// be told by identity: emptied when their Firecrackers exit, gone at a reboot.
+/// (none in an earlier build's). Still earlier builds' (`idle-PID-N`) are left alone, as their
+/// owner cannot be told by identity: emptied when their Firecrackers exit, gone at a reboot.
 fn cgroup_owner(name: &str) -> Option<(Ident, Option<u64>)> {
     let parts: Vec<&str> = name.strip_prefix("idle-")?.split('-').collect();
     let (pid, start, ns) = match parts[..] {
@@ -3385,10 +3385,9 @@ fn cgroup_owner(name: &str) -> Option<(Ident, Option<u64>)> {
     Some((Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() }, ns))
 }
 
-/// Whether a Firecracker cgroup's owner is proven gone, judged only in its own PID namespace
-/// (`ns`, this process's): one of another namespace's, or of none known, is never.
-fn cgroup_owner_gone(name: &str, ns: Option<u64>) -> bool {
-    cgroup_owner(name).is_some_and(|(o, of)| of.is_none_or(|of| Some(of) == ns) && o.liveness() == Liveness::Gone)
+/// Whether a Firecracker cgroup's owner is proven gone (`PidNs::owner_gone`).
+fn cgroup_owner_gone(name: &str, ns: &PidNs) -> bool {
+    cgroup_owner(name).is_some_and(|(o, of)| ns.owner_gone(&o, of))
 }
 
 /// A tap's alias, naming its owner (`net::create_tap`): `flexvm pidns:NS PID START RUN`,
@@ -3408,11 +3407,69 @@ fn tap_alias_in(run: &Path, owner: &Ident, ns: Option<u64>) -> String {
 
 /// This process's PID namespace, `/proc/self/ns/pid`'s inode: hosts sharing a network
 /// namespace from different PID namespaces (containers with the host's network) cannot
-/// tell each other's processes apart by pid, so each leaves the others' taps alone (#1078).
+/// tell each other's processes apart by pid, so each leaves the others' taps and cgroups
+/// alone (#1078, #1082), until such a namespace is proven gone (`PidNs::gone`).
 fn pid_ns() -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     static NS: OnceLock<Option<u64>> = OnceLock::new();
     *NS.get_or_init(|| std::fs::metadata("/proc/self/ns/pid").ok().map(|m| m.ino()))
+}
+
+/// The PID namespaces with a process left, when this process sees every process: in the
+/// initial PID namespace only, which kernel threads are in (kthreadd, pid 2, there), with its
+/// own `/proc`. Elsewhere (a container, WSL's distribution) a namespace whose processes it
+/// cannot see would read as empty: None, and no other namespace is ever proven gone.
+fn pid_ns_census() -> Option<HashSet<u64>> {
+    use std::os::unix::fs::MetadataExt;
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    let ns_of = |dir: &Path| std::fs::metadata(dir.join("ns/pid")).ok().map(|m| m.ino());
+    let stat = std::fs::read_to_string("/proc/2/stat").ok()?;
+    let flags: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(6)?.parse().ok()?;
+    if flags & PF_KTHREAD == 0 || ns_of(Path::new("/proc/2"))? != pid_ns()? {
+        return None;
+    }
+    let mut live = HashSet::new();
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
+        if e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) {
+            live.extend(ns_of(&e.path()));
+        }
+    }
+    Some(live)
+}
+
+/// How a sweep judges a resource's owner by the PID namespace it names: in this one (`mine`),
+/// or named by none (an earlier build's), by its pid here; in another, only as a whole: gone
+/// once that namespace has no process left (`gone`), never by its pid.
+struct PidNs<'a> {
+    mine: Option<u64>,
+    census: &'a dyn Fn() -> Option<HashSet<u64>>,
+    live: std::cell::OnceCell<Option<HashSet<u64>>>,
+}
+
+impl PidNs<'_> {
+    fn now() -> PidNs<'static> {
+        PidNs { mine: pid_ns(), census: &pid_ns_census, live: Default::default() }
+    }
+
+    /// Whether `of` (an owner's namespace) is judged by its pids here.
+    fn own(&self, of: Option<u64>) -> bool {
+        of.is_none_or(|n| self.mine == Some(n))
+    }
+
+    /// Another namespace `of` is proven to have no process left only by a census of every
+    /// process (`pid_ns_census`) that finds none in it. A namespace's inode can be reused once
+    /// it is gone: a live one with it then has a process, and its resources stay.
+    fn gone(&self, of: Option<u64>) -> bool {
+        let (Some(_), Some(ns)) = (self.mine, of) else { return false };
+        self.live.get_or_init(|| (self.census)()).as_ref().is_some_and(|l| !l.contains(&ns))
+    }
+
+    fn owner_gone(&self, owner: &Ident, of: Option<u64>) -> bool {
+        match self.own(of) {
+            true => owner.liveness() == Liveness::Gone,
+            false => self.gone(of),
+        }
+    }
 }
 
 /// (owner, its PID namespace if the alias names one, run directory). An older build's
@@ -3432,15 +3489,16 @@ fn parse_tap_alias(alias: &str) -> Option<(Ident, Option<u64>, &str)> {
 }
 
 /// This host's taps: tun devices whose alias names its run directory (`tap_alias`), with
-/// their index (read before the alias: a tap made since under the name has another) and
-/// owner. A tap without such an alias (another host's, an earlier build's, anyone's), or
-/// one whose alias names another PID namespace than `ns` (this process's, `pid_ns`), is
-/// never this host's; an alias naming none is judged by its run directory alone.
+/// their index (read before the alias: a tap made since under the name has another), owner,
+/// and the PID namespaces it names. A tap without such an alias (another host's, an earlier
+/// build's, anyone's) is never this host's. One naming another PID namespace than this
+/// process's is never judged by its pid (`PidNs`).
 fn taps_of(run: &Path) -> Vec<(String, u32, Ident)> {
-    taps_of_at(run, Path::new("/sys/class/net"), false, pid_ns())
+    let ns = PidNs::now();
+    taps_of_at(run, Path::new("/sys/class/net"), false).into_iter().filter(|t| ns.own(t.3)).map(|(n, i, o, _)| (n, i, o)).collect()
 }
 
-fn taps_of_at(run: &Path, net: &Path, orphaned: bool, ns: Option<u64>) -> Vec<(String, u32, Ident)> {
+fn taps_of_at(run: &Path, net: &Path, orphaned: bool) -> Vec<(String, u32, Ident, Option<u64>)> {
     let run = run.to_string_lossy();
     let mut taps = Vec::new();
     for e in std::fs::read_dir(net).into_iter().flatten().flatten() {
@@ -3448,33 +3506,34 @@ fn taps_of_at(run: &Path, net: &Path, orphaned: bool, ns: Option<u64>) -> Vec<(S
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
         let Some(index) = read("ifindex").and_then(|i| i.trim().parse().ok()) else { continue };
         let Some(alias) = read("ifalias") else { continue };
-        let Some((owner, of_ns, of)) = parse_tap_alias(alias.strip_suffix('\n').unwrap_or(&alias)) else { continue };
-        // Its owner's pid means nothing in this namespace: never judged dead here.
-        if of_ns.is_some_and(|n| Some(n) != ns) {
-            continue;
-        }
+        let Some((owner, ns, of)) = parse_tap_alias(alias.strip_suffix('\n').unwrap_or(&alias)) else { continue };
         // Only NotFound proves the other run directory is gone; permission and I/O
         // errors leave its taps alone. The owner must still be proven dead by GC.
         let missing = || Path::new(of).metadata().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
         if (of == run || (orphaned && missing())) && dir.join("tun_flags").exists() {
-            taps.push((e.file_name().to_string_lossy().into_owned(), index, owner));
+            taps.push((e.file_name().to_string_lossy().into_owned(), index, owner, ns));
         }
     }
     taps
 }
 
-/// A dead holder's taps here; a sweep (no holder) also collects taps from deleted run directories.
-fn dead_taps_at(run: &Path, net: &Path, holder: Option<&Ident>, ns: Option<u64>) -> Vec<(String, u32, Ident)> {
-    taps_of_at(run, net, holder.is_none(), ns)
+/// A dead holder's taps here (of this PID namespace); a sweep (no holder) also collects taps from
+/// deleted run directories, and those of another PID namespace proven gone (`PidNs::gone`).
+fn dead_taps_at(run: &Path, net: &Path, holder: Option<&Ident>, ns: &PidNs) -> Vec<(String, u32, Ident)> {
+    taps_of_at(run, net, holder.is_none())
         .into_iter()
-        .filter(|(_, _, owner)| holder.is_none_or(|h| h == owner) && owner.liveness() == Liveness::Gone)
+        .filter(|(_, _, owner, of)| match holder {
+            Some(h) => ns.own(*of) && h == owner && owner.liveness() == Liveness::Gone,
+            None => ns.owner_gone(owner, *of),
+        })
+        .map(|(n, i, o, _)| (n, i, o))
         .collect()
 }
 
 /// A holder's taps, or a sweep's (including orphaned hosts). Deleting a tap also
 /// withdraws its routes, without touching a route since moved to another tap.
 fn collect_dead_taps(run: &Path, holder: Option<&Ident>) {
-    for (name, index, _) in dead_taps_at(run, Path::new("/sys/class/net"), holder, pid_ns()) {
+    for (name, index, _) in dead_taps_at(run, Path::new("/sys/class/net"), holder, &PidNs::now()) {
         crate::net::delete_link(index, &name);
     }
 }
@@ -4127,11 +4186,12 @@ fn collect_owned(run: &Path) {
         return;
     }
     // Firecrackers' by identity: once their process is gone no other makes one under their name.
+    let ns = PidNs::now();
     for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         if n.starts_with("vm-") {
             sweep_scope(&e.path());
-        } else if cgroup_owner_gone(&n, pid_ns()) {
+        } else if cgroup_owner_gone(&n, &ns) {
             let _ = crate::fc::remove_cgroup(&e.path());
         }
     }
@@ -7291,6 +7351,7 @@ pub(crate) mod tests {
         assert_eq!(idle_cgroup_in(&owner, 3, None), "idle-4242-77-3");
         assert_eq!(idle_cgroup_in(&owner, 3, Some(9)), "idle-4242-77-3-9");
         assert_eq!(cgroup_owner(&idle_cgroup(5)), Some((Ident::me(), pid_ns())));
+        assert!(pid_ns().is_some());
         for cg in [
             "vm-4242",
             "vm-4242-77",
@@ -7301,19 +7362,38 @@ pub(crate) mod tests {
             "idle-4242-77-x",
             "idle-4242-77-3-x",
             "idle-4242-77-3-",
+            "idle-4242-77-3-9.8",
             "idle-1-2-3-4-5",
             "cgroup.procs",
             "memory.max",
         ] {
             assert_eq!(cgroup_owner(cg), None, "{cg}");
         }
-        // A dead owner's: judged gone only in its own namespace, or with none named.
-        let (dead, mine, theirs) = (Ident { pid: 999_999_931, start: 1, boot: boot_id().into() }, Some(11), Some(12));
-        assert!(cgroup_owner_gone(&idle_cgroup_in(&dead, 0, mine), mine));
-        assert!(cgroup_owner_gone(&idle_cgroup_in(&dead, 0, None), mine));
-        assert!(!cgroup_owner_gone(&idle_cgroup_in(&dead, 0, theirs), mine));
-        assert!(!cgroup_owner_gone(&idle_cgroup_in(&dead, 0, theirs), None));
-        assert!(!cgroup_owner_gone(&idle_cgroup_in(&Ident::me(), 0, mine), mine), "a live owner's stays");
+        // A dead owner's: judged by its pid in its own namespace, or with none named; another
+        // namespace's only once a census of every process finds none left in it.
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        let census = || Some(HashSet::from([100, 200]));
+        let host = pidns(Some(100), &census);
+        assert!(cgroup_owner_gone(&idle_cgroup_in(&dead, 0, Some(100)), &host));
+        assert!(cgroup_owner_gone(&idle_cgroup_in(&dead, 0, None), &host));
+        assert!(!cgroup_owner_gone(&idle_cgroup_in(&Ident::me(), 0, Some(100)), &host), "a live owner's stays");
+        assert!(!cgroup_owner_gone(&idle_cgroup_in(&dead, 0, Some(200)), &host), "a live namespace's stays");
+        assert!(cgroup_owner_gone(&idle_cgroup_in(&Ident::me(), 0, Some(210)), &host), "a gone namespace's goes");
+        let blind = || None;
+        assert!(!cgroup_owner_gone(&idle_cgroup_in(&dead, 0, Some(210)), &pidns(Some(100), &blind)), "never without a census");
+        assert!(!cgroup_owner_gone(&idle_cgroup_in(&dead, 0, Some(210)), &pidns(None, &census)), "nor from an unknown namespace");
+        // Here: a census only from the initial PID namespace; one that has it lists this process's.
+        if let Some(live) = pid_ns_census() {
+            assert!(live.contains(&pid_ns().unwrap()));
+        }
+    }
+
+    fn pidns<'a>(mine: Option<u64>, census: &'a dyn Fn() -> Option<HashSet<u64>>) -> PidNs<'a> {
+        PidNs { mine, census, live: Default::default() }
+    }
+
+    fn owned(taps: Vec<(String, u32, Ident, Option<u64>)>) -> Vec<(String, u32, Ident)> {
+        taps.into_iter().map(|(n, i, o, _)| (n, i, o)).collect()
     }
 
     /// #553, #555: until a boot's recovery is marked complete, routes to peers' VMs come back from
@@ -7849,8 +7929,9 @@ pub(crate) mod tests {
         // An earlier build's alias names no namespace; the run directory may have spaces.
         assert_eq!(parse_tap_alias("flexvm 1 2 /run/a b").map(|(o, ns, r)| (o.pid, o.start, ns, r)), Some((1, 2, None, "/run/a b")));
         assert_eq!(parse_tap_alias("flexvm pidns:7 1 2 /run/a b").map(|(o, ns, r)| (o.pid, o.start, ns, r)), Some((1, 2, Some(7), "/run/a b")));
-        assert_eq!(tap_alias_in(Path::new("/run/x"), &Ident { pid: 1, start: 2, boot: String::new() }, None), "flexvm 1 2 /run/x");
-        assert_eq!(tap_alias_in(Path::new("/run/x"), &Ident { pid: 1, start: 2, boot: String::new() }, Some(7)), "flexvm pidns:7 1 2 /run/x");
+        let one = Ident { pid: 1, start: 2, boot: String::new() };
+        assert_eq!(tap_alias_in(Path::new("/run/x"), &one, None), "flexvm 1 2 /run/x");
+        assert_eq!(tap_alias_in(Path::new("/run/x"), &one, Some(7)), "flexvm pidns:7 1 2 /run/x");
         let net = h.run.join("net");
         let other = h.run.join("other");
         std::fs::create_dir(&other).unwrap();
@@ -7871,10 +7952,10 @@ pub(crate) mod tests {
         dev("fq21a2ct0", 13, &tap_alias(&other, &dead), true);
         dev("fq1t0", 14, "", true);
         dev("fq2t0", 15, &tap_alias(&h.run, &dead), false);
-        let mut got = taps_of_at(&h.run, &net, false, pid_ns());
+        let mut got = owned(taps_of_at(&h.run, &net, false));
         got.sort_by_key(|t| t.1);
         assert_eq!(got, vec![("fq3e7t0".into(), 10, dead.clone()), ("fqx3e7".into(), 11, me.clone())]);
-        let mut theirs = taps_of_at(&other, &net, false, pid_ns());
+        let mut theirs = owned(taps_of_at(&other, &net, false));
         theirs.sort_by_key(|t| t.1);
         assert_eq!(theirs, vec![("fq21a2bt0".into(), 12, me), ("fq21a2ct0".into(), 13, dead)]);
     }
@@ -7904,12 +7985,12 @@ pub(crate) mod tests {
             std::fs::write(dev.join("ifalias"), tap_alias(run, owner)).unwrap();
             std::fs::write(dev.join("tun_flags"), "0x1802\n").unwrap();
         }
-        let mut taps = dead_taps_at(&run, &net, Some(&dead), pid_ns());
+        let mut taps = dead_taps_at(&run, &net, Some(&dead), &PidNs::now());
         taps.sort_by_key(|t| t.1);
         assert_eq!(taps, vec![("dead-0".into(), 10, dead.clone()), ("dead-1".into(), 11, dead.clone())]);
-        assert!(dead_taps_at(&run, &net, Some(&live), pid_ns()).is_empty(), "a live holder's taps stay");
-        assert!(dead_taps_at(&run, &net, Some(&Ident { boot: String::new(), ..dead }), pid_ns()).is_empty(), "unknown is not proof of death");
-        assert_eq!(dead_taps_at(&run, &net, None, pid_ns()).len(), 5, "the sweep also collects other dead holders and orphaned hosts");
+        assert!(dead_taps_at(&run, &net, Some(&live), &PidNs::now()).is_empty(), "a live holder's taps stay");
+        assert!(dead_taps_at(&run, &net, Some(&Ident { boot: String::new(), ..dead }), &PidNs::now()).is_empty(), "unknown is not proof of death");
+        assert_eq!(dead_taps_at(&run, &net, None, &PidNs::now()).len(), 5, "the sweep also collects other dead holders and orphaned hosts");
     }
 
     #[test]
@@ -7929,28 +8010,33 @@ pub(crate) mod tests {
                 std::fs::write(dev.join("tun_flags"), "0x1802\n").unwrap();
             }
         }
-        assert!(dead_taps_at(&run, &net, None, pid_ns()).is_empty(), "another existing host's taps stay");
+        assert!(dead_taps_at(&run, &net, None, &PidNs::now()).is_empty(), "another existing host's taps stay");
         std::fs::remove_dir(&other).unwrap();
-        assert_eq!(dead_taps_at(&run, &net, None, pid_ns()), vec![("dead".into(), 10, dead)]);
-        assert!(taps_of_at(&run, &net, false, pid_ns()).is_empty(), "pid-reuse cleanup still only selects this host's taps");
+        assert_eq!(dead_taps_at(&run, &net, None, &PidNs::now()), vec![("dead".into(), 10, dead)]);
+        assert!(owned(taps_of_at(&run, &net, false)).is_empty(), "pid-reuse cleanup still only selects this host's taps");
     }
 
     /// Hosts in other PID namespaces sharing this network namespace and run path (#1078): their
-    /// taps' owners read as dead here, but are never judged here; an older alias reads as before.
+    /// taps' owners read as dead here, but are never judged here by pid; an older alias reads as
+    /// before. Another namespace's taps go once a census of every process finds none left in it
+    /// (a killed container's debris, swept from the initial PID namespace).
     #[test]
     fn taps_of_another_pid_namespace_are_never_swept() {
         let d = crate::test_util::TempDir::new("pidns-taps");
-        let run = d.join("run");
+        let (run, other) = (d.join("run"), d.join("other"));
         std::fs::create_dir(&run).unwrap();
+        std::fs::create_dir(&other).unwrap();
         let (net, orphan) = (d.join("net"), d.join("missing"));
         let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
-        let (mine, theirs) = (Some(4_026_531_836), Some(4_026_532_999));
+        // This host is namespace 100; 200 has a process left, 210 none.
         for (name, index, run, ns) in [
-            ("mine", 10, &run, mine),
-            ("theirs", 11, &run, theirs),
-            ("old", 12, &run, None),
-            ("theirs-orphan", 13, &orphan, theirs),
-            ("mine-orphan", 14, &orphan, mine),
+            ("mine", 10, &run, Some(100)),
+            ("old", 11, &run, None),
+            ("live-ns", 12, &run, Some(200)),
+            ("gone-ns", 13, &run, Some(210)),
+            ("gone-ns-orphan", 14, &orphan, Some(210)),
+            ("gone-ns-other", 15, &other, Some(210)),
+            ("mine-orphan", 16, &orphan, Some(100)),
         ] {
             let dev = net.join(name);
             std::fs::create_dir_all(&dev).unwrap();
@@ -7963,13 +8049,16 @@ pub(crate) mod tests {
             n.sort();
             n
         };
-        assert_eq!(names(dead_taps_at(&run, &net, None, mine)), ["mine", "mine-orphan", "old"]);
-        assert_eq!(names(dead_taps_at(&run, &net, Some(&dead), mine)), ["mine", "old"]);
-        assert_eq!(names(taps_of_at(&run, &net, false, mine)), ["mine", "old"]);
-        // From the other namespace: the reverse, and the old alias as before.
-        assert_eq!(names(dead_taps_at(&run, &net, None, theirs)), ["old", "theirs", "theirs-orphan"]);
-        // Its own namespace unknown: only old aliases are judged.
-        assert_eq!(names(dead_taps_at(&run, &net, None, None)), ["old"]);
+        let census = || Some(HashSet::from([100, 200]));
+        let host = pidns(Some(100), &census);
+        assert_eq!(names(dead_taps_at(&run, &net, None, &host)), ["gone-ns", "gone-ns-orphan", "mine", "mine-orphan", "old"]);
+        assert_eq!(names(dead_taps_at(&run, &net, Some(&dead), &host)), ["mine", "old"]);
+        assert_eq!(names(taps_of(&run)), Vec::<String>::new(), "sysfs has none of these");
+        // From 200, which sees no census (a container): its own by pid, the others' never, the old alias as before.
+        let blind = || None;
+        assert_eq!(names(dead_taps_at(&run, &net, None, &pidns(Some(200), &blind))), ["live-ns", "old"]);
+        assert_eq!(names(dead_taps_at(&run, &net, None, &pidns(Some(100), &blind))), ["mine", "mine-orphan", "old"]);
+        assert_eq!(names(dead_taps_at(&run, &net, None, &pidns(None, &census))), ["old"]);
     }
 
     /// A VM process's own cgroup goes only once empty, whatever its pid

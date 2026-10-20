@@ -10175,6 +10175,18 @@ def arrival_log():
         res["r"][0].close()
 
 
+def pid_ns():
+    """This process's PID namespace inode (`host::pid_ns`), and whether this namespace sees every
+    process (`host::pid_ns_census`: the initial one, kthreadd its pid 2)."""
+    ns = os.stat("/proc/self/ns/pid").st_ino
+    try:
+        flags = int(open("/proc/2/stat").read().rsplit(")", 1)[1].split()[6])
+        census = bool(flags & 0x00200000) and os.stat("/proc/2/ns/pid").st_ino == ns
+    except (OSError, ValueError, IndexError):
+        census = False
+    return ns, census
+
+
 def template_tap():
     """A template build SIGKILLed after making its tap (PREFIX x PID, its
     owner in its alias): a sweep removes the tap once the build is gone (any
@@ -10201,17 +10213,25 @@ def template_tap():
     p.wait()
     run = os.path.realpath(A.run)
     check("template tap: made by the build", up, tap)
-    check("template tap: its alias names the build and this host", alias == f"flexvm {p.pid} {start} {run}", alias)
+    ns, census = pid_ns()
+    check("template tap: its alias names the build, its PID namespace and this host", alias == f"flexvm pidns:{ns} {p.pid} {start} {run}", alias)
     me = f"{os.getpid()} {starttime_of(os.getpid())}"
     dead = f"{p.pid} 1"
     # (name, alias, kept): this script lives; another host's (its run dir exists) and an unowned
-    # tap read as dead pids here; a dead owner's tap whose run dir is gone is swept (#581).
+    # tap read as dead pids here; a dead owner's tap whose run dir is gone is swept (#581). The same
+    # by an earlier build's alias (no namespace) and this one's (#1078). One of another PID namespace
+    # is never judged by its pid: with no process left in it (inode 1: none has it), it goes only
+    # where a census of every process can tell (the initial PID namespace).
     other = tempfile.mkdtemp(prefix="fvci-other-")
     made = [(f"{prefix}x{os.getpid():x}", f"flexvm {me} {run}", True),
             (f"{prefix}1t0", f"flexvm {dead} {other}", True),
             (f"{prefix}2t0", "", True),
             (f"{prefix}3t0", f"flexvm {dead} {run}", False),
-            (f"{prefix}4t0", f"flexvm {dead} {run}.gone", False)]
+            (f"{prefix}4t0", f"flexvm {dead} {run}.gone", False),
+            (f"{prefix}5t0", f"flexvm pidns:{ns} {me} {run}", True),
+            (f"{prefix}6t0", f"flexvm pidns:{ns} {dead} {run}", False),
+            (f"{prefix}7t0", f"flexvm pidns:{ns} {dead} {other}", True),
+            (f"{prefix}8t0", f"flexvm pidns:1 {me} {run}", not census)]
     try:
         for dev, al, _ in made:
             subprocess.run(["ip", "tuntap", "add", "dev", dev, "mode", "tap"], check=True)

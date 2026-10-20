@@ -295,7 +295,7 @@ devices whose alias names its run directory and an owner proven gone
 (another host's taps, whatever their names read as under this prefix, and
 taps with no such alias, an earlier version's say, are never touched); a
 process with a reused pid removes its dead namesake's as it starts, as their
-names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>-<pidns>`, by the process's identity, only those of this PID namespace or of none named), work directories, names, a standby
+names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>-<pidns>`, by the process's identity in this PID namespace or one naming none; another namespace's, as its taps, only once a census from the initial PID namespace finds none of its processes left), work directories, names, a standby
 VM's socket (its `PID-START.lock` free) and a lock it died before renaming in place (`.PID-START.lock`), an arrival's log (its lock in `vms/.locks` free or gone, 5 s
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
 killed (`rmdir` refuses a populated cgroup). An earlier version's
