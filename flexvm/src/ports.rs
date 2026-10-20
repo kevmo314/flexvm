@@ -905,10 +905,12 @@ mod tests {
         };
         let (old, new) = (ago(IDLE * 2), ago(Duration::ZERO));
         let mut connections = vec![connection(old, false), connection(new, true)];
-        // Accepted in connect order: the third is the fresh one's client. A FIN alone is no hangup (a
-        // half-closed client may wait for its reply); a reset is.
+        // The fresh one's client's peer, found by address: accept order need not be connect order. A FIN
+        // alone is no hangup (a half-closed client may wait for its reply); a reset is.
         let mut peers: Vec<_> = (0..4).map(|_| listener.accept().unwrap().0).collect();
-        peers[2].shutdown(std::net::Shutdown::Write).unwrap();
+        let client = connections[1].client.local_addr().unwrap();
+        let peer = peers.remove(peers.iter().position(|p| p.peer_addr().unwrap() == client).unwrap());
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
         wait_until("the FIN to arrive", || {
             let mut b = 0u8;
             (unsafe { libc::recv(connections[1].client.as_raw_fd(), (&mut b as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) }) == 0
@@ -916,8 +918,8 @@ mod tests {
         assert!(!connections[1].client_gone(), "half-closed, it still waits for its reply");
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
         let size = std::mem::size_of::<libc::linger>() as libc::socklen_t;
-        assert_eq!(unsafe { libc::setsockopt(peers[2].as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size) }, 0);
-        drop(peers.remove(2));
+        assert_eq!(unsafe { libc::setsockopt(peer.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size) }, 0);
+        drop(peer);
         let fresh = &connections[1];
         let deadline = Instant::now() + Duration::from_secs(5);
         while !fresh.client_gone() {
