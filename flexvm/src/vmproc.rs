@@ -36,9 +36,10 @@ const APP_LOG_SILENCE: Duration = Duration::from_secs(15);
 /// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
 /// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session.
 /// `both`: the client's input goes to the guest as well (`relay_input`), which ends the stream itself.
-fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut &UnixStream, stall: Duration, both: bool) -> Result<()> {
+/// `sessions`: the slots in use (`SESSIONS`), which make a stall fatal near `MAX_SESSIONS`.
+fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut &UnixStream, stall: Duration, sessions: &AtomicUsize, both: bool) -> Result<()> {
     while let Some((kind, data)) = guest::read_frame(guest)? {
-        relay_output(client, &guest::frame(kind, &[&data]), stall, &SESSIONS)?;
+        relay_output(client, &guest::frame(kind, &[&data]), stall, sessions)?;
         if kind == guest::FRAME_EXIT && !both {
             let mut ack = [0];
             if (crate::util::By { s: client, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
@@ -65,15 +66,15 @@ fn relay_output(client: &UnixStream, mut bytes: &[u8], stall: Duration, sessions
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e.into()),
         }
-        if since.elapsed() >= stall {
-            if sessions.load(Ordering::SeqCst) >= MAX_SESSIONS * 3 / 4 {
-                bail!("the client took no output for {} s", stall.as_secs());
-            }
-            since = Instant::now();
+        let stalled = since.elapsed();
+        if stalled >= stall && sessions.load(Ordering::SeqCst) >= MAX_SESSIONS * 3 / 4 {
+            bail!("the client took no output for {} s", stalled.as_secs());
         }
+        // Past its deadline, a stalled client is looked at again each second, in case slots run short.
+        let wait = stall.checked_sub(stalled).filter(|d| !d.is_zero()).unwrap_or(stall.min(Duration::from_secs(1)));
         let mut pfd = libc::pollfd { fd: client.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
-        let left = || stall.saturating_sub(since.elapsed()).as_millis().max(1).min(i32::MAX as u128) as i32;
-        crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, left()) })?;
+        let wait = wait.as_millis().max(1).min(i32::MAX as u128) as i32;
+        crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, wait) })?;
         if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             bail!("the client hung up");
         }
@@ -1599,8 +1600,8 @@ impl Proc {
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             send_json(&mut w, &json!({"ok": true}))?;
             match req["interactive"] == true {
-                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, CLIENT_STALL, true)),
-                false => relay_session(&mut g, &mut w, CLIENT_STALL, false),
+                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, CLIENT_STALL, &SESSIONS, true)),
+                false => relay_session(&mut g, &mut w, CLIENT_STALL, &SESSIONS, false),
             }
         })();
         vm.untrack_exec(id);
@@ -1634,8 +1635,8 @@ impl Proc {
             g.get_ref().set_read_timeout((!input).then_some(Duration::from_secs(15)))?;
             send_json(&mut w, &json!({"ok": true}))?;
             match input {
-                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, CLIENT_STALL, true)),
-                false => relay_session(&mut g, &mut w, CLIENT_STALL, true),
+                true => relay_input(g.get_ref().try_clone()?, &c, || relay_session(&mut g, &mut w, CLIENT_STALL, &SESSIONS, true)),
+                false => relay_session(&mut g, &mut w, CLIENT_STALL, &SESSIONS, true),
             }
         })();
         if !input {
@@ -5103,7 +5104,7 @@ mod session_relay_tests {
             client.set_read_timeout(Some(WAIT)).unwrap();
             client.write_all(&ack).unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
-            relay_session(&mut guest, &mut &relay, CLIENT_STALL, false).unwrap();
+            relay_session(&mut guest, &mut &relay, CLIENT_STALL, &SESSIONS, false).unwrap();
             let mut got = vec![0; exit.len()];
             client.read_exact(&mut got).unwrap();
             assert_eq!(got, exit);
@@ -5125,7 +5126,7 @@ mod session_relay_tests {
             let _ = wait.recv_timeout(WAIT);
         });
         let t = Instant::now();
-        relay_session(&mut guest, &mut &relay, CLIENT_STALL, false).unwrap();
+        relay_session(&mut guest, &mut &relay, CLIENT_STALL, &SESSIONS, false).unwrap();
         assert!(t.elapsed() < Duration::from_secs(4), "the relay waited {:?}", t.elapsed());
         drop(release);
         assert!(guest.get_ref().output.is_empty());
@@ -5155,7 +5156,7 @@ mod session_relay_tests {
         });
         let (relay, client) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(WAIT)).unwrap();
-        let worker = thread::spawn(move || relay_session(&mut BufReader::new(relay_end), &mut &relay, stall, false));
+        let worker = thread::spawn(move || relay_session(&mut BufReader::new(relay_end), &mut &relay, stall, &AtomicUsize::new(0), false));
         // Wait until output is queued, then leave it unread through several stall deadlines.
         assert!(crate::util::readable(&client, WAIT).unwrap());
         thread::sleep(stall * 6);
