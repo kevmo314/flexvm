@@ -4112,11 +4112,19 @@ def signals():
     after SIGTERM."""
     n = "ft-signals"
     setup(n)
-    # Every page reply a second late until the SIGTERM is in: the target cannot finish its pull first.
-    with armed_fault(A, "pages_slow", 600000):
-        ok(migrate(A, n, B))
-        check("signals: still the source when SIGTERM comes", vms(A).get(n, {}).get("state") == "source", where(n))
-        signal_vm(A, n, signal.SIGTERM)
+    # The target's background pull held (`pull_gate`) until the source has taken the SIGTERM (its log says
+    # so): it cannot have every page, so the source is still one, however long each step takes.
+    clear_gate(B, "pull_gate")
+    with armed_fault(B, "pull_gate", 600000):
+        try:
+            ok(migrate(A, n, B))
+            check("signals: the target's pull is held", wait_for(lambda: reached(B, "pull_gate"), 30), reached(B, "pull_gate"))
+            check("signals: still the source when SIGTERM comes", vms(A).get(n, {}).get("state") == "source", where(n))
+            signal_vm(A, n, signal.SIGTERM)
+            check("signals: the source took the SIGTERM as one", wait_for(lambda: "migrating away; it ends once the target has its memory" in log(A, n), 30),
+                  log(A, n)[-500:])
+        finally:
+            release(B, "pull_gate")
     st = wait_released(B, n)
     check("signals: SIGTERM on a source: no suspend, released", st["released"] is True and not os.path.exists(
         os.path.join(A.state, "suspended", n)), st)
