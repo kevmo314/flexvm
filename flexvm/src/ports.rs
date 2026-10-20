@@ -388,12 +388,12 @@ impl Connection {
         self.connected && !queued(&self.out) && !queued(&self.incoming) && idle_now().duration_since(self.active) >= idle
     }
 
-    /// Its client reset, or closed (or shut down its sending side) with nothing sent: at the cap, it
-    /// takes over no live forward.
+    /// Its client failed: reset, or a socket error pending (POLLERR), or both directions closed (POLLHUP).
+    /// A FIN alone is not that: a half-closed client may still wait for its reply. At the cap, a gone
+    /// one takes over no live forward.
     fn client_gone(&self) -> bool {
-        let mut b = 0u8;
-        let n = unsafe { libc::recv(self.client.as_raw_fd(), (&mut b as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-        n == 0 || n < 0 && !matches!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
+        let mut p = libc::pollfd { fd: self.client.as_raw_fd(), events: 0, revents: 0 };
+        (unsafe { libc::poll(&mut p, 1, 0) }) > 0 && p.revents & (libc::POLLERR | libc::POLLHUP) != 0
     }
 }
 
@@ -885,8 +885,15 @@ mod tests {
         };
         let (old, new) = (ago(IDLE * 2), ago(Duration::ZERO));
         let mut connections = vec![connection(old, false), connection(new, true)];
-        // Accepted in connect order: the third is the fresh one's client, and closing it is the client hanging up.
+        // Accepted in connect order: the third is the fresh one's client. A FIN alone is no hangup (a
+        // half-closed client may wait for its reply); a reset is.
         let mut peers: Vec<_> = (0..4).map(|_| listener.accept().unwrap().0).collect();
+        peers[2].shutdown(std::net::Shutdown::Write).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(!connections[1].client_gone(), "half-closed, it still waits for its reply");
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        let size = std::mem::size_of::<libc::linger>() as libc::socklen_t;
+        assert_eq!(unsafe { libc::setsockopt(peers[2].as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size) }, 0);
         drop(peers.remove(2));
         let fresh = &connections[1];
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1117,6 +1124,35 @@ mod tests {
         }
         let (client, server) = &mut forwards[1];
         echo(client, server);
+        halt(&stop, worker);
+    }
+
+    #[test]
+    fn a_half_closed_client_admitted_at_the_cap_still_gets_its_reply() {
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        let (addr, guest, stop, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut client, &mut server);
+        *clock.lock().unwrap() = start + IDLE;
+        // An empty request, ended by its FIN before its guest connect completes.
+        let mut asking = TcpStream::connect(addr).unwrap();
+        asking.shutdown(std::net::Shutdown::Write).unwrap();
+        asking.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut replying, _) = crate::test_util::accept_tcp(&guest);
+        replying.set_read_timeout(Some(WAIT)).unwrap();
+        assert_eq!(replying.read(&mut [0]).unwrap(), 0, "the FIN is passed on");
+        replying.write_all(b"reply").unwrap();
+        drop(replying);
+        let mut got = Vec::new();
+        asking.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"reply");
+        match client.read(&mut [0]) {
+            Ok(n) => assert_eq!(n, 0, "the idle forward made way"),
+            Err(e) => assert!(!transient(&e) && e.kind() != io::ErrorKind::TimedOut, "the idle forward stayed open: {e}"),
+        }
         halt(&stop, worker);
     }
 
