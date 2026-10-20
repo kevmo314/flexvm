@@ -2984,10 +2984,12 @@ def reconcile_kill():
         m = setup(n, mib=100)
         ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
         gen = addr(A, ip)["seen"]
+        # Each armed until the scenario disarms it, however long the steps in between take: the
+        # outcome stays unknown until the source is killed, and a slow pull unfinished.
         if slow:
-            fault(A, "pages_slow", 120000)
-        with armed_fault(B, "lost_ack", 30000):
-            fault(B, "status", 30000)
+            fault(A, "pages_slow", 600000)
+        with armed_fault(B, "lost_ack", 600000):
+            fault(B, "status", 600000)
             r = migrate(A, n, B)
         check(f"{what}: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
         check(f"{what}: lent while it waits", addr(A, ip).get("lent") == gen, addr(A, ip))
@@ -3078,15 +3080,19 @@ def reconcile_kill():
     what = f"reconcile kill ({n})"
     setup(n, mib=100)
     ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
-    with armed_fault(A, "pages_slow", 120000):
-        fault(B, "incoming_stall", 2000)
-        with armed_fault(B, "lost_ack", 30000):
-            fault(B, "status", 30000)
+    # The arrival parked preparing (`incoming_gate`) until the source has taken the SIGINT and waits
+    # for the migration (`destroy_wait`), not for a guessed stall.
+    clear_gate(B, "incoming_gate")
+    clear_gate(A, "destroy_wait")
+    with armed_fault(A, "pages_slow", 600000), armed_fault(A, "destroy_wait", 600000), armed_fault(B, "incoming_gate", 600000):
+        with armed_fault(B, "lost_ack", 600000):
+            fault(B, "status", 600000)
             r = [None]
             th = start_thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
-            lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
-            wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
+            check(f"{what}: the arrival parked preparing", wait_for(lambda: reached(B, "incoming_gate"), 30), reached(B, "incoming_gate"))
             os.kill(pid, signal.SIGINT)
+            check(f"{what}: the SIGINT waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 30), reached(A, "destroy_wait"))
+            fault(B, "incoming_gate", 0)
             th.join()
         gone = wait_for(lambda: not alive(pid), 10)
         check(f"{what}: the waiting SIGINT ends the source, the migration giving up", gone and not r[0]["ok"] and "being destroyed" in r[0]["error"] and not owed(A),
