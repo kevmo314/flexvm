@@ -33,7 +33,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -91,6 +91,8 @@ pub const MAX_FETCH: usize = PULL_RUN * PAGE_SIZE;
 const _: () = assert!(REMOTE_FAULT_RUN <= PULL_RUN && PREFETCH_RUN <= PULL_RUN);
 /// How long a fault may keep failing (other than EAGAIN) before the pager gives up.
 const FAULT_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long export waits for prefetch and in-flight installs to settle.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(1);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // From linux/userfaultfd.h.
@@ -225,6 +227,8 @@ pub struct Runtime {
     quiesce: AtomicBool,
     /// Held from the prefetch's quiesce check through settling its claims. Export drains it; freeze holds it before wp.
     prefetch_gate: Mutex<()>,
+    #[cfg(test)]
+    before_prefetch_claim: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// The working-set prefetch ended for `quiesce` before it was done.
     prefetch_cut: AtomicBool,
     /// The page after the last template fault: only sequential template reads copy `FAULT_AROUND` pages, avoiding
@@ -490,6 +494,10 @@ impl Pager {
                 if self.quiesce.load(Ordering::SeqCst) {
                     cut = true;
                     break;
+                }
+                #[cfg(test)]
+                if let Some(pause) = self.before_prefetch_claim.get() {
+                    pause();
                 }
                 // Holes were zero at snapshot time (mostly free memory the guest allocates again); map them too, or
                 // each one costs a fault.
@@ -868,11 +876,22 @@ impl Pager {
         self.quiesce.store(true, Ordering::SeqCst);
         // Set quiesce first so a copy retrying EAGAIN can give its claims back. Once drained, no prefetch can claim
         // behind the export scan or publish a writable page after freeze takes its dirty bit.
-        drop(self.prefetch_gate.lock().unwrap());
+        let start = Instant::now();
+        loop {
+            match self.prefetch_gate.try_lock() {
+                Ok(_) => break,
+                Err(TryLockError::WouldBlock) => {
+                    if start.elapsed() >= EXPORT_TIMEOUT {
+                        bail!("prefetch is still installing pages; the VM is mid-migration");
+                    }
+                    thread::sleep(Duration::from_micros(20));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
         // A pass held asleep (the VM paused) sees it now, not at the next resume.
         self.wake_collapse();
         drop(self.pages().removing());
-        let start = Instant::now();
         let mut runs: Runs = Vec::new();
         let pages = self.pages();
         for m in self.mappings() {
@@ -880,7 +899,7 @@ impl Pager {
             let mut i = pages.next_not(BASE, first, end);
             while i < end {
                 let mut s = pages.get(i);
-                while (s == INFLIGHT || s == DISCARDED) && start.elapsed() < Duration::from_secs(1) {
+                while (s == INFLIGHT || s == DISCARDED) && start.elapsed() < EXPORT_TIMEOUT {
                     thread::sleep(Duration::from_micros(20));
                     s = pages.get(i);
                 }

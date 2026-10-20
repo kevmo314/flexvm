@@ -860,9 +860,8 @@ fn eagain_retries_only_with_a_stop_flag() {
     assert_eq!((states(&p), resolved), (vec![PRESENT, PRESENT], 0));
 }
 
-#[test]
-fn freeze_waits_for_prefetch_to_publish_dirty_pages() {
-    let dir = crate::test_util::TempDir::new("prefetch-freeze");
+fn prefetch_pager(name: &str) -> (crate::test_util::TempDir, Pager) {
+    let dir = crate::test_util::TempDir::new(name);
     std::fs::write(
         dir.join("meta.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -882,8 +881,6 @@ fn freeze_waits_for_prefetch_to_publish_dirty_pages() {
         runtime: Runtime {
             pages: Pages::new(1).into(),
             mappings: vec![Mapping { offset: 0, size: PAGE_SIZE, base_host_virt_addr: 0 }].into(),
-            tracking: true.into(),
-            fail_protect: true.into(),
             ..Runtime::default()
         },
         fault_stats: FaultStats::new(),
@@ -892,6 +889,76 @@ fn freeze_waits_for_prefetch_to_publish_dirty_pages() {
         collapse_report: Mutex::new(None),
         collapse_gate: Default::default(),
     };
+    (dir, pager)
+}
+
+#[test]
+fn export_waits_for_prefetch_before_its_claim() {
+    let (_dir, pager) = prefetch_pager("prefetch-export");
+    let (checked, checked_rx) = std::sync::mpsc::channel();
+    let (claim, claim_rx) = std::sync::mpsc::channel();
+    let claim_rx = Mutex::new(claim_rx);
+    assert!(pager
+        .before_prefetch_claim
+        .set(Box::new(move || {
+            checked.send(()).unwrap();
+            claim_rx.lock().unwrap().recv_timeout(crate::test_util::WAIT).unwrap();
+        }))
+        .is_ok());
+    let finished = AtomicBool::new(false);
+    let (started, started_rx) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        let prefetch = scope.spawn(|| pager.prefetch_pass_with(|_, n, _| Ok(n)));
+        checked_rx.recv_timeout(crate::test_util::WAIT).unwrap();
+        assert_eq!(pager.pages().get(0), BASE);
+        let export = scope.spawn(|| {
+            started.send(unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t).unwrap();
+            let result = pager.quiesce_export();
+            finished.store(true, Ordering::SeqCst);
+            result
+        });
+        let tid = started_rx.recv_timeout(crate::test_util::WAIT).unwrap();
+        crate::test_util::wait_until("export to block or finish", || finished.load(Ordering::SeqCst) || crate::test_util::asleep(tid));
+        let waited = !finished.load(Ordering::SeqCst);
+        // No INFLIGHT page can make the scan wait: prefetch passed its quiesce check but has yet to claim BASE.
+        let state = pager.pages().get(0);
+        claim.send(()).unwrap();
+        assert!(!prefetch.join().unwrap());
+        let runs = export.join().unwrap().unwrap();
+        assert!(waited, "export scanned before the prefetch claimed its page");
+        assert_eq!(state, BASE);
+        assert_eq!(runs, [(0, 1, REMOTE)]);
+        assert_eq!(pager.pages().get(0), PRESENT);
+    });
+}
+
+#[test]
+fn export_times_out_waiting_for_prefetch() {
+    let (_dir, pager) = prefetch_pager("prefetch-export-timeout");
+    let gate = pager.prefetch_gate.lock().unwrap();
+    let (done, done_rx) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let start = Instant::now();
+            done.send((pager.quiesce_export(), start.elapsed())).unwrap();
+        });
+        let result = done_rx.recv_timeout(crate::test_util::WAIT);
+        // Release before asserting, so even an unbounded gate wait cannot hang the scoped join.
+        drop(gate);
+        let (result, elapsed) = result.unwrap();
+        assert!(result.unwrap_err().to_string().contains("the VM is mid-migration"));
+        assert!(elapsed >= EXPORT_TIMEOUT);
+        assert!(pager.quiesce.load(Ordering::SeqCst));
+        assert_eq!(pager.pages().get(0), BASE);
+    });
+    assert!(pager.quiesce_export().unwrap().is_empty());
+}
+
+#[test]
+fn freeze_waits_for_prefetch_to_publish_dirty_pages() {
+    let (_dir, pager) = prefetch_pager("prefetch-freeze");
+    pager.tracking.store(true, Ordering::SeqCst);
+    pager.fail_protect.store(true, Ordering::SeqCst);
     let (marked, marked_rx) = std::sync::mpsc::channel();
     let (publish, publish_rx) = std::sync::mpsc::channel();
     let publish_rx = Mutex::new(publish_rx);
