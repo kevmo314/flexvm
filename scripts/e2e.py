@@ -2335,6 +2335,87 @@ def pull_gc():
                     host.rm(v, force=True, check=False)
 
 
+def standby_pids(run, t):
+    """Pids of the live standby VMs of `t` under `run` (their lock files in RUN/standby/HASH/.locks)."""
+    m, h = (1 << 64) - 1, 0xcbf29ce484222325
+
+    def word(w):
+        nonlocal h
+        x = ((h ^ w) * 0x9e3779b97f4a7c15) & m
+        h = x ^ (x >> 29)
+    b = t.encode()
+    word(len(b))
+    full = len(b) - len(b) % 8
+    for i in range(0, full, 8):
+        word(int.from_bytes(b[i:i + 8], "little"))
+    word(int.from_bytes(b[full:].ljust(8, b"\0"), "little"))
+    d = os.path.join(run, "standby", f"{h:016x}", ".locks")
+    pids = [f[:-5].split("-")[0] for f in os.listdir(d) if f.endswith(".lock")] if os.path.isdir(d) else []
+    return sorted(p for p in pids if alive(p))
+
+
+def generations_open(pid):
+    """The template generations (`.gen/ID`) process `pid` has open."""
+    found = set()
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                m = re.search(r"/\.gen/([^/]+)$", os.readlink(f"/proc/{pid}/fd/{fd}"))
+            except OSError:
+                continue
+            if m:
+                found.add(m.group(1))
+    except OSError:
+        pass
+    return found
+
+
+@case
+def pull_standby():
+    """#921, #943: with no listener and no VM, a rebuild's superseded standby VMs leave, the old generation is
+    deleted (none keeps it open through its refill), and the pool comes back from the new one."""
+    h = Host("sbpull", args.port_a, args.port_a + 1, args.net_a)
+    os.makedirs(h.run_dir)
+    os.makedirs(h.state_dir)
+    os.symlink(ARTIFACTS, os.path.join(h.state_dir, "artifacts"))
+    h.configure(vm_ips=f"{args.net_a}.241-{args.net_a}.250", reserve_mib=256)
+    name = "e2e-sbpull"
+
+    def pull(n, *extra):
+        r = h.cli("pull", TEST_IMAGE, "--tag", name, "--vcpus", "2", "--max", "2048", "--env", f"SB={n}", *extra, timeout=600)
+        return [json.loads(line)["deleted"] for line in r.stdout.splitlines() if line.startswith("{") and "deleted" in line]
+
+    def current():
+        return next(v["id"] for v in json.loads(h.cli("images", "--json").stdout) if v["name"] == name)
+
+    def pool_on(gen):
+        pids = standby_pids(h.run_dir, name)
+        return len(pids) == 2 and all(generations_open(p) == {gen} for p in pids)
+    try:
+        pull(1, "--standby", "2")
+        first = current()
+        check("pull standby: two ready", wait_for(lambda: pool_on(first), 120), [(p, generations_open(p)) for p in standby_pids(h.run_dir, name)])
+        for i in range(2):
+            old = current()
+            # The first time, each standby a departing one starts stalls before its lock, so the departing one's
+            # refill outlasts the pull's five-second wait for it (#943): it must not hold its generation meanwhile.
+            h.cli("debug", "fault", "standby_lock_stall", "60000" if i == 0 else "0")
+            deleted = pull(2 + i)
+            new = current()
+            check("pull standby: the superseded generation is deleted", deleted == [old], (old, deleted))
+            check("pull standby: the pool comes back from the new generation", wait_for(lambda: pool_on(new), 120),
+                  [(p, generations_open(p)) for p in standby_pids(h.run_dir, name)])
+        h.cli("debug", "fault", "standby_lock_stall", "0")
+        h.cli("rmi", name, timeout=300)
+        check("pull standby: rmi leaves no standby", wait_for(lambda: not standby_pids(h.run_dir, name), 60), standby_pids(h.run_dir, name))
+    finally:
+        if os.path.isdir(h.state_dir):
+            for v in h.ps():
+                h.rm(v, force=True, check=False)
+            if standby_pids(h.run_dir, name):
+                h.cli("pull", name, "--standby", "0", check=False, timeout=300)
+
+
 @case
 def faults():
     """The selected scripts/faults.py scenarios against the same two hosts."""
@@ -2488,7 +2569,7 @@ COST = {"faults/exec_background": 110, "containers": 15, "faults/reboot": 40, "f
         "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
         "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
         "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
-        "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "checkpoint_store": 12, "checkpoint_save_load": 20, "checkpoint_load_other_build": 15, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
+        "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "pull_standby": 20, "checkpoint_store": 12, "checkpoint_save_load": 20, "checkpoint_load_other_build": 15, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
         "faults/page_refusals": 14, "faults/connect_after_pull": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
         "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,
