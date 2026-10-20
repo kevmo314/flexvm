@@ -670,6 +670,8 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
                     let _ = s.send(&buf[..n]);
                     *at = idle_now();
                 }
+                #[cfg(test)]
+                tests::udp_processed(peer.0);
             }
         }
         clients.retain(|_, (_, at, _)| idle_now().duration_since(*at) < idle);
@@ -685,6 +687,15 @@ mod tests {
     // relaying bytes and recording their activity. Other workers and tests keep real clocks.
     thread_local! {
         pub(super) static CLOCK: std::cell::RefCell<Option<(Arc<std::sync::Mutex<Instant>>, Instant)>> = const { std::cell::RefCell::new(None) };
+        static UDP_PROCESSED: std::cell::RefCell<Option<std::sync::mpsc::Sender<SocketAddr>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn udp_processed(peer: SocketAddr) {
+        UDP_PROCESSED.with(|sender| {
+            if let Some(sender) = sender.borrow().as_ref() {
+                let _ = sender.send(peer);
+            }
+        });
     }
 
     pub(super) fn tick_clock() {
@@ -744,16 +755,25 @@ mod tests {
         let stop = Arc::new(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) });
         let start = Instant::now();
         let clock = Arc::new(std::sync::Mutex::new(start));
+        let (processed, received) = std::sync::mpsc::channel();
         let worker = {
             let stop = stop.clone();
             let clock = clock.clone();
             thread::spawn(move || {
                 pin_clock(clock);
+                UDP_PROCESSED.with(|sender| *sender.borrow_mut() = Some(processed));
                 udp(vec![listener], target, stop.as_fd(), 2, IDLE);
             })
         };
+        let worker = Worker { stop, thread: Some(worker) };
         let client = || UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let (a, b, c) = (client(), client(), client());
+        // Different sending sockets can arrive out of order, even on the same listener.
+        // Acknowledge processing (including refusal) before another probe or clock advance.
+        let send = |client: &UdpSocket, data: &[u8]| {
+            client.send_to(data, addr).unwrap();
+            assert_eq!(received.recv_timeout(WAIT).unwrap(), client.local_addr().unwrap());
+        };
         // What the guest gets next, and from which session.
         let got = || {
             guest.set_read_timeout(Some(WAIT)).unwrap();
@@ -761,28 +781,28 @@ mod tests {
             let (n, from) = guest.recv_from(&mut buf).unwrap();
             (String::from_utf8_lossy(&buf[..n]).into_owned(), from)
         };
-        a.send_to(b"a", addr).unwrap();
+        send(&a, b"a");
         let (_, from_a) = got();
-        b.send_to(b"b", addr).unwrap();
+        send(&b, b"b");
         let (_, from_b) = got();
-        c.send_to(b"c", addr).unwrap();
-        // Same listener, in order: b's arrival proves c was processed and refused.
-        b.send_to(b"b", addr).unwrap();
-        assert_eq!(got(), ("b".into(), from_b), "admitted over the cap with both sessions recent");
+        send(&c, b"c");
+        send(&b, b"recent");
+        assert_eq!(got(), ("recent".into(), from_b), "admitted over the cap with both sessions recent");
         *clock.lock().unwrap() = start + IDLE * 3 / 8;
-        b.send_to(b"b", addr).unwrap();
-        assert_eq!(got(), ("b".into(), from_b));
+        send(&b, b"busy");
+        assert_eq!(got(), ("busy".into(), from_b));
         // a quiet for half the expiry, b not: a goes for c.
         *clock.lock().unwrap() = start + IDLE * 5 / 8;
-        c.send_to(b"c", addr).unwrap();
+        send(&c, b"c");
         let (data, from_c) = got();
         assert!(data == "c" && from_c != from_a && from_c != from_b);
         assert!(clock.lock().unwrap().duration_since(start) < IDLE, "replacement must precede expiry");
-        a.send_to(b"a", addr).unwrap();
-        b.send_to(b"b", addr).unwrap();
-        assert_eq!(got(), ("b".into(), from_b), "a was not replaced or b's busy session was replaced");
-        unsafe { libc::write(stop.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
-        worker.join_within().unwrap();
+        send(&a, b"a");
+        send(&b, b"survived");
+        assert_eq!(got(), ("survived".into(), from_b), "a was not replaced or b's busy session was replaced");
+        send(&c, b"survived");
+        assert_eq!(got(), ("survived".into(), from_c), "c's admitted session was replaced");
+        worker.halt();
     }
 
     #[test]
@@ -941,7 +961,7 @@ mod tests {
         assert!(connections.iter().all(|c| !c.fresh));
     }
 
-    /// A running TCP worker: `halt` stops it and checks it ended; dropped (a failed test), it is stopped all the same.
+    /// A running port worker: `halt` stops it and checks it ended; dropped (a failed test), it is stopped all the same.
     struct Worker {
         stop: Arc<OwnedFd>,
         thread: Option<JoinHandle<()>>,
