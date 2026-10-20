@@ -58,9 +58,10 @@ not wait on the host:
   the memory it keeps for its next checkpoint: the request is a number in
   `RUN/.locks/release-BOOT`, raised under the host lock, which each VM
   process looks for every 100 ms, answering in its own file in
-  `RUN/.locks/released-BOOT/`. Taking the host lock waits until the caller's
-  deadline, or without a time limit if it has none; the response wait starts
-  after taking the lock. The request waits up to 200 ms for each that
+  `RUN/.locks/released-BOOT/`. Admission waits for the host lock to ask as it
+  does to admit: until its deadline, or until it has it without one (#1081); a
+  VM's controller or a standby, which look again next tick, give up on it after
+  200 ms. The response wait starts after taking the lock. The request waits up to 200 ms for each that
   runs (not for one that is stopped; the files of those proven gone are
   removed), and MemAvailable is read again whoever answered: that memory is
   not admitted, so it never refuses a grant (#648, #677). Eviction and the

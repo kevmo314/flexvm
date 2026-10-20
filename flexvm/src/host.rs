@@ -2034,7 +2034,7 @@ impl Host {
             drop(l);
             // A guard further out would keep the lock held through the wait.
             debug_assert_eq!(DEPTH.with(|d| d.get()), 0, "waiting for VM processes under the host lock");
-            crate::hostmem::release_kept(self, deadline);
+            crate::hostmem::release_kept_admitting(self, deadline);
             released = true;
         }
     }
