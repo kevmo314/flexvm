@@ -861,6 +861,10 @@ fn eagain_retries_only_with_a_stop_flag() {
 }
 
 fn prefetch_pager(name: &str) -> (crate::test_util::TempDir, Pager) {
+    prefetch_pager_with_pages(name, 1)
+}
+
+fn prefetch_pager_with_pages(name: &str, n: usize) -> (crate::test_util::TempDir, Pager) {
     let dir = crate::test_util::TempDir::new(name);
     std::fs::write(
         dir.join("meta.json"),
@@ -873,14 +877,14 @@ fn prefetch_pager(name: &str) -> (crate::test_util::TempDir, Pager) {
         .unwrap(),
     )
     .unwrap();
-    std::fs::write(dir.join("mem"), vec![0x5a; PAGE_SIZE]).unwrap();
+    std::fs::write(dir.join("mem"), vec![0x5a; n * PAGE_SIZE]).unwrap();
     let mut base = crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap();
-    Arc::get_mut(&mut base).unwrap().working_set = vec![(0, 1)];
+    Arc::get_mut(&mut base).unwrap().working_set = vec![(0, n as u64)];
     let pager = Pager {
         base,
         runtime: Runtime {
-            pages: Pages::new(1).into(),
-            mappings: vec![Mapping { offset: 0, size: PAGE_SIZE, base_host_virt_addr: 0 }].into(),
+            pages: Pages::new(n).into(),
+            mappings: vec![Mapping { offset: 0, size: n * PAGE_SIZE, base_host_virt_addr: 0 }].into(),
             ..Runtime::default()
         },
         fault_stats: FaultStats::new(),
@@ -1040,6 +1044,23 @@ fn prefetch_installs_prepared_template_bytes() {
     }));
     assert_eq!(copied, 1);
     assert_eq!(pager.pages().get(0), PRESENT);
+}
+
+#[test]
+fn prefetch_reuses_scratch_across_runs() {
+    let (_dir, mut pager) = prefetch_pager_with_pages("prefetch-scratch", 6);
+    Arc::get_mut(&mut pager.base).unwrap().working_set = vec![(0, 1), (2, 2), (5, 1)];
+    let mut start = None;
+    let mut copied = Vec::new();
+    assert!(!pager.prefetch_pass_with(|p, n, src| {
+        let src = src.unwrap();
+        assert_eq!(src, vec![0x5a; n * PAGE_SIZE]);
+        assert_eq!(*start.get_or_insert(src.as_ptr()), src.as_ptr());
+        copied.push((p, n));
+        Ok(n)
+    }));
+    assert_eq!(copied, [(0, 1), (2, 2), (5, 1)]);
+    assert_eq!(states(pager.pages()), [PRESENT, BASE, PRESENT, PRESENT, BASE, PRESENT]);
 }
 
 #[test]

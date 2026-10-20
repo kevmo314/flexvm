@@ -18,7 +18,10 @@ use std::{
     os::fd::{AsRawFd, FromRawFd},
     os::unix::fs::FileExt,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 fn tmp(name: &str) -> crate::test_util::TempDir {
@@ -661,9 +664,10 @@ fn direct_read_falls_back_only_on_einval_and_propagates_retry_errors() {
     fs::write(&path, page(7)).unwrap();
     let file = File::open(path).unwrap();
     let _ = direct(&file, true);
+    let cached = AtomicBool::new(false);
     let mut calls = 0;
     let mut buf = vec![0; PAGE_SIZE];
-    read_with_fallback(&file, || {
+    read_with_fallback(&file, &cached, || {
         calls += 1;
         if calls == 1 {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -673,15 +677,18 @@ fn direct_read_falls_back_only_on_einval_and_propagates_retry_errors() {
     })
     .unwrap();
     assert_eq!(calls, 2);
+    assert!(cached.load(Ordering::Relaxed));
     assert_eq!(buf, page(7));
     for (first, expected_calls) in [(libc::EIO, 1), (libc::EINVAL, 2)] {
         let mut calls = 0;
-        let err = read_with_fallback(&file, || {
+        cached.store(false, Ordering::Relaxed);
+        let err = read_with_fallback(&file, &cached, || {
             calls += 1;
             Err(io::Error::from_raw_os_error(if calls == 1 { first } else { libc::EIO }))
         })
         .unwrap_err();
         assert_eq!(calls, expected_calls);
+        assert_eq!(cached.load(Ordering::Relaxed), first == libc::EINVAL);
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
     }
 }
@@ -1464,12 +1471,12 @@ fn recorded_users_follow_a_stopped_vm_renamed_meanwhile() {
     for (name, id) in [("a", "aaaa1111"), ("b", "bbbb2222")] {
         link(&state.join("suspended").join(name), None, |m| m.template_id = id.into());
     }
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let mover = {
         let (state, stop) = (state.clone(), stop.clone());
         std::thread::spawn(move || {
             let mut i = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) {
                 let (from, to) = if i % 2 == 0 { ("b", "c") } else { ("c", "b") };
                 let _moves = crate::host::suspended_moves(&state, libc::LOCK_EX).unwrap();
                 fs::rename(state.join("suspended").join(from), state.join("suspended").join(to)).unwrap();
@@ -1482,7 +1489,7 @@ fn recorded_users_follow_a_stopped_vm_renamed_meanwhile() {
         let want: std::collections::BTreeSet<String> = ["aaaa1111", "bbbb2222"].map(String::from).into();
         assert_eq!(users, want);
     }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
     mover.join().unwrap();
 }
 

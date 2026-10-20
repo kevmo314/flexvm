@@ -210,6 +210,16 @@ impl Pages {
         }
     }
 
+    /// Installed writable: publish dirty before PRESENT, which lets quiesce_export finish and freeze take it.
+    fn mark_dirty_range(&self, mut first: usize, end: usize) {
+        while first < end {
+            let word = end.min((first / 64 + 1) * 64);
+            self.touch(first);
+            self.dirty[first / 64].fetch_or((u64::MAX >> (64 - (word - first))) << (first % 64), Ordering::SeqCst);
+            first = word;
+        }
+    }
+
     pub fn is_dirty(&self, page: usize) -> bool {
         self.dirty.get(page / 64).is_some_and(|w| w.load(Ordering::Relaxed) >> (page % 64) & 1 != 0)
     }
@@ -432,12 +442,10 @@ impl Pages {
     }
 
     /// Settles claimed `page`, claimed from state `from`. Returns whether a REMOTE page got resolved, for the pager's
-    /// count of pages to pull.
+    /// count of pages to pull. Populated pages must already be dirty.
     fn settle(&self, page: usize, populated: bool, from: u8) -> bool {
+        #[cfg(test)]
         if populated {
-            // Installed writable: publish dirty before PRESENT, which lets quiesce_export finish and freeze take it.
-            self.mark_dirty(page);
-            #[cfg(test)]
             if let Some(pause) = self.before_present.get() {
                 pause(page);
             }
@@ -512,6 +520,7 @@ impl Pages {
                 Ok(done) => {
                     let done = done.clamp(1, m);
                     self.woke(i, done);
+                    self.mark_dirty_range(i, i + done);
                     resolved += (i..i + done).filter(|&p| self.settle(p, true, from)).count();
                     i += done;
                 }
@@ -519,6 +528,7 @@ impl Pages {
                     if from == BASE || from == REMOTE {
                         self.note_preset(i, from);
                     }
+                    self.mark_dirty(i);
                     resolved += self.settle(i, true, from) as usize;
                     i += 1;
                 }
@@ -770,6 +780,54 @@ mod tests {
     }
 
     #[test]
+    fn partial_installs_mark_only_populated_ranges_before_present() {
+        use std::sync::Arc;
+
+        for first in [0, 63, CHUNK - 1] {
+            let mut pages = Pages::new(first + 100);
+            pages.fill(first, 100, REMOTE);
+            let pages = Arc::new(pages);
+            let weak = Arc::downgrade(&pages);
+            let end = Arc::new(AtomicUsize::new(first));
+            let published = end.clone();
+            assert!(pages
+                .before_present
+                .set(Box::new(move |_| {
+                    let pages = weak.upgrade().unwrap();
+                    for p in first..published.load(Ordering::Relaxed) {
+                        assert!(pages.touched(p));
+                        assert!(pages.is_dirty(p));
+                    }
+                }))
+                .is_ok());
+            assert_eq!(pages.claim(first, 100, REMOTE, |_| true), 100);
+            let mut calls = 0;
+            let (resolved, result) = pages.install(first, 100, REMOTE, None, |p, n| {
+                calls += 1;
+                match calls {
+                    1 | 3 => {
+                        let done = if calls == 1 { 3 } else { n };
+                        end.store(p + done, Ordering::Relaxed);
+                        Ok(done)
+                    }
+                    2 => {
+                        end.store(p + 1, Ordering::Relaxed);
+                        Err(io::Error::from_raw_os_error(libc::EEXIST))
+                    }
+                    _ => Err(io::Error::from_raw_os_error(libc::EIO)),
+                }
+            });
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+            let end = end.load(Ordering::Relaxed);
+            assert_eq!(resolved, end - first);
+            assert_eq!(pages.dirty_bits(false).pages(0, pages.len()).collect::<Vec<_>>(), (first..end).collect::<Vec<_>>());
+            for p in first..pages.len() {
+                assert_eq!(pages.get(p), if p < end { PRESENT } else { REMOTE });
+            }
+        }
+    }
+
+    #[test]
     fn present_publishes_dirty() {
         for from in [BASE, ZERO, REMOTE] {
             let mut pages = Pages::new(8192);
@@ -786,7 +844,7 @@ mod tests {
                     }
                 });
                 let (resolved, result) =
-                    pages.install(0, pages.len(), from, None, |p, _| if p % 2 == 0 { Ok(1) } else { Err(io::Error::from_raw_os_error(libc::EEXIST)) });
+                    pages.install(0, pages.len(), from, None, |p, n| if p % 3 != 0 { Ok(n) } else { Err(io::Error::from_raw_os_error(libc::EEXIST)) });
                 result.unwrap();
                 assert_eq!(resolved, if from == REMOTE { pages.len() } else { 0 });
             });
