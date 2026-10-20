@@ -209,11 +209,43 @@ impl Checkpoint {
         self.file.runs.iter().map(|r| r.1).sum()
     }
 
+    /// DATA is pulled in full; prefetch only allocates working-set pages left BASE.
+    pub fn restore_mib(&self, working_set: &[(u64, u64)]) -> u64 {
+        (restore_pages(self.data_pages(), &self.runs, working_set) * PAGE_SIZE as u64) >> 20
+    }
+
     pub fn content_hash(&self, template: &Template) -> Result<String> {
         let mut canon = Canon::new(template);
         self.each_page(false, |p, b| canon.page(p, b))?;
         Ok(canon.finish())
     }
+}
+
+fn restore_pages(data: u64, runs: &Runs, working_set: &[(u64, u64)]) -> u64 {
+    let mut sorted = working_set.to_vec();
+    sorted.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (first, count) in sorted {
+        let end = first + count;
+        match merged.last_mut() {
+            Some((_, last)) if first <= *last => *last = (*last).max(end),
+            _ => merged.push((first, end)),
+        }
+    }
+    let mut pages = data;
+    let mut at = 0;
+    for (first, end) in merged {
+        pages += end - first;
+        while at < runs.len() && runs[at].0 + runs[at].1 <= first {
+            at += 1;
+        }
+        for &(f, n, kind) in runs[at..].iter().take_while(|r| r.0 < end) {
+            if kind != crate::uffd::BASE {
+                pages -= end.min(f + n) - first.max(f);
+            }
+        }
+    }
+    pages
 }
 
 pub(super) fn overlay(base: &[Run], top: &[Run]) -> Vec<Run> {
@@ -322,5 +354,21 @@ pub(super) fn read_with_fallback(file: &File, mut read: impl FnMut() -> io::Resu
             read()
         }
         r => r,
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn restore_counts_data_and_only_merged_base_working_set() {
+        use crate::uffd::ZERO;
+        let runs = vec![(100, 300, REMOTE), (500, 100, ZERO), (700, 100, REMOTE)];
+        assert_eq!(restore_pages(400, &runs, &[(350, 200), (50, 200), (200, 250), (700, 100)]), 550);
+        assert_eq!(restore_pages(400, &runs, &[]), 400);
+        assert_eq!(restore_pages(400, &runs, &[(100, 300), (100, 300)]), 400);
+        // A 2 GiB DATA checkpoint already supplies its 1 GiB working set.
+        assert_eq!(restore_pages(524288, &vec![(0, 524288, REMOTE)], &[(0, 262144), (0, 262144)]), 524288);
     }
 }

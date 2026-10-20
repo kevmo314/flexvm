@@ -20,7 +20,7 @@ use std::io::{Read, Seek};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::host::Host;
@@ -302,6 +302,64 @@ impl Limit {
     }
 }
 
+/// A short-lived template VM: its start stays reserved through teardown, even
+/// when warm-up or recording outlasts the recent-grant window.
+pub struct Building {
+    host: Host,
+    hold: Mutex<Option<crate::host::Hold>>,
+    admitted: u64,
+    limit: Arc<Limit>,
+    live: Arc<AtomicBool>,
+    watcher: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Building {
+    pub fn admit(host: &Host, need: u64) -> crate::util::Result<Self> {
+        let admitted = allowance(need);
+        let (_, hold) = host.grant_start(admitted, crate::host::Floor::Reserve, true, None)?;
+        Ok(Self {
+            host: host.clone(),
+            hold: Mutex::new(hold),
+            admitted,
+            limit: Arc::new(Limit::new(None)),
+            live: Arc::new(AtomicBool::new(true)),
+            watcher: None,
+        })
+    }
+
+    /// Before boot or snapshot load, just as ordinary VMs join before running. Again for a
+    /// Firecracker that replaces the last (a retried load): the last one's watcher stops first.
+    pub fn start(&mut self, fc: &mut crate::fc::Firecracker, cap: u64) -> crate::util::Result<()> {
+        self.stop();
+        fc.isolate()?;
+        self.limit = Arc::new(Limit::new(fc.cgroup()));
+        self.limit.start(self.admitted, cap);
+        let limit = self.limit.clone();
+        self.live = Arc::new(AtomicBool::new(true));
+        let (host, live) = (self.host.clone(), self.live.clone());
+        self.watcher = Some(std::thread::spawn(move || limit.watch(&host, Duration::from_secs(1), || live.load(Ordering::SeqCst), || true)));
+        Ok(())
+    }
+
+    pub fn lift(&self, pid: u32) -> Lifted<'_> {
+        self.limit.lift(Some(pid))
+    }
+
+    fn stop(&mut self) {
+        self.live.store(false, Ordering::SeqCst);
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
+        }
+    }
+}
+
+impl Drop for Building {
+    fn drop(&mut self) {
+        self.stop();
+        self.host.release_hold(&self.hold);
+    }
+}
+
 /// Waits until the cgroup file changes (POLLPRI) or `tick` passes.
 fn wait_event(f: Option<&mut std::fs::File>, tick: Duration) {
     let Some(f) = f else { return std::thread::sleep(tick) };
@@ -324,6 +382,26 @@ impl Drop for Lifted<'_> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn building_keeps_and_refunds_its_start_grant() {
+        let dir = crate::test_util::TempDir::new("building-admission");
+        let mut host = Host::open(&dir.join("state"), &dir.join("run")).unwrap();
+        host.cfg.reserve_mib = Some(0);
+        let admission = Building::admit(&host, 1).unwrap();
+        let holds = crate::host::locks(&host.run).join("holds");
+        assert_eq!(std::fs::read_dir(&holds).unwrap().count(), 1);
+        let grants: Vec<(u64, u64, u64)> = crate::host::load(&host.grants()).unwrap().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].1, allowance(1));
+        drop(admission);
+        assert_eq!(std::fs::read_dir(&holds).unwrap().count(), 0);
+        let grants: Vec<(u64, u64, u64)> = crate::host::load(&host.grants()).unwrap().unwrap();
+        assert!(grants.is_empty());
+        host.cfg.reserve_mib = Some(u64::MAX);
+        assert!(Building::admit(&host, 1).err().unwrap().to_string().contains("not enough memory"));
+        assert_eq!(std::fs::read_dir(&holds).unwrap().count(), 0);
+    }
 
     #[test]
     fn no_memory_controller_leaves_memory_features_off() {

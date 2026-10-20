@@ -429,8 +429,8 @@ impl Proc {
         let tpl = Template::open_id(&self.paths, &ck.manifest.template, &ck.manifest.template_id)?;
         tpl.check_vouched(ck.manifest.template_digests.as_ref(), "the checkpoint")?;
         t.mark("verify_template");
-        // The template's working set is prefetched too.
-        self.admit_start(tpl.working_set_mib() + ((ck.data_pages() * PAGE_SIZE as u64) >> 20), None, crate::host::Floor::Reserve, None)?;
+        // Prefetch only claims pages the flattened checkpoint leaves BASE.
+        self.admit_start(ck.restore_mib(&tpl.working_set), None, crate::host::Floor::Reserve, None)?;
         Ok(tpl)
     }
 
