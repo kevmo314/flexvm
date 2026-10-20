@@ -1396,23 +1396,37 @@ def exec_background():
     def slow_reader(size, wait):
         hold = f"sleep {wait}" if wait else f'while [ ! -e "$4" ]; do sleep 0.05; done'
         cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" sh -c "head -c {size} /dev/zero" | ({hold}; cat) | wc -c'
-        r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n, release], capture_output=True, text=True, timeout=180, env=ENV)
-        drained.append((size, (r.returncode, r.stdout.strip(), r.stderr.strip()[-200:])))
+        # Its own session, so a timeout ends the whole pipeline (the waiting subshell too), not just bash.
+        p = subprocess.Popen(["bash", "-c", cmd, BIN, A.state, A.run, n, release], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, env=ENV, start_new_session=True)
+        try:
+            out, err = p.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+            out, err = p.communicate()
+        drained.append((size, (p.returncode, out.strip(), err.strip()[-200:])))
 
     readers = [threading.Thread(target=slow_reader, args=(big, None)) for _ in range(70)]
     start = time.time()
-    for r in readers:
-        r.start()
-        time.sleep(0.02)
-    full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
-    check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
-    t = time.time()
-    r = sh(A, n, "echo hi")
-    took = time.time() - t
-    check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
-    open(release, "w").close()
-    for r in readers:
-        r.join()
+    try:
+        for r in readers:
+            r.start()
+            time.sleep(0.02)
+        full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
+        check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
+        t = time.time()
+        r = sh(A, n, "echo hi")
+        took = time.time() - t
+        check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
+    finally:
+        # Released however the checks went (one raising too), and gone once they all read.
+        open(release, "w").close()
+        for r in readers:
+            if r.ident is not None:
+                r.join()
+        with suppress(FileNotFoundError):
+            os.unlink(release)
     bad = [d for d in drained if d[1] != (0, str(d[0]), "")]
     check("exec bg: 70 slow readers all get all their output and status", len(drained) == 70 and not bad, bad[:3])
     # More output than the guest keeps for a session (4 MiB): the command waits for its reader, and the
