@@ -2577,8 +2577,10 @@ def rx_stall():
     restore, suspend and resume, and pause and resume a VM over and over;
     after each, the guest's InDatagrams must go up again. On a stall it
     records the guest's, Firecracker's and the tap's view, then has the
-    guest send one datagram
-    (an interrupt on the same line) to see whether that wakes its receive.
+    guest send one datagram (an interrupt on the same line) to see whether
+    that wakes its receive. A VM that died instead is no stall: that fails
+    as a death, with the VM's log (a crashed guest's console) printed, as
+    CI's were guests crashing right after a restore (#968).
     RX_ITERS (default 25), RX_RATE (datagrams/s, default 2000) and
     RX_TAP_RATE (frames/s written onto its tap, default 1000) scale it."""
     n = "ft-rx-stall"
@@ -2661,8 +2663,16 @@ def rx_stall():
             check(f"rx stall: {op} {i} succeeded", False, r)
             break
         done[op] = done.get(op, 0) + 1
-        cur_tap[0] = vms(cur)[n].get("tap") or cur_tap[0]
+        cur_tap[0] = vms(cur).get(n, {}).get("tap") or cur_tap[0]
         if not receiving(cur, n):
+            v = vms(cur).get(n, {})
+            if not v.get("pid"):
+                # Not a stall: the VM is gone (#968). Its log ends with how it died, and a guest crash
+                # with the guest's console (#964), which the scenario's later cleanup may not leave behind.
+                check(f"rx stall: the VM lived through {op} {i}", False,
+                      {"state": v.get("state"), "error": v.get("error"), "status": v.get("status")})
+                print(f"rx stall: {cur}'s log of {n}:\n{log(cur, n)}", flush=True)
+                break
             before = rx_state(cur, n)
             code, out = sh(cur, n, "echo wake | socat -u - UDP-SENDTO:169.254.1.1:9")
             woke = receiving(cur, n)
