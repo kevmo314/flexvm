@@ -67,10 +67,8 @@ impl Pages {
                     failed = res.err();
                     done = ready;
                 }
-                // After a failed install, the rest of the reply is read and dropped rather than cut short: the
-                // connection then serves the retry (cutting it would reconnect on every retry, as memory is short).
-                // Only a stop cuts it.
-                failed.is_none() || !stop.load(Ordering::SeqCst)
+                // Cut the reply on install failure; the link drops it and reconnects for the retry.
+                failed.is_none()
             });
             match fetched {
                 _ if failed.is_some() => break,

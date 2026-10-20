@@ -357,10 +357,9 @@ fn failure_history_follows_the_pages() {
     }
 }
 
-/// A streamed install that fails installs nothing more, but reads the rest of the reply, so that the connection lives
-/// on for the retry; a stopped pager cuts the fetch at once.
+/// An install failure cuts the fetch and releases the unread tail for retry.
 #[test]
-fn failed_install_drains_the_fetch() {
+fn failed_install_stops_the_fetch() {
     for stopped in [false, true] {
         let p = pages(&[REMOTE; 64]);
         p.claim(0, 64, REMOTE, |_| true);
@@ -386,7 +385,7 @@ fn failed_install_drains_the_fetch() {
         assert!(matches!(res, Err(Failed::Install(_))));
         assert_eq!(resolved, 1);
         assert_eq!(installs, 2, "nothing installed after the failure");
-        let want = if stopped { 1 + STREAM_RUN } else { 64 };
+        let want = 1 + STREAM_RUN;
         assert_eq!(delivered, want, "stopped: {stopped}");
         assert!(states(&p)[1..].iter().all(|&s| s == REMOTE));
         assert!(p.failing_since(1, 1).is_some());

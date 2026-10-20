@@ -1061,7 +1061,7 @@ fn load(idle: Firecracker, template: Arc<Template>, stopping: impl Fn() -> bool)
     check_stop()?;
     p.pager.wait_ready(Duration::from_secs(5))?;
     // With the pager's view in place, before the guest runs: memory mapped behind its back would read as zeroes (#949).
-    p.pager.check_foreign()?;
+    p.pager.check_foreign(Duration::from_secs(10))?;
     check_stop()?;
     let resumed = fc.resume(API_TIMEOUT);
     p.pager.loaded();

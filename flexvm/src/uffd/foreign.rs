@@ -12,7 +12,7 @@
 //! userfaultfd), or turn up as EEXIST when it installs them (`Pages::preset`). `Pager::foreign_pages` looks for both
 //! once a load is done and before the guest first runs, so the load can be retried on a fresh Firecracker.
 
-use super::{Pager, BASE, INFLIGHT, PAGE_SIZE, REMOTE};
+use super::{Pager, Pages, BASE, INFLIGHT, PAGE_SIZE, REMOTE};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
@@ -28,9 +28,6 @@ const PM_SWAP: u64 = 1 << 62;
 /// Regions per `PAGEMAP_SCAN` call, and pages per pagemap read where it is missing.
 const SCAN_REGIONS: usize = 512;
 const READ_PAGES: usize = 64 << 10;
-/// How long `foreign_pages` waits for claimed pages it finds mapped to settle (an install settles each run as its
-/// copy finishes); those that have not by then are not counted.
-const INFLIGHT_WAIT: Duration = Duration::from_secs(10);
 
 #[repr(C)]
 #[derive(Default)]
@@ -131,63 +128,66 @@ fn foreign(state: u8, has_data: bool) -> bool {
 impl Pager {
     /// How many guest pages Firecracker has mapped that the pager never installed and that should hold template or
     /// migrated data (see the module docs). For a load that is done, before the guest first runs.
-    pub fn foreign_pages(&self) -> io::Result<(usize, Option<usize>)> {
-        let pagemap = self.pagemap_file()?;
+    pub fn foreign_pages(&self, timeout: Duration) -> (usize, Option<usize>) {
+        let deadline = Instant::now() + timeout;
         let pages = self.pages();
-        let (mut found, mut first_found) = (0, None);
-        let mut note = |p: usize| {
-            found += 1;
-            first_found = first_found.or(Some(p));
-        };
-        // Mapped while claimed: by the claimant's own copy (it settles at once), or before the claim (its copy
-        // gets EEXIST, noted in `preset`). Either way, known once it settles.
-        let mut inflight = Vec::new();
-        for m in self.mappings() {
-            let first = m.span().0;
-            for (a, b) in mapped_runs(pagemap, m.base_host_virt_addr, m.size as u64)? {
-                for p in (first + a..first + b).filter(|&p| p < pages.len()) {
-                    match pages.get(p) {
-                        INFLIGHT => inflight.push(p),
-                        s if foreign(s, self.base.has_data(p)) => note(p),
-                        _ => {}
+        let mut mapped = Vec::new();
+        let scan = || -> io::Result<Vec<usize>> {
+            let pagemap = self.pagemap_file()?;
+            let mut mapped = Vec::new();
+            for m in self.mappings() {
+                let (first, end) = m.span();
+                // Skip pages the pager installed and template holes, including on kernels without PAGEMAP_SCAN.
+                let mut runs = Vec::new();
+                for p in first..end.min(pages.len()) {
+                    let state = pages.get(p);
+                    if state == INFLIGHT || foreign(state, self.base.has_data(p)) {
+                        push_run(&mut runs, p, p + 1);
+                    }
+                }
+                for (a, b) in runs {
+                    let start = m.base_host_virt_addr + ((a - first) * PAGE_SIZE) as u64;
+                    for (lo, hi) in mapped_runs(pagemap, start, ((b - a) * PAGE_SIZE) as u64)? {
+                        mapped.extend(a + lo..a + hi);
                     }
                 }
             }
+            Ok(mapped)
+        };
+        match scan() {
+            Ok(found) => mapped = found,
+            Err(e) => crate::log!("uffd: checking firecracker's guest memory: {e}; using EEXIST evidence only"),
         }
-        let deadline = Instant::now() + INFLIGHT_WAIT;
-        while !inflight.is_empty() && Instant::now() < deadline {
-            inflight.retain(|&p| match pages.get(p) {
-                INFLIGHT => true,
-                // Given back (a failed install releases its claim) though mapped: not the pager's.
-                s => {
-                    if foreign(s, self.base.has_data(p)) {
-                        note(p);
-                    }
-                    false
-                }
-            });
-            std::thread::sleep(Duration::from_millis(1));
+        // A claimant's copy may map the page itself; wait for its state or EEXIST evidence to settle.
+        while mapped.iter().any(|&p| pages.get(p) == INFLIGHT) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
         }
-        // Still claimed: a copy may be mapping a run a page at a time, so that is no proof either way, and the
-        // check never fails a load it cannot prove wrong.
-        // Settled PRESENT since, by an install that hit EEXIST.
-        pages.preset.lock().unwrap().iter().filter(|&&(p, from)| foreign(from, self.base.has_data(p))).for_each(|&(p, _)| note(p));
-        Ok((found + pages.preset_more.load(Ordering::Relaxed), first_found))
+        foreign_count(pages, &mapped, |p| self.base.has_data(p))
     }
 
     /// `foreign_pages` as a load's check: an error, which retrying on a fresh Firecracker gets past, if there are any.
-    pub fn check_foreign(&self) -> crate::util::Result<()> {
-        match self.foreign_pages() {
-            Ok((0, _)) => Ok(()),
-            Ok((n, first)) => Err(format!(
-                "{FOREIGN}: {n} pages ({} KiB, from guest memory offset {:#x}) were mapped before its userfaultfd covered them",
-                n * PAGE_SIZE / 1024,
-                first.unwrap_or(0) * PAGE_SIZE
-            )
-            .into()),
-            Err(e) => Err(format!("checking firecracker's guest memory: {e}").into()),
+    pub fn check_foreign(&self, timeout: Duration) -> crate::util::Result<()> {
+        let (n, first) = self.foreign_pages(timeout);
+        if n == 0 {
+            return Ok(());
         }
+        Err(format!(
+            "{FOREIGN}: {n} pages ({} KiB, from guest memory offset {:#x}) were mapped before its userfaultfd covered them",
+            n * PAGE_SIZE / 1024,
+            first.unwrap_or(0) * PAGE_SIZE
+        )
+        .into())
     }
+}
+
+// Recheck states after waiting: a mapped page claimed since the scan may now be in `preset`.
+fn foreign_count(pages: &Pages, mapped: &[usize], has_data: impl Fn(usize) -> bool) -> (usize, Option<usize>) {
+    let preset = pages.preset.lock().unwrap();
+    let mut found: Vec<_> = mapped.iter().copied().filter(|&p| foreign(pages.get(p), has_data(p))).collect();
+    found.extend(preset.iter().filter(|&&(p, from)| foreign(from, has_data(p))).map(|&(p, _)| p));
+    found.sort_unstable();
+    found.dedup();
+    (found.len() + pages.preset_more.load(Ordering::Relaxed), found.first().copied())
 }
 
 /// How `check_foreign`'s error starts.
@@ -250,6 +250,19 @@ mod tests {
         for s in [PRESENT, ZERO, INFLIGHT, DISCARDED] {
             assert!(!foreign(s, true));
         }
+    }
+
+    #[test]
+    fn mapped_pages_claimed_since_the_scan_are_counted_once() {
+        let mut pages = Pages::new(4);
+        pages.fill(0, 4, REMOTE);
+        assert_eq!(pages.claim(0, 2, REMOTE, |_| true), 2);
+        let _ = pages.install(0, 2, REMOTE, None, |_, _| Err(io::Error::from_raw_os_error(libc::EEXIST)));
+        assert_eq!(foreign_count(&pages, &[0, 1, 2], |_| true), (3, Some(0)));
+        // Without pagemap access, EEXIST still proves these pages foreign.
+        assert_eq!(foreign_count(&pages, &[], |_| true), (2, Some(0)));
+        assert_eq!(pages.claim(3, 1, REMOTE, |_| true), 1);
+        assert_eq!(foreign_count(&pages, &[3], |_| true), (2, Some(0)), "unsettled copies prove nothing");
     }
 
     #[test]

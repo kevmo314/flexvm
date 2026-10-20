@@ -4543,18 +4543,35 @@ pub fn fault(name: &str) -> bool {
 
 /// When fault `name`'s arming ends, if it is armed now: each arming has its own.
 fn armed_until(name: &str) -> Option<u64> {
-    static CACHE: Mutex<Option<(SystemTime, HashMap<String, u64>)>> = Mutex::new(None);
+    static CACHE: OnceLock<Mutex<FaultCache>> = OnceLock::new();
     if !faults_on() {
         return None;
     }
     let path = RUN_DIR.get()?.join("faults.json");
-    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let mut c = CACHE.lock().unwrap();
-    if c.as_ref().map(|c| Some(c.0)) != Some(mtime) {
-        *c = mtime.map(|m| (m, load(&path).ok().flatten().unwrap_or_default()));
+    let mut c = CACHE.get_or_init(|| Mutex::new(FaultCache::default())).lock().unwrap();
+    c.refresh(&path, std::time::Instant::now());
+    c.armed.get(name).copied().filter(|&until| wall_ms() < until)
+}
+
+#[derive(Default)]
+struct FaultCache {
+    checked: Option<std::time::Instant>,
+    stamp: Option<crate::template::Stamp>,
+    armed: HashMap<String, u64>,
+}
+
+impl FaultCache {
+    fn refresh(&mut self, path: &Path, now: std::time::Instant) {
+        if self.checked.is_some_and(|t| now.duration_since(t) < Duration::from_millis(10)) {
+            return;
+        }
+        self.checked = Some(now);
+        let stamp = std::fs::metadata(path).ok().map(|m| crate::template::Stamp::of(&m));
+        if stamp != self.stamp {
+            self.armed = load(path).ok().flatten().unwrap_or_default();
+            self.stamp = stamp;
+        }
     }
-    let now = wall_ms();
-    c.as_ref()?.1.get(name).copied().filter(|&until| now < until)
 }
 
 /// Test hook: MemAvailable (MiB) as a test wrote it to `RUN/mem_available_mib`, in place of the host's.
@@ -4697,7 +4714,7 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
         _ => armed.insert(name.into(), now + ms),
     };
     store(&path, &armed, false)?;
-    // Ensure the next write changes the mtime the cache keys on.
+    // Let running processes refresh their test-fault caches before the caller proceeds.
     std::thread::sleep(Duration::from_millis(10));
     Ok(())
 }
@@ -4711,6 +4728,29 @@ pub fn name_busy(e: &crate::util::Error) -> bool {
 pub(crate) mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn fault_cache_polls_for_runtime_arming_and_removal() {
+        let dir = crate::test_util::TempDir::new("fault-cache");
+        let path = dir.join("faults.json");
+        let mut cache = FaultCache::default();
+        let now = std::time::Instant::now();
+        cache.refresh(&path, now);
+        assert!(cache.armed.is_empty());
+        std::fs::write(&path, br#"{"gate":123}"#).unwrap();
+        cache.refresh(&path, now + Duration::from_millis(9));
+        assert!(cache.armed.is_empty(), "no filesystem check within the polling interval");
+        cache.refresh(&path, now + Duration::from_millis(10));
+        assert_eq!(cache.armed.get("gate"), Some(&123));
+        let replacement = dir.join("replacement");
+        std::fs::write(&replacement, br#"{"gate":456}"#).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        cache.refresh(&path, now + Duration::from_millis(20));
+        assert_eq!(cache.armed.get("gate"), Some(&456));
+        std::fs::remove_file(&path).unwrap();
+        cache.refresh(&path, now + Duration::from_millis(30));
+        assert!(cache.armed.is_empty());
+    }
 
     /// Parks `n` threads at gate `g` on `marker` (one latch set), returning once the marker counts all of them.
     fn parked(latches: &'static Latches, marker: &Path, n: usize) -> Vec<std::thread::JoinHandle<()>> {

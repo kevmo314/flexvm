@@ -1348,7 +1348,7 @@ impl Prepared {
                 self.pager.wait_ready(left(Duration::from_secs(5)))?;
                 // With the pager's view in place, before the guest runs: memory mapped behind its back would read
                 // as zeroes (#949).
-                self.pager.check_foreign().inspect_err(|e| load_failed = Some(e.to_string()))
+                self.pager.check_foreign(left(Duration::from_secs(10))).inspect_err(|e| load_failed = Some(e.to_string()))
             });
             let readied = neighbour.map(|r| r.join()).transpose().map_err(|_| "neighbour thread panicked")?;
             held?;

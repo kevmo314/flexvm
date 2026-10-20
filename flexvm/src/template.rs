@@ -844,6 +844,9 @@ fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<Socket
     let fc = p.firecracker();
     // Like VM restores: stepping the clock touches pages of its own.
     fc.load_snapshot(&tpl.vmstate(), &tpl, tap, Some(true), crate::fc::API_TIMEOUT)?;
+    fc.pause(crate::fc::API_TIMEOUT)?;
+    p.pager.wait_ready(Duration::from_secs(5))?;
+    p.pager.check_foreign(Duration::from_secs(10))?;
     fc.resume(crate::fc::API_TIMEOUT)?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;
