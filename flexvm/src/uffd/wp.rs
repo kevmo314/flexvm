@@ -365,6 +365,7 @@ impl Pager {
     /// with `cow` arms copy-on-write for them so the VM can run on: whatever was unprotected since the last pause is
     /// write-protected again first.
     pub fn freeze(&self, runs: &Runs, incremental: bool, cow: bool) -> Result<Frozen> {
+        let _prefetch = self.prefetch_gate.lock().unwrap();
         // Hot pages (see `hot`), copied first, outside the fault lock.
         let start = Instant::now();
         let (mut hot, prev_generation, prev) = match if cow && self.tracking() { self.copy_hot() } else { Ok(None) } {

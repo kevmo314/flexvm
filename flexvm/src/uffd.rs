@@ -223,6 +223,8 @@ pub struct Runtime {
     /// Set by the checkpoint barrier: no new prefetch, and the collapse pass ends; cleared if a migration aborts
     /// (`unquiesce`).
     quiesce: AtomicBool,
+    /// Held from the prefetch's quiesce check through settling its claims. Export drains it; freeze holds it before wp.
+    prefetch_gate: Mutex<()>,
     /// The working-set prefetch ended for `quiesce` before it was done.
     prefetch_cut: AtomicBool,
     /// The page after the last template fault: only sequential template reads copy `FAULT_AROUND` pages, avoiding
@@ -476,10 +478,15 @@ impl Pager {
     /// One prefetch pass; true if it was cut short by `quiesce` but an abort has cleared that meanwhile and left it to
     /// this to go on (`unquiesce` takes `prefetch_cut` only once it is published).
     fn prefetch_pass(&self) -> bool {
+        self.prefetch_pass_with(|p, c, src| self.populate(p, c, src))
+    }
+
+    fn prefetch_pass_with(&self, mut populate: impl FnMut(usize, usize, Option<&[u8]>) -> io::Result<usize>) -> bool {
         let pages = self.pages();
         let mut cut = false;
         for (mut i, end) in self.chunks(self.working_set(0, 1), PREFETCH_RUN) {
             while i < end {
+                let _prefetch = self.prefetch_gate.lock().unwrap();
                 if self.quiesce.load(Ordering::SeqCst) {
                     cut = true;
                     break;
@@ -493,8 +500,8 @@ impl Pager {
                     // A cold template read happens here, not under `events`, where it would hold up every fault batch.
                     let prefault = |p: usize, c: usize| self.base.prefault(p, c);
                     let stop = || self.quiesce.load(Ordering::SeqCst);
-                    let _ = pages
-                        .install_prepared(i, n, BASE, Some(&stop), data.then_some(&prefault as &dyn Fn(usize, usize)), |p, c| self.populate(p, c, src(p, c)));
+                    let _ =
+                        pages.install_prepared(i, n, BASE, Some(&stop), data.then_some(&prefault as &dyn Fn(usize, usize)), |p, c| populate(p, c, src(p, c)));
                 }
                 i += n.max(1);
             }
@@ -859,6 +866,9 @@ impl Pager {
     /// ZERO stays ZERO and BASE is implied.
     pub fn quiesce_export(&self) -> Result<Runs> {
         self.quiesce.store(true, Ordering::SeqCst);
+        // Set quiesce first so a copy retrying EAGAIN can give its claims back. Once drained, no prefetch can claim
+        // behind the export scan or publish a writable page after freeze takes its dirty bit.
+        drop(self.prefetch_gate.lock().unwrap());
         // A pass held asleep (the VM paused) sees it now, not at the next resume.
         self.wake_collapse();
         drop(self.pages().removing());
