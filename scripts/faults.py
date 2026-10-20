@@ -2798,7 +2798,8 @@ def delayed_announce():
         r = migrate(A, n, B)
         check("delayed announce: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
         wait_released(B, n)
-        check("delayed announce: B took the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
+        # Recorded after the commit's answer (its fsyncs off the downtime): waited for, not read once.
+        check("delayed announce: B took the next revision", wait_for(lambda: addr(B, ip).get("rev") == 1, 10), addr(B, ip))
         check("delayed announce: A heard of it", wait_for(lambda: addr(A, ip).get("rev") == 1, 10), addr(A, ip))
     check("delayed announce: B handled it, as stale", wait_for(lambda: held_routes(B, ip, since)["answered"], 10)
           and held_routes(B, ip, since)["answered"] == [(gen, 0, "stale")], held_routes(B, ip, since))
