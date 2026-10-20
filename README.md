@@ -178,7 +178,7 @@ every word after it is the command.
 `cpu.max` quota on its Firecracker's cgroup, set before the VM runs); it
 still has its image's vCPUs. A host without the cgroup cpu controller refuses
 a start (or an arrival) with `--cpus` rather than run it uncapped.
-`--memory SIZE` (`512m`, `2g`; a plain number is bytes, as in Docker) caps
+`-m` / `--memory SIZE` (`512m`, `2g`; a plain number is bytes, as in Docker) caps
 how far the VM grows: from its image's boot memory plus what its snapshot
 plugged (a VM never shrinks below that) up to the image's ceiling. A value
 outside that is refused, saying the range. vCPU count and boot memory are
@@ -197,7 +197,7 @@ flexvm ps --format json         # an object per line, as docker's
 flexvm inspect web db           # a JSON array: per VM, what ps --json says and its config
 ```
 
-`--filter` keys are `name` (a part of it, as docker's), `status` (a state
+`-f` / `--filter` keys are `name` (a part of it, as docker's), `status` (a state
 below, as `exited`, or `stopped` for any no process runs; a status filter
 lists stopped and exited VMs without `-a`), `image` (as `pull` took it, or its template name)
 and `ip`. `--format` fields are `.Name`, `.IP`, `.Image`, `.State` (or
@@ -235,7 +235,8 @@ flexvm exec -d -e MODE=worker -w /srv -u app:staff web ./worker
 
 `exec [OPTIONS] NAME CMD...` preserves each argument, including spaces and empty
 arguments. Options go before NAME: `-d` / `--detach` starts the command and returns
-0 without output; `-e` / `--env K=V` is repeatable; `-w` / `--workdir DIR` and
+0 without output; `-e` / `--env K[=V]` is repeatable; a bare key takes its
+value from this environment and is left out if unset; `-w` / `--workdir DIR` and
 `-u` / `--user USER[:GROUP]` override the run's effective config for this command.
 Users and groups are resolved inside the guest as `pull` resolves the image's
 `User` (a numeric uid or gid need no entry; supplementary groups only without an
@@ -284,9 +285,12 @@ unwritten for an hour, by sweeps that run when a VM starts and about every
 
 ```sh
 flexvm logs web                 # its log: NAME.log.1 (before the last rotation), then NAME.log
-flexvm logs --tail 20 web       # the last 20 lines
+flexvm logs -n 20 web           # the last 20 lines
 flexvm logs -f web              # and follow it, until the VM exits, is removed or renamed
 ```
+
+`-n` / `--tail N` selects the last N lines. Short switches can be bundled
+(for example, `ps -aq` or `logs -fn 20 web`).
 
 `logs -f` reads on across rotations (it finishes the rotated log, then
 starts on the new one) and restarts (a VM started again appends to its log);
@@ -304,6 +308,9 @@ flexvm's and flexvm-init's informational messages go to the log alone, and
 also to stderr with the global `--verbose` (`-v`) or `FLEXVM_LOG=debug`.
 After `run`, `-v` is docker's volume flag, which flexvm refuses (volumes are
 not supported yet, #717): put `-v` before the command (`flexvm -v run ...`).
+
+After `run`, `-h` is Docker's hostname flag and is refused: use `--name`
+to set the VM's name and hostname, and `--help` for help.
 
 The guest's hostname is the VM's name (`root@web` in a shell's prompt), with
 an /etc/hosts entry for it; a rename sets it in the guest too. Templates pulled
@@ -386,6 +393,9 @@ several names, go on past one that fails, and print each name done (`start`
 prints the VM's JSON when restoring a stopped VM, and its name when already
 running or paused). A VM is its process, so the signals in
 parentheses work as well, sent to the pid `ps` shows.
+
+`stop` of an already stopped or exited VM succeeds without changing it.
+`restart` of a failed or lost VM names that state and points to `ps -a` and `rm`.
 
 A stopped VM keeps its name and address. `start` restores it in a new
 process, in the background whether it first ran in the foreground or with
