@@ -53,7 +53,8 @@ fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut &UnixStr
 /// What ends a relay waiting on a client that takes no output, besides its hangup: a stall of `stall`
 /// while `sessions` near `MAX_SESSIONS`, or `guest` (-1: none) hanging up with `cut()` true (its VM
 /// pausing: `Vm::save_state` shut it down; the client reattaches). A guest that hangs up on its own
-/// still has its last frames delivered: an exit, say, that the slow client takes past `ACK_WAIT`.
+/// still has its last frames delivered (an exit, say, that the slow client takes past `ACK_WAIT`)
+/// unless a cut comes after.
 struct Wait<'a> {
     stall: Duration,
     sessions: &'a AtomicUsize,
@@ -84,6 +85,9 @@ fn relay_output(client: &UnixStream, mut bytes: &[u8], wait: &Wait) -> Result<()
         }
         // Past its deadline, a stalled client is looked at again each second, in case slots run short.
         let left = wait.stall.checked_sub(stalled).filter(|d| !d.is_zero()).unwrap_or(wait.stall.min(Duration::from_secs(1)));
+        // A guest that hung up on its own stays checked for a cut each second (a checkpoint after it).
+        let hung = guest < 0 && wait.guest >= 0;
+        let left = if hung { left.min(Duration::from_secs(1)) } else { left };
         let left = left.as_millis().max(1).min(i32::MAX as u128) as i32;
         // A negative fd is skipped; hangups are reported whatever the events.
         let mut pfds =
@@ -95,7 +99,7 @@ fn relay_output(client: &UnixStream, mut bytes: &[u8], wait: &Wait) -> Result<()
         if pfds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             bail!("the client hung up");
         }
-        if pfds[1].revents != 0 {
+        if pfds[1].revents != 0 || hung {
             if (wait.cut)() {
                 bail!("the guest's connection was cut");
             }
@@ -5341,6 +5345,31 @@ mod session_relay_tests {
         assert_eq!(got, exit);
         drop(client);
         worker.join_within().unwrap().unwrap();
-        assert_eq!(cuts.load(Ordering::SeqCst), 1);
+    }
+
+    /// A guest that hung up on its own, then a checkpoint untracking the session: the relay still ends.
+    #[test]
+    fn a_cut_after_the_guest_hung_up_ends_a_stalled_relay() {
+        let (relay_end, writer) = big_frame_then(vec![]);
+        let (relay, _client) = UnixStream::pair().unwrap();
+        let (cut, cuts) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+        let (c, n) = (cut.clone(), cuts.clone());
+        let worker = thread::spawn(move || {
+            let fd = relay_end.as_raw_fd();
+            let looked = || {
+                n.fetch_add(1, Ordering::SeqCst);
+                c.load(Ordering::SeqCst)
+            };
+            let wait = Wait { guest: fd, cut: &looked, ..idle(&IDLE) };
+            relay_session(&mut BufReader::new(relay_end), &mut &relay, &wait, false)
+        });
+        drop(writer.join_within().unwrap());
+        // Seen hung up, and looked at again since, while the client stays stalled.
+        reach(&cuts, 2);
+        assert!(!worker.is_finished());
+        cut.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        let err = worker.join_within().unwrap().unwrap_err();
+        assert!(err.to_string().contains("cut") && t.elapsed() < Duration::from_secs(3), "{err} after {:?}", t.elapsed());
     }
 }
