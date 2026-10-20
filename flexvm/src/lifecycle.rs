@@ -397,7 +397,7 @@ impl Proc {
         if let Some(ip) = want {
             crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         }
-        self.set_name(self.host.take_name(&name, false)?);
+        self.set_name(self.host.take_restoring_name(&name, name == ck.manifest.name)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         drop(held);
         self.set_resources(resources.or(ck.manifest.resources), &tpl.meta)?;
