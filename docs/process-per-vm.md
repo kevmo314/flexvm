@@ -306,9 +306,11 @@ takes the name. Only the VM's own process writes them (a foreground client whose
 is gone drops its own output), and it and `logs -f` hold the directory, never its path:
 they open, rotate and read only in it. So a lifetime ends in one step, without waiting on
 anyone: explicit `rm` (including `rm -f` of a running VM, once its process has exited, so
-its last words are in the log removed), a new VM of a `failed`, `lost` or `moved` name,
-or an accepted arrival renames the directory away (`.NAME.logs.X.gone`) and removes it,
-holding the name and `RUN/.locks/logs` shared; `rename` moves it to the new name. A writer
+its last words are in the log removed), or a new VM of a `failed`, `lost` or `moved` name
+renames the directory away (`.NAME.logs.X.gone`) and removes it, holding the name and
+`RUN/.locks/logs` shared; `rename` moves it to the new name. An accepted arrival's log is
+published as `log` in the directory its VM made as it took the name. Logs at `NAME.log`
+and `NAME.log.1` from before these directories are moved into it when it is made. A writer
 still running then goes on only in its own directory, and `logs -f` ends once the directory
 at the path is not the one it holds (its inode, held, is never a later one's). `kill` and a
 foreground `run -i`/`-t`'s end keep the logs. Logs remain available for stopped and exited
@@ -632,7 +634,7 @@ an operation. Busy here is what the VM process's own checks say (its reply
 sets `busy`), never a peer's text: any peer's refusal, whatever it says, is
 a refusal (#599). A refused VM and peer pair is not tried again for 5 s, doubling
 to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
-log is removed; an accepted one becomes `NAME.logs/log`, a new lifetime.
+log is removed; an accepted one becomes `NAME.logs/log`.
 Announcements and `lend` requests go to all peers at once, by the peers
 configured now (`Host::config_now`); the listener re-reads them too, so
 an edit of host.json's `peers` reaches running processes.

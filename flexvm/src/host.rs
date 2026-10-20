@@ -871,7 +871,7 @@ impl Host {
         // A new VM of a failed, lost or moved one's name starts a fresh log; a resume (`start`) keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
         if !resuming && ["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) {
-            let _ = self.remove_logs(name);
+            let _ = self.retire_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
         // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log.
@@ -925,16 +925,12 @@ impl Host {
         Ok(())
     }
 
-    /// `name`'s logs retired (`retire_logs`), those missing too; under its name and the logs lock (shared).
-    fn remove_logs(&self, name: &str) -> Result<()> {
-        self.retire_logs(name)
-    }
-
     /// `RUN/vms/NAME.logs`, made if missing, opened: a lifetime of `name`'s logs (`log`, and
     /// `log.1` before its last rotation). Its writers (its VM's process: `output::append_in`)
     /// and followers (`logs -f`) hold the directory, never its path, so one retired is never
     /// written or read for the name again, and while held its inode is never a later one's.
-    /// `NAME.log` and `NAME.log.1` link into it, for people (and the paths documented).
+    /// `NAME.log` and `NAME.log.1` link into it, for people (and the paths documented); logs
+    /// there from before these directories are moved into it. Under the name.
     pub fn open_logs(&self, name: &str) -> Result<File> {
         let dir = self.vms(name, "logs")?;
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
@@ -942,7 +938,23 @@ impl Host {
             _ => {}
         }
         for ext in ["log", "log.1"] {
-            let _ = std::os::unix::fs::symlink(format!("{name}.logs/{ext}"), self.vms(name, ext)?);
+            let (link, target) = (self.vms(name, ext)?, PathBuf::from(format!("{name}.logs/{ext}")));
+            let ours = || std::fs::read_link(&link).is_ok_and(|t| t == target);
+            match std::fs::symlink_metadata(&link) {
+                Ok(m) if m.is_file() => {
+                    if !crate::util::rename_noreplace(&link, &dir.join(ext))? {
+                        bail!("{}: a log from before {name}.logs/, which has its own; remove one", link.display());
+                    }
+                }
+                Ok(_) if ours() => continue,
+                Ok(_) => bail!("{}: not a link to {}", link.display(), target.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            match std::os::unix::fs::symlink(&target, &link) {
+                Err(e) if !(e.kind() == std::io::ErrorKind::AlreadyExists && ours()) => return Err(format!("{}: {e}", link.display()).into()),
+                _ => {}
+            }
         }
         Ok(crate::util::output::open_dir(&dir)?)
     }
@@ -2840,7 +2852,7 @@ impl NameLock {
     /// opens its log before the child takes the name, so clearing at the child's start is too late.
     pub fn remove_logs(&self) -> Result<()> {
         let _logs = self.host.logs_lock(libc::LOCK_SH)?;
-        self.host.remove_logs(&self.name)
+        self.host.retire_logs(&self.name)
     }
 
     pub fn publish(&self, e: &Entry) -> Result<()> {

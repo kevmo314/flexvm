@@ -186,15 +186,24 @@ const FOLLOW_EVERY: Duration = Duration::from_millis(200);
 /// runs the VM and it is not stopped (it exited, `kill`), as docker's does, or its reader is gone.
 /// It holds the directory, never a lock: nothing it reads is a later VM's.
 pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Result<()> {
+    logs_to(host, name, follow, lines, &mut out)
+}
+
+/// `logs`, to `out` (false once its reader is gone).
+fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mut dyn FnMut(&[u8]) -> Result<bool>) -> Result<()> {
     use crate::util::output::{open_dir, open_in};
     host::check_name(name)?;
     let at = host.vms(name, "logs")?;
+    // The VM it is of: with no logs yet, only this one's are taken once made.
+    let holder = host.name_holder(name).ok().flatten();
     let mut dir = open_dir(&at).ok();
     let open = |d: &std::fs::File, file: &std::ffi::CStr| open_in(d, file, libc::O_RDONLY).ok();
     // The current log first: one rotated meanwhile is then the previous one read below.
     let mut cur = dir.as_ref().and_then(|d| open(d, c"log"));
     let ino = |f: &std::fs::File| f.metadata().ok().map(|m| (m.dev(), m.ino()));
     let old = dir.as_ref().and_then(|d| open(d, c"log.1")).filter(|o| cur.as_ref().is_none_or(|c| ino(c) != ino(o)));
+    // The last log read whole: never again as a `log.1`.
+    let mut read = old.as_ref().and_then(ino);
     let files: Vec<_> = [old.as_ref(), cur.as_ref()].into_iter().flatten().map(|f| (f, f.metadata().map_or(0, |m| m.len()))).collect();
     if cur.is_none() && files.iter().all(|&(_, len)| len == 0) && !known(host, name) {
         bail!("no vm named {name:?}");
@@ -231,8 +240,12 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
             }
         }
         let Some(d) = dir.as_ref() else {
-            // A known VM's, not made yet.
-            dir = open_dir(&at).ok();
+            // A known VM's, not made yet: taken only while the VM it was is the name's, running.
+            let made = open_dir(&at).ok();
+            if holder.is_none() || host.name_holder(name).ok().flatten() != holder || !host.alive(name) {
+                return Ok(());
+            }
+            dir = made;
             cur = dir.as_ref().and_then(|d| open(d, c"log"));
             continue;
         };
@@ -240,23 +253,25 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
         if std::fs::metadata(&at).ok().map(|m| (m.dev(), m.ino())) != ino(d) {
             return Ok(());
         }
+        // Rotated twice since (the second maybe the writer's last, with no log after): the one
+        // in between, neither followed nor read, is read whole first.
+        if let Some(mut between) = open(d, c"log.1") {
+            let b = ino(&between);
+            if b.is_some() && b != cur.as_ref().and_then(ino) && b != read {
+                read = b;
+                if !cur.as_mut().map_or(Ok(true), &mut drain)? || !drain(&mut between)? {
+                    return Ok(());
+                }
+            }
+        }
         // Rotated: what was written before the rename is drained, then the new one.
         let now = crate::util::stat_at(std::os::fd::AsRawFd::as_raw_fd(d), c"log").map(|st| (st.st_dev, st.st_ino));
         if now.is_some() && now != cur.as_ref().and_then(ino) {
-            if let Some(f) = cur.as_mut() {
-                if !drain(f)? {
-                    return Ok(());
-                }
+            if !cur.as_mut().map_or(Ok(true), &mut drain)? {
+                return Ok(());
             }
-            let was = cur.as_ref().and_then(ino);
+            read = cur.as_ref().and_then(ino).or(read);
             cur = open(d, c"log");
-            // Rotated twice since: the one in between is the previous log now, whole.
-            if let Some(mut between) = open(d, c"log.1") {
-                let b = ino(&between);
-                if b.is_some() && b != was && b != cur.as_ref().and_then(ino) && !drain(&mut between)? {
-                    return Ok(());
-                }
-            }
             continue;
         }
         // Ended for a while (not a restart's moment between its stop and start).
@@ -436,6 +451,8 @@ fn take_rename_name(host: &Host, from: &str) -> Result<host::NameLock> {
 /// VM's of the new name are retired first.
 fn move_records(host: &Host, from: &str, to: &str) -> Result<()> {
     let _logs = host.logs_lock(libc::LOCK_SH)?;
+    // Logs from before these directories go with it too.
+    drop(host.open_logs(from)?);
     host.retire_logs(to)?;
     let (a, b) = (host.vms(from, "logs")?, host.vms(to, "logs")?);
     match std::fs::rename(&a, &b) {
@@ -855,9 +872,7 @@ mod tests {
             let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
             let name = host.take_name("job", false).unwrap();
             host.write_log("job", "log", b"old\n");
-            let (tx, rx) = std::sync::mpsc::channel();
-            let follower = host.clone();
-            std::thread::spawn(move || tx.send(logs(&follower, "job", true, Some(1)).is_ok()));
+            let (got, rx) = follow(&host, "job");
             std::thread::sleep(FOLLOW_EVERY * 2);
             // The VM's own writer, which holds its logs' directory.
             let writer = host.open_logs("job").unwrap();
@@ -879,7 +894,102 @@ mod tests {
                 assert_eq!((read("api", "log.1").as_deref(), read("api", "log").as_deref()), (Some("old\nlate, past the cap\n"), Some("later\n")));
             }
             assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "{how}: logs -f of a retired vm's logs ends");
+            let got = String::from_utf8(got.lock().unwrap().clone()).unwrap();
+            assert!(got.starts_with("old\n") && !got.contains("new"), "{how}: {got:?}");
         }
+    }
+
+    /// `logs -f NAME` in a thread: what it printed, and whether it ended well.
+    fn follow(host: &Host, name: &str) -> (std::sync::Arc<Mutex<Vec<u8>>>, std::sync::mpsc::Receiver<bool>) {
+        let got = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (host, name, sink) = (host.clone(), name.to_string(), got.clone());
+        std::thread::spawn(move || {
+            let mut out = |d: &[u8]| {
+                sink.lock().unwrap().extend_from_slice(d);
+                Ok(true)
+            };
+            tx.send(logs_to(&host, &name, true, None, &mut out).is_ok())
+        });
+        (got, rx)
+    }
+
+    #[test]
+    fn logs_follow_reads_a_last_rotation_with_no_log_after_it() {
+        let root = TempDir::new("logs-last-rotation");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        host.write_log("job", "log", b"first\n");
+        let (got, rx) = follow(&host, "job");
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        // Rotated twice between polls, the writer's last write the second's: no log after it.
+        let dir = host.vms("job", "logs").unwrap();
+        std::fs::rename(dir.join("log"), dir.join("log.1")).unwrap();
+        std::fs::write(dir.join("log"), b"second\n").unwrap();
+        std::fs::rename(dir.join("log"), dir.join("log.1")).unwrap();
+        drop(name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "first\nsecond\n");
+    }
+
+    /// A known VM's logs not made yet: taken once made by it; the follower ends once it is gone
+    /// or another holds the name, never taking a later VM's.
+    #[test]
+    fn logs_follow_without_logs_yet_takes_only_its_vms() {
+        for how in ["made", "gone", "replaced"] {
+            let root = TempDir::new("logs-none-yet");
+            let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            let name = host.take_name("job", false).unwrap();
+            let (got, rx) = follow(&host, "job");
+            std::thread::sleep(FOLLOW_EVERY * 2);
+            match how {
+                "made" => host.write_log("job", "log", b"its own\n"),
+                "gone" => drop(name),
+                _ => {
+                    let other = Ident { pid: 1, start: 1, boot: host::boot_id().into() };
+                    std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&other).unwrap()).unwrap();
+                    host.write_log("job", "log", b"a later vm's\n");
+                }
+            }
+            if how == "made" {
+                assert!(rx.recv_timeout(FOLLOW_EVERY * 5).is_err(), "followed on while its vm runs");
+                assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "its own\n");
+                continue;
+            }
+            assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "{how}: ends");
+            assert!(got.lock().unwrap().is_empty(), "{how}");
+        }
+    }
+
+    /// Logs at `NAME.log` and `NAME.log.1` from before these directories: moved into the first
+    /// made, read there, and moved by `rename`; anything else there is refused, never ignored.
+    #[test]
+    fn logs_from_before_their_directories_are_moved_in() {
+        let root = TempDir::new("logs-upgrade");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::write(host.vms("job", "log.1").unwrap(), b"older\n").unwrap();
+        std::fs::write(host.vms("job", "log").unwrap(), b"old\n").unwrap();
+        let _name = host.take_name("job", false).unwrap();
+        drop(host.open_logs("job").unwrap());
+        let dir = host.vms("job", "logs").unwrap();
+        assert_eq!(std::fs::read(dir.join("log.1")).unwrap(), b"older\n");
+        assert_eq!(std::fs::read(host.vms("job", "log").unwrap()).unwrap(), b"old\n", "through its link");
+        let (got, rx) = follow(&host, "job");
+        drop(_name);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        assert_eq!(got.lock().unwrap().as_slice(), b"older\nold\n");
+        // Renamed with only old ones: they move.
+        std::fs::write(host.vms("web", "log").unwrap(), b"web's\n").unwrap();
+        move_records(&host, "web", "api").unwrap();
+        assert_eq!(std::fs::read(host.vms("api", "logs").unwrap().join("log")).unwrap(), b"web's\n");
+        assert!(["logs", "log", "log.1"].iter().all(|e| host.vms("web", e).unwrap().symlink_metadata().is_err()));
+        // An old log where the directory has its own, or a link elsewhere: refused.
+        std::fs::remove_file(host.vms("api", "log").unwrap()).unwrap();
+        std::fs::write(host.vms("api", "log").unwrap(), b"stray\n").unwrap();
+        assert!(host.open_logs("api").is_err());
+        std::fs::remove_file(host.vms("api", "log").unwrap()).unwrap();
+        std::os::unix::fs::symlink("elsewhere", host.vms("api", "log").unwrap()).unwrap();
+        assert!(host.open_logs("api").is_err());
     }
 
     #[test]

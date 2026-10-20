@@ -9545,8 +9545,11 @@ def log_cap():
     ok(migrate(A, m, B))
     moved = os.path.join(B.run, "vms", f"{m}.log")
     pid = vm_pid(B, m)
-    # migrate can return before B publishes the arrival's log (renamed over NAME.log): pad only once it is there.
-    check("log cap: the arrival's log published", wait_for(lambda: os.path.exists(moved), 30), moved)
+    # migrate can return before B publishes the arrival's log (renamed into NAME.logs/ as log): pad only once
+    # it is there, its .incoming- file gone (the VM's own early messages may make NAME.logs/log before).
+    vd_b = os.path.join(B.run, "vms")
+    published = lambda: os.path.exists(moved) and not any(f.startswith(".incoming-") for f in os.listdir(vd_b))
+    check("log cap: the arrival's log published", wait_for(published, 30), (moved, os.listdir(vd_b)))
     with open(moved, "a") as f:
         f.write("pad\n" * (2 << 20))
     wait_released(B, m)
