@@ -527,7 +527,7 @@ impl Proc {
 
     pub fn set_name(&self, n: NameLock) {
         // Its logs' lifetime: this VM's from here (`Host::open_logs`).
-        match self.host.open_logs(&n.name) {
+        match self.host.own_logs(&n.name, false) {
             Ok(logs) => crate::util::output::fall_back_to(logs),
             Err(e) => crate::log!("vm {}: its logs: {e}", n.name),
         }
@@ -2351,6 +2351,9 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
             // close-on-exec, so no Firecracker holds it on.
             let held =
                 log.as_ref().map(|_| unsafe { std::fs::File::from_raw_fd(5) }).filter(|_| unsafe { libc::fcntl(5, libc::F_SETFD, libc::FD_CLOEXEC) } == 0);
+            if log.is_some() {
+                crate::util::output::arriving();
+            }
             let res = p.migrate_in(&req, unsafe { std::net::TcpStream::from_raw_fd(3) });
             if let Some(log) = log {
                 match crate::listen::finish_incoming_log(&p.host, &p.name(), &log, res.is_ok()) {

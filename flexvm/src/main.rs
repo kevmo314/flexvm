@@ -1202,7 +1202,7 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     // Opened and marked written holding the logs lock (shared): garbage
     // collection removes only a quiet log, holding it exclusively.
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    let f = util::output::open_in(&host.open_logs(name)?, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT)?;
+    let f = util::output::open_in(&host.own_logs(name, true)?, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT)?;
     f.set_modified(std::time::SystemTime::now())?;
     Ok(f)
 }

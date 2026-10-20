@@ -276,12 +276,9 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             true => std::fs::symlink_metadata(&at).is_ok(),
             false => std::fs::metadata(&at).ok().map(|m| (m.dev(), m.ino())) != ino(d),
         };
-        if retired {
-            return Ok(());
-        }
         // Rotated: what was written before the rename is drained, then any log in between, then
         // the new one; until what is at `log.1` and `log` holds still (a writer may rotate again
-        // as this reads).
+        // as this reads). Retired, all of it is read now (from the held directory), then ended.
         loop {
             // A `log.1` neither followed nor read (rotated twice since, the second maybe the
             // writer's last, with no log after) is older than the current log: read whole first.
@@ -305,10 +302,24 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             }
             mark(&mut read, cur.as_ref().and_then(ino));
             cur = Some(next);
+            if retired {
+                continue;
+            }
             continue 'poll;
         }
-        // Ended for a while (not a restart's moment between its stop and start).
-        match (host.alive(name) || host.is_suspended(name), gone_since) {
+        if retired {
+            cur.as_mut().map_or(Ok(true), &mut drain)?;
+            return Ok(());
+        }
+        // Ended for a while (not a restart's moment between its stop and start). Its VM's: the
+        // name's holder is the one these logs are of (or a `run` handing them to it), so a later
+        // VM of the name is never taken for it.
+        let ours = |holder: Option<host::Ident>| match (legacy, host::logs_owner(d)) {
+            (false, Some(o)) => o.handoff || holder.as_ref() == Some(&o.id),
+            _ => true,
+        };
+        let running = host.alive(name) && ours(host.name_holder(name).ok().flatten());
+        match (running || host.is_suspended(name), gone_since) {
             (true, _) => gone_since = None,
             (false, None) => gone_since = Some(Instant::now()),
             (false, Some(t)) if t.elapsed() > Duration::from_secs(1) => return Ok(()),
@@ -424,6 +435,8 @@ fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
         bail!("no vm named {from:?}");
     }
     let _to = host.take_unrecorded_name(to)?;
+    // What of moving its records can fail, before its checkpoint and claim move: never half renamed.
+    prepare_records(host, from, to)?;
     let (dir, dest) = (host.suspended(from)?, host.suspended(to)?);
     let ip = crate::checkpoint::read_manifest(&dir).ok().map(|m| m.ip);
     {
@@ -478,15 +491,27 @@ fn take_rename_name(host: &Host, from: &str) -> Result<host::NameLock> {
     })
 }
 
+/// `move_records`' steps that can fail on what is there (a log in the way, one not retired),
+/// taken ahead by a rename that moves more first; `move_records` takes them again (done, they
+/// are no-ops).
+fn prepare_records(host: &Host, from: &str, to: &str) -> Result<()> {
+    let _logs = host.logs_lock(libc::LOCK_SH)?;
+    prepare_logs(host, from, to)
+}
+
+/// Logs from before these directories moved into `from`'s, and any of `to`'s retired.
+fn prepare_logs(host: &Host, from: &str, to: &str) -> Result<()> {
+    drop(host.open_logs(from)?);
+    host.retire_logs(to)
+}
+
 /// Its logs and exit records, under the logs lock shared, as a
 /// start opens a log: a sweep never decides on a log midway. Its logs' directory moves in one
 /// step: its writers (held) go on in it, its followers by the old name end, and any earlier
 /// VM's of the new name are retired first.
 fn move_records(host: &Host, from: &str, to: &str) -> Result<()> {
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    // Logs from before these directories go with it too.
-    drop(host.open_logs(from)?);
-    host.retire_logs(to)?;
+    prepare_logs(host, from, to)?;
     let (a, b) = (host.vms(from, "logs")?, host.vms(to, "logs")?);
     match std::fs::rename(&a, &b) {
         Ok(()) => drop(host.open_logs(to)?),
@@ -564,6 +589,7 @@ impl Proc {
             bail!("vm {from} is the source of a migration whose outcome is pending: not renaming it");
         }
         let new = self.host.take_unrecorded_name(to)?;
+        prepare_records(&self.host, &from, to)?;
         let (sock, new_sock) = (self.host.sock(&from)?, self.host.sock(to)?);
         std::fs::rename(&sock, &new_sock).map_err(|e| format!("vm {from}: moving its control socket: {e}"))?;
         let moved = (|| -> Result<()> {
@@ -929,6 +955,50 @@ mod tests {
             assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "{how}: logs -f of a retired vm's logs ends");
             let got = String::from_utf8(got.lock().unwrap().clone()).unwrap();
             assert!(got.starts_with("old\n") && !got.contains("new"), "{how}: {got:?}");
+        }
+    }
+
+    /// Rotated, then retired (renamed), between two polls: what the new log got first is read
+    /// from the held directory before it ends.
+    #[test]
+    fn logs_follow_reads_a_rotation_its_retirement_follows_in_one_poll() {
+        let root = TempDir::new("logs-rotated-retired");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("job", false).unwrap();
+        let logs = host.own_logs("job", false).unwrap();
+        assert!(crate::util::output::append_in(&logs, b"old\n", 1 << 20));
+        let (got, rx) = follow(&host, "job");
+        std::thread::sleep(FOLLOW_EVERY * 2);
+        // At once, so the follower is in one sleep throughout.
+        assert!(crate::util::output::append_in(&logs, b"past the cap\n", 4));
+        assert!(crate::util::output::append_in(&logs, b"rotated\n", 1 << 20));
+        move_records(&host, "job", "api").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        drop(name);
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "old\npast the cap\nrotated\n");
+    }
+
+    /// The name held by a VM other than the one its logs are of (an owner that is not its
+    /// holder): ended as for a VM gone; a handing `run`'s (its VM taking the name) followed on.
+    #[test]
+    fn logs_follow_ends_when_its_vm_no_longer_holds_the_name() {
+        let root = TempDir::new("logs-other-holder");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let _name = host.take_name("job", false).unwrap();
+        let dir = host.vms("job", "logs").unwrap();
+        for (owner, ends) in [(Ident { pid: u32::MAX, start: 1, ..Ident::me() }, true), (Ident::me(), false)] {
+            for handoff in [false, true] {
+                host.write_log("job", "log", b"old\n");
+                std::fs::write(dir.join(".owner"), serde_json::to_vec(&host::LogsOwner { id: owner.clone(), handoff }).unwrap()).unwrap();
+                let (_got, rx) = follow(&host, "job");
+                let ended = rx.recv_timeout(Duration::from_secs(3)).is_ok();
+                assert_eq!(ended, ends && !handoff, "{owner:?} {handoff}");
+                // Ended now in any case (and the next case starts on a fresh directory).
+                host.retire_logs("job").unwrap();
+                if !ended {
+                    assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+                }
+            }
         }
     }
 
@@ -1427,6 +1497,25 @@ mod tests {
         drop(l);
         assert!(rename_stopped(&host, "old", "other").unwrap_err().to_string().contains("no vm named"));
         assert!(rename_stopped(&host, "taken", "other").unwrap_err().to_string().contains("failed"));
+    }
+
+    /// Its logs cannot be moved (something not its log in the way): refused before its
+    /// checkpoint or claim moves, never half renamed.
+    #[test]
+    fn a_stopped_vm_whose_logs_cannot_move_is_not_renamed_at_all() {
+        let (_d, host) = host("rename-logs-fail");
+        suspended_vm(&host, "old", "10.0.0.9");
+        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into() }, STOPPED);
+        std::fs::create_dir(host.vms("old", "log").unwrap()).unwrap();
+        assert!(rename_stopped(&host, "old", "new").unwrap_err().to_string().contains("not a link"));
+        assert!(host.is_suspended("old") && !host.suspended("new").unwrap().exists());
+        assert_eq!(exit_record(&host, "old").unwrap().code, STOPPED);
+        let l = host.lock().unwrap();
+        assert_eq!(host.holder(&l, "10.0.0.9".parse().unwrap()).unwrap().as_deref(), Some("old"));
+        drop(l);
+        std::fs::remove_dir(host.vms("old", "log").unwrap()).unwrap();
+        rename_stopped(&host, "old", "new").unwrap();
+        assert!(host.is_suspended("new"));
     }
 
     /// An exited VM's record (`app::Exited`), as a background VM whose app exited leaves it.

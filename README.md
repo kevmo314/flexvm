@@ -290,8 +290,8 @@ VM's log stays available to read until `rm`. `rm` (including `rm -f` of a
 running VM) deletes both `NAME.log` and `NAME.log.1`, as `docker rm` does, so a
 new VM with the same name starts with a fresh log. For a post-mortem, read
 `logs` before `rm`, or `kill` first: `kill` keeps the log (with what the VM
-wrote as it ended) until the hourly sweep. A foreground `run -i`/`-t` leaves
-its log too. A foreground VM's output is its
+wrote as it ended) until the hourly sweep or the name's next VM, which starts
+a fresh log. A foreground `run -i`/`-t` leaves its log too. A foreground VM's output is its
 terminal's, so its log holds only what came after a closed terminal. Foreground `run`,
 `start -a` and `attach` print only the app's output, errors and warnings;
 flexvm's and flexvm-init's informational messages go to the log alone, and
