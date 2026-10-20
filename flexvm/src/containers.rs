@@ -259,10 +259,12 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             }
         }
         if dir.is_none() {
-            // A known VM's, not made yet: taken once made while no other VM has had the name (its
-            // VM may have ended since: read whole, then ended), read from its start below (`log.1`
-            // first, if it rotated already). None made, and its VM gone or another's: ended.
-            let made = open_dir(&at).ok();
+            // A known VM's, not made yet: taken once made while no other VM has had the name, and
+            // only if recorded as that VM's (`Host::own_logs`: a later VM of the name may have
+            // come and gone within a poll; its VM may have ended since: read whole, then ended),
+            // read from its start below (`log.1` first, if it rotated already). None of its VM's
+            // made, and its VM gone or another's: ended.
+            let made = open_dir(&at).ok().filter(|d| holder.as_ref().is_some_and(|h| host::logs_owner(d).is_some_and(|o| o.of(h))));
             let now = host.name_holder(name).ok().flatten();
             if holder.is_none() || now.is_some() && now != holder || made.is_none() && !host.alive(name) {
                 return Ok(());
@@ -1072,7 +1074,7 @@ mod tests {
         let name = host.take_name("job", false).unwrap();
         let (got, rx) = follow(&host, "job");
         std::thread::sleep(FOLLOW_EVERY * 2);
-        let logs = host.open_logs("job").unwrap();
+        let logs = host.own_logs("job", None).unwrap();
         assert!(crate::util::output::append_in(&logs, b"first, past the cap\n", 10));
         assert!(crate::util::output::append_in(&logs, b"second\n", 10));
         std::thread::sleep(FOLLOW_EVERY * 4);
@@ -1131,7 +1133,7 @@ mod tests {
         let name = host.take_name("job", false).unwrap();
         let (got, rx) = follow(&host, "job");
         std::thread::sleep(FOLLOW_EVERY * 2);
-        let logs = host.open_logs("job").unwrap();
+        let logs = host.own_logs("job", None).unwrap();
         assert!(crate::util::output::append_in(&logs, b"first, past the cap\n", 10));
         assert!(crate::util::output::append_in(&logs, b"done\n", 10));
         drop(name);
@@ -1158,18 +1160,28 @@ mod tests {
     }
 
     /// A known VM's logs not made yet: taken once made by it; the follower ends once it is gone
-    /// or another holds the name, never taking a later VM's.
+    /// or another holds the name, never taking a later VM's: one that ran and ended (letting
+    /// go of the name) between two polls, too.
     #[test]
     fn logs_follow_without_logs_yet_takes_only_its_vms() {
-        for how in ["made", "gone", "replaced"] {
+        for how in ["made", "gone", "replaced", "came and went"] {
             let root = TempDir::new("logs-none-yet");
             let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
             let name = host.take_name("job", false).unwrap();
             let (got, rx) = follow(&host, "job");
             std::thread::sleep(FOLLOW_EVERY * 2);
             match how {
-                "made" => host.write_log("job", "log", b"its own\n"),
+                "made" => drop(host.own_logs("job", None).unwrap()),
                 "gone" => drop(name),
+                "came and went" => {
+                    drop(name);
+                    let later = host::LogsOwner { id: Ident { pid: 1, start: 1, boot: host::boot_id().into() }, handoff: false, to: vec![] };
+                    let made = host.vms("job", ".made").unwrap();
+                    std::fs::create_dir(&made).unwrap();
+                    std::fs::write(made.join(".owner"), serde_json::to_vec(&later).unwrap()).unwrap();
+                    std::fs::write(made.join("log"), b"a later vm's\n").unwrap();
+                    std::fs::rename(&made, host.vms("job", "logs").unwrap()).unwrap();
+                }
                 _ => {
                     let other = Ident { pid: 1, start: 1, boot: host::boot_id().into() };
                     std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&other).unwrap()).unwrap();
@@ -1177,6 +1189,7 @@ mod tests {
                 }
             }
             if how == "made" {
+                host.write_log("job", "log", b"its own\n");
                 assert!(rx.recv_timeout(FOLLOW_EVERY * 5).is_err(), "followed on while its vm runs");
                 assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), "its own\n");
                 continue;

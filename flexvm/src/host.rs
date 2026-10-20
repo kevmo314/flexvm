@@ -981,12 +981,14 @@ impl Host {
     /// which takes the name while this one waits, and keeps them by the token even if this one
     /// dies meanwhile. A handoff added to one still pending (another `run`'s, whose VM process
     /// has not taken the name yet) adds its token to it, never replacing that one's: whichever
-    /// VM process takes the name keeps them. A new VM of the name retires any lifetime but
-    /// those (`take_name`). Under the logs' writers' lock (`output::lock_dir`).
+    /// VM process takes the name keeps them. No pending token is dropped: one more is refused
+    /// (as a taken name) while `MAX_HANDOFFS` live `run`s are preparing them. A new VM of the
+    /// name retires any lifetime but those (`take_name`). Under the logs' writers' lock
+    /// (`output::lock_dir`).
     pub fn own_logs(&self, name: &str, to: Option<&str>) -> Result<File> {
         let dir = self.open_logs(name)?;
         let lock = crate::util::output::lock_dir(&dir);
-        let res = self.write_owner(&dir, to);
+        let res = self.write_owner(name, &dir, to);
         if let Some(l) = lock {
             // Unlocked, not only closed: see `Flock`.
             let _ = flock(&l, libc::LOCK_UN);
@@ -994,15 +996,19 @@ impl Host {
         res.map(|()| dir)
     }
 
-    fn write_owner(&self, dir: &File, to: Option<&str>) -> Result<()> {
+    fn write_owner(&self, name: &str, dir: &File, to: Option<&str>) -> Result<()> {
         let tmp = std::ffi::CString::new(format!("{OWNER}.{}", std::process::id()))?;
-        let mut tokens: Vec<String> = match to {
+        let mut tokens: Vec<Handoff> = match to {
             Some(_) => logs_owner(dir).filter(|o| o.handoff).map(|o| o.to).unwrap_or_default(),
             None => Vec::new(),
         };
-        tokens.extend(to.map(String::from));
-        // The latest few: a pending handoff's run waits on its VM process, so few are at once.
-        tokens.drain(..tokens.len().saturating_sub(MAX_HANDOFFS));
+        // Every pending one is kept, a dead `run`'s too (its VM process may yet take the name by
+        // it). Each live one's `run` waits on its VM process, all but one of which will find the
+        // name taken: more than a few at once are refused rather than any dropped.
+        if to.is_some() && tokens.iter().filter(|t| t.by.alive()).count() >= MAX_HANDOFFS {
+            bail!("vm name {name:?} is taken ({MAX_HANDOFFS} runs are starting a vm of it)");
+        }
+        tokens.extend(to.map(|t| Handoff { token: t.into(), by: Ident::me() }));
         let owner = LogsOwner { id: Ident::me(), handoff: to.is_some(), to: tokens };
         let mut f = crate::util::output::open_in(dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
         std::io::Write::write_all(&mut f, &serde_json::to_vec(&owner)?)?;
@@ -1017,11 +1023,11 @@ impl Host {
     }
 
     /// Whether `name` has logs that are not this process's to go on with (`own_logs`): none
-    /// recorded, an ended VM's, or one a `run` that is gone opened for another (not handed to
-    /// this one by `handed`); anything else at their path (not a directory) is retired too.
+    /// recorded, an ended VM's, or one opened for another by `run`s that are all gone (not
+    /// handed to this one by `handed`); anything else at their path (not a directory) is retired too.
     /// Under the name.
     fn earlier_logs(&self, name: &str, handed: Option<&str>) -> Result<bool> {
-        let ours = |o: &LogsOwner| o.id == Ident::me() || handed.is_some_and(|t| o.to.iter().any(|o| o == t)) || o.handoff && o.id.alive();
+        let ours = |o: &LogsOwner| o.id == Ident::me() || handed.is_some_and(|t| o.to.iter().any(|h| h.token == t)) || o.preparing();
         Ok(match crate::util::output::open_dir(&self.vms(name, "logs")?) {
             Ok(dir) => !logs_owner(&dir).is_some_and(|o| ours(&o)),
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
@@ -3120,10 +3126,30 @@ pub struct LogsOwner {
     /// The tokens of the VM processes they are handed to, pending (`HANDOFF_ENV`, or a standby
     /// claim's `logs_handoff`): one per `run` preparing them before any of those took the name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub to: Vec<String>,
+    pub to: Vec<Handoff>,
 }
 
-/// Pending handoffs kept in a logs' owner record (`Host::own_logs`).
+impl LogsOwner {
+    /// A handoff's: whether a `run` preparing them is still there (the latest, or an earlier one).
+    pub fn preparing(&self) -> bool {
+        self.handoff && (self.id.alive() || self.to.iter().any(|h| h.by.alive()))
+    }
+
+    /// Whether they are `id`'s: its VM process's, or a handoff `id` prepared.
+    pub fn of(&self, id: &Ident) -> bool {
+        self.id == *id || self.handoff && self.to.iter().any(|h| h.by == *id)
+    }
+}
+
+/// A pending handoff of a logs' lifetime (`Host::own_logs`): its VM process's token, and the
+/// `run` that prepared it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handoff {
+    pub token: String,
+    pub by: Ident,
+}
+
+/// Live `run`s at once preparing a handoff of a name's logs (`Host::own_logs`).
 const MAX_HANDOFFS: usize = 16;
 
 /// Where a `run` tells the VM process it starts the token of the logs it hands it (`own_logs`).
@@ -5723,7 +5749,7 @@ pub(crate) mod tests {
         for (token, retired) in [(Some("tok"), false), (Some("other"), true), (None, true)] {
             let held = owned(Some(&gone), true);
             let dir = h.vms("job", "logs").unwrap();
-            let marker = LogsOwner { id: gone.clone(), handoff: true, to: vec!["tok".into()] };
+            let marker = LogsOwner { id: gone.clone(), handoff: true, to: vec![Handoff { token: "tok".into(), by: gone.clone() }] };
             std::fs::write(dir.join(OWNER), serde_json::to_vec(&marker).unwrap()).unwrap();
             drop(h.take_handed_name("job", token).unwrap());
             assert_eq!(held.metadata().unwrap().nlink() == 0, retired, "{token:?}");
@@ -5736,7 +5762,52 @@ pub(crate) mod tests {
         drop(name);
         drop(h.take_name("job", false).unwrap());
         assert_ne!(logs.metadata().unwrap().nlink(), 0);
-        assert_eq!(logs_owner(&h.own_logs("job", Some("t")).unwrap()), Some(LogsOwner { id: me, handoff: true, to: vec!["t".into()] }));
+        assert_eq!(
+            logs_owner(&h.own_logs("job", Some("t")).unwrap()),
+            Some(LogsOwner { id: me.clone(), handoff: true, to: vec![Handoff { token: "t".into(), by: me }] })
+        );
+    }
+
+    /// More `run`s preparing a name's logs than `MAX_HANDOFFS` before any VM process takes it:
+    /// no pending token is dropped (the first's VM process keeps them once every `run` is gone);
+    /// one more is refused while that many are live; an earlier live one keeps them for all.
+    #[test]
+    fn pending_handoffs_are_never_dropped() {
+        let (_dir, h) = host("handoff-cap");
+        let dir = h.vms("job", "logs").unwrap();
+        let gone = Ident { pid: u32::MAX, start: 1, ..Ident::me() };
+        let parent = Ident::of(std::os::unix::process::parent_id()).unwrap();
+        let held = h.own_logs("job", Some("t0")).unwrap();
+        for i in 1..MAX_HANDOFFS {
+            drop(h.own_logs("job", Some(&format!("t{i}"))).unwrap());
+        }
+        let refused = h.own_logs("job", Some("extra")).unwrap_err();
+        assert!(name_taken(&refused), "{refused}");
+        let rewrite = |f: &dyn Fn(&mut LogsOwner)| {
+            let mut o = logs_owner(&held).unwrap();
+            f(&mut o);
+            std::fs::write(dir.join(OWNER), serde_json::to_vec(&o).unwrap()).unwrap();
+        };
+        // The latest `run` dead, an earlier one live: kept by any VM of the name.
+        rewrite(&|o| {
+            o.to.iter_mut().for_each(|t| t.by = gone.clone());
+            o.to[0].by = parent.clone();
+            o.id = gone.clone();
+        });
+        drop(h.take_name("job", false).unwrap());
+        assert_ne!(held.metadata().unwrap().nlink(), 0, "an earlier run is still there");
+        // Every `run` dead: no longer refused, and the first's token still keeps them.
+        rewrite(&|o| o.to[0].by = gone.clone());
+        drop(h.own_logs("job", Some("late")).unwrap());
+        rewrite(&|o| {
+            o.to.iter_mut().for_each(|t| t.by = gone.clone());
+            o.id = gone.clone();
+        });
+        let o = logs_owner(&held).unwrap();
+        assert_eq!(o.to.len(), MAX_HANDOFFS + 1);
+        assert_eq!(o.to[0].token, "t0");
+        drop(h.take_handed_name("job", Some("t0")).unwrap());
+        assert_ne!(held.metadata().unwrap().nlink(), 0, "the first run's vm keeps its logs");
     }
 
     #[test]
