@@ -1548,6 +1548,13 @@ entry (`K=V`), `w` the working directory, `u` `USER[:GROUP]`, `d` detach,
 `i` client stdin, `t` a pty, and `s` its initial size (`ROWS COLS`). The `d`,
 `i` and `t` fields have no value. IDs, retries and body limits work as for SESSION.
 
+The host's exec relay reads each frame into one owned wire buffer and forwards
+it unchanged, retaining the buffer and send offset across partial writes and
+checkpoint cuts. Complete frames still queued on a cut connection keep their
+wire buffers until forwarded; a partial frame is read again after reattachment.
+Readiness RPC cancellation checks run every 50 ms on a watcher whose wait is
+woken when the request ends, so fast replies need not wait out that interval.
+
 Frames retain `[kind u8][payload length u32 LE][payload]`. SESSION, ARGV and ATTACH
 first return kind 4 with the session ID. A session has at most one attachment
 (connection streaming its output): SESSION, ARGV or ATTACH replaces it, and the guest
