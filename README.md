@@ -680,8 +680,20 @@ A host that only runs VMs needs no listener, but see below for what recovers it 
 
 Taps are named after the state directory (`f` and five characters of its
 hash, then the owning process's pid), so hosts on separate state directories
-read apart. Each tap's alias (`ip link show`) names its owner, `flexvm PID
-START RUN-DIR`: hosts sharing a network namespace only ever sweep their own taps.
+read apart. Each tap's alias (`ip link show`) names its owner, `flexvm
+pidns:NS PID START RUN-DIR`, NS being its PID namespace's inode: hosts sharing
+a network namespace only ever sweep their own taps, also from different PID
+namespaces (containers on the host's network), whose taps they never judge by
+pid. Once a PID namespace has no process left (a killed container), a flexvm in
+the initial PID namespace (the host's, which sees every process) sweeps its
+taps and Firecracker cgroups; a flexvm in any other PID namespace (a
+replacement container, WSL's distribution) cannot tell, and leaves them. Taps
+of earlier builds (`flexvm PID START RUN-DIR`) name no PID namespace and are
+judged by their run directory alone, so hosts on separate PID namespaces must
+not share one while such taps remain. After an upgrade, earlier builds cannot
+read the new names: what a VM process of this version leaves when it is
+SIGKILLed (its taps and their routes, its Firecracker cgroups) stays until a
+flexvm of this version sweeps.
 
 ### Under systemd
 
@@ -744,10 +756,14 @@ them, and only goes without the per-VM memory limits (`--cpus` likewise needs
 the cpu controller there). A foreground run put in the background
 keeps running under `stty tostop`: its VM process ignores SIGTTOU and SIGTTIN.
 
-Hosts in different PID namespaces must not share `/sys/fs/cgroup/flexvm`.
-Cgroup owners are recorded by PID and start time in the creator's PID namespace;
-garbage collection cannot distinguish a foreign namespace's owner and may kill
-its Firecrackers. Give each PID namespace its own cgroup subtree, mounted so
+Hosts in different PID namespaces should not share `/sys/fs/cgroup/flexvm`.
+Cgroup owners are recorded by PID and start time in the creator's PID namespace.
+Firecracker cgroups (`idle-PID-START-N-NS`) also name that namespace, and
+garbage collection leaves another namespace's alone until that namespace is
+proven gone (as taps, above), but an earlier build's
+(`idle-PID-START-N`) are judged by this namespace's processes and may have
+their Firecrackers killed, and a VM process's own empty `vm-PID-START` may be
+removed. Give each PID namespace its own cgroup subtree, mounted so
 that its `/sys/fs/cgroup` is rooted there; a new cgroup namespace or a second
 cgroup2 mount alone still sees the shared hierarchy. Separate state and run
 directories alone do not isolate cgroup collection.

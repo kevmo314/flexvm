@@ -7,7 +7,7 @@ migration protocol are in [process-per-vm.md](process-per-vm.md).
 
 | Concern | Mechanism |
 |---|---|
-| CPU | vCPUs = host cores (FC max 32). Idle vCPUs halt and cost nothing. Each VM's Firecracker runs in a cgroup of its own with the `cpu` controller on, all at the default `cpu.weight`, so busy VMs share contended CPU equally however many threads each runs. |
+| CPU | vCPUs = host cores, rounded down to an even count (Firecracker takes 1 or an even count, at most 32; `pull --vcpus` overrides). Idle vCPUs halt and cost nothing. Each VM's Firecracker runs in a cgroup of its own with the `cpu` controller on, all at the default `cpu.weight`, so busy VMs share contended CPU equally however many threads each runs. |
 | Memory growth | Boot memory (256 MiB + 1/32 of the ceiling) + a virtio-mem region up to host RAM, of which 4 GiB is already plugged in the template. Past that the guest asks for more over vsock the moment it runs low, and its VM process keeps a quarter of the guest (at least 1 GiB) free. See [Memory](#memory). |
 | Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds. |
 | Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. Snapshots name it `rootfs`, a file in each Firecracker's directory that every load links to the generation's own (`template::ROOTFS`): a generation's root filesystem can be anywhere, so a migration target need not have pulled the image (generations built by v0.1.0 name it by its path, which a target must then hold). |

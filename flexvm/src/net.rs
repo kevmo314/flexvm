@@ -606,9 +606,11 @@ pub fn netns_id() -> Option<String> {
 /// Whether `ip` is one of this network namespace's addresses, IPv4 or IPv6 (an IPv4-mapped one as its IPv4).
 pub fn is_local_ip(ip: std::net::IpAddr) -> Result<bool> {
     let ip = ip.to_canonical();
-    if ip.is_loopback() {
-        return Ok(true);
-    }
+    Ok(ip.is_loopback() || local_ips()?.contains(&ip))
+}
+
+/// This network namespace's addresses, IPv4 and IPv6, at most a second old.
+pub fn local_ips() -> Result<Vec<std::net::IpAddr>> {
     // At most a second old: listen checks one per route it installs.
     static LOCAL: std::sync::Mutex<(Option<std::time::Instant>, Vec<std::net::IpAddr>)> = std::sync::Mutex::new((None, Vec::new()));
     let mut local = LOCAL.lock().unwrap();
@@ -637,7 +639,7 @@ pub fn is_local_ip(ip: std::net::IpAddr) -> Result<bool> {
         unsafe { libc::freeifaddrs(addrs) };
         local.0 = Some(std::time::Instant::now());
     }
-    Ok(local.1.contains(&ip))
+    Ok(local.1.clone())
 }
 
 /// The kernel's route toward `to`, as `ip route get` reads it (policy routing

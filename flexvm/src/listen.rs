@@ -1174,7 +1174,24 @@ fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways:
     routable_by(ip, cfg, peers, gateways, crate::net::is_local_addr)
 }
 
-fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr], local: impl FnOnce(Ipv4Addr) -> Result<bool>) -> Result<()> {
+/// `routable`'s refusals for a fresh VM's address (`Host::claim_new_in`), by the peers' addresses as
+/// last looked up (`Cached`) and this host's addresses and next hops now, read once: never one this
+/// host reaches its network or peers by (#1078).
+pub fn assignable<'a>(run: &std::path::Path, cfg: &'a crate::host::Config) -> Result<impl Fn(Ipv4Addr) -> Result<()> + 'a> {
+    let cache = Cached::read(run, &cfg.peers);
+    let peers: Vec<IpAddr> = cfg.peers.iter().flat_map(|n| cache.addrs(n).unwrap_or_default()).collect();
+    let gateways = crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?);
+    let local = crate::net::local_ips()?;
+    Ok(move |ip: Ipv4Addr| routable_by(ip, cfg, &peers, &gateways, |ip| Ok(ip.is_loopback() || local.contains(&IpAddr::V4(ip)))))
+}
+
+pub(crate) fn routable_by(
+    ip: Ipv4Addr,
+    cfg: &crate::host::Config,
+    peers: &[IpAddr],
+    gateways: &[Ipv4Addr],
+    local: impl FnOnce(Ipv4Addr) -> Result<bool>,
+) -> Result<()> {
     // Only local configuration authorizes a VM address; a peer's range is untrusted.
     if !cfg.cluster()?.contains(ip) {
         bail!("{ip} is not a vm's address: outside this host's configured VM ranges");

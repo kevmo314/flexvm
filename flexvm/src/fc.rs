@@ -216,7 +216,7 @@ impl Firecracker {
     /// A builder owns its tap and directory, but needs the same per-VM memory cgroup.
     pub fn isolate(&mut self) -> Result<()> {
         if let Some(root) = crate::vmproc::cgroup_root() {
-            let cg = root.join(format!("idle-{}-{}", crate::host::Ident::me().key(), self.pid()));
+            let cg = root.join(crate::host::idle_cgroup(self.pid()));
             self.attach_cgroup(cg, false);
             self.join_cgroup()?;
         }
@@ -628,7 +628,7 @@ impl Spawner {
         let tap = free_tap(&self.tap_prefix, Path::new("/sys/class/net"), &self.making)?;
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         // Named by this process's identity, not its pid alone: never a dead one's with the same pid.
-        let id = format!("idle-{}-{n}", crate::host::Ident::me().key());
+        let id = crate::host::idle_cgroup(n);
         let dir = self.root.join(&id);
         let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
         let made = {

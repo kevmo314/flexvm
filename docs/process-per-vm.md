@@ -31,7 +31,8 @@ joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID-START` (`util::spawn_se
 named after the instance, so one that exists is refused, never joined),
 so stopping its starter's cgroup (a systemd unit's restart with
 `KillMode=control-group`, a oneshot unit's end, logind's `KillUserProcesses`)
-does not reach it. Its Firecrackers move on to `flexvm/idle-PID-START-N`. Without
+does not reach it. Its Firecrackers move on to `flexvm/idle-PID-START-N-NS`, NS its PID
+namespace's inode (`host::idle_cgroup`). Without
 cgroup2 it stays where it was started, and says so in its log. A foreground
 VM process stays in its caller's cgroup, and a foreground `run` that claims a
 standby VM has that VM's process move itself into the caller's cgroup (`util::join_cgroup`).
@@ -294,7 +295,7 @@ devices whose alias names its run directory and an owner proven gone
 (another host's taps, whatever their names read as under this prefix, and
 taps with no such alias, an earlier version's say, are never touched); a
 process with a reused pid removes its dead namesake's as it starts, as their
-names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>`, by the process's identity), work directories, names, a standby
+names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>-<pidns>`, by the process's identity in this PID namespace or one naming none; another namespace's, as its taps, only once a census from the initial PID namespace finds none of its processes left), work directories, names, a standby
 VM's socket (its `PID-START.lock` free) and a lock it died before renaming in place (`.PID-START.lock`), an arrival's log (its lock in `vms/.locks` free or gone, 5 s
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
 killed (`rmdir` refuses a populated cgroup). An earlier version's
@@ -425,8 +426,10 @@ removes that debris (that resume never ran its VM).
   checked again under the host lock, held until the vCPUs run.
 
 **Admission** (`reserve_mib`): every start (run, restore, resume, standby
-claim, arrival: what the VM brings or pages in, and a step), growth and
-incoming migrations are admitted under the host lock against MemAvailable
+claim, arrival: what the VM brings or pages in, and a step), growth,
+incoming migrations, and a template build's VMs (`pull`'s boot, by its boot
+memory, and its working-set recording, by the working set; each limited, in a
+cgroup of its own, to the memory it may plug) are admitted under the host lock against MemAvailable
 minus the reserve and the grants of the last 10 s (`RUN/grants-BOOTID`); an
 arrival's or checkpoint restore's grant (including a suspended resume) is
 held past that until all its memory is here, or it ends, as it comes in only
@@ -729,7 +732,7 @@ committed, never ends the process,
    only as the source of the migration id they name.
 9. **Shared resources have one owner.** Socket roots, work directories, taps
    (`<prefix><pid>t<n>`, a template build's `<prefix>x<pid>`, owned by their alias) and cgroups
-   (`idle-<pid>-<start>-<n>`; a VM process's own `vm-<pid>-<start>`, swept once empty) are named after the owning process and only swept once it is gone; each process has its own
+   (`idle-<pid>-<start>-<n>-<pidns>`; a VM process's own `vm-<pid>-<start>`, swept once empty) are named after the owning process and only swept once it is gone; each process has its own
    hold TUN (not persistent: it goes with the process); `unroute` happens
    under the host lock and only for an address the process still holds;
    checkpoint staging is cleared by owner pid; suspended directories are
