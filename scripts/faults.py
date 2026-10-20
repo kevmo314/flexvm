@@ -1096,7 +1096,7 @@ def target_killed():
         w = where(n)
         check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "reconciling", (r, w or "gone everywhere"))
         migs = os.path.join(B.state, "migs")
-        newest = max(os.listdir(migs), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
+        newest = max(migs_of(B), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
         # Asked at once, before the Firecracker can have died of its own accord.
         fault(B, "status", 0)
         st = peer(B, {"op": "migration", "mig": int(newest)})
@@ -1885,7 +1885,8 @@ def arrivals(host):
 
 
 def migs_of(host):
-    return set(os.listdir(os.path.join(host.state, "migs")))
+    """`host`'s migration records: not the temporary files (dotfiles) a record is written by."""
+    return {f for f in os.listdir(os.path.join(host.state, "migs")) if not f.startswith(".")}
 
 
 def undone_migs(d):
@@ -7044,7 +7045,7 @@ def refused_admission():
     borrows no address from its home host, an arrival records no migration."""
     n, path = "ft-refused-adm", ckpt_path("ft-refused-adm")
     m = setup(n, mib=1)
-    migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+    migs = lambda: sorted(migs_of(B)) if os.path.isdir(os.path.join(B.state, "migs")) else []
     # The start announces its generation to B in the background: in before the snapshot.
     v = vms(A)[n]
     check("refused admission: b saw the start", wait_for(lambda: addr(B, v["ip"]).get("seen", 0) >= v["gen"], 10), addr(B, v["ip"]))
@@ -7116,7 +7117,7 @@ def arrival_grew():
     with marks(1024, 1024, host=B), mem_available_as(B, 1024 + ARRIVAL_ROOM):
         hold_dir = os.path.join(B.run, ".locks", "holds")
         holds = lambda: [f for f in os.listdir(hold_dir) if not f.startswith(".")] if os.path.isdir(hold_dir) else []
-        migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+        migs = lambda: sorted(migs_of(B)) if os.path.isdir(os.path.join(B.state, "migs")) else []
         check("arrival grew: b holds nothing before", not holds(), holds())
         recorded = migs()
         time.sleep(11)  # Earlier grants on B age out: its preflight's hold is all it counts.
