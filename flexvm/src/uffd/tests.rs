@@ -873,7 +873,7 @@ fn prefetch_pager(name: &str) -> (crate::test_util::TempDir, Pager) {
         .unwrap(),
     )
     .unwrap();
-    std::fs::File::create(dir.join("mem")).unwrap().set_len(PAGE_SIZE as u64).unwrap();
+    std::fs::write(dir.join("mem"), vec![0x5a; PAGE_SIZE]).unwrap();
     let mut base = crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap();
     Arc::get_mut(&mut base).unwrap().working_set = vec![(0, 1)];
     let pager = Pager {
@@ -913,7 +913,7 @@ fn export_waits_for_prefetch_before_its_claim() {
         assert_eq!(pager.pages().get(0), BASE);
         let export = scope.spawn(|| {
             started.send(unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t).unwrap();
-            let result = pager.quiesce_export();
+            let result = pager.quiesce_export(|| false);
             finished.store(true, Ordering::SeqCst);
             result
         });
@@ -940,7 +940,7 @@ fn export_times_out_waiting_for_prefetch() {
     thread::scope(|scope| {
         scope.spawn(|| {
             let start = Instant::now();
-            done.send((pager.quiesce_export(), start.elapsed())).unwrap();
+            done.send((pager.quiesce_export(|| false), start.elapsed())).unwrap();
         });
         let result = done_rx.recv_timeout(crate::test_util::WAIT);
         // Release before asserting, so even an unbounded gate wait cannot hang the scoped join.
@@ -951,7 +951,95 @@ fn export_times_out_waiting_for_prefetch() {
         assert!(pager.quiesce.load(Ordering::SeqCst));
         assert_eq!(pager.pages().get(0), BASE);
     });
-    assert!(pager.quiesce_export().unwrap().is_empty());
+    assert!(pager.quiesce_export(|| false).unwrap().is_empty());
+}
+
+#[test]
+fn export_cancels_waiting_for_prefetch() {
+    let (_dir, pager) = prefetch_pager("prefetch-export-cancel");
+    let gate = pager.prefetch_gate.lock().unwrap();
+    let cancelled = AtomicBool::new(false);
+    let (done, done_rx) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            done.send(pager.quiesce_export(|| cancelled.load(Ordering::SeqCst))).unwrap();
+        });
+        crate::test_util::wait_until("export to quiesce", || pager.quiesce.load(Ordering::SeqCst));
+        cancelled.store(true, Ordering::SeqCst);
+        let result = done_rx.recv_timeout(EXPORT_TIMEOUT / 2);
+        drop(gate);
+        assert!(result.unwrap().unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(pager.pages().get(0), BASE);
+    });
+}
+
+#[test]
+fn export_cancels_waiting_for_inflight() {
+    let (_dir, pager) = prefetch_pager("prefetch-export-inflight-cancel");
+    assert_eq!(pager.pages().claim(0, 1, BASE, |_| true), 1);
+    let cancelled = AtomicBool::new(false);
+    let (done, done_rx) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            done.send(pager.quiesce_export(|| cancelled.load(Ordering::SeqCst))).unwrap();
+        });
+        crate::test_util::wait_until("export to quiesce", || pager.quiesce.load(Ordering::SeqCst));
+        cancelled.store(true, Ordering::SeqCst);
+        let result = done_rx.recv_timeout(EXPORT_TIMEOUT / 2);
+        pager.pages().release(0, 1, BASE);
+        assert!(result.unwrap().unwrap_err().to_string().contains("cancelled"));
+    });
+}
+
+#[test]
+fn export_does_not_wait_for_cold_prefetch_read() {
+    let (_dir, pager) = prefetch_pager("prefetch-export-cold");
+    assert!(pager.base.has_data(0));
+    let (reading, reading_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    assert!(pager
+        .before_prefetch_read
+        .set(Box::new(move || {
+            // Model a prefault stalled on cold disk I/O, before any template bytes can be read.
+            reading.send(()).unwrap();
+            release_rx.lock().unwrap().recv_timeout(crate::test_util::WAIT).unwrap();
+        }))
+        .is_ok());
+    let (done, done_rx) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        let prefetch = scope.spawn(|| pager.prefetch_pass_with(|_, _, _| panic!("prefetch installed after quiesce")));
+        reading_rx.recv_timeout(crate::test_util::WAIT).unwrap();
+        scope.spawn(|| {
+            done.send(pager.quiesce_export(|| false)).unwrap();
+        });
+        let result = done_rx.recv_timeout(EXPORT_TIMEOUT + Duration::from_secs(1));
+        let state = pager.pages().get(0);
+        // Always unblock the reader before asserting, including if export exceeded its budget.
+        release.send(()).unwrap();
+        assert!(!prefetch.join().unwrap());
+        assert!(result.unwrap().unwrap().is_empty());
+        assert_eq!(state, BASE);
+        assert_eq!(pager.pages().get(0), BASE);
+        assert!(!pager.pages().is_dirty(0));
+        assert!(pager.prefetch_cut.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
+fn prefetch_installs_prepared_template_bytes() {
+    let (_dir, pager) = prefetch_pager("prefetch-prepared");
+    let mut copied = 0;
+    assert!(!pager.prefetch_pass_with(|p, n, src| {
+        assert_eq!((p, n), (0, 1));
+        let src = src.unwrap();
+        assert_eq!(src, vec![0x5a; PAGE_SIZE]);
+        assert_ne!(src.as_ptr(), pager.base.pages(p, n).as_ptr());
+        copied += n;
+        Ok(n)
+    }));
+    assert_eq!(copied, 1);
+    assert_eq!(pager.pages().get(0), PRESENT);
 }
 
 #[test]
@@ -997,7 +1085,7 @@ fn freeze_waits_for_prefetch_to_publish_dirty_pages() {
         assert_eq!(pager.pages().get(0), PRESENT);
         assert!(pager.pages().is_dirty(0));
     });
-    let runs = pager.quiesce_export().unwrap();
+    let runs = pager.quiesce_export(|| false).unwrap();
     assert_eq!(runs, [(0, 1, REMOTE)]);
     pager.pages().states[0].store(BASE, Ordering::SeqCst);
     assert!(!pager.prefetch_pass_with(|_, _, _| panic!("prefetch claimed after quiesce")));
