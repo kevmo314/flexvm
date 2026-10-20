@@ -563,6 +563,8 @@ fn a_reply_the_caller_wants_no_more_of_is_drained_unless_stopped() {
                     let (off, len) = request(&req);
                     let _ = w.write_all(&[0]);
                     for p in (off..off + len as u64).step_by(PAGE_SIZE) {
+                        // A page at a time, so that a reply arrives in many reads.
+                        thread::sleep(Duration::from_millis(1));
                         if w.write_all(&[(p / PAGE_SIZE as u64) as u8; PAGE_SIZE]).is_err() {
                             return;
                         }
@@ -592,6 +594,14 @@ fn a_reply_the_caller_wants_no_more_of_is_drained_unless_stopped() {
     stop.store(false, Ordering::SeqCst);
     link.fetch_with(None, 0, &mut buf[..PAGE_SIZE], &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
     assert_eq!(conns.load(Ordering::SeqCst), 2);
+    // A stop that comes while a reply is drained cuts it there, not once the reply is done.
+    let checks = AtomicUsize::new(0);
+    let e = link.fetch_with(None, 0, &mut buf, &|| checks.fetch_add(1, Ordering::SeqCst) >= 3, &mut |_| false);
+    assert!(matches!(e.as_ref().map_err(fetch_failure), Err(Some(FetchFailure::Cancelled))), "{e:?}");
+    // Before the fetch, at each of three chunks (cut at the third, of tens), and once it was cut.
+    assert_eq!(checks.load(Ordering::SeqCst), 5, "cut at the third chunk drained");
+    link.fetch_with(None, 0, &mut buf[..PAGE_SIZE], &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
+    assert_eq!(conns.load(Ordering::SeqCst), 3);
 }
 
 #[test]

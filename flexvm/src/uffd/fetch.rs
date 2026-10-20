@@ -431,12 +431,10 @@ impl Link {
             let mut counted = |data: &[u8]| {
                 got = data.len();
                 if !draining && !progress(data) {
-                    if stopped() {
-                        return false;
-                    }
                     draining = true;
                 }
-                true
+                // A stop cuts a reply being drained too, at whatever chunk it comes.
+                !(draining && stopped())
             };
             let res = match lane {
                 Some(lane) if buf.is_empty() => lane.flush(&client.stream.s.s, None, at),
