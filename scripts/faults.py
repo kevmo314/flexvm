@@ -2919,6 +2919,76 @@ def delayed_announce_handoff():
     kill(B, n)
 
 
+def handoff_onward():
+    """#1028: a migration onward waits for the arrival's packet hand-off, whose injections, link-up and
+    route changes would otherwise land during or after its device snapshot. B's hand-off of A's held
+    packets is held at `handoff_gate`: B->A waits for it and, held past its wait, is refused with B's copy
+    running on; let go meanwhile, it moves the VM back, its memory intact."""
+    n = "ft-handoff-onward"
+    m = setup(n, mib=20)
+    clear_gate(B, "handoff_gate")
+    with armed_fault(B, "handoff_gate", 60000):
+        r = migrate(A, n, B)
+        check("handoff onward: migrated to B", r["ok"] and where(n).get(B) == "running", (r, where(n)))
+        check("handoff onward: B's hand-off is held", wait_for(lambda: reached(B, "handoff_gate"), 5), reached(B, "handoff_gate"))
+        wait_released(B, n, timeout=30)
+        t = time.time()
+        r = migrate(B, n, A)
+        check("handoff onward: refused while the hand-off runs", not r["ok"] and "held packets" in r.get("error", ""), r)
+        check("handoff onward: waited for it first", time.time() - t >= 8, time.time() - t)
+        check("handoff onward: still running on B", where(n) == {B: "running"}, where(n))
+        out = {}
+        mover = threading.Thread(target=lambda: out.update(r=migrate(B, n, A)))
+        mover.start()
+        time.sleep(1.5)
+        check("handoff onward: B->A waits", mover.is_alive() and where(n) == {B: "running"}, (out, where(n)))
+    mover.join(120)
+    check("handoff onward: moved back once the hand-off ended", not mover.is_alive() and out.get("r", {}).get("ok"), out)
+    wait_released(A, n)
+    check("handoff onward: running on A", where(n) == {A: "running"}, where(n))
+    check("handoff onward: memory intact", md5(A, n, tries=3) == m)
+    kill(A, n)
+
+
+def handoff_rename():
+    """#1028: a rename waits for the arrival's packet hand-off. Its ownership checks go by the VM's name:
+    renamed between the address's new holder and the process's new name, the hand-off would read the
+    address as gone, forget its hold and never route it to the tap. B's hand-off is held at `handoff_gate`
+    while B renames the VM; once it is let go, both end, and the VM is reachable under its new name."""
+    n, to = "ft-handoff-rename", "ft-handoff-renamed"
+    scenario_vms.update((n, to))
+    ok(run(A, n))
+    ip = vm_ip(A, n)
+    tcp_server(A, n)
+    clear_gate(B, "handoff_gate")
+    out = {}
+    with armed_fault(B, "handoff_gate", 60000):
+        r = migrate(A, n, B)
+        check("handoff rename: migrated to B", r["ok"] and where(n).get(B) == "running", (r, where(n)))
+        check("handoff rename: B's hand-off is held", wait_for(lambda: reached(B, "handoff_gate"), 5), reached(B, "handoff_gate"))
+        wait_released(B, n, timeout=30)
+        renamer = threading.Thread(target=lambda: out.update(r=cli(B, "rename", n, to)))
+        renamer.start()
+        time.sleep(1.5)
+        check("handoff rename: the rename waits for the hand-off", renamer.is_alive() and n in vms(B), (out, list(vms(B))))
+    renamer.join(60)
+    code, stdout, err = out.get("r", (None, "", "no answer"))
+    check("handoff rename: renamed once the hand-off ended", not renamer.is_alive() and code == 0 and stdout.strip() == to, out)
+    check("handoff rename: running on B as its new name", where(to) == {B: "running"} and not where(n), (where(to), where(n)))
+    check("handoff rename: reachable on B's tap", wait_for(lambda: echoes(ip), 10), peer_route(ip))
+    kill(B, to)
+
+
+def echoes(ip, port=7000):
+    """Whether the guest at `ip` echoes a line on `port`."""
+    try:
+        with socket.create_connection((ip, port), timeout=1) as c:
+            c.settimeout(1)
+            return echo(c, b"ping\n")
+    except OSError:
+        return False
+
+
 # Linux's (and its SCM_TIMESTAMPNS cmsg type), which Python's socket module leaves out.
 SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
 
@@ -10687,7 +10757,7 @@ SCENARIOS = dict(
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_qdisc_backlog=same_host_qdisc_backlog, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
-    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
+    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, handoff_onward=handoff_onward, handoff_rename=handoff_rename, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, arrival_bind_fail=arrival_bind_fail, back_to_back=back_to_back, app_abort=app_abort,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status, resume_outcome=resume_outcome, exec_recovery_instance=exec_recovery_instance,

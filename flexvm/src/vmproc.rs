@@ -4019,6 +4019,31 @@ mod tests {
         (p, root)
     }
 
+    /// A migration onward waits for the arrival's packet hand-off to end; an eviction is refused while it runs (#1028).
+    #[test]
+    fn migrating_onward_waits_for_the_arrivals_handoff() {
+        let (p, _root) = test_proc("settle-handoff", Some("moved"));
+        p.settle_handoff(false).unwrap();
+        p.settle_handoff(true).unwrap();
+        let revoked = Arc::new(Mutex::new(false));
+        *p.held_in.lock().unwrap() = Some(revoked.clone());
+        let e = p.settle_handoff(true).unwrap_err();
+        assert!(e.downcast_ref::<Busy>().is_some() && e.to_string().contains("held packets"), "{e}");
+        let start = Instant::now();
+        let ended = {
+            let p = p.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                p.held_in.lock().unwrap().take();
+            })
+        };
+        p.settle_handoff(false).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(200));
+        // Waited out, not revoked: the hand-off ran to its end.
+        assert!(!*revoked.lock().unwrap());
+        ended.join().unwrap();
+    }
+
     #[test]
     fn withdrawal_fallback_keeps_the_removed_claims_revision() {
         let (p, _root) = test_proc("withdraw-rev", Some("job"));

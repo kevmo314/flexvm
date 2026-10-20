@@ -590,11 +590,27 @@ fn set_mac(ifindex: u32, mac: &[u8; 6]) -> Result<()> {
 }
 
 pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
+    is_local_ip(ip.into())
+}
+
+/// This network namespace's identity: the boot's id with the namespace's device and inode, unique on this kernel
+/// while it runs. A peer sharing this host's routes has the same; an address cannot tell (a router's hairpin NAT
+/// shows a peer here as the router's address, #1028).
+pub fn netns_id() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let ns = std::fs::metadata("/proc/thread-self/ns/net").ok()?;
+    Some(format!("{}:{}:{}", boot.trim(), ns.dev(), ns.ino()))
+}
+
+/// Whether `ip` is one of this network namespace's addresses, IPv4 or IPv6 (an IPv4-mapped one as its IPv4).
+pub fn is_local_ip(ip: std::net::IpAddr) -> Result<bool> {
+    let ip = ip.to_canonical();
     if ip.is_loopback() {
         return Ok(true);
     }
     // At most a second old: listen checks one per route it installs.
-    static LOCAL: std::sync::Mutex<(Option<std::time::Instant>, Vec<Ipv4Addr>)> = std::sync::Mutex::new((None, Vec::new()));
+    static LOCAL: std::sync::Mutex<(Option<std::time::Instant>, Vec<std::net::IpAddr>)> = std::sync::Mutex::new((None, Vec::new()));
     let mut local = LOCAL.lock().unwrap();
     if local.0.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1)) {
         let mut addrs = std::ptr::null_mut();
@@ -603,9 +619,18 @@ pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
         let mut current = addrs;
         while !current.is_null() {
             let addr = unsafe { &*current };
-            if !addr.ifa_addr.is_null() && unsafe { (*addr.ifa_addr).sa_family } == libc::AF_INET as u16 {
-                let v4 = unsafe { &*addr.ifa_addr.cast::<libc::sockaddr_in>() };
-                local.1.push(Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()));
+            if !addr.ifa_addr.is_null() {
+                match unsafe { (*addr.ifa_addr).sa_family } as i32 {
+                    libc::AF_INET => {
+                        let v4 = unsafe { &*addr.ifa_addr.cast::<libc::sockaddr_in>() };
+                        local.1.push(Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()).into());
+                    }
+                    libc::AF_INET6 => {
+                        let v6 = unsafe { &*addr.ifa_addr.cast::<libc::sockaddr_in6>() };
+                        local.1.push(std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr).into());
+                    }
+                    _ => {}
+                }
             }
             current = addr.ifa_next;
         }
