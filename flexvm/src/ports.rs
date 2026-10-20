@@ -16,6 +16,9 @@ const CONNECTIONS: usize = 256;
 const BUFFER: usize = 65536;
 /// UDP sessions expire after this; a TCP forward this idle is closed only to admit a client at the cap.
 const IDLE: Duration = Duration::from_secs(60);
+/// A TCP forward holding data its reader has taken none of for this many `IDLE`s is closed (its reader
+/// reset) to admit a client at the cap, once none is idle: a stalled reader cannot hold its slot forever.
+const STALLED: u32 = 4;
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 /// Once either side fails, how long buffered data and the other side's FIN have to finish:
 /// closing on it at once would reset what the kernel has yet to deliver.
@@ -382,10 +385,15 @@ impl Connection {
         !self.out.done || !self.incoming.done && !client_failed
     }
 
-    /// Connected, with nothing it holds yet to deliver, and nothing relayed for `idle`.
+    /// Holding data its sink has yet to take.
+    fn queued(&self) -> bool {
+        self.out.start < self.out.end || self.incoming.start < self.incoming.end
+    }
+
+    /// Connected, and nothing relayed for `idle`, or for `STALLED` times that if it holds data its reader
+    /// has stopped taking.
     fn idle(&self, idle: Duration) -> bool {
-        let queued = |d: &Direction| d.start < d.end;
-        self.connected && !queued(&self.out) && !queued(&self.incoming) && idle_now().duration_since(self.active) >= idle
+        self.connected && idle_now().duration_since(self.active) >= if self.queued() { idle * STALLED } else { idle }
     }
 
     /// Its client failed: reset, or a socket error pending (POLLERR), or both directions closed (POLLHUP).
@@ -397,11 +405,30 @@ impl Connection {
     }
 }
 
+impl Drop for Connection {
+    /// A forward closed (its deadline past, or evicted) with data it still owed a sink resets that sink:
+    /// a cut-off stream must not end in a FIN, as if it were complete.
+    fn drop(&mut self) {
+        for (d, sink) in [(&self.out, &self.guest), (&self.incoming, &self.client)] {
+            if d.start < d.end {
+                abort(sink);
+            }
+        }
+    }
+}
+
+/// Closing `s` resets it (SO_LINGER {1, 0}) instead of sending a FIN.
+fn abort(s: &impl AsRawFd) -> bool {
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size_of_val(&linger) as _) == 0 }
+}
+
 const DOWN: i16 = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
 
-/// The connected forward idle longest, if for at least `idle`: the one to close for a new client at the cap.
+/// The connected forward idle longest, if for at least `idle` (a stalled one only once none is idle):
+/// the one to close for a new client at the cap.
 fn idlest(connections: &[Connection], idle: Duration) -> Option<usize> {
-    connections.iter().enumerate().filter(|(_, c)| c.idle(idle)).min_by_key(|(_, c)| c.active).map(|(i, _)| i)
+    connections.iter().enumerate().filter(|(_, c)| c.idle(idle)).min_by_key(|(_, c)| (c.queued(), c.active)).map(|(i, _)| i)
 }
 
 /// How many connected forwards have been idle for `idle`: each may make way for one more client.
@@ -880,6 +907,11 @@ mod tests {
         // What it still holds for a stalled reader would be lost: it is not idle.
         connections[3].incoming.end = 1;
         assert_eq!((idlest(&connections, IDLE), spare(&connections, IDLE)), (Some(2), 1));
+        // Unless its reader has taken none of it for long: then it may go, but only once none is idle.
+        connections[3].active = ago(IDLE * STALLED);
+        assert_eq!((idlest(&connections, IDLE), spare(&connections, IDLE)), (Some(2), 2));
+        connections.swap_remove(2);
+        assert_eq!(idlest(&connections, IDLE), Some(2));
     }
 
     #[test]
@@ -1441,10 +1473,7 @@ mod tests {
     }
 
     fn reset(s: TcpStream) {
-        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
-        let set =
-            unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, (&linger as *const libc::linger).cast(), size_of_val(&linger) as _) };
-        assert_eq!(set, 0);
+        assert!(abort(&s));
     }
 
     #[test]
@@ -1523,6 +1552,8 @@ mod tests {
             let mut fd = poll(&connection.client, libc::POLLIN);
             assert_eq!(unsafe { libc::poll(&mut fd, 1, WAIT.as_millis() as _) }, 1);
             if !connection.forward(fd.revents, 0) {
+                // As the worker would have: nothing unread (that alone would reset the client) when it closes.
+                while (&connection.client).read(&mut taken).is_ok_and(|n| n > 0) {}
                 break now;
             }
             if reply(&connection) != seen {
@@ -1535,6 +1566,83 @@ mod tests {
         assert!(closed > relayed + LINGER, "closed before LINGER past the last relay");
         assert!(closed <= relayed + LINGER + step, "a blocked reply must not prevent expiry");
         CLOCK.with(|c| *c.borrow_mut() = None);
+        // The reply was cut off: the client sees a reset, not a FIN as if it were complete.
+        drop(connection);
+        assert_eq!(read_until_closed(&mut client).map_err(|e| e.kind()), Err(io::ErrorKind::ConnectionReset));
+    }
+
+    /// Reads `s` to its end: how many bytes came before a FIN, or the error that ended it.
+    fn read_until_closed(s: &mut TcpStream) -> io::Result<usize> {
+        s.set_read_timeout(Some(WAIT)).unwrap();
+        let (mut total, mut chunk) = (0, [0; 65536]);
+        loop {
+            match s.read(&mut chunk) {
+                Ok(0) => return Ok(total),
+                Ok(n) => total += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// A client connected to `addr` with a small receive window: most of what it is sent waits in the proxy.
+    fn small_window(addr: SocketAddr) -> TcpStream {
+        let client = unsafe { OwnedFd::from_raw_fd(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)) };
+        let size: libc::c_int = 4096;
+        let set =
+            unsafe { libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&size as *const libc::c_int).cast(), size_of_val(&size) as _) };
+        assert_eq!(set, 0);
+        let SocketAddr::V4(at) = addr else { unreachable!() };
+        let sa = libc::sockaddr_in {
+            sin_family: libc::AF_INET as _,
+            sin_port: at.port().to_be(),
+            sin_addr: libc::in_addr { s_addr: u32::from(*at.ip()).to_be() },
+            sin_zero: [0; 8],
+        };
+        assert_eq!(unsafe { libc::connect(client.as_raw_fd(), (&sa as *const libc::sockaddr_in).cast(), size_of_val(&sa) as _) }, 0);
+        let client = TcpStream::from(client);
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        client
+    }
+
+    #[test]
+    fn a_reader_that_stalls_is_reset_to_admit_a_client_at_the_cap_once_stalled_for_long() {
+        let start = Instant::now();
+        let clock = Arc::new(std::sync::Mutex::new(start));
+        let (addr, guest, worker) = worker_with_clock(1, IDLE, Some(clock.clone()));
+        let mut stalled = small_window(addr);
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut stalled, &mut server);
+        // A large reply its client never reads: the proxy holds what the kernels will not.
+        server.set_nonblocking(true).unwrap();
+        let chunk = [7; 65536];
+        wait_until("the reply to stop moving", || {
+            while server.write(&chunk).is_ok() {}
+            thread::sleep(Duration::from_millis(200));
+            server.write(&chunk).is_err_and(|e| transient(&e))
+        });
+        guest.set_nonblocking(true).unwrap();
+        let mut waiting = TcpStream::connect(addr).unwrap();
+        waiting.write_all(b"w").unwrap();
+        // Quiet for IDLE, a forward holding data is not idle: the waiting client waits.
+        *clock.lock().unwrap() = start + IDLE;
+        thread::sleep(Duration::from_millis(TICK as u64) * 2);
+        assert!(guest.accept().is_err_and(|e| transient(&e)), "a forward holding data was closed once quiet for IDLE");
+        *clock.lock().unwrap() = start + IDLE * STALLED;
+        let mut accepted = None;
+        wait_until("the waiting client to replace the stalled forward", || {
+            accepted = guest.accept().ok();
+            accepted.is_some()
+        });
+        let (mut replacement, _) = accepted.unwrap();
+        replacement.set_nonblocking(false).unwrap();
+        replacement.set_read_timeout(Some(WAIT)).unwrap();
+        let mut b = [0];
+        replacement.read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"w");
+        // Its reply was cut off: a reset, not a FIN as if it were complete.
+        assert_eq!(read_until_closed(&mut stalled).map_err(|e| e.kind()), Err(io::ErrorKind::ConnectionReset));
+        worker.halt();
     }
 
     /// Until all `s` sent is acknowledged: a reset discards what its kernel still holds (a small write
@@ -1584,23 +1692,7 @@ mod tests {
         // Small enough for the proxy to hand all of it to the kernel at once (and be done with the
         // guest before the client's next request comes), and too big for that.
         for len in [10_000u32, 100_000] {
-            // A small receive window: most of the reply waits in the proxy.
-            let client = unsafe { OwnedFd::from_raw_fd(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)) };
-            let size: libc::c_int = 4096;
-            let set = unsafe {
-                libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&size as *const libc::c_int).cast(), size_of_val(&size) as _)
-            };
-            assert_eq!(set, 0);
-            let SocketAddr::V4(at) = addr else { unreachable!() };
-            let sa = libc::sockaddr_in {
-                sin_family: libc::AF_INET as _,
-                sin_port: at.port().to_be(),
-                sin_addr: libc::in_addr { s_addr: u32::from(*at.ip()).to_be() },
-                sin_zero: [0; 8],
-            };
-            assert_eq!(unsafe { libc::connect(client.as_raw_fd(), (&sa as *const libc::sockaddr_in).cast(), size_of_val(&sa) as _) }, 0);
-            let mut client = TcpStream::from(client);
-            client.set_read_timeout(Some(WAIT)).unwrap();
+            let mut client = small_window(addr);
             let (mut server, _) = crate::test_util::accept_tcp(&guest);
             echo(&mut client, &mut server);
             let reply: Vec<u8> = (0..len).map(|i| i as u8).collect();
