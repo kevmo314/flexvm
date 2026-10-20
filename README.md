@@ -285,7 +285,7 @@ unwritten for an hour, by sweeps that run when a VM starts and about every
 
 ```sh
 flexvm logs web                 # its log: NAME.log.1 (before the last rotation), then NAME.log
-flexvm logs -n 20 web            # the last 20 lines
+flexvm logs -n 20 web           # the last 20 lines
 flexvm logs -f web              # and follow it, until the VM exits, is removed or renamed
 ```
 
