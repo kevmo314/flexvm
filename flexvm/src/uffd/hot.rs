@@ -164,8 +164,8 @@ impl Pager {
     /// The VM process's memory controller, every second: `room` gives what host memory is left above its reserve and
     /// the grants guests have yet to touch (MiB; None if unknown), which rescue memory and hot pages' memory grow
     /// within, as they are not admitted like a guest's (`cow::Room`, which checks again as it takes); and while the host is
-    /// `short` (under its eviction mark, or this VM starved) the memory kept for the next checkpoint (both of those)
-    /// goes back. A copy running on keeps what it has until it ends.
+    /// `short` (under its reserve, under its eviction mark with peers, or this VM starved) the memory kept for the next
+    /// checkpoint (both of those) goes back. A copy running on keeps what it has until it ends.
     pub fn host_memory(&self, room: impl FnOnce() -> Option<u64>, short: bool) {
         self.mem_room.refresh(room);
         if short {
