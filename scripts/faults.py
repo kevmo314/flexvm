@@ -8901,10 +8901,14 @@ def suspend_killed():
     setup(n, mib=20)
     ip = vms(A)[n]["ip"]
     pid = vm_pid(A, n)
-    with armed_fault(A, "suspend_stall", 10000):
+    # Armed until the kill is in, however long the suspend takes to publish: the SIGINT comes while it
+    # stalls there (3 s, after publishing), seen by its marker.
+    clear_gate(A, "suspend_stall")
+    with armed_fault(A, "suspend_stall", 600000):
         os.kill(pid, signal.SIGTERM)
         d = os.path.join(A.state, "suspended", n)
-        check("suspend killed: published", wait_for(lambda: os.path.exists(os.path.join(d, "manifest.json")), 30), d)
+        check("suspend killed: published", wait_for(lambda: pid in reached(A, "suspend_stall"), 60) and os.path.exists(os.path.join(d, "manifest.json")),
+              (reached(A, "suspend_stall"), d))
         os.kill(pid, signal.SIGINT)
         check("suspend killed: the process ends", wait_for(lambda: not alive(pid), 30), pid)
     check("suspend killed: no suspended vm left", n not in vms(A) and not os.path.exists(d), (vms(A).get(n), os.path.exists(d)))
