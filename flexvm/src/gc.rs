@@ -219,9 +219,10 @@ fn load_sets(dir: &Path) {
     }
 }
 
-/// The name a log in `RUN/vms` is of (`NAME.log`, or its predecessor `NAME.log.1`).
+/// The name logs in `RUN/vms` are of: `NAME.logs` (`Host::open_logs`), or its links
+/// `NAME.log` and `NAME.log.1` (or logs at those paths from before such directories).
 fn log_name(file: &str) -> Option<&str> {
-    file.strip_suffix(".log").or_else(|| file.strip_suffix(".log.1")).filter(|n| !n.starts_with('.'))
+    file.strip_suffix(".logs").or_else(|| file.strip_suffix(".log")).or_else(|| file.strip_suffix(".log.1")).filter(|n| !n.starts_with('.'))
 }
 
 /// In `RUN/vms`: a dead arrival's log; the logs of a name with nothing left
@@ -247,15 +248,27 @@ fn vm_files(host: &Host) {
             }
             continue;
         }
+        // A retired lifetime's that a writer added to as it went (`Host::retire_logs`): no name's.
+        if file.starts_with('.') && file.contains(".logs.") && file.ends_with(".gone") {
+            let _ = std::fs::remove_dir_all(&path);
+            continue;
+        }
         let Some(name) = log_name(&file) else { continue };
-        if logs.is_none() || unwritten_for(&path).is_none_or(|a| a <= ORPHAN_LOG_TTL) {
+        // Logs' age is their log's (or their directory's, with none); a link's, its own with none.
+        let lifetime = file.ends_with(".logs");
+        let age = match lifetime {
+            true => unwritten_for(&path.join("log")).or_else(|| unwritten_for(&path)),
+            false => unwritten_for(&path).or_else(|| std::time::SystemTime::now().duration_since(std::fs::symlink_metadata(&path).ok()?.modified().ok()?).ok()),
+        };
+        if logs.is_none() || age.is_none_or(|a| a <= ORPHAN_LOG_TTL) {
             continue;
         }
         // Not a VM's name: never one of its logs.
         let Ok(suspended) = host.suspended(name) else { continue };
         let orphan = host.holder_gone(name) && !suspended.exists() && !["failed", "moved", "lost", "exited"].iter().any(|ext| host.has_record(name, ext));
-        if orphan {
-            // Its writers' lock goes after (`orphan_log_locks`).
+        if orphan && lifetime {
+            let _ = host.retire_logs(name);
+        } else if orphan {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -745,6 +758,27 @@ mod tests {
         std::fs::remove_file(log).unwrap();
         orphan_log_locks(&d);
         assert!(!path.exists(), "interrupted finish_incoming_log leaves no orphan lock");
+    }
+
+    #[test]
+    fn an_orphan_names_logs_and_retired_ones_go() {
+        let d = dir("vmlogs");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        for name in ["gone", "held", "new"] {
+            host.write_log(name, "log", "x");
+            let log = File::options().append(true).open(host.vms(name, "logs").unwrap().join("log")).unwrap();
+            log.set_modified(if name == "new" { SystemTime::now() } else { old }).unwrap();
+        }
+        store_holder(&host, "held", &crate::host::Ident::me());
+        // Retired as a writer still added to it.
+        let retired = host.run.join("vms/.gone.logs.0123456789abcdef.gone");
+        std::fs::create_dir(&retired).unwrap();
+        std::fs::write(retired.join("log"), "late").unwrap();
+        vm_files(&host);
+        assert!(!retired.exists(), "a retired lifetime's");
+        assert!(["logs", "log", "log.1"].iter().all(|ext| host.vms("gone", ext).unwrap().symlink_metadata().is_err()), "an orphan's, with its links");
+        assert!(host.has_record("held", "log") && host.has_record("new", "log"), "a held name's, and one not quiet yet");
     }
 
     #[test]

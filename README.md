@@ -269,7 +269,7 @@ shell, so quote a command that has its own quoting:
 belong to CMD; a `--` there is dropped.
 
 A background VM's output (an image app's stdout and stderr, flexvm's own
-messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: past
+messages) goes to `/run/flexvm/vms/web.log` (a link into `web.logs/`). Logs live on tmpfs: past
 8 MiB, `NAME.log` becomes `NAME.log.1` (replacing the one before) and a new
 one is started; the logs of a name with nothing left on
 the host (no VM, stopped VM, `exited`, `failed`, `lost` or moved record) are removed once

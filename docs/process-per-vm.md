@@ -179,14 +179,16 @@ STATE (default /var/lib/flexvm, on disk)
   staging/               where image layers unpack (`pull`); its ancestry must be root-owned
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{json,sock}            registry entry, control socket (0600)
-  vms/NAME.{log,log.1}            current log and previous rotation of background VMs (0600)
-  vms/.locks/NAME.lock            liveness lock; NAME.log, a log's writers' lock; .incoming-*.log, an arrival's lock
+  vms/NAME.logs/{log,log.1}       a lifetime of the name's logs: current log and previous rotation (0700, 0600)
+  vms/NAME.{log,log.1}            links into NAME.logs/
+  vms/.NAME.logs.X.gone           a retired lifetime being removed (swept if a writer added to it meanwhile)
+  vms/.locks/NAME.lock            liveness lock; .incoming-*.log, an arrival's lock
   vms/NAME.{failed,moved}         why a VM died (until `rm` or name reuse); where it migrated to (an hour)
   vms/NAME.exit                   the process's exit status and identity (`flexvm wait`)
   vms/NAME.exited                 a background VM's app exit status and run config (until `start` or `rm`)
   vms/NAME.lost                   a VM lost with the host, recorded before its address is withdrawn (until `rm` or name reuse)
   .boot                  the boot id once this boot's recovery completed (`gc::after_boot`)
-  vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
+  vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.logs/log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc                   when garbage was last swept periodically
   .X.PID-START-BOOT.tmp   `util::write_file`'s temporary files here and in STATE: swept once their writer is
@@ -299,20 +301,26 @@ Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a 
 VM, suspended VM, `failed`, `lost`, `exited` or `moved` record go once unwritten for an hour,
 decided and removed holding `RUN/.locks/logs`, which a start holds (shared)
 while it opens and marks its log (whether a VM holds the name is read from its lock's record, never by probing the lock a start takes without waiting); `NAME.moved` goes after an hour.
-Explicit `rm`, including `rm -f` of a running VM (once its process has exited, so
-its last words are in the log removed), removes `NAME.log` and
-`NAME.log.1` while holding the name and `RUN/.locks/logs` shared, before
-another VM can take the name; `kill` and a foreground `run -i`/`-t`'s end keep them. Logs remain available for stopped and exited
+A VM's logs are a lifetime's directory, `NAME.logs` (`Host::open_logs`), made as its VM
+takes the name. Only the VM's own process writes them (a foreground client whose terminal
+is gone drops its own output), and it and `logs -f` hold the directory, never its path:
+they open, rotate and read only in it. So a lifetime ends in one step, without waiting on
+anyone: explicit `rm` (including `rm -f` of a running VM, once its process has exited, so
+its last words are in the log removed), a new VM of a `failed`, `lost` or `moved` name,
+or an accepted arrival renames the directory away (`.NAME.logs.X.gone`) and removes it,
+holding the name and `RUN/.locks/logs` shared; `rename` moves it to the new name. A writer
+still running then goes on only in its own directory, and `logs -f` ends once the directory
+at the path is not the one it holds (its inode, held, is never a later one's). `kill` and a
+foreground `run -i`/`-t`'s end keep the logs. Logs remain available for stopped and exited
 VMs until removal; `start` keeps them. A detached `run` opens its log in the
 parent before the child takes the name, so removal clears the logs before
 that parent opens them. Released migration records are retired as below.
 Logs are capped by their
-writers, not swept (`output::append_capped`): a VM process's output relay
-tries the log's lock (`.locks/NAME.log` in its directory, never the log itself)
-for up to a second, then appends to the file at the log's path. With the lock,
-a write past 8 MiB renames it `NAME.log.1`; the next write starts a new one.
-Without the lock, it appends without rotating, so a concurrent rotation may
-carry that write into `NAME.log.1`. Writes are never retried.
+writers, not swept (`output::append_in`): a writer tries the directory's lock (a flock
+of its own open of it) for up to a second, then appends to `log` in it, making it if
+missing. With the lock, a write past 8 MiB renames it `log.1`; the next write starts a
+new one (one interrupted between leaves `log.1`, which `logs` reads). Without the lock,
+it appends without rotating. Writes are never retried.
 
 **The tap prefix** names taps and hold devices: `f` and five base-36 digits
 of a hash of the state directory (`Host::tap_prefix`), so it never changes
@@ -624,7 +632,7 @@ an operation. Busy here is what the VM process's own checks say (its reply
 sets `busy`), never a peer's text: any peer's refusal, whatever it says, is
 a refusal (#599). A refused VM and peer pair is not tried again for 5 s, doubling
 to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
-log is removed; an accepted one becomes `NAME.log`.
+log is removed; an accepted one becomes `NAME.logs/log`, a new lifetime.
 Announcements and `lend` requests go to all peers at once, by the peers
 configured now (`Host::config_now`); the listener re-reads them too, so
 an edit of host.json's `peers` reaches running processes.

@@ -835,9 +835,11 @@ fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
 /// Its lock goes with it: held, it is the caller's to let go of then.
 pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accepted: bool) -> Result<()> {
     if accepted {
+        // A new lifetime of the name's logs: any earlier VM's are retired.
         let _logs = host.logs_lock(libc::LOCK_SH)?;
-        let _ = std::fs::remove_file(host.vms(name, "log.1")?);
-        std::fs::rename(log, host.vms(name, "log")?)?;
+        host.retire_logs(name)?;
+        drop(host.open_logs(name)?);
+        std::fs::rename(log, host.vms(name, "logs")?.join("log"))?;
     } else {
         std::fs::remove_file(log)?;
     }

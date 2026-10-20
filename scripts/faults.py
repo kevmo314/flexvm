@@ -26,7 +26,7 @@ a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
 """
 from contextlib import ExitStack, contextmanager, suppress
 
-import argparse, base64, fcntl, glob, ipaddress, json, shlex, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, base64, fcntl, glob, ipaddress, json, shlex, shutil, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -561,10 +561,17 @@ def whole_log(host, name):
     return text
 
 
+def remove_logs(vms_dir, name):
+    """`name`'s logs: their lifetime's directory (NAME.logs) and its links (NAME.log, NAME.log.1)."""
+    shutil.rmtree(os.path.join(vms_dir, f"{name}.logs"), ignore_errors=True)
+    for f in (f"{name}.log", f"{name}.log.1"):
+        with suppress(OSError):
+            os.unlink(os.path.join(vms_dir, f))
+
+
 def clear_log(host, name):
     REMOVED_LOGS.pop((host.run, name), None)
-    with suppress(OSError):
-        os.unlink(os.path.join(host.run, "vms", f"{name}.log"))
+    remove_logs(os.path.join(host.run, "vms"), name)
 
 
 def addr(host, ip):
@@ -9515,9 +9522,7 @@ def log_cap():
     n = "ft-logcap"
     scenario_vms.add(n)
     vd = os.path.join(A.run, "vms")
-    for f in (f"{n}.log", f"{n}.log.1"):
-        if os.path.exists(os.path.join(vd, f)):
-            os.unlink(os.path.join(vd, f))
+    remove_logs(vd, n)
     lines = 1_500_000  # ~11 MiB
     r = cli_json(A, "run", "--name", n, "-d", args.template, f"seq 1 {lines}")
     check("log cap: started", r["ok"], r)
@@ -9535,9 +9540,7 @@ def log_cap():
     # cap, the next write rotates it: here, what it logs as it migrates back (its end on SIGINT prints nothing). That migration is served only once its arrival is done and the log published, however long the
     # arrival's tail (held packets, route) takes, so the pad never lands before publication matters.
     m = "ft-logcap-moved"
-    for f in (f"{m}.log", f"{m}.log.1"):
-        if os.path.exists(os.path.join(B.run, "vms", f)):
-            os.unlink(os.path.join(B.run, "vms", f))
+    remove_logs(os.path.join(B.run, "vms"), m)
     ok(run(A, m))
     ok(migrate(A, m, B))
     moved = os.path.join(B.run, "vms", f"{m}.log")
