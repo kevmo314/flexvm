@@ -374,20 +374,44 @@ impl Drop for Claim {
     }
 }
 
-/// Whether `vm`'s agent takes the host's claim numbers (`guest::attach_line`), asked once, by `at`. The probe
-/// attaches nothing: a newer agent finds its offset bad, an older one the whole request (`BAD_SESSION_REQUEST`).
-fn fenced(vm: &Vm, at: Instant) -> Result<bool> {
+/// One random epoch per host process: claim counters restart after a restore or migration (#1085).
+fn host_epoch() -> Result<u64> {
+    static EPOCH: OnceLock<std::result::Result<u64, String>> = OnceLock::new();
+    EPOCH
+        .get_or_init(|| crate::util::random_hex(8).map(|s| u64::from_str_radix(&s, 16).expect("random hex")).map_err(|e| e.to_string()))
+        .clone()
+        .map_err(Into::into)
+}
+
+/// Which attachment form `vm`'s agent takes, asked once, by `at`. A supported form fails on the bad offset,
+/// an unsupported one on the whole request. Neither probe attaches a session.
+fn fenced(vm: &Vm, at: Instant) -> Result<guest::AttachForm> {
+    use guest::AttachForm;
     match vm.fenced.load(Ordering::SeqCst) {
-        1 => return Ok(true),
-        2 => return Ok(false),
+        1 => return Ok(AttachForm::Numbered),
+        2 => return Ok(AttachForm::Plain),
+        3 => return Ok(AttachForm::Epoch),
         _ => {}
     }
-    let (mut g, id) = vm.exec_by(at, |s| guest::request_by(s, "ATTACH flexvm-claim-probe x 0", at))?;
-    let reply = guest::read_frame(&mut crate::util::By { s: &mut g, at });
-    vm.untrack_exec(id);
-    let fenced = probed(reply?)?;
-    vm.fenced.store(if fenced { 1 } else { 2 }, Ordering::SeqCst);
-    Ok(fenced)
+    let form = probe_form(&|line| {
+        let (mut g, id) = vm.exec_by(at, |s| guest::request_by(s, line, at))?;
+        let reply = guest::read_frame(&mut crate::util::By { s: &mut g, at });
+        vm.untrack_exec(id);
+        probed(reply?)
+    })?;
+    vm.fenced.store(form as u8, Ordering::SeqCst);
+    Ok(form)
+}
+
+fn probe_form(probe: &dyn Fn(&str) -> Result<bool>) -> Result<guest::AttachForm> {
+    use guest::AttachForm;
+    if probe("ATTACH flexvm-claim-probe x 0 0")? {
+        Ok(AttachForm::Epoch)
+    } else if probe("ATTACH flexvm-claim-probe x 0")? {
+        Ok(AttachForm::Numbered)
+    } else {
+        Ok(AttachForm::Plain)
+    }
 }
 
 /// The probe's answer: whether the agent took the claim's form (a busy one's refusal is passed on, to try again).
@@ -405,26 +429,27 @@ fn probed(reply: Option<(u8, Vec<u8>)>) -> Result<bool> {
 }
 
 /// One try at attaching session `id` again from `offset` for claim `claim`, by `at` (#1074): `open` sends a
-/// request line and returns its connection. A `REJOIN` if the agent takes claim numbers (`fenced`); one that turns
-/// out older after all (it refuses the form) is told `old`, and sent the plain ATTACH. Its id echo read, the agent
+/// request line and returns its connection. A `REJOIN` carries the epoch and claim where supported; a refused
+/// form is downgraded, updating the cache through `old`. Its id echo read, the agent
 /// has attached it; its refusal for a newer claim is an error, as another client's.
 fn reattach(
     open: &dyn Fn(&str) -> Result<BufReader<UnixStream>>,
-    fenced: &dyn Fn() -> Result<bool>,
-    old: &dyn Fn(),
+    fenced: &dyn Fn() -> Result<guest::AttachForm>,
+    old: &dyn Fn(guest::AttachForm),
     id: &str,
     offset: u64,
     claim: u64,
     at: Instant,
 ) -> Result<BufReader<UnixStream>> {
-    let mut numbered = fenced()?;
+    let mut form = fenced()?;
+    let epoch = host_epoch()?;
     loop {
-        let mut g = open(&guest::attach_line(id, offset, numbered.then_some(claim), true)?)?;
+        let mut g = open(&guest::attach_line(id, offset, claim, epoch, form, true)?)?;
         match guest::read_frame(&mut crate::util::By { s: &mut g, at })? {
             Some((guest::FRAME_MSG, m)) if m == id.as_bytes() => return Ok(g),
-            Some((guest::FRAME_MSG, m)) if numbered && String::from_utf8_lossy(&m).contains(guest::BAD_SESSION_REQUEST) => {
-                old();
-                numbered = false;
+            Some((guest::FRAME_MSG, m)) if form != guest::AttachForm::Plain && String::from_utf8_lossy(&m).contains(guest::BAD_SESSION_REQUEST) => {
+                form = form.older();
+                old(form);
             }
             Some((guest::FRAME_MSG, m)) if String::from_utf8_lossy(&m).contains(guest::ATTACHED_SINCE) => {
                 bail!("another client attached to the session")
@@ -1989,7 +2014,7 @@ impl Proc {
             // With its claim's number where the agent takes one: a relay's later REJOIN under an older claim is
             // then refused rather than shut this attachment down (#1074).
             ("attach", Some(claim)) => fenced(vm, Instant::now() + guest::TIMEOUT).and_then(|fenced| {
-                let line = guest::attach_line(session, req["offset"].as_u64().unwrap_or(0), fenced.then_some(claim.n), false)?;
+                let line = guest::attach_line(session, req["offset"].as_u64().unwrap_or(0), claim.n, host_epoch()?, fenced, false)?;
                 vm.exec(|s| guest::request_on(s, &line, guest::TIMEOUT))
             }),
             _ => vm.exec(|s| {
@@ -2039,7 +2064,7 @@ impl Proc {
                     vm.untrack_exec(track.replace(id));
                     Ok(g)
                 };
-                let old = || vm.fenced.store(2, Ordering::SeqCst);
+                let old = |form: guest::AttachForm| vm.fenced.store(form as u8, Ordering::SeqCst);
                 match reattach(&open, &|| fenced(vm, at), &old, session, from, claim.n, at) {
                     Ok(g) => {
                         g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -6292,9 +6317,9 @@ mod session_relay_tests {
         let lines = Mutex::new(vec![]);
         let echo = guest::frame(guest::FRAME_MSG, &[b"sid"]);
         let at = Instant::now() + WAIT;
-        let (yes, no) = (|| -> Result<bool> { Ok(true) }, || -> Result<bool> { Ok(false) });
+        let (yes, no) = (|| Ok(guest::AttachForm::Numbered), || Ok(guest::AttachForm::Plain));
         let olds = AtomicUsize::new(0);
-        let old = || {
+        let old = |_| {
             olds.fetch_add(1, Ordering::SeqCst);
         };
         let open = |line: &str| agent_reply(&lines, line, echo.clone(), None);
@@ -6316,6 +6341,63 @@ mod session_relay_tests {
         assert_eq!(lines.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn epoch_rejoins_and_fallbacks_keep_the_process_epoch() {
+        use guest::AttachForm;
+        let epoch = host_epoch().unwrap();
+        assert_eq!(host_epoch().unwrap(), epoch);
+        for supported in [AttachForm::Epoch, AttachForm::Numbered, AttachForm::Plain] {
+            let lines = Mutex::new(vec![]);
+            let forms = Mutex::new(vec![]);
+            let open = |line: &str| {
+                let supported = match supported {
+                    AttachForm::Epoch => true,
+                    AttachForm::Numbered => line.split_whitespace().count() <= 4,
+                    AttachForm::Plain => line.starts_with("ATTACH"),
+                };
+                let msg = if supported { "sid" } else { guest::BAD_SESSION_REQUEST };
+                agent_reply(&lines, line, guest::frame(guest::FRAME_MSG, &[msg.as_bytes()]), None)
+            };
+            reattach(&open, &|| Ok(AttachForm::Epoch), &|f| forms.lock().unwrap().push(f), "sid", 5, 3, Instant::now() + WAIT).unwrap();
+            let mut expected = vec![format!("REJOIN sid 5 3 {epoch}")];
+            if supported != AttachForm::Epoch {
+                expected.push("REJOIN sid 5 3".into());
+            }
+            if supported == AttachForm::Plain {
+                expected.push("ATTACH sid 5".into());
+            }
+            assert_eq!(*lines.lock().unwrap(), expected);
+            assert_eq!(forms.lock().unwrap().last().copied().unwrap_or(AttachForm::Epoch), supported);
+        }
+        // An epoch refusal is a takeover, never a reason to retry with a weaker fence.
+        let lines = Mutex::new(vec![]);
+        let open = |line: &str| agent_reply(&lines, line, guest::frame(guest::FRAME_MSG, &[guest::ATTACHED_SINCE.as_bytes()]), None);
+        let err = reattach(&open, &|| Ok(AttachForm::Epoch), &|_| panic!("downgraded"), "sid", 0, 99, Instant::now() + WAIT).err().unwrap();
+        assert!(err.to_string().contains("another client"));
+        assert_eq!(*lines.lock().unwrap(), [format!("REJOIN sid 0 99 {epoch}")]);
+    }
+
+    #[test]
+    fn attachment_probe_selects_each_agent_generation() {
+        use guest::AttachForm;
+        for (answers, expected) in [(vec![true], AttachForm::Epoch), (vec![false, true], AttachForm::Numbered), (vec![false, false], AttachForm::Plain)] {
+            let lines = Mutex::new(vec![]);
+            let form = probe_form(&|line| {
+                let mut lines = lines.lock().unwrap();
+                lines.push(line.to_string());
+                Ok(answers[lines.len() - 1])
+            })
+            .unwrap();
+            assert_eq!(form, expected);
+            assert_eq!(lines.lock().unwrap().len(), answers.len());
+            assert_eq!(lines.lock().unwrap()[0], "ATTACH flexvm-claim-probe x 0 0");
+            if answers.len() == 2 {
+                assert_eq!(lines.lock().unwrap()[1], "ATTACH flexvm-claim-probe x 0");
+            }
+        }
+        assert!(probe_form(&|_| Err("busy".into())).is_err());
+    }
+
     /// The whole of attaching again keeps to one deadline, however slowly the guest trickles its answer: a newer
     /// client waiting on the claim's lock waits no longer than that (#1074 review).
     #[test]
@@ -6325,7 +6407,7 @@ mod session_relay_tests {
         // Each byte well within any one read's timeout; all of them far past the deadline.
         let open = |line: &str| agent_reply(&lines, line, echo.clone(), Some(Duration::from_millis(100)));
         let t = Instant::now();
-        let err = reattach(&open, &|| Ok(true), &|| (), "sid", 0, 1, t + Duration::from_millis(400)).err().unwrap();
+        let err = reattach(&open, &|| Ok(guest::AttachForm::Epoch), &|_| (), "sid", 0, 1, t + Duration::from_millis(400)).err().unwrap();
         assert!(t.elapsed() < Duration::from_millis(900), "{err} after {:?}", t.elapsed());
         // The OK line alone, too.
         let (ours, mut theirs) = UnixStream::pair().unwrap();
