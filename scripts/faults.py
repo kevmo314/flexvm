@@ -551,6 +551,16 @@ def dump_logs(names, tail=6000):
                     print(f"--- {n} on {h}: its logs could not be printed: {type(e).__name__}: {e}", flush=True)
 
 
+def whole_log(host, name):
+    """`log`, after what its rotation kept (NAME.log.1), as `flexvm logs` prints it."""
+    text = ""
+    for f, removed in ((f"{name}.log.1", REMOVED_PREV), (f"{name}.log", REMOVED_LOGS)):
+        text += removed.get((host.run, name), "")
+        with suppress(OSError):
+            text += open(os.path.join(host.run, "vms", f), errors="replace").read()
+    return text
+
+
 def clear_log(host, name):
     REMOVED_LOGS.pop((host.run, name), None)
     with suppress(OSError):
@@ -2566,9 +2576,21 @@ def rx_state(host, name):
         st["fc_flushes"] = len(lines)
     except Exception as e:
         st["fc_net"] = f"unavailable: {e}"
-    tap = vms(host)[name].get("tap")
+    tap = vms(host).get(name, {}).get("tap")  # it may be gone meanwhile
     st["tap"] = subprocess.run(["ip", "-s", "link", "show", tap], capture_output=True, text=True).stdout if tap else None
     return st
+
+
+def vm_alive(host, name):
+    """Whether `name` has a live VM process on `host`. `vms` keeps the pid `ps` gave even when the
+    process exited before its status query, so that process is checked, then `ps` asked again."""
+    pid = vms(host).get(name, {}).get("pid")
+    try:
+        if pid:
+            os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return bool(pid) and bool(vms(host).get(name, {}).get("pid"))
 
 
 def rx_stall():
@@ -2577,8 +2599,10 @@ def rx_stall():
     restore, suspend and resume, and pause and resume a VM over and over;
     after each, the guest's InDatagrams must go up again. On a stall it
     records the guest's, Firecracker's and the tap's view, then has the
-    guest send one datagram
-    (an interrupt on the same line) to see whether that wakes its receive.
+    guest send one datagram (an interrupt on the same line) to see whether
+    that wakes its receive. A VM that died instead is no stall: that fails
+    as a death, with the VM's log (a crashed guest's console) printed, as
+    CI's were guests crashing right after a restore (#968).
     RX_ITERS (default 25), RX_RATE (datagrams/s, default 2000) and
     RX_TAP_RATE (frames/s written onto its tap, default 1000) scale it."""
     n = "ft-rx-stall"
@@ -2661,8 +2685,16 @@ def rx_stall():
             check(f"rx stall: {op} {i} succeeded", False, r)
             break
         done[op] = done.get(op, 0) + 1
-        cur_tap[0] = vms(cur)[n].get("tap") or cur_tap[0]
+        cur_tap[0] = vms(cur).get(n, {}).get("tap") or cur_tap[0]
         if not receiving(cur, n):
+            if not vm_alive(cur, n):
+                v = vms(cur).get(n, {})
+                # Not a stall: the VM is gone (#968). Its log ends with how it died, and a guest crash
+                # with the guest's console (#964), which the scenario's later cleanup may not leave behind.
+                check(f"rx stall: the VM lived through {op} {i}", False,
+                      {"state": v.get("state"), "error": v.get("error"), "status": v.get("status")})
+                print(f"rx stall: {cur}'s log of {n}:\n{whole_log(cur, n)}", flush=True)
+                break
             before = rx_state(cur, n)
             code, out = sh(cur, n, "echo wake | socat -u - UDP-SENDTO:169.254.1.1:9")
             woke = receiving(cur, n)
