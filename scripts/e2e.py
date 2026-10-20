@@ -385,6 +385,11 @@ class Host:
                  and ipaddress.IPv4Address(r.split()[0]) in net]
         locks = os.path.join(self.run_dir, "vms", ".locks")
         left += [f"vm {v}" for v in os.listdir(locks) if v.endswith(".lock")] if os.path.isdir(locks) else []
+        # A case's checkpoints (a stored one, its name, a staging directory) are the next one's surprise.
+        store = os.path.join(self.state_dir, "checkpoints")
+        names = os.path.join(store, "names")
+        left += [f"checkpoint {c}" for c in sorted(os.listdir(store)) if c not in ("names", ".locks")] if os.path.isdir(store) else []
+        left += [f"checkpoint name {c}" for c in sorted(os.listdir(names))] if os.path.isdir(names) else []
         return left
 
     def save_logs(self):
@@ -552,10 +557,38 @@ def ckpt_dir(label):
     return path
 
 
+def rm_ckpt(path):
+    """Removes `path`, a link to a stored checkpoint (`Host.checkpoint`), and that checkpoint, by its owner: the
+    CLI of the host whose store holds it (`checkpoint rm -f`, with any built on it). A link is no directory to rmtree."""
+    target = os.path.realpath(path)
+    if os.path.islink(path):
+        os.remove(path)
+    else:
+        shutil.rmtree(path, ignore_errors=True)
+    for h in (A, B):
+        if os.path.dirname(target) == os.path.realpath(os.path.join(h.state_dir, "checkpoints")) and os.path.isdir(target):
+            h.cli("checkpoint", "rm", "-f", os.path.basename(target))
+
+
 # --- cases ---------------------------------------------------------------------
 
 CASES = {}
 results = []
+# Hosts a case made of its own (no listener): teardown checks them for leftovers too, as it does A and B.
+LOCAL_HOSTS = []
+
+
+def local_host(label, ips):
+    """A host of a case's own, on this lane's ports (never listened on) and A's network, VM addresses `ips`:
+    its directories made, its artifacts this run's; registered for teardown's leftover check."""
+    h = Host(label, args.port_a, args.port_a + 1, args.net_a)
+    os.makedirs(h.run_dir)
+    os.makedirs(h.state_dir)
+    os.symlink(ARTIFACTS, os.path.join(h.state_dir, "artifacts"))
+    h.configure(vm_ips=ips, reserve_mib=256)
+    h.prefix = h.info()["derived"]["prefix"]
+    LOCAL_HOSTS.append(h)
+    return h
 
 
 def case(fn):
@@ -567,6 +600,10 @@ def check(label, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + label + (f"  [{detail}]" if detail and not cond else ""), flush=True)
     if not cond:
         raise AssertionError(label + (f": {detail}" if detail else ""))
+
+
+class Skip(Exception):
+    """The case cannot run here (as asked): it ends SKIP, never PASS (a failure with --no-skips)."""
 
 
 @case
@@ -694,7 +731,7 @@ def app_lifecycle():
     check("checkpoint: the restored vm exits with the app", wait_for(lambda: exited("e2e-app-ck2"), 30) and A.ps()["e2e-app-ck2"].get("status") == 9,
           (A.ps().get("e2e-app-ck2"), A.logs("e2e-app-ck2")[-2000:]))
     A.rm("e2e-app-ck2")
-    shutil.rmtree(ck, ignore_errors=True)
+    rm_ckpt(ck)
 
     # --rm: no record once it exits.
     run_d("e2e-app-rm", "--rm", *entry("exit 0"))
@@ -873,7 +910,7 @@ def migrate_unpulled():
               and '"template_digests"' in open(os.path.join(path, "manifest.json")).read())
         B.restore(path)
         check("B: restored onto the received copy", md5(B, vm) == m and marker_id(B, vm) == proc)
-        shutil.rmtree(path, ignore_errors=True)
+        rm_ckpt(path)
         B.kill(vm)
         # Stored checkpoints of it (the restore's) keep it too.
         for ck in B.cli("checkpoint", "ls", "-q").stdout.split():
@@ -1020,12 +1057,16 @@ def checkpoint_restore():
     print(f"  restore: ready in {r.get('ready_ms')} ms")
     check("restore on B: borrows A's address", r.get("ip") == ip and B.ps().get(vm, {}).get("ip") == ip, r)
     B.kill(vm)
+    refused = []
+
     def restore_home():
+        # Refused while B still lets go; the last refusal (flexvm's error) is the failure's detail.
         try:
             return A.restore(path)
-        except AssertionError:
+        except AssertionError as e:
+            refused[:] = [str(e)]
             return None
-    check("restore on A once B let it go", wait_for(restore_home, 10))
+    check("restore on A once B let it go", wait_for(restore_home, 10), refused)
     check("restore: same name and address", A.ps().get(vm, {}).get("ip") == ip, A.ps())
     check("restore: RAM intact", md5(A, vm) == m)
     check("restore: same process", marker_id(A, vm) == proc)
@@ -1048,8 +1089,8 @@ def checkpoint_restore():
     check("fork: same process", marker_id(B, fork) == proc)
     A.kill(vm)
     B.kill(fork)
-    shutil.rmtree(path, ignore_errors=True)
-    shutil.rmtree(path2, ignore_errors=True)
+    rm_ckpt(path)
+    rm_ckpt(path2)
 
 
 @case
@@ -1389,7 +1430,7 @@ def port_forward():
     r = A.restore(path, name=fork, ip="auto")
     check("restore without -p: no ports", not r.get("ports") and not A.ps()[fork].get("ports"), r)
     A.kill(fork)
-    shutil.rmtree(path, ignore_errors=True)
+    rm_ckpt(path)
     # Aborted after switchover: the target's pull cannot finish (every page a second late) when its
     # VM process is killed, so the source runs its copy again, with its forwards.
     try:
@@ -1581,7 +1622,8 @@ def containers():
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
     check("rename: the separate exec client's command runs", wait_for(lambda: must(A, renamed, "ls /tmp/exec-started 2>/dev/null || :") != "", 60))
     A.cli("rename", renamed, moved)
-    A.cli("checkpoint", "create", moved)
+    # The checkpoints this case makes, removed at its end: the next case's store starts empty.
+    made = [json.loads(A.cli("checkpoint", "create", moved).stdout)["id"]]
     must(A, moved, "touch /tmp/exec-go")
     out, err = e.communicate(timeout=120)
     check("rename: a separate exec client reattaches under the new name", e.returncode == 0 and out == "exec-done\n", (e.returncode, out, err[-500:]))
@@ -1601,7 +1643,8 @@ def containers():
     # Refused while a checkpoint holds the vm.
     fill(A, renamed, 32)
     A.cli("debug", "fault", "ckpt_crawl", "120000")
-    ck = threading.Thread(target=lambda: A.cli("checkpoint", "create", renamed, check=False, timeout=300))
+    crawled = []
+    ck = threading.Thread(target=lambda: crawled.append(A.cli("checkpoint", "create", renamed, check=False, timeout=300)))
     ck.start()
     try:
         # Under way once its copy runs (or it is paused for it), not after a guessed delay.
@@ -1614,6 +1657,7 @@ def containers():
     finally:
         A.cli("debug", "fault", "ckpt_crawl", "0")
         ck.join()
+    made += [json.loads(r.stdout)["id"] for r in crawled if r.returncode == 0]
     # rename while stopped: started again under the new name, with its address and processes.
     A.suspend(renamed)
     final = vm + "-final"
@@ -1637,13 +1681,15 @@ def containers():
     A.vms.update({cmd_vm, cmd_new})
     A.cli("run", "--name", cmd_vm, "-d", args.template, "--", "sleep 4; echo cmd-done; exit 4")
     A.cli("rename", cmd_vm, cmd_new)
-    A.cli("checkpoint", "create", cmd_new)
+    made.append(json.loads(A.cli("checkpoint", "create", cmd_new).stdout)["id"])
     check("rename: a command's vm ends with its command, under the new name", A.cli("wait", cmd_new, timeout=120).stdout == "4\n")
     check("rename: its command's output in the new log", "cmd-done\n" in A.cli("logs", cmd_new).stdout)
+    A.rm(cmd_new)
     # rm (of a running vm, and of a failed one) leaves no status to wait for.
     for n in (final, other):
         A.rm(n, force=True)
         check(f"rm: no status of {n} left to wait for", A.cli("wait", n, check=False).returncode != 0)
+    A.cli("checkpoint", "rm", *made)
 
 
 # --- the image case's registry pull and its cache --------------------------------
@@ -1726,6 +1772,17 @@ def typed(p, line, want, timeout=30):
     return p.expect(want, timeout, p.expect(re.escape(line[-12:]), timeout, since))
 
 
+def checked(label, step, *a, **kw):
+    """`step(*a, **kw)`, an asserting helper (`typed`, `size_follows`), as the check `label`: what it
+    asserted is the failure's detail. Returns what it returned."""
+    try:
+        r = step(*a, **kw)
+    except AssertionError as e:
+        check(label, False, e)
+    check(label, True)
+    return r
+
+
 def size_follows(p, rows, cols, timeout=30):
     """Types `stty size` until it reads `rows` `cols`: a resize reaches the guest's pty in its own time
     (SIGWINCH to the CLI, then to the guest), so one read right after it may still see the old size."""
@@ -1777,19 +1834,17 @@ def interactive():
     out, err = proc.communicate(timeout=120)
     check("exec -i: through a checkpoint and a pause, stdin intact", proc.returncode == 0 and out.split()[0].decode() == hashlib.sha256(data).hexdigest(),
           (proc.returncode, out[:100], err[-500:]))
-    shutil.rmtree(ck, ignore_errors=True)
+    rm_ckpt(ck)
     r = A.cli("exec", "-it", vm, "true", check=False, stdin=subprocess.DEVNULL)
     check("exec -it: refused without a terminal", r.returncode != 0 and "the input device is not a TTY" in r.stderr, (r.returncode, r.stderr))
 
     p = Pty(A, "exec", "-it", vm, "sh").wait_raw()
     try:
-        typed(p, "echo $((6 * 7))", r"42\r\n")
-        check("exec -it: keys echo and run", True)
+        checked("exec -it: keys echo and run", typed, p, "echo $((6 * 7))", r"42\r\n")
         check("exec -it: the terminal is raw", p.raw())
         typed(p, "stty size", r"24 80\r\n")
         p.resize(40, 120)
-        size_follows(p, 40, 120)
-        check("exec -it: stty size follows a resize", True)
+        checked("exec -it: stty size follows a resize", size_follows, p, 40, 120)
         typed(p, "tty", r"/dev/pts/\d+\r\n")
         p.send("sleep 100\r")
         time.sleep(1)
@@ -1810,7 +1865,7 @@ def interactive():
         since = len(p.out)
         typed(p, "echo after-$((2 + 2))-checkpoint", r"after-4-checkpoint\r\n")
         check("exec -it: on after a checkpoint, nothing typed twice", p.out[since:].count(b"after-4-checkpoint") == 1)
-        shutil.rmtree(ck, ignore_errors=True)
+        rm_ckpt(ck)
         p.send("exit 3\r")
         check("exec -it: the shell's exit status", p.wait() == 3, p.out[-500:])
         check("exec -it: the terminal restored", not p.raw())
@@ -1965,12 +2020,10 @@ def interactive():
             check("two attaches: the pty takes the newest one's size", wait_for(lambda: size() == "30 100\n", 30), size())
             _, sizes, _ = A.exec(vm, f"for i in $(seq 40); do stty size < {pts}; sleep 0.05; done | sort -u")
             check("two attaches: idle, the pty keeps the newest one's size", sizes == "30 100\n", sizes)
-            typed(p, "stty size", r"30 100\r\n")
-            check("two attaches: typing takes stdin, without a resize", True)
+            checked("two attaches: typing takes stdin, without a resize", typed, p, "stty size", r"30 100\r\n")
             typed(q, "echo from-$((5 * 5))", r"from-25\r\n")
             p.resize(40, 120)
-            size_follows(p, 40, 120)
-            check("two attaches: a SIGWINCH resizes", True)
+            checked("two attaches: a SIGWINCH resizes", size_follows, p, 40, 120)
         finally:
             q.close()
         A.migrate(vm, B)
@@ -1980,8 +2033,7 @@ def interactive():
     check("migrate: on B", wait_for(lambda: where(vm) == {B.label: "running"}, 60), where(vm))
     p = Pty(B, "attach", vm).wait_raw()
     try:
-        typed(p, "echo on-b-$x", r"on-b-kept-9\r\n")
-        check("attach on B: the shell kept its state", True)
+        checked("attach on B: the shell kept its state", typed, p, "echo on-b-$x", r"on-b-kept-9\r\n")
         p.send("exit 5\r")
         check("attach: the app's exit status", p.wait() == 5, p.out[-500:])
     finally:
@@ -2207,8 +2259,7 @@ def save_layout(stderr):
 def image_template():
     """pull: a container image becomes a template whose VMs run its entrypoint."""
     if args.no_image:
-        print("  skipped (--no-image)")
-        return
+        raise Skip("--no-image")
     name = args.template + "-img"
     t = time.time()
     cmd = ["sh", "-c", "mkdir -p /tmp/www && echo hello-from-image > /tmp/www/index.html && "
@@ -2255,12 +2306,8 @@ def image_template():
 def pull_gc():
     """pull: a rebuild deletes the generation it superseded, unless a stopped VM or a checkpoint here (or a stopped VM of a state sharing the templates) still uses it."""
     # A host of its own (no listener), with its own templates: A's and B's are shared, which keeps them all.
-    h = Host("gc", args.port_a, args.port_a + 1, args.net_a)
-    os.makedirs(h.run_dir)
-    os.makedirs(h.state_dir)
-    os.symlink(ARTIFACTS, os.path.join(h.state_dir, "artifacts"))
-    h.configure(vm_ips=f"{args.net_a}.200-{args.net_a}.220", reserve_mib=256)
-    peer = Host("gc-peer", args.port_a, args.port_a + 1, args.net_a)
+    h = local_host("gc", f"{args.net_a}.200-{args.net_a}.220")
+    peer = None
     name, vm = "e2e-gc", "e2e-gc"
 
     def pull(n):
@@ -2307,11 +2354,8 @@ def pull_gc():
         check("prune: collected once its checkpoint is gone", third in out and third not in images(), (third, out))
         # #869: another state whose templates link to these; its stopped VM keeps its generation through this
         # state's pull and image prune, which see none of its VMs but read its records.
-        os.makedirs(peer.run_dir)
-        os.makedirs(peer.state_dir)
-        os.symlink(ARTIFACTS, os.path.join(peer.state_dir, "artifacts"))
+        peer = local_host("gc-peer", f"{args.net_a}.221-{args.net_a}.240")
         os.symlink(os.path.join(h.state_dir, "templates"), os.path.join(peer.state_dir, "templates"))
-        peer.configure(vm_ips=f"{args.net_a}.221-{args.net_a}.240", reserve_mib=256)
         fourth = current()
         peer.run(vm, template=name)
         peer.suspend(vm)
@@ -2329,10 +2373,9 @@ def pull_gc():
         h.cli("rmi", name)
         check("rmi: nothing left", not images(), images())
     finally:
-        for host in (h, peer):
-            if os.path.isdir(host.state_dir):
-                for v in host.ps():
-                    host.rm(v, force=True, check=False)
+        for host in (h, peer) if peer else (h,):
+            for v in host.ps():
+                host.rm(v, force=True, check=False)
 
 
 def standby_pids(run, t, ready=False):
@@ -2376,11 +2419,7 @@ def generations_open(pid):
 def pull_standby():
     """#921, #943: with no listener and no VM, a rebuild's superseded standby VMs leave, the old generation is
     deleted (none keeps it open through its refill), and the pool comes back from the new one."""
-    h = Host("sbpull", args.port_a, args.port_a + 1, args.net_a)
-    os.makedirs(h.run_dir)
-    os.makedirs(h.state_dir)
-    os.symlink(ARTIFACTS, os.path.join(h.state_dir, "artifacts"))
-    h.configure(vm_ips=f"{args.net_a}.241-{args.net_a}.250", reserve_mib=256)
+    h = local_host("sbpull", f"{args.net_a}.241-{args.net_a}.250")
     name = "e2e-sbpull"
 
     def pull(n, *extra):
@@ -2412,11 +2451,10 @@ def pull_standby():
         h.cli("rmi", name, timeout=300)
         check("pull standby: rmi leaves no standby", wait_for(lambda: not standby_pids(h.run_dir, name), 60), standby_pids(h.run_dir, name))
     finally:
-        if os.path.isdir(h.state_dir):
-            for v in h.ps():
-                h.rm(v, force=True, check=False)
-            if standby_pids(h.run_dir, name):
-                h.cli("pull", name, "--standby", "0", check=False, timeout=300)
+        for v in h.ps():
+            h.rm(v, force=True, check=False)
+        if standby_pids(h.run_dir, name):
+            h.cli("pull", name, "--standby", "0", check=False, timeout=300)
 
 
 @case
@@ -2434,13 +2472,56 @@ def faults():
     # Listeners of this lane's hosts (started by the worker), or, for the scenarios that restart them,
     # faults.py's own on the same addresses and directories (BUILD links this run's artifacts and templates).
     listeners = ["--state", BUILD] if args.own_listeners else ["--no-listeners"]
-    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
-                        "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
-                        "--a-listen-log", A.log, "--b-listen-log", B.log,
-                        "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
-                        *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", args.template,
-                        "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *args.faults.split()], timeout=1800, env=env)
-    check("faults.py: no failures", r.returncode == 0, f"exit {r.returncode}")
+    # In a process group of its own, with the listeners it starts: past the timeout (or interrupted) it is
+    # asked to stop (SIGINT: it stops them), then the group is SIGKILLed, so none of them outlives it.
+    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
+                          "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
+                          "--a-listen-log", A.log, "--b-listen-log", B.log,
+                          "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
+                          *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", args.template,
+                          "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *args.faults.split()], env=env, start_new_session=True)
+    code = None
+    try:
+        code = p.wait(FAULTS_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # Not ended by itself (timed out, or this worker interrupted): its group goes, whatever else arrives.
+        if code is None:
+            stop_group(p)
+    check(f"faults.py: done within {FAULTS_TIMEOUT_S} s", code is not None, "stopped, its process group killed")
+    check("faults.py: no failures", code == 0, f"exit {code}")
+
+
+FAULTS_TIMEOUT_S = 1800
+
+
+def stop_group(p):
+    """Asks `p` (a process group's leader) to stop (SIGINT), waits 30 s (within the 60 s an interrupted run
+    gives its workers), then SIGKILLs its group and reaps it. A Ctrl-C reaches this worker and the
+    coordinator, which forwards another: SIGINT and SIGTERM are held (blocked, delivered once done), and
+    one that lands before they are is caught and the stop carried on, then raised."""
+    interrupted = None
+    while True:
+        try:
+            old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+            try:
+                if p.poll() is None:
+                    p.send_signal(signal.SIGINT)
+                    try:
+                        p.wait(30)
+                    except subprocess.TimeoutExpired:
+                        pass
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old)
+            break
+        except KeyboardInterrupt as e:
+            interrupted = e
+    if interrupted:
+        raise interrupted
 
 
 # --- main ------------------------------------------------------------------------
@@ -2511,6 +2592,9 @@ def worker():
             try:
                 CASES[c]()
                 results.append((c, "PASS", time.time() - t))
+            except Skip as e:
+                print(f"  skipped ({e})", flush=True)
+                results.append((c, "SKIP", time.time() - t))
             except Exception as e:
                 traceback.print_exc()
                 results.append((c, "FAIL", time.time() - t))
@@ -2534,24 +2618,34 @@ def worker():
                     print(f"saving {h.label}'s logs: {e}", flush=True)
         t = time.time()
         problems = []
-        # What a SIGKILLed VM process leaves (its tap, its name) is collected by a sweep, which
-        # some process on its host runs every 30 s: after scenarios (which kill VM processes
-        # so), sweep each host now.
+        hosts = [A, B, *LOCAL_HOSTS]
         for h in (A, B):
             try:
                 if args.own_listeners and os.path.isdir(h.state_dir):
                     h.prefix = h.info()["derived"]["prefix"]
-                if "faults" in args.cases and os.path.isdir(h.state_dir):
-                    h.cli("debug", "gc")
             except Exception as e:
-                problems.append(f"host {h.label}: collecting garbage: {e}")
+                problems.append(f"host {h.label}: flexvm info: {e}")
         for h in (A, B):
             try:
                 h.stop()
             except Exception as e:
                 problems.append(str(e))
-        wait_for(lambda: not (A.leftovers() + B.leftovers()), 15)
-        problems += [f"left behind: {x}" for x in A.leftovers() + B.leftovers()]
+        leftovers = lambda: [f"{h.label}: {x}" for h in hosts for x in h.leftovers()]
+        left = [] if wait_for(lambda: not leftovers(), 15) else leftovers()
+        # What a SIGKILLed VM process leaves (its tap, its name) is collected by a sweep, which some process
+        # on its host runs every 30 s: after scenarios (which kill VM processes so), each host is swept now,
+        # once what is left was read, and what only the sweep removed is reported (it only hides it).
+        if left and "faults" in args.cases:
+            for h in hosts:
+                try:
+                    if os.path.isdir(h.state_dir):
+                        h.cli("debug", "gc")
+                except Exception as e:
+                    problems.append(f"host {h.label}: collecting garbage: {e}")
+            wait_for(lambda: not leftovers(), 15)
+            if (swept := [x for x in left if x not in leftovers()]):
+                print(f"left for a sweep at teardown: {swept}", flush=True)
+        problems += [f"left behind: {x}" for x in leftovers()]
         results.append(("hosts stop cleanly, nothing left", "FAIL" if problems else "PASS", time.time() - t))
         if problems:
             failed.append("teardown")
@@ -2599,7 +2693,13 @@ COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containe
         "faults/rmi_suspend": 22, "faults/standby_refill_mark": 18, "faults/standby_relief_no_vm": 17, "faults/back_to_back": 14,
         "faults/resume_migrating": 11, "faults/standby_claim_orphan_migrating": 9, "faults/standby_claim_orphan": 7,
         "faults/app_abort": 5, "faults/evict_peer_busy": 4, "faults/arrival_bind_fail": 3, "faults/kill_prepare": 3,
-        "faults/standby_claim_cgroupns": 3, "faults/resume_bind_fail": 3}
+        "faults/standby_claim_cgroupns": 3, "faults/resume_bind_fail": 3,
+        # The heavy shard's (the scheduled CI run's, --jobs 1; the slowest of a few, rounded up): no two fit
+        # in one BATCH_S batch, so each runs under a faults.py timeout of its own.
+        "faults/evict_no_pingpong": 95, "faults/pull_died": 60, "faults/evict_grower": 50, "faults/cow_reports_held": 45,
+        "faults/shrink_stall": 45, "faults/pages_dead": 40, "faults/source_killed_basic": 35, "faults/kill_refused_checkpoint": 35,
+        "faults/quiet_source": 32, "faults/kill_source": 32, "faults/checkpoint_crash": 30, "faults/suspend_disk_freed": 23,
+        "faults/collapse_ckpt_fail": 12}
 BATCH_S = 20
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
@@ -2752,6 +2852,9 @@ def main():
                 if "(left something for a sweep)" in line:
                     with lock:
                         swept.append(f"faults/{m.group(1)} (batch {label})")
+            elif line.startswith("left for a sweep at teardown: "):
+                with lock:
+                    swept.append(f"teardown (batch {label})")
         code = p.wait()
         try:
             # The faults case fails for a skip under --no-skips, which its scenario's own line says already.
