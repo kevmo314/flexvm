@@ -780,6 +780,7 @@ def lost_ack():
     n = "ft-lost-ack"
     m = setup(n)
     # Armed until the migration answered, however long it takes to get to its ack.
+    clear_gate(B, "lost_ack")
     with armed_fault(B, "lost_ack", 600000):
         r = migrate(A, n, B)
     check("lost ack: the target dropped its ack", reached(B, "lost_ack"), reached(B, "lost_ack"))
