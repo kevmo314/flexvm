@@ -517,6 +517,17 @@ def log(host, name):
     return REMOVED_LOGS.get((host.run, name), "") + cur
 
 
+def dump_logs(names, tail=6000):
+    """Prints the end of what each of `names` logged on each host, removed logs included: `rm -f`
+    deletes a VM's log, and a VM that died says why only there."""
+    for n in sorted(names):
+        for h in (A, B):
+            text = log(h, n)
+            if text:
+                cut = text[-tail:]
+                print(f"--- {n} on {h}{' (its last %d bytes)' % tail if len(text) > tail else ''}:\n{cut.rstrip()}\n--- end of {n} on {h}", flush=True)
+
+
 def clear_log(host, name):
     REMOVED_LOGS.pop((host.run, name), None)
     with suppress(OSError):
@@ -10420,6 +10431,9 @@ try:
             for n in scenario_vms:
                 for h in (A, B):
                     kill(h, n)
+            # The kills removed the VMs' logs (and any record of a death): a failure keeps only what is printed here.
+            if failures != before:
+                dump_logs(scenario_vms)
             for path in scenario_checkpoints:
                 rm_ckpt(path)
             try:
