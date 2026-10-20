@@ -699,9 +699,11 @@ def app_lifecycle():
     # --rm: no record once it exits.
     run_d("e2e-app-rm", "--rm", *entry("exit 0"))
     check("--rm: gone once its app exits", wait_for(lambda: "e2e-app-rm" not in A.ps(), 30), A.ps().get("e2e-app-rm"))
-    # -d -i: no client to wait for, so it exits as soon as its app does.
-    began = time.monotonic()
+    # -d -i: no client to wait for, so it exits as soon as its app does, not after the 10 s an app's end
+    # waits for a foreground client (vmproc's ATTACH_WAIT). Timed from the start's answer: however long
+    # the start took on a loaded host is not part of it.
     run_d("e2e-app-di", "-i", *entry("exit 2"))
+    began = time.monotonic()
     check("-d -i: exited at once", wait_for(lambda: exited("e2e-app-di"), 30) and time.monotonic() - began < 8, (time.monotonic() - began, A.ps().get("e2e-app-di")))
     A.rm("e2e-app-di")
 
