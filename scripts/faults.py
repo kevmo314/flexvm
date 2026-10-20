@@ -8214,7 +8214,9 @@ def standby_stalled():
         rep = w.report("standby stalled: under the reserve")
         check("standby stalled: under the reserve, one that cannot exit still marks the pressure", marked and alive(pid), (before, mtime(pressure)))
         check("standby stalled: and holds eviction off no longer", evicting)
-        check("standby stalled: the controller ticks on meanwhile", all(r["ticks"] > 0 and not r["stuck"] and r["tick_gap_max_ms"] < 1600 for r in rep.values()), rep)
+        # Its ticks come about a second apart (1.1 s gaps here): a loaded host delays one by some hundreds of ms, a
+        # controller held up by the stopped standby misses several. The bound evict_grower and evict_latency use.
+        check("standby stalled: the controller ticks on meanwhile", all(r["ticks"] > 0 and not r["stuck"] and r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
     finally:
         os.kill(pid, signal.SIGCONT)
     check("standby stalled: it exits once it can", wait_for(lambda: not alive(pid), 10))
