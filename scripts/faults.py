@@ -1949,9 +1949,20 @@ def undone_migs(d):
     return sorted(f for f in os.listdir(d) if not f.startswith(".") and not done(f)) if os.path.isdir(d) else []
 
 
+def sweep_arrivals(host, mine):
+    """Sweeps the logs `mine` (of `arrivals`) that killed arrivals left on `host`, as its sweep
+    does once they are 5 s unwritten, so no later scenario sees them."""
+    vd = os.path.join(host.run, "vms")
+    for f in mine & arrivals(host):
+        os.utime(os.path.join(vd, f), (time.time() - 60,) * 2)
+    ok(cli_json(host, "debug", "gc"))
+    check(f"swept the killed arrivals' logs on {host}", not (mine & arrivals(host)), arrivals(host))
+
+
 def boundary(host):
-    """What `host` has before a migration to it: its taps and migration records."""
-    return taps(host), migs_of(host)
+    """What `host` has before a migration to it: its taps, migration records and arrivals' logs (an
+    earlier scenario's, its arrival killed, stays until a sweep: not this one's)."""
+    return taps(host), migs_of(host), arrivals(host)
 
 
 def one_owner(label, n, m, owner, ip, gen, before, lent=None, leaving=False):
@@ -1975,7 +1986,7 @@ def nothing_on(label, other, n, ip, before):
     lock, claim, tap or migration record (one left, its arrival killed say, reads aborted and goes
     once asked about)."""
     lock = os.path.join(other.run, "vms", ".locks", f"{n}.lock")
-    left = lambda: (n in vms(other), os.path.exists(lock), arrivals(other), taps(other) - before[0], addr(other, ip).get("holder"))
+    left = lambda: (n in vms(other), os.path.exists(lock), arrivals(other) - before[2], taps(other) - before[0], addr(other, ip).get("holder"))
     check(f"{label}: nothing of it left on {other}", wait_for(lambda: left() == (False, False, set(), set(), None), 15), left())
     made = lambda: migs_of(other) - before[1]
     told = {mig: peer(other, {"op": "migration", "mig": int(mig)}).get("result", {}).get("outcome") for mig in made()}
@@ -3430,9 +3441,11 @@ def arrival_killed_route():
     migration reads as aborted."""
     n, ip = "ft-killed-route", A.ips.split("-")[1].rsplit(".", 1)[0] + ".202"
     scenario_vms.add(n)
+    earlier = arrivals(B)
     s, mig, gw, gen = arrival_with_peer_route(n, ip)
     lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
     pid = json.load(open(lock))["pid"]
+    mine = arrivals(B) - earlier
     # Its load failed; it waits for the preloaded pages.
     time.sleep(2)
     check("arrival killed route: the route via the peer stays while it waits", f"via {gw}" in peer_route(ip), peer_route(ip))
@@ -3444,6 +3457,7 @@ def arrival_killed_route():
     check("arrival killed route: aborted", st["outcome"] == "aborted", st)
     check("arrival killed route: the route via the peer is put back", f"via {gw}" in peer_route(ip), (peer_route(ip), addr(B, ip)))
     forget_peer_route(ip, gen)
+    sweep_arrivals(B, mine)
 
 
 def rootfs_link(d, template):
@@ -9761,6 +9775,7 @@ def log_cap():
     # arrival's tail (held packets, route) takes, so the pad never lands before publication matters.
     m = "ft-logcap-moved"
     remove_logs(os.path.join(B.run, "vms"), m)
+    earlier = arrivals(B)
     ok(run(A, m))
     ok(migrate(A, m, B))
     moved = os.path.join(B.run, "vms", f"{m}.log")
@@ -9768,7 +9783,8 @@ def log_cap():
     # migrate can return before B publishes the arrival's log (renamed into NAME.logs/ as log): pad only once
     # it is there, its .incoming- file gone (the VM's own early messages may make NAME.logs/log before).
     vd_b = os.path.join(B.run, "vms")
-    published = lambda: os.path.exists(moved) and not any(f.startswith(".incoming-") for f in os.listdir(vd_b))
+    # Its own only: an earlier scenario's killed arrival leaves its log until a sweep.
+    published = lambda: os.path.exists(moved) and not arrivals(B) - earlier
     check("log cap: the arrival's log published", wait_for(published, 30), (moved, os.listdir(vd_b)))
     with open(moved, "a") as f:
         f.write("pad\n" * (2 << 20))
