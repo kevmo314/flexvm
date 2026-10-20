@@ -4475,14 +4475,21 @@ def kill_prepare():
         ip, pid, recorded = vms(A)[n]["ip"], vm_pid(A, n), migs()
         clear_gate(host, gate)
         clear_gate(A, "destroy_wait")
-        # Parked until the kill is seen waiting, however long that takes: both sides' preflight deadlines
-        # made long (`long_preflight`), so the target's gate outlasts them.
+        # Parked until the kill is seen waiting, however long that takes: both sides' preflight deadlines and
+        # the target's wait for its source after its answer made long (`long_preflight`), so the gates outlast them.
         with armed_fault(A, "destroy_wait", 600000), armed_fault(A, "long_preflight", 600000), \
                 armed_fault(B, "long_preflight", 600000), armed_fault(host, gate, 600000):
             moved, mt = background(lambda: migrate(A, n, B))
             check(f"{what}: the migration got to the gate", wait_for(lambda: reached(host, gate), 30), reached(host, gate))
             killed, kt = background(lambda: cli_json(A, "kill", n))
             check(f"{what}: the kill waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 30), reached(A, "destroy_wait"))
+            # Its arrival still there to give up, not gone on its own meanwhile.
+            lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
+            try:
+                arrival = json.load(open(lock))["pid"]
+            except (OSError, ValueError, KeyError):
+                arrival = None
+            check(f"{what}: the target's arrival is still alive once the kill waits", arrival is not None and alive(arrival), arrival)
             fault(host, gate, 0)
             mt.join()
             kt.join()

@@ -36,8 +36,9 @@ const INCOMING_WAIT: Duration = Duration::from_secs(30);
 const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_HEADER: u64 = 256 << 20;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Test fault `long_preflight`: both sides' preflight deadlines (`PREFLIGHT_TIMEOUT`, `listen::PREPARE_WAIT`) this
-/// long instead, so a test parked in the preflight (`incoming_gate`) lets it go when it is done, not against them.
+/// Test fault `long_preflight`: both sides' preflight deadlines (`PREFLIGHT_TIMEOUT`, `listen::PREPARE_WAIT`), and the
+/// target's wait for its source after answering it (`INCOMING_WAIT`), this long instead, so a test parked in the
+/// preflight (`incoming_gate`) or right after it (`leave_gate`) lets it go when it is done, not against them.
 pub const LONG_PREFLIGHT: Duration = Duration::from_secs(300);
 const HOLD_FENCE: Duration = Duration::from_millis(250);
 const HELD_STREAM: Duration = Duration::from_secs(2);
@@ -687,7 +688,11 @@ impl Proc {
         // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app; `attaches`: -i and -t too.
         let result = json!({"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true, "attaches": true});
         send_json(&mut w, &json!({"ok": true, "result": result}))?;
-        let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
+        let deadline = Instant::now() + match () {
+            _ if fault("short_incoming") => Duration::from_secs(2),
+            _ if fault("long_preflight") => LONG_PREFLIGHT,
+            _ => INCOMING_WAIT,
+        };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
         // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
