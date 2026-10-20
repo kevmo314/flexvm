@@ -491,6 +491,7 @@ impl Pager {
     fn prefetch_pass_with(&self, mut populate: impl FnMut(usize, usize, Option<&[u8]>) -> io::Result<usize>) -> bool {
         let pages = self.pages();
         let mut cut = false;
+        let mut scratch = Vec::with_capacity(PREFETCH_RUN * PAGE_SIZE);
         for (mut i, end) in self.chunks(self.working_set(0, 1), PREFETCH_RUN) {
             while i < end {
                 if self.quiesce.load(Ordering::SeqCst) {
@@ -513,7 +514,9 @@ impl Pager {
                     // Both prefault and the actual template read can wait on disk. Keep them outside the gate, and
                     // copy into our own buffer so eviction cannot make the install read the template again.
                     self.base.prefault(i, prepared_end - i);
-                    self.base.pages(i, prepared_end - i).to_vec()
+                    scratch.clear();
+                    scratch.extend_from_slice(self.base.pages(i, prepared_end - i));
+                    scratch.as_slice()
                 });
                 let _prefetch = self.prefetch_gate.lock().unwrap();
                 if self.quiesce.load(Ordering::SeqCst) {

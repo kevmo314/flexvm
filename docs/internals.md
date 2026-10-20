@@ -193,6 +193,11 @@ settle before exporting page states, so they match the saved vmstate. If the
 migration source stays unreachable for 10 s (fetches reconnect with backoff
 until then), the target kills the VM and reports it `failed`.
 
+Each successful copy marks its dirty range a bitmap word at a time before
+publishing any of its pages as PRESENT; EEXIST marks its one page too.
+Working-set prefetch reuses one scratch buffer per pass, preparing template
+bytes before taking the prefetch gate so cold reads cannot hold up export.
+
 One thread reads uffd events, but it never waits for the network or disk:
 a fault on a REMOTE page claims a 64-page run and queues it for one of 8
 fetcher threads (each with its own connection to the source), so faults on
@@ -380,7 +385,10 @@ VM that is busy, paused or suspended.
   a `run`. By default it keeps its name and address. A restore refuses an
   address a peer is using; `--ip auto` picks a new one, which also makes a
   restore a fork of a running VM. `--paused` holds the restored VM paused
-  until `unpause`; its memory is still paged in meanwhile.
+  until `unpause`; its memory is still paged in meanwhile. Page files cache
+  their buffered/direct mode per descriptor; an EINVAL read fallback disables
+  direct I/O and publishes buffered mode for later reads and cache eviction,
+  avoiding an `F_GETFL` on each background-read segment.
 - **stop** (SIGTERM) checkpoints into `STATE/suspended/NAME` (`/var/lib/flexvm` by
   default; it must be on disk, not tmpfs). Then stop kills Firecracker, so the VM costs no memory. Memory is
   released only once the checkpoint is durable. The pager is stopped before

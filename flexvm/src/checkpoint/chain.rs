@@ -19,7 +19,10 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 pub const MAX_CHAIN: usize = 64;
@@ -283,11 +286,19 @@ pub(super) fn flatten(layers: &[Vec<Run>], files: Vec<File>, sums: Vec<Vec<u32>>
         }
         states.push((first, count, if kind == DATA { REMOTE } else { crate::uffd::ZERO }));
     }
+    let files = files
+        .into_iter()
+        .map(|f| {
+            let cached = AtomicBool::new(buffered(&f));
+            (f, cached)
+        })
+        .collect();
     (states, PageFile { files, runs: data, sums })
 }
 
 pub struct PageFile {
-    files: Vec<File>,
+    /// Dedicated page descriptors and whether they use the page cache; only EINVAL fallback changes the mode.
+    files: Vec<(File, AtomicBool)>,
     /// DATA runs: (first guest page, pages, file, index of the first in it).
     runs: Vec<(u64, u64, usize, u64)>,
     sums: Vec<Vec<u32>>,
@@ -311,9 +322,10 @@ impl PageFile {
                 _ => return Err(corrupt(format!("page {p} is not stored"))),
             };
             let (k, d) = (((first + count - p) as usize).min(n - done), d + p - first);
-            let (out, off, file) = (&mut buf[done * PAGE_SIZE..(done + k) * PAGE_SIZE], d * PAGE_SIZE as u64, &self.files[f]);
-            read_with_fallback(file, || file.read_exact_at(out, off)).map_err(|e| corrupt(format!("read at {off}: {e}")))?;
-            if drop_cache && buffered(file) {
+            let (file, cached) = &self.files[f];
+            let (out, off) = (&mut buf[done * PAGE_SIZE..(done + k) * PAGE_SIZE], d * PAGE_SIZE as u64);
+            read_with_fallback(file, cached, || file.read_exact_at(out, off)).map_err(|e| corrupt(format!("read at {off}: {e}")))?;
+            if drop_cache && cached.load(Ordering::Relaxed) {
                 unsafe { libc::posix_fadvise(file.as_raw_fd(), off as i64, out.len() as i64, libc::POSIX_FADV_DONTNEED) };
             }
             for (i, page) in out.chunks(PAGE_SIZE).enumerate() {
@@ -329,12 +341,12 @@ impl PageFile {
 
     /// Whether any file is read through the page cache (its filesystem refused O_DIRECT).
     pub fn buffered(&self) -> bool {
-        self.files.iter().any(buffered)
+        self.files.iter().any(|(_, cached)| cached.load(Ordering::Relaxed))
     }
 
     /// Evicts the files read through the page cache.
     pub fn drop_cache(&self) {
-        for f in self.files.iter().filter(|f| buffered(f)) {
+        for (f, _) in self.files.iter().filter(|(_, cached)| cached.load(Ordering::Relaxed)) {
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         }
     }
@@ -347,10 +359,11 @@ fn buffered(file: &File) -> bool {
 
 /// EINVAL can be reported on I/O even if enabling O_DIRECT succeeded (e.g. tmpfs).
 /// Disabling it on the shared descriptor also makes subsequent readers use the fallback.
-pub(super) fn read_with_fallback(file: &File, mut read: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+pub(super) fn read_with_fallback(file: &File, cached: &AtomicBool, mut read: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     match read() {
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
             direct(file, false)?;
+            cached.store(true, Ordering::Relaxed);
             read()
         }
         r => r,
