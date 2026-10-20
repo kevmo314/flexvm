@@ -61,15 +61,19 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   reuse them. Ownership is never changed. A symlinked `STATE/images` works
   (its target is the cache). Each root filesystem's users are files in
   `rootfs/KEY.users/` (0700, files 0600), one per templates directory whose
-  generations use it, named by a hash of its canonical path and holding it,
-  written under the key's lock as a generation is published or reused. Once
+  generations use it, named by its device and inode and holding its path,
+  written under the key's lock when the state opens, before prune, and as a
+  generation is published or reused. Bind mount aliases use the same record;
+  a moved state refreshes its recorded path when opened. Once
   no generation here uses it, `rmi` and `image prune` drop this state's file
   and remove the entry if none is left. An entry older flexvm built has no
   `.users`: in a regular `STATE/images` it goes once no generation here uses
-  it; in a symlinked one it is kept (a pull reusing it marks it `legacy`)
-  until `image prune --force-shared` finds no generation here using it. That
-  also drops the files of templates directories that are gone (ENOENT or
-  ENOTDIR only; a moved state's too: it records itself again as it pulls).
+  it; in a symlinked one it is kept even with `--force-shared` until a state
+  using it opens or prunes and records it as `legacy` (one that no state
+  records once all have opened is used by none and may be removed by hand). Open all states sharing
+  an older cache before using `image prune --force-shared`: this drops `legacy`
+  and the records of templates directories that are gone (ENOENT or ENOTDIR
+  only), and removes entries with no remaining users.
   `image prune` also removes entries only a file of this state's, left by a
   crash before publication, names. A symlinked `images/rootfs` gets no records
   and nothing in it is removed.
@@ -101,8 +105,10 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   `/etc/flexvm/app.conf` (argv, env, workdir, uid/gid/groups resolved against
   the image's own `/etc/passwd` and `/etc/group`), an `/etc/hosts`, and an
   empty `/etc/resolv.conf` if the image has none (host.json's `dns` fills
-  it at `run`). `mkfs.ext4 -d` writes the read-only image. Built filesystems
-  are cached in `STATE/images/rootfs/` by image config digest, layer `diff_ids`,
+  it at `run`). `mkfs.ext4 -d` writes the read-only image; an image whose
+  root directory has ACLs or xattrs needs e2fsprogs 1.45.7 or newer to keep them
+  (older ones are refused for it; other images build with any). Built
+  filesystems are cached in `STATE/images/rootfs/` by image config digest, layer `diff_ids`,
   flexvm-init and overrides, and templates attach the cached file in place, so
   templates of one image share one copy in the page cache (it is never rewritten; `rmi`
   removes it once no state's generation uses it, as above; deleting it by hand breaks those

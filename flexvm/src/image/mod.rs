@@ -393,16 +393,46 @@ fn users_dir(pinned: &crate::host::Directory, cached: &Path, create: bool, legac
     Ok(Some(dir))
 }
 
-/// Records that the generations of the (canonical) templates directory `templates` use the cache
-/// entry `rootfs`, under the same key lock as removal: a file named by its `state_key` holding its
+/// Records that the generations of the templates directory `templates` use the cache
+/// entry `rootfs`, under the same key lock as removal: a file named by its (dev, ino) holding its
 /// path. An entry built before records were kept gets `LEGACY` too in a symlinked (shared) cache.
 pub fn note_rootfs(cache: &Path, rootfs: &Path, templates: &Path) -> Result<()> {
+    note(cache, rootfs, templates, false)
+}
+
+/// `note_rootfs` for a generation published already (a state opening, or prune): a missing or
+/// unfinished entry gets no record, and a key another holds (a build) is skipped, not waited for:
+/// that pull's publication records its own, and the next open or prune this one.
+pub(crate) fn note_published_rootfs(cache: &Path, rootfs: &Path, templates: &Path) -> Result<()> {
+    note(cache, rootfs, templates, true)
+}
+
+/// `existing`: as `note_published_rootfs`.
+fn note(cache: &Path, rootfs: &Path, templates: &Path, existing: bool) -> Result<()> {
     let Some(pinned) = rootfs_directory(cache, rootfs)? else { return Ok(()) };
     let cached = pinned.path.join(rootfs.file_name().unwrap());
-    let _lock = crate::host::lock_at(crate::host::host_locks()?, &key_lock(&pinned, &cached)?, libc::LOCK_EX)?;
+    let how = libc::LOCK_EX | if existing { libc::LOCK_NB } else { 0 };
+    let _lock = match crate::host::lock_at(crate::host::host_locks()?, &key_lock(&pinned, &cached)?, how) {
+        Err(e) if existing && e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        r => r?,
+    };
+    if existing && !entry_complete(&cached) {
+        return Ok(());
+    }
     let users = users_dir(&pinned, &cached, true, cache.is_symlink())?.unwrap();
-    crate::util::write_file_mode(&users.path, &crate::template::state_key(templates), templates.as_os_str().as_bytes(), true, 0o600)?;
+    let (key, path) = (rootfs_user_key(templates)?, templates.as_os_str().as_bytes());
+    // Each open records again: an unchanged record is neither rewritten nor synced.
+    if std::fs::read(users.path.join(&key)).ok().as_deref() == Some(path) {
+        return Ok(());
+    }
+    crate::util::write_file_mode(&users.path, &key, path, true, 0o600)?;
     Ok(sync_dir(&pinned.path)?)
+}
+
+/// Bind mounts and moved states keep the same record even when their canonical paths differ.
+pub(crate) fn rootfs_user_key(templates: &Path) -> std::io::Result<String> {
+    let meta = std::fs::metadata(templates)?;
+    Ok(format!("{}-{}", meta.dev(), meta.ino()))
 }
 
 /// The cache's `rootfs` directory, pinned and by its canonical path, unless it is a symlink (or
@@ -456,7 +486,7 @@ fn gone(record: &[u8]) -> bool {
 /// marker first, so a build that waits for the lock builds it again. The caller knows no generation
 /// of `templates` (canonical) uses it: its record goes, and the entry is kept while other records
 /// remain (or a legacy shared entry has none). `force` (`--force-shared`) drops `LEGACY` and the
-/// records of templates directories that are gone, and removes a legacy shared entry without records. Neither lock is waited for: a pull holding
+/// records of templates directories that are gone. Unrecorded shared entries are always kept. Neither lock is waited for: a pull holding
 /// either means `Removal::InUse`.
 pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool) -> Result<Removal> {
     let Some(pinned) = rootfs_directory(cache, rootfs)? else { return Ok(Removal::Absent) };
@@ -466,12 +496,25 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool)
     let users = users_dir(&pinned, &cached, false, false)?;
     let mut kept = false;
     if let Some(dir) = &users {
-        let me = crate::template::state_key(templates);
+        let me = rootfs_user_key(templates)?;
+        let old = crate::template::state_key(templates);
         for entry in std::fs::read_dir(&dir.path)? {
             let name = entry?.file_name();
             let path = dir.path.join(&name);
             // A record's temporary (`write_file_mode`), the record of these templates, or one `force` forgets.
-            let drop = name.as_bytes().starts_with(b".") || name == me.as_str() || force && (name == LEGACY || std::fs::read(&path).is_ok_and(|p| gone(&p)));
+            // Also drop path-keyed records from older versions, including bind mount aliases.
+            let record = std::fs::read(&path);
+            let names =
+                |want: bool| record.as_ref().is_ok_and(|p| rootfs_user_key(Path::new(std::ffi::OsStr::from_bytes(p))).is_ok_and(|key| (key == me) == want));
+            let ours = names(true);
+            // Named by this directory's (dev, ino) but naming another live directory: a device renumbered
+            // since (a reboot) gave another state's record this key. Its own, never this one's to drop.
+            let theirs = names(false);
+            let drop = name.as_bytes().starts_with(b".")
+                || name == me.as_str() && !theirs
+                || name == old.as_str()
+                || ours
+                || force && (name == LEGACY || record.is_ok_and(|p| gone(&p)));
             if drop {
                 match std::fs::remove_file(&path) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -500,8 +543,15 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool)
     if kept {
         return Ok(Removal::Absent);
     }
-    if users.is_none() && cache.is_symlink() && !force {
-        // A legacy shared entry may have users that have not pulled with records yet.
+    if users.is_none() && cache.is_symlink() {
+        // The old key cannot be reused by a pull, and other states may not have opened yet.
+        if force {
+            // Entries no state uses are never recorded: once every state sharing the cache has opened, they can go by hand.
+            crate::log!(
+                "image: kept {}: no state has recorded using it (built before records were kept); every state sharing the cache records its own as it opens, and one still unrecorded after that is used by none of them and may be removed by hand",
+                rootfs.display()
+            );
+        }
         return Ok(Removal::Absent);
     }
     // Kept while a pull builds a template of it (`Cached::reserved`).
@@ -516,7 +566,9 @@ pub fn remove_rootfs(cache: &Path, rootfs: &Path, templates: &Path, force: bool)
         }
     }
     if users.is_some() {
-        std::fs::remove_dir(cached.with_extension("users"))?;
+        if let Err(e) = std::fs::remove_dir(cached.with_extension("users")) {
+            crate::log!("image: removing {}: {e}", cached.with_extension("users").display());
+        }
     }
     sync_dir(&pinned.path)?;
     Ok(Removal::Removed)
@@ -971,8 +1023,39 @@ fn ext4_extra_kib(dir: &Path) -> Result<u64> {
     Ok(kib)
 }
 
+/// `mke2fs -V` prints its version on stderr; older versions omit root xattrs with `-d`.
+/// A missing part reads as 0 (`1.47`) and a suffix is ignored (`1.47.1-rc1`).
+fn root_xattrs_supported(version: &str) -> bool {
+    let mut parts = version.split_whitespace().nth(1).unwrap_or("").split('.');
+    let mut number = || parts.next().map(|p| p.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok());
+    match (number(), number(), number()) {
+        (Some(Some(major)), Some(Some(minor)), patch) => (major, minor, patch.flatten().unwrap_or(0)) >= (1, 45, 7),
+        _ => false,
+    }
+}
+
+/// Whether the image root `dir` has extended attributes (ACLs among them) of its own: the host's
+/// SELinux label is not the image's.
+fn root_xattrs(dir: &Path) -> Result<bool> {
+    let path = cpath(dir)?;
+    let mut names = vec![0u8; 64 << 10];
+    let n = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::ENOTSUP) { Ok(false) } else { Err(e.into()) };
+    }
+    Ok(names[..n as usize].split(|&b| b == 0).any(|name| !name.is_empty() && name != b"security.selinux"))
+}
+
 /// Sized to content and 256-byte inodes plus headroom, rounded up to 2 MiB as virtio-pmem requires.
 fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
+    // Only an image whose root has them needs it: older hosts (RHEL 8, Ubuntu 20.04) build the rest.
+    if root_xattrs(dir)? {
+        let version = run_until(Command::new("mkfs.ext4").arg("-V"), interrupted)?;
+        if !version.status.success() || !root_xattrs_supported(&String::from_utf8_lossy(&version.stderr)) {
+            bail!("this image's root directory has ACLs or xattrs: mkfs.ext4 from e2fsprogs 1.45.7 or newer is required to keep them");
+        }
+    }
     let du = run_until(Command::new("du").arg("-sk").arg(dir), interrupted)?;
     let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
     let kib = kib + ext4_extra_kib(dir)?;
@@ -1203,6 +1286,44 @@ mod tests {
         }
         // 24 bytes for dot entries, 264 per long name, doubled for headroom.
         assert_eq!(ext4_extra_kib(&dir).unwrap(), 52);
+    }
+
+    #[test]
+    fn mkfs_requires_root_xattr_support() {
+        for (version, supported) in [("1.44.5", false), ("1.45.6", false), ("1.45.7", true), ("1.46.0", true), ("1.47.2", true), ("2.0.0", true)] {
+            assert_eq!(root_xattrs_supported(&format!("mke2fs {version} (date)\nUsing EXT2FS Library version {version}")), supported);
+        }
+        assert!(!root_xattrs_supported("unknown version"));
+        assert!(root_xattrs_supported("mke2fs 1.47.1-rc1 (date)"));
+        assert!(root_xattrs_supported("mke2fs 1.46 (date)"));
+        assert!(!root_xattrs_supported("mke2fs 1.43 (date)"));
+        assert!(!root_xattrs_supported("mke2fs 1 (date)"));
+    }
+
+    #[test]
+    fn rootfs_records_use_directory_identity_and_drop_old_aliases() {
+        let root = crate::test_util::TempDir::new("image-user-identity");
+        let templates = root.join("templates");
+        let alias = root.join("alias");
+        std::fs::create_dir(&templates).unwrap();
+        symlink(&templates, &alias).unwrap();
+        let cache = root.join("images");
+        std::fs::create_dir_all(cache.join("rootfs")).unwrap();
+        let rootfs = cache.join("rootfs/k.ext4");
+        for ext in ["ext4", "ok", "conf"] {
+            std::fs::write(rootfs.with_extension(ext), b"image").unwrap();
+        }
+        note_rootfs(&cache, &rootfs, &templates).unwrap();
+        note_rootfs(&cache, &rootfs, &alias).unwrap();
+        let users = rootfs.with_extension("users");
+        assert_eq!(rootfs_user_key(&templates).unwrap(), rootfs_user_key(&alias).unwrap());
+        assert_eq!(std::fs::read_dir(&users).unwrap().count(), 1);
+        // Older versions could write multiple path-keyed records for one directory.
+        for path in [&templates, &alias] {
+            std::fs::write(users.join(crate::template::state_key(path)), path.as_os_str().as_bytes()).unwrap();
+        }
+        assert_eq!(remove_rootfs(&cache, &rootfs, &templates, false).unwrap(), Removal::Removed);
+        assert!(!rootfs.exists() && !users.exists());
     }
 
     #[test]
@@ -2028,6 +2149,8 @@ mod tests {
     #[test]
     fn missing_rootfs_removes_abandoned_users_directories() {
         let root = crate::test_util::TempDir::new("rmi-users");
+        let templates = root.join("templates");
+        std::fs::create_dir(&templates).unwrap();
         let images = root.join("images");
         let dir = images.join("rootfs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2039,15 +2162,15 @@ mod tests {
         assert_eq!(recorded_rootfs(&images, false).unwrap(), [cached.clone()]);
         let pinned = crate::host::Directory::open(&dir).unwrap();
         let key = crate::host::lock_at(crate::host::host_locks().unwrap(), &key_lock(&pinned, &cached).unwrap(), libc::LOCK_EX).unwrap();
-        assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::InUse);
+        assert_eq!(remove_rootfs(&images, &cached, &templates, false).unwrap(), Removal::InUse);
         assert!(dir.join("k.users").exists() && dir.join("k.newusers").exists());
         drop(key);
-        assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &cached, &templates, false).unwrap(), Removal::Absent);
         assert!(recorded_rootfs(&images, false).unwrap().is_empty());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::create_dir(dir.join("k.newusers")).unwrap();
         assert_eq!(recorded_rootfs(&images, false).unwrap(), [cached.clone()]);
-        assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &cached, &templates, false).unwrap(), Removal::Absent);
         assert!(!dir.join("k.newusers").exists());
         // Beside a present entry, an unfinished one is no record: such an entry stays as unrecorded.
         std::fs::create_dir(dir.join("k.newusers")).unwrap();
@@ -2056,7 +2179,7 @@ mod tests {
         std::fs::remove_file(&cached).unwrap();
         std::fs::create_dir(dir.join("k.users")).unwrap();
         std::fs::write(dir.join("k.users/other"), b"/other/templates").unwrap();
-        assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &cached, &templates, false).unwrap(), Removal::Absent);
         assert!(dir.join("k.users/other").exists());
         assert!(!dir.join("k.newusers").exists());
     }
@@ -2064,6 +2187,8 @@ mod tests {
     #[test]
     fn removed_rootfs_goes_marker_first_and_only_from_the_cache() {
         let root = crate::test_util::TempDir::new("rmi-rootfs");
+        let templates = root.join("templates");
+        std::fs::create_dir(&templates).unwrap();
         let dir = root.join("images/rootfs");
         std::fs::create_dir_all(&dir).unwrap();
         for ext in ["ext4", "conf", "ok"] {
@@ -2071,23 +2196,23 @@ mod tests {
         }
         std::fs::write(root.join("k.ext4"), "elsewhere").unwrap();
         let images = root.join("images");
-        assert_eq!(remove_rootfs(&images, &root.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::Absent);
-        assert_eq!(remove_rootfs(&images, &dir.join("k.conf"), Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &root.join("k.ext4"), &templates, false).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.conf"), &templates, false).unwrap(), Removal::Absent);
         assert!(root.join("k.ext4").exists() && entry_complete(&dir.join("k.ext4")));
         // A pull building a template of it holds it until it is published.
         let building = cached_rootfs(&dir.join("k.ext4"), never, sync_dir).unwrap();
         assert_eq!(building.conf, "conf");
-        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::InUse);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), &templates, false).unwrap(), Removal::InUse);
         assert!(entry_complete(&dir.join("k.ext4")));
         drop(building);
         // One checking or building it holds its key's lock: not waited for.
         let pinned = crate::host::Directory::open(&dir).unwrap();
         let key = crate::host::lock_at(crate::host::host_locks().unwrap(), &key_lock(&pinned, &pinned.path.join("k.ext4")).unwrap(), libc::LOCK_EX).unwrap();
-        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::InUse);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), &templates, false).unwrap(), Removal::InUse);
         drop(key);
-        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::Removed);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), &templates, false).unwrap(), Removal::Removed);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), Path::new("/test"), false).unwrap(), Removal::Absent);
+        assert_eq!(remove_rootfs(&images, &dir.join("k.ext4"), &templates, false).unwrap(), Removal::Absent);
     }
 
     /// #631: an rmi between the cache check and reading `.conf` (or reserving) made the pull fail.
@@ -2109,15 +2234,18 @@ mod tests {
             }
         }
         let root = crate::test_util::TempDir::new("rmi-pull-race");
+        let templates = root.join("templates");
+        std::fs::create_dir(&templates).unwrap();
         let (images, cached) = (root.join("images"), root.join("images/rootfs/k.ext4"));
         std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
         let (stop, tries, removed) = (Stop(Arc::new(AtomicBool::new(false))), Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let remover = {
             let (stop, tries, removed, images, cached) = (stop.0.clone(), tries.clone(), removed.clone(), images.clone(), cached.clone());
+            let templates = templates.clone();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let start = Instant::now();
-                    if remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap() == Removal::Removed {
+                    if remove_rootfs(&images, &cached, &templates, false).unwrap() == Removal::Removed {
                         removed.fetch_add(1, Ordering::SeqCst);
                     }
                     tries.fetch_add(1, Ordering::SeqCst);
@@ -2130,10 +2258,11 @@ mod tests {
         };
         let pulls = {
             let (tries, removed, images) = (tries.clone(), removed.clone(), images.clone());
+            let templates = templates.clone();
             std::thread::spawn(move || {
                 // Called under the pull's key lock, after its cache check (and in a publication): refused there.
                 let sync = |dir: &Path| {
-                    assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::InUse);
+                    assert_eq!(remove_rootfs(&images, &cached, &templates, false).unwrap(), Removal::InUse);
                     sync_dir(dir)
                 };
                 // A time budget (a slow disk slows the remover tenfold), but past one removal at least.
@@ -2142,7 +2271,7 @@ mod tests {
                 while round < 300 && (Instant::now() < until || removed.load(Ordering::SeqCst) == 0) {
                     let got = cached_rootfs(&cached, build("built"), sync).unwrap();
                     assert_eq!(got.conf, "built config");
-                    assert_eq!(remove_rootfs(&images, &cached, Path::new("/test"), false).unwrap(), Removal::InUse);
+                    assert_eq!(remove_rootfs(&images, &cached, &templates, false).unwrap(), Removal::InUse);
                     assert_eq!(read(&got.path), "built image");
                     drop(got);
                     // Every other round, a removal tried wholly after the entry is let go.
