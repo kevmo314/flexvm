@@ -9386,6 +9386,96 @@ def run_status():
     ok(set_standby(A, args.template, 0))
 
 
+def gated_app(n, status):
+    """`run -d` of VM `n` whose app exits with `status` once /tmp/go is there (each run's own: none at its start)."""
+    scenario_vms.add(n)
+    app = json.dumps(["sh", "-c", f"while [ ! -e /tmp/go ]; do sleep 0.05; done; exit {status}"])
+    ok(cli_json(A, "run", "--name", n, "-d", "--entrypoint", app, args.template))
+
+
+def app_ends(n, status):
+    code, out = sh(A, n, "touch /tmp/go")
+    check(f"{n}: told to exit", code == 0, out)
+    return wait_for(lambda: vms(A).get(n, {}).get("state") == "exited" and vms(A)[n].get("status") == status, 30)
+
+
+def concurrent_start():
+    """#1151: two `flexvm start NAME` at once, of a stopped VM and of an exited one, both succeed (the
+    loser's start is the winner's VM, once it runs), and the VM runs."""
+    n = "ft-conc-start"
+    gated_app(n, 3)
+    for how in ("stopped", "stopped again", "exited"):
+        if how == "exited":
+            check("concurrent start: its app exited", app_ends(n, 3), vms(A).get(n))
+        else:
+            code, out, err = cli(A, "stop", n)
+            check(f"concurrent start: {how}", code == 0 and vms(A).get(n, {}).get("state") == "suspended", (code, err, vms(A).get(n)))
+        ps = [spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        got = [(p.returncode, out, err[-300:]) for p in ps for out, err in [communicate_process(p, 120)]]
+        check(f"concurrent start of the {how} vm: both succeed", all(code == 0 for code, _, _ in got), got)
+        check(f"concurrent start of the {how} vm: it runs", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+    # A start that comes while the winner's resume has bound its socket but has no VM yet (held at
+    # `resume_unmarked_gate`) is answered busy, "starting": it waits for that VM, not fails.
+    code, out, err = cli(A, "stop", n)
+    check("concurrent start: stopped once more", code == 0 and vms(A).get(n, {}).get("state") == "suspended", (code, err, vms(A).get(n)))
+    clear_gate(A, "resume_unmarked_gate")
+    fault(A, "resume_unmarked_gate", 600000)
+    try:
+        first = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("concurrent start: the winner's resume is held", wait_for(lambda: reached(A, "resume_unmarked_gate"), 60), reached(A, "resume_unmarked_gate"))
+        second = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(2)
+        check("concurrent start: the loser waits for the held winner", second.poll() is None, (second.poll(), second.stderr.read()[-300:] if second.poll() is not None else ""))
+    finally:
+        release(A, "resume_unmarked_gate")
+    got = [(p.returncode, out, err[-300:]) for p in (first, second) for out, err in [communicate_process(p, 120)]]
+    check("concurrent start of a vm held starting: both succeed", all(code == 0 for code, _, _ in got), got)
+    check("concurrent start of a vm held starting: it runs", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+
+
+def kill_rerun_race():
+    """#1151: `kill` and `rm` of an exited VM that a `start` is running again: while the rerun holds the
+    name (stalled before its VM runs) both are refused, and the exited record the rerun goes by stays
+    (it is removed only once the VM runs); the rerun then runs as recorded."""
+    n = "ft-kill-rerun"
+    gated_app(n, 5)
+    check("kill rerun: exited", app_ends(n, 5), vms(A).get(n))
+    record = os.path.join(A.run, "vms", f"{n}.exited")
+    clear_gate(A, "start_stall")
+    with armed_fault(A, "start_stall", 10000):
+        p = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("kill rerun: the rerun holds the name, stalled", wait_for(lambda: reached(A, "start_stall"), 30), reached(A, "start_stall"))
+        code, out, err = cli(A, "kill", n)
+        check("kill rerun: kill is refused, it is starting", code != 0 and "is starting" in err, (code, out, err))
+        check("kill rerun: its exited record stays", os.path.exists(record))
+        code, out, err = cli(A, "rm", n)
+        check("kill rerun: rm is refused, it is running", code != 0 and "is running" in err, (code, out, err))
+        check("kill rerun: its exited record still stays", os.path.exists(record))
+    out, err = communicate_process(p, 120)
+    check("kill rerun: the rerun runs", p.returncode == 0 and vms(A).get(n, {}).get("state") == "running", (p.returncode, err[-300:], vms(A).get(n)))
+    check("kill rerun: as recorded (its app, its status)", app_ends(n, 5), vms(A).get(n))
+    code, out, err = cli(A, "rm", n)
+    check("kill rerun: rm removes it then", code == 0 and n not in vms(A), (code, err, vms(A).get(n)))
+
+
+def stop_self_exit():
+    """#1151: `stop` of a VM whose app exits on its own meanwhile (the VM ending, its SIGTERM takes no
+    suspend) is done: the VM is exited, with its app's status, and `start` runs it again."""
+    n = "ft-stop-exit"
+    gated_app(n, 4)
+    pid = vm_pid(A, n)
+    clear_gate(A, "app_exit_stall")
+    with armed_fault(A, "app_exit_stall", 30000):
+        code, out = sh(A, n, "touch /tmp/go")
+        check("stop self exit: told to exit", code == 0, out)
+        check("stop self exit: ending, stalled", wait_for(lambda: pid in reached(A, "app_exit_stall"), 30), reached(A, "app_exit_stall"))
+        code, out, err = cli(A, "stop", n)
+    check("stop self exit: stop succeeds", code == 0 and out == n, (code, out, err))
+    check("stop self exit: exited, with the app's status", vms(A).get(n, {}).get("state") == "exited" and vms(A)[n].get("status") == 4, vms(A).get(n))
+    code, out, err = cli(A, "start", n)
+    check("stop self exit: start runs it again", code == 0 and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), (code, err, vms(A).get(n)))
+
+
 def unread_output():
     """`run IMAGE CMD` whose stdout is a pipe nobody reads (output stuck) still
     ends at once on SIGINT, with status 130: printing never holds it up."""
@@ -11436,7 +11526,7 @@ def isolate(scenario):
 SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
-    run_status=run_status,
+    run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit,
     terminal=terminal,
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,
