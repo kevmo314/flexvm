@@ -586,10 +586,8 @@ fn refill_once(host: &Host, template: &str, cooldown: bool, ready_wait: bool) ->
     if !ready_wait {
         return failed.map_or(Ok(started), Err);
     }
-    for r in ready {
-        if let Err(e) = wait_ready(r, READY_TIMEOUT) {
-            failed.get_or_insert(e);
-        }
+    if let Err(e) = wait_readies(ready, READY_TIMEOUT) {
+        failed.get_or_insert(e);
     }
     match failed {
         Some(e) => Err(e),
@@ -605,10 +603,21 @@ fn refill_locked(lock: std::io::Result<Flock>, wait: bool) -> Result<Option<Floc
     }
 }
 
-/// A started standby's readiness reply, within `timeout` of now: counted from when it is
-/// read, not from its start, as replies are read only once every start in the round is done.
-fn wait_ready(r: BufReader<UnixStream>, timeout: Duration) -> Result<()> {
-    let mut r = crate::util::By { s: r, at: Instant::now() + timeout };
+/// All replies share one deadline after the launch phase, including after a failed start; a reply
+/// already sent still counts once it has passed, as with a deadline of its own.
+fn wait_readies(ready: Vec<BufReader<UnixStream>>, timeout: Duration) -> Result<()> {
+    let by = Instant::now() + timeout;
+    let mut failed = None;
+    for r in ready {
+        if let Err(e) = wait_ready(r, by.max(Instant::now() + Duration::from_millis(1))) {
+            failed.get_or_insert(e);
+        }
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+fn wait_ready(r: BufReader<UnixStream>, by: Instant) -> Result<()> {
+    let mut r = crate::util::By { s: r, at: by };
     match crate::util::recv_json(&mut r)? {
         None => Err("a standby vm failed to start (see its log)".into()),
         Some(reply) if reply["ok"] != json!(true) => Err(format!("a standby vm failed to start: {}", reply["error"]).into()),
@@ -1893,17 +1902,37 @@ mod tests {
     }
 
     #[test]
+    fn refill_readiness_shares_one_deadline() {
+        let (ready, _writers): (Vec<_>, Vec<_>) = (0..8)
+            .map(|_| {
+                let (r, w) = UnixStream::pair().unwrap();
+                (BufReader::new(r), w)
+            })
+            .unzip();
+        let start = Instant::now();
+        let timeout = Duration::from_millis(100);
+        let error = wait_readies(ready, timeout).unwrap_err();
+        assert!(error.to_string().contains("deadline passed"), "{error}");
+        assert!(start.elapsed() >= timeout);
+        assert!(start.elapsed() < Duration::from_millis(600), "each child got a fresh deadline");
+        // Past the shared deadline, a reply already sent is still read: only a stalled child fails.
+        let (sent, mut w) = UnixStream::pair().unwrap();
+        send_json(&mut w, &json!({"ok": true, "result": {}})).unwrap();
+        wait_readies(vec![BufReader::new(sent)], Duration::ZERO).unwrap();
+    }
+
+    #[test]
     fn a_readiness_reply_queued_long_before_it_is_read_still_counts() {
         // As for the first of many standbys, whose reply waits while the others start.
         let (r, mut w) = UnixStream::pair().unwrap();
         send_json(&mut w, &json!({"ok": true, "result": {}})).unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        wait_ready(BufReader::new(r), Duration::from_millis(100)).unwrap();
-        // A child that never replies still fails within its timeout, from when it is read.
+        wait_ready(BufReader::new(r), Instant::now() + Duration::from_millis(100)).unwrap();
+        // A child that never replies still fails within its timeout, from the end of the launch phase.
         let (r, _w) = UnixStream::pair().unwrap();
         let start = Instant::now();
         let timeout = Duration::from_millis(100);
-        assert!(wait_ready(BufReader::new(r), timeout).unwrap_err().to_string().contains("deadline passed"));
+        assert!(wait_ready(BufReader::new(r), start + timeout).unwrap_err().to_string().contains("deadline passed"));
         let elapsed = start.elapsed();
         assert!(elapsed >= timeout, "readiness timed out early: {elapsed:?}");
         assert!(elapsed < timeout + Duration::from_secs(5), "readiness missed its deadline: {elapsed:?}");
@@ -2008,7 +2037,7 @@ mod tests {
         drop(child);
         locked.unwrap();
         assert!(!r.buffer().is_empty());
-        wait_ready(r, Duration::from_millis(100)).unwrap();
+        wait_ready(r, Instant::now() + Duration::from_millis(100)).unwrap();
     }
 
     #[test]

@@ -290,8 +290,9 @@ target's reply to them.
    generation records SHA-256 digests of its files and of its metadata
    (`Meta::digests`, at its build or its receipt; a received one is marked
    `received`), and checkpoints copy them into their manifest
-   (`template_digests`). A restore onto a received generation needs the
-   checkpoint's to match: one with none (v0.1.0's, or of a template v0.1.0
+   (`template_digests`). A build computes component hashes and SHA-256 of
+   vmstate, memory and rootfs in one pass per file. A restore onto a received
+   generation needs the checkpoint's to match: one with none (v0.1.0's, or of a template v0.1.0
    built) restores only onto a generation built here. A target answering that
    it has a received copy sends its digests,
    and the source refuses one that differs from its own; it then sends its
@@ -341,9 +342,15 @@ target's reply to them.
    preloaded pages while Firecracker parses the state. Only once every check
    that can still abort has passed (the source's page server answers, the
    pager is healthy, the name is registered) does it record the migration
-   committed, and only then resume the VM: a VM that ran on the target is
-   never handed back to the source. A source that is gone, or too slow (one
-   30 s deadline for everything it sends after the pause), leaves nothing
+   committed, and only then resume the VM. Committed is not released: the
+   source keeps its paused copy until the target has all its memory and
+   records release. If the target process dies before release, its record
+   becomes aborted once its Firecrackers are dead, and the source resumes
+   from the pause. External side effects made on the target before release
+   can repeat after this rollback. After release, the source discards its
+   copy; a target failure no longer rolls back to it. A source that is gone,
+   or too slow (one 30 s deadline for everything it sends after the pause),
+   leaves nothing
    behind on the target. Once it answered, it takes in the packets the
    source held and only then announces the VM.
 
@@ -981,7 +988,9 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   lock and snapshot live beside the refill lock, outside the removable pool,
   and work without a listener. Each elected ranker removes its template's
   abandoned snapshot temporary files under the rank lock before publishing.
-  Commands and refills still scan live records.
+  Commands and refills still scan live records. A refill waits for readiness
+  against one 60 s deadline set after all its starts, even if a start failed;
+  stalled children do not each add another minute holding the refill locks.
 - **Generations.** `flexvm pull` publishes each build as an immutable
   `templates/.gen/<content id>/` and points `templates/NAME` at it with one
   atomic symlink swap, all through the templates directory as opened and

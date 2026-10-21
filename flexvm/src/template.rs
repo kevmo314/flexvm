@@ -381,10 +381,20 @@ impl Meta {
     }
 
     fn identify(&mut self, paths: &Paths, dir: &Path) -> Result<()> {
-        for (name, path) in self.files(paths, dir) {
-            self.components.insert(name.into(), hash_file(&path)?);
+        let mut digests = [String::new(), String::new(), String::new()];
+        for (i, (name, path)) in self.files(paths, dir).into_iter().enumerate() {
+            let component = if i < digests.len() {
+                let file = File::open(&path).map_err(|e| format!("template component {}: {e}", path.display()))?;
+                let (component, digest) = hash_and_digest(&file, &path)?;
+                digests[i] = digest;
+                component
+            } else {
+                hash_file(&path)?
+            };
+            self.components.insert(name.into(), component);
         }
         self.id = content_id(&self.components, self.image.as_ref());
+        self.digests = Some(digests_of(self, digests)?);
         Ok(())
     }
 
@@ -1888,7 +1898,6 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
         received: false,
     };
     meta.identify(paths, dir)?;
-    meta.digests = Some(digests(&meta, &dir.join("vmstate"), &dir.join("mem"), &meta.rootfs)?);
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     let _ = std::fs::remove_file(dir.join("wset"));
     interrupted()?;
@@ -2362,6 +2371,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn identify_hashes_and_digests_match_separate_passes() {
+        let mut f = Fixture::new();
+        let mem = File::create(f.dir.join("mem")).unwrap();
+        mem.set_len((4 * PAGE_SIZE + 17) as u64).unwrap();
+        mem.write_all_at(b"memory", PAGE_SIZE as u64).unwrap();
+        mem.write_all_at(b"tail", (4 * PAGE_SIZE + 13) as u64).unwrap();
+        f.meta.image = Some(image("sha256:a", "arg /x\n"));
+        f.meta.identify(&f.paths, &f.dir).unwrap();
+        let mut components = BTreeMap::new();
+        for (name, path) in f.meta.files(&f.paths, &f.dir) {
+            let expected = hash_file(&path).unwrap();
+            assert_eq!(f.meta.components[name].hash, expected.hash);
+            assert_eq!(f.meta.components[name].metadata, expected.metadata);
+            components.insert(name.into(), expected);
+        }
+        assert_eq!(f.meta.id, content_id(&components, f.meta.image.as_ref()));
+        assert_eq!(f.meta.digests.as_ref().unwrap(), &digests(&f.meta, &f.dir.join("vmstate"), &f.dir.join("mem"), &f.meta.rootfs).unwrap());
+    }
+
+    #[test]
     fn streaming_hash_reuses_its_page_and_clears_holes() {
         let len = 5 * PAGE_SIZE + 37;
         let mut bytes = vec![0; len];
@@ -2471,6 +2500,7 @@ pub(crate) mod tests {
                 std::fs::write(path, name.as_bytes()).unwrap();
             }
             meta.identify(&paths, &dir).unwrap();
+            meta.digests = None; // Legacy generations have none.
             Self { paths, dir, meta }
         }
 
