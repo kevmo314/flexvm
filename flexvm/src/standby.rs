@@ -1146,7 +1146,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     // Separate netlink preparation from the generation fence (which can wait
     // for the host lock). Neither belongs to the route replacement below.
     t.mark("neighbour");
-    let still = host.fence(claim.ip, claim.gen).map_err(|e| not_run(e, false))?;
+    let still = host.fence(claim.ip, claim.gen).map_err(|e| not_run(e, want.is_none()))?;
     let paused = p.standby.lock().unwrap().take().ok_or_else(|| not_run("standby vm gone".into(), true))?;
     let vm = resume(paused, name, claim.ip, index, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
         let e = format!("resuming a standby vm failed{}: {e}", if ran { ", and it may have run" } else { "" }).into();

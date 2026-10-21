@@ -60,7 +60,7 @@ p.add_argument("--image-cache", help="keep the pulled image here as an OCI layou
 # copy-on-write exactness, growth and a checkpoint during a resize (on a template with little
 # pre-plugged), held packets and devices, signals, standby VMs, resume failures, admission, the
 # exit statuses of foreground runs and image apps' logs.
-FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background exec_burst exec_stalled_cap exec_pause_grace exec_ckpt_stalled "
+FAULTS = ("basic route route_abort route_abandoned lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background exec_burst exec_stalled_cap exec_pause_grace exec_ckpt_stalled "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_rescue_fail cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare forged_vmstate slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded signals suspend_gen standby standby_vm_ips restore_ip_peer loan_start_retry spoof_filter killed_migrated "
@@ -617,6 +617,8 @@ def run_exec_ps():
     vms = A.ps(all=False)
     check("ps: listed running with its address", vms.get(vm, {}).get("state") == "running" and vms[vm]["ip"] == ip, vms)
     check("ps: image", vms[vm]["template"] == args.template, vms[vm])
+    # Its Firecracker's, found through the VM's PID namespace (#1174): a running guest has some.
+    check("ps: rss", vms[vm].get("rss_mib", 0) > 0, vms[vm])
     code, out, err = A.exec(vm, "echo to-stdout; echo to-stderr >&2; exit 7")
     check("exec: stdout", out == "to-stdout\n", repr(out))
     check("exec: stderr", err == "to-stderr\n", repr(err))

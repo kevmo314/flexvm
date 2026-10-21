@@ -3433,7 +3433,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     if fault("no_evict") {
         return;
     }
-    let rss = |e: &Entry| e.firecracker.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 20;
+    let rss = Entry::rss_mib;
     let mut vms = rank(host.entries(), rss);
     if !pressure {
         vms.retain(|e| e.starved);
