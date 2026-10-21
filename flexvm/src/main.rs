@@ -1444,39 +1444,81 @@ fn no_process(host: &Host, name: &str, none: &str) -> util::Error {
     }
 }
 
-/// Signals the instance registered under `name`, returning its pidfd and identity: None when
-/// there is none (no registry entry, or its process gone meanwhile). Anything else that keeps
-/// it from being signalled (a process this one cannot see or tell apart, a refused signal) is
-/// an error, never "not running". `check` refuses an entry before it is signalled (its error returned).
-fn signal_entry(host: &Host, name: &str, sig: i32, check: &dyn Fn(&host::Entry) -> Result<()>) -> Result<Option<(host::PidFd, host::Ident)>> {
-    let Ok(e) = host.entry(name) else { return Ok(None) };
-    check(&e)?;
-    let Some(fd) = host::PidFd::open(&e.ident)? else { return Ok(None) };
-    match fd.signal(sig) {
-        Ok(()) => Ok(Some((fd, e.ident))),
-        Err(_) if !e.ident.alive() => Ok(None),
-        Err(e) => Err(format!("vm {name}: {e}").into()),
-    }
-}
-
 /// How long `stop`, `pause`, `kill` and `rm -f` wait for a VM that holds its name but is not registered yet (starting).
 const START_WAIT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 60 });
 
-/// `signal_entry`, waiting (as `stopped_to_attach` does) while the name is held with no entry
-/// (a VM starting, or an `rm` or sweep deciding): None once nothing holds it.
-fn signal_ready(host: &Host, name: &str, sig: i32, check: &dyn Fn(&host::Entry) -> Result<()>) -> Result<Option<(host::PidFd, host::Ident)>> {
-    let deadline = Instant::now() + START_WAIT;
-    loop {
-        if let Some(v) = signal_entry(host, name, sig, check)? {
-            return Ok(Some(v));
+/// An instance `stop`, `pause`, `kill` or `rm -f` signalled under `asked`, followed by its process identity under
+/// whatever name it has (`last`): never by (ip, gen), which `Pin` follows and a resume or migration keeps.
+struct Tracked {
+    ident: host::Ident,
+    pidfd: host::PidFd,
+    asked: String,
+    last: String,
+}
+
+/// What a `Tracked` instance left once ended: under the name it had last, its exit record (as read and checked) and records.
+struct Ended {
+    last: String,
+    exit: Option<containers::Exit>,
+    shown: String,
+    records: host::Records,
+}
+
+impl Tracked {
+    /// Signals the instance registered under `name` (one read of the registry), waiting while the name is held with no
+    /// entry (a VM starting, #1189, or an `rm` or sweep deciding): None once nothing holds it. Anything else that keeps
+    /// it from being signalled (`host::Unseen`, a process not told apart, a refused signal) is an error, never "not
+    /// running". `check` refuses an entry before it is signalled.
+    fn signal(host: &Host, name: &str, sig: i32, check: &dyn Fn(&host::Entry) -> Result<()>) -> Result<Option<Tracked>> {
+        let deadline = Instant::now() + START_WAIT;
+        loop {
+            if let Ok(e) = host.entry(name) {
+                check(&e)?;
+                if let Some(pidfd) = host::PidFd::open(&e.ident).map_err(|err| if err.is::<host::Unseen>() { unseen(name, err) } else { err })? {
+                    match pidfd.signal(sig) {
+                        Ok(()) => return Ok(Some(Tracked { ident: e.ident, pidfd, asked: name.into(), last: name.into() })),
+                        // Its process gone meanwhile.
+                        Err(_) if !e.ident.alive() => {}
+                        Err(err) => bail!("vm {name}: {err}"),
+                    }
+                }
+            }
+            if !host.alive(name) {
+                return Ok(None);
+            }
+            if Instant::now() >= deadline {
+                bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if !host.alive(name) {
-            return Ok(None);
+    }
+
+    /// Its registry entry now, under `last` or whatever name a rename that held its op as the signal
+    /// landed gave it (#1178), which `last` follows. None while it is not registered (its entry rewritten) or once it ended.
+    fn refresh(&mut self, host: &Host) -> Option<host::Entry> {
+        let entry = host.entry(&self.last).ok().filter(|e| e.ident == self.ident).or_else(|| host.entries().into_iter().find(|e| e.ident == self.ident));
+        if let Some(e) = &entry {
+            self.last.clone_from(&e.name);
         }
-        if Instant::now() >= deadline {
-            bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
+        entry
+    }
+
+    /// `asked`, as a message names it, renamed `last` meanwhile.
+    fn shown(&self) -> String {
+        match self.asked == self.last {
+            true => self.asked.clone(),
+            false => format!("{} (renamed {})", self.asked, self.last),
         }
-        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    /// Once its process is gone: its records are under the name it had last, as its exit record
+    /// says (written before it let the name go), else the last one seen.
+    fn ended(&mut self, host: &Host) -> Ended {
+        let exit = containers::last_name(host, &self.last, &self.ident).map(|(n, e)| {
+            self.last = n;
+            e
+        });
+        Ended { last: self.last.clone(), exit, shown: self.shown(), records: host::Records::read(host, &self.last) }
     }
 }
 
@@ -1492,68 +1534,37 @@ const STOP_WAIT: Duration = Duration::from_secs(600);
 /// Returns the name the VM has last (a rename as it was signalled moves it on: `restart` starts that).
 fn stop(host: &Host, name: &str) -> Result<String> {
     host::check_name(name)?;
-    // The instance signalled, its identity and pidfd from one read of the registry: its exit status
-    // tells an app that exited first (`--rm` or attached VMs leave no exited record).
-    let (vm, ident) = match signal_ready(host, name, libc::SIGTERM, &|_| Ok(())) {
-        Ok(Some(v)) => v,
-        Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
-        Err(e) => return Err(e),
+    // The instance signalled: its exit status tells an app that exited first (`--rm` or attached VMs leave no exited record).
+    let mut vm = match Tracked::signal(host, name, libc::SIGTERM, &|_| Ok(()))? {
+        Some(vm) => vm,
         // A stopped VM's checkpoint, not debris (a consumed or discarded one) under its name.
-        Ok(None) if host.is_suspended(name) || host.has_record(name, "exited") => return Ok(name.into()),
-        Ok(None) => return Err(not_running(host, name)),
+        None if host.is_suspended(name) || host.has_record(name, "exited") => return Ok(name.into()),
+        None => return Err(not_running(host, name)),
     };
-    // Followed by its identity, under whatever name it has: a rename that held its op as the
-    // signal landed moves it on (#1178).
-    let (start, mut seen, mut last) = (Instant::now(), false, name.to_string());
-    while !vm.wait(Duration::from_millis(100)) {
-        let entry = host.entry(&last).ok().filter(|e| e.ident == ident).or_else(|| host.entries().into_iter().find(|e| e.ident == ident));
-        if let Some(e) = &entry {
-            last.clone_from(&e.name);
-        }
-        let state = entry.map(|e| e.state).unwrap_or_default();
+    let (start, mut seen) = (Instant::now(), false);
+    while !vm.pidfd.wait(Duration::from_millis(100)) {
+        let state = vm.refresh(host).map(|e| e.state).unwrap_or_default();
         seen |= state == "suspending" || state == "checkpointing";
         // Back to running: the suspend failed, and the VM runs on (its log says why).
         let gave_up = seen && matches!(state.as_str(), "running" | "paused");
         if gave_up || start.elapsed() > STOP_WAIT || (!seen && start.elapsed() > Duration::from_secs(10) && !matches!(state.as_str(), "source" | "reconciling"))
         {
-            let name = renamed_as(name, &last);
-            return Err(format!("vm {name} did not suspend (it runs on); see {}", host.vms(&last, "log")?.display()).into());
+            return Err(format!("vm {} did not suspend (it runs on); see {}", vm.shown(), host.vms(&vm.last, "log")?.display()).into());
         }
     }
-    // Its records are under the name it had last, as its exit record says (written before it let
-    // the name go), else the last one seen.
-    let (last, exit) = match containers::last_name(host, &last, &ident) {
-        Some((n, e)) => (n, Some(e)),
-        None => (last, None),
-    };
-    let shown = renamed_as(name, &last);
-    let name = last.as_str();
-    // Suspended by the instance signalled, as its checkpoint's OWNER says: never debris (a checkpoint
-    // consumed by a resume that then died) or another instance's.
-    let r = host::Records::read(host, name);
-    if matches!(&r.checkpoint, Some(host::Checkpoint::Resumable { owner: Some(o) }) if *o == ident) {
-        return Ok(last);
-    }
-    // Its app exited first (the VM was ending, so took no suspend): stopped all the same.
-    if r.exited {
+    let (Ended { last, exit, shown, records: r }, ident) = (vm.ended(host), &vm.ident);
+    // Suspended by the instance signalled, as its checkpoint's OWNER says (never debris, a checkpoint consumed by a
+    // resume that then died, or another instance's), or its app exited first (the VM, ending, took no suspend).
+    if matches!(&r.checkpoint, Some(host::Checkpoint::Resumable { owner: Some(o) }) if o == ident) || r.exited {
         return Ok(last);
     }
     if let Some(Some(to)) = r.moved {
         return Err(format!("vm {shown} moved to {to} before it was stopped; stop it there").into());
     }
-    let died = r.failed || r.lost;
-    // Its own exit record, as read and checked (a later instance of the name may replace it since).
-    match !died && app_exited(exit.as_ref(), &ident) {
+    // Not failed or lost, and its own exit record, as read and checked (a later instance of the name may replace it since).
+    match !(r.failed || r.lost) && app_exited(exit.as_ref(), ident) {
         true => Ok(last),
-        false => Err(format!("vm {shown} ended without suspending; see {}", host.vms(name, "log")?.display()).into()),
-    }
-}
-
-/// `name`, as a message names it, renamed `last` meanwhile.
-fn renamed_as(name: &str, last: &str) -> String {
-    match name == last {
-        true => name.into(),
-        false => format!("{name} (renamed {last})"),
+        false => Err(format!("vm {shown} ended without suspending; see {}", host.vms(&last, "log")?.display()).into()),
     }
 }
 
@@ -1564,30 +1575,19 @@ fn app_exited(exit: Option<&containers::Exit>, ident: &host::Ident) -> bool {
     exit.is_some_and(|e| e.ident == *ident && e.app.unwrap_or(![vmproc::DIED, 128 + libc::SIGINT, 128 + libc::SIGQUIT].contains(&e.code)))
 }
 
-/// SIGTSTP, and waits until its vCPUs are paused: the instance signalled, followed by its
-/// identity under whatever name it has (a rename that held its op as the signal landed).
+/// SIGTSTP, and waits until the instance signalled (`Tracked`, under whatever name it has) has its vCPUs paused.
 fn pause(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
-    let (vm, ident) = match signal_ready(host, name, libc::SIGTSTP, &|_| Ok(())) {
-        Ok(Some(v)) => v,
-        Ok(None) => return Err(not_running(host, name)),
-        Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
-        Err(e) => return Err(e),
-    };
-    let (deadline, mut last) = (Instant::now() + Duration::from_secs(30), name.to_string());
+    let mut vm = Tracked::signal(host, name, libc::SIGTSTP, &|_| Ok(()))?.ok_or_else(|| not_running(host, name))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let entry = host.entry(&last).ok().filter(|e| e.ident == ident).or_else(|| host.entries().into_iter().find(|e| e.ident == ident));
-        if let Some(e) = &entry {
-            last.clone_from(&e.name);
-        }
-        let shown = renamed_as(name, &last);
-        match entry.map(|e| e.state) {
+        match vm.refresh(host).map(|e| e.state) {
             Some(s) if s == "paused" => return output(format_args!("{name}\n")),
             Some(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Some(s) => bail!("vm {shown} is still {s}; see {}", host.vms(&last, "log")?.display()),
+            Some(s) => bail!("vm {} is still {s}; see {}", vm.shown(), host.vms(&vm.last, "log")?.display()),
             // Not registered for a moment (its entry rewritten), or ended: its pidfd tells.
-            None if !vm.wait(Duration::ZERO) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            None => bail!("vm {shown} ended before it paused; see {}", host.vms(&last, "log")?.display()),
+            None if !vm.pidfd.wait(Duration::ZERO) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            None => bail!("vm {} ended before it paused; see {}", vm.shown(), host.vms(&vm.last, "log")?.display()),
         }
     }
 }
@@ -1617,23 +1617,17 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
             false => Ok(()),
         }
     };
-    // A VM starting (holding the name, not registered yet) is waited for, as `stop` waits (#1189).
-    let killed = match signal_ready(host, name, libc::SIGINT, &not_source) {
-        Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
-        r => r?,
-    };
+    let killed = Tracked::signal(host, name, libc::SIGINT, &not_source)?;
     // Test gate `kill_gate`: the name's lock probed (`alive`), the VM signalled if it had an entry.
     host::gate("kill_gate");
-    if let Some((vm, ident)) = &killed {
-        if !vm.wait(Duration::from_secs(30)) {
+    if let Some(mut vm) = killed {
+        if !vm.pidfd.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
         }
-        // Only what the instance signalled left is undone or removed (`owns`): its records are
-        // under the name it had last, as its exit record says (written before it let the name go).
-        let last = containers::last_name(host, name, ident).map_or_else(|| name.to_string(), |(n, _)| n);
-        let shown = renamed_as(name, &last);
+        // Only what the instance signalled left is undone or removed (`owns`), under the name it had last.
+        let (Ended { last, shown, records, .. }, ident) = (vm.ended(host), &vm.ident);
         // A migration past its pause refused the kill, and the VM runs on at its target (#567).
-        if let Ok(to) = std::fs::read_to_string(host.vms(&last, "moved")?) {
+        if let Some(Some(to)) = records.moved {
             return Err(format!("vm {shown} moved to {to} before the kill took; kill it there").into());
         }
         // `rm -f` also removes logs and any exit or suspend record that won the race, under its name.
