@@ -95,13 +95,21 @@ fn wait_for(host: &Host, name: &str, id: &Ident, before: Option<Ident>) -> Resul
 
 /// `id`'s exit record: under `name`, else under whatever name it had last (`rename`).
 fn exit_of(host: &Host, name: &str, id: &Ident) -> Option<Exit> {
+    last_name(host, name, id).map(|(_, e)| e)
+}
+
+/// The name `id`, ended, had last, with its exit record there (written before it let the name
+/// go): `name` first, else whatever name a `rename` gave it. None without a record of its own.
+/// The record is the one read and checked as `id`'s: never read again, as a later instance of
+/// the name may have ended and replaced it meanwhile.
+pub fn last_name(host: &Host, name: &str, id: &Ident) -> Option<(String, Exit)> {
     if let Some(e) = exit_record(host, name).filter(|e| e.ident == *id) {
-        return Some(e);
+        return Some((name.into(), e));
     }
     std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten().find_map(|e| {
         let file = e.file_name().into_string().ok()?;
         let n = file.strip_suffix(".exit").filter(|n| !n.starts_with('.'))?;
-        exit_record(host, n).filter(|e| e.ident == *id)
+        exit_record(host, n).filter(|e| e.ident == *id).map(|e| (n.to_string(), e))
     })
 }
 
@@ -622,6 +630,8 @@ impl Proc {
         // Nor while its arrival hands its held packets over: the hand-off's ownership checks go by the name, and one
         // between the address's new holder and this process's new name would read as the address gone (#1028).
         self.settle_handoff(false)?;
+        // Test gate `rename_gate`: the op held, its checks passed, for a `stop` to signal meanwhile (#1178).
+        host::gate("rename_gate");
         let new = self.host.take_unrecorded_name(to)?;
         prepare_records(&self.host, &from, to)?;
         let (sock, new_sock) = (self.host.sock(&from)?, self.host.sock(to)?);
@@ -1432,6 +1442,38 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(waiter.join_within().unwrap().unwrap(), 5);
         drop(lock);
+    }
+
+    #[test]
+    fn exit_of_returns_only_the_record_it_checked_as_its_own() {
+        let (_d, host) = host("exit-of-checked");
+        let id = Ident { pid: 1, start: 1, boot: "b".into(), ns: None };
+        let later = Ident { pid: 2, start: 2, boot: "b".into(), ns: None };
+        // A later instance of the name ends and replaces the record, over and over, meanwhile:
+        // what is returned is the record that was checked as `id`'s, never the later one's.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (host, id, later, stop) = (host.clone(), id.clone(), later.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    record_exit(&host, "job-new", &id, 143, false);
+                    record_exit(&host, "job-new", &later, 0, true);
+                }
+            })
+        };
+        let mut found = 0;
+        for _ in 0..2000 {
+            if let Some(e) = exit_of(&host, "job", &id) {
+                assert_eq!((e.ident, e.code), (id.clone(), 143), "another instance's status");
+                found += 1;
+            }
+            if let Some((n, e)) = last_name(&host, "job", &id) {
+                assert_eq!((n.as_str(), e.ident, e.code), ("job-new", id.clone(), 143));
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.join().unwrap();
+        assert!(found > 0, "its record was never found");
     }
 
     #[test]

@@ -1499,28 +1499,52 @@ fn stop(host: &Host, name: &str) -> Result<()> {
         Ok(None) if host.suspended(name)?.exists() || host.has_record(name, "exited") => return Ok(()),
         Ok(None) => return Err(not_running(host, name)),
     };
-    let (start, mut seen) = (Instant::now(), false);
+    // Followed by its identity, under whatever name it has: a rename that held its op as the
+    // signal landed moves it on (#1178).
+    let (start, mut seen, mut last) = (Instant::now(), false, name.to_string());
     while !vm.wait(Duration::from_millis(100)) {
-        let state = host.entry(name).map(|e| e.state).unwrap_or_default();
+        let entry = host.entry(&last).ok().filter(|e| e.ident == ident).or_else(|| host.entries().into_iter().find(|e| e.ident == ident));
+        if let Some(e) = &entry {
+            last.clone_from(&e.name);
+        }
+        let state = entry.map(|e| e.state).unwrap_or_default();
         seen |= state == "suspending" || state == "checkpointing";
         // Back to running: the suspend failed, and the VM runs on (its log says why).
         let gave_up = seen && matches!(state.as_str(), "running" | "paused");
         if gave_up || start.elapsed() > STOP_WAIT || (!seen && start.elapsed() > Duration::from_secs(10) && !matches!(state.as_str(), "source" | "reconciling"))
         {
-            return Err(format!("vm {name} did not suspend (it runs on); see {}", host.vms(name, "log")?.display()).into());
+            let name = renamed_as(name, &last);
+            return Err(format!("vm {name} did not suspend (it runs on); see {}", host.vms(&last, "log")?.display()).into());
         }
     }
+    // Its records are under the name it had last, as its exit record says (written before it let
+    // the name go), else the last one seen.
+    let (last, exit) = match containers::last_name(host, &last, &ident) {
+        Some((n, e)) => (n, Some(e)),
+        None => (last, None),
+    };
+    let shown = renamed_as(name, &last);
+    let name = last.as_str();
     // Its app exited first (the VM was ending, so took no suspend): stopped all the same.
     if host.suspended(name)?.exists() || host.has_record(name, "exited") {
         return Ok(());
     }
     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
-        return Err(format!("vm {name} moved to {to} before it was stopped; stop it there").into());
+        return Err(format!("vm {shown} moved to {to} before it was stopped; stop it there").into());
     }
     let died = ["failed", "lost"].iter().any(|ext| host.has_record(name, ext));
-    match !died && app_exited(containers::exit_record(host, name).as_ref(), &ident) {
+    // Its own exit record, as read and checked (a later instance of the name may replace it since).
+    match !died && app_exited(exit.as_ref(), &ident) {
         true => Ok(()),
-        false => Err(format!("vm {name} ended without suspending; see {}", host.vms(name, "log")?.display()).into()),
+        false => Err(format!("vm {shown} ended without suspending; see {}", host.vms(name, "log")?.display()).into()),
+    }
+}
+
+/// `name`, as a message names it, renamed `last` meanwhile.
+fn renamed_as(name: &str, last: &str) -> String {
+    match name == last {
+        true => name.into(),
+        false => format!("{name} (renamed {last})"),
     }
 }
 
@@ -2931,6 +2955,42 @@ mod exec_tests {
         stop(&host, "app").unwrap();
         assert!(app.wait().is_ok());
         drop(lock);
+    }
+
+    #[test]
+    fn stop_of_a_vm_renamed_as_it_was_signalled_reads_its_new_name() {
+        let root = crate::test_util::TempDir::new("stop-renamed");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        for moved in [false, true] {
+            let lock = host.take_name("app", false).unwrap();
+            let mut app = crate::test_util::sleeper(60);
+            let ident = host::Ident::of(app.id()).unwrap();
+            std::fs::write(host.vms("app", "lock").unwrap(), serde_json::to_vec(&ident).unwrap()).unwrap();
+            lock.publish(&host::Entry { name: "app".into(), ident: ident.clone(), state: "running".into(), ..host::Entry::default() }).unwrap();
+            // A rename that held its op as the SIGTERM landed: its records are under the new name (#1178).
+            containers::record_exit(&host, "app-new", &ident, 128 + libc::SIGTERM, false);
+            let r = match moved {
+                false => {
+                    std::fs::create_dir_all(host.suspended("app-new").unwrap()).unwrap();
+                    stop(&host, "app").map_err(|e| e.to_string())
+                }
+                true => {
+                    std::fs::remove_dir_all(host.suspended("app-new").unwrap()).unwrap();
+                    std::fs::write(host.vms("app-new", "moved").unwrap(), "elsewhere").unwrap();
+                    stop(&host, "app").map_err(|e| e.to_string())
+                }
+            };
+            assert!(app.wait().is_ok());
+            drop(lock);
+            match moved {
+                false => r.unwrap(),
+                true => {
+                    let e = r.unwrap_err();
+                    assert!(e.contains("vm app (renamed app-new) moved to elsewhere"), "{e}");
+                    assert!(host.has_record("app-new", "moved"), "the hint is kept");
+                }
+            }
+        }
     }
 
     #[test]

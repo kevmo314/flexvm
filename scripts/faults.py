@@ -9661,6 +9661,34 @@ def kill_held_stopped():
     check("kill held: md5 intact", md5(A, n, tries=3) == m)
 
 
+def stop_renamed():
+    """#1178: a rename that holds the VM's op (its checks passed) as `stop`'s SIGTERM lands moves the
+    VM on before the suspend runs: stop follows the instance it signalled under its new name, and
+    is done once it is stopped there (never "ended without suspending" or "did not suspend")."""
+    n, to = "ft-stop-renamed", "ft-stop-renamed-to"
+    scenario_vms.update((n, to))
+    m = setup(n, mib=1)
+    clear_gate(A, "rename_gate")
+    stopper = None
+    fault(A, "rename_gate", 600000)
+    try:
+        renamer = spawn_cli(A, "rename", n, to, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("stop renamed: the rename holds the op", wait_for(lambda: reached(A, "rename_gate"), 30), reached(A, "rename_gate"))
+        stopper = spawn_cli(A, "stop", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Its SIGTERM taken (published as suspending): the suspend waits for the op the rename holds.
+        check("stop renamed: the stop signalled", wait_for(lambda: vms(A).get(n, {}).get("state") == "suspending", 30), vms(A).get(n))
+    finally:
+        release(A, "rename_gate")
+    out, err = communicate_process(renamer, 60)
+    check("stop renamed: renamed", renamer.returncode == 0 and out.strip() == to, (renamer.returncode, out, err))
+    out, err = communicate_process(stopper, 120)
+    check("stop renamed: stop succeeds", stopper.returncode == 0 and out.strip() == n, (stopper.returncode, out, err))
+    check("stop renamed: stopped under its new name", vms(A).get(to, {}).get("state") == "suspended" and n not in vms(A), (vms(A).get(to), vms(A).get(n)))
+    code, out, err = cli(A, "start", to)
+    check("stop renamed: starts again", code == 0 and wait_for(lambda: vms(A).get(to, {}).get("state") == "running", 30), (code, err, vms(A).get(to)))
+    check("stop renamed: md5 intact", md5(A, to, tries=3) == m)
+
+
 def unread_output():
     """`run IMAGE CMD` whose stdout is a pipe nobody reads (output stuck) still
     ends at once on SIGINT, with status 130: printing never holds it up."""
@@ -11712,6 +11740,7 @@ SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
     run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint, kill_held_stopped=kill_held_stopped,
+    stop_renamed=stop_renamed,
     terminal=terminal,
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,
