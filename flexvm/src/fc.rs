@@ -48,6 +48,7 @@ pub struct Firecracker {
     cgroup: RefCell<Option<PathBuf>>,
     /// Empty for image builders, which own their directory and network.
     pub tap: String,
+    tap_index: Option<u32>,
     api: Api,
     /// The cgroup move: joined before a load or reap.
     joining: RefCell<Option<std::thread::JoinHandle<std::io::Result<()>>>>,
@@ -98,6 +99,7 @@ impl Firecracker {
             dir: dir.into(),
             cgroup: RefCell::new(None),
             tap: String::new(),
+            tap_index: None,
             api: Api { bin: bin.into(), ..Api::default() },
             joining: RefCell::new(None),
             capped: false,
@@ -544,7 +546,7 @@ impl Drop for Firecracker {
         let _ = self.child.wait();
         self.join_log();
         if !self.tap.is_empty() {
-            release(Some(&self.tap), self.cgroup.get_mut().as_deref(), &self.dir);
+            release(self.tap_index.map(|index| (self.tap.as_str(), index)), self.cgroup.get_mut().as_deref(), &self.dir);
         } else if let Some(cg) = self.cgroup.get_mut().take() {
             let _ = remove_cgroup(&cg);
         }
@@ -552,9 +554,9 @@ impl Drop for Firecracker {
 }
 
 /// Its Firecracker must be gone.
-fn release(tap: Option<&str>, cgroup: Option<&Path>, dir: &Path) {
-    if let Some(tap) = tap {
-        crate::net::delete_tap(tap);
+fn release(tap: Option<(&str, u32)>, cgroup: Option<&Path>, dir: &Path) {
+    if let Some((tap, index)) = tap {
+        crate::net::delete_link(index, tap);
     }
     if let Some(cg) = cgroup {
         let _ = remove_cgroup(cg);
@@ -697,20 +699,28 @@ impl Spawner {
         let made = {
             let (first, owner, prefix, making) = (tap.clone(), self.tap_owner.clone(), self.tap_prefix.clone(), self.making.clone());
             std::thread::spawn(move || {
-                let make = |claim: &mut dyn FnMut(&std::os::fd::OwnedFd) -> Result<String>| crate::net::create_tap_with(&owner, claim);
-                make_free_tap(first, &prefix, Path::new("/sys/class/net"), &making, make, crate::net::claim_tap)
+                let mut index = None;
+                let make = |claim: &mut dyn FnMut(&std::os::fd::OwnedFd) -> Result<String>| {
+                    crate::net::create_indexed_tap(&owner, claim).map(|(name, i)| {
+                        index = Some(i);
+                        name
+                    })
+                };
+                let (held, made) = make_free_tap(first, &prefix, Path::new("/sys/class/net"), &making, make, crate::net::claim_tap);
+                (held, made, index)
             })
         };
         let fc = crate::host::host_dir(&dir, 0o700).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
-        let (held, made) = made.join().unwrap_or_else(|_| (Some(tap), Err("tap thread panicked".into())));
+        let (held, made, index) = made.join().unwrap_or_else(|_| (Some(tap), Err("tap thread panicked".into()), None));
         let tap = made.as_ref().ok().cloned();
         // A Firecracker without its tap is dropped (killed) here, before `release`.
-        let fc = fc.and_then(|fc| made.map(|_| fc)).inspect_err(|_| release(tap.as_deref(), cgroup.as_deref(), &dir));
+        let fc = fc.and_then(|fc| made.map(|_| fc)).inspect_err(|_| release(tap.as_deref().zip(index), cgroup.as_deref(), &dir));
         // Made (sysfs has it now) or released: no longer kept from other takes.
         if let Some(held) = held {
             self.making.lock().unwrap().remove(&held);
         }
         let (mut fc, tap) = (fc?, tap.unwrap_or_default());
+        fc.tap_index = index;
         // Under test, each VM's Firecracker keeps its device metrics (`metrics.json` in its
         // directory, appended every 60 s and on `FlushMetrics`), so a test can see what a
         // device did (#149). Metrics can only be configured before a load.
@@ -761,6 +771,7 @@ mod tests {
                 dir: dir.to_path_buf(),
                 cgroup: RefCell::new(Some(cg.clone())),
                 tap: String::new(),
+                tap_index: None,
                 api: Api::default(),
                 joining: RefCell::new(Some(std::thread::spawn(|| Err(std::io::Error::from_raw_os_error(libc::EACCES))))),
                 capped,
@@ -785,6 +796,7 @@ mod tests {
             dir: dir.to_path_buf(),
             cgroup: RefCell::new(None),
             tap: String::new(),
+            tap_index: None,
             api: Api::default(),
             joining: RefCell::new(None),
             capped: false,

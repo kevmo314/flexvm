@@ -1361,11 +1361,12 @@ def port_forward():
     anything starts; kept by stop/start and by an app's exit and start; freed by kill and SIGKILL; not
     taken by a restore without -p; kept by a migration that aborts after switchover, dropped by one that ends."""
     vm, hp = "e2e-ports", A.port + 20000
-    fwd = ["-p", f"127.0.0.1:{hp}:7000", "-p", f"127.0.0.1:{hp}:7001/udp"]
+    fwd = ["-p", f"127.0.0.1:{hp}:7000", "-p", f"127.0.0.1:{hp}:7001/udp", "-p", f"127.0.0.1:{hp + 2}:7002"]
     r = A.run_json(vm, extra=fwd)
     ip = r["ip"]
     want = [{"ip": "127.0.0.1", "host_port": hp, "vm_port": 7000, "protocol": "tcp"},
-            {"ip": "127.0.0.1", "host_port": hp, "vm_port": 7001, "protocol": "udp"}]
+            {"ip": "127.0.0.1", "host_port": hp, "vm_port": 7001, "protocol": "udp"},
+            {"ip": "127.0.0.1", "host_port": hp + 2, "vm_port": 7002, "protocol": "tcp"}]
     check("run -d: its JSON has the ports", r.get("ports") == want, r)
     check("ps: lists the ports", A.ps()[vm].get("ports") == want, A.ps()[vm])
     echo_server(A, vm, ip)
@@ -1446,7 +1447,37 @@ def port_forward():
     check("migrate aborted: ps lists the ports", A.ps()[vm].get("ports") == want, A.ps()[vm])
     check("migrate aborted: tcp forwarded still", wait_for(tcp_ok, 10))
     check("migrate aborted: udp forwarded still", udp_ok())
+    # A download still flowing when the move ends its forward is reset, never ended as if complete (#1163).
+    # The client only reads: a write of its own could take the reset's error, leaving its read a plain EOF.
+    must(A, vm, "setsid socat TCP-LISTEN:7002,fork,reuseaddr OPEN:/dev/zero >/dev/null 2>&1 </dev/null &")
+    flow = {"got": 0}
+
+    def serving():
+        try:
+            with socket.create_connection(("127.0.0.1", hp + 2), timeout=2) as s:
+                return bool(s.recv(1))
+        except OSError:
+            return False
+
+    check("download server up", wait_for(serving, 10))
+
+    def download():
+        try:
+            with socket.create_connection(("127.0.0.1", hp + 2), timeout=60) as s:
+                while d := s.recv(1 << 16):
+                    flow["got"] += len(d)
+                flow["end"] = "eof"
+        except ConnectionResetError:
+            flow["end"] = "reset"
+        except OSError as e:
+            flow["end"] = repr(e)
+
+    dl = threading.Thread(target=download, daemon=True)
+    dl.start()
+    check("migrate: a download flows through the forward", wait_for(lambda: flow["got"] > 1 << 20, 10), flow)
     A.migrate(vm, B)
+    dl.join(60)
+    check("migrate: the cut download is reset, not a clean EOF", flow.get("end") == "reset", flow)
     check("migrate: freed on the source", wait_for(lambda: free(hp, socket.SOCK_STREAM) and free(hp, socket.SOCK_DGRAM), 60))
     check("migrate: none on the target", not B.ps()[vm].get("ports"), B.ps()[vm])
     B.kill(vm)

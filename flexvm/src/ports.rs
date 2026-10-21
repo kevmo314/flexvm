@@ -84,13 +84,19 @@ impl std::str::FromStr for Port {
 }
 
 impl Port {
+    fn ips(&self) -> impl Iterator<Item = IpAddr> {
+        match self.ip {
+            Some(ip) => [Some(ip), None],
+            None => [Some(Ipv4Addr::UNSPECIFIED.into()), Some(Ipv6Addr::UNSPECIFIED.into())],
+        }
+        .into_iter()
+        .flatten()
+    }
+
     /// Whether both would bind one address and port (no IP: both wildcards; a wildcard takes its family's).
     pub fn overlaps(&self, other: &Self) -> bool {
-        let ips = |p: &Self| p.ip.map_or_else(|| vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()], |ip| vec![ip]);
         let covers = |a: IpAddr, b: IpAddr| a == b || (a.is_unspecified() && a.is_ipv4() == b.is_ipv4());
-        self.protocol == other.protocol
-            && self.host_port == other.host_port
-            && ips(self).into_iter().any(|a| ips(other).into_iter().any(|b| covers(a, b) || covers(b, a)))
+        self.protocol == other.protocol && self.host_port == other.host_port && self.ips().any(|a| other.ips().any(|b| covers(a, b) || covers(b, a)))
     }
 }
 
@@ -123,7 +129,7 @@ impl Forwarder {
         let (mut bound, mut bound_ports) = (Vec::new(), Vec::new());
         for p in ports {
             let mut fds = Vec::new();
-            for ip in p.ip.map_or_else(|| vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()], |ip| vec![ip]) {
+            for ip in p.ips() {
                 let at = Port { ip: Some(ip), ..p.clone() };
                 match listen(SocketAddr::new(ip, p.host_port), p.protocol) {
                     Ok(fd) => {
@@ -267,12 +273,11 @@ struct Direction {
     start: usize,
     end: usize,
     eof: bool,
-    /// Its source failed (a reset, say): it ends once what was read before is written.
+    /// Its source failed: drain prior data and wait boundedly for acknowledgements before resetting.
     failed: bool,
     /// Its sink failed: what it held is dropped, and what its source still sends is read and dropped.
     broken: bool,
-    /// It has ended: its source finished (a FIN, or a failure once what came before is written) and
-    /// that end was passed on as a FIN, or its sink failed and its source has finished since.
+    /// It has ended: a clean FIN was forwarded, a failure drained, or its sink failed.
     done: bool,
     /// While it holds data: when it began to, or its sink last took some (a write, or the sink's TCP
     /// acknowledging more of what the kernel holds). Its source sending more is not that.
@@ -332,9 +337,16 @@ impl Direction {
         }
         if self.start == self.end {
             (self.start, self.end) = (0, 0);
-            // A failed source ends as a FIN too: the sink gets all that came before, cleanly.
             if self.eof && !self.done {
-                if !self.broken {
+                if self.failed && !self.broken {
+                    // Leave closure to Connection after the sink acknowledges prior bytes.
+                    // Its failure deadline bounds a peer that stops acknowledging.
+                    let mut queued: libc::c_int = 0;
+                    if unsafe { libc::ioctl(to.as_raw_fd(), libc::TIOCOUTQ, &mut queued) } == 0 && queued > 0 {
+                        return moved;
+                    }
+                    abort(to);
+                } else if !self.broken {
                     let _ = to.shutdown(Shutdown::Write);
                 }
                 self.done = true;
@@ -412,12 +424,17 @@ impl Connection {
         if self.lingering.is_some_and(|t| idle_now().duration_since(t) > LINGER) {
             return false;
         }
-        if client == 0 && guest == 0 {
+        if client == 0 && guest == 0 && !self.out.failed && !self.incoming.failed {
             return true;
         }
         (self.client_down, self.guest_down) = (self.client_down | client & DOWN, self.guest_down | guest & DOWN);
         // Both directions: what one socket sent before failing still goes out the other way.
-        let (out, incoming) = (self.out.pump(&self.client, &self.guest), self.incoming.pump(&self.guest, &self.client));
+        // A write that fails takes its socket's error (a reset, say): reading that socket then only
+        // ends, which must not pass for its FIN.
+        let out = self.out.pump(&self.client, &self.guest);
+        self.incoming.failed |= self.out.broken && !self.incoming.eof;
+        let incoming = self.incoming.pump(&self.guest, &self.client);
+        self.out.failed |= self.incoming.broken && !self.out.eof;
         if out || incoming {
             self.active = idle_now();
             // What is still delivered keeps it: a slow reader gets the rest, and LINGER for its FIN after.
@@ -429,6 +446,9 @@ impl Connection {
         let client_failed = failed(self.client_down, &self.out, &self.incoming);
         if client_failed || failed(self.guest_down, &self.incoming, &self.out) {
             self.lingering.get_or_insert_with(idle_now);
+        }
+        if (self.out.failed && self.out.done) || (self.incoming.failed && self.incoming.done) {
+            return false;
         }
         !self.out.done || !self.incoming.done && !client_failed
     }
@@ -465,11 +485,11 @@ impl Connection {
 }
 
 impl Drop for Connection {
-    /// A forward closed (its deadline past, or evicted) with data it still owed a sink resets that sink:
+    /// A forward closed before a direction finishes resets its sink, even with an empty buffer:
     /// a cut-off stream must not end in a FIN, as if it were complete.
     fn drop(&mut self) {
         for (d, sink) in [(&self.out, &self.guest), (&self.incoming, &self.client)] {
-            if d.start < d.end {
+            if !d.done {
                 abort(sink);
             }
         }
@@ -701,10 +721,18 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
     // Keyed by where the client sent to, on a wildcard listener.
     let mut clients: HashMap<(SocketAddr, Option<Local>), (UdpSocket, Instant, usize)> = HashMap::new();
     let mut buf = vec![0; BUFFER];
+    let mut fds = Vec::with_capacity(listeners.len() + cap + 1);
+    let mut peers = Vec::with_capacity(cap);
+    let mut changed = true;
     loop {
-        let mut fds: Vec<_> = listeners.iter().map(|l| poll(l, libc::POLLIN)).collect();
-        let peers: Vec<_> = clients.keys().copied().collect();
-        fds.extend(peers.iter().map(|p| poll(&clients[p].0, libc::POLLIN)));
+        if changed {
+            fds.clear();
+            peers.clear();
+            fds.extend(listeners.iter().map(|l| poll(l, libc::POLLIN)));
+            peers.extend(clients.keys().copied());
+            fds.extend(peers.iter().map(|p| poll(&clients[p].0, libc::POLLIN)));
+            changed = false;
+        }
         if !wait(&mut fds, stop, None) {
             return;
         }
@@ -750,6 +778,7 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
                                     clients.remove(&v);
                                 }
                                 clients.insert(peer, (s, idle_now(), i));
+                                changed = true;
                             }
                         }
                     }
@@ -762,7 +791,9 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
                 tests::udp_processed(peer.0);
             }
         }
+        let before = clients.len();
         clients.retain(|_, (_, at, _)| idle_now().duration_since(*at) < idle);
+        changed |= clients.len() != before;
     }
 }
 
@@ -1915,6 +1946,27 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_resets_live_streams_with_empty_proxy_buffers() {
+        for half_closed in [false, true] {
+            let (addr, guest, worker) = worker(4, IDLE);
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            server.set_read_timeout(Some(WAIT)).unwrap();
+            echo(&mut client, &mut server);
+            if half_closed {
+                client.shutdown(Shutdown::Write).unwrap();
+                assert_eq!(server.read(&mut [0]).unwrap(), 0);
+            }
+            worker.halt();
+            assert_eq!(client.read(&mut [0]).unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+            if !half_closed {
+                assert_eq!(server.read(&mut [0]).unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+            }
+        }
+    }
+
+    #[test]
     fn what_arrives_before_a_reset_is_still_relayed_both_ways() {
         let (addr, guest, worker) = worker(4, IDLE);
         let reply: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
@@ -1929,7 +1981,7 @@ mod tests {
             acknowledged(&server);
             reset(server);
             let mut got = Vec::new();
-            let _ = client.read_to_end(&mut got);
+            assert_eq!(client.read_to_end(&mut got).unwrap_err().kind(), io::ErrorKind::ConnectionReset);
             assert_eq!(got.len(), reply.len());
             // And a client's last request before its reset reaches the guest.
             let mut client = TcpStream::connect(addr).unwrap();
@@ -1939,8 +1991,38 @@ mod tests {
             acknowledged(&client);
             reset(client);
             let mut got = Vec::new();
-            let _ = server.read_to_end(&mut got);
+            assert_eq!(server.read_to_end(&mut got).unwrap_err().kind(), io::ErrorKind::ConnectionReset);
             assert_eq!(got.len(), reply.len());
+        }
+        worker.halt();
+    }
+
+    /// The proxy's write to the guest can be what finds its reset first (taking the socket's error),
+    /// after which reading it only ends: that must still reset the client, not pass a FIN.
+    #[test]
+    fn a_guest_reset_found_writing_still_resets_the_client() {
+        let (addr, guest, worker) = worker(4, IDLE);
+        for _ in 0..5 {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            let (mut server, _) = crate::test_util::accept_tcp(&guest);
+            echo(&mut client, &mut server);
+            // The guest reads nothing more: the proxy holds what it cannot write when the reset comes.
+            client.set_nonblocking(true).unwrap();
+            let mut blocked = 0;
+            while blocked < 3 {
+                match client.write(&[0; 1 << 16]) {
+                    Ok(_) => blocked = 0,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        blocked += 1;
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            reset(server);
+            client.set_nonblocking(false).unwrap();
+            assert_eq!(client.read(&mut [0]).unwrap_err().kind(), io::ErrorKind::ConnectionReset);
         }
         worker.halt();
     }
@@ -1960,15 +2042,17 @@ mod tests {
             reset(server);
             thread::sleep(Duration::from_millis(50));
             // A request the reset guest cannot take: that direction ends, the reply still goes out.
-            client.write_all(b"next request").unwrap();
+            let write_reset = client.write_all(b"next request").err().is_some_and(|e| e.kind() == io::ErrorKind::ConnectionReset);
             thread::sleep(Duration::from_millis(50));
             // Slowly: the proxy writes the last of the reply long before it is read.
             let (mut got, mut chunk) = (Vec::new(), [0; 2048]);
             loop {
                 match client.read(&mut chunk) {
-                    Ok(0) => break,
+                    Ok(0) if write_reset => break,
+                    Ok(0) => panic!("failed guest ended with FIN"),
                     Ok(n) => got.extend_from_slice(&chunk[..n]),
-                    // A reset: the proxy closed with the request unread, or before it came.
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+                    // Any other error is unexpected.
                     Err(e) => panic!("after {} of the {len}-byte reply: {e}", got.len()),
                 }
                 thread::sleep(Duration::from_millis(2));

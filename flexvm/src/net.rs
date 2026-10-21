@@ -133,6 +133,10 @@ pub fn create_free_tap(name: &str, owner: &str) -> Result<String> {
 /// `claim` attaches the descriptor it is given to a new tap (`claim_tap`) and names it.
 pub fn create_tap_with(owner: &str, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<String> {
     // Subscribed before the tap exists: udev's event for it cannot come before.
+    create_indexed_tap(owner, claim).map(|(name, _)| name)
+}
+
+pub fn create_indexed_tap(owner: &str, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<(String, u32)> {
     make_tap(owner, udev_monitor(), claim)
 }
 
@@ -191,7 +195,7 @@ fn free_name(name: &str, mut claim: impl FnMut(&str) -> std::io::Result<()>) -> 
 }
 
 /// `create_tap_with`, with `udev` (if any) handed to the tap's watcher (`keep_mac_from_udev`).
-fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<String> {
+fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<(String, u32)> {
     if owner.len() >= 256 {
         bail!("tap: owner {owner:?} is over 255 bytes (a shorter run directory)");
     }
@@ -227,7 +231,7 @@ fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> 
         set_link_up(name, true)
     })();
     match (&made, udev) {
-        (Err(_), _) => delete_tap(name),
+        (Err(_), _) => delete_link(index, name),
         (Ok(()), Some(udev)) => {
             let tap = name.to_string();
             // Not fatal: neighbour still checks the MAC when the tap is handed to a VM.
@@ -237,7 +241,7 @@ fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> 
         }
         (Ok(()), None) => {}
     }
-    made.map(|()| name.to_string())
+    made.map(|()| (name.to_string(), index))
 }
 
 /// How often a tap's watcher checks its MAC, and that it is still there, between udev's events.
@@ -542,8 +546,9 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
     if retry3(remove).is_ok() {
         return (drops + queued, Err(format!("{e}; removed the plug instead").into()));
     }
-    let tap = tap.to_string();
-    std::thread::spawn(move || {
+    let retry_tap = tap.to_string();
+    let retry = move || {
+        let tap = retry_tap;
         let mut latest = (drops, queued);
         for _ in 0..60 {
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -557,7 +562,14 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
             }
         }
         crate::log!("tap {tap}: could not remove its plug, {} extra drops; backlog stays queued", latest.0.saturating_sub(drops));
-    });
+    };
+    if let Err(spawn) = std::thread::Builder::new().name("unplug-retry".into()).spawn(retry) {
+        let removed = retry3(remove);
+        return (
+            drops + if removed.is_ok() { queued } else { 0 },
+            Err(format!("{e}; could not start plug retry: {spawn}; inline removal: {removed:?}").into()),
+        );
+    }
     (drops, Err(format!("{e}; removing the plug failed too, retrying").into()))
 }
 
@@ -567,11 +579,12 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
 pub fn drain_qdisc(tap: &str, wait: std::time::Duration) -> u64 {
     let Ok(ifindex) = ifindex(tap) else { return 0 };
     let end = std::time::Instant::now() + wait;
+    let Ok(sock) = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket") else { return 0 };
     loop {
         // Whatever the root qdisc is (a default one, or our plug); the answer waited for only
         // within `wait` (at least a millisecond), so an unanswered query never holds it longer.
         let left = end.saturating_duration_since(std::time::Instant::now()).max(std::time::Duration::from_millis(1));
-        let queued = qdisc_stats(ifindex, 0, left).map_or(0, |(_, queued)| queued);
+        let queued = qdisc_stats_on(&sock, ifindex, 0, left).map_or(0, |(_, queued)| queued);
         if queued == 0 || std::time::Instant::now() >= end {
             return queued;
         }
@@ -606,8 +619,12 @@ const STATS_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// RTM_GETQDISC on a socket of its own: the qdisc echoed back (NLM_F_ECHO; a get without it
 /// answers nothing), no ACK, waited for up to `wait`.
 fn qdisc_stats(ifindex: u32, handle: u32, wait: std::time::Duration) -> Option<(u64, u64)> {
-    const NLM_F_ECHO: c_int = 8;
     let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket").ok()?;
+    qdisc_stats_on(&sock, ifindex, handle, wait)
+}
+
+fn qdisc_stats_on(sock: &OwnedFd, ifindex: u32, handle: u32, wait: std::time::Duration) -> Option<(u64, u64)> {
+    const NLM_F_ECHO: c_int = 8;
     // A zero timeval would mean no timeout at all.
     let wait = wait.max(std::time::Duration::from_micros(1));
     let timeout = libc::timeval { tv_sec: wait.as_secs() as libc::time_t, tv_usec: wait.subsec_micros() as libc::suseconds_t };
@@ -617,7 +634,7 @@ fn qdisc_stats(ifindex: u32, handle: u32, wait: std::time::Duration) -> Option<(
     }
     let body = tcmsg(ifindex, handle, TC_H_ROOT, 0);
     let mut buf = [0u8; 8192];
-    let reply = exchange(&sock, libc::RTM_GETQDISC, NLM_F_ECHO, &body, &mut buf).ok()?;
+    let reply = exchange(sock, libc::RTM_GETQDISC, NLM_F_ECHO, &body, &mut buf).ok()?;
     if reply.len() < 36 || u16::from_ne_bytes([reply[4], reply[5]]) != libc::RTM_NEWQDISC {
         return None;
     }
@@ -1270,6 +1287,23 @@ mod tests {
             let f = filters();
             assert!(f.matches("direct-action").count() == 1 && f.contains(&format!(" {},", u32::from(ip))), "{f}");
         }
+    }
+
+    /// Needs CAP_NET_ADMIN; no VM. An old owner must not delete a replacement tap.
+    #[test]
+    #[ignore]
+    fn deleting_an_old_tap_preserves_a_reused_name() {
+        let _root = crate::test_util::root_net_lock();
+        let tap = format!("tw4r{:x}", std::process::id());
+        let create = || create_indexed_tap("test", |fd| claim_tap(fd, &tap).map(|()| tap.clone()).map_err(Into::into)).unwrap().1;
+        let old = create();
+        delete_link(old, &tap);
+        let new = create();
+        delete_link(old, &tap);
+        let retained = ifindex(&tap).ok();
+        delete_link(new, &tap);
+        assert_ne!(old, new);
+        assert_eq!(retained, Some(new));
     }
 
     /// A message as udev broadcasts it on its monitor group (`udev_event`).
