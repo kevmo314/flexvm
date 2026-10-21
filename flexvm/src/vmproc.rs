@@ -2571,6 +2571,8 @@ impl Proc {
                 Suspend::Idle => *s = Suspend::Ending,
             }
             drop(s);
+            // Test fault `app_exit_stall`: a window, ending, for a `stop` to come (its SIGTERM no suspend).
+            crate::host::stall("app_exit_stall");
             let refused = self.exit_with(code);
             if tries == 0 {
                 crate::log!("vm {}: {refused}", self.name());

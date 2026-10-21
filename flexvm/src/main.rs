@@ -717,10 +717,7 @@ fn real_main(args: &Args) -> Result<()> {
         }
         Some("start") => {
             let host = open_host(args)?;
-            each(args.names(), |n| match resume(&host, n)? {
-                true => output(format_args!("{n}\n")),
-                false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", "--", n]), &log_file(&host, n)?, false)?),
-            })
+            each(args.names(), |n| start(&host, args, n))
         }
         Some("ps") => ps(&open_host(args)?, args),
         Some("exec") => {
@@ -757,10 +754,7 @@ fn real_main(args: &Args) -> Result<()> {
             let host = open_host(args)?;
             each(args.names(), |n| {
                 stop(&host, n)?;
-                match resume(&host, n)? {
-                    true => output(format_args!("{n}\n")),
-                    false => print(spawn_detached(&host, n, &child_args(args, &["start", "--attach", "--", n]), &log_file(&host, n)?, false)?),
-                }
+                start(&host, args, n)
             })
         }
         Some("pause") => {
@@ -1322,6 +1316,37 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
     util::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
 }
 
+/// `start` (and `restart`): a running VM's process resumes it, a stopped or exited one a new
+/// process. A start that lost the name to another meanwhile (two `start`s at once) is that one's:
+/// done once it runs, as resuming a running VM is.
+fn start(host: &Host, args: &Args, name: &str) -> Result<()> {
+    if resume(host, name)? {
+        return output(format_args!("{name}\n"));
+    }
+    match spawn_detached(host, name, &child_args(args, &["start", "--attach", "--", name]), &log_file(host, name)?, false) {
+        Ok(v) => print(v),
+        Err(e) if host::name_taken(&e) || host.alive(name) => match started_meanwhile(host, name, Instant::now() + Duration::from_secs(60))? {
+            true => output(format_args!("{name}\n")),
+            false => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a VM another process holds `name` for runs by `deadline`: its process resumes it (a
+/// no-op once it runs). False once nothing holds the name (that start failed), or at `deadline`.
+fn started_meanwhile(host: &Host, name: &str, deadline: Instant) -> Result<bool> {
+    loop {
+        if resume(host, name)? {
+            return Ok(true);
+        }
+        if !host.alive(name) || Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// A running VM's process resumes it (true); a suspended one a new process. A
 /// suspend coming (a SIGTERM sent before) is waited out: the VM then runs here
 /// (it failed) or is suspended. Never true unless its process said so, once the
@@ -1344,8 +1369,9 @@ fn resume_by(host: &Host, name: &str, deadline: Instant, suspend_by: Instant) ->
                 }
             }
             Ok(Ok(Some(v))) if v["ok"] == true => return Ok(true),
-            // Its control connections are all taken: asked again.
-            Ok(Ok(Some(v))) if v["error"] == "busy" && Instant::now() < deadline => {}
+            // Its control connections are all taken, or its process has no VM yet (a resume or
+            // restore that bound its socket first, another `start`'s): asked again.
+            Ok(Ok(Some(v))) if (v["error"] == "busy" || v["busy"] == true) && Instant::now() < deadline => {}
             Ok(Ok(Some(v))) => return Err(v["error"].as_str().unwrap_or("resume refused").to_string().into()),
             Ok(Err(e)) if host.alive(name) => return Err(format!("vm {name}: its resume was not confirmed: {e}").into()),
             // It took the request: whatever ended it meanwhile ended the resume too.
@@ -1422,7 +1448,8 @@ fn stop(host: &Host, name: &str) -> Result<()> {
             return Err(format!("vm {name} did not suspend (it runs on); see {}", host.vms(name, "log")?.display()).into());
         }
     }
-    if host.suspended(name)?.exists() {
+    // Its app exited first (the VM was ending, so took no suspend): stopped all the same.
+    if host.suspended(name)?.exists() || host.has_record(name, "exited") {
         return Ok(());
     }
     match std::fs::read_to_string(host.vms(name, "moved")?) {
@@ -1497,7 +1524,13 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         }
         return done();
     }
-    let removed = ["failed", "lost", "exited"].into_iter().map(|ext| Ok(std::fs::remove_file(host.vms(name, ext)?).is_ok())).collect::<Result<Vec<_>>>()?;
+    // Under the name, as `remove_stopped` does: a start that holds it (a rerun reading its exited
+    // record) keeps its records, and this is refused below (it is starting).
+    let removed = match host.take_name(name, true) {
+        Ok(_lock) => ["failed", "lost", "exited"].into_iter().map(|ext| Ok(std::fs::remove_file(host.vms(name, ext)?).is_ok())).collect::<Result<Vec<_>>>()?,
+        Err(e) if host::name_taken(&e) => Vec::new(),
+        Err(e) => return Err(e),
+    };
     if !host.alive(name) && removed.contains(&true) {
         return done();
     }
@@ -2760,6 +2793,39 @@ mod exec_tests {
             assert_eq!(std::fs::read_to_string(record).unwrap(), "reason");
         }
         assert_eq!(stop(&host, "missing").unwrap_err().to_string(), r#"no running vm named "missing""#);
+    }
+
+    #[test]
+    fn kill_leaves_the_records_of_a_vm_starting_under_its_name() {
+        let root = crate::test_util::TempDir::new("kill-rerun");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let exited = host.vms("job", "exited").unwrap();
+        std::fs::write(&exited, "its run").unwrap();
+        // A rerun holds the name, reading its record, and has not published itself yet (#1151).
+        let rerun = host.take_name("job", true).unwrap();
+        let e = remove(&host, "job", true, false).unwrap_err().to_string();
+        assert!(e.contains("is starting"), "{e}");
+        assert_eq!(std::fs::read_to_string(&exited).unwrap(), "its run");
+        drop(rerun);
+        // Once it is gone (it failed: the VM is still exited), plain rm removes the record.
+        remove(&host, "job", false, true).unwrap();
+        assert!(!exited.exists());
+    }
+
+    #[test]
+    fn stop_of_a_vm_whose_app_exits_meanwhile_is_done() {
+        let root = crate::test_util::TempDir::new("stop-exit");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let lock = host.take_name("app", false).unwrap();
+        let mut app = crate::test_util::sleeper(60);
+        let ident = host::Ident::of(app.id()).unwrap();
+        std::fs::write(host.vms("app", "lock").unwrap(), serde_json::to_vec(&ident).unwrap()).unwrap();
+        lock.publish(&host::Entry { name: "app".into(), ident, state: "running".into(), ..host::Entry::default() }).unwrap();
+        // Its app exited first: the VM, ending, takes no suspend and leaves its exited record (#1151).
+        std::fs::write(host.vms("app", "exited").unwrap(), "its run").unwrap();
+        stop(&host, "app").unwrap();
+        assert!(app.wait().is_ok());
+        drop(lock);
     }
 
     #[test]
