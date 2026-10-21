@@ -1655,7 +1655,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     if records()? {
         bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
     }
-    remove_stopped(host, name, false, true, None)
+    nothing_to_remove(host, name)
 }
 
 /// Whether what is under the name `lock` holds is what `ident` left, decided holding the name; None
@@ -1685,21 +1685,37 @@ fn unconfirmed(shown: &str, last: &str) -> util::Error {
 /// `had`: a stopped VM's records were there before, or -f just killed its process. `logs`: its logs
 /// and exit status go too (`rm`, so a new VM of the name starts a fresh one). `of`: only the records that
 /// instance left go (`rm -f` of the one it killed), none of another VM's under the name since.
+/// With nothing recorded (`!had`), what a VM that died recording nothing (SIGKILLed) left goes too:
+/// its dead holder's lock and its logs (`Host::left_unrecorded`), decided again holding the name (#1187).
 fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host::Ident>) -> Result<()> {
-    if !had {
-        if host.alive(name) {
-            bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
-        }
-        return match std::fs::read_to_string(host.vms(name, "moved")?) {
-            Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
-            Err(_) => Err(format!("no vm named {name:?}").into()),
-        };
+    if !had && (host.alive(name) || host.has_record(name, "moved") || !host.left_unrecorded(name)?) {
+        return nothing_to_remove(host, name);
     }
+    remove_held(host, name, had, logs, of)
+}
+
+/// `remove_stopped` past its checks, which it takes the name for. With nothing recorded before
+/// (`!had`), what those checks found is checked again holding it: a VM that took the name since
+/// may have moved away (its hint and logs kept: it runs there) or ended (its records left for a
+/// `rm` that sees them), and then nothing is removed.
+fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host::Ident>) -> Result<()> {
     let lock = match host.take_name(name, true) {
         Ok(lock) => lock,
         Err(_) if host.alive(name) => bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"),
         Err(e) => return Err(e),
     };
+    if !had {
+        let recorded = host.suspended(name)?.exists() || ["exited", "failed", "lost"].iter().any(|ext| host.has_record(name, ext));
+        let moved = std::fs::read_to_string(host.vms(name, "moved")?);
+        if moved.is_ok() || host.has_record(name, "moved") || recorded {
+            lock.release_to_prior();
+            return Err(match moved {
+                Ok(to) => format!("vm {name} moved to {to}; kill it there").into(),
+                Err(_) if host.has_record(name, "moved") => format!("vm {name} moved away; kill it where it runs").into(),
+                Err(_) => format!("vm {name} ended meanwhile (see flexvm ps -a): left as it is; flexvm rm {name} removes it").into(),
+            });
+        }
+    }
     if let Some(id) = of {
         let checkpoint = host.suspended(name)?.exists();
         match owns(host, &lock, id, checkpoint) {
@@ -1718,8 +1734,16 @@ fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool, of: Option<&ho
     if host.suspended(name)?.exists() {
         lifecycle::revoke(host, name)??;
     }
-    if logs {
+    if logs && had {
         lock.remove_logs()?;
+    } else if logs {
+        // Holding the name: its holder, if any, proven dead by its full identity (`take_name` reaps
+        // only on `Liveness::Gone`, and a live one, in any PID namespace, holds the lock). Logs a
+        // live `run` prepares for the VM it starts are its own, and stay.
+        if !lock.remove_unowned_logs()? && lock.prior.is_none() {
+            drop(lock);
+            return nothing_to_remove(host, name);
+        }
     }
     // Its exit status too (`rm`: a removed VM has none left to wait for), held under the name and
     // only once it is known to be the instance's whose records go: never a later VM's of the name.
@@ -1731,6 +1755,18 @@ fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool, of: Option<&ho
         }
     }
     Ok(())
+}
+
+/// Why there is nothing under `name` to remove: a VM starting (holding the name, or a `run`
+/// preparing its logs), one that moved away, or no VM at all.
+fn nothing_to_remove(host: &Host, name: &str) -> Result<()> {
+    if host.alive(name) || host.has_record(name, "logs") && !host.left_unrecorded(name)? {
+        bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
+    }
+    match std::fs::read_to_string(host.vms(name, "moved")?) {
+        Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
+        Err(_) => Err(format!("no vm named {name:?}").into()),
+    }
 }
 
 /// Withdraws the generation an address was lent out with, everywhere, and forgets what
@@ -3165,6 +3201,91 @@ mod exec_tests {
         assert_eq!(containers::exit_record(&host, "web").map(|e| e.ident), Some(b.clone()), "a later vm's exit status is kept");
         remove_stopped(&host, "web", true, true, Some(&b)).unwrap();
         assert!(containers::exit_record(&host, "web").is_none());
+    }
+
+    /// #1187: a VM SIGKILLed before it recorded anything leaves its logs and a dead holder's lock
+    /// (or, swept, only its logs). `ps -a` lists no VM of the name, and `rm` and `rm -f` remove what
+    /// it left, judging its holder dead holding the name; never a live holder's, a starting `run`'s
+    /// logs, or a moved hint.
+    #[test]
+    fn rm_removes_what_a_vm_that_recorded_nothing_left() {
+        let root = crate::test_util::TempDir::new("rm-unrecorded");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let listed = |n: &str| vms(&host).iter().any(|v| v["name"] == n);
+        for force in [false, true] {
+            for swept in [false, true] {
+                if !swept {
+                    std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&dead_ident()).unwrap()).unwrap();
+                }
+                host.write_log("web", "log", "killed vm");
+                assert!(!listed("web"));
+                // `kill` is for a running VM: what it left stays.
+                assert_eq!(remove(&host, "web", true, false).unwrap_err().to_string(), "no vm named \"web\"");
+                assert!(host.has_record("web", "log"));
+                remove(&host, "web", force, true).unwrap();
+                assert!(!host.has_record("web", "log") && !host.has_record("web", "logs"), "force={force} swept={swept}");
+                assert_eq!(host.name_holder("web").unwrap(), None, "the name is free");
+                assert!(!listed("web"));
+                assert_eq!(remove(&host, "web", force, true).unwrap_err().to_string(), "no vm named \"web\"");
+            }
+        }
+        // A holder not proven dead (alive, as one of another PID namespace may be told) is never reaped.
+        let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&host::Ident::of(child.id()).unwrap()).unwrap()).unwrap();
+        host.write_log("web", "log", "live vm");
+        assert!(remove(&host, "web", true, true).is_err());
+        assert!(host.has_record("web", "log"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        remove(&host, "web", false, true).unwrap();
+        // Logs a live `run` prepares for the VM it starts stay theirs.
+        drop(host.own_logs("web", Some("token")).unwrap());
+        host.write_log("web", "log", "starting vm");
+        let e = remove(&host, "web", false, true).unwrap_err().to_string();
+        assert!(e.contains("is starting"), "{e}");
+        assert!(host.has_record("web", "log"));
+        host.retire_logs("web").unwrap();
+        // A moved hint stays.
+        std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&dead_ident()).unwrap()).unwrap();
+        std::fs::write(host.vms("web", "moved").unwrap(), "peer").unwrap();
+        let e = remove(&host, "web", true, true).unwrap_err().to_string();
+        assert!(e.contains("moved to peer"), "{e}");
+        assert!(host.has_record("web", "moved"));
+    }
+
+    /// #1188 review: a removal of only a SIGKILLed VM's logs that took the name late finds what a VM
+    /// that took it meanwhile left (moved away, or ended): checked again holding the name, nothing
+    /// of it is removed.
+    #[test]
+    fn a_late_rm_of_unrecorded_logs_keeps_what_a_later_vm_left() {
+        let root = crate::test_util::TempDir::new("rm-unrecorded-late");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        for (record, err) in [("moved", "moved to peer; kill it there"), ("exited", "ended meanwhile"), ("failed", "ended meanwhile")] {
+            for force in [false, true] {
+                // `remove_stopped`'s checks passed (only orphaned logs); the later VM then left these.
+                host.write_log("web", "log", "later vm");
+                std::fs::write(host.vms("web", record).unwrap(), if record == "moved" { "peer" } else { "{}" }).unwrap();
+                let dead = dead_ident();
+                containers::record_exit(&host, "web", &dead, 0, true);
+                std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&dead).unwrap()).unwrap();
+                let e = remove_held(&host, "web", false, true, None).unwrap_err().to_string();
+                assert!(e.contains(err), "{record}, force={force}: {e}");
+                for ext in [record, "log", "exit"] {
+                    assert!(host.has_record("web", ext), "{record}: its {ext} is kept");
+                }
+                assert_eq!(host.name_holder("web").unwrap(), Some(dead), "left as found");
+                if record == "moved" {
+                    host.retire_logs("web").unwrap();
+                    for ext in ["moved", "exit", "lock"] {
+                        std::fs::remove_file(host.vms("web", ext).unwrap()).unwrap();
+                    }
+                } else {
+                    // Seen now: `rm` removes it.
+                    remove(&host, "web", force, true).unwrap();
+                    assert!(!host.has_record("web", record) && !host.has_record("web", "log"));
+                }
+            }
+        }
     }
 
     /// #1185: a delayed `rm -f` signalled A; B took the name and crashed holding it, unrecorded. The
