@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 mod tar;
 
 use crate::bail;
+use crate::containers::Exit;
 use crate::guest::{
     self, frame, FRAME_ACK, FRAME_LOST, FRAME_MSG, FRAME_NOTE, FRAME_STDERR, FRAME_STDOUT, IN_DATA, IN_DETACH, IN_EOF, IN_RESIZE, MAX_INPUT, SESSION_DONE,
 };
@@ -438,19 +439,33 @@ fn open(vm: &Pinned, req: &Value) -> Result<BufReader<UnixStream>> {
 /// Why attaching to the VM can go on no more, its VM process gone: its app's status if it exited.
 fn gone(vm: &Pinned) -> Result<i32> {
     let (host, name) = (&vm.host, &vm.name());
-    // The process last reached: only its own end is told (one made again under the name since may have ended too).
-    let process = vm.pin.lock().unwrap().pin.process.clone();
-    let last = crate::containers::exit_record(host, name).map(|e| e.ident);
-    if process.is_some() && last.is_some() && last != process {
+    // Only its own VM's end is told: one made again under the name since may have ended too. Its own is the
+    // instance it pinned (a resume's process, after a stop and start, too, though never reached); a record from
+    // before the instance was kept is judged by the process last reached.
+    let last = crate::containers::exit_record(host, name);
+    // None: no end of its own recorded (its exited record, if any, is not taken as its own).
+    let ours = {
+        let mut s = vm.pin.lock().unwrap();
+        let ours = match (&last, s.pin.vm, &s.pin.process) {
+            (_, _, None) => Some(true),
+            (None, ..) => None,
+            (Some(Exit { vm: Some(ran), .. }), Some(pinned), _) => Some(*ran == pinned),
+            (Some(e), _, Some(process)) => Some(e.ident == *process),
+        };
+        // Its status and records are those of the process that ended: the one `attach_to` reports.
+        if let (Some(true), Some(e), Some(_)) = (ours, &last, &s.pin.process) {
+            s.pin.process = Some(e.ident.clone());
+        }
+        ours
+    };
+    if ours == Some(false) {
         bail!("vm {name} was killed and made again since this attached; the vm it attached to is gone");
     }
     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
         bail!("vm {name} moved to {to}; attach to it there");
     }
-    if let Ok(rec) = crate::app::Exited::read(&host.vms(name, "exited")?) {
-        if process.is_none() || last == process {
-            return Ok(rec.status);
-        }
+    if let (Some(true), Ok(rec)) = (ours, crate::app::Exited::read(&host.vms(name, "exited")?)) {
+        return Ok(rec.status);
     }
     if host.is_suspended(name) {
         bail!("vm {name} was stopped; flexvm start {name}, then attach again");
@@ -1035,6 +1050,35 @@ mod tests {
         // Its own end: its status.
         crate::containers::record_exit(&host, "web", &ours, 0, false);
         assert_eq!(gone(&vm).unwrap(), 0);
+    }
+
+    /// #1208: judged by the instance it pinned. A resume's process (after a stop and start it never reached)
+    /// that ended is its own VM's: its status, and the process `attach_to` reports; another instance's is not.
+    #[test]
+    fn an_attach_takes_its_resumed_vms_status() {
+        let root = crate::test_util::TempDir::new("attach-resumed");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let ours = crate::host::Ident { pid: 999_999_901, start: 1, boot: crate::host::boot_id().into(), ns: None };
+        let resumed = crate::host::Ident { pid: 999_999_902, ..ours.clone() };
+        let ip = "10.0.0.2".parse().unwrap();
+        let vm = Pinned { host: host.clone(), name: "web".into(), pin: Arc::default() };
+        {
+            let mut s = vm.pin.lock().unwrap();
+            (s.pin.vm, s.pin.process) = (Some(crate::Instance { ip, gen: 7 }), Some(ours.clone()));
+        }
+        let rec = crate::app::Exited::new(4, "t".into(), None, Default::default(), Default::default(), 0);
+        crate::host::write_record(&host.vms("web", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
+        // Killed and made again (a new generation), that one exited: not its own.
+        crate::containers::record_exit_of(&host, "web", &resumed, Some(crate::Instance { ip, gen: 8 }), 4, true);
+        assert!(gone(&vm).unwrap_err().to_string().contains("made again"));
+        assert_eq!(vm.pin.lock().unwrap().pin.process, Some(ours.clone()));
+        // Its resumed process exited: its status, that process its own.
+        crate::containers::record_exit_of(&host, "web", &resumed, Some(crate::Instance { ip, gen: 7 }), 4, true);
+        assert_eq!(gone(&vm).unwrap(), 4);
+        assert_eq!(vm.pin.lock().unwrap().pin.process, Some(resumed));
+        // No end of its own recorded: its exited record is not taken as its own.
+        std::fs::remove_file(host.vms("web", "exit").unwrap()).unwrap();
+        assert!(gone(&vm).is_err());
     }
 
     /// #832: the stdin connection of an app that ended at once closed before its reply: asked again, it is

@@ -1397,6 +1397,8 @@ impl Proc {
             rec.settle(matches!(end, End::Gone));
         }
         let exited = matches!(end, End::Gone) && *self.exiting.lock().unwrap() == Some(code);
+        // The VM it ran, before its claim goes: its exit record tells a resume's end from another VM's.
+        let instance = self.vm.get().map(|v| crate::Instance { ip: v.ip, gen: self.gen() }).filter(|i| i.gen != 0);
         self.end_claim(end, source_runs);
         if let Some(dir) = self.consumed.lock().unwrap().take() {
             crate::lifecycle::delete_consumed(&self.name(), &dir);
@@ -1406,7 +1408,7 @@ impl Proc {
         }
         // Before the name goes: `flexvm wait` reads it as this instance's.
         if let Some(n) = self.name.lock().unwrap().as_ref() {
-            crate::containers::record_exit(&self.host, &n.name, &self.ident, code, exited);
+            crate::containers::record_exit_of(&self.host, &n.name, &self.ident, instance, code, exited);
         }
         drop(self.name.lock().unwrap().take());
         for f in self.files.lock().unwrap().drain(..) {

@@ -2343,7 +2343,7 @@ fn exec_request(
 /// Which VM a command runs in: its address and that address's generation. A
 /// suspend and resume, or a migration, keeps both; a VM made again under the
 /// name (after a kill) has a new generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Instance {
     ip: std::net::Ipv4Addr,
     gen: u64,
@@ -2541,7 +2541,7 @@ mod exec_tests {
     fn stop_takes_only_the_signalled_instances_app_exit() {
         let me = host::Ident::me();
         let earlier = host::Ident { pid: me.pid.wrapping_add(1), ..me.clone() };
-        let exit = |ident: &host::Ident, code, app| containers::Exit { ident: ident.clone(), code, app };
+        let exit = |ident: &host::Ident, code, app| containers::Exit { ident: ident.clone(), code, app, vm: None };
         for code in [0, 4, vmproc::DIED, 130, 131] {
             assert!(app_exited(Some(&exit(&me, code, Some(true))), &me), "the app's own {code}");
             assert!(!app_exited(Some(&exit(&me, code, Some(false))), &me), "flexvm's {code}");
