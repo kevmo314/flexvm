@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::host::Host;
+use crate::host::{Host, Verdict};
 use crate::template::Paths;
 use crate::util::{proc_kb, recv_json, Result};
 use crate::vmproc::Start;
@@ -1624,7 +1624,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         if !vm.pidfd.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
         }
-        // Only what the instance signalled left is undone or removed (`owns`), under the name it had last.
+        // Only what the instance signalled left is undone or removed (`HeldName::verdict`), under the name it had last.
         let (Ended { last, shown, records, .. }, ident) = (vm.ended(host), &vm.ident);
         // A migration past its pause refused the kill, and the VM runs on at its target (#567).
         if let Some(Some(to)) = records.moved {
@@ -1636,20 +1636,15 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         }
         // A suspend that finished before the kill took is undone: the kill wins.
         if host.suspended(&last)?.exists() {
-            let lock = host.take_name(&last, true)?;
-            // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
-            if host.suspended(&last)?.exists() {
-                match owns(host, &lock, ident, true) {
-                    Some(true) => lifecycle::revoke(host, &last)??,
-                    // Another instance's, or not shown whose: left as found, its dead holder's record too (#1185).
-                    Some(false) => lock.release_to_prior(),
-                    None => {
-                        lock.release_to_prior();
-                        return Err(unconfirmed(&shown, &last));
-                    }
+            let held = host::HeldName::new(host.take_name(&last, true)?);
+            // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or
+            // resume's). Another instance's: left as found, its dead holder's record too (#1185).
+            if held.records.stopped() {
+                match held.verdict(ident) {
+                    Verdict::Mine => drop(held.revoke()?),
+                    Verdict::Theirs => {}
+                    Verdict::Unknown | Verdict::Nothing => return Err(unconfirmed(&shown, &last)),
                 }
-            } else {
-                lock.release_to_prior();
             }
         }
         return done();
@@ -1669,23 +1664,6 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
     }
     nothing_to_remove(host, name)
-}
-
-/// Whether what is under the name `lock` holds is what `ident` left, decided holding the name; None
-/// when nothing shows whose it is. A stopped VM (`checkpoint`): who suspended it, as its checkpoint
-/// says. Its other records: a holder that died holding the name (the newest one to hold it) is
-/// theirs; else its exit record's instance is (a rename into the name, or another VM's end under
-/// it, replaces that record; a sweep, or taking the name, removes one a later holder's death made stale).
-fn owns(host: &Host, lock: &host::NameLock, ident: &host::Ident, checkpoint: bool) -> Option<bool> {
-    if checkpoint {
-        if let Some(owner) = host.suspended(&lock.name).ok().and_then(|d| lifecycle::read_owner(&d)) {
-            return Some(owner == *ident);
-        }
-    }
-    if let Some(prior) = &lock.prior {
-        return Some(prior == ident);
-    }
-    containers::exit_record(host, &lock.name).map(|e| e.ident == *ident)
 }
 
 /// What is under `last` now may not be what the VM killed left: left as it is.
@@ -1720,34 +1698,26 @@ fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host:
         Err(_) if host.alive(name) => bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"),
         Err(e) => return Err(e),
     };
-    // Held: taking the name removed any debris, so a checkpoint is a stopped VM's.
-    let r = host::Records::read(host, name);
+    let held = host::HeldName::new(lock);
+    let r = &held.records;
     if !had && (r.moved.is_some() || r.recorded()) {
-        lock.release_to_prior();
-        return Err(match r.moved {
+        return Err(match &r.moved {
             Some(Some(to)) => format!("vm {name} moved to {to}; kill it there").into(),
             Some(None) => format!("vm {name} moved away; kill it where it runs").into(),
             None => format!("vm {name} ended meanwhile (see flexvm ps -a): left as it is; flexvm rm {name} removes it").into(),
         });
     }
-    if let Some(id) = of {
-        let checkpoint = r.stopped();
-        match owns(host, &lock, id, checkpoint) {
-            Some(true) => {}
-            // Another instance's: left as found, its dead holder's record too (#1185).
-            Some(false) => {
-                lock.release_to_prior();
-                return Ok(());
-            }
-            // Nothing left of any VM under the name: nothing to remove.
-            // Its log alone, as before `Records` (never its logs' directory or `log.1`).
-            None if !checkpoint && !r.ended() && !host.has_record(name, "log") => return Ok(()),
-            None => return Err(unconfirmed(name, name)),
-        }
+    match of.map(|id| held.verdict(id)) {
+        None | Some(Verdict::Mine) => {}
+        // Another instance's: left as found, its dead holder's record too (#1185). Nothing left of
+        // any VM under the name: nothing to remove.
+        Some(Verdict::Theirs | Verdict::Nothing) => return Ok(()),
+        Some(Verdict::Unknown) => return Err(unconfirmed(name, name)),
     }
-    if r.stopped() {
-        lifecycle::revoke(host, name)??;
-    }
+    let lock = match held.records.stopped() {
+        true => held.revoke()?,
+        false => held.take(),
+    };
     if logs && had {
         lock.remove_logs()?;
     } else if logs {
@@ -3225,7 +3195,7 @@ mod exec_tests {
             }
             let lock = host.take_name("web", true).unwrap();
             assert_eq!(lock.prior.as_ref(), prior);
-            lock
+            host::HeldName::new(lock)
         };
         let checkpoint = |owner: Option<&host::Ident>| {
             let dir = host.suspended("web").unwrap();
@@ -3240,22 +3210,24 @@ mod exec_tests {
         containers::record_exit(&host, "web", &a, 130, false);
         checkpoint(None);
         let lock = take(Some(&b));
-        assert_eq!(owns(&host, &lock, &a, true), Some(false), "a later holder's death outranks an older exit record");
-        assert_eq!(owns(&host, &lock, &b, true), Some(true));
+        assert_eq!(lock.verdict(&a), Verdict::Theirs, "a later holder's death outranks an older exit record");
+        assert_eq!(lock.verdict(&b), Verdict::Mine);
         drop(lock);
         checkpoint(Some(&b));
         let lock = take(Some(&b));
-        assert_eq!(owns(&host, &lock, &a, true), Some(false));
+        assert_eq!(lock.verdict(&a), Verdict::Theirs);
         drop(lock);
         // A suspended, then died before recording its exit; a sweep took its lock (and the stale
         // record, as taking B's did: #1185).
         assert!(containers::exit_record(&host, "web").is_none(), "taking a dead holder's name drops an earlier instance's exit status");
         checkpoint(Some(&a));
         let lock = take(None);
-        assert_eq!(owns(&host, &lock, &a, true), Some(true), "its checkpoint says it suspended it");
-        assert_eq!(owns(&host, &lock, &b, true), Some(false));
-        assert_eq!(owns(&host, &lock, &a, false), None, "its other records: nothing shows whose");
+        assert_eq!(lock.verdict(&a), Verdict::Mine, "its checkpoint says it suspended it");
+        assert_eq!(lock.verdict(&b), Verdict::Theirs);
         drop(lock);
+        // Its checkpoint gone: nothing left shows whose.
+        std::fs::remove_dir_all(host.suspended("web").unwrap()).unwrap();
+        assert_eq!(take(None).verdict(&a), Verdict::Nothing, "nothing left of any vm");
         // `rm -f` of A removes its checkpoint; of B leaves it; unknown, it refuses.
         checkpoint(Some(&a));
         remove_stopped(&host, "web", true, true, Some(&b), true).unwrap();

@@ -457,11 +457,13 @@ fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce
             None => crate::no_vm(host, from),
         });
     }
-    let _from = take_rename_name(host, from)?;
+    // Let go as found (its dead holder's record kept) unless the checkpoint moves.
+    let held = crate::host::HeldName::new(take_rename_name(host, from)?);
     // Taking the name removed what an interrupted suspend, resume or discard left.
-    if !host.is_suspended(from) {
+    if !held.records.stopped() {
         bail!("no vm named {from:?}");
     }
+    let _from; // Let go after `to`.
     let _to = host.take_unrecorded_name(to)?;
     // What of moving its records can fail, before its checkpoint and claim move: never half renamed.
     prepare_records(host, from, to)?;
@@ -480,6 +482,7 @@ fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce
             let _ = crate::util::unlink_durably(&journal);
             return Err(e.into());
         }
+        _from = held.take();
         // The checkpoint is at `to` now, maybe not durably: the journal stays, so the claim stays
         // `from`'s, held by the directory at either name, and the next to take `to` moves it.
         if let Err(e) = sync(&parent) {
@@ -509,12 +512,14 @@ fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce
 /// An exited VM (`app::Exited`): no checkpoint or address claim, only its record (what `start`
 /// runs again), logs and exit status move, both names held.
 fn rename_exited(host: &Host, from: &str, to: &str) -> Result<()> {
-    let _from = take_rename_name(host, from)?;
-    if !host.has_record(from, "exited") || host.is_suspended(from) {
+    let held = crate::host::HeldName::new(take_rename_name(host, from)?);
+    if !held.records.exited || held.records.stopped() {
         bail!("vm {from} changed meanwhile: try again");
     }
+    let _from;
     // Refuses a `failed`, `lost` or `exited` record of `to`, and a stopped vm of it.
     let _to = host.take_unrecorded_name(to)?;
+    _from = held.take();
     move_records(host, from, to)
 }
 
@@ -1680,10 +1685,16 @@ mod tests {
         suspended_vm(&host, "old", "10.0.0.9");
         host.write_log("old", "log", "hello\n");
         host.write_log("new", "log.1", "an earlier vm's\n");
-        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, STOPPED, false);
+        let dead = Ident { pid: 1, start: 1, boot: "b".into(), ns: None };
+        record_exit(&host, "old", &dead, STOPPED, false);
         std::fs::write(host.vms("taken", "failed").unwrap(), "died").unwrap();
+        // A dead holder's record is left as found by a rename that fails, and goes with one that moves the vm.
+        let lock = host.vms("old", "lock").unwrap();
+        std::fs::write(&lock, serde_json::to_vec(&dead).unwrap()).unwrap();
         assert!(rename_stopped(&host, "old", "taken").unwrap_err().to_string().contains("taken"));
+        assert_eq!(host.name_holder("old").unwrap(), Some(dead));
         rename_stopped(&host, "old", "new").unwrap();
+        assert!(!lock.exists());
         assert!(!dir.exists() && host.is_suspended("new"));
         assert_eq!(std::fs::read_to_string(host.vms("new", "log").unwrap()).unwrap(), "hello\n");
         assert!(!host.vms("new", "log.1").unwrap().exists(), "the earlier vm's log does not pass for its");
