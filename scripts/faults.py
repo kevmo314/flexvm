@@ -369,6 +369,27 @@ def alive(pid):
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+def exited(pid, start):
+    """Whether every thread of `pid` (started at `start`, `starttime_of`) exited, not only its leader: a
+    killed process's leader is a zombie (not `alive`) while its other threads still exit, the last one
+    closing its files (and so letting go of its locks) only then, after a tap's close waits out the
+    kernel's netdev teardown, say. Reaped, its pid taken by another process (another start time): exited."""
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return True
+    if starttime_of(pid) != start:
+        return True
+    for t in tasks:
+        try:
+            stat = open(f"/proc/{pid}/task/{t}/stat").read()
+        except OSError:
+            continue
+        if stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X"):
+            return False
+    return True
+
+
 def vm_pid(host, name):
     return vms(host)[name]["pid"]
 
@@ -3765,9 +3786,11 @@ def arrival_killed_route():
     time.sleep(2)
     check("arrival killed route: the route via the peer stays while it waits", f"via {gw}" in peer_route(ip), peer_route(ip))
     subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+    start = starttime_of(pid)
     os.kill(pid, signal.SIGKILL)
     s.close()
-    check("arrival killed route: dead", wait_for(lambda: not alive(pid), 10), pid)
+    # Its arrival's lock is let go of (and its log can be swept) only once its last thread is gone.
+    check("arrival killed route: dead", wait_for(lambda: exited(pid, start), 10), pid)
     st = ok(peer(B, {"op": "migration", "mig": mig}))
     check("arrival killed route: aborted", st["outcome"] == "aborted", st)
     check("arrival killed route: the route via the peer is put back", f"via {gw}" in peer_route(ip), (peer_route(ip), addr(B, ip)))
