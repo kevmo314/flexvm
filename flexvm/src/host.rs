@@ -835,33 +835,33 @@ impl Host {
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
-        self.take_name_as(name, resuming, false, handed(), false, false)
+        self.take_name_as(name, Take { resuming, ..Take::new() })
     }
 
     /// `take_name` of a new name by the VM process a `run` handed its logs to with `token`
     /// (`own_logs`): a claimed standby, told in the claim.
     pub fn take_handed_name(&self, name: &str, token: Option<&str>) -> Result<NameLock> {
-        self.take_name_as(name, false, false, token, false, false)
+        self.take_name_as(name, Take { handed: token, ..Take::new() })
     }
 
     /// `take_name` of a new name for a VM (`rename`): a `failed` or `lost` record of it is
     /// refused, decided holding the name, never cleared.
     pub fn take_unrecorded_name(&self, name: &str) -> Result<NameLock> {
-        self.take_name_as(name, false, true, handed(), false, false)
+        self.take_name_as(name, Take { refuse_records: true, ..Take::new() })
     }
 
     /// `take_name` of a new name for a restore: `own`, of the checkpoint's own name, it is that
     /// VM going on, so it keeps the name's logs as `start` does (a failed, lost or moved VM's
     /// still go); under another name (a fork), a fresh log.
     pub fn take_restoring_name(&self, name: &str, own: bool) -> Result<NameLock> {
-        self.take_name_as(name, false, false, handed(), own, false)
+        self.take_name_as(name, Take { keep_logs: own, ..Take::new() })
     }
 
     /// `take_name` of a new name for a VM migrating in: a VM of it that moved away leaves its hint
     /// (`NAME.moved`, where it went) and its logs until the arrival commits (`arrived`), so an
     /// arrival that fails leaves them as they were.
     pub fn take_arriving_name(&self, name: &str) -> Result<NameLock> {
-        self.take_name_as(name, false, false, handed(), false, true)
+        self.take_name_as(name, Take { arriving: true, ..Take::new() })
     }
 
     /// An arrival under `name` (held) committed: the hint of a VM that moved away goes, as do
@@ -880,7 +880,8 @@ impl Host {
         unhinted.and(retired)
     }
 
-    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool, handed: Option<&str>, keep_logs: bool, arriving: bool) -> Result<NameLock> {
+    fn take_name_as(&self, name: &str, how: Take) -> Result<NameLock> {
+        let Take { resuming, refuse_records, handed, keep_logs, arriving } = how;
         if !resuming {
             check_new_name(name)?;
         }
@@ -906,8 +907,9 @@ impl Host {
         // Exclusively held: a partial holder is an earlier owner's interrupted write.
         // Read errors still fail; Firecrackers are reaped on proof of death only.
         let bytes = read_record(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
-        if let Some(old) = serde_json::from_slice::<Ident>(&bytes).ok().filter(|o| *o != Ident::me()) {
-            reap(&self.run, &old)?;
+        let prior = serde_json::from_slice::<Ident>(&bytes).ok().filter(|o| *o != Ident::me());
+        if let Some(old) = &prior {
+            reap(&self.run, old)?;
         }
         self.finish_rename(name)?;
         if refuse_records {
@@ -951,7 +953,7 @@ impl Host {
         }
         f.set_len(0)?;
         f.write_all_at(&serde_json::to_vec(&Ident::me())?, 0)?;
-        Ok(NameLock { name: name.into(), host: self.clone(), _file: f })
+        Ok(NameLock { name: name.into(), prior, host: self.clone(), _file: f })
     }
 
     /// `start` of an exited VM: its name, and its record's path, which the rerun reads under it
@@ -2372,6 +2374,13 @@ impl Host {
 
     /// A record whose process died becomes aborted once its Firecrackers are
     /// dead: committed or not, the source's paused copy is the only one left.
+    /// What changes as migration `id`'s record is written or removed (`store` replaces it): read
+    /// without the host lock, so a status long-poll asks again only once it changes (`mig_status`).
+    pub fn mig_stamp(&self, id: u64) -> Option<(u64, i64, i64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(self.mig_path(id)).ok().map(|m| (m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
+    }
+
     pub fn mig_status(&self, id: u64) -> Result<&'static str> {
         let l = self.lock()?;
         let path = self.mig_path(id);
@@ -3233,6 +3242,9 @@ thread_local! {
 
 pub struct NameLock {
     pub name: String,
+    /// Who held the name last, and died holding it (its lock's record left behind): nothing took
+    /// the name since.
+    pub prior: Option<Ident>,
     host: Host,
     _file: File,
 }
@@ -3374,6 +3386,26 @@ pub const HANDOFF_ENV: &str = "FLEXVM_LOGS_HANDOFF";
 
 /// This process's handed logs' token, if a `run` started it with one: read once, at its start
 /// (`main` then clears it, so no process of its own inherits it).
+/// How `Host::take_name_as` takes a name: what a holder of it may find there, and what of it stays.
+struct Take<'a> {
+    /// A `start` going on with the stopped or exited VM of the name, not a new VM of it.
+    resuming: bool,
+    /// A `failed` or `lost` record of the name refuses it (`rename`), never cleared.
+    refuse_records: bool,
+    /// The token of a `run` that handed its logs to this process (`own_logs`).
+    handed: Option<&'a str>,
+    /// The name's logs stay (a restore under the checkpoint's own name).
+    keep_logs: bool,
+    /// A VM migrating in: a moved hint and the logs stay until it commits (`Host::arrived`).
+    arriving: bool,
+}
+
+impl Take<'_> {
+    fn new() -> Self {
+        Take { resuming: false, refuse_records: false, handed: handed(), keep_logs: false, arriving: false }
+    }
+}
+
 pub fn handed() -> Option<&'static str> {
     static HANDED: OnceLock<Option<String>> = OnceLock::new();
     HANDED.get_or_init(|| std::env::var(HANDOFF_ENV).ok().filter(|t| !t.is_empty())).as_deref()

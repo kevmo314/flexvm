@@ -9697,6 +9697,163 @@ def stop_renamed():
     check("stop renamed: md5 intact", md5(A, to, tries=3) == m)
 
 
+def kill_renamed_into():
+    """#1183: `kill` (and `rm -f`) of a running VM, held after its signal (`kill_gate`) while that
+    VM ends and a stopped VM is renamed into its name, leaves the stopped VM alone: only what the
+    instance it signalled left is undone or removed, never a checkpoint renamed in since."""
+    n, other = "ft-kill-into", "ft-kill-into-other"
+    scenario_vms.update((n, other))
+    for argv in (("kill", n), ("rm", "-f", n)):
+        what = " ".join(argv[:-1])
+        setup(n, mib=1)
+        m = setup(other, mib=1)
+        code, out, err = cli(A, "stop", other)
+        check(f"kill renamed into ({what}): the other vm is stopped", code == 0 and vms(A).get(other, {}).get("state") == "suspended", (code, err, vms(A).get(other)))
+        clear_gate(A, "kill_gate")
+        killer = None
+        fault(A, "kill_gate", 600000)
+        try:
+            killer = spawn_cli(A, *argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            check(f"kill renamed into ({what}): the kill signalled, then held", wait_for(lambda: reached(A, "kill_gate"), 30), reached(A, "kill_gate"))
+            check(f"kill renamed into ({what}): the killed vm is gone", name_free(A, n, 30), vms(A).get(n))
+            code, out, err = cli(A, "rename", other, n)
+            check(f"kill renamed into ({what}): the stopped vm is renamed into the name", code == 0, (code, out, err))
+        finally:
+            release(A, "kill_gate")
+        if killer:
+            out, err = communicate_process(killer, 60)
+            check(f"kill renamed into ({what}): the kill succeeds", killer.returncode == 0 and out.strip() == n, (killer.returncode, out, err))
+        check(f"kill renamed into ({what}): the renamed vm stays stopped, its checkpoint kept", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+        code, out, err = cli(A, "start", n)
+        check(f"kill renamed into ({what}): it starts again", code == 0 and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), (code, err, vms(A).get(n)))
+        check(f"kill renamed into ({what}): md5 intact", md5(A, n, tries=3) == m)
+        kill(A, n)
+        check(f"kill renamed into ({what}): cleaned up", name_free(A, n, 30), vms(A).get(n))
+
+
+def kill_crashed_owner():
+    """#1184: a delayed `kill` decides by who suspended the checkpoint under the name (its OWNER),
+    not by records a crash or a sweep leaves. (1) The VM it signalled published its suspend and was
+    SIGKILLed before recording its exit, a sweep then taking its lock: its checkpoint is revoked
+    all the same. (2) The VM it signalled ended; a new VM of the name then published a suspend and
+    was SIGKILLed unrecorded (the first one's exit record stale): that checkpoint is kept."""
+    n = "ft-kill-crashed"
+    scenario_vms.add(n)
+
+    def crash_suspended(what):
+        """`stop`s `n`, held once its checkpoint is published; SIGKILLs its process there."""
+        pid = vm_pid(A, n)
+        clear_gate(A, "suspend_gate")
+        fault(A, "suspend_gate", 600000)
+        stopper = spawn_cli(A, "stop", n)
+        check(f"kill crashed owner ({what}): the suspend is published, held", wait_for(lambda: pid in reached(A, "suspend_gate"), 60), reached(A, "suspend_gate"))
+        return pid, stopper
+
+    def killed(pid):
+        os.kill(pid, signal.SIGKILL)
+        check("kill crashed owner: its process is gone", wait_for(lambda: not os.path.exists(f"/proc/{pid}"), 30))
+
+    for g in ("kill_gate", "suspend_gate"):
+        clear_gate(A, g)
+    setup(n, mib=1)
+    stopper = killer = None
+    try:
+        pid, stopper = crash_suspended("own")
+        fault(A, "kill_gate", 600000)
+        killer = spawn_cli(A, "kill", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("kill crashed owner (own): the kill signalled, then held", wait_for(lambda: reached(A, "kill_gate"), 30), reached(A, "kill_gate"))
+        killed(pid)
+        code, out, err = cli(A, "debug", "gc")
+        check("kill crashed owner (own): swept", code == 0, (code, err))
+    finally:
+        release(A, "kill_gate")
+        release(A, "suspend_gate")
+    if killer:
+        out, err = communicate_process(killer, 60)
+        check("kill crashed owner (own): the kill succeeds", killer.returncode == 0 and out.strip() == n, (killer.returncode, out, err))
+    if stopper:
+        communicate_process(stopper, 60)
+    check("kill crashed owner (own): its checkpoint is revoked", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
+
+    setup(n, mib=1)
+    stopper = killer = None
+    try:
+        fault(A, "kill_gate", 600000)
+        killer = spawn_cli(A, "kill", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("kill crashed owner (other): the kill signalled, then held", wait_for(lambda: reached(A, "kill_gate"), 30), reached(A, "kill_gate"))
+        check("kill crashed owner (other): the killed vm is gone", name_free(A, n, 30), vms(A).get(n))
+        m = setup(n, mib=1)
+        pid, stopper = crash_suspended("other")
+        killed(pid)
+    finally:
+        release(A, "kill_gate")
+        release(A, "suspend_gate")
+    if killer:
+        out, err = communicate_process(killer, 60)
+        check("kill crashed owner (other): the kill succeeds", killer.returncode == 0 and out.strip() == n, (killer.returncode, out, err))
+    if stopper:
+        communicate_process(stopper, 60)
+    check("kill crashed owner (other): the later vm stays stopped", wait_for(lambda: vms(A).get(n, {}).get("state") == "suspended", 30), vms(A).get(n))
+    code, out, err = cli(A, "start", n)
+    check("kill crashed owner (other): it starts again", code == 0 and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), (code, err, vms(A).get(n)))
+    check("kill crashed owner (other): md5 intact", md5(A, n, tries=3) == m)
+
+
+def rm_later_exit():
+    """#1184: a delayed `rm -f` (held at `kill_gate` after its signal) of a VM that ends, a new VM of
+    the name then running and exiting (`--rm`: its exit status its only record), leaves that VM's
+    exit status: `flexvm wait` still gives it."""
+    n = "ft-rm-later-exit"
+    ok(run(A, n))
+    clear_gate(A, "kill_gate")
+    killer = None
+    fault(A, "kill_gate", 600000)
+    try:
+        killer = spawn_cli(A, "rm", "-f", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("rm later exit: the rm signalled, then held", wait_for(lambda: reached(A, "kill_gate"), 30), reached(A, "kill_gate"))
+        check("rm later exit: the killed vm is gone", name_free(A, n, 30), vms(A).get(n))
+        gated_app(n, 7, "--rm")
+        check("rm later exit: the later vm runs", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+        tell_exit(n, "rm later exit", lambda: name_free(A, n, 1))
+        check("rm later exit: the later vm exited", name_free(A, n, 30), vms(A).get(n))
+    finally:
+        release(A, "kill_gate")
+    if killer:
+        out, err = communicate_process(killer, 60)
+        check("rm later exit: the rm succeeds", killer.returncode == 0 and out.strip() == n, (killer.returncode, out, err))
+    code, out, err = cli(A, "wait", n)
+    check("rm later exit: wait gives the later vm's exit status", code == 0 and out.strip() == "7", (code, out, err))
+
+
+def pause_renamed():
+    """#1183: a rename that holds the VM's op (its checks passed) as `pause`'s SIGTSTP lands moves
+    the VM on before the pause runs: pause follows the instance it signalled under its new name, and
+    is done once it is paused there (never "ended before it paused")."""
+    n, to = "ft-pause-renamed", "ft-pause-renamed-to"
+    scenario_vms.update((n, to))
+    m = setup(n, mib=1)
+    clear_gate(A, "rename_gate")
+    pauser = None
+    fault(A, "rename_gate", 600000)
+    try:
+        renamer = spawn_cli(A, "rename", n, to, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("pause renamed: the rename holds the op", wait_for(lambda: reached(A, "rename_gate"), 30), reached(A, "rename_gate"))
+        pauser = spawn_cli(A, "pause", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Its SIGTSTP taken: the pause waits for the op the rename holds (nothing published shows it).
+        time.sleep(2)
+        check("pause renamed: the pause is waiting", pauser.poll() is None and vms(A).get(n, {}).get("state") == "running", (pauser.poll(), vms(A).get(n)))
+    finally:
+        release(A, "rename_gate")
+    out, err = communicate_process(renamer, 60)
+    check("pause renamed: renamed", renamer.returncode == 0 and out.strip() == to, (renamer.returncode, out, err))
+    out, err = communicate_process(pauser, 60)
+    check("pause renamed: pause succeeds", pauser.returncode == 0 and out.strip() == n, (pauser.returncode, out, err))
+    check("pause renamed: paused under its new name", vms(A).get(to, {}).get("state") == "paused" and n not in vms(A), (vms(A).get(to), vms(A).get(n)))
+    code, out, err = cli(A, "unpause", to)
+    check("pause renamed: unpauses", code == 0 and wait_for(lambda: vms(A).get(to, {}).get("state") == "running", 30), (code, err, vms(A).get(to)))
+    check("pause renamed: md5 intact", md5(A, to, tries=3) == m)
+
+
 def unread_output():
     """`run IMAGE CMD` whose stdout is a pipe nobody reads (output stuck) still
     ends at once on SIGINT, with status 130: printing never holds it up."""
@@ -11748,7 +11905,7 @@ SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
     run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint, kill_held_stopped=kill_held_stopped,
-    stop_renamed=stop_renamed,
+    stop_renamed=stop_renamed, kill_renamed_into=kill_renamed_into, pause_renamed=pause_renamed, kill_crashed_owner=kill_crashed_owner, rm_later_exit=rm_later_exit,
     terminal=terminal,
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,

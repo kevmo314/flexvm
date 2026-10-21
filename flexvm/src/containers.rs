@@ -42,15 +42,6 @@ pub fn exit_record(host: &Host, name: &str) -> Option<Exit> {
     host::load::<Exit>(&host.vms(name, "exit").ok()?).ok().flatten()
 }
 
-/// `rm`: a removed VM has no status left to wait for.
-pub fn forget_exit(host: &Host, name: &str) {
-    if !host.alive(name) {
-        if let Ok(path) = host.vms(name, "exit") {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
 /// The status a suspend ends its process with (`stop`, SIGTERM).
 const STOPPED: i32 = 128 + libc::SIGTERM;
 
@@ -1409,8 +1400,6 @@ mod tests {
         assert!(wait(&host, "web").unwrap_err().to_string().contains("without an exit status"));
         std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&gone).unwrap()).unwrap();
         assert_eq!(wait(&host, "web").unwrap(), 3, "the record is the dead holder's own");
-        forget_exit(&host, "web");
-        assert!(exit_record(&host, "web").is_none());
     }
 
     #[test]
