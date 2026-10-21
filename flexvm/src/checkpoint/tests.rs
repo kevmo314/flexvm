@@ -818,6 +818,27 @@ fn stored(state: &Path, parent: Option<&str>, ms: u64) -> String {
 }
 
 #[test]
+fn a_claimed_name_refuses_a_concurrent_create_until_linked_or_dropped() {
+    let state = tmp("claim");
+    drop(store::lock(&state, libc::LOCK_SH).unwrap());
+    let a = stored(&state, None, 1);
+    let lock = crate::host::locks(&store::dir(&state)).join("name-web");
+    let first = store::claim(&state, "web").unwrap();
+    let e = store::claim(&state, "web").err().unwrap().to_string();
+    assert!(e.contains("being taken by another"), "{e}");
+    assert!(store::claim(&state, "db").is_ok(), "only the same name waits");
+    // Its holder failed: the name is free again, and its lock file gone.
+    drop(first);
+    assert!(!lock.exists());
+    let again = store::claim(&state, "web").unwrap();
+    store::link(&state, "web", &a).unwrap();
+    drop(again);
+    let e = store::claim(&state, "web").err().unwrap().to_string();
+    assert!(e.contains("is taken"), "{e}");
+    assert!(store::claim(&state, "../x").is_err(), "checked as a name first");
+}
+
+#[test]
 fn the_store_names_lists_and_removes_dependants_first() {
     let state = tmp("store");
     drop(store::lock(&state, libc::LOCK_SH).unwrap());

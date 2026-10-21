@@ -369,6 +369,7 @@ fn exec_conf(mut c: Conf, e: &crate::proto::Exec, passwd: &str, group: &str) -> 
 fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let (ms, hex) = arg.trim().split_once(' ').ok_or_else(|| io::Error::other("usage: CHECK <ms> <hex>"))?;
     let ms: u64 = ms.parse().map_err(|_| io::Error::other("bad timeout"))?;
+    let deadline = check_deadline(Instant::now(), ms)?;
     let bytes = unhex(hex).ok_or_else(|| io::Error::other("bad command encoding"))?;
     let c = config()?;
     let mut cg = match CheckGroup::new() {
@@ -385,7 +386,7 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     credentials(&mut cmd, c, true);
     let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
     let pid = child.id() as i32;
-    let code = wait_exit(statuses, token, Some(Instant::now() + Duration::from_millis(ms)));
+    let code = wait_exit(statuses, token, Some(deadline));
     // Kill whatever is left, the leader included if it timed out. Without a cgroup only its session
     // (group) can be, and only while the leader is unreaped: a reaped leader's pid may be anyone's.
     let cleaned = match &mut cg {
@@ -408,6 +409,10 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         Some(code) => format!("exit {code}"),
         None => "timeout".into(),
     })
+}
+
+fn check_deadline(now: Instant, ms: u64) -> io::Result<Instant> {
+    now.checked_add(Duration::from_millis(ms)).ok_or_else(|| io::Error::other("bad timeout"))
 }
 
 fn read_conf(path: impl AsRef<std::path::Path>) -> io::Result<Conf> {
@@ -667,6 +672,18 @@ fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn readiness_deadline_rejects_overflow() {
+        let mut now = Instant::now();
+        assert_eq!(check_deadline(now, 0).unwrap(), now);
+        assert_eq!(check_deadline(now, 1000).unwrap(), now + Duration::from_secs(1));
+        // u64::MAX milliseconds fits on some platforms; advance to their Instant limit.
+        while let Some(next) = now.checked_add(Duration::from_millis(u64::MAX)) {
+            now = next;
+        }
+        assert_eq!(check_deadline(now, u64::MAX).unwrap_err().to_string(), "bad timeout");
+    }
 
     #[test]
     fn running_app_ignores_new_settings() {

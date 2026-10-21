@@ -538,13 +538,33 @@ fn fake_source(first: usize, seen: std::sync::mpsc::Sender<Vec<(u64, u32)>>) -> 
 }
 
 #[test]
+fn background_lane_requests_whole_runs() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut link = Link::new(fake_source(usize::MAX, tx));
+    let lane = Lane::default();
+    // One run queued before attaching, one written by push on the attached connection.
+    lane.push((0, PULL_RUN, Instant::now()));
+    link.fetch_with(Some(&lane), 0, &mut [], 0, &|| false, &mut |_| true).unwrap();
+    lane.push((PULL_RUN, PULL_RUN, Instant::now()));
+    for first in [0, PULL_RUN] {
+        let mut buf = vec![0; PULL_RUN * PAGE_SIZE];
+        link.fetch_with(Some(&lane), (first * PAGE_SIZE) as u64, &mut buf, 0, &|| false, &mut |_| true).unwrap();
+        assert!(buf.chunks(PAGE_SIZE).enumerate().all(|(i, p)| p.iter().all(|&b| b == (first + i) as u8)));
+        lane.pop();
+    }
+    drop((link, lane));
+    let len = (PULL_RUN * PAGE_SIZE) as u32;
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), vec![(0, len), (len as u64, len)]);
+}
+
+#[test]
 fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
     let (tx, rx) = std::sync::mpsc::channel();
     // The first connection answers the head and the rest of the first run only.
     let source = fake_source(2, tx);
     let (lane, stop) = (Lane::default(), AtomicBool::new(false));
     let mut link = Link::new(source);
-    link.fetch_with(Some(&lane), 0, &mut [], &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
+    link.fetch_with(Some(&lane), 0, &mut [], PAGE_SIZE, &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
     // Reconnects must use the cached addresses, even if the original name can no longer resolve.
     link.source.addr = "invalid address".into();
     // Written as they are queued, before the fetcher reads any reply.
@@ -554,7 +574,7 @@ fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
     assert_eq!(lane.q.lock().unwrap().sent, 3);
     for (first, n) in [(3usize, 2usize), (7, 1), (10, 3)] {
         let mut buf = vec![0u8; n * PAGE_SIZE];
-        link.fetch_with(Some(&lane), (first * PAGE_SIZE) as u64, &mut buf, &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
+        link.fetch_with(Some(&lane), (first * PAGE_SIZE) as u64, &mut buf, PAGE_SIZE, &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
         assert!(buf.chunks(PAGE_SIZE).enumerate().all(|(i, p)| p.iter().all(|&b| b as usize == first + i)), "run {first}+{n}");
         lane.pop();
     }
@@ -600,29 +620,29 @@ fn a_reply_the_caller_wants_no_more_of_is_drained_unless_stopped() {
     let n = 64;
     let mut buf = vec![0u8; n * PAGE_SIZE];
     let mut calls = 0;
-    let e = link.fetch_with(None, 0, &mut buf, &|| stop.load(Ordering::SeqCst), &mut |_| {
+    let e = link.fetch_with(None, 0, &mut buf, 0, &|| stop.load(Ordering::SeqCst), &mut |_| {
         calls += 1;
         false
     });
     assert!(matches!(e.as_ref().map_err(fetch_failure), Err(Some(FetchFailure::Cancelled))), "{e:?}");
     assert_eq!(calls, 1, "told nothing more");
     // The next reply is read from the same connection, in step.
-    link.fetch_with(None, (n * PAGE_SIZE) as u64, &mut buf[..PAGE_SIZE], &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
+    link.fetch_with(None, (n * PAGE_SIZE) as u64, &mut buf[..PAGE_SIZE], 0, &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
     assert!(buf[..PAGE_SIZE].iter().all(|&b| b as usize == n));
     assert_eq!(conns.load(Ordering::SeqCst), 1);
     // Stopped: cut, and the next fetch connects again.
-    let e = link.fetch_with(None, 0, &mut buf, &|| stop.swap(true, Ordering::SeqCst), &mut |_| false);
+    let e = link.fetch_with(None, 0, &mut buf, 0, &|| stop.swap(true, Ordering::SeqCst), &mut |_| false);
     assert!(matches!(e.as_ref().map_err(fetch_failure), Err(Some(FetchFailure::Cancelled))), "{e:?}");
     stop.store(false, Ordering::SeqCst);
-    link.fetch_with(None, 0, &mut buf[..PAGE_SIZE], &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
+    link.fetch_with(None, 0, &mut buf[..PAGE_SIZE], 0, &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
     assert_eq!(conns.load(Ordering::SeqCst), 2);
     // A stop that comes while a reply is drained cuts it there, not once the reply is done.
     let checks = AtomicUsize::new(0);
-    let e = link.fetch_with(None, 0, &mut buf, &|| checks.fetch_add(1, Ordering::SeqCst) >= 3, &mut |_| false);
+    let e = link.fetch_with(None, 0, &mut buf, 0, &|| checks.fetch_add(1, Ordering::SeqCst) >= 3, &mut |_| false);
     assert!(matches!(e.as_ref().map_err(fetch_failure), Err(Some(FetchFailure::Cancelled))), "{e:?}");
     // Before the fetch, at each of three chunks (cut at the third, of tens), and once it was cut.
     assert_eq!(checks.load(Ordering::SeqCst), 5, "cut at the third chunk drained");
-    link.fetch_with(None, 0, &mut buf[..PAGE_SIZE], &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
+    link.fetch_with(None, 0, &mut buf[..PAGE_SIZE], 0, &|| stop.load(Ordering::SeqCst), &mut |_| true).unwrap();
     assert_eq!(conns.load(Ordering::SeqCst), 3);
 }
 
@@ -676,7 +696,7 @@ fn a_slow_source_that_keeps_delivering_is_not_lost() {
     p.claim(0, n, REMOTE, |_| true);
     let mut link = Link::new(source);
     let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| {
-        link.fetch_with(None, off, buf, &|| stop.load(Ordering::SeqCst), progress)
+        link.fetch_with(None, off, buf, 0, &|| stop.load(Ordering::SeqCst), progress)
     };
     let stop = AtomicBool::new(false);
     let mut got = vec![0u8; n];

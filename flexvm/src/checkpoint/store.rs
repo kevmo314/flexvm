@@ -2,9 +2,9 @@
 //! `Staging::in_store` under its manifest's id, and `names/NAME`, links to `../ID`. The store's
 //! lock is held shared while a checkpoint is written into it (a delta's parent must stay) and
 //! while a restore opens one (its files stay readable once open), exclusively while any is
-//! removed. A removal unlinks the name, then renames the checkpoint `.removed-ID` (durably,
-//! dependants before what they build on) and deletes that; what a crash leaves, the next removal
-//! does, and so an `ID` without a manifest (a revoked publication's: one is published whole).
+//! removed. A create's requested name is `claim`ed from its check until it is linked. A removal
+//! unlinks the name, then renames the checkpoint `.removed-ID` (durably, dependants before what they
+//! build on) and deletes that; what a crash leaves, the next removal does, and so an `ID` without a manifest (a revoked publication's: one is published whole).
 use super::{managed, Manifest};
 use crate::{bail, host::Flock, util::Result};
 use serde_json::{json, Value};
@@ -239,6 +239,43 @@ pub fn check_free(state: &Path, name: &str) -> Result<()> {
         bail!("checkpoint name {name:?} is taken (see flexvm checkpoint ls)");
     }
     Ok(())
+}
+
+/// A requested name, held from its check until it is linked (`link`), so a concurrent create of the
+/// same name is refused at once, before it saves anything. Its lock file, `.locks/name-NAME`, goes
+/// with it; whoever then opens it again checks it is still the one there.
+pub struct NameClaim {
+    path: PathBuf,
+    _lock: Flock,
+}
+
+impl Drop for NameClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// `check_free`, then the claim on `name`: refused while another create holds it.
+pub fn claim(state: &Path, name: &str) -> Result<NameClaim> {
+    use std::os::unix::fs::MetadataExt;
+    check_free(state, name)?;
+    let path = crate::host::locks(&dir(state)).join(format!("name-{name}"));
+    let lock = loop {
+        let f = crate::host::private_file(&path)?;
+        let ino = f.metadata()?.ino();
+        let lock = match Flock::new(f, libc::LOCK_EX | libc::LOCK_NB) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => bail!("checkpoint name {name:?} is being taken by another checkpoint create"),
+            held => held?,
+        };
+        // Its last holder may have removed it before this took it.
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.ino() == ino) {
+            break lock;
+        }
+    };
+    let claim = NameClaim { path, _lock: lock };
+    // Taken by a create that held it before.
+    check_free(state, name)?;
+    Ok(claim)
 }
 
 /// Names checkpoint `id`, under the lock; refused if the name was taken meanwhile.

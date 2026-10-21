@@ -154,7 +154,8 @@ impl Proc {
         let state = &self.host.state;
         // Shared until it is named: a removal waits, so the parent of a delta stays.
         let _store = store::lock(state, libc::LOCK_SH)?;
-        name.map(|n| store::check_free(state, n)).transpose()?;
+        // A concurrent create of the same name is refused until this one links it or fails.
+        let _claim = name.map(|n| store::claim(state, n)).transpose()?;
         let staging = Staging::in_store(&store::dir(state), vm.dir.join("checkpoint.vmstate"))?;
         self.save_spec(&staging)?;
         t.mark("prepare");
@@ -163,7 +164,7 @@ impl Proc {
         let (m, mut v) = saved?;
         let id = v["id"].as_str().unwrap_or_default().to_string();
         let dest = store::dir(state).join(&id);
-        // Taken by another meanwhile: kept unnamed, as the VM may be gone.
+        // A failed link (only by an error: the name is claimed) keeps the checkpoint unnamed, as the VM may be gone.
         let name =
             name.filter(|n| store::link(state, n, &id).inspect_err(|e| crate::log!("vm {}: checkpoint {id} is kept without a name: {e}", vm.name)).is_ok());
         let state = match vm.state() {

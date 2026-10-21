@@ -208,9 +208,10 @@ is on its way while the fetcher wakes, and several can be outstanding on one
 connection, answered in order. Fetchers and the
 4 background pullers install pages as they arrive (16 at a time), and a
 fetcher asks for the faulting page on its own, pipelined ahead of the rest of
-its run. Each attempt has 5 s to write its requests and read the reply in
-full. An attempt that ran out of time after some pages arrived installs them
-and asks for the rest on a new connection, and the source counts as alive. So
+its run. Background pullers request each run whole. Each attempt has 5 s to
+write its requests and read the reply in full. An attempt that ran out of
+time after some pages arrived installs them and asks for the rest on a new
+connection, and the source counts as alive. So
 a fault's wait is bounded by progress, not by a strict end-to-end deadline:
 a 64-page run from a source that delivers one page per attempt can take
 about 320 s. Only a source that delivers nothing for 10 s is lost. A REMOTE fault also steers the pullers: they pull
@@ -468,9 +469,12 @@ VM that is busy, paused or suspended.
 `ID`, its manifest's checksum: `Staging::in_store` stages it there as below
 and, once the manifest is written, publishes it under that id
 (`RENAME_NOREPLACE`). A name is a link `names/NAME` to `../ID`, made with
-`symlink` (atomic, never over another) after publication: a name taken
-meanwhile leaves the checkpoint unnamed (logged), as a `--stop` VM is gone
-by then. A delta's parent is `../ID`. Everything listed or referenced is a
+`symlink` (atomic, never over another) after publication. A create claims
+its name (`store::claim`, a flock on `.locks/name-NAME`, removed with it) from
+checking it until linking it: a concurrent create of the same name fails at
+once, before it saves anything. A link failing otherwise (an I/O error)
+leaves the checkpoint unnamed (logged), as a `--stop` VM may be gone by then.
+A delta's parent is `../ID`. Everything listed or referenced is a
 complete `ID` with a manifest: staging (`.flexvm-staging-*`) and removed
 ones (`.removed-ID`) are not ids. Its generation is kept while it is stored
 (`checkpoint::managed`, read by `Host::template_users`).
