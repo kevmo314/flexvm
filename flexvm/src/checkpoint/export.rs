@@ -820,11 +820,12 @@ fn import(
     ensure!(specs.len() == header.specs.len() && specs.iter().all(|id| chain.contains(id)), "its {HEADER} names run settings of no checkpoint of its chain");
     ensure!(template::valid_id(&header.template_id) && header.template_id.len() <= 64, "its {HEADER} names no template id");
     let name = name.map(str::to_string).or(header.name.clone());
+    let mut _claim = None;
     if let Some(n) = &name {
         ensure!(crate::host::check_name(n).is_ok(), "bad checkpoint name {n:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.'");
-        // Refused before anything is read: a name is one checkpoint's.
+        // Claimed until linked, before anything is read: a name is one checkpoint's.
         if named(state, n).is_none_or(|have| have != header.id) {
-            store::check_free(state, n).map_err(|e| format!("{e}; give another with --name"))?;
+            _claim = Some(store::claim(state, n).map_err(|e| format!("{e}; give another with --name"))?);
         }
     }
     drop(store::lock(state, libc::LOCK_SH)?);
@@ -1111,6 +1112,45 @@ mod tests {
             (Some(&head[..]), Some(2), Some(true), Some(tar.len() as u64))
         );
         (dir, paths, tpl, state, vec![head, base], tar)
+    }
+
+    #[test]
+    fn load_holds_its_name_until_publication_and_releases_it_on_error() {
+        let (_dir, paths, _tpl, _state, _, tar) = saved();
+        struct Checked<'a> {
+            bytes: &'a [u8],
+            state: &'a Path,
+            held: bool,
+        }
+        impl Read for Checked<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if store::claim(self.state, "snap").is_err() {
+                    self.held = true;
+                }
+                self.bytes.read(out)
+            }
+        }
+        let h = fresh(&paths);
+        let claim = store::claim(&h.state, "snap").unwrap();
+        assert!(load_bytes(&h, &tar, Some("snap")).unwrap_err().to_string().contains("being taken"));
+        assert!(nothing(&h));
+        drop(claim);
+        for complete in [false, true] {
+            let h = fresh(&paths);
+            let bytes = if complete { &tar[..] } else { &tar[..tar.len() / 2] };
+            let mut src = Checked { bytes, state: &h.state, held: false };
+            let result = load(&h.state, &h.paths, &mut src, Some("snap"), None, &BTreeSet::new);
+            assert_eq!(result.is_ok(), complete);
+            assert!(src.held, "a competing create must be refused while reading the save");
+            assert!(!crate::host::locks(&store::dir(&h.state)).join("name-snap").exists());
+            if complete {
+                assert!(named(&h.state, "snap").is_some());
+                load_bytes(&h, &tar, Some("snap")).unwrap();
+            } else {
+                assert!(store::claim(&h.state, "snap").is_ok());
+                assert!(nothing(&h));
+            }
+        }
     }
 
     #[test]

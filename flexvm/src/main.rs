@@ -1563,6 +1563,7 @@ fn vms(host: &Host) -> Vec<Value> {
             v
         })
         .collect();
+    vms.extend(lifecycle::unreadable_running(host, &vms));
     let names = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned());
     // A name lock alone need not mean a registered VM: a resume may not have published yet.
     for n in names(host.state.join("suspended")).filter(|n| !n.starts_with('.')) {

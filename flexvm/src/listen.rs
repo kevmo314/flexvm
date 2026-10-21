@@ -774,32 +774,41 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant,
     let (log_path, lock_path) = (vms.join(&file), crate::host::locks(&vms).join(&file));
     // Retried until the file locked is the path's: a sweep may remove a lock with no log yet
     // (`gc::orphan_log_locks`) between its creation and the flock.
-    let lock = crate::host::lock_path(&lock_path, libc::LOCK_SH)?;
-    let log = {
+    let made = crate::host::lock_path(&lock_path, libc::LOCK_SH).and_then(|lock| {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&log_path).inspect_err(|_| drop(std::fs::remove_file(&lock_path)))?
+        let log = std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&log_path);
+        Ok((lock, log.inspect_err(|_| drop(std::fs::remove_file(&lock_path)))?))
+    });
+    let (lock, log) = match made {
+        Ok(made) => made,
+        Err(e) => {
+            refuse(&conn, format!("cannot start the vm process: {e}"))?;
+            return Ok(());
+        }
     };
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
-    let (done, told) = std::os::unix::net::UnixStream::pair()?;
-    let by = (monotonic_ms() + by.saturating_duration_since(Instant::now()).as_millis() as u64).to_string();
-    let peers = serde_json::to_string(peers)?;
-    let spawned = crate::util::spawn_self_child(
-        &args,
-        &log,
-        conn.as_raw_fd(),
-        Some(told.as_raw_fd()),
-        Some(lock.as_raw_fd()),
-        &[
-            ("FLEXVM_INCOMING", std::str::from_utf8(line)?),
-            ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?),
-            ("FLEXVM_NOTIFY_FD", "4"),
-            ("FLEXVM_INCOMING_BY", &by),
-            ("FLEXVM_INCOMING_PEERS", &peers),
-        ],
-    );
-    drop(told);
+    let spawned = (|| -> Result<_> {
+        let (done, told) = std::os::unix::net::UnixStream::pair()?;
+        let by = (monotonic_ms() + by.saturating_duration_since(Instant::now()).as_millis() as u64).to_string();
+        let peers = serde_json::to_string(peers)?;
+        let child = crate::util::spawn_self_child(
+            &args,
+            &log,
+            conn.as_raw_fd(),
+            Some(told.as_raw_fd()),
+            Some(lock.as_raw_fd()),
+            &[
+                ("FLEXVM_INCOMING", std::str::from_utf8(line)?),
+                ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?),
+                ("FLEXVM_NOTIFY_FD", "4"),
+                ("FLEXVM_INCOMING_BY", &by),
+                ("FLEXVM_INCOMING_PEERS", &peers),
+            ],
+        )?;
+        Ok((child, done))
+    })();
     match spawned {
-        Ok(child) => crate::util::reap_later(child, Some((done.into(), Box::new(slot)))),
+        Ok((child, done)) => crate::util::reap_later(child, Some((done.into(), Box::new(slot)))),
         Err(e) => {
             let _ = std::fs::remove_file(log_path);
             let _ = std::fs::remove_file(lock_path);
@@ -1827,6 +1836,38 @@ mod tests {
         crate::util::NO_REAPER.with(|n| n.set(true));
         refused("cannot start the vm process");
         crate::util::NO_REAPER.with(|n| n.set(false));
+        assert_eq!(held(), 0);
+        for bad_path in [false, true] {
+            use std::os::unix::ffi::OsStringExt;
+            // Host::open refuses a non-UTF-8 run directory, so a link to this one stands in.
+            let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            if bad_path {
+                host.run = root.join(std::ffi::OsString::from_vec(b"run-\xff".to_vec()));
+                std::os::unix::fs::symlink(root.join("run"), &host.run).unwrap();
+            }
+            let run = host.run.clone();
+            let (client, server) = pair();
+            let line: &[u8] = if bad_path { line } else { b"\xff" };
+            incoming(&host, &json!({"name": "web"}), line, server, Instant::now() + PREPARE_WAIT, &[]).unwrap();
+            let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
+            assert_eq!(reply["ok"], false);
+            assert!(reply["error"].as_str().unwrap().contains(if bad_path { "non-UTF8 log path" } else { "utf-8" }), "{reply}");
+            for dir in [run.join("vms"), crate::host::locks(&run.join("vms"))] {
+                assert!(!std::fs::read_dir(dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(crate::gc::ARRIVAL_LOG)));
+            }
+            assert_eq!(held(), 0);
+        }
+        // Nowhere for its lock and log: refused too, not a bare EOF.
+        let run = root.join("run-nolocks");
+        let host = Host::open(&root.join("state-nolocks"), &run).unwrap();
+        std::fs::remove_dir_all(crate::host::locks(&run.join("vms"))).unwrap();
+        std::fs::write(crate::host::locks(&run.join("vms")), "").unwrap();
+        let (client, server) = pair();
+        incoming(&host, &json!({"name": "web"}), line, server, Instant::now() + PREPARE_WAIT, &[]).unwrap();
+        let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("cannot start the vm process"), "{reply}");
+        assert!(!std::fs::read_dir(run.join("vms")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(crate::gc::ARRIVAL_LOG)));
         assert_eq!(held(), 0);
     }
 

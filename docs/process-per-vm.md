@@ -652,7 +652,8 @@ an operation. Busy here is what the VM process's own checks say (its reply
 sets `busy`), never a peer's text: any peer's refusal, whatever it says, is
 a refusal (#599). A refused VM and peer pair is not tried again for 5 s, doubling
 to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
-log is removed; an accepted one becomes `NAME.logs/log`.
+log and its lock are removed, including on setup errors before its process starts;
+the source gets a JSON refusal. An accepted log becomes `NAME.logs/log`.
 Announcements and `lend` requests go to all peers at once, by the peers
 configured now (`Host::config_now`); the listener re-reads them too, so
 an edit of host.json's `peers` reaches running processes.
