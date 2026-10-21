@@ -975,8 +975,13 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         p.attacher.store(req["attacher"] == json!(true), std::sync::atomic::Ordering::SeqCst);
         match claim(p, &req) {
             Ok(v) => {
-                // The VM's now: its memory is in MemAvailable already, and its grant expires on its own.
-                p.standby_grant.store(0, std::sync::atomic::Ordering::SeqCst);
+                // The VM's now: its memory is in MemAvailable once a working-set prefetch still running is done.
+                let q = p.clone();
+                std::thread::spawn(move || {
+                    if q.vm().pager.wait_pulled_every(Duration::from_secs(1), |_| ()) {
+                        q.refund_standby();
+                    }
+                });
                 p.forget_stop();
                 crate::host::gate("claim_stall");
                 let _ = std::fs::remove_file(&sock);

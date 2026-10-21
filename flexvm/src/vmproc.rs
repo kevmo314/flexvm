@@ -739,7 +739,7 @@ pub struct Runtime {
     granted: AtomicU64,
     /// The grant of this start (refunded if the VM never starts).
     charged: AtomicU64,
-    /// A disk restore or arrival grant, held until all its memory is here.
+    /// A cold start, disk restore or arrival grant, held until all its memory is here.
     held_grant: Mutex<Option<crate::host::Hold>>,
     /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
     pub sizes: Mutex<Option<(u64, u64)>>,
@@ -959,7 +959,7 @@ impl Proc {
     }
 
     /// Admits a start against the host's floor. `held` is memory already here;
-    /// None holds the grant until a disk restore or arrival finishes pulling. Not under the host lock (`grant_start`).
+    /// None holds the grant until a start finishes prefetching or a restore or arrival finishes pulling. Not under the host lock (`grant_start`).
     pub fn admit_start(&self, need: u64, held: Option<u64>, floor: crate::host::Floor, deadline: Option<Instant>) -> Result<()> {
         let mib = crate::limit::allowance(need);
         let id = match held {
@@ -998,6 +998,11 @@ impl Proc {
         self.host.release_hold(&self.held_grant);
     }
 
+    /// A cold start's prefetch done: its hold goes, its grant still counting out its window, as a plain grant's would.
+    fn end_hold(&self) {
+        drop(self.held_grant.lock().unwrap().take());
+    }
+
     /// Waits for `vm`'s pull, its hold counting only what is still to come:
     /// pages in count in MemAvailable already (#162).
     pub fn wait_pulled(&self, vm: &Vm) -> bool {
@@ -1011,7 +1016,7 @@ impl Proc {
         }
     }
 
-    /// An unclaimed standby's refill grant given back, once: it counts only within its window, and its VM is gone.
+    /// A standby's refill grant given back, once: its VM is gone or claimed.
     pub(crate) fn refund_standby(&self) {
         let id = self.standby_grant.swap(0, Ordering::SeqCst);
         if id > 0 {
@@ -1684,7 +1689,7 @@ impl Proc {
         self.spec.lock().unwrap().check(tpl.meta.image.as_ref())?;
         t.mark("template");
         // Before the claim: a refused start mints no generation (nor withdraws one).
-        self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve, None)?;
+        self.admit_start(tpl.working_set_mib(), None, crate::host::Floor::Reserve, None)?;
         self.bind_ports()?;
         let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
         let ip = self.set_addr(claim);
@@ -1713,6 +1718,13 @@ impl Proc {
         drop(still);
         t.mark("resume");
         self.set_vm(vm);
+        if let Some(p) = self.arc() {
+            thread::spawn(move || {
+                if p.wait_pulled(p.vm()) && p.pulled_all() {
+                    p.end_hold();
+                }
+            });
+        }
         let started = self.start_guest(&mut t);
         // It ran, then died: no longer exited, as its failed record will say (#730).
         if let (Err(_), Some(path)) = (&started, &record) {
