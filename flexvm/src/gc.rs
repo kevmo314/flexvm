@@ -137,7 +137,7 @@ pub fn sweep_now(host: &Host) -> Result<()> {
 }
 
 fn sweep_within(host: &Host, wait: Duration) -> Result<()> {
-    let lock = gc_lock(host, Some(wait))?;
+    let lock = gc_lock(host, Some(wait))?.expect("a waiting sweep acquires the lock or fails");
     let cleaned = cleanup_locked(host, lock);
     network(host);
     cleaned
@@ -153,7 +153,7 @@ fn network(host: &Host) {
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
     if let Ok(Some(lock)) = gc_lock(host, None) {
-        cleanup_locked(host, Some(lock)).unwrap_or_else(|e| crate::log!("garbage collection: {e}"));
+        cleanup_locked(host, lock).unwrap_or_else(|e| crate::log!("garbage collection: {e}"));
     }
 }
 
@@ -177,8 +177,7 @@ fn gc_lock(host: &Host, wait: Option<Duration>) -> Result<Option<Flock>> {
     }
 }
 
-fn cleanup_locked(host: &Host, lock: Option<Flock>) -> Result<()> {
-    let Some(_lock) = lock else { return Ok(()) };
+fn cleanup_locked(host: &Host, _lock: Flock) -> Result<()> {
     let collected = host.collect_garbage();
     vm_files(host);
     orphan_log_locks(&host.run.join("vms"));

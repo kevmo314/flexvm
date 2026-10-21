@@ -304,7 +304,7 @@ right after another sweep does not; one sweep at a time under
 `RUN/.locks/gc`), so a host with no VM starting still sweeps.
 What a process owns goes once that process is proven gone: taps
 (`<prefix><pid hex>t<n>`, and a template build's `<prefix>x<pid hex>`),
-by their alias, never their name: `flexvm PID START RUN`, set before the
+by their alias, never their name: `flexvm pidns:NS PID START RUN`, set before the
 tap is made persistent (`host::tap_alias`), so a sweep takes only tun
 devices whose alias names its run directory and an owner proven gone
 (another host's taps, whatever their names read as under this prefix, and
@@ -591,7 +591,7 @@ cgroup (`cgroup`), and the VM process moves itself there, where a cold run's VM
 process is. A detached claim (`run -d`) hangs up once answered, and its VM runs on. Under memory pressure standby VMs are stopped
 (SIGUSR1) first. The count is explicit, and refills stop under the eviction mark; one refill
 of a template runs at a time (`.locks/refill`), and waits until the standby
-VMs it starts are ready (a minute at most each), so concurrent claims never overfill. A claim sent
+VMs it starts are ready (one shared 60 s deadline for the whole refill), so concurrent claims never overfill. A claim sent
 but not answered (the standby died, or hung up) is an uncertain outcome: the
 guest may have run, so `run` reports it (with the standby's socket, and
 whether the registry shows the VM) and starts nothing else.

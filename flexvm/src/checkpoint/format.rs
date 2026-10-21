@@ -117,6 +117,22 @@ mod parent_path {
     }
 }
 
+/// Checks the checksum line and parses the manifest body.
+pub(super) fn parse_manifest(text: &[u8]) -> Result<(String, Manifest)> {
+    let split = text.iter().position(|&b| b == b'\n').ok_or("manifest has no checksum")?;
+    let id = sum(&text[split + 1..]);
+    ensure!(text[..split] == *id.as_bytes(), "manifest checksum mismatch");
+    let manifest = serde_json::from_slice(&text[split + 1..]).map_err(|e| format!("manifest: {e}"))?;
+    Ok((id, manifest))
+}
+
+pub(super) fn manifest_text(manifest: &Manifest) -> Result<(String, Vec<u8>)> {
+    let body = serde_json::to_vec_pretty(manifest)?;
+    let id = sum(&body);
+    let text = [format!("{id}\n").as_bytes(), &body].concat();
+    Ok((id, text))
+}
+
 pub(super) fn sum(bytes: &[u8]) -> String {
     let mut h = Hash::new();
     h.update(bytes);

@@ -1229,7 +1229,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   ("lent", in `STATE/addrs/IP`) until that VM is killed wherever it is (its
   host tells the peers), or it migrates back and has all its memory there again
   (released; an arrival that dies before leaves the loan in place). If that message is lost, the
-  address stays taken; removing `lent` from that file frees it. Leaks, never
+  address stays taken; use `flexvm reclaim IP` to inspect and reclaim it. Leaks, never
   collisions. A restore elsewhere that keeps the address borrows it the same
   way (op `lend`). Every address carries a generation that orders the VMs
   that had it, and a revision that orders the places it ran within one;

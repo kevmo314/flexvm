@@ -1,7 +1,7 @@
 //! Budgeted chain opening, overlay flattening and checked page reads.
 use super::{
     bail,
-    format::{parse_pagemap, sum, Canon, Manifest, Run, DATA, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE, TEMPLATE},
+    format::{parse_manifest, parse_pagemap, sum, Canon, Manifest, Run, DATA, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE, TEMPLATE},
     fstat, open_at, open_dir_at,
     write::{direct, Buf},
 };
@@ -63,9 +63,9 @@ pub(super) fn read_at(dir: RawFd, name: &str, max: u64) -> io::Result<(File, Vec
 }
 
 pub(super) struct Link {
-    dir: PathBuf,
-    manifest: Manifest,
-    id: String,
+    pub(super) dir: PathBuf,
+    pub(super) manifest: Manifest,
+    pub(super) id: String,
     vmstate: Vec<u8>,
     map: Vec<Run>,
     file: Option<File>,
@@ -90,10 +90,7 @@ impl Link {
         let bad = |why: String| format!("checkpoint {} is invalid: {why}", dir.display());
         let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| bad(e.to_string()))?;
         let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", 1 << 20).map_err(|e| bad(format!("manifest.json: {e}")))?;
-        let split = text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("manifest has no checksum".into()))?;
-        ensure!(text[..split] == *sum(&text[split + 1..]).as_bytes(), "{}", bad("manifest checksum mismatch".into()));
-        let manifest: Manifest = serde_json::from_slice(&text[split + 1..]).map_err(|e| bad(format!("manifest: {e}")))?;
-        let id = String::from_utf8_lossy(&text[..split]).into_owned();
+        let (id, manifest) = parse_manifest(&text).map_err(|e| bad(e.to_string()))?;
         match (manifest.format, &manifest.parent) {
             (FORMAT, None) | (FORMAT_INCREMENTAL, Some(_)) => {}
             (f, _) => bail!("{}", bad(format!("format {f}; this flexvm reads formats {FORMAT} and {FORMAT_INCREMENTAL}"))),
@@ -135,7 +132,7 @@ impl Link {
 /// The chain ending at `dir`, nearest first; `full` verifies all metadata within
 /// `chain_meta_budget` (returning what is left), except unused ancestor VM states;
 /// else only manifests.
-fn open_chain(dir: &Path, full: bool) -> Result<(Vec<Link>, u64)> {
+pub(super) fn open_chain(dir: &Path, full: bool) -> Result<(Vec<Link>, u64)> {
     let mut meta_left = chain_meta_budget();
     let mut links = vec![Link::open(dir, 0, full.then_some(&mut meta_left))?];
     while let Some(parent) = links.last().unwrap().manifest.parent.clone() {

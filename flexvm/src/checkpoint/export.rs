@@ -15,9 +15,9 @@
 //! a template is read, taken or moved: the source's tags may name other builds than this host's.
 use super::{
     bail,
-    chain::{chain_ids, chain_meta_budget, read_at},
-    format::{parse_pagemap, sum, DATA, MAX_VMSTATE},
-    open_at, open_dir_at, read_manifest, store, Checkpoint, CommitError, Manifest, Parent, Staging, FORMAT, FORMAT_INCREMENTAL, MAX_CHAIN,
+    chain::{chain_ids, chain_meta_budget, open_chain, read_at},
+    format::{manifest_text, parse_manifest, parse_pagemap, sum, DATA, MAX_VMSTATE},
+    open_at, open_dir_at, read_manifest, store, CommitError, Manifest, Parent, Staging, FORMAT, FORMAT_INCREMENTAL, MAX_CHAIN,
 };
 use crate::{
     template::{self, Paths, Template},
@@ -290,9 +290,8 @@ fn read_member(dir: &Path, id: &str) -> Result<Saved> {
     let bad = |why: String| format!("checkpoint {}: {why}", dir.display());
     let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| bad(e.to_string()))?;
     let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", MAX_MANIFEST).map_err(|e| bad(format!("manifest.json: {e}")))?;
-    let (sum_line, body) = text.split_at(text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("manifest has no checksum".into()))?);
-    ensure!(sum_line == id.as_bytes() && sum(&body[1..]) == id, "{}", bad("it changed as it was saved".into()));
-    let manifest: Manifest = serde_json::from_slice(&body[1..])?;
+    let (found, manifest) = parse_manifest(&text).map_err(|e| bad(e.to_string()))?;
+    ensure!(found == id, "{}", bad("it changed as it was saved".into()));
     let open = |name: &str| -> Result<File> {
         let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
         let (f, _) = read_at(dfd.as_raw_fd(), name, 0).map_err(|e| bad(format!("{name}: {e}")))?;
@@ -598,19 +597,24 @@ struct Loaded {
     meta: u64,
 }
 
-fn file_sha(path: &Path) -> io::Result<Vec<u8>> {
-    let mut h = Sha256::new();
-    io::copy(&mut File::open(path)?, &mut h)?;
-    Ok(h.finalize().to_vec())
-}
-
-/// Whether checkpoint directory `dir` has exactly `files` (by SHA-256; `None`: none of that name).
-fn has(dir: &Path, files: &[(&str, Option<Vec<u8>>)]) -> bool {
-    files.iter().all(|(name, sha)| match (file_sha(&dir.join(name)), sha) {
-        (Ok(have), Some(sha)) => have == *sha,
-        (Err(e), None) => e.kind() == io::ErrorKind::NotFound,
-        _ => false,
-    })
+/// Verify outside the exclusive store lock, retaining the compared file descriptors.
+fn matching(dir: &Path, files: &[(&'static str, Option<Vec<u8>>)]) -> Option<Pinned> {
+    let mut pinned = Pinned::open(dir)?;
+    for (name, sha) in files {
+        match (open_at(pinned.dir.as_raw_fd(), name), sha) {
+            (Ok(mut f), Some(sha)) if regular(&f) => {
+                let mut hash = Sha256::new();
+                io::copy(&mut f, &mut hash).ok()?;
+                if hash.finalize().as_slice() != sha {
+                    return None;
+                }
+                pinned.files.push((name, Some(f)));
+            }
+            (Err(e), None) if e.kind() == io::ErrorKind::NotFound => pinned.files.push((name, None)),
+            _ => return None,
+        }
+    }
+    Some(pinned)
 }
 
 /// Reads checkpoint `id` (`chain[i]`), whose parent the chain says is `parent` (the source's id and
@@ -641,9 +645,8 @@ fn receive(
     take(len, MAX_MANIFEST, "manifest")?;
     let mut text = read_all(src, len)?;
     digest.file("manifest.json", len, &Sha256::digest(&text));
-    let split = text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("its manifest has no checksum"))?;
-    ensure!(text[..split] == *id.as_bytes() && sum(&text[split + 1..]) == id, "{}", bad("its manifest does not match its id"));
-    let mut manifest: Manifest = serde_json::from_slice(&text[split + 1..]).map_err(|e| bad(&format!("its manifest: {e}")))?;
+    let (found, mut manifest) = parse_manifest(&text).map_err(|e| bad(&e.to_string()))?;
+    ensure!(found == id, "{}", bad("its manifest does not match its id"));
     match (manifest.format, &manifest.parent, parent) {
         (FORMAT, None, None) => {}
         (FORMAT_INCREMENTAL, Some(p), Some((want, _))) if p.id == want => {}
@@ -656,9 +659,7 @@ fn receive(
         let path = Path::new("..").join(now);
         if manifest.parent.as_ref().is_some_and(|p| p.path != path) || was != now {
             manifest.parent = Some(Parent { path, id: now.into() });
-            let body = serde_json::to_vec_pretty(&manifest)?;
-            here = sum(&body);
-            text = [format!("{here}\n").as_bytes(), &body].concat();
+            (here, text) = manifest_text(&manifest)?;
         }
     }
     // This host may have one by its id, which is no cryptographic check: what was sent is verified all
@@ -762,10 +763,11 @@ pub fn load(state: &Path, paths: &Paths, r: &mut dyn Read, name: Option<&str>, s
 /// chain, with their run settings, into the store; its template is not in it, so this host needs its
 /// generation to restore it.
 pub fn load_dir(state: &Path, paths: &Paths, dir: &Path, name: Option<&str>, sha256: Option<&str>) -> Result<Value> {
-    let ck = Checkpoint::open(dir)?;
-    let chain: Vec<String> = std::iter::once(ck.id.clone()).chain(ck.chain_ids.iter().cloned()).collect();
+    let (links, _) = open_chain(dir, false)?;
+    let ck = &links[0];
+    let chain: Vec<String> = links.iter().map(|l| l.id.clone()).collect();
     let mut dirs = BTreeMap::new();
-    for (d, id) in std::iter::once(&ck.dir).chain(&ck.chain).zip(&chain) {
+    for (d, id) in links.iter().map(|l| &l.dir).zip(&chain) {
         dirs.insert(id.clone(), open_dir_at(libc::AT_FDCWD, &CString::new(d.as_os_str().as_bytes())?)?);
     }
     let specs = chain.iter().filter(|id| crate::util::stat_at(dirs[*id].as_raw_fd(), &CString::new(SPEC).unwrap()).is_some()).cloned().collect();
@@ -938,18 +940,32 @@ impl<E: Into<crate::util::Error>> From<E> for Abort {
 /// published since, is used only if it has the very files verified here, its id being no
 /// cryptographic check. On failure, what it published goes again.
 fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> std::result::Result<(String, usize), Abort> {
-    let _lock = store::lock(state, libc::LOCK_EX)?;
     let store_dir = store::dir(state);
+    let dir = open_dir_at(libc::AT_FDCWD, &CString::new(store_dir.as_os_str().as_bytes())?)?;
+    crate::util::sync_ancestors_fd(dir.as_raw_fd())?;
+    for l in loaded.iter_mut() {
+        let dest = store_dir.join(&l.id);
+        if !l.pinned.as_ref().is_some_and(|p| p.still(&dest)) {
+            l.pinned = matching(&dest, &l.files);
+        }
+    }
+    let _lock = store::lock(state, libc::LOCK_EX)?;
     let mut published = vec![];
     let done = (|| -> std::result::Result<String, Abort> {
         for l in loaded.iter_mut() {
             let dest = store_dir.join(&l.id);
             match std::fs::symlink_metadata(dest.join("manifest.json")) {
-                Ok(_) => ensure!(
-                    l.pinned.as_ref().is_some_and(|p| p.still(&dest)) || has(&dest, &l.files),
-                    "checkpoint {} here has other files than the save's: remove it (flexvm checkpoint rm {0}) to load this one",
-                    l.id
-                ),
+                Ok(_) => {
+                    // Hashed before the lock, unless published since (another load's): then here.
+                    if !l.pinned.as_ref().is_some_and(|p| p.still(&dest)) {
+                        l.pinned = matching(&dest, &l.files);
+                    }
+                    ensure!(
+                        l.pinned.is_some(),
+                        "checkpoint {} here has other files than the save's: remove it (flexvm checkpoint rm {0}) to load this one",
+                        l.id
+                    )
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     // A revoked publication's leftover (as `rm` clears it), else nothing.
                     if std::fs::symlink_metadata(&dest).is_ok() {
@@ -1012,7 +1028,7 @@ fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> std::resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::format::MAGIC;
+    use crate::checkpoint::{format::MAGIC, Checkpoint};
     use std::{cell::Cell, fs};
 
     thread_local! {
@@ -1278,7 +1294,7 @@ mod tests {
         let page = tar.windows(PAGE_SIZE.min(64)).position(|w| w[..8] == [1, 32, 63, 94, 125, 156, 187, 218]).unwrap();
         let manifest = tar.windows(12).position(|w| w == b"\"data_pages\"").unwrap() + 15;
         let mem = tar.len() - 2 * BLOCK - 100;
-        for (at, want) in [(page, "data page 0 does not match"), (manifest, "does not match its id"), (mem, "")] {
+        for (at, want) in [(page, "data page 0 does not match"), (manifest, "manifest checksum mismatch"), (mem, "")] {
             let mut bad = tar.clone();
             bad[at] ^= 0x40;
             let b = fresh(&paths);
@@ -1446,6 +1462,22 @@ mod tests {
     }
 
     #[test]
+    fn manifest_helpers_preserve_ids_and_reject_damaged_text() {
+        let (_dir, _paths, _tpl, state, chain, _) = saved();
+        let text = fs::read(store::dir(&state).join(&chain[0]).join("manifest.json")).unwrap();
+        let (id, manifest) = parse_manifest(&text).unwrap();
+        assert_eq!(id, chain[0]);
+        assert_eq!(manifest_text(&manifest).unwrap(), (id, text.clone()));
+        let mut damaged = text;
+        damaged[0] = b'x';
+        assert!(parse_manifest(&damaged).is_err());
+        assert!(parse_manifest(b"no checksum line").is_err());
+        let body = b"not json";
+        let invalid = [format!("{}\n", sum(body)).as_bytes(), body].concat();
+        assert!(parse_manifest(&invalid).is_err());
+    }
+
+    #[test]
     fn a_checkpoint_directory_loads_with_its_chain_named_the_stores_way() {
         let (_dir, paths, tpl, _state, _, _) = saved();
         // v0.1.0's way: directories side by side, the delta naming its parent by a path of its own.
@@ -1512,6 +1544,12 @@ mod tests {
     fn a_load_that_fails_as_it_publishes_leaves_nothing() {
         let (_dir, paths, _tpl, _state, chain, tar) = saved();
         let b = fresh(&paths);
+        drop(store::lock(&b.state, libc::LOCK_EX).unwrap());
+        for id in &chain {
+            let stale = store::dir(&b.state).join(format!(".removed-{id}"));
+            fs::create_dir(&stale).unwrap();
+            fs::write(stale.join("pages"), b"interrupted removal").unwrap();
+        }
         FAIL_NAMING.set(true);
         let e = load_bytes(&b, &tar, None).err().unwrap().to_string();
         FAIL_NAMING.set(false);
@@ -1545,14 +1583,18 @@ mod tests {
             .chain([("gone", None)])
             .collect();
         p.compare("gone", None);
-        assert!(p.equal && p.still(&dir) && has(&dir, &files));
+        assert!(p.equal && p.still(&dir) && matching(&dir, &files).is_some());
         // The same bytes in another inode: no longer pinned, but hashed, still the same.
         let vmstate = fs::read(dir.join("vmstate")).unwrap();
         fs::remove_file(dir.join("vmstate")).unwrap();
         fs::write(dir.join("vmstate"), &vmstate).unwrap();
-        assert!(!p.still(&dir) && has(&dir, &files));
+        let checked = matching(&dir, &files).unwrap();
+        assert!(!p.still(&dir) && checked.still(&dir));
+        fs::rename(dir.join("vmstate"), dir.join("old-vmstate")).unwrap();
+        fs::write(dir.join("vmstate"), &vmstate).unwrap();
+        assert!(!checked.still(&dir), "a replacement after hashing must be refused under the lock");
         fs::write(dir.join("vmstate"), b"other").unwrap();
-        assert!(!has(&dir, &files));
+        assert!(matching(&dir, &files).is_none());
         // One that should be absent, there.
         fs::write(dir.join("gone"), b"").unwrap();
         let mut q = Pinned::open(&dir).unwrap();

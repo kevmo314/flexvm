@@ -327,7 +327,7 @@ before this need pulling again for it.
 ## Forward host ports
 
 ```sh
-flexvm run -d --name web -p 8080:80 -p 127.0.0.1:5353:53/udp ubuntu:24.04
+flexvm run -d --name web -p 8080:80 -p 127.0.0.1:5353:53/udp ubuntu:24.04 sleep infinity
 ```
 
 `run -p [IP:]HOST_PORT:VM_PORT[/tcp|/udp]` forwards a host port to
