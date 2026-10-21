@@ -149,24 +149,7 @@ impl Staging {
         check(unsafe { libc::fsync(self.ck.as_raw_fd()) })?;
         (self.base, self.dest) = (cname(id), self.dest.with_file_name(id));
         crate::util::sync_ancestors_fd(self.parent.as_raw_fd())?;
-        let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
-        match check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) }) {
-            Err(e) if matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) => return Ok(false),
-            r => r.map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?,
-        }
-        self.published = true;
-        let synced = crate::fault_result!(crate::host::fault("import_fsync") => Err(io::Error::other("injected fault: fsync failed"));
-            check(unsafe { libc::fsync(parent) }));
-        if let Err(e) = synced {
-            // Not durably there: none is better than one a crash may tear (a missing manifest revokes it;
-            // a directory left without one is debris, which the next removal or load clears).
-            let e = format!("making checkpoint {} durable: {e}", self.dest.display());
-            return Err(match self.revoke() {
-                Ok(_) => CommitError::Failed(format!("{e} (revoked it)").into()),
-                Err(r) => CommitError::Uncertain(format!("{e}; revoking it failed too: {r}").into()),
-            });
-        }
-        Ok(true)
+        self.publish(true)
     }
 
     /// Where it is published: `dest`, or for `in_store` the store's entry `id`.
@@ -312,27 +295,37 @@ impl Staging {
         // after rename below, to persist the checkpoint's new name.
         crate::util::sync_ancestors_fd(self.parent.as_raw_fd())?;
         t.mark("fsync");
+        self.publish(false)?;
+        t.mark("publish");
+        Ok((manifest, id))
+    }
+
+    /// The staging directory and ancestors are synced before this; publication persists its
+    /// new name, or revokes the manifest before reporting that the VM may resume. An `import`
+    /// accepts an existing content-addressed entry (`Ok(false)`); a checkpoint must be new.
+    fn publish(&mut self, import: bool) -> std::result::Result<bool, CommitError> {
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
-        check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) })
-            .map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?;
+        match check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) }) {
+            Err(e) if import && matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) => return Ok(false),
+            r => r.map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?,
+        }
         self.published = true;
-        let synced = crate::fault_result!(crate::host::fault("publish_fsync") => Err(io::Error::other("injected fault: fsync failed"));
+        let sync_fault = if import { "import_fsync" } else { "publish_fsync" };
+        let synced = crate::fault_result!(crate::host::fault(sync_fault) => Err(io::Error::other("injected fault: fsync failed"));
             check(unsafe { libc::fsync(parent) }));
         if let Err(e) = synced {
             // A crash could bring it back after the VM ran on: revoke it, durably.
             let revoked = self.revoke();
             let e = format!("making checkpoint {} durable: {e}", self.dest.display());
             return Err(match revoked {
-                Ok(Ok(())) => CommitError::Failed(format!("{e} (revoked it)").into()),
-                // Unloadable for good; in the way of that path until removed (a suspend's, by the name's next holder).
-                Ok(Err(r)) => CommitError::Failed(
+                Ok(Err(r)) if !import => CommitError::Failed(
                     format!("{e} (revoked it, but removing its directory failed: {r}; remove {} by hand if it stays)", self.dest.display()).into(),
                 ),
+                Ok(_) => CommitError::Failed(format!("{e} (revoked it)").into()),
                 Err(r) => CommitError::Uncertain(format!("{e}; revoking it failed too: {r}").into()),
             });
         }
-        t.mark("publish");
-        Ok((manifest, id))
+        Ok(true)
     }
 
     /// Unpublishes `dest`. The outer error: its manifest (what makes it a
@@ -422,5 +415,37 @@ fn clear_stale_fd(parent: &OwnedFd) {
         }
         let ck = open_dir_at(outer.as_raw_fd(), c"ck").ok();
         remove_staging(parent.as_raw_fd(), &cname(&name), outer.as_raw_fd(), ck.as_ref().map(|c| c.as_raw_fd()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_preserves_existing_entries_for_both_callers() {
+        for import in [true, false] {
+            for directory in [false, true] {
+                let root = crate::test_util::TempDir::new("publication-collision");
+                let dest = root.join("checkpoint");
+                let mut staging = Staging::new(&dest, PathBuf::new()).unwrap();
+                staging.add_file("manifest.json", b"new").unwrap();
+                let existing = if directory {
+                    std::fs::create_dir(&dest).unwrap();
+                    dest.join("manifest.json")
+                } else {
+                    dest.clone()
+                };
+                std::fs::write(&existing, b"existing").unwrap();
+                match (import, staging.publish(import)) {
+                    (true, Ok(false)) | (false, Err(CommitError::Failed(_))) => {}
+                    _ => panic!("unexpected publication result"),
+                }
+                assert!(!staging.published);
+                drop(staging);
+                assert_eq!(std::fs::read(existing).unwrap(), b"existing");
+                assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 1);
+            }
+        }
     }
 }

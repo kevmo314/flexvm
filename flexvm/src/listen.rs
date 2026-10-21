@@ -616,16 +616,15 @@ pub fn refuse(conn: TcpStream, why: &str, wait: Option<Duration>) {
     if wait.is_none() && conn.set_nonblocking(true).is_err() {
         return;
     }
-    let reply = json!({"ok": false, "error": why});
-    let _ = match wait {
-        Some(_) => send_json(&mut c, &reply),
-        None => send_json(&mut &conn, &reply),
-    };
-    let _ = conn.shutdown(std::net::Shutdown::Write);
-    let _ = match wait {
-        Some(_) => std::io::copy(&mut c.take(1 << 20), &mut std::io::sink()),
-        None => std::io::copy(&mut (&conn).take(1 << 20), &mut std::io::sink()),
-    };
+    fn reply(conn: &TcpStream, mut io: impl Read + std::io::Write, why: &str) {
+        let _ = send_json(&mut io, &json!({"ok": false, "error": why}));
+        let _ = conn.shutdown(std::net::Shutdown::Write);
+        let _ = std::io::copy(&mut io.take(1 << 20), &mut std::io::sink());
+    }
+    match wait {
+        Some(_) => reply(&conn, &mut c, why),
+        None => reply(&conn, &conn, why),
+    }
 }
 
 pub fn activated() -> Option<TcpListener> {
@@ -1115,10 +1114,6 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
 /// A peer's local address (hosts sharing a network namespace, loopback included) is taken:
 /// `net::route_via` installs nothing for it, and a migration's handoff relies on it.
 pub fn check_via(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
-    via_by(via, peers)
-}
-
-pub(crate) fn via_by(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     if !is_peer(peers, IpAddr::V4(via)) || via.is_unspecified() || via.is_broadcast() || via.is_multicast() {
         bail!("{via} is not a peer next hop: not a peer's address, or not unicast");
     }
@@ -1297,15 +1292,15 @@ mod tests {
     fn next_hops_are_known_peers_and_unicast() {
         let via: Ipv4Addr = "192.0.2.7".parse().unwrap();
         let peers = [IpAddr::V4(via), "::ffff:192.0.2.8".parse().unwrap(), "127.0.0.1".parse().unwrap()];
-        via_by(via, &peers).unwrap();
-        via_by("192.0.2.8".parse().unwrap(), &peers).unwrap();
+        check_via(via, &peers).unwrap();
+        check_via("192.0.2.8".parse().unwrap(), &peers).unwrap();
         // Peers sharing this network namespace route via a local address (net::route_via skips it).
-        via_by("127.0.0.1".parse().unwrap(), &peers).unwrap();
-        assert!(via_by("192.0.2.9".parse().unwrap(), &peers).is_err());
-        assert!(via_by("127.0.0.2".parse().unwrap(), &peers).is_err());
+        check_via("127.0.0.1".parse().unwrap(), &peers).unwrap();
+        assert!(check_via("192.0.2.9".parse().unwrap(), &peers).is_err());
+        assert!(check_via("127.0.0.2".parse().unwrap(), &peers).is_err());
         for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1"] {
             let ip = ip.parse().unwrap();
-            assert!(via_by(ip, &[IpAddr::V4(ip)]).is_err());
+            assert!(check_via(ip, &[IpAddr::V4(ip)]).is_err());
         }
     }
 
@@ -1401,8 +1396,8 @@ mod tests {
         cfg.peer_underlays.insert("192.0.2.9:7070".into(), vec!["198.51.100.9".parse().unwrap()]);
         assert_eq!(cfg.peer_underlay_addrs(), [IpAddr::V4(data)]);
         let known = [vec!["192.0.2.7".parse().unwrap()], cfg.peer_underlay_addrs()].concat();
-        via_by(data, &known).unwrap();
-        assert!(via_by("198.51.100.9".parse().unwrap(), &known).is_err(), "not a configured peer's");
+        check_via(data, &known).unwrap();
+        assert!(check_via("198.51.100.9".parse().unwrap(), &known).is_err(), "not a configured peer's");
         // The asking peer's own addresses take in its underlays, never another peer's.
         cfg.peers.push("192.0.2.10:7070".into());
         cfg.peer_underlays.insert("192.0.2.10:7070".into(), vec!["198.51.100.10".parse().unwrap()]);
