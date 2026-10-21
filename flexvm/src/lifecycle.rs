@@ -1143,12 +1143,33 @@ pub(crate) fn quarantined<'a>(q: &'a str, boot: &str) -> Option<&'a str> {
     (written == boot).then_some(why)
 }
 
+/// Display only: a corrupt record must not grant operations an unverified identity.
+pub fn unreadable_running(host: &Host, known: &[Value]) -> Vec<Value> {
+    std::fs::read_dir(host.run.join("vms"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name();
+            let name = file.to_str()?.strip_suffix(".json")?;
+            if known.iter().any(|v| v["name"] == name) || !host.alive(name) {
+                return None;
+            }
+            let error = crate::host::load::<crate::host::Entry>(&e.path()).err()?;
+            Some(json!({"name": name, "state": "unknown", "error": error.to_string()}))
+        })
+        .collect()
+}
+
 pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     if !host.is_suspended(name) {
         return None;
     }
     let dir = host.suspended(name).ok()?;
-    let m = read_manifest(&dir).ok()?;
+    let m = match read_manifest(&dir) {
+        Ok(m) => m,
+        Err(e) => return Some(json!({"name": name, "state": "suspended", "error": e.to_string()})),
+    };
     // A quarantine from an earlier boot no longer holds (`resume_suspended` drops it).
     let held = std::fs::read_to_string(dir.join(QUARANTINE)).is_ok_and(|q| quarantined(&q, crate::host::boot_id()).is_some());
     let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };
@@ -1173,6 +1194,29 @@ pub fn ckhash(paths: &crate::template::Paths, dir: &Path) -> Result<Value> {
 mod tests {
     use super::{quarantined, read_spec, SPEC};
     use crate::app::RunSpec;
+
+    #[test]
+    fn corrupt_records_remain_visible_without_authorizing_operations() {
+        let root = crate::test_util::TempDir::new("corrupt-vms");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let dir = host.suspended("sleeping").unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "broken").unwrap();
+        let held = host.take_name("awake", false).unwrap();
+        std::fs::write(host.vms("awake", "json").unwrap(), "broken").unwrap();
+        let rows = crate::vms(&host);
+        assert_eq!(rows.len(), 2);
+        for (name, state) in [("sleeping", "suspended"), ("awake", "unknown")] {
+            let row = rows.iter().find(|v| v["name"] == name).unwrap();
+            assert_eq!(row["state"], state);
+            assert!(!row["error"].as_str().unwrap().is_empty());
+        }
+        assert!(super::unreadable_running(&host, &rows).is_empty(), "a record damaged after listing must not duplicate its row");
+        assert!(host.entry("awake").is_err());
+        assert!(host.entries().is_empty());
+        drop(held);
+        assert_eq!(crate::vms(&host).len(), 1, "a dead corrupt record is not a running VM");
+    }
 
     #[test]
     fn suspended_specs_round_trip_and_v010_checkpoints_default() {

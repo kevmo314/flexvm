@@ -624,9 +624,15 @@ fn suspended_description_checks_manifest_and_saturates_sizes() {
     assert_eq!(description["checkpoint_mib"], u64::MAX >> 20);
     assert_eq!(read_manifest(&dir).unwrap().name, "x");
     fs::write(dir.join("manifest.json"), b"bad checksum\n{}").unwrap();
-    assert!(crate::lifecycle::describe_suspended(&host, "x").is_none());
+    // A corrupt manifest stays listed (#1132), by its name and why, with nothing read from it.
+    let corrupt = || {
+        let v = crate::lifecycle::describe_suspended(&host, "x").unwrap();
+        assert_eq!((v["name"].as_str(), v["state"].as_str()), (Some("x"), Some("suspended")));
+        assert!(!v["error"].as_str().unwrap().is_empty() && v["guest_mib"].is_null(), "{v}");
+    };
+    corrupt();
     fs::write(dir.join("manifest.json"), vec![b' '; (1 << 20) + 1]).unwrap();
-    assert!(crate::lifecycle::describe_suspended(&host, "x").is_none());
+    corrupt();
 }
 
 #[test]

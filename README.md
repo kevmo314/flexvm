@@ -214,7 +214,9 @@ what `ps --json` says of each VM: its image, template and the image's app,
 caps, ports (`ports`), run settings (`run`: `-e`, `--entrypoint`, `--keep`,
 `--rm`, `--ip`, `-p`, `-i` as `stdin`, `-t` as `tty`), its log, and its control socket (running) or checkpoint
 directory (stopped); a stopped or exited one has its `exit_code` too. A name that is not a VM
-fails `inspect` once the others are printed.
+fails `inspect` once the others are printed. A corrupt suspended manifest stays visible
+as `suspended`; a corrupt record with a live name lock stays visible as `unknown`.
+Both carry an `error` in `ps --json` and `inspect`.
 
 | state | meaning |
 |---|---|
@@ -513,7 +515,8 @@ root filesystem; and the run settings each was taken with (`--keep`, `--rm`, `-e
 `--entrypoint`), which a restore on the other host keeps. Stored checkpoints themselves stay lean, sharing the template.
 `checkpoint load` reads a save from stdin, or `-i FILE`, and stores it under the
 same ids and name (`--name NAME` gives another; a name another checkpoint has is
-refused before anything is read). Everything is verified before anything is
+refused before anything is read). A new name is claimed until publication, so a
+concurrent checkpoint create or load cannot take it. Everything is verified before anything is
 published, so a damaged or truncated save stores nothing (nor does a load that fails
 as it publishes): each checkpoint by its
 id and checksums, and the template by its content id and the SHA-256 digests the
