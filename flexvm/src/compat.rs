@@ -105,6 +105,7 @@ impl Compat {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct HostKey {
     boot_id: String,
+    microcode: Vec<String>,
     flexvm: Stamp,
     firecracker: Stamp,
     kvm: (u64, u64),
@@ -131,7 +132,17 @@ impl HostKey {
             }
         }
         let flexvm = Stamp::of(&std::fs::metadata("/proc/self/exe")?);
-        Ok(Self { boot_id, flexvm, firecracker, kvm: node(&std::fs::metadata("/dev/kvm")?), modules })
+        // A late microcode load changes what the CPU reports; a host that shows no revision (a guest,
+        // a non-x86 CPU) keeps an empty, still stable, key rather than probing every time.
+        let mut microcode: Vec<_> = std::fs::read_to_string("/proc/cpuinfo")?
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == "microcode").then(|| value.trim().to_string())
+            })
+            .collect();
+        microcode.dedup();
+        Ok(Self { boot_id, microcode, flexvm, firecracker, kvm: node(&std::fs::metadata("/dev/kvm")?), modules })
     }
 }
 
@@ -382,7 +393,14 @@ mod tests {
     fn host_key(root: &Path) -> HostKey {
         let m = std::fs::metadata(root).unwrap();
         let stamp = Stamp::of(&m);
-        HostKey { boot_id: "boot-a".into(), flexvm: stamp.clone(), firecracker: stamp, kvm: node(&m), modules: [Some(node(&m)), None, None] }
+        HostKey {
+            boot_id: "boot-a".into(),
+            microcode: vec!["0x1".into()],
+            flexvm: stamp.clone(),
+            firecracker: stamp,
+            kvm: node(&m),
+            modules: [Some(node(&m)), None, None],
+        }
     }
 
     /// How many times `host_compat` probed the host (as `host()`) for `key`.
@@ -421,7 +439,7 @@ mod tests {
         std::fs::write(&replacement, b"replacement").unwrap();
         let m = std::fs::metadata(replacement).unwrap();
         let (stamp, inode) = (Stamp::of(&m), node(&m));
-        let mut keys = vec![key.clone(); 8];
+        let mut keys = vec![key.clone(); 9];
         keys[0].boot_id = "boot-b".into();
         keys[1].firecracker = stamp.clone();
         keys[2].kvm = inode;
@@ -430,6 +448,7 @@ mod tests {
         keys[5].modules[2] = Some(inode);
         keys[6].modules[0] = None;
         keys[7].flexvm = stamp;
+        keys[8].microcode = vec!["0x2".into()];
         for changed in keys {
             host_compat(Some(&root), Some(&key), || Ok(host())).unwrap();
             assert_eq!(probes(&root, &changed), 1, "{changed:?}");
@@ -458,6 +477,9 @@ mod tests {
             value["compat"].as_object_mut().unwrap().remove(field);
             invalid.push(serde_json::to_vec(&value).unwrap());
         }
+        let mut old_key = valid.clone();
+        old_key["key"].as_object_mut().unwrap().remove("microcode");
+        invalid.push(serde_json::to_vec(&old_key).unwrap());
         for bytes in invalid {
             std::fs::write(root.join("compat.json"), bytes).unwrap();
             assert_eq!(probes(&root, &key), 1);

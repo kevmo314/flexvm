@@ -9304,6 +9304,38 @@ def route_abort():
             subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
+def route_abandoned():
+    """#1174: a source whose route switch fails throughout, its background retries and the last try at
+    the release too, gives it up; the release then puts back the target's announced route, so this
+    host still reaches the VM rather than having no route to it. B advertises an underlay that is
+    not a local address (the third peer's, listed as B's in A's `peer_underlays` so A takes it from
+    B as a next hop), so the route is a real one the kernel keeps."""
+    n = "ft-route-abandoned"
+    scenario_vms.add(n)
+    gw = third_peer()
+    underlays = host_config(A).get("peer_underlays", {})
+    configure(A, peer_underlays={**underlays, B.addr: [gw]})
+    configure(B, underlay=gw)
+    ip = None
+    try:
+        m = setup(n)
+        ip = vm_ip(A, n)
+        # Armed past the release: every try fails, the last one in `wait_release` too.
+        with armed_fault(A, "route", 600000):
+            r = ok(migrate(A, n, B))
+            check("route abandoned: the switch failed, so it is retried", r["reroute_error"] is not None, r["reroute_error"])
+            st = wait_released(B, n)
+            check("route abandoned: released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+            check("route abandoned: the source gave the switch up", "giving up" in log(A, n), log(A, n)[-1500:])
+        check("route abandoned: the release put the target's route back", f"via {gw}" in peer_route(ip), (peer_route(ip), log(A, n)[-1500:]))
+        check("route abandoned: md5 intact", md5(B, n) == m)
+    finally:
+        configure(B, underlay=None)
+        configure(A, peer_underlays=underlays)
+        if ip and f"via {gw}" in peer_route(ip):
+            subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+
+
 def arrival_overtaken():
     """Operations that change who owns a VM wait for its arrival to settle
     (every page in, the migration released, a home loan taken back), or are
@@ -11617,6 +11649,7 @@ SCENARIOS = dict(
     pull_died=pull_died,
     connect_after_pull=connect_after_pull,
     route_abort=route_abort,
+    route_abandoned=route_abandoned,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
     mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_claim_cgroupns=standby_claim_cgroupns, standby_claim_orphan_migrating=standby_claim_orphan_migrating, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, standby_lost_cgroup=standby_lost_cgroup, standby_claim_setup_fail=standby_claim_setup_fail, evict_latency=evict_latency,

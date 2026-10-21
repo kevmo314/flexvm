@@ -301,10 +301,15 @@ fn hash_and_digest(file: &File, path: &Path) -> Result<(Component, String)> {
 }
 
 /// Reuse only a local generation's hashes for the exact same rootfs inode and stamp.
-fn cached_rootfs(paths: &Paths, file: &File) -> Option<(Component, String)> {
+fn cached_rootfs(paths: &Paths, file: &File, preferred: Option<&Path>) -> Option<(Component, String)> {
     let stamp = Stamp::of(&file.metadata().ok()?);
-    for id in generations(&paths.templates).ok()? {
-        let Ok(meta) = Meta::read(&paths.templates.join(GENERATIONS).join(id)) else { continue };
+    // Keep the generation scan lazy: a hit through the current name reads just one metadata file.
+    let candidates = preferred
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(std::iter::once_with(|| generations(&paths.templates).unwrap_or_default()).flatten().map(|id| paths.templates.join(GENERATIONS).join(id)));
+    for dir in candidates {
+        let Ok(meta) = Meta::read(&dir) else { continue };
         if meta.received || !meta.identified() {
             continue;
         }
@@ -403,10 +408,10 @@ impl Meta {
 
     #[cfg(test)]
     fn identify(&mut self, paths: &Paths, dir: &Path) -> Result<()> {
-        self.identify_inputs(paths, dir, BTreeMap::new())
+        self.identify_inputs(paths, dir, BTreeMap::new(), None)
     }
 
-    fn identify_inputs(&mut self, paths: &Paths, dir: &Path, inputs: BTreeMap<String, Component>) -> Result<()> {
+    fn identify_inputs(&mut self, paths: &Paths, dir: &Path, inputs: BTreeMap<String, Component>, preferred: Option<&Path>) -> Result<()> {
         let mut digests = [String::new(), String::new(), String::new()];
         for (i, (name, path)) in self.files(paths, dir).into_iter().enumerate() {
             let component = if let Some(input) = inputs.get(name) {
@@ -414,7 +419,7 @@ impl Meta {
             } else if i < digests.len() {
                 let file = File::open(&path).map_err(|e| format!("template component {}: {e}", path.display()))?;
                 let (component, digest) = if name == "rootfs" {
-                    cached_rootfs(paths, &file).map(Ok).unwrap_or_else(|| hash_and_digest(&file, &path))?
+                    cached_rootfs(paths, &file, preferred).map(Ok).unwrap_or_else(|| hash_and_digest(&file, &path))?
                 } else {
                     hash_and_digest(&file, &path)?
                 };
@@ -1963,7 +1968,7 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
         digests: None,
         received: false,
     };
-    meta.identify_inputs(paths, dir, inputs)?;
+    meta.identify_inputs(paths, dir, inputs, Template::resolve(paths, name).ok().as_deref())?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     interrupted()?;
     let wset = record_working_set(host, paths, dir, tap, &sockets)?;
@@ -3475,13 +3480,25 @@ pub(crate) mod tests {
         f.meta.identify(&f.paths, &f.dir).unwrap();
         publish_as(&f, "t", &f.meta);
         let file = File::open(&f.meta.rootfs).unwrap();
-        assert_eq!(cached_rootfs(&f.paths, &file).unwrap().1, digest(&f.meta.rootfs).unwrap());
+        assert_eq!(cached_rootfs(&f.paths, &file, None).unwrap().1, digest(&f.meta.rootfs).unwrap());
         let gen = Template::resolve(&f.paths, "t").unwrap();
         f.write_meta(&Meta { received: true, ..f.meta.clone() }, &gen);
-        assert!(cached_rootfs(&f.paths, &file).is_none());
+        assert!(cached_rootfs(&f.paths, &file, None).is_none());
         f.write_meta(&f.meta, &gen);
         std::fs::write(&f.meta.rootfs, b"changed rootfs").unwrap();
-        assert!(cached_rootfs(&f.paths, &file).is_none());
+        assert!(cached_rootfs(&f.paths, &file, None).is_none());
+    }
+
+    #[test]
+    fn rootfs_cache_checks_the_linked_generation_before_listing_generations() {
+        let mut f = Fixture::new();
+        f.meta.identify(&f.paths, &f.dir).unwrap();
+        f.write_meta(&f.meta, &f.dir);
+        let file = File::open(&f.meta.rootfs).unwrap();
+        let mut paths = f.paths.clone();
+        paths.templates = f.dir.join("absent");
+        assert_eq!(cached_rootfs(&paths, &file, Some(&f.dir)).unwrap().1, digest(&f.meta.rootfs).unwrap());
+        assert!(cached_rootfs(&paths, &file, None).is_none());
     }
 
     #[test]

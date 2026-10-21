@@ -2446,6 +2446,39 @@ impl Host {
         recorded || self.leaving_by(by)
     }
 
+    /// One conservative snapshot for reached-record GC, while the caller holds the host lock.
+    pub(crate) fn owing_sources(&self, _l: &Locked) -> Option<Vec<Ident>> {
+        let mut sources = Vec::new();
+        match self.owed_ids() {
+            Ok(ids) => {
+                for (_, path) in ids {
+                    if let Some(o) = load::<Owed>(&path).ok()? {
+                        sources.push(o.by);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        match std::fs::read_dir(self.state.join("addrs")) {
+            Ok(entries) => {
+                for e in entries {
+                    let e = e.ok()?;
+                    let Some(ip) = e.file_name().to_str().and_then(|n| n.parse::<Ipv4Addr>().ok()) else { continue };
+                    let a = self.read_addr(ip).ok()?;
+                    if a.leaving.is_some() {
+                        if let Some(by) = a.holder_id {
+                            sources.push(by);
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        Some(sources)
+    }
+
     /// Whether `by` holds an address here as a migration source (`leaving`);
     /// what cannot be read counts as such.
     fn leaving_by(&self, by: &Ident) -> bool {
@@ -3224,6 +3257,32 @@ pub struct Entry {
     pub growth_mib_s: u64,
     /// Runs `run -- CMD`: its process ends with CMD's, so eviction leaves it here.
     pub cmd: bool,
+}
+
+impl Entry {
+    /// Firecracker's pid is relative to the publishing VM's namespace, not the reader's.
+    pub fn rss_mib(&self) -> u64 {
+        self.rss_in(Path::new("/proc"), &proc_ns).unwrap_or(0) >> 20
+    }
+
+    fn rss_in(&self, proc: &Path, ns_of: &dyn Fn(&Path, &str) -> std::io::Result<u64>) -> Option<u64> {
+        let pid = self.firecracker?;
+        let ns = self.ident.ns?;
+        let read = |dir: &Path| -> Option<u64> {
+            if ns_of(dir, "pid").ok()? != ns {
+                return None;
+            }
+            let status = std::fs::read_to_string(dir.join("status")).ok()?;
+            if nspid(&status)?.last().copied()? != pid {
+                return None;
+            }
+            status.lines().find_map(|l| l.strip_prefix("VmRSS:"))?.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)
+        };
+        if proc_is_mine() && ns_of(&proc.join("self"), "pid").ok() == Some(ns) {
+            return read(&proc.join(pid.to_string()));
+        }
+        std::fs::read_dir(proc).ok()?.flatten().filter(|e| e.file_name().to_str().is_some_and(|n| n.parse::<u32>().is_ok())).find_map(|e| read(&e.path()))
+    }
 }
 
 /// A logs' lifetime's record of whose it is, in it (`Host::own_logs`).
@@ -5111,6 +5170,13 @@ pub fn lock_path(path: &Path, how: i32) -> std::io::Result<File> {
 
 /// Every error, and anything unparsable, is unknown.
 fn liveness_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<String>) -> Liveness {
+    liveness_with_time(id, boot, stat, || match (proc_ns(&PathBuf::from(format!("/proc/{}", id.pid)), "time"), proc_ns(Path::new("/proc/self"), "time")) {
+        (Ok(theirs), Ok(mine)) => theirs == mine,
+        _ => false,
+    })
+}
+
+fn liveness_with_time(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<String>, same_time: impl FnOnce() -> bool) -> Liveness {
     // Without either boot id, a mismatch proves nothing.
     if boot.is_empty() || id.boot.is_empty() {
         return Liveness::Unknown;
@@ -5125,7 +5191,13 @@ fn liveness_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<Str
         r => r,
     };
     match pid_liveness_by(id.pid, stat) {
-        (Liveness::Alive, Some(start)) if start != id.start => Liveness::Gone,
+        (Liveness::Alive, Some(start)) if start != id.start => {
+            if same_time() {
+                Liveness::Gone
+            } else {
+                Liveness::Unknown
+            }
+        }
         (l, _) => l,
     }
 }
@@ -5502,6 +5574,32 @@ pub fn name_busy(e: &crate::util::Error) -> bool {
 pub(crate) mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn start_mismatch_in_another_time_namespace_is_not_death() {
+        let id = Ident { pid: 1, start: 42, boot: "boot".into(), ns: Some(7) };
+        let stat = |state, start| format!("1 (x) {state} {}{start}", "0 ".repeat(18));
+        assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("S", 43)), || false), Liveness::Unknown);
+        assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("S", 43)), || true), Liveness::Gone);
+        assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("S", 42)), || false), Liveness::Alive);
+        assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("Z", 43)), || false), Liveness::Gone);
+    }
+
+    #[test]
+    fn rss_uses_the_publishers_pid_namespace() {
+        let root = crate::test_util::TempDir::new("rss-ns");
+        for (pid, status) in [(7, "NSpid: 7\nVmRSS: 1024 kB\n"), (100, "NSpid: 100 7\nVmRSS: 8192 kB\n")] {
+            std::fs::create_dir(root.join(pid.to_string())).unwrap();
+            std::fs::write(root.join(pid.to_string()).join("status"), status).unwrap();
+        }
+        let ns = |dir: &Path, _: &str| Ok(if dir.ends_with("100") { 2 } else { 1 });
+        let mut e = Entry { ident: Ident { ns: Some(2), ..Ident::default() }, firecracker: Some(7), ..Entry::default() };
+        assert_eq!(e.rss_in(&root, &ns), Some(8 << 20));
+        e.ident.ns = Some(3);
+        assert_eq!(e.rss_in(&root, &ns), None, "an unseen sibling must not read the reader's pid 7");
+        e.ident.ns = None;
+        assert_eq!(e.rss_in(&root, &ns), None, "unknown namespace is not permission to guess");
+    }
 
     #[test]
     fn fault_cache_polls_for_runtime_arming_and_removal() {

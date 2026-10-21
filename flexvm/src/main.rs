@@ -1625,13 +1625,12 @@ fn reclaim(host: &Host, ip: &str, force: Option<u64>) -> Result<()> {
 
 /// The VMs `ps -a` lists: registered, suspended, failed and lost.
 fn vms(host: &Host) -> Vec<Value> {
-    let rss = |pid: Option<u32>| pid.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 20;
     let mut vms: Vec<Value> = host
         .entries()
         .into_iter()
         .map(|e| {
             let mut v = serde_json::to_value(&e).unwrap_or_default();
-            v["rss_mib"] = json!(rss(e.firecracker));
+            v["rss_mib"] = json!(e.rss_mib());
             v
         })
         .collect();

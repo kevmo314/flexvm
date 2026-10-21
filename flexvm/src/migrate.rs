@@ -185,11 +185,15 @@ impl Reached {
         let dir = host.state.join("reached");
         crate::util::create_dir_durably(&dir, 0o700)?;
         let l = host.lock()?;
+        // Read once, under the lock, for the first gone source only: what `forget_unless_owed` asks of each.
+        let owing = std::cell::OnceCell::new();
         for e in std::fs::read_dir(&dir)?.flatten() {
             let Some(id) = e.file_name().to_str().and_then(|n| n.parse::<u64>().ok()) else { continue };
             if let Ok(Some(r)) = crate::host::load::<Reached>(&e.path()) {
-                if r.by.liveness() == crate::host::Liveness::Gone {
-                    Self::forget_unless_owed(&l, host, id, &r.by);
+                if r.by.liveness() == crate::host::Liveness::Gone
+                    && owing.get_or_init(|| host.owing_sources(&l)).as_ref().is_some_and(|sources: &Vec<_>| !sources.contains(&r.by))
+                {
+                    Self::forget(host, id);
                 }
             }
         }
@@ -722,15 +726,26 @@ impl Proc {
             // One last try, never a retry loop: until `finish` the source stays unkillable, keeps its
             // name, claim and paused Firecracker, and a migration back here waits. `retry_route` already
             // retried in the background while the target pulled.
+            let mut abandoned = false;
             if let Some(mut route) = p.take_pending_route(mig) {
                 if let Err(e) = route.resolve(&p.host).and_then(|via| p.switch_route(mig, via)) {
+                    abandoned = true;
                     crate::log!("route {} to {}: {e}; giving up", p.vm().ip, route.to);
                 }
             }
             let op = p.op();
             // Decided here durably first: once the target forgets its record, the
             // migration would read as aborted there.
-            match p.host.lock().and_then(|l| p.host.release(&l, p.vm().ip, &p.vm().name.get(), Some(&crate::host::Ident::me()))) {
+            match p.host.lock().and_then(|l| {
+                p.host.release(&l, p.vm().ip, &p.vm().name.get(), Some(&crate::host::Ident::me()))?;
+                if abandoned {
+                    // The target's announcement was saved while our source still held the route.
+                    if let Err(e) = p.host.reinstall(&l, p.vm().ip, None) {
+                        crate::log!("route {}: reinstall after release: {e}", p.vm().ip);
+                    }
+                }
+                Ok(())
+            }) {
                 Ok(()) => {
                     reached.done(mig);
                     Reached::forget(&p.host, mig);
@@ -1991,6 +2006,25 @@ mod tests {
         reached("t:1", at, None).record(&host, 3).unwrap();
         assert!(Reached::load(&host, 1).unwrap().is_none());
         assert!(Reached::load(&host, 2).unwrap().is_some() && Reached::load(&host, 3).unwrap().is_some());
+    }
+
+    #[test]
+    fn reached_batch_keeps_dead_sources_when_an_owed_record_is_unreadable() {
+        let root = crate::test_util::TempDir::new("reached-corrupt");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let at = "127.0.0.1:1".parse().unwrap();
+        let gone = Reached { by: crate::host::Ident { boot: "another boot".into(), ..crate::host::Ident::me() }, ..reached("t:1", at, None) };
+        gone.record(&host, 1).unwrap();
+        std::fs::create_dir_all(host.state.join("owed")).unwrap();
+        std::fs::write(host.state.join("owed/9"), b"broken").unwrap();
+        gone.record(&host, 2).unwrap();
+        reached("t:1", at, None).record(&host, 3).unwrap();
+        assert!(Reached::load(&host, 1).unwrap().is_some());
+        assert!(Reached::load(&host, 2).unwrap().is_some());
+        std::fs::remove_file(host.state.join("owed/9")).unwrap();
+        reached("t:1", at, None).record(&host, 4).unwrap();
+        assert!(Reached::load(&host, 1).unwrap().is_none());
+        assert!(Reached::load(&host, 2).unwrap().is_none());
     }
 
     /// #1117: a gone source's record is let go of only under the host lock, so `withdraw_dead`'s owing it (also
