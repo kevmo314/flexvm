@@ -4,7 +4,12 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +25,7 @@ struct Hosts {
     b: Host,
     to: Option<String>,
     timeout: Duration,
+    cancelled: Arc<AtomicBool>,
 }
 
 /// Only successful starts confer ownership; a refused name must never be killed.
@@ -27,6 +33,7 @@ struct OwnedVm<'a> {
     h: &'a Hosts,
     name: &'a str,
     hosts: Vec<&'a Host>,
+    checkpoint: Option<OwnedCheckpoint<'a>>,
 }
 
 impl Drop for OwnedVm<'_> {
@@ -39,9 +46,57 @@ impl Drop for OwnedVm<'_> {
     }
 }
 
+struct OwnedCheckpoint<'a> {
+    state: &'a std::path::Path,
+    id: String,
+}
+
+impl Drop for OwnedCheckpoint<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = crate::checkpoint::store::remove(self.state, std::slice::from_ref(&self.id), true) {
+            crate::log!("bench: cleanup checkpoint {}: {e}", self.id);
+        }
+    }
+}
+
+fn check(cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        bail!("benchmark interrupted");
+    }
+    Ok(())
+}
+
+fn wait(cancelled: &AtomicBool, timeout: Duration, what: &str, cond: impl Fn() -> bool) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        check(cancelled)?;
+        if cond() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for {what}");
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 impl Hosts {
+    fn check(&self) -> Result<()> {
+        check(&self.cancelled)
+    }
+
     fn cli(&self, host: &Host, args: &[&str]) -> Result<Value> {
-        let out = Command::new("/proc/self/exe").arg("--state").arg(&host.state).arg("--run").arg(&host.run).args(args).output()?;
+        // Let starts finish and confer ownership even when the terminal sends Ctrl-C; in a background
+        // group, never reading the terminal (it would stop).
+        let out = Command::new("/proc/self/exe")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .arg("--state")
+            .arg(&host.state)
+            .arg("--run")
+            .arg(&host.run)
+            .args(args)
+            .output()?;
         if !out.status.success() {
             bail!("flexvm {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -53,19 +108,13 @@ impl Hosts {
     }
 
     fn wait(&self, what: &str, cond: impl Fn() -> bool) -> Result<()> {
-        let deadline = Instant::now() + self.timeout;
-        while !cond() {
-            if Instant::now() >= deadline {
-                bail!("timed out waiting for {what}");
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        Ok(())
+        wait(&self.cancelled, self.timeout, what, cond)
     }
 
     fn pulled(&self, host: &Host, name: &str) -> Result<Value> {
         let deadline = Instant::now() + self.timeout;
         loop {
+            self.check()?;
             let st = crate::vmproc::call(host, name, json!({"op": "debug", "what": "status"}), None)?;
             if st["background_pull_ms"].is_number() {
                 return Ok(st["background_pull_ms"].clone());
@@ -79,6 +128,10 @@ impl Hosts {
 }
 
 pub fn run(args: &Args) -> Result<()> {
+    validate(args)?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = cancelled.clone();
+    crate::util::on_signal(&[libc::SIGINT, libc::SIGTERM], move |_| flag.store(true, Ordering::Relaxed));
     let sha = command("git", &["rev-parse", "HEAD"])?;
     let dirty = !command("git", &["status", "--porcelain"])?.is_empty();
     let dir = format!("{}/bench", command("git", &["rev-parse", "--show-toplevel"])?);
@@ -91,7 +144,7 @@ pub fn run(args: &Args) -> Result<()> {
         _ => bail!("--to needs the target host's --to-state and --to-run (on this machine)"),
     };
     let timeout = Duration::from_secs(args.parse_or::<u64>("timeout", 120)?.max(1));
-    let hosts = Hosts { a, b, to, timeout };
+    let hosts = Hosts { a, b, to, timeout, cancelled };
     let template = &crate::template::name_of(args.get("template").unwrap_or("ubuntu:24.04"))?;
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
     let id = format!("{}-{}", std::process::id(), crate::migrate::migration_id());
@@ -108,7 +161,37 @@ pub fn run(args: &Args) -> Result<()> {
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     serde_json::to_writer_pretty(file, &report)?;
     crate::output(format_args!("{path}\n"))?;
+    if let Some(error) = report["error"].as_str() {
+        bail!("{error}");
+    }
     Ok(())
+}
+
+fn validate(args: &Args) -> Result<()> {
+    if args.parse_or::<u64>("iterations", 1)? == 0 {
+        bail!("--iterations must be positive");
+    }
+    if args.has("lifecycle") {
+        for flag in ["warmup", "settle-ms", "ready-port", "ready-http"] {
+            if args.has(flag) {
+                bail!("--{flag} is unused with --lifecycle");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record(result: Result<Value>, samples: &mut Vec<Value>, error: &mut Option<String>) -> bool {
+    match result {
+        Ok(sample) => {
+            samples.push(sample);
+            true
+        }
+        Err(e) => {
+            *error = Some(e.to_string());
+            false
+        }
+    }
 }
 
 fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<Value> {
@@ -129,20 +212,31 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<
         bail!("--dirty-mib needs --to");
     }
     let mut samples = Vec::new();
+    let mut error = None;
     for i in 0..warmup + iterations {
         let name = format!("bench-{id}-{i}");
-        let sample = iteration(h, &name, template, dirty_mib, ready).map_err(|e| format!("iteration {} failed: {e}", i + 1))?;
-        if i >= warmup {
-            samples.push(sample);
+        let result = h.check().and_then(|()| iteration(h, &name, template, dirty_mib, ready)).map_err(|e| format!("iteration {} failed: {e}", i + 1).into());
+        if !record(result, &mut samples, &mut error) {
+            break;
+        }
+        if i < warmup {
+            samples.pop();
         }
         crate::log!("bench: {}/{}{}", i + 1, warmup + iterations, if i < warmup { " (warmup)" } else { "" });
         // Let standby VMs refill between trials; misses show up as cold runs.
-        thread::sleep(settle);
+        let until = Instant::now() + settle;
+        while Instant::now() < until && h.check().is_ok() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if let Err(e) = h.check() {
+            error = Some(e.to_string());
+            break;
+        }
     }
     let standby = samples.iter().filter(|s| s["standby"] == json!(true)).count();
     let mut summary = run_summary(&samples)?;
     summary["run_standby_hits"] = json!(standby);
-    if h.to.is_some() {
+    if h.to.is_some() && !samples.is_empty() {
         summary["migrate"] = summarize(&samples, "migrate")?;
         summary["migrate_target"] = summarize(&samples, "migrate_target")?;
         summary["post_copy"] = summarize(&samples, "post_copy")?;
@@ -150,6 +244,8 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<
     Ok(json!({
         "params": {"to": h.to, "template": template, "iterations": iterations, "warmup": warmup, "dirty_mib": dirty_mib,
                    "settle_ms": settle.as_millis(), "ready_port": ready.map(|r| r.0), "ready_http": ready.is_some_and(|r| r.1), "date": date},
+        "status": if error.is_some() { "failed" } else { "ok" },
+        "error": error,
         "summary_ms": summary,
         "samples_ms": samples,
     }))
@@ -159,11 +255,12 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
     let start = Instant::now();
     let run = h.cli(&h.a, &["run", "--name", name, "-d", template])?;
     let run_cli = start.elapsed();
-    let mut owned = OwnedVm { h, name, hosts: vec![&h.a] };
+    let mut owned = OwnedVm { h, name, hosts: vec![&h.a], checkpoint: None };
+    h.check()?;
     let mut sample = json!({"run": run["timings_ms"], "standby": run["standby"], "run_client": {"total": ms(run_cli)}});
     if let Some((port, http)) = ready {
         let ip: std::net::Ipv4Addr = run["ip"].as_str().ok_or("run reply has no ip")?.parse()?;
-        wait_ready((ip, port).into(), http, start + h.timeout)?;
+        wait_ready(h, (ip, port).into(), http, start + h.timeout)?;
         let total = start.elapsed();
         sample["client"] = json!({"run_cli": ms(run_cli), "app_ready": ms(total - run_cli), "total": ms(total)});
     }
@@ -205,13 +302,14 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
         }
         sample["post_copy"] = post;
     }
+    h.check()?;
     h.cli(if h.to.is_some() { &h.b } else { &h.a }, &["rm", "-f", name])?;
     owned.hosts.clear();
     Ok(sample)
 }
 
 fn lifecycle(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<Value> {
-    let iterations = args.parse_or::<u64>("iterations", 5)?.max(1);
+    let iterations = args.parse_or::<u64>("iterations", 5)?;
     let sizes: Vec<u64> = args
         .get("dirty-mib")
         .unwrap_or("0,256,1024")
@@ -220,37 +318,56 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Re
         .collect::<std::result::Result<_, _>>()?;
     let mut summary = Map::new();
     let mut all = Map::new();
+    let mut error = None;
+    let mut sizes_mib = Map::new();
     for &mib in &sizes {
         let mut samples = Vec::new();
         for i in 0..iterations {
             let name = format!("lcbench-{id}-{mib}-{i}");
-            let res = trial(h, &name, template, mib);
-            samples.push(res.map_err(|e| format!("{mib} MiB, trial {}: {e}", i + 1))?);
+            let res = h.check().and_then(|()| trial(h, &name, template, mib)).map_err(|e| format!("{mib} MiB, trial {}: {e}", i + 1).into());
+            if !record(res, &mut samples, &mut error) {
+                break;
+            }
             crate::log!("bench: {mib} MiB {}/{iterations}", i + 1);
         }
         let mut s = Map::new();
         for group in ["pause_client", "checkpoint", "restore", "suspend", "resume_suspended"] {
-            s.insert(group.into(), summarize(&samples, group)?);
+            if !samples.is_empty() {
+                s.insert(group.into(), summarize(&samples, group)?);
+            }
         }
+        sizes_mib.insert(format!("{mib}_mib"), extract_sizes(&mut samples));
         summary.insert(format!("{mib}_mib"), s.into());
         all.insert(format!("{mib}_mib"), samples.into());
+        if error.is_some() {
+            break;
+        }
     }
     Ok(json!({
         "params": {"to": h.to, "template": template, "iterations": iterations, "dirty_mib": sizes, "date": date},
+        "status": if error.is_some() { "failed" } else { "ok" },
+        "error": error,
         "summary_ms": summary,
         "samples_ms": all,
+        "checkpoint_data_mib": sizes_mib,
     }))
+}
+
+fn extract_sizes(samples: &mut [Value]) -> Value {
+    samples.iter_mut().map(|s| s.as_object_mut().unwrap().remove("checkpoint_data_mib").unwrap_or(Value::Null)).collect()
 }
 
 /// Ten pause/resume cycles, checkpoint --stop, restore on `b` (by its path in `a`'s store), then suspend and resume.
 fn trial(h: &Hosts, name: &str, template: &str, mib: u64) -> Result<Value> {
     h.cli(&h.a, &["run", "--name", name, "-d", template])?;
-    let mut owned = OwnedVm { h, name, hosts: vec![&h.a] };
+    let mut owned = OwnedVm { h, name, hosts: vec![&h.a], checkpoint: None };
+    h.check()?;
     if mib > 0 && crate::exec(&h.a, name, &json!({"argv": ["sh", "-c", format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null")]}))? != 0 {
         bail!("dirtying guest memory failed");
     }
     let (mut p, mut r) = (Vec::new(), Vec::new());
     for _ in 0..10 {
+        h.check()?;
         let t = Instant::now();
         h.a.signal(name, libc::SIGTSTP)?;
         h.wait("pause", || Hosts::state(&h.a, name) == "paused")?;
@@ -272,7 +389,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64) -> Result<Value> {
     let c = crate::vmproc::call(&h.a, name, json!({"op": "checkpoint", "stop": true}), None)?;
     let mut checkpoint = c["timings_ms"].clone();
     checkpoint["paused"] = c["paused_ms"].clone();
-    checkpoint["data_mib"] = c["data_mib"].clone();
+    owned.checkpoint = Some(OwnedCheckpoint { state: &h.a.state, id: c["id"].as_str().ok_or("checkpoint reply has no id")?.into() });
     h.wait("the checkpointed vm to go", || !h.a.alive(name))?;
     owned.hosts.clear();
 
@@ -290,9 +407,10 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64) -> Result<Value> {
     }
     let reply = h.cli(&h.b, &argv);
     // Open once restored: its files stay readable.
-    let _ = crate::checkpoint::store::remove(&h.a.state, &[c["id"].as_str().unwrap_or_default().into()], true);
+    drop(owned.checkpoint.take());
     let reply = reply?;
     owned.hosts.push(&h.b);
+    h.check()?;
     let restore = restored(reply)?;
 
     let t = Instant::now();
@@ -300,7 +418,10 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64) -> Result<Value> {
     h.wait("suspend", || !h.b.alive(name))?;
     let suspend = json!({"total": ms(t.elapsed())});
     let resume_suspended = restored(h.cli(&h.b, &["start", name])?)?;
-    Ok(json!({"pause_client": pause_client, "checkpoint": checkpoint, "restore": restore, "suspend": suspend, "resume_suspended": resume_suspended}))
+    h.check()?;
+    Ok(
+        json!({"checkpoint_data_mib": c["data_mib"], "pause_client": pause_client, "checkpoint": checkpoint, "restore": restore, "suspend": suspend, "resume_suspended": resume_suspended}),
+    )
 }
 
 fn host_context(template: &str) -> Value {
@@ -318,8 +439,9 @@ fn host_context(template: &str) -> Value {
     })
 }
 
-fn wait_ready(addr: SocketAddr, http: bool, deadline: Instant) -> Result<()> {
+fn wait_ready(h: &Hosts, addr: SocketAddr, http: bool, deadline: Instant) -> Result<()> {
     loop {
+        h.check()?;
         let attempt = (|| -> std::io::Result<()> {
             let mut c = TcpStream::connect_timeout(&addr, Duration::from_millis(200))?;
             if http {
@@ -409,6 +531,81 @@ fn command(bin: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_stops_waits_and_runs_cleanup() {
+        const CHILD: &str = "FLEXVM_TEST_BENCH_SIGNAL";
+        if let Some(sig) = std::env::var_os(CHILD) {
+            let dir = crate::test_util::TempDir::new("bench-signal");
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = cancelled.clone();
+            crate::util::on_signal(&[libc::SIGINT, libc::SIGTERM], move |_| flag.store(true, Ordering::Relaxed));
+            // A dangling checkpoint name exercises cleanup without starting a VM.
+            let names = dir.join("checkpoints/names");
+            std::fs::create_dir_all(&names).unwrap();
+            std::os::unix::fs::symlink("../missing", names.join("bench-test")).unwrap();
+            let owned = OwnedCheckpoint { state: &dir, id: "bench-test".into() };
+            unsafe {
+                libc::kill(libc::getpid(), sig.to_str().unwrap().parse().unwrap());
+            }
+            assert!(wait(&cancelled, Duration::from_secs(1), "signal", || false).unwrap_err().to_string().contains("interrupted"));
+            assert!(wait(&cancelled, Duration::from_secs(1), "already ready", || true).is_err());
+            assert!(check(&cancelled).is_err());
+            drop(owned);
+            assert!(std::fs::symlink_metadata(names.join("bench-test")).is_err());
+            return;
+        }
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            // Block before the test harness starts its threads.
+            unsafe {
+                cmd.pre_exec(|| {
+                    crate::util::block_signals(&[libc::SIGINT, libc::SIGTERM]);
+                    Ok(())
+                });
+            }
+            let out =
+                cmd.args(["--exact", "bench::tests::cancellation_stops_waits_and_runs_cleanup", "--nocapture"]).env(CHILD, sig.to_string()).output().unwrap();
+            assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    #[test]
+    fn failed_trials_keep_completed_samples() {
+        let mut samples = Vec::new();
+        let mut error = None;
+        assert!(record(Ok(json!({"run": {"total": 4}})), &mut samples, &mut error));
+        assert!(!record(Err("trial failed".into()), &mut samples, &mut error));
+        assert_eq!(error.as_deref(), Some("trial failed"));
+        assert_eq!(summarize(&samples, "run").unwrap()["total"]["count"], 1);
+        let mut empty = Vec::new();
+        assert!(!record(Err("first trial failed".into()), &mut empty, &mut error));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_rejects_unused_flags_and_zero_iterations() {
+        for lifecycle in [false, true] {
+            let mut argv = vec!["--iterations", "0"];
+            if lifecycle {
+                argv.push("--lifecycle");
+            }
+            assert!(validate(&Args::parse(argv.into_iter().map(String::from)).unwrap()).is_err());
+        }
+        for flag in ["--warmup", "--settle-ms", "--ready-port", "--ready-http"] {
+            let args = Args::parse(["--lifecycle", flag, "1"].map(String::from)).unwrap();
+            assert!(validate(&args).unwrap_err().to_string().contains(flag));
+        }
+        assert!(validate(&Args::parse(["--lifecycle", "--iterations", "1"].map(String::from)).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_sizes_are_not_timings() {
+        let mut samples = vec![json!({"checkpoint": {"total": 2}, "checkpoint_data_mib": 256})];
+        assert_eq!(extract_sizes(&mut samples), json!([256]));
+        assert_eq!(summarize(&samples, "checkpoint").unwrap(), json!({"total": {"count": 1, "p50": 2.0, "p90": 2.0, "p99": 2.0, "max": 2.0}}));
+        assert!(samples[0].get("checkpoint_data_mib").is_none());
+    }
 
     #[test]
     fn sha_is_resolved_before_opening_hosts_or_running_iterations() {

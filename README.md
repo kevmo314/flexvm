@@ -975,15 +975,20 @@ absent population is omitted. Phase percentiles use only
 samples containing that phase and include a `count`. Lifecycle `pause_client`
 and `resume_client` include signal dispatch and state polling at 1 ms intervals;
 they are client-observed times, with each trial reporting ten cycles' median.
+Lifecycle checkpoint sizes are in `checkpoint_data_mib`, grouped by dirty-memory
+size with one value per completed trial, outside `summary_ms` and `samples_ms`.
+On a failed trial or SIGINT/SIGTERM, bench cleans up owned VMs and checkpoints,
+writes completed measured samples with `status: failed` and an `error`, then exits
+with an error. Successful reports have `status: ok`; warmups are never included.
 
 | option | default | what |
 |---|---|---|
 | `--timeout SECONDS` | 120 (minimum 1) | timeout for state waits, background pulls and app readiness |
-| `--iterations N` | 50; 5 with `--lifecycle` | measured trials (positive; lifecycle clamps to at least 1) |
-| `--warmup N` | 3 | unmeasured trials before run benchmarks; unused with `--lifecycle` |
-| `--settle-ms MS` | 100 | sleep after each run trial, including warmups; unused with `--lifecycle` |
-| `--ready-port PORT` | none | wait for a TCP connection after each run; unused with `--lifecycle` |
-| `--ready-http PORT` | none | send `GET /` and wait for a response byte after each run; unused with `--lifecycle`; mutually exclusive with `--ready-port` |
+| `--iterations N` | 50; 5 with `--lifecycle` | measured trials (positive in both modes) |
+| `--warmup N` | 3 | unmeasured trials before run benchmarks; rejected with `--lifecycle` |
+| `--settle-ms MS` | 100 | sleep after each run trial, including warmups; rejected with `--lifecycle` |
+| `--ready-port PORT` | none | wait for a TCP connection after each run; rejected with `--lifecycle` |
+| `--ready-http PORT` | none | send `GET /` and wait for a response byte after each run; rejected with `--lifecycle`; mutually exclusive with `--ready-port` |
 
 ## Tests
 
