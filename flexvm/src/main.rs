@@ -1112,7 +1112,8 @@ fn started(v: &Value) -> host::Ident {
 /// Its own: the process the attachment last reached (a resume's, after a stop and start), else, its app done
 /// before any connection, the one it started.
 fn run_attached(host: &Host, name: &str, keep: bool, started: &host::Ident) -> Result<()> {
-    let (code, last) = attach::attach_to(host, name, Some(0))?;
+    let (code, last, name) = attach::attach_to(host, name, Some(0))?;
+    let name = name.as_str();
     let vm = last.as_ref().unwrap_or(started);
     let until = Instant::now() + Duration::from_secs(10);
     while !keep && host.alive(name) && Instant::now() < until {
