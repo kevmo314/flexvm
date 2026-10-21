@@ -1064,6 +1064,8 @@ fn migration_wait<S: PartialEq>(
         if left.is_zero() {
             break;
         }
+        #[cfg(test)]
+        POLL_SLEEP.with(|hook| hook.borrow_mut().as_mut().map(|hook| hook()));
         std::thread::sleep(Duration::from_millis(20).min(left));
         let now = stamp();
         if now == seen && asked.elapsed() < RECHECK {
@@ -1077,6 +1079,12 @@ fn migration_wait<S: PartialEq>(
     }
     reply["waited"] = json!(!wait.is_zero());
     Ok(reply)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: called on this thread each time a long-polled migration status sleeps between reads.
+    static POLL_SLEEP: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// How often a long-polled migration status is asked again with its record unchanged.
@@ -1348,36 +1356,38 @@ mod tests {
         static LOCKING: AtomicUsize = AtomicUsize::new(0);
         let active = Waiting::new(1, 1);
         let from = "127.0.0.1".parse().unwrap();
-        // Parallel tests share the process's host lock: a poll they delay past its wait is tried again.
+        // Parallel tests share the process's host lock: a first read they make busy is tried again.
         for _ in 0..10 {
             let slot = active.take(from).unwrap();
             let (client, server) = pair();
             writeln!(&client, "{}", json!({"op": "migration", "mig": 7, "wait": true})).unwrap();
-            // Held here so the first read is seen taking its slots, then seen done.
-            let held = host.lock().unwrap();
+            let (slept, sleeping) = std::sync::mpsc::channel();
+            let (go, proceed) = std::sync::mpsc::channel::<()>();
             let worker = {
                 let host = host.clone();
                 std::thread::spawn(move || {
+                    // The first sleep between reads waits here until both budgets were tried.
+                    let mut first = true;
+                    POLL_SLEEP.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            if std::mem::take(&mut first) {
+                                let _ = slept.send(());
+                                let _ = proceed.recv();
+                            }
+                        }))
+                    });
                     handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, Some(slot)).unwrap();
                 })
             };
-            let until = |held: bool| {
-                let by = Instant::now() + Duration::from_secs(2);
-                while active.held.lock().unwrap().is_empty() == held {
-                    assert!(Instant::now() < by);
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            };
-            until(true);
-            drop(held);
-            until(false);
-            // The first read done: occupy both budgets during the sleep.
+            // Disconnected instead if the poll ended without sleeping (its first read was busy).
+            let in_wait = sleeping.recv().is_ok();
             let active = active.take(from);
             let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
-            let sleeping = !worker.is_finished();
+            let _ = go.send(());
             worker.join_within().unwrap();
             let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
-            if !sleeping || reply["ok"] != true {
+            if !in_wait {
+                assert_eq!(reply["error"], BUSY, "{reply}");
                 continue;
             }
             assert!(active.is_some(), "sleeping poll kept its active slot");
@@ -1386,7 +1396,7 @@ mod tests {
             assert_eq!(reply["result"]["waited"], true);
             return;
         }
-        panic!("every poll was delayed past its wait");
+        panic!("every poll's first read was busy");
     }
 
     #[test]
