@@ -2277,7 +2277,7 @@ def image_template():
         save_layout(r.stderr)
     vm = "e2e-img"
     ip = A.run(vm, template=name)
-    check("image vm: app's output in logs", wait_for(lambda: "\napp-started\n" in A.logs(vm), 15), A.logs(vm))
+    check("image vm: app's output in logs", wait_for(lambda: "app-started" in A.logs(vm).splitlines(), 15), A.logs(vm))
     code, out, err = A.exec(vm, "cat /etc/os-release 2>/dev/null; busybox | head -1")
     check("image vm: image's userland", code == 0 and "BusyBox" in out, out + err)
 
