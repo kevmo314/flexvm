@@ -28,11 +28,21 @@ pub struct Exit {
     /// stop, a death): unknown in a record from before it was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<bool>,
+    /// The VM it ran (its address and generation): a resume's process runs the same one as the
+    /// process it resumed. Unknown in a record from before it was kept, or of a VM given none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vm: Option<crate::Instance>,
 }
 
+#[cfg(test)]
 pub fn record_exit(host: &Host, name: &str, ident: &Ident, code: i32, app: bool) {
+    record_exit_of(host, name, ident, None, code, app)
+}
+
+/// `record_exit`, with the VM `ident` ran (`Exit::vm`).
+pub(crate) fn record_exit_of(host: &Host, name: &str, ident: &Ident, vm: Option<crate::Instance>, code: i32, app: bool) {
     if let Ok(path) = host.vms(name, "exit") {
-        if let Err(e) = host::store(&path, &Exit { ident: ident.clone(), code, app: Some(app) }, false) {
+        if let Err(e) = host::store(&path, &Exit { ident: ident.clone(), code, app: Some(app), vm }, false) {
             crate::log!("vm {name}: recording its exit status: {e}");
         }
     }
