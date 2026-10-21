@@ -48,7 +48,6 @@ const FEATURES: [(u32, u32, &[usize]); 11] = [
 const REGS: [&str; 4] = ["eax", "ebx", "ecx", "edx"];
 
 impl Compat {
-    #[cfg(test)]
     pub fn check(&self, host: &Self) -> Result<()> {
         self.check_saved(host, self.tsc_khz, &self.msrs).map(drop)
     }
@@ -159,9 +158,13 @@ fn host_compat(run: Option<&Path>, key: Option<&HostKey>, probe: impl FnOnce() -
 
 /// Shared across VM processes and cached in-process while the host key is unchanged.
 pub fn local(pid: u32) -> Result<Compat> {
+    local_binary(&PathBuf::from(format!("/proc/{pid}/exe")))
+}
+
+/// Probe the host without starting a VM, using the binary a pull would boot.
+pub fn local_binary(firecracker: &Path) -> Result<Compat> {
     static CACHE: Mutex<Option<(HostKey, Compat)>> = Mutex::new(None);
-    let firecracker = PathBuf::from(format!("/proc/{pid}/exe"));
-    let stamp = Stamp::of(&std::fs::metadata(&firecracker)?);
+    let stamp = Stamp::of(&std::fs::metadata(firecracker)?);
     // If an identity cannot be read, probe rather than trust an unverifiable cache.
     let key = HostKey::local(stamp).ok();
     let mut cache = CACHE.lock().unwrap();
@@ -170,7 +173,7 @@ pub fn local(pid: u32) -> Result<Compat> {
     }
     let run = crate::host::run_dir();
     let compat = host_compat(run, key.as_ref(), || {
-        let (_, binary) = firecracker_id(&firecracker, run)?;
+        let (_, binary) = firecracker_id(firecracker, run)?;
         let kvm = File::open("/dev/kvm").map_err(|e| format!("/dev/kvm: {e}"))?;
         let mut compat = Compat::of_cpuid(&supported_cpuid(&kvm)?, binary)?;
         compat.tsc_khz = tsc_khz(&kvm)?;

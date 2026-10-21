@@ -276,8 +276,12 @@ fn names_by_path(vmstate: &[u8], rootfs: &Path) -> bool {
 
 pub(crate) fn hash_file(path: &Path) -> Result<Component> {
     let file = File::open(path).map_err(|e| format!("template component {}: {e}", path.display()))?;
+    hash_open_file(&file, path)
+}
+
+fn hash_open_file(file: &File, path: &Path) -> Result<Component> {
     let metadata = Stamp::of(&file.metadata()?);
-    let hash = content_hash(&file)?;
+    let hash = content_hash(file)?;
     if Stamp::of(&file.metadata()?) != metadata {
         bail!("template component {} changed while hashing", path.display());
     }
@@ -294,6 +298,23 @@ fn hash_and_digest(file: &File, path: &Path) -> Result<(Component, String)> {
     }
     let (hash, digest) = h.finish();
     Ok((Component { hash, metadata }, digest))
+}
+
+/// Reuse only a local generation's hashes for the exact same rootfs inode and stamp.
+fn cached_rootfs(paths: &Paths, file: &File) -> Option<(Component, String)> {
+    let stamp = Stamp::of(&file.metadata().ok()?);
+    for id in generations(&paths.templates).ok()? {
+        let Ok(meta) = Meta::read(&paths.templates.join(GENERATIONS).join(id)) else { continue };
+        if meta.received || !meta.identified() {
+            continue;
+        }
+        if let Some(component) = meta.components.get("rootfs").filter(|c| c.metadata == stamp) {
+            if let Some(digest) = meta.digests.as_ref().and_then(|d| d.get("rootfs")) {
+                return Some((component.clone(), digest.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// The image cache's root filesystem `path` names, opened only if it is one: a regular file `KEY.ext4` right in
@@ -380,12 +401,23 @@ impl Meta {
             && content_id(&self.components, self.image.as_ref()) == self.id
     }
 
+    #[cfg(test)]
     fn identify(&mut self, paths: &Paths, dir: &Path) -> Result<()> {
+        self.identify_inputs(paths, dir, BTreeMap::new())
+    }
+
+    fn identify_inputs(&mut self, paths: &Paths, dir: &Path, inputs: BTreeMap<String, Component>) -> Result<()> {
         let mut digests = [String::new(), String::new(), String::new()];
         for (i, (name, path)) in self.files(paths, dir).into_iter().enumerate() {
-            let component = if i < digests.len() {
+            let component = if let Some(input) = inputs.get(name) {
+                input.clone()
+            } else if i < digests.len() {
                 let file = File::open(&path).map_err(|e| format!("template component {}: {e}", path.display()))?;
-                let (component, digest) = hash_and_digest(&file, &path)?;
+                let (component, digest) = if name == "rootfs" {
+                    cached_rootfs(paths, &file).map(Ok).unwrap_or_else(|| hash_and_digest(&file, &path))?
+                } else {
+                    hash_and_digest(&file, &path)?
+                };
                 digests[i] = digest;
                 component
             } else {
@@ -847,8 +879,8 @@ fn sparsify(path: &Path) -> Result<u64> {
 fn record_working_set(host: &crate::host::Host, paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<SocketRoot>) -> Result<usize> {
     let tpl = Template::open_dir("(building)", dir.to_path_buf())?;
     let run = tpl.dir.join("record");
-    // One admission for the recording, whichever Firecracker it takes: each joins its own cgroup.
-    let mut admission = crate::limit::Building::admit(host, tpl.working_set_mib())?;
+    // No working set exists yet: start with the minimum allowance and grow as needed.
+    let mut admission = crate::limit::Building::admit(host, 0)?;
     let mut load = || -> Result<crate::vm::Prepared> {
         let _ = std::fs::remove_dir_all(&run);
         std::fs::create_dir_all(&run)?;
@@ -981,6 +1013,17 @@ pub fn interrupted() -> Result<()> {
 /// a staging directory without a lock, or a link, seen under it is dead.
 pub(crate) fn templates_lock(paths: &Paths, how: i32) -> Result<crate::host::Flock> {
     Ok(crate::host::Flock::new(template_lock(paths, "templates", "")?, how)?)
+}
+
+/// Serialize the freshness check and publication for one normalized template name. Taken before
+/// any other pull lock (image cache, blobs, `templates_lock`); a signal stops the wait.
+pub fn pull_lock(paths: &Paths, name: &str) -> Result<crate::host::Flock> {
+    check_name(name)?;
+    std::fs::create_dir_all(&paths.templates)?;
+    let file = template_lock(paths, "template-pull", &format!("-{name}"))?;
+    crate::image::wait_lock(&file, libc::LOCK_EX, interrupted)?;
+    // Held already through this open file: this only hands it to the guard.
+    Ok(crate::host::Flock::new(file, libc::LOCK_EX)?)
 }
 
 /// A lock on the templates directory's contents: in the host's lock directory
@@ -1127,8 +1170,22 @@ impl Size {
 /// and Firecracker (by content), and its files intact. A moved tag, new options or replaced
 /// artifacts make a new generation; this only spares an identical rebuild.
 pub fn up_to_date(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: &ImageMeta) -> Option<String> {
-    let dir = Template::resolve(paths, name).ok()?;
-    let meta = Meta::read(&dir).ok()?;
+    up_to_date_with(paths, name, size, rootfs, image, || crate::compat::local_binary(&paths.firecracker))
+}
+
+fn up_to_date_with(
+    paths: &Paths,
+    name: &str,
+    size: Size,
+    rootfs: &Path,
+    image: &ImageMeta,
+    host: impl FnOnce() -> Result<crate::compat::Compat>,
+) -> Option<String> {
+    let tpl = Template::open(paths, name).ok()?;
+    let meta = &tpl.meta;
+    if meta.received || meta.compatibility.check(&host().ok()?).is_err() {
+        return None;
+    }
     let same_image = meta.image.as_ref().is_some_and(|i| {
         (&i.digest, &i.config_digest, &i.app_conf, &i.argv, i.warm) == (&image.digest, &image.config_digest, &image.app_conf, &image.argv, image.warm)
             && serde_json::to_value(&i.ready).ok() == serde_json::to_value(&image.ready).ok()
@@ -1138,13 +1195,14 @@ pub fn up_to_date(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: &
         return None;
     }
     let kernel = std::fs::canonicalize(&paths.kernel).ok()?;
-    if meta.components.get("kernel")?.hash != hash_file(&kernel).ok()?.hash {
+    let saved_kernel = meta.components.get("kernel")?;
+    if saved_kernel.metadata != Stamp::of(&std::fs::metadata(&kernel).ok()?) && saved_kernel.hash != hash_file(&kernel).ok()?.hash {
         return None;
     }
     // Firecracker, the root filesystem and the snapshot files (rehashed if their stat changed).
-    meta.verify(paths, &dir, &mut BTreeMap::new()).ok()?;
+    tpl.verify(paths).ok()?;
     crate::image::note_rootfs(&paths.images, &meta.rootfs, &std::fs::canonicalize(&paths.templates).ok()?).ok()?;
-    Some(meta.id)
+    Some(meta.id.clone())
 }
 
 /// In a templates directory another state links to: VMs this host does not know of (a suspended
@@ -1814,6 +1872,9 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     // Downloaded on first use if missing (`artifacts`): every later VM restores with the Firecracker built with.
     crate::artifacts::ensure(&[(&paths.kernel, &crate::artifacts::KERNEL), (&paths.firecracker, &crate::artifacts::FIRECRACKER)])?;
     let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
+    let kernel_file = File::open(&kernel)?;
+    let kernel_component = hash_open_file(&kernel_file, &kernel)?;
+    let kernel_source = format!("/proc/{}/fd/{}", std::process::id(), kernel_file.as_raw_fd());
     let sockets = SocketRoot::unique(&std::fs::canonicalize(dir)?)?;
     let start = Instant::now();
     let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
@@ -1824,7 +1885,7 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     let metrics = run.join("metrics.json");
     File::create(&metrics)?;
     fc.put("/metrics", json!({"metrics_path": metrics}))?;
-    fc.put("/boot-source", json!({"kernel_image_path": kernel, "boot_args": BOOT_ARGS}))?;
+    fc.put("/boot-source", json!({"kernel_image_path": kernel_source, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.link_rootfs(&rootfs)?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": ROOTFS, "root_device": true, "read_only": true}))?;
@@ -1871,6 +1932,11 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     )?;
     let snapshotted = snapshotting.elapsed();
     let compatibility = crate::compat::local(fc.pid())?;
+    let executable = PathBuf::from(format!("/proc/{}/exe", fc.pid()));
+    if Stamp::of(&kernel_file.metadata()?) != kernel_component.metadata {
+        bail!("kernel changed during template boot");
+    }
+    let inputs = BTreeMap::from([("kernel".into(), kernel_component), ("firecracker".into(), hash_file(&executable)?)]);
     drop(lifted);
     drop(fc);
     drop(admission);
@@ -1897,9 +1963,8 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
         digests: None,
         received: false,
     };
-    meta.identify(paths, dir)?;
+    meta.identify_inputs(paths, dir, inputs)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
-    let _ = std::fs::remove_file(dir.join("wset"));
     interrupted()?;
     let wset = record_working_set(host, paths, dir, tap, &sockets)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
@@ -2040,7 +2105,11 @@ pub fn tag(paths: &Paths, src: &str, dst: &str) -> Result<Value> {
         }
         None => generation_by_prefix(paths, src)?,
     };
-    if Meta::read(&paths.templates.join(GENERATIONS).join(&id))?.image.is_none() {
+    let meta = Meta::read(&paths.templates.join(GENERATIONS).join(&id))?;
+    if meta.received {
+        bail!("tag cannot name a generation received from a peer; pull the image locally");
+    }
+    if meta.image.is_none() {
         bail!("tag needs a pulled image generation");
     }
     let live = paths.templates.join(&dst);
@@ -3335,6 +3404,9 @@ pub(crate) mod tests {
     #[test]
     fn pulling_again_rebuilds_only_what_changed() {
         let f = Fixture::new();
+        let host = f.meta.compatibility.clone();
+        let up_to_date =
+            |paths: &Paths, name: &str, size, rootfs: &Path, image: &ImageMeta| up_to_date_with(paths, name, size, rootfs, image, || Ok(host.clone()));
         let cache = crate::test_util::TempDir::new("shared-images");
         std::fs::create_dir(cache.join("rootfs")).unwrap();
         let rootfs = cache.join("rootfs/a.ext4");
@@ -3348,6 +3420,21 @@ pub(crate) mod tests {
         let img = image("sha256:a", "arg /x\n");
         std::fs::remove_dir_all(rootfs.with_extension("users")).unwrap();
         assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), Some(meta.id.clone()));
+        let gen = Template::resolve(&f.paths, "t").unwrap();
+        let mut incompatible = meta.clone();
+        incompatible.compatibility.cpu = "changed microcode".into();
+        f.write_meta(&incompatible, &gen);
+        assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_none());
+        incompatible = meta.clone();
+        incompatible.compatibility.tsc_khz /= 2;
+        f.write_meta(&incompatible, &gen);
+        assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_none());
+        f.write_meta(&meta, &gen);
+        let memory = gen.join("mem");
+        let bytes = std::fs::read(&memory).unwrap();
+        std::fs::write(&memory, bytes).unwrap();
+        assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_some());
+        assert_eq!(Meta::read(&gen).unwrap().components["mem"].metadata, Stamp::of(&std::fs::metadata(&memory).unwrap()));
         let record = rootfs.with_extension("users").join(crate::image::rootfs_user_key(&f.paths.templates).unwrap());
         assert!(record.is_file(), "reusing a legacy entry records this state without rebuilding");
         assert_eq!(up_to_date(&f.paths, "other", size, &rootfs, &img), None);
@@ -3369,6 +3456,51 @@ pub(crate) mod tests {
         assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_some());
         f.replace("firecracker", b"another firecracker");
         assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), None);
+    }
+
+    #[test]
+    fn tag_refuses_received_image_by_id_and_name() {
+        let f = Fixture::new();
+        let meta = Meta { id: "aaaa1111".into(), received: true, image: Some(image("sha256:a", "")), ..f.meta.clone() };
+        publish_as(&f, "peer", &meta);
+        for source in ["aaaa", "peer"] {
+            assert!(tag(&f.paths, source, "local").unwrap_err().to_string().contains("received from a peer"));
+            assert!(!f.paths.templates.join("local").exists());
+        }
+    }
+
+    #[test]
+    fn rootfs_hash_cache_requires_local_matching_stamp() {
+        let mut f = Fixture::new();
+        f.meta.identify(&f.paths, &f.dir).unwrap();
+        publish_as(&f, "t", &f.meta);
+        let file = File::open(&f.meta.rootfs).unwrap();
+        assert_eq!(cached_rootfs(&f.paths, &file).unwrap().1, digest(&f.meta.rootfs).unwrap());
+        let gen = Template::resolve(&f.paths, "t").unwrap();
+        f.write_meta(&Meta { received: true, ..f.meta.clone() }, &gen);
+        assert!(cached_rootfs(&f.paths, &file).is_none());
+        f.write_meta(&f.meta, &gen);
+        std::fs::write(&f.meta.rootfs, b"changed rootfs").unwrap();
+        assert!(cached_rootfs(&f.paths, &file).is_none());
+    }
+
+    #[test]
+    fn booted_descriptor_keeps_identity_after_path_replacement() {
+        let f = Fixture::new();
+        let file = File::open(&f.paths.kernel).unwrap();
+        let original = hash_open_file(&file, &f.paths.kernel).unwrap();
+        f.replace("kernel", b"replacement kernel");
+        assert_eq!(hash_open_file(&file, &f.paths.kernel).unwrap().hash, original.hash);
+        assert_ne!(hash_file(&f.paths.kernel).unwrap().hash, original.hash);
+    }
+
+    #[test]
+    fn pulls_lock_only_the_same_name() {
+        let f = Fixture::new();
+        let _held = pull_lock(&f.paths, "t").unwrap();
+        let same = template_lock(&f.paths, "template-pull", "-t").unwrap();
+        assert_eq!(crate::host::flock(&same, libc::LOCK_EX | libc::LOCK_NB).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let _other = pull_lock(&f.paths, "other").unwrap();
     }
 
     #[test]

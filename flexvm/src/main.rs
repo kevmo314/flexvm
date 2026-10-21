@@ -1779,6 +1779,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     let paths = paths(args)?;
     let opts = image_options(args, src)?;
     let host = open_host(args)?;
+    let _pull = template::pull_lock(&paths, &name)?;
     let me = host::Ident::me();
     host::clear_taps(&host.run, &me);
     let tap = template::tap(&host.tap_prefix());

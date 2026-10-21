@@ -14,18 +14,27 @@ const ASSETS: [(&str, &str); 2] = [("firecracker", "FLEXVM_PIN_FIRECRACKER"), ("
 fn main() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest.parent().unwrap().to_path_buf();
-    // Worktrees keep HEAD and branch refs outside their .git file.
-    let reference = git(&root, &["symbolic-ref", "-q", "HEAD"]);
-    for name in [Some("HEAD"), Some("packed-refs"), reference.as_deref()].into_iter().flatten() {
-        if let Some(path) = git(&root, &["rev-parse", "--git-path", name]) {
-            println!("cargo:rerun-if-changed={}", root.join(path).display());
-        }
+    for path in git_inputs(&root) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
     let commit = git(&root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=FLEXVM_GIT_COMMIT={commit}");
     state_dir();
     pins(&root);
     init(&root);
+}
+
+/// Worktrees keep HEAD and refs outside their .git file. Missing inputs make Cargo
+/// rerun forever; the reflog also catches commits when a branch has only a packed ref.
+fn git_inputs(root: &Path) -> Vec<PathBuf> {
+    let reference = git(root, &["symbolic-ref", "-q", "HEAD"]);
+    [Some("HEAD"), Some("packed-refs"), Some("logs/HEAD"), reference.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|name| git(root, &["rev-parse", "--git-path", name]))
+        .map(|path| root.join(path))
+        .filter(|path| path.exists())
+        .collect()
 }
 
 /// The default `--state`: `FLEXVM_STATE_DIR` at build time, else `/var/lib/flexvm`.
@@ -136,6 +145,24 @@ fn init(root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::valid_tag;
+
+    #[test]
+    fn packed_refs_do_not_leave_missing_cargo_inputs() {
+        let root = std::env::temp_dir().join(format!("build-refs-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let run = |args: &[&str]| assert!(super::git(&root, args).is_some(), "{args:?}");
+        run(&["init", "-q"]);
+        run(&["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "test"]);
+        let before = super::git_inputs(&root);
+        assert!(before.iter().all(|p| p.exists()));
+        run(&["pack-refs", "--all", "--prune"]);
+        let after = super::git_inputs(&root);
+        assert!(after.iter().all(|p| p.exists()));
+        assert!(after.iter().any(|p| p.ends_with("packed-refs")));
+        assert!(after.iter().any(|p| p.ends_with("logs/HEAD")));
+        assert!(before.iter().any(|p| !after.contains(p)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn release_tags() {

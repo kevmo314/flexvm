@@ -268,7 +268,7 @@ fn read_logs(vsock: &Path, deadline: Instant, stop: impl Fn() -> Result<()>) -> 
 
 /// Takes `lock` (`how`: shared or exclusive) once its holders let go, unless `stop` fails
 /// first (an interrupted build).
-fn wait_lock(lock: &File, how: i32, stop: impl Fn() -> Result<()>) -> Result<()> {
+pub(crate) fn wait_lock(lock: &File, how: i32, stop: impl Fn() -> Result<()>) -> Result<()> {
     loop {
         stop()?;
         match flock(lock, how | libc::LOCK_NB) {
