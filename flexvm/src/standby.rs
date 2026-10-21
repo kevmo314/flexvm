@@ -888,7 +888,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // Under `.locks/publish`, a lock (not `*.lock`, which names a standby) a sweep holds: none finds this pid's socket stale and unlinks it after the bind.
     let publish = crate::host::Flock::new(crate::host::private_file(&l.join("publish"))?, libc::LOCK_EX)?;
     let _ = std::fs::remove_file(&sock); // A previous process with this pid may have left it.
-    let listener = crate::socket::bind_private(&l.join(format!(".{}.sock", me.pid)), &sock)?;
+    let listener = crate::socket::bind_private(&l.join(crate::socket::private_name()), &sock)?;
     // A claimer refused by a dead standby of this pid may unlink the path after this bind.
     let bound = std::fs::metadata(&sock)?.ino();
     drop(publish);
@@ -946,6 +946,13 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20, ready) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
         let Some(spec) = claim_spec(&req, &mine) else { continue };
+        // Not `claiming`: the claimer tries another standby, or starts cold.
+        if !claimable(peer.is_some(), &req, fds.len()) {
+            crate::log!(
+                "standby {template}: a foreground claimer in a PID namespace this one cannot see: its cgroup cannot be joined, so it starts its vm elsewhere"
+            );
+            continue;
+        }
         // Locked until the claim succeeds or rolls back (dropped): relief does not count it stopped.
         let claiming = crate::host::private_file(&claim_path)?;
         crate::host::flock(&claiming, libc::LOCK_EX)?;
@@ -989,8 +996,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 let attached = req["attached"] == json!(true);
                 // In the claimer's cgroup, as a cold foreground run's VM process is (its Firecracker
                 // has its own either way). This process moves itself: its own pid is never a reused one.
-                if let (true, Some(cg)) = (attached, fds.get(2)) {
-                    if let Err(e) = crate::util::join_cgroup(cg, peer.0, &peer.1) {
+                if let (true, Some(cg), Some((pid, pidfd))) = (attached, fds.get(2), &peer) {
+                    if let Err(e) = crate::util::join_cgroup(cg, *pid, pidfd) {
                         crate::log!("vm {}: not moved to its claimer's cgroup: {e}", req["name"].as_str().unwrap_or(""));
                     }
                 }
@@ -1053,10 +1060,23 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     }
 }
 
-/// The claimer's pid and pidfd, if it runs as `uid`.
-fn claim_peer(c: &UnixStream, uid: libc::uid_t) -> Option<(u32, std::os::fd::OwnedFd)> {
+/// The claimer, if it runs as `uid`: its pid and pidfd, or None (inside) for one in a PID namespace
+/// this one cannot see (an ancestor's: SO_PEERCRED names it by pid 0, #1146).
+fn claim_peer(c: &UnixStream, uid: libc::uid_t) -> Option<Option<(u32, std::os::fd::OwnedFd)>> {
     let cred = crate::util::peer_cred(c).ok().filter(|cred| cred.uid == uid)?;
-    Some((cred.pid as u32, crate::util::pidfd_open(cred.pid as u32).ok()?))
+    match cred.pid {
+        0 => Some(None),
+        pid => Some(Some((pid as u32, crate::util::pidfd_open(pid as u32).ok()?))),
+    }
+}
+
+/// Whether a claim (of `fds` passed) may go on, its claimer `seen` (`claim_peer`) or not. A
+/// foreground one passing its cgroup (`util::my_cgroup`, the third) has its VM join it, which only
+/// its pid here can prove its own (`util::join_cgroup`): one unseen claims nothing, and its `run`
+/// starts the VM as its own process, in that cgroup. A pidfd it passed would not do: it gives no
+/// pid here, nor can it be signalled from here, and `cgroup.procs` here lists no pid for it.
+fn claimable(seen: bool, req: &Value, fds: usize) -> bool {
+    seen || req["attached"] != json!(true) || fds < 3
 }
 
 /// On failure, the flag says whether another standby (or a cold start) may
@@ -1284,6 +1304,12 @@ pub(crate) fn sock_name(id: &Ident) -> String {
     }
 }
 
+/// This process's `sock_name`: what names it, among live processes of every PID namespace, in
+/// names other processes' sit beside (private binds, `socket::private_name`; arrival logs).
+pub(crate) fn own_name() -> String {
+    sock_name(&Ident { pid: std::process::id(), start: 0, boot: String::new(), ns: crate::host::pid_ns() })
+}
+
 /// The pid and PID namespace a socket's name less `.sock` (`sock_name`) names: None (the
 /// namespace) for an earlier build's `PID`; None if it is no standby's.
 pub(crate) fn sock_of(stem: &str) -> Option<(u32, Option<u64>)> {
@@ -1447,8 +1473,16 @@ mod tests {
         let _c = UnixStream::connect(&sock).unwrap();
         let (c, _) = listener.accept().unwrap();
         let uid = unsafe { libc::geteuid() };
-        assert_eq!(claim_peer(&c, uid).map(|p| p.0), Some(std::process::id()));
+        assert_eq!(claim_peer(&c, uid).flatten().map(|p| p.0), Some(std::process::id()));
         assert!(claim_peer(&c, uid.wrapping_add(1)).is_none());
+    }
+
+    #[test]
+    fn unseen_claimers_claim_only_without_a_cgroup_to_join() {
+        let (fg, bg) = (json!({"attached": true}), json!({"attached": false}));
+        assert!(claimable(true, &fg, 3) && claimable(true, &bg, 2));
+        assert!(claimable(false, &bg, 2) && claimable(false, &fg, 2), "nothing to join");
+        assert!(!claimable(false, &fg, 3), "a cgroup only its pid here proves its own");
     }
 
     /// A host with template `default` (generation `a`) and its pool's directory.

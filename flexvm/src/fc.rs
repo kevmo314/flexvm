@@ -59,8 +59,17 @@ pub struct Firecracker {
     logging: RefCell<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// Why no VM starts where `/proc` is not this PID namespace's (`host::proc_is_mine`).
+pub const FOREIGN_PROC: &str = "no vm can start here: /proc is not this PID namespace's (`unshare --pid` without `--mount-proc`, say); mount one of its own";
+
 impl Firecracker {
     pub fn spawn(bin: &Path, dir: &Path, sockets: Sockets, ready: Duration) -> Result<Self> {
+        // Its pid (`Child::id`) is this namespace's, which another's /proc names another process by:
+        // its identity, executable, fds, maps, tasks and network namespace read there would be
+        // another's, so no VM starts at all (#1146).
+        if !crate::host::proc_is_mine() {
+            return Err(FOREIGN_PROC.into());
+        }
         crate::socket::check(&sockets.api)?;
         use std::os::unix::process::CommandExt;
         let mut cmd = Command::new(bin);
