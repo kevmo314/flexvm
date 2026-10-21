@@ -1860,7 +1860,7 @@ impl Host {
     /// failed) may be that peer's.
     fn route_check(&self, ip: Ipv4Addr, via: Ipv4Addr) -> Result<bool> {
         let peers = crate::listen::known_peers(self)?;
-        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::via_by(via, &peers));
+        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::check_via(via, &peers));
         if let Err(e) = &checked {
             let unknown = crate::listen::unknown_peers(self);
             if !unknown.is_empty() && !peers.iter().any(|p| p.to_canonical() == IpAddr::V4(via)) {
