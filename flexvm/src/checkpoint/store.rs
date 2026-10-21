@@ -438,7 +438,17 @@ fn remove_entry(store: &Path, path: &Path, id: &str) -> Result<()> {
 /// linking to its generation now (null if none does), the parent its name or id.
 pub fn rows(state: &Path, templates: &[Value]) -> Vec<Value> {
     let all = list(state);
-    let image = |id: &str| templates.iter().find(|t| t["id"] == id && t["name"].is_string()).map(|t| t["name"].clone());
+    // First match wins in both, as the scans these replace did.
+    let mut labels = BTreeMap::new();
+    for e in &all.entries {
+        labels.entry(e.id.as_str()).or_insert(e.label());
+    }
+    let mut images = BTreeMap::new();
+    for t in templates {
+        if let (Some(id), Some(name)) = (t["id"].as_str(), t["name"].as_str()) {
+            images.entry(id).or_insert(name);
+        }
+    }
     all.entries
         .iter()
         .map(|e| {
@@ -446,9 +456,9 @@ pub fn rows(state: &Path, templates: &[Value]) -> Vec<Value> {
                 Ok(m) => m,
                 Err(err) => return json!({"name": e.names.first(), "names": e.names, "id": e.id, "directory": e.dir.to_string_lossy(), "error": err.to_string()}),
             };
-            let parent = m.parent.as_ref().map(|p| all.entries.iter().find(|a| a.id == p.id).map_or(p.id.as_str(), Entry::label));
+            let parent = m.parent.as_ref().map(|p| labels.get(p.id.as_str()).copied().unwrap_or(p.id.as_str()));
             let size = crate::management::disk_usage(&e.dir, &mut BTreeSet::new()).unwrap_or(0);
-            json!({"name": e.names.first(), "names": e.names, "id": e.id, "directory": e.dir.to_string_lossy(), "vm": m.name, "template": image(&m.template_id), "template_id": m.template_id,
+            json!({"name": e.names.first(), "names": e.names, "id": e.id, "directory": e.dir.to_string_lossy(), "vm": m.name, "template": images.get(m.template_id.as_str()), "template_id": m.template_id,
                    "parent": parent, "size": size, "created": m.created_unix_ms / 1000})
         })
         .chain(all.errors.iter().enumerate().map(|(i, e)| json!({"directory": all.error_dirs.get(i).map(|p| p.to_string_lossy()), "error": e.to_string()})))

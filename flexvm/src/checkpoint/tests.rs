@@ -872,7 +872,8 @@ fn the_store_names_lists_and_removes_dependants_first() {
     assert!(held.is_some() && store::lock(&state, libc::LOCK_EX | libc::LOCK_NB).is_err());
     drop(held);
     assert!(store::holding(&state).unwrap().is_none());
-    let rows = store::rows(&state, &[json!({"name": "busybox:1.36", "id": "id"})]);
+    let rows =
+        store::rows(&state, &[json!({"name": null, "id": "id"}), json!({"name": "busybox:1.36", "id": "id"}), json!({"name": "later-alias", "id": "id"})]);
     assert_eq!(
         (&rows[0]["template"], &rows[0]["vm"], &rows[1]["parent"], &rows[2]["parent"]),
         (&json!("busybox:1.36"), &json!("x"), &json!("base"), &json!(b))

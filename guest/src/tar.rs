@@ -423,6 +423,11 @@ impl Reader<'_> {
                         let Some(len) = len.filter(|&l| l <= rest.len() && l > 0 && rest[l - 1] == b'\n') else { return Err(invalid("bad PAX record")) };
                         let kv = &rest[rest.iter().position(|&c| c == b' ').unwrap_or(0) + 1..len - 1];
                         let eq = kv.iter().position(|&c| c == b'=').ok_or_else(|| invalid("bad PAX record"))?;
+                        // Every GNU PAX sparse format (0.0, 0.1, 1.0) marks its entry with these keys; its payload is
+                        // packed (1.0 also prefixes a map), so writing it out as a regular file would corrupt it.
+                        if kv[..eq].starts_with(b"GNU.sparse.") {
+                            return Err(invalid("PAX sparse entries are not supported"));
+                        }
                         pax.push((String::from_utf8_lossy(&kv[..eq]).into_owned(), kv[eq + 1..].to_vec()));
                         rest = &rest[len..];
                     }
@@ -1526,6 +1531,95 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(e.to_string().contains("old-GNU sparse entries are not supported"), "{e}");
         assert!(!e.to_string().contains("checksum"), "{e}");
+    }
+
+    /// Build PAX records and a regular-file payload, including the map block for sparse 1.0.
+    fn pax_sparse_archive(kind: u8, keys: &[(&str, &str)], name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut pax = Vec::new();
+        for (key, value) in keys {
+            pax_record(&mut pax, key, value.as_bytes());
+        }
+        let mut v = Vec::new();
+        for (name, kind, data) in [("PaxHeader", kind, pax.as_slice()), (name, b'0', payload)] {
+            let mut size = [0; 12];
+            assert!(octal(&mut size, data.len() as u64));
+            v.extend(raw_header(name, kind, &size));
+            v.extend_from_slice(data);
+            v.resize(v.len().div_ceil(BLOCK) * BLOCK, 0);
+        }
+        v.extend_from_slice(&[0; BLOCK * 2]);
+        v
+    }
+
+    fn assert_pax_sparse_refused(archive: &[u8]) {
+        use std::os::unix::fs::MetadataExt;
+        let t = Tmp::new("pax-sparse");
+        let dst = t.s("sparse");
+        std::fs::write(&dst, b"original destination").unwrap();
+        let before = std::fs::metadata(&dst).unwrap();
+        let top = Top::Named(b"sparse".to_vec());
+        for dest in [Dest::Into(t.0.to_str().unwrap()), Dest::Cp(&dst), Dest::Guest(&dst, &top)] {
+            let e = unpack_to(archive, dest).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            assert!(e.to_string().contains("PAX sparse entries are not supported"), "{e}");
+            assert_eq!(std::fs::read(&dst).unwrap(), b"original destination");
+            let after = std::fs::metadata(&dst).unwrap();
+            assert_eq!((after.ino(), after.mode(), after.mtime(), after.mtime_nsec()), (before.ino(), before.mode(), before.mtime(), before.mtime_nsec()));
+            assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 1);
+        }
+        let absent = t.s("absent");
+        assert!(unpack_to(archive, Dest::Cp(&absent)).unwrap_err().to_string().contains("PAX sparse entries are not supported"));
+        assert!(!Path::new(&absent).exists());
+    }
+
+    #[test]
+    fn pax_sparse_formats_are_refused_before_replacing_destination() {
+        // Each archive represents 8192 logical bytes with DATA at offset 4096.
+        let v00 = pax_sparse_archive(
+            b'x',
+            &[
+                ("GNU.sparse.size", "8192"),
+                ("GNU.sparse.numblocks", "2"),
+                ("GNU.sparse.offset", "4096"),
+                ("GNU.sparse.numbytes", "4"),
+                ("GNU.sparse.offset", "8192"),
+                ("GNU.sparse.numbytes", "0"),
+            ],
+            "sparse",
+            b"DATA",
+        );
+        let v01 = pax_sparse_archive(
+            b'x',
+            &[("GNU.sparse.size", "8192"), ("GNU.sparse.numblocks", "2"), ("GNU.sparse.name", "sparse"), ("GNU.sparse.map", "4096,4,8192,0")],
+            "./GNUSparseFile.123/sparse",
+            b"DATA",
+        );
+        let mut payload = b"2\n4096\n4\n8192\n0\n".to_vec();
+        payload.resize(BLOCK, 0);
+        payload.extend_from_slice(b"DATA");
+        let v10 = pax_sparse_archive(
+            b'x',
+            &[("GNU.sparse.major", "1"), ("GNU.sparse.minor", "0"), ("GNU.sparse.name", "sparse"), ("GNU.sparse.realsize", "8192")],
+            "./GNUSparseFile.123/sparse",
+            &payload,
+        );
+        for archive in [v00, v01, v10] {
+            assert_pax_sparse_refused(&archive);
+        }
+    }
+
+    #[test]
+    fn pax_sparse_keys_are_refused_but_sparse_looking_names_are_not() {
+        for key in ["GNU.sparse.size", "GNU.sparse.map", "GNU.sparse.major", "GNU.sparse.future"] {
+            assert_pax_sparse_refused(&pax_sparse_archive(b'x', &[(key, "")], "sparse", b"DATA"));
+        }
+        // Only the keys mark a sparse entry: a regular file may be named like GNU tar's synthetic path.
+        for (keys, name) in [(&[][..], "GNUSparseFile.123/sparse"), (&[("path", "GNUSparseFile.1/x")][..], "sparse")] {
+            let t = Tmp::new("pax-sparse-name");
+            unpack_to(&pax_sparse_archive(b'x', keys, name, b"DATA"), Dest::Into(t.0.to_str().unwrap())).unwrap();
+            let want = keys.first().map_or(name, |(_, v)| *v);
+            assert_eq!(std::fs::read(t.0.join(want)).unwrap(), b"DATA");
+        }
     }
 
     #[test]
