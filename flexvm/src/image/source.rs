@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use serde_json::Value;
 
 use super::reference::Reference;
 use super::registry::{blob_path, sha256_hex, Registry};
-use super::unpack::{each_entry, lexical, Hashed, Limits, MAX_DOCUMENT};
+use super::unpack::{each_entry_seek, lexical, Hashed, Limits, MAX_DOCUMENT};
 use crate::bail;
 use crate::util::Result;
 
@@ -64,7 +65,13 @@ pub enum Blob {
 
 impl Blob {
     pub(super) fn open(&self) -> Result<(Box<dyn Read>, u64)> {
-        Ok(match self {
+        let (r, len) = self.open_tracked()?;
+        Ok((r.inner, len))
+    }
+
+    fn open_tracked(&self) -> Result<(Hashed<Box<dyn Read>>, u64)> {
+        let mut identity = None;
+        let (inner, len): (Box<dyn Read>, u64) = match self {
             // Read as it is: unpacking checks it (`Layer::verify`, which evicts a corrupt one).
             Blob::Cached { blobs, registry, digest, size } => {
                 let path = match blob_path(blobs, digest)? {
@@ -72,8 +79,9 @@ impl Blob {
                     _ => registry.blob(digest, *size, blobs)?,
                 };
                 let f = super::private_file(super::private_blobs(blobs)?.as_ref(), &path)?;
-                let len = f.metadata()?.len();
-                (Box::new(f), len)
+                let meta = f.metadata()?;
+                identity = Some((meta.dev(), meta.ino()));
+                (Box::new(f), meta.len())
             }
             Blob::File(p) => {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -90,7 +98,10 @@ impl Blob {
                 f.seek(SeekFrom::Start(*offset))?;
                 (Box::new(f.take(*len)), *len)
             }
-        })
+        };
+        let mut r = Hashed::new(inner);
+        r.identity = identity;
+        Ok((r, len))
     }
 
     /// A cached blob that `Layer::verify` found corrupt and removed: opening it downloads it again.
@@ -114,19 +125,19 @@ impl Layer {
     }
 
     pub fn open(&self) -> Result<Hashed<Box<dyn Read>>> {
-        let (inner, len) = self.src.open()?;
-        self.open_with(inner, len)
+        let (reader, len) = self.src.open_tracked()?;
+        self.open_with(reader, len)
     }
 
-    fn open_with(&self, inner: Box<dyn Read>, len: u64) -> Result<Hashed<Box<dyn Read>>> {
+    fn open_with(&self, reader: Hashed<Box<dyn Read>>, len: u64) -> Result<Hashed<Box<dyn Read>>> {
         if let Err(e) = self.check_size(len) {
             // Only cached blobs need hashing here, to evict one whose digest does not match.
             if matches!(self.src, Blob::Cached { .. }) {
-                let _ = self.verify(Hashed::new(inner));
+                let _ = self.verify(reader);
             }
             return Err(e);
         }
-        Ok(Hashed::new(inner))
+        Ok(reader)
     }
 
     fn check_size(&self, len: u64) -> Result<()> {
@@ -141,16 +152,25 @@ impl Layer {
         std::io::copy(&mut r, &mut std::io::sink())?;
         if let Some(d) = &self.digest {
             if *d != r.digest() {
-                self.evict();
+                self.evict(r.identity);
                 bail!("layer blob {d} has digest {}", r.digest());
             }
         }
         self.check_size(r.n)
     }
 
-    fn evict(&self) {
+    fn evict(&self, identity: Option<(u64, u64)>) {
         if let Blob::Cached { blobs, digest, .. } = &self.src {
-            let _ = blob_path(blobs, digest).map(std::fs::remove_file);
+            let evict = || -> Result<()> {
+                let _lock = super::registry::blob_lock(blobs, digest)?;
+                let path = blob_path(blobs, digest)?;
+                let m = std::fs::symlink_metadata(&path)?;
+                if identity == Some((m.dev(), m.ino())) {
+                    std::fs::remove_file(path)?;
+                }
+                Ok(())
+            };
+            let _ = evict();
         }
     }
 }
@@ -252,17 +272,25 @@ fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> 
         if depth > 4 {
             bail!("nested image indexes");
         }
-        fn plat(m: &Value) -> (Option<&str>, Option<&str>) {
-            (m["platform"]["os"].as_str(), m["platform"]["architecture"].as_str())
+        fn plat(m: &Value) -> (Option<&str>, Option<&str>, Option<&str>) {
+            (m["platform"]["os"].as_str(), m["platform"]["architecture"].as_str(), m["platform"]["variant"].as_str().filter(|v| !v.is_empty()))
         }
+        // The baseline first: a v3 or v4 build may need instructions (AVX2, AVX-512) this CPU lacks.
         let found = manifests
             .iter()
-            .find(|m| plat(m) == (Some("linux"), Some("amd64")))
+            .filter_map(|m| match plat(m) {
+                (Some("linux"), Some("amd64"), None) => Some((0, m)),
+                (Some("linux"), Some("amd64"), Some("v1")) => Some((1, m)),
+                (Some("linux"), Some("amd64"), Some("v2")) => Some((2, m)),
+                _ => None,
+            })
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, m)| m)
             // An OCI layout's index.json often lists one manifest with no platform.
             .or_else(|| manifests.iter().find(|m| m["platform"].is_null()));
         let Some(m) = found else {
             let have: Vec<String> = manifests.iter().map(|m| format!("{:?}", plat(m))).collect();
-            bail!("no linux/amd64 image in the index (has {})", have.join(", "))
+            bail!("no linux/amd64 image (baseline, v1 or v2) in the index (has {})", have.join(", "))
         };
         digest = m["digest"].as_str().ok_or("index entry without digest")?.to_string();
         blob_path(Path::new(""), &digest)?;
@@ -361,9 +389,11 @@ fn tar_index(file: &Path, limits: &Limits) -> Result<impl Fn(&str) -> Result<Blo
     if magic == [0x1f, 0x8b] {
         bail!("{file:?} is compressed; decompress it first (gunzip)");
     }
+    let file_len = f.metadata()?.len();
     f.rewind()?;
     let mut members = HashMap::new();
-    each_entry(f, &mut 0, limits.entries, |e, m| {
+    // Seeking past payloads reads no data, so a truncated archive shows here, not as end of archive.
+    each_entry_seek(f, &mut 0, limits.entries, |e, m| {
         let kind = e.header().entry_type();
         let path = lexical(&m.path);
         let member = if kind.is_symlink() || kind.is_hard_link() {
@@ -371,6 +401,9 @@ fn tar_index(file: &Path, limits: &Limits) -> Result<impl Fn(&str) -> Result<Blo
             // Symlinks are relative to their directory; hard links to the archive root.
             Member::Link(lexical(&if kind.is_symlink() { path.parent().unwrap_or(&path).join(target) } else { target }))
         } else if kind.is_file() {
+            if e.raw_file_position().checked_add(e.size()).is_none_or(|end| end > file_len) {
+                bail!("{:?} extends past the end of the archive", m.path);
+            }
             Member::Data { offset: e.raw_file_position(), len: e.size() }
         } else {
             return Ok(());
@@ -440,6 +473,60 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn platform_selection_prefers_baseline_and_rejects_newer_isa() {
+        let digest = sha256_hex(b"baseline");
+        let baseline = |v: &Option<&str>| matches!(v, None | Some("v1" | "v2"));
+        for variants in [vec![Some("v3"), None, Some("v1")], vec![Some("v4"), Some("v1")], vec![Some("v3"), Some("v2")], vec![Some("v3"), Some("v4")]] {
+            let manifests: Vec<_> = variants
+                .iter()
+                .map(|v| serde_json::json!({"digest": if baseline(v) {digest.clone()} else {sha256_hex(b"unsupported")}, "platform": {"os": "linux", "architecture": "amd64", "variant": v}}))
+                .collect();
+            let result = resolve_index(serde_json::json!({"manifests": manifests}), String::new(), |d| {
+                assert_eq!(d, digest);
+                Ok(serde_json::json!({"layers": []}))
+            });
+            assert_eq!(result.is_ok(), variants.iter().any(baseline), "{variants:?}");
+        }
+        // Lower variants win; an arm64 entry listed first is never picked.
+        let index = serde_json::json!({"manifests": [
+            {"digest": sha256_hex(b"arm"), "platform": {"os": "linux", "architecture": "arm64"}},
+            {"digest": sha256_hex(b"v2"), "platform": {"os": "linux", "architecture": "amd64", "variant": "v2"}},
+            {"digest": digest, "platform": {"os": "linux", "architecture": "amd64", "variant": "v1"}}
+        ]});
+        assert_eq!(resolve_index(index, String::new(), |_| Ok(serde_json::json!({}))).unwrap().1, digest);
+        let index = serde_json::json!({"manifests": [
+            {"digest": sha256_hex(b"v1"), "platform": {"os": "linux", "architecture": "amd64", "variant": "v1"}},
+            {"digest": digest, "platform": {"os": "linux", "architecture": "amd64"}}
+        ]});
+        assert_eq!(resolve_index(index, String::new(), |_| Ok(serde_json::json!({}))).unwrap().1, digest);
+    }
+
+    #[test]
+    fn eviction_keeps_a_blob_replaced_after_open() {
+        let dir = super::super::unpack::tests::tmpdir("eviction-inode");
+        let digest = sha256_hex(b"good");
+        let path = blob_path(&dir, &digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"evil").unwrap();
+        let layer = Layer {
+            src: Blob::Cached {
+                blobs: dir.to_path_buf(),
+                registry: Arc::new(Registry::new(Reference::parse("example.com/test").unwrap())),
+                digest: digest.clone(),
+                size: 4,
+            },
+            digest: Some(digest),
+            size: Some(4),
+        };
+        let reader = layer.open().unwrap();
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, b"good").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(layer.verify(reader).unwrap_err().to_string().contains("has digest"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"good");
+    }
 
     #[test]
     fn index_children_must_be_sha256_digests() {
@@ -527,7 +614,7 @@ mod tests {
         }
         for src in [Blob::File("unused".into()), Blob::Slice { file: "unused".into(), offset: 0, len: 4 }] {
             let layer = Layer { src, digest: Some(sha256_hex(b"good")), size: Some(5) };
-            assert!(layer.open_with(Box::new(Unread), 4).err().unwrap().to_string().contains("descriptor says 5"));
+            assert!(layer.open_with(Hashed::new(Box::new(Unread)), 4).err().unwrap().to_string().contains("descriptor says 5"));
         }
     }
 

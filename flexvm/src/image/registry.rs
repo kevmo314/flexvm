@@ -619,6 +619,9 @@ impl Registry {
     }
 
     /// Credentials go only over HTTPS to the registry itself or its well-known token service.
+    /// Other token authorities (including the same hostname on another port) receive no Basic
+    /// credentials. Private registries requiring those realms are currently unsupported; a
+    /// challenge alone must not authorize forwarding a saved password to another authority.
     fn trusted(&self, url: &str) -> bool {
         let Some(rest) = url.strip_prefix("https://") else { return false };
         let host = rest.split(['/', '?', '#']).next().unwrap_or("");
@@ -810,10 +813,22 @@ pub fn download(url: &str, size: u64) -> Result<ureq::Body> {
     unreachable!()
 }
 
+/// Held by a download (through its cache check) and by corrupt-layer eviction, so concurrent pulls
+/// of a digest download it once. The wait ends on an interrupt; the lock file goes when let go.
+pub(super) fn blob_lock(blobs: &Path, digest: &str) -> Result<crate::host::HeldLock> {
+    let path = blob_path(blobs, digest)?;
+    let dir = crate::host::Directory::open(path.parent().unwrap())?;
+    let name = crate::host::keyed("blob", &dir.stat()?, &format!("-{}", &digest["sha256:".len()..]));
+    Ok(crate::host::lock_at_with(crate::host::host_locks()?, &name, |file| {
+        super::wait_lock(file, libc::LOCK_EX, crate::template::interrupted).map_err(std::io::Error::other)
+    })?)
+}
+
 fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl FnOnce() -> Result<R>) -> Result<PathBuf> {
     let path = blob_path(blobs, digest)?;
     let dir = path.parent().unwrap().to_path_buf();
     let private = super::private_blobs(blobs)?;
+    let _lock = blob_lock(blobs, digest)?;
     if path.exists() {
         let reader = super::private_file(private.as_ref(), &path)?;
         let len = reader.metadata()?.len();
@@ -1206,6 +1221,29 @@ pub(super) mod tests {
         let err = agent(Instant::now(), false, Peer::default()).get("http://unused.example:80/").call().unwrap_err();
         let ureq::Error::Io(err) = err else { panic!("expected a timed-out lookup: {err}") };
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn concurrent_cached_blobs_download_once() {
+        let dir = super::super::unpack::tests::tmpdir("concurrent-blob");
+        let digest = sha256_hex(b"good");
+        let barrier = std::sync::Barrier::new(8);
+        let downloads = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let path = cached_blob(&digest, 4, &dir, || {
+                        downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(20));
+                        Ok(&b"good"[..])
+                    })
+                    .unwrap();
+                    assert_eq!(std::fs::read(path).unwrap(), b"good");
+                });
+            }
+        });
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
