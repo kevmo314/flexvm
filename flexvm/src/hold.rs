@@ -324,8 +324,7 @@ impl Holder {
         if !lost && !matches!(switched, Switch::Lost(_)) {
             self.give_queued(&e, sink, &mut stats);
         }
-        stats.dropped += e.q.lock().unwrap().discard();
-        self.report_stragglers();
+        self.finish_release(&e, &mut stats, true);
         Some((stats, switched))
     }
 
@@ -355,13 +354,16 @@ impl Holder {
         let switching = AtomicBool::new(!late);
         let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
         let switched = std::thread::scope(|sc| {
-            sc.spawn(|| {
+            if let Err(e) = std::thread::Builder::new().name("hold-release".into()).spawn_scoped(sc, || {
                 while switching.load(Ordering::SeqCst) {
                     if !give(&mut out.lock().unwrap()) {
                         std::thread::sleep(Duration::from_micros(200));
                     }
                 }
-            });
+            }) {
+                // Continue the switch and drain inline below; the reader still queues arrivals.
+                crate::log!("hold {ip}: releasing without a hand-over helper: {e}");
+            }
             let switched = switch();
             if late {
                 std::thread::sleep(Duration::from_millis(30));
@@ -392,14 +394,15 @@ impl Holder {
         // After `unhold`: a packet read since is a straggler, re-sent, not discarded below.
         give(&mut o);
         let mut stats = o.1;
+        self.finish_release(&e, &mut stats, switched.is_ok());
+        Some((stats, switched))
+    }
+
+    fn finish_release(&self, e: &Entry, stats: &mut Stats, discard: bool) {
         let mut q = e.q.lock().unwrap();
-        stats.dropped += match switched {
-            Ok(()) => q.discard(),
-            Err(_) => std::mem::take(&mut q.dropped),
-        };
+        stats.dropped += if discard { q.discard() } else { std::mem::take(&mut q.dropped) };
         drop(q);
         self.report_stragglers();
-        Some((stats, switched))
     }
 
     /// Routed away, nothing new reaches the device for the address: what it took is read off it
@@ -929,11 +932,15 @@ pub fn receive(
         return None;
     }
     let tap_dropped = inj.dropped();
-    // Closing a packet socket waits for an RCU grace period (tens of ms): not before the
-    // caller routes the address.
-    std::thread::spawn(move || drop(inj));
     let reply = json!({"injected": injected, "dropped": dropped + tap_dropped});
-    write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| tap_dropped)
+    let replied = write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| tap_dropped);
+    // Reply before closing: even a failed spawn closes inline only after reporting the counts.
+    // Closing a packet socket waits for an RCU grace period (tens of ms).
+    if let Err(e) = std::thread::Builder::new().name("injector-close".into()).spawn(move || drop(inj)) {
+        // A failed spawn drops its closure (and injector) inline.
+        crate::log!("injector closed inline: {e}");
+    }
+    replied
 }
 
 /// A whole IPv4 packet for `ip`: all a guest is ever handed.
