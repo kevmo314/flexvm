@@ -9541,28 +9541,33 @@ def concurrent_start():
 
 
 def kill_rerun_race():
-    """#1151: `kill` and `rm` of an exited VM that a `start` is running again: while the rerun holds the
-    name (stalled before its VM runs) both are refused, and the exited record the rerun goes by stays
-    (it is removed only once the VM runs); the rerun then runs as recorded."""
+    """#1151, #1189: `kill` and `rm` of an exited VM that a `start` is running again: while the rerun
+    holds the name (stalled before its VM runs) `rm` is refused, and the exited record the rerun goes
+    by stays; `kill` waits for the rerun (as `stop` does), the record staying meanwhile, and kills it
+    once it runs."""
     n = "ft-kill-rerun"
     gated_app(n, 5)
     check("kill rerun: exited", app_ends(n, 5), vms(A).get(n))
     record = os.path.join(A.run, "vms", f"{n}.exited")
     clear_gate(A, "start_stall")
+    killer = None
     with armed_fault(A, "start_stall", 10000):
         p = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         check("kill rerun: the rerun holds the name, stalled", wait_for(lambda: reached(A, "start_stall"), 30), reached(A, "start_stall"))
-        code, out, err = cli(A, "kill", n)
-        check("kill rerun: kill is refused, it is starting", code != 0 and "is starting" in err, (code, out, err))
-        check("kill rerun: its exited record stays", os.path.exists(record))
         code, out, err = cli(A, "rm", n)
         check("kill rerun: rm is refused, it is running", code != 0 and "is running" in err, (code, out, err))
+        check("kill rerun: its exited record stays", os.path.exists(record))
+        killer = spawn_cli(A, "kill", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(2)
+        check("kill rerun: kill waits for the starting rerun", killer.poll() is None, killer.poll())
         check("kill rerun: its exited record still stays", os.path.exists(record))
-    out, err = communicate_process(p, 120)
-    check("kill rerun: the rerun runs", p.returncode == 0 and vms(A).get(n, {}).get("state") == "running", (p.returncode, err[-300:], vms(A).get(n)))
-    check("kill rerun: as recorded (its app, its status)", app_ends(n, 5), vms(A).get(n))
+    out, err = communicate_process(killer, 120)
+    check("kill rerun: kill kills the rerun once it runs", killer.returncode == 0 and out.strip() == n, (killer.returncode, out, err))
+    communicate_process(p, 120)
+    check("kill rerun: the rerun is gone", name_free(A, n, 30), vms(A).get(n))
     code, out, err = cli(A, "rm", n)
-    check("kill rerun: rm removes it then", code == 0 and n not in vms(A), (code, err, vms(A).get(n)))
+    check("kill rerun: rm then leaves nothing", code == 0 or "no vm named" in err, (code, out, err))
+    check("kill rerun: nothing left", n not in vms(A), vms(A).get(n))
 
 
 def stop_self_exit():
@@ -9630,10 +9635,10 @@ def migrated_hint():
 
 
 def kill_held_stopped():
-    """#1173: `kill` of a stopped VM while something else holds its name (a start whose resume
-    then fails) never discards its checkpoint: refused while the name is held ("is starting"),
-    and, once let go of meanwhile, refused as not running (kill is for a running VM). The VM
-    then starts again, intact."""
+    """#1173, #1189: `kill` of a stopped VM while something else holds its name (a start whose resume
+    then fails) never discards its checkpoint: it waits while the name is held (as for a VM
+    starting), and once the start lets it go, signalling nothing, is refused as not running (kill
+    is for a running VM). The VM then starts again, intact."""
     n = "ft-kill-held"
     m = setup(n, mib=1)
     code, out, err = cli(A, "stop", n)
@@ -9646,16 +9651,16 @@ def kill_held_stopped():
     try:
         starter = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         check("kill held: a start holds the name, its resume held", wait_for(lambda: reached(A, "resume_unmarked_gate"), 60), reached(A, "resume_unmarked_gate"))
-        code, out, err = cli(A, "kill", n)
-        check("kill held: kill is refused while it is held", code != 0 and "is starting" in err, (code, out, err))
-        # A kill that saw the name held, and signalled nothing, decides only after the start let it go.
+        # A kill that finds the name held, with no VM registered, waits; it decides only after the start let it go.
         fault(A, "kill_gate", 600000)
         killer = spawn_cli(A, "kill", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        check("kill held: the kill saw the name held", wait_for(lambda: reached(A, "kill_gate"), 30), reached(A, "kill_gate"))
+        time.sleep(2)
+        check("kill held: the kill waits while the name is held", killer.poll() is None and not reached(A, "kill_gate"), (killer.poll(), reached(A, "kill_gate")))
         release(A, "resume_unmarked_gate")
         out, err = communicate_process(starter, 120)
         check("kill held: the start fails (refused at its fence)", starter.returncode != 0, (starter.returncode, err[-300:]))
         check("kill held: the name is let go of", wait_for(lambda: not name_locked(A, n), 30))
+        check("kill held: the kill then goes on, signalling nothing", wait_for(lambda: reached(A, "kill_gate"), 30), reached(A, "kill_gate"))
     finally:
         fault(A, "resume_fence_fail", 0)
         release(A, "resume_unmarked_gate")
@@ -9667,6 +9672,38 @@ def kill_held_stopped():
     code, out, err = cli(A, "start", n)
     check("kill held: starts again", code == 0 and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), (code, err, vms(A).get(n)))
     check("kill held: md5 intact", md5(A, n, tries=3) == m)
+
+
+def kill_starting():
+    """#1189: `kill` and `rm -f` of a stopped VM whose `start` holds its name (its resume loaded, held
+    before it is registered) wait for it, as `stop` does, and kill it once it runs: never refused
+    as starting, and `rm -f` never told to `rm -f`."""
+    n = "ft-kill-starting"
+    scenario_vms.add(n)
+    for argv in (("kill", n), ("rm", "-f", n)):
+        what = " ".join(argv[:-1])
+        setup(n, mib=1)
+        code, out, err = cli(A, "stop", n)
+        check(f"kill starting ({what}): stopped", code == 0 and vms(A).get(n, {}).get("state") == "suspended", (code, err, vms(A).get(n)))
+        clear_gate(A, "resume_unmarked_gate")
+        starter = killer = None
+        fault(A, "resume_unmarked_gate", 600000)
+        try:
+            starter = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            check(f"kill starting ({what}): a start holds the name, its resume held", wait_for(lambda: reached(A, "resume_unmarked_gate"), 60), reached(A, "resume_unmarked_gate"))
+            killer = spawn_cli(A, *argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(2)
+            check(f"kill starting ({what}): waits for the starting vm", killer.poll() is None,
+                  (killer.poll(), killer.stderr.read()[-300:] if killer.poll() is not None else ""))
+        finally:
+            release(A, "resume_unmarked_gate")
+        if starter:
+            communicate_process(starter, 120)
+        if killer and killer.returncode is None:
+            out, err = communicate_process(killer, 120)
+            check(f"kill starting ({what}): kills it once it runs", killer.returncode == 0 and out.strip() == n and "rm -f" not in err, (killer.returncode, out, err))
+        check(f"kill starting ({what}): it is gone", name_free(A, n, 30) and wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
+        cleanup(n)
 
 
 def stop_renamed():
@@ -9695,6 +9732,77 @@ def stop_renamed():
     code, out, err = cli(A, "start", to)
     check("stop renamed: starts again", code == 0 and wait_for(lambda: vms(A).get(to, {}).get("state") == "running", 30), (code, err, vms(A).get(to)))
     check("stop renamed: md5 intact", md5(A, to, tries=3) == m)
+
+
+def restart_renamed():
+    """#1189: a rename that holds the VM's op as `restart`'s SIGTERM lands moves the VM on before
+    its suspend: restart's stop follows it under its new name, and restart starts it there (never
+    "no vm named" the old name)."""
+    n, to = "ft-restart-renamed", "ft-restart-renamed-to"
+    scenario_vms.update((n, to))
+    m = setup(n, mib=1)
+    clear_gate(A, "rename_gate")
+    restarter = None
+    fault(A, "rename_gate", 600000)
+    try:
+        renamer = spawn_cli(A, "rename", n, to, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("restart renamed: the rename holds the op", wait_for(lambda: reached(A, "rename_gate"), 30), reached(A, "rename_gate"))
+        restarter = spawn_cli(A, "restart", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("restart renamed: the restart signalled", wait_for(lambda: vms(A).get(n, {}).get("state") == "suspending", 30), vms(A).get(n))
+    finally:
+        release(A, "rename_gate")
+    out, err = communicate_process(renamer, 60)
+    check("restart renamed: renamed", renamer.returncode == 0 and out.strip() == to, (renamer.returncode, out, err))
+    out, err = communicate_process(restarter, 120)
+    check("restart renamed: restart succeeds", restarter.returncode == 0, (restarter.returncode, out, err))
+    check("restart renamed: runs under its new name", wait_for(lambda: vms(A).get(to, {}).get("state") == "running", 30) and n not in vms(A), (vms(A).get(to), vms(A).get(n)))
+    check("restart renamed: md5 intact", md5(A, to, tries=3) == m)
+
+
+def rename_moved_hint():
+    """#1189: a running VM's rename into the name of a VM that migrated away, failing after it took
+    the name (its control socket cannot move), leaves that VM's hint (where it went) and its logs:
+    `kill` still says it moved. A rename that goes through then clears them."""
+    n, other = "ft-rename-hint", "ft-rename-hint-other"
+    scenario_vms.update((n, other))
+    setup(n, mib=1)
+    ok(migrate(A, n, B))
+    assert_released(B, n)
+    vmsd = os.path.join(A.run, "vms")
+    moved, log = os.path.join(vmsd, f"{n}.moved"), os.path.join(vmsd, f"{n}.log")
+    check("rename moved hint: A has its moved record and its log", os.path.exists(moved) and os.path.lexists(log))
+    hint, logged = open(moved).read(), whole_log(A, n)
+    setup(other, mib=1)
+    # Something in the way of its control socket's move, which the rename does after taking the name.
+    blocker = os.path.join(vmsd, f"{n}.sock")
+    os.makedirs(os.path.join(blocker, "in-the-way"))
+    try:
+        code, out, err = cli(A, "rename", other, n)
+        check("rename moved hint: the rename fails", code != 0 and "control socket" in err, (code, out, err))
+    finally:
+        shutil.rmtree(blocker)
+    check("rename moved hint: the hint is kept", os.path.exists(moved) and open(moved).read() == hint)
+    check("rename moved hint: its log is kept", os.path.lexists(log) and whole_log(A, n) == logged)
+    code, out, err = cli(A, "kill", n)
+    check("rename moved hint: kill still says it moved to B", code != 0 and f"moved to {B.addr}" in err, (code, out, err))
+    check("rename moved hint: the vm runs on as it was", vms(A).get(other, {}).get("state") == "running", vms(A).get(other))
+    # Something in the way of retiring the new name's logs refuses the rename before anything moves (never half renamed).
+    blocked = n + "-blocked"
+    scenario_vms.add(blocked)
+    blocker = os.path.join(vmsd, f"{blocked}.log")
+    os.makedirs(os.path.join(blocker, "in-the-way"))
+    try:
+        code, out, err = cli(A, "rename", other, blocked)
+        check("rename moved hint: a rename onto obstructed logs is refused", code != 0 and "in the way" in err, (code, out, err))
+    finally:
+        shutil.rmtree(blocker)
+    check("rename moved hint: nothing moved", vms(A).get(other, {}).get("state") == "running" and blocked not in vms(A), (vms(A).get(other), vms(A).get(blocked)))
+    check("rename moved hint: its logs stay under its name", os.path.lexists(os.path.join(vmsd, f"{other}.log")))
+    code, out, err = cli(A, "rename", other, n)
+    check("rename moved hint: a rename then goes through", code == 0 and out.strip() == n, (code, out, err))
+    check("rename moved hint: and clears the hint", not os.path.exists(moved) and vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+    kill(A, n)
+    kill(B, n)
 
 
 def kill_renamed_into():
@@ -11976,7 +12084,7 @@ def isolate(scenario):
 SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
-    run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint, kill_held_stopped=kill_held_stopped,
+    run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint, kill_held_stopped=kill_held_stopped, kill_starting=kill_starting, restart_renamed=restart_renamed, rename_moved_hint=rename_moved_hint,
     stop_renamed=stop_renamed, kill_renamed_into=kill_renamed_into, pause_renamed=pause_renamed, kill_crashed_owner=kill_crashed_owner, rm_later_exit=rm_later_exit, rm_crashed_replacement=rm_crashed_replacement, rm_unrecorded=rm_unrecorded,
     terminal=terminal,
     suspend_killed=suspend_killed,

@@ -752,13 +752,14 @@ fn real_main(args: &Args) -> Result<()> {
         Some("rename") => containers::rename(&open_host(args)?, name, arg2.unwrap_or_default()),
         Some("stop") => {
             let host = open_host(args)?;
-            each(args.names(), |n| stop(&host, n).and_then(|()| output(format_args!("{n}\n"))))
+            each(args.names(), |n| stop(&host, n).and_then(|_| output(format_args!("{n}\n"))))
         }
         Some("restart") => {
             let host = open_host(args)?;
+            // Started under the name it has last: a rename as it was stopped moved it on (#1189).
             each(args.names(), |n| {
-                stop(&host, n)?;
-                start(&host, args, n)
+                let last = stop(&host, n)?;
+                start(&host, args, &last)
             })
         }
         Some("pause") => {
@@ -1116,7 +1117,7 @@ fn run_attached(host: &Host, name: &str, keep: bool) -> Result<()> {
     }
     if !keep && !host.alive(name) && host.vms(name, "exited")?.exists() {
         // Its log stays, as a foreground run's without a terminal (its diagnostics are there alone).
-        let _ = remove_stopped(host, name, true, false, None);
+        let _ = remove_stopped(host, name, true, false, None, false);
     }
     util::exit(code)
 }
@@ -1432,8 +1433,9 @@ pub fn no_vm(host: &Host, name: &str) -> util::Error {
 }
 
 fn no_process(host: &Host, name: &str, none: &str) -> util::Error {
-    match host.suspended(name).map(|d| d.exists()) {
-        Ok(true) => format!("vm {name} is stopped: flexvm start {name}").into(),
+    // A stopped VM's checkpoint, not debris (consumed by a resume, or being discarded).
+    match host.is_suspended(name) {
+        true => format!("vm {name} is stopped: flexvm start {name}").into(),
         _ if host.has_record(name, "exited") => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
         _ if host.has_record(name, "failed") => format!("vm {name} has failed: see flexvm ps -a; flexvm rm {name} clears it").into(),
         _ if host.has_record(name, "lost") => format!("vm {name} is lost: see flexvm ps -a; flexvm rm {name} clears it").into(),
@@ -1447,9 +1449,10 @@ fn no_process(host: &Host, name: &str, none: &str) -> util::Error {
 /// Signals the instance registered under `name`, returning its pidfd and identity: None when
 /// there is none (no registry entry, or its process gone meanwhile). Anything else that keeps
 /// it from being signalled (a process this one cannot see or tell apart, a refused signal) is
-/// an error, never "not running".
-fn signal_entry(host: &Host, name: &str, sig: i32) -> Result<Option<(host::PidFd, host::Ident)>> {
+/// an error, never "not running". `check` refuses an entry before it is signalled (its error returned).
+fn signal_entry(host: &Host, name: &str, sig: i32, check: &dyn Fn(&host::Entry) -> Result<()>) -> Result<Option<(host::PidFd, host::Ident)>> {
     let Ok(e) = host.entry(name) else { return Ok(None) };
+    check(&e)?;
     let Some(fd) = host::PidFd::open(&e.ident)? else { return Ok(None) };
     match fd.signal(sig) {
         Ok(()) => Ok(Some((fd, e.ident))),
@@ -1458,15 +1461,15 @@ fn signal_entry(host: &Host, name: &str, sig: i32) -> Result<Option<(host::PidFd
     }
 }
 
-/// How long `stop` and `pause` wait for a VM that holds its name but is not registered yet (starting).
-const START_WAIT: Duration = Duration::from_secs(60);
+/// How long `stop`, `pause`, `kill` and `rm -f` wait for a VM that holds its name but is not registered yet (starting).
+const START_WAIT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 60 });
 
 /// `signal_entry`, waiting (as `stopped_to_attach` does) while the name is held with no entry
 /// (a VM starting, or an `rm` or sweep deciding): None once nothing holds it.
-fn signal_ready(host: &Host, name: &str, sig: i32) -> Result<Option<(host::PidFd, host::Ident)>> {
+fn signal_ready(host: &Host, name: &str, sig: i32, check: &dyn Fn(&host::Entry) -> Result<()>) -> Result<Option<(host::PidFd, host::Ident)>> {
     let deadline = Instant::now() + START_WAIT;
     loop {
-        if let Some(v) = signal_entry(host, name, sig)? {
+        if let Some(v) = signal_entry(host, name, sig, check)? {
             return Ok(Some(v));
         }
         if !host.alive(name) {
@@ -1488,15 +1491,17 @@ fn unseen(name: &str, e: util::Error) -> util::Error {
 const STOP_WAIT: Duration = Duration::from_secs(600);
 
 /// SIGTERM, and waits until the VM is suspended (its process gone). Stopped or exited: a no-op.
-fn stop(host: &Host, name: &str) -> Result<()> {
+/// Returns the name the VM has last (a rename as it was signalled moves it on: `restart` starts that).
+fn stop(host: &Host, name: &str) -> Result<String> {
     host::check_name(name)?;
     // The instance signalled, its identity and pidfd from one read of the registry: its exit status
     // tells an app that exited first (`--rm` or attached VMs leave no exited record).
-    let (vm, ident) = match signal_ready(host, name, libc::SIGTERM) {
+    let (vm, ident) = match signal_ready(host, name, libc::SIGTERM, &|_| Ok(())) {
         Ok(Some(v)) => v,
         Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
         Err(e) => return Err(e),
-        Ok(None) if host.suspended(name)?.exists() || host.has_record(name, "exited") => return Ok(()),
+        // A stopped VM's checkpoint, not debris (a consumed or discarded one) under its name.
+        Ok(None) if host.is_suspended(name) || host.has_record(name, "exited") => return Ok(name.into()),
         Ok(None) => return Err(not_running(host, name)),
     };
     // Followed by its identity, under whatever name it has: a rename that held its op as the
@@ -1525,9 +1530,14 @@ fn stop(host: &Host, name: &str) -> Result<()> {
     };
     let shown = renamed_as(name, &last);
     let name = last.as_str();
+    // Suspended by the instance signalled, as its checkpoint's OWNER says: never debris (a checkpoint
+    // consumed by a resume that then died) or another instance's.
+    if host.is_suspended(name) && host.suspended(name).ok().and_then(|d| lifecycle::read_owner(&d)).is_some_and(|o| o == ident) {
+        return Ok(last);
+    }
     // Its app exited first (the VM was ending, so took no suspend): stopped all the same.
-    if host.suspended(name)?.exists() || host.has_record(name, "exited") {
-        return Ok(());
+    if host.has_record(name, "exited") {
+        return Ok(last);
     }
     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
         return Err(format!("vm {shown} moved to {to} before it was stopped; stop it there").into());
@@ -1535,7 +1545,7 @@ fn stop(host: &Host, name: &str) -> Result<()> {
     let died = ["failed", "lost"].iter().any(|ext| host.has_record(name, ext));
     // Its own exit record, as read and checked (a later instance of the name may replace it since).
     match !died && app_exited(exit.as_ref(), &ident) {
-        true => Ok(()),
+        true => Ok(last),
         false => Err(format!("vm {shown} ended without suspending; see {}", host.vms(name, "log")?.display()).into()),
     }
 }
@@ -1559,7 +1569,7 @@ fn app_exited(exit: Option<&containers::Exit>, ident: &host::Ident) -> bool {
 /// identity under whatever name it has (a rename that held its op as the signal landed).
 fn pause(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
-    let (vm, ident) = match signal_ready(host, name, libc::SIGTSTP) {
+    let (vm, ident) = match signal_ready(host, name, libc::SIGTSTP, &|_| Ok(())) {
         Ok(Some(v)) => v,
         Ok(None) => return Err(not_running(host, name)),
         Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
@@ -1599,13 +1609,17 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     }
     let done = || output(format_args!("{name}\n"));
     if !running {
-        return remove_stopped(host, name, records()?, true, None).and_then(|()| done());
+        return remove_stopped(host, name, records()?, true, None, false).and_then(|()| done());
     }
     // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
-    if host.entry(name).is_ok_and(|e| e.state == "source") {
-        return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
-    }
-    let killed = match signal_entry(host, name, libc::SIGINT) {
+    let not_source = |e: &host::Entry| -> Result<()> {
+        match e.state == "source" {
+            true => Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into()),
+            false => Ok(()),
+        }
+    };
+    // A VM starting (holding the name, not registered yet) is waited for, as `stop` waits (#1189).
+    let killed = match signal_ready(host, name, libc::SIGINT, &not_source) {
         Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
         r => r?,
     };
@@ -1625,7 +1639,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         }
         // `rm -f` also removes logs and any exit or suspend record that won the race, under its name.
         if stopped {
-            return remove_stopped(host, &last, true, true, Some(ident)).and_then(|()| done());
+            return remove_stopped(host, &last, true, true, Some(ident), true).and_then(|()| done());
         }
         // A suspend that finished before the kill took is undone: the kill wins.
         if host.suspended(&last)?.exists() {
@@ -1634,15 +1648,21 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
             if host.suspended(&last)?.exists() {
                 match owns(host, &lock, ident, true) {
                     Some(true) => lifecycle::revoke(host, &last)??,
-                    Some(false) => {}
-                    None => return Err(unconfirmed(&shown, &last)),
+                    // Another instance's, or not shown whose: left as found, its dead holder's record too (#1185).
+                    Some(false) => lock.release_to_prior(),
+                    None => {
+                        lock.release_to_prior();
+                        return Err(unconfirmed(&shown, &last));
+                    }
                 }
+            } else {
+                lock.release_to_prior();
             }
         }
         return done();
     }
     if stopped {
-        return remove_stopped(host, name, records()?, true, None).and_then(|()| done());
+        return remove_stopped(host, name, records()?, true, None, true).and_then(|()| done());
     }
     // Nothing signalled: what held the name (`alive`) was no registered VM, or let it go since (a
     // start whose resume failed, a sweep, an `rm` deciding). A stopped or ended VM's records stay:
@@ -1687,20 +1707,23 @@ fn unconfirmed(shown: &str, last: &str) -> util::Error {
 /// instance left go (`rm -f` of the one it killed), none of another VM's under the name since.
 /// With nothing recorded (`!had`), what a VM that died recording nothing (SIGKILLed) left goes too:
 /// its dead holder's lock and its logs (`Host::left_unrecorded`), decided again holding the name (#1187).
-fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host::Ident>) -> Result<()> {
+/// `force`: an `rm -f`, never told to `rm -f`.
+fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host::Ident>, force: bool) -> Result<()> {
     if !had && (host.alive(name) || host.has_record(name, "moved") || !host.left_unrecorded(name)?) {
         return nothing_to_remove(host, name);
     }
-    remove_held(host, name, had, logs, of)
+    remove_held(host, name, had, logs, of, force)
 }
 
 /// `remove_stopped` past its checks, which it takes the name for. With nothing recorded before
 /// (`!had`), what those checks found is checked again holding it: a VM that took the name since
 /// may have moved away (its hint and logs kept: it runs there) or ended (its records left for a
 /// `rm` that sees them), and then nothing is removed.
-fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host::Ident>) -> Result<()> {
+fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host::Ident>, force: bool) -> Result<()> {
     let lock = match host.take_name(name, true) {
         Ok(lock) => lock,
+        // A VM of the name started meanwhile: `rm -f` (which killed or found none) is tried again.
+        Err(_) if host.alive(name) && force => bail!("vm {name} started meanwhile: try again"),
         Err(_) if host.alive(name) => bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"),
         Err(e) => return Err(e),
     };
@@ -2994,6 +3017,7 @@ mod exec_tests {
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let suspended = host.suspended("stopped").unwrap();
         std::fs::create_dir_all(&suspended).unwrap();
+        std::fs::write(suspended.join("manifest.json"), "{}").unwrap();
         stop(&host, "stopped").unwrap();
         assert!(suspended.exists());
         let exited = host.vms("done", "exited").unwrap();
@@ -3032,6 +3056,55 @@ mod exec_tests {
         assert!(!exited.exists());
     }
 
+    /// #1189: `kill` of a VM starting (holding its name, not registered yet) waits for it, as `stop`
+    /// does, and kills it once it is there; `rm -f` of one that never registers is refused as starting,
+    /// never told to `rm -f`, and the records it saw stay.
+    #[test]
+    fn kill_and_rm_f_wait_for_a_vm_starting_under_its_name() {
+        let root = crate::test_util::TempDir::new("kill-starting");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let lock = host.take_name("app", false).unwrap();
+        let mut app = crate::test_util::sleeper(60);
+        let ident = host::Ident::of(app.id()).unwrap();
+        std::fs::write(host.vms("app", "lock").unwrap(), serde_json::to_vec(&ident).unwrap()).unwrap();
+        let entry = host::Entry { name: "app".into(), ident, state: "running".into(), ..host::Entry::default() };
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            lock.publish(&entry).unwrap();
+            lock
+        });
+        remove(&host, "app", true, false).unwrap();
+        let status = app.wait().unwrap();
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(libc::SIGINT), "killed once registered");
+        drop(publisher.join().unwrap());
+
+        let exited = host.vms("job", "exited").unwrap();
+        std::fs::write(&exited, "its run").unwrap();
+        let rerun = host.take_name("job", true).unwrap();
+        let e = remove(&host, "job", true, true).unwrap_err().to_string();
+        assert!(e.contains("is starting") && !e.contains("rm -f"), "{e}");
+        assert_eq!(std::fs::read_to_string(&exited).unwrap(), "its run");
+        drop(rerun);
+    }
+
+    /// #1189: `stop` of a VM whose process is gone is done only for a stopped VM: a checkpoint a resume
+    /// consumed (STARTED: its VM died paging in) or one being discarded is not one.
+    #[test]
+    fn stop_of_a_vm_with_only_a_consumed_checkpoint_is_not_running() {
+        let root = crate::test_util::TempDir::new("stop-consumed");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let dir = host.suspended("app").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        assert_eq!(stop(&host, "app").unwrap(), "app");
+        for marker in ["STARTED", "DISCARDED"] {
+            std::fs::write(dir.join(marker), "").unwrap();
+            let e = stop(&host, "app").unwrap_err().to_string();
+            assert!(e.contains("no running vm named"), "{marker}: {e}");
+            std::fs::remove_file(dir.join(marker)).unwrap();
+        }
+    }
+
     #[test]
     fn stop_of_a_vm_whose_app_exits_meanwhile_is_done() {
         let root = crate::test_util::TempDir::new("stop-exit");
@@ -3062,7 +3135,10 @@ mod exec_tests {
             containers::record_exit(&host, "app-new", &ident, 128 + libc::SIGTERM, false);
             let r = match moved {
                 false => {
-                    std::fs::create_dir_all(host.suspended("app-new").unwrap()).unwrap();
+                    let dir = host.suspended("app-new").unwrap();
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+                    std::fs::write(dir.join("OWNER"), serde_json::to_vec(&ident).unwrap()).unwrap();
                     stop(&host, "app").map_err(|e| e.to_string())
                 }
                 true => {
@@ -3074,7 +3150,8 @@ mod exec_tests {
             assert!(app.wait().is_ok());
             drop(lock);
             match moved {
-                false => r.unwrap(),
+                // `restart` starts it under the name stop returns (#1189).
+                false => assert_eq!(r.unwrap(), "app-new"),
                 true => {
                     let e = r.unwrap_err();
                     assert!(e.contains("vm app (renamed app-new) moved to elsewhere"), "{e}");
@@ -3187,19 +3264,19 @@ mod exec_tests {
         drop(lock);
         // `rm -f` of A removes its checkpoint; of B leaves it; unknown, it refuses.
         checkpoint(Some(&a));
-        remove_stopped(&host, "web", true, true, Some(&b)).unwrap();
+        remove_stopped(&host, "web", true, true, Some(&b), true).unwrap();
         assert!(host.suspended("web").unwrap().exists());
         checkpoint(None);
-        let e = remove_stopped(&host, "web", true, true, Some(&a)).unwrap_err().to_string();
+        let e = remove_stopped(&host, "web", true, true, Some(&a), true).unwrap_err().to_string();
         assert!(e.contains("could not confirm"), "{e}");
         assert!(host.suspended("web").unwrap().exists());
         // B ran under the name after A and exited (no `exited` record: `--rm`, or killed): a delayed
         // `rm -f` of A leaves B's exit status for `flexvm wait`; one of B removes it.
         std::fs::remove_dir_all(host.suspended("web").unwrap()).unwrap();
         containers::record_exit(&host, "web", &b, 3, true);
-        remove_stopped(&host, "web", true, true, Some(&a)).unwrap();
+        remove_stopped(&host, "web", true, true, Some(&a), true).unwrap();
         assert_eq!(containers::exit_record(&host, "web").map(|e| e.ident), Some(b.clone()), "a later vm's exit status is kept");
-        remove_stopped(&host, "web", true, true, Some(&b)).unwrap();
+        remove_stopped(&host, "web", true, true, Some(&b), true).unwrap();
         assert!(containers::exit_record(&host, "web").is_none());
     }
 
@@ -3268,7 +3345,7 @@ mod exec_tests {
                 let dead = dead_ident();
                 containers::record_exit(&host, "web", &dead, 0, true);
                 std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&dead).unwrap()).unwrap();
-                let e = remove_held(&host, "web", false, true, None).unwrap_err().to_string();
+                let e = remove_held(&host, "web", false, true, None, false).unwrap_err().to_string();
                 assert!(e.contains(err), "{record}, force={force}: {e}");
                 for ext in [record, "log", "exit"] {
                     assert!(host.has_record("web", ext), "{record}: its {ext} is kept");
@@ -3300,7 +3377,7 @@ mod exec_tests {
         std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&b).unwrap()).unwrap();
         std::fs::write(host.vms("web", "log").unwrap(), "b's log").unwrap();
         for _ in 0..2 {
-            remove_stopped(&host, "web", true, true, Some(&a)).unwrap();
+            remove_stopped(&host, "web", true, true, Some(&a), true).unwrap();
             assert_eq!(std::fs::read_to_string(host.vms("web", "log").unwrap()).unwrap(), "b's log", "b's logs are kept");
             assert_eq!(host.name_holder("web").unwrap(), Some(b.clone()), "b's death is still on record");
             let e = containers::wait(&host, "web").unwrap_err().to_string();
@@ -3309,12 +3386,12 @@ mod exec_tests {
         // Even with the dead holder's record gone after all (a sweep), the stale exit is too.
         std::fs::remove_file(host.vms("web", "lock").unwrap()).unwrap();
         assert!(containers::exit_record(&host, "web").is_none());
-        let e = remove_stopped(&host, "web", true, true, Some(&a)).unwrap_err().to_string();
+        let e = remove_stopped(&host, "web", true, true, Some(&a), true).unwrap_err().to_string();
         assert!(e.contains("could not confirm"), "{e}");
         assert!(host.has_record("web", "log"));
         // B's own removal takes them.
         std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&b).unwrap()).unwrap();
-        remove_stopped(&host, "web", true, true, Some(&b)).unwrap();
+        remove_stopped(&host, "web", true, true, Some(&b), true).unwrap();
         assert!(!host.has_record("web", "log"));
     }
 
@@ -3489,7 +3566,7 @@ mod exec_tests {
         for ext in ["log", "log.1"] {
             std::fs::write(host.vms("web", ext).unwrap(), "running vm").unwrap();
         }
-        let e = remove_stopped(&host, "web", true, true, None).unwrap_err().to_string();
+        let e = remove_stopped(&host, "web", true, true, None, false).unwrap_err().to_string();
         assert!(e.contains("is running") && e.contains("rm -f web"), "{e}");
         assert!(host.vms("web", "failed").unwrap().exists());
         for ext in ["log", "log.1"] {

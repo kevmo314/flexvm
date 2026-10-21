@@ -521,27 +521,41 @@ fn take_rename_name(host: &Host, from: &str) -> Result<host::NameLock> {
     })
 }
 
-/// `move_records`' steps that can fail on what is there (a log in the way, one not retired),
-/// taken ahead by a rename that moves more first; `move_records` takes them again (done, they
-/// are no-ops).
+/// `move_records`' steps that can fail on what is there, taken ahead by a rename that moves more
+/// first, so it is never left half renamed: a log of `from`'s in the way (`move_records` takes that
+/// step again: done, a no-op), and anything in the way of retiring `to`'s logs or moving its exit
+/// records over (a directory where a file goes). Nothing of `to`'s changes: what an earlier VM of it
+/// left (its logs, a moved VM's hint) goes only once the VM is moved over (#1189).
 fn prepare_records(host: &Host, from: &str, to: &str) -> Result<()> {
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    prepare_logs(host, from, to)
-}
-
-/// Logs from before these directories moved into `from`'s, and any of `to`'s retired.
-fn prepare_logs(host: &Host, from: &str, to: &str) -> Result<()> {
     drop(host.open_logs(from)?);
-    host.retire_logs(to)
+    for ext in ["log", "log.1", "exit", "exited"] {
+        let path = host.vms(to, ext)?;
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            bail!("vm {from}: renaming it to {to}: {} is in the way (a directory)", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// Its logs and exit records, under the logs lock shared, as a
 /// start opens a log: a sweep never decides on a log midway. Its logs' directory moves in one
 /// step: its writers (held) go on in it, its followers by the old name end, and any earlier
-/// VM's of the new name are retired first.
+/// VM's of the new name are retired first. Only once the VM is `to`'s (moved over): the hint of
+/// an earlier VM of `to` that moved away goes too, the VM being here under it now.
 fn move_records(host: &Host, from: &str, to: &str) -> Result<()> {
+    // The hint goes whatever becomes of the logs (as `Host::arrived` does).
+    let unhinted: Result<()> = match std::fs::remove_file(host.vms(to, "moved")?) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("removing the moved record of {to}: {e}").into()),
+        _ => Ok(()),
+    };
+    unhinted.and(move_logs(host, from, to))
+}
+
+fn move_logs(host: &Host, from: &str, to: &str) -> Result<()> {
     let _logs = host.logs_lock(libc::LOCK_SH)?;
-    prepare_logs(host, from, to)?;
+    drop(host.open_logs(from)?);
+    host.retire_logs(to)?;
     let (a, b) = (host.vms(from, "logs")?, host.vms(to, "logs")?);
     match std::fs::rename(&a, &b) {
         Ok(()) => drop(host.open_logs(to)?),
@@ -1592,6 +1606,47 @@ mod tests {
         assert!(host.take_unrecorded_name("db").err().unwrap().to_string().contains("lost"));
         assert!(host.vms("db", "lost").unwrap().exists() && !host.alive("db"));
         drop(host.take_unrecorded_name("free").unwrap());
+    }
+
+    /// #1189: a rename takes its new name keeping what an earlier VM of it left (a migrated VM's
+    /// hint, its logs) until the VM is moved over: a rename that fails before then (its control
+    /// socket or its address's claim not moved) leaves them; one that moves over clears them.
+    #[test]
+    fn a_rename_keeps_the_hint_and_logs_of_its_new_name_until_it_moves_over() {
+        let (_d, host) = host("rename-hint");
+        std::fs::write(host.vms("web", "moved").unwrap(), "10.0.0.9:7000").unwrap();
+        host.write_log("web", "log", "the vm that moved");
+        host.write_log("app", "log", "the vm renamed");
+        let to = host.take_unrecorded_name("web").unwrap();
+        prepare_records(&host, "app", "web").unwrap();
+        // The rename fails here: the name is let go of.
+        drop(to);
+        assert_eq!(std::fs::read_to_string(host.vms("web", "moved").unwrap()).unwrap(), "10.0.0.9:7000");
+        assert_eq!(std::fs::read_to_string(host.vms("web", "logs").unwrap().join("log")).unwrap(), "the vm that moved");
+        let to = host.take_unrecorded_name("web").unwrap();
+        prepare_records(&host, "app", "web").unwrap();
+        move_records(&host, "app", "web").unwrap();
+        drop(to);
+        assert!(!host.has_record("web", "moved"));
+        assert_eq!(std::fs::read_to_string(host.vms("web", "logs").unwrap().join("log")).unwrap(), "the vm renamed");
+        assert!(!host.has_record("app", "logs"));
+    }
+
+    /// #1189: what is in the way of retiring the new name's logs (or moving the exit records there)
+    /// refuses the rename before anything moves, never after its checkpoint or claim did.
+    #[test]
+    fn a_rename_is_refused_before_anything_moves_when_the_new_names_logs_are_obstructed() {
+        let (_d, host) = host("rename-obstructed");
+        host.write_log("app", "log", "the vm renamed");
+        for ext in ["log", "log.1", "exit", "exited"] {
+            let blocker = host.vms("web", ext).unwrap();
+            std::fs::create_dir_all(blocker.join("in-the-way")).unwrap();
+            let e = prepare_records(&host, "app", "web").unwrap_err().to_string();
+            assert!(e.contains("in the way"), "{ext}: {e}");
+            assert_eq!(std::fs::read_to_string(host.vms("app", "logs").unwrap().join("log")).unwrap(), "the vm renamed");
+            std::fs::remove_dir_all(&blocker).unwrap();
+        }
+        prepare_records(&host, "app", "web").unwrap();
     }
 
     /// A suspended VM `name` at `ip`, its claim held by a process gone (as a suspend leaves it).

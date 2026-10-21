@@ -845,9 +845,11 @@ impl Host {
     }
 
     /// `take_name` of a new name for a VM (`rename`): a `failed` or `lost` record of it is
-    /// refused, decided holding the name, never cleared.
+    /// refused, decided holding the name, never cleared. A VM of it that moved away keeps its hint
+    /// (`NAME.moved`) and its logs until the rename has moved the VM over (`containers::move_records`
+    /// retires them), so a rename that fails before then leaves them as they were (#1189).
     pub fn take_unrecorded_name(&self, name: &str) -> Result<NameLock> {
-        self.take_name_as(name, Take { refuse_records: true, ..Take::new() })
+        self.take_name_as(name, Take { refuse_records: true, arriving: true, ..Take::new() })
     }
 
     /// `take_name` of a new name for a restore: `own`, of the checkpoint's own name, it is that
@@ -3448,7 +3450,8 @@ struct Take<'a> {
     handed: Option<&'a str>,
     /// The name's logs stay (a restore under the checkpoint's own name).
     keep_logs: bool,
-    /// A VM migrating in: a moved hint and the logs stay until it commits (`Host::arrived`).
+    /// A VM migrating in (or renamed in): a moved hint and the logs stay until it commits
+    /// (`Host::arrived`, `containers::move_records`).
     arriving: bool,
 }
 
