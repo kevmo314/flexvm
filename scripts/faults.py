@@ -2148,6 +2148,12 @@ def hit(host, f, n):
     return vm_pid(host, n) in reached(host, f)
 
 
+def reached_records(host):
+    """Migration ids whose target's address `host` keeps (`migrate::Reached`)."""
+    d = os.path.join(host.state, "reached")
+    return sorted(f for f in os.listdir(d) if f.isdigit()) if os.path.isdir(d) else []
+
+
 def leave_fail():
     """#460: leaving fails right after the address was lent (`leave_fail`): the VM, never paused,
     runs on; its loan and leaving mark are undone in one write and the prepared target gives up.
@@ -2163,6 +2169,8 @@ def leave_fail():
     check("leave fail: reached", hit(A, "leave_fail", n), reached(A, "leave_fail"))
     check("leave fail: migrate refused, saying why", not r["ok"] and "leaving failed" in r["error"], r)
     one_owner("leave fail", n, m, A, ip, gen, before)
+    # #1117: undone, nothing is owed, so where the target was reached is not kept.
+    check("leave fail: its target's record goes", not reached_records(A), reached_records(A))
     clear_gate(A, "leave_fail")
     before = boundary(B)
     seen = len(log(A, n))
@@ -2175,6 +2183,7 @@ def leave_fail():
     check("leave and stay fail: says the loan stays",
           wait_for(lambda: "undoing its loan after a refused migration: injected fault" in log(A, n)[seen:], 5), log(A, n)[seen:][-500:])
     one_owner("leave and stay fail", n, m, A, ip, gen, before, lent=gen, leaving=True)
+    check("leave and stay fail: still leaving, its target's record stays", len(reached_records(A)) == 1, reached_records(A))
     r = migrate(A, n, B)
     st = wait_released(B, n)
     check("leave and stay fail: the next migration goes", r["ok"] and st["released"] and where(n) == {B: "running"}, (r, st, where(n)))
@@ -3252,6 +3261,87 @@ def reconcile_announce():
     check("reconcile announce: announced past B's revision",
           wait_for(lambda: addr(B, ip).get("rev") == 2 and addr(B, ip).get("via") == "127.0.0.1", 10), addr(B, ip))
     kill(A, n)
+
+
+def target_renamed():
+    """#1117: the target's name resolving elsewhere during a migration (here, to the source's own listener,
+    which never saw it and so says aborted) changes nothing: the source asks only where the migration reached
+    its target, whether reconciling, waiting for the pull, or once its outcome is owed by a killed source.
+    Names resolve through the test hook RUN/hosts.json."""
+    if not A.addr.startswith("127."):
+        raise Skip("its hosts are not on loopback")
+    name = "pr1117-target.test:" + B.addr.rsplit(":", 1)[1]
+    hosts = os.path.join(A.run, "hosts.json")
+
+    def resolve(h):
+        with open(hosts + ".tmp", "w") as f:
+            json.dump({name: [h.addr]}, f)
+        os.replace(hosts + ".tmp", hosts)
+
+    def unknown(n, slow):
+        """Migrated to B by name, its outcome unknown (ack lost, status unavailable), then the name moved to A."""
+        m = setup(n, mib=100)
+        resolve(B)
+        if slow:
+            fault(A, "pages_slow", 600000)
+        with armed_fault(B, "lost_ack", 600000):
+            fault(B, "status", 600000)
+            r = cli_json(A, "migrate", n, name)
+        check(f"target renamed ({n}): outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
+        resolve(A)
+        return m
+
+    try:
+        # Reconciling: A's listener says aborted, B (still) nothing; past the source's lookup cache (5 s).
+        n = "ft-renamed"
+        m = unknown(n, True)
+        time.sleep(8)
+        check("target renamed: reconciling, never resumed by a host that never saw it", where(n) == {A: "reconciling", B: "running"}, where(n))
+        fault(B, "status", 0)
+        fault(A, "pages_slow", 0)
+        st = wait_released(B, n)
+        check("target renamed: released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+        check("target renamed: md5 intact", md5(B, n) == m)
+        kill(B, n)
+
+        # Committed, the target still pulling (`pages_slow`) while the source waits for its release.
+        n = "ft-renamed-pull"
+        m = setup(n, mib=100)
+        resolve(B)
+        with armed_fault(A, "pages_slow", 600000):
+            r = cli_json(A, "migrate", n, name)
+            check("target renamed (pull): migrated", r["ok"], r)
+            resolve(A)
+            time.sleep(8)
+            check("target renamed (pull): the source waits, never resumed", where(n) == {A: "source", B: "running"}, where(n))
+        st = wait_released(B, n)
+        check("target renamed (pull): released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+        check("target renamed (pull): md5 intact", md5(B, n) == m)
+        kill(B, n)
+
+        # Owed: the source killed while reconciling, B with every page; gc asks B, never A.
+        n = "ft-renamed-owed"
+        unknown(n, False)
+        ip = vms(B)[n]["ip"]
+        gen = addr(A, ip)["seen"]
+        check("target renamed (owed): the target has every page", wait_for(lambda: vms(B).get(n, {}).get("background_pull_ms") is not None, 30), vms(B).get(n))
+        pid = vm_pid(A, n)
+        os.kill(pid, signal.SIGINT)
+        check("target renamed (owed): the source exits, its outcome owed", wait_for(lambda: not alive(pid), 10) and len(owed(A)) == 1, owed(A))
+        cli(A, "debug", "gc")
+        check("target renamed (owed): unsettled while B cannot say, though A's listener says aborted",
+              len(owed(A)) == 1 and addr(A, ip).get("lent") == gen and not addr(A, ip).get("withdrawn"), (owed(A), addr(A, ip)))
+        fault(B, "status", 0)
+        check("target renamed (owed): gc settles it with B", wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), owed(A))
+        a = addr(A, ip)
+        check("target renamed (owed): still lent to B, not withdrawn", a.get("lent") == gen and not a.get("withdrawn"), a)
+        check("target renamed (owed): runs on B only", where(n) == {B: "running"}, where(n))
+        kill(B, n)
+    finally:
+        fault(B, "status", 0)
+        fault(A, "pages_slow", 0)
+        with suppress(OSError):
+            os.unlink(hosts)
 
 
 def owed(host):
@@ -11172,7 +11262,7 @@ SCENARIOS = dict(
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_qdisc_backlog=same_host_qdisc_backlog, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, handoff_onward=handoff_onward, handoff_rename=handoff_rename, announce_arp_timer=announce_arp_timer,
-    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
+    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, target_renamed=target_renamed, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, arrival_bind_fail=arrival_bind_fail, back_to_back=back_to_back, app_abort=app_abort,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status, resume_outcome=resume_outcome, exec_recovery_instance=exec_recovery_instance,
     ckpt_ancestor_corrupt=ckpt_ancestor_corrupt, resume_listener_restart=resume_listener_restart,

@@ -146,6 +146,141 @@ impl Route {
     }
 }
 
+/// Where migration `mig`'s target was reached: its connection's address, never `to` looked up again (#1117),
+/// and who it answered the prepare as (`host_token`). Every question about the migration's outcome goes there,
+/// and an answer from a host that is not that one (holding no record, it would say "aborted") is no answer.
+/// Recorded here (`STATE/reached/MIG`) before the address is lent: after this source's death, the outcome it
+/// then owes is asked the same way (`owed_outcome`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Reached {
+    to: String,
+    at: std::net::SocketAddr,
+    /// None from an older target, which names no host: its answers from `at` are taken as they come.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    /// The source process: its record goes once it is gone and owes nothing (`Host::owes`).
+    by: crate::host::Ident,
+}
+
+impl Reached {
+    fn new(to: &str, conn: &TcpStream, prepared: &Value) -> Result<Self> {
+        let token = prepared["token"].as_str().map(String::from);
+        Ok(Self { to: to.into(), at: conn.peer_addr()?, token, by: crate::host::Ident::me() })
+    }
+
+    fn path(host: &crate::host::Host, mig: u64) -> std::path::PathBuf {
+        host.state.join("reached").join(mig.to_string())
+    }
+
+    /// Durably, after letting go of those of sources that are gone and owe nothing.
+    fn record(&self, host: &crate::host::Host, mig: u64) -> Result<()> {
+        let dir = host.state.join("reached");
+        crate::util::create_dir_durably(&dir, 0o700)?;
+        let l = host.lock()?;
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            let Some(id) = e.file_name().to_str().and_then(|n| n.parse::<u64>().ok()) else { continue };
+            if let Ok(Some(r)) = crate::host::load::<Reached>(&e.path()) {
+                if r.by.liveness() == crate::host::Liveness::Gone {
+                    Self::forget_unless_owed(&l, host, id, &r.by);
+                }
+            }
+        }
+        drop(l);
+        crate::host::store(&Self::path(host, mig), self, true)
+    }
+
+    /// Removes `mig`'s record unless its source `by` still owes an outcome here: an owed record, or a claim still
+    /// leaving. Under the host lock (`_l`), which `withdraw_dead` holds while it turns the one into the other.
+    fn forget_unless_owed(_l: &crate::host::Locked, host: &crate::host::Host, mig: u64, by: &crate::host::Ident) {
+        if !host.owes(by) {
+            Self::forget(host, mig);
+        }
+    }
+
+    /// A migration given up before the pause: its record goes once its loan and leaving are undone.
+    fn give_up(&self, host: &crate::host::Host, mig: u64) {
+        if let Ok(l) = host.lock() {
+            Self::forget_unless_owed(&l, host, mig, &self.by);
+        }
+    }
+
+    /// Unreadable is an error: never a lookup of the name instead.
+    fn load(host: &crate::host::Host, mig: u64) -> Result<Option<Self>> {
+        crate::host::load(&Self::path(host, mig))
+    }
+
+    fn forget(host: &crate::host::Host, mig: u64) {
+        let _ = std::fs::remove_file(Self::path(host, mig));
+    }
+
+    /// The target's answer about `mig`: an error, never an outcome, from a host that is not it.
+    fn ask(&self, mig: u64) -> Result<Value> {
+        let r = peer_call(&self.at.to_string(), json!({"op": "migration", "mig": mig}))?;
+        match &self.token {
+            Some(t) if r["token"].as_str() != Some(t) => {
+                bail!("{} (for {}) is not the host migration {mig} went to: it answers as {}", self.at, self.to, r["token"])
+            }
+            _ => Ok(r),
+        }
+    }
+
+    fn done(&self, mig: u64) {
+        drop(peer_call(&self.at.to_string(), json!({"op": "migration", "mig": mig, "done": true})));
+    }
+}
+
+/// The outcome of migration `mig` to `to`, owed since its source here died (`Host::settle_owed`): asked where
+/// the source reached its target. Only a record from before they were kept asks `to` by name.
+pub(crate) fn owed_outcome(host: &crate::host::Host, to: &str, mig: u64) -> Result<String> {
+    let r = match Reached::load(host, mig)? {
+        Some(reached) => reached.ask(mig)?,
+        None => peer_call(to, json!({"op": "migration", "mig": mig}))?,
+    };
+    Ok(r["outcome"].as_str().unwrap_or_default().to_string())
+}
+
+/// Tells the target of an owed migration that this host is done with its record.
+pub(crate) fn owed_done(host: &crate::host::Host, to: &str, mig: u64) {
+    match Reached::load(host, mig) {
+        Ok(Some(reached)) => {
+            reached.done(mig);
+            Reached::forget(host, mig);
+        }
+        _ => drop(peer_call(to, json!({"op": "migration", "mig": mig, "done": true}))),
+    }
+}
+
+/// This host's identity, for a migration's source (`Reached`): random, kept in `STATE/token` from the first
+/// prepare it answers (`create`) on, so a restarted listener answers as the same host. None if there is none yet.
+pub(crate) fn host_token(host: &crate::host::Host, create: bool) -> Result<Option<String>> {
+    let path = host.state.join("token");
+    if let Some(t) = crate::host::load::<String>(&path)? {
+        return Ok(Some(t));
+    }
+    if !create {
+        return Ok(None);
+    }
+    // Linked in, never renamed over: two first prepares at once both answer with the one that won.
+    let tmp = host.state.join(format!(".token.{}.tmp", crate::util::random_hex(8)?));
+    let linked = crate::host::store(&tmp, &crate::util::random_hex(16)?, true).map(|()| std::fs::hard_link(&tmp, &path));
+    let _ = std::fs::remove_file(&tmp);
+    match linked? {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+        _ => crate::util::sync_dir(&host.state)?,
+    }
+    crate::host::load::<String>(&path)?.map(Some).ok_or_else(|| "this host's token vanished".into())
+}
+
+/// The source's regions, before anything is sized by them: never more memory than a VM of the template has, its
+/// boot memory and hotplug region (`max_mib`).
+fn check_regions(regions: &[(u64, u64)], max_mib: u64) -> Result<()> {
+    let total = regions.iter().try_fold(0u64, |t, r| t.checked_add(r.1)).ok_or("memory regions too large")?;
+    if total > max_mib << 20 {
+        bail!("the source's memory regions add up to {} MiB, more than the template's {max_mib} MiB", total >> 20);
+    }
+    Ok(())
+}
+
 impl Proc {
     /// Releases held packets back to the VM's tap, returning stats and whether the route was attached.
     pub(crate) fn release_to_tap(&self, vm: &Vm, id: u64) -> (Option<hold::Stats>, bool) {
@@ -232,6 +367,7 @@ impl Proc {
         })?;
         // Before the pause: dropped, the connection ends the target's arrival.
         check_app_support(to, &vm.name.get(), &prepared, &self.spec.lock().unwrap().moving(), vm.template.meta.image.as_ref())?;
+        let reached = Reached::new(to, &conn, &prepared)?;
         let prepare = prep.elapsed();
         // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
         let mut wanted = crate::standby::load_set(&self.host, &vm.template);
@@ -247,10 +383,19 @@ impl Proc {
         self.holder();
         // A kill that came while this prepared wins (#567): its connection dropped, the target's arrival goes.
         self.not_destroyed()?;
+        // Before the loan: its owed outcome, should this process die, is asked there too.
+        reached.record(&self.host, mig)?;
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
         // With where the target was reached: only it moves or withdraws the generation here meanwhile (#914).
-        let at = target_at(&self.host.config_now(), to, conn.peer_addr().ok().map(|a| a.ip()));
-        self.lent_here.fetch_or(self.host.lend_at(&self.host.lock()?, vm.ip, gen, mig, to, &at)?, Ordering::SeqCst);
+        let at = target_at(&self.host.config_now(), to, Some(reached.at.ip()));
+        let lent = match self.host.lock().and_then(|l| self.host.lend_at(&l, vm.ip, gen, mig, to, &at)) {
+            Ok(lent) => lent,
+            Err(e) => {
+                reached.give_up(&self.host, mig);
+                return Err(e);
+            }
+        };
+        self.lent_here.fetch_or(lent, Ordering::SeqCst);
         // Test gate: lent, not yet leaving.
         crate::host::gate("leave_gate");
         self.drop_held_in();
@@ -267,6 +412,8 @@ impl Proc {
                 Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
                 Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after a refused migration: {r}", vm.name),
             }
+            // Kept while its claim still says leaving.
+            reached.give_up(&self.host, mig);
             return Err(e);
         }
         self.publish();
@@ -330,11 +477,11 @@ impl Proc {
             Err(e) => {
                 // Close before asking its outcome, so the target's arrival can abort.
                 drop(conn);
-                match outcome(to, mig, Duration::from_secs(2)) {
+                match outcome(&reached, mig, Duration::from_secs(2)) {
                     Some(Outcome::Committed(target)) => (target, None),
                     Some(Outcome::Aborted) => return Err(self.abort(&op, &vm, mig, e)),
                     None => {
-                        self.reconcile_later(mig, to.to_string());
+                        self.reconcile_later(mig, reached);
                         bail!("migrating {} to {to}: {e}; {to} has not said whether it resumed the vm, so it stays paused here until it does", vm.name);
                     }
                 }
@@ -347,7 +494,7 @@ impl Proc {
             crate::log!("vm {}: migration {mig} to {to}: rerouting failed: {e}", self.name());
         }
         t.mark("reroute");
-        self.wait_release(mig, to.to_string());
+        self.wait_release(mig, reached);
         Ok(json!({
             "name": vm.name,
             "to": to,
@@ -483,7 +630,11 @@ impl Proc {
         let stayed = crate::fault_result!(tripped("abort_stay_fail") => Err("injected fault: marking it here again failed".into());
                 self.host.stay(&l, vm.ip, unlend));
         match stayed {
-            Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
+            Ok(()) => {
+                self.lent_here.store(false, Ordering::SeqCst);
+                // Nothing is owed for it now.
+                Reached::forget(&self.host, mig);
+            }
             Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after an aborted migration: {r}", vm.name),
         }
         drop(l);
@@ -510,13 +661,14 @@ impl Proc {
 
     /// Until the outcome is known, a kill ends this copy (`Proc::destroy`); once it
     /// is, this takes it back first, or (a kill took it) leaves the process to end.
-    fn reconcile_later(self: &Arc<Self>, mig: u64, to: String) {
+    fn reconcile_later(self: &Arc<Self>, mig: u64, reached: Reached) {
+        let to = reached.to.clone();
         self.reconciling(mig, &to);
         let p = self.clone();
         thread::spawn(move || {
             let mut patience = Duration::from_secs(1);
             loop {
-                let o = outcome(&to, mig, patience);
+                let o = outcome(&reached, mig, patience);
                 if o.is_some() && !p.known(mig) {
                     return;
                 }
@@ -526,7 +678,7 @@ impl Proc {
                         if let (_, Err(e)) = p.reroute(mig, &to, &target, None) {
                             crate::log!("vm {}: migration {mig} to {to}: rerouting failed: {e}", p.name());
                         }
-                        return p.wait_release(mig, to);
+                        return p.wait_release(mig, reached);
                     }
                     Some(Outcome::Aborted) => return p.abort_later(mig, &format!("migration {mig} to {to} aborted")),
                     None => patience = (patience * 2).min(Duration::from_secs(30)),
@@ -543,12 +695,14 @@ impl Proc {
 
     /// Ends the process once the target is `released`; on `aborted` this copy,
     /// as of the pause, is the only one left and runs again here.
-    fn wait_release(self: &Arc<Self>, mig: u64, to: String) {
+    /// Asked where the migration reached it (`Reached`).
+    fn wait_release(self: &Arc<Self>, mig: u64, reached: Reached) {
         let p = self.clone();
+        let to = reached.to.clone();
         thread::spawn(move || {
             let mut delay = Duration::from_millis(20);
             loop {
-                match peer_call(&to, json!({"op": "migration", "mig": mig})).map(|r| r["outcome"].clone()) {
+                match reached.ask(mig).map(|r| r["outcome"].clone()) {
                     Ok(o) if o == "released" => break,
                     Ok(o) if o == "aborted" => {
                         return p.abort_later(mig, &format!("{to} lost the vm before it had all its memory; it runs here again, from the pause"));
@@ -569,7 +723,10 @@ impl Proc {
             // Decided here durably first: once the target forgets its record, the
             // migration would read as aborted there.
             match p.host.lock().and_then(|l| p.host.release(&l, p.vm().ip, &p.vm().name.get(), Some(&crate::host::Ident::me()))) {
-                Ok(()) => drop(peer_call(&to, json!({"op": "migration", "mig": mig, "done": true}))),
+                Ok(()) => {
+                    reached.done(mig);
+                    Reached::forget(&p.host, mig);
+                }
                 Err(e) => crate::log!(
                     "vm {}: recording that {to} has it: {e}; {to} is not told it is done, so it keeps its record for this host to ask about",
                     p.vm().name
@@ -705,15 +862,17 @@ impl Proc {
         // Decided once, for the hold, the commit's route and the hand-off, and told the source with the commit (#1028).
         let from = w.peer_addr()?.ip();
         let shared = shares_routes(req["netns"].as_str(), crate::net::netns_id().as_deref(), from);
-        let prepared = match self.prepare_in(req, mig, from, shared, &mut prep, by, &going) {
-            Ok(p) => p,
+        // Which host this is, for the source's questions about the outcome (`Reached`).
+        let prepared = match self.prepare_in(req, mig, from, shared, &mut prep, by, &going).and_then(|p| Ok((p, host_token(&self.host, true)?))) {
+            Ok((p, token)) => (p, token),
             Err(e) => {
                 send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?;
                 return Err(e);
             }
         };
         // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app; `attaches`: -i and -t too.
-        let result = json!({"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true, "attaches": true});
+        let (prepared, token) = prepared;
+        let result = json!({"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true, "attaches": true, "token": token});
         send_json(&mut w, &json!({"ok": true, "result": result}))?;
         let deadline = Instant::now()
             + match () {
@@ -996,6 +1155,8 @@ impl Proc {
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         // One received from a peer only for a source with the same files: its content id proves none.
         tpl.check_vouched(serde_json::from_value(req["template_digests"].clone()).ok().as_ref(), "this source (a v0.1.0 one cannot)")?;
+        // Before the header and its runs are sized by them.
+        check_regions(&source.regions, tpl.meta.max_mib)?;
         // Its caps move with it (the same template: they fit).
         // Refused before the source pauses: a capped VM never runs uncapped here.
         self.keep_resources(serde_json::from_value(req["resources"].clone()).unwrap_or_default())?;
@@ -1304,10 +1465,10 @@ fn retry(what: &str, mut f: impl FnMut() -> Result<()>) -> bool {
     false
 }
 
-fn outcome(to: &str, mig: u64, patience: Duration) -> Option<Outcome> {
+fn outcome(reached: &Reached, mig: u64, patience: Duration) -> Option<Outcome> {
     let start = Instant::now();
     loop {
-        if let Ok(r) = peer_call(to, json!({"op": "migration", "mig": mig})) {
+        if let Ok(r) = reached.ask(mig) {
             match r["outcome"].as_str() {
                 Some("committed" | "released") => return Some(Outcome::Committed(r)),
                 Some("aborted") => return Some(Outcome::Aborted),
@@ -1751,5 +1912,137 @@ mod tests {
         assert_eq!(arrival_owed(u64::MAX, 1_000_000), most);
         assert_eq!(arrival_owed(100, 2), 100 + 2 * crate::util::PAGE_SIZE as u64);
         assert_eq!(arrival_owed(0, 0), 0);
+    }
+
+    /// A listener at 127.0.0.1 answering each status query with `reply` (`token`, `outcome`), counting the queries.
+    fn answering(reply: Value) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (at, asked) = (l.local_addr().unwrap(), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let n = asked.clone();
+        thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut BufReader::new(&c), &mut line);
+                n.fetch_add(1, Ordering::SeqCst);
+                let _ = c.write_all(format!("{}\n", json!({"ok": true, "result": reply})).as_bytes());
+            }
+        });
+        (at, asked)
+    }
+
+    fn reached(to: &str, at: std::net::SocketAddr, token: Option<&str>) -> Reached {
+        Reached { to: to.into(), at, token: token.map(String::from), by: crate::host::Ident::me() }
+    }
+
+    /// #1117: a host that never saw the migration says aborted; only the one the migration reached, as it named
+    /// itself in the prepare answer, is believed. An older target (no token) is taken at its reached address.
+    #[test]
+    fn only_the_reached_target_says_what_became_of_a_migration() {
+        let (other, _) = answering(json!({"outcome": "aborted", "token": "other"}));
+        let (unnamed, _) = answering(json!({"outcome": "aborted"}));
+        let (target, _) = answering(json!({"outcome": "committed", "token": "target"}));
+        assert!(reached("t:1", other, Some("target")).ask(7).is_err());
+        assert!(reached("t:1", unnamed, Some("target")).ask(7).is_err());
+        assert!(outcome(&reached("t:1", other, Some("target")), 7, Duration::ZERO).is_none(), "no answer, never aborted");
+        assert!(matches!(outcome(&reached("t:1", target, Some("target")), 7, Duration::ZERO), Some(Outcome::Committed(_))));
+        assert!(matches!(outcome(&reached("t:1", other, None), 7, Duration::ZERO), Some(Outcome::Aborted)));
+    }
+
+    /// A dead source's owed outcome is asked where it reached its target, never by the target's name again, and the
+    /// record goes once the target is told done; one from before records were kept asks the name.
+    #[test]
+    fn an_owed_outcome_is_asked_where_the_source_reached_its_target() {
+        let root = crate::test_util::TempDir::new("reached");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let (at, asked) = answering(json!({"outcome": "released", "token": "target"}));
+        reached("unresolvable.invalid:7070", at, Some("target")).record(&host, 3).unwrap();
+        assert_eq!(owed_outcome(&host, "unresolvable.invalid:7070", 3).unwrap(), "released");
+        owed_done(&host, "unresolvable.invalid:7070", 3);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        assert!(Reached::load(&host, 3).unwrap().is_none());
+        assert!(owed_outcome(&host, "unresolvable.invalid:7070", 3).is_err(), "by name, which does not resolve");
+        // Unreadable: no answer, never the name.
+        std::fs::write(Reached::path(&host, 4), "{").unwrap();
+        assert!(owed_outcome(&host, &at.to_string(), 4).is_err());
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    /// A record goes once its source is gone and owes nothing; a live source's stays.
+    #[test]
+    fn reached_records_of_gone_sources_that_owe_nothing_go() {
+        let root = crate::test_util::TempDir::new("reached-prune");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let at = "127.0.0.1:1".parse().unwrap();
+        let gone = Reached { by: crate::host::Ident { boot: "another boot".into(), ..crate::host::Ident::me() }, ..reached("t:1", at, None) };
+        gone.record(&host, 1).unwrap();
+        assert_eq!(Reached::load(&host, 1).unwrap(), Some(gone));
+        reached("t:1", at, None).record(&host, 2).unwrap();
+        reached("t:1", at, None).record(&host, 3).unwrap();
+        assert!(Reached::load(&host, 1).unwrap().is_none());
+        assert!(Reached::load(&host, 2).unwrap().is_some() && Reached::load(&host, 3).unwrap().is_some());
+    }
+
+    /// #1117: a gone source's record is let go of only under the host lock, so `withdraw_dead`'s owing it (also
+    /// under the lock) is seen: never a moment where neither its owed record nor its leaving claim is there.
+    #[test]
+    fn a_gone_sources_record_is_decided_under_the_host_lock() {
+        let root = crate::test_util::TempDir::new("reached-locked");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let at = "127.0.0.1:1".parse().unwrap();
+        let by = crate::host::Ident { boot: "another boot".into(), ..crate::host::Ident::me() };
+        Reached { by: by.clone(), ..reached("t:1", at, None) }.record(&host, 1).unwrap();
+        let l = host.lock().unwrap();
+        thread::scope(|s| {
+            let recording = s.spawn(|| reached("t:1", at, None).record(&host, 2).unwrap());
+            thread::sleep(Duration::from_millis(200));
+            assert!(!recording.is_finished(), "waits for the host lock");
+            // As `withdraw_dead` does under it: owed, then its leaving claim goes.
+            host.owe(1, &crate::host::Owed { to: "t:1".into(), ip: Ipv4Addr::new(10, 9, 0, 1), gen: 1, by }).unwrap();
+            drop(l);
+            recording.join().unwrap();
+        });
+        assert!(Reached::load(&host, 1).unwrap().is_some(), "owed: kept");
+        assert!(Reached::load(&host, 2).unwrap().is_some());
+    }
+
+    /// #1117: a migration given up before the pause lets go of its record, unless its source still owes it.
+    #[test]
+    fn a_migration_given_up_lets_go_of_its_record_unless_owed() {
+        let root = crate::test_util::TempDir::new("reached-give-up");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let r = reached("t:1", "127.0.0.1:1".parse().unwrap(), None);
+        r.record(&host, 1).unwrap();
+        r.give_up(&host, 1);
+        assert!(Reached::load(&host, 1).unwrap().is_none());
+        r.record(&host, 2).unwrap();
+        host.owe(9, &crate::host::Owed { to: "t:1".into(), ip: Ipv4Addr::new(10, 9, 0, 1), gen: 1, by: crate::host::Ident::me() }).unwrap();
+        r.give_up(&host, 2);
+        assert!(Reached::load(&host, 2).unwrap().is_some(), "still owed: kept");
+    }
+
+    /// A host answers as one identity from its first prepare on, however many ask at once, and none before.
+    #[test]
+    fn a_host_token_is_made_once() {
+        let root = crate::test_util::TempDir::new("host-token");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        assert_eq!(host_token(&host, false).unwrap(), None);
+        let made: Vec<_> = thread::scope(|s| {
+            let each: Vec<_> = (0..8).map(|_| s.spawn(|| host_token(&host, true).unwrap().unwrap())).collect();
+            each.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert!(made.iter().all(|t| *t == made[0] && t.len() == 32), "{made:?}");
+        assert_eq!(host_token(&host, false).unwrap().as_ref(), Some(&made[0]));
+        let again = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        assert_eq!(host_token(&again, true).unwrap().as_ref(), Some(&made[0]));
+        assert!(std::fs::read_dir(&host.state).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    /// #1117: regions past the template's memory (boot and hotplug) are refused before anything is sized by them.
+    #[test]
+    fn regions_past_the_templates_memory_are_refused() {
+        assert!(check_regions(&[(0, 512 << 20), (1 << 32, 512 << 20)], 1024).is_ok());
+        assert!(check_regions(&[(0, 512 << 20), (1 << 32, (512 << 20) + 4096)], 1024).is_err());
+        assert!(check_regions(&[(0, 256 << 20)], 128).is_err());
+        assert!(check_regions(&[(0, u64::MAX), (1, 2)], u64::MAX >> 20).is_err());
     }
 }
