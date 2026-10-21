@@ -539,7 +539,21 @@ fn stdin_lost(name: &str, e: &util::Error) -> ! {
 /// `attach NAME`, and a foreground `run -i`/`-t` (from 0): the app's output from `from` (None: from now on),
 /// and stdin to it if it was run with `-i`, until it exits (its status) or the client detaches.
 pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
+    attach_to(host, name, from).map(|(code, _)| code)
+}
+
+/// `attach`, and the VM process it last reached and verified (`connect_same`): the one its app's status is
+/// from, a resume's or a migration's if one replaced the process first reached. None: it reached none (an
+/// app done before the first connection).
+pub fn attach_to(host: &Host, name: &str, from: Option<u64>) -> Result<(i32, Option<crate::host::Ident>)> {
     let vm = Pinned { host: host.clone(), name: name.to_string(), pin: Arc::default() };
+    let code = attach_pinned(&vm, name, from)?;
+    let last = vm.pin.lock().unwrap().pin.process.clone();
+    Ok((code, last))
+}
+
+fn attach_pinned(vm: &Pinned, name: &str, from: Option<u64>) -> Result<i32> {
+    let vm = vm.clone();
     let stream = u64::from_str_radix(&util::random_hex(8)?, 16)?;
     let stdin_req = json!({"op": "stdin", "stream": stream});
     let handshake = stdin_hello(|| open(&vm, &stdin_req), name);

@@ -900,8 +900,13 @@ fn align(text: &str) -> String {
 /// What gc keeps: an exit record of a name with nothing else left, once it is `ttl` old, goes.
 pub fn stale_exit(host: &Host, name: &str, path: &Path, ttl: Duration) -> bool {
     let old = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > ttl);
+    // A young one stays, whoever holds the name: its holder's liveness (a /proc scan for one in
+    // another PID namespace) is never looked up for it.
+    if !old {
+        return false;
+    }
     let r = crate::host::Records::read(host, name);
-    old && r.holder_gone() && r.checkpoint.is_none() && !r.logs && !r.exited
+    r.holder_gone() && r.checkpoint.is_none() && !r.logs && !r.exited
 }
 
 #[cfg(test)]
