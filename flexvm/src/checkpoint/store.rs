@@ -410,10 +410,7 @@ fn delete(state: &Path, all: &[Entry], order: Vec<usize>) -> Result<Vec<Value>> 
         for name in &e.names {
             crate::util::unlink_durably(&store.join(NAMES).join(name))?;
         }
-        let gone = store.join(format!("{REMOVED}{}", e.id));
-        std::fs::rename(&e.dir, &gone)?;
-        crate::util::sync_dir(&store)?;
-        std::fs::remove_dir_all(&gone)?;
+        remove_entry(&store, &e.dir, &e.id)?;
         out.push(json!({"deleted": e.id, "name": display_names(e)}));
     }
     Ok(out)
@@ -424,11 +421,16 @@ fn delete(state: &Path, all: &[Entry], order: Vec<usize>) -> Result<Vec<Value>> 
 pub(super) fn unpublish(state: &Path, ids: &[String]) -> Result<()> {
     let store = dir(state);
     for id in ids {
-        let gone = store.join(format!("{REMOVED}{id}"));
-        std::fs::rename(store.join(id), &gone)?;
-        crate::util::sync_dir(&store)?;
-        std::fs::remove_dir_all(&gone)?;
+        remove_entry(&store, &store.join(id), id)?;
     }
+    Ok(())
+}
+
+fn remove_entry(store: &Path, path: &Path, id: &str) -> Result<()> {
+    let gone = store.join(format!("{REMOVED}{id}"));
+    std::fs::rename(path, &gone)?;
+    crate::util::sync_dir(store)?;
+    std::fs::remove_dir_all(&gone)?;
     Ok(())
 }
 
