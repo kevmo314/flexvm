@@ -985,6 +985,14 @@ there can read each one's stopped VMs and checkpoints; pulls through a shared
 one leave old generations to `image prune` (see Images);
 after upgrading to this release, run a command with each such state (`flexvm --state S
 ps`) before pulling, or a stopped VM there may lose its generation.
+
+Admission ledgers are per RUN directory, not machine-wide. Co-located hosts
+with different RUN directories admit against the same `MemAvailable` without
+seeing each other's pending grants or holds. They can over-commit within the
+10-second grant window, or longer while a start, restore or arrival is still
+paging memory in. Use one host per machine when relying on admission to protect
+the memory reserve.
+
 The state/run directory binding and defaults are described in [Setup](#setup).
 `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).

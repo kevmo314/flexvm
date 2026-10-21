@@ -1902,6 +1902,10 @@ impl Host {
         for e in entries {
             let e = e.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
             let name = e.file_name().to_string_lossy().into_owned();
+            // Outside the host lock, a temp file's owner may not have flocked it yet.
+            if !reap && name.starts_with('.') {
+                continue;
+            }
             let hold = name.split_once('-').and_then(|(i, m)| Some((i.parse().ok()?, m.parse().ok()?)));
             if hold.is_none() && !name.starts_with('.') {
                 continue;
@@ -10181,6 +10185,32 @@ pub(crate) mod tests {
         drop(hold);
         h.refund(id); // Start failed: refund the recent grant as well as its hold.
         assert!(grant(charge, false).is_ok());
+    }
+
+    #[test]
+    fn unlocked_hold_scan_never_opens_unpublished_holds() {
+        use std::os::fd::FromRawFd;
+
+        let dir = crate::test_util::TempDir::new_in(&std::env::temp_dir(), "unpublished-hold");
+        let h = Host::open(&dir.join("state"), &dir.join("run")).unwrap();
+        let tmp = locks(&h.run).join("holds/.7");
+        let file = private_file(&tmp).unwrap();
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0);
+        let watch = unsafe { OwnedFd::from_raw_fd(fd) };
+        let path = std::ffi::CString::new(tmp.as_os_str().as_encoded_bytes()).unwrap();
+        assert!(unsafe { libc::inotify_add_watch(watch.as_raw_fd(), path.as_ptr(), libc::IN_OPEN) } >= 0);
+        assert!(h.live_holds(false).unwrap().is_empty());
+        let mut events = [0u8; 4096];
+        assert_eq!(unsafe { libc::read(watch.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) }, -1);
+        assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock, "the scan must not open or probe the temp file");
+        flock(&file, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let published = tmp.with_file_name("7-100");
+        std::fs::rename(&tmp, &published).unwrap();
+        assert_eq!(h.live_holds(false).unwrap(), vec![(7, 100)]);
+        drop(file);
+        assert!(h.holds(&h.lock().unwrap()).unwrap().is_empty());
+        assert!(!published.exists());
     }
 
     #[test]
