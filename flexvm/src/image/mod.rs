@@ -1096,13 +1096,15 @@ fn data_kib(path: &Path, metadata: &std::fs::Metadata) -> u64 {
 /// prefix and its value, each rounded up to 4) and a 4-byte end. Values as listed here: ext4
 /// stores ACLs smaller.
 fn xattr_kib(path: &Path) -> Result<u64> {
-    let path = cpath(path)?;
-    let size = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    // Pin the inode without opening device nodes or FIFOs, or following symlinks.
+    let Ok(fd) = open_at(libc::AT_FDCWD, &cpath(path)?, libc::O_PATH | libc::O_NOFOLLOW) else { return Ok(0) };
+    let path = cpath(Path::new(&format!("/proc/self/fd/{}", fd.as_raw_fd())))?;
+    let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
     if size <= 0 {
         return Ok(0);
     }
     let mut names = vec![0u8; size as usize];
-    let n = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    let n = unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
     if n < 0 {
         // Changed meanwhile (ERANGE), or unsupported: assume a block.
         return Ok(4);
@@ -1110,7 +1112,7 @@ fn xattr_kib(path: &Path) -> Result<u64> {
     let mut used = 4 + 4;
     for name in names[..n as usize].split(|&b| b == 0).filter(|n| !n.is_empty()) {
         let Ok(cname) = std::ffi::CString::new(name) else { continue };
-        let value = unsafe { libc::lgetxattr(path.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
+        let value = unsafe { libc::getxattr(path.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
         if value < 0 {
             return Ok(4);
         }
@@ -1423,6 +1425,10 @@ mod tests {
         // Another such: 128, a block of its own.
         assert!(set("overflows", "user.a", 40) && set("overflows", "user.b", 40));
         assert_eq!(ext4_content_kib(&dir).unwrap(), 8);
+        symlink("overflows", dir.join("link")).unwrap();
+        let fifo = cpath(&dir.join("fifo")).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 8, "symlinks do not count their target's xattrs; FIFOs are never opened");
     }
 
     #[test]
