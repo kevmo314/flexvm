@@ -16,5 +16,19 @@ CI=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$CI_VERSION/$ARCH
 # --inputs: Firecracker's version, commit and patches, the build recipe, the kernel) bumps this in the same change;
 # see RELEASING in README.md. Tags use vMAJOR.MINOR.PATCH (artifacts-5 was the last artifacts-N; v0.1.0 was the first source release).
 # A release's assets never change.
-ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.2.0}
+ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.2.1}
 ARTIFACTS_URL=https://github.com/numerataz/flexvm/releases/download/$ARTIFACTS_TAG
+
+# The pinned SHA256 of a URL; 2 means absent, 1 means malformed or unreadable. Callers set root (the checkout).
+# shellcheck disable=SC2154
+pinned() {
+  local lines checksum
+  lines=$(awk -v url="$1" '$0 !~ /^[[:space:]]*#/ {for (i = 1; i <= NF; i++) if ($i == url) {print; break}}' "$root/scripts/checksums.sha256") || return 1
+  if [ -z "$lines" ]; then return 2; fi
+  checksum=$(awk 'NF == 2 {print $1}' <<< "$lines")
+  if [[ $lines == *$'\n'* || ! $checksum =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "Malformed SHA256 for $1 in scripts/checksums.sha256" >&2
+    return 1
+  fi
+  echo "$checksum"
+}

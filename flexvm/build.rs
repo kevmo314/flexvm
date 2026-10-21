@@ -57,6 +57,13 @@ fn shell_default(text: &str, name: &str) -> Option<String> {
     Some(value.trim_matches('"').to_string())
 }
 
+/// The same vMAJOR.MINOR.PATCH form as release.yml and pin-artifacts.sh.
+fn valid_tag(tag: &str) -> bool {
+    let Some(version) = tag.strip_prefix('v') else { return false };
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn pins(root: &Path) {
     let versions = root.join("scripts/versions.sh");
     let checksums = root.join("scripts/checksums.sha256");
@@ -64,26 +71,25 @@ fn pins(root: &Path) {
     println!("cargo:rerun-if-changed={}", checksums.display());
     let versions = std::fs::read_to_string(&versions).expect("scripts/versions.sh");
     let tag = shell_default(&versions, "ARTIFACTS_TAG").expect("ARTIFACTS_TAG in scripts/versions.sh");
-    assert!(!tag.is_empty() && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b)), "bad ARTIFACTS_TAG {tag:?}");
+    assert!(valid_tag(&tag), "bad ARTIFACTS_TAG {tag:?}");
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
     println!("cargo:rustc-env=FLEXVM_ARTIFACTS_BASE={base}");
     let checksums = std::fs::read_to_string(&checksums).expect("scripts/checksums.sha256");
     for (asset, var) in ASSETS {
         let url = format!("{base}/{asset}");
-        let found: Vec<&str> = checksums
+        // As pinned() in scripts/versions.sh: any non-comment line naming the URL is its pin, and must be `SHA256 URL`.
+        let found: Vec<Vec<&str>> = checksums
             .lines()
-            .filter_map(|l| {
-                let mut fields = l.split_whitespace();
-                let hash = fields.next()?;
-                (fields.next()? == url).then_some(hash)
-            })
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .map(|l| l.split_whitespace().collect::<Vec<_>>())
+            .filter(|fields| fields.contains(&url.as_str()))
             .collect();
-        match found[..] {
+        match &found[..] {
             [] => println!(
                 "cargo:warning=scripts/checksums.sha256 pins no {url}: this flexvm cannot download {asset} (scripts/pin-artifacts.sh pins it once the release exists)"
             ),
-            [hash] if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
-                println!("cargo:rustc-env={var}={}", hash.to_ascii_lowercase())
+            [fields] if matches!(fields[..], [hash, u] if u == url && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())) => {
+                println!("cargo:rustc-env={var}={}", fields[0].to_ascii_lowercase())
             }
             _ => panic!("scripts/checksums.sha256 must pin {url} once, by its sha256"),
         }
@@ -125,4 +131,19 @@ fn init(root: &Path) {
     let built = target_dir.join(target).join("release/flexvm-init");
     // Copied, not linked: OUT_DIR's file stays what this build embedded.
     std::fs::copy(&built, &dest).unwrap_or_else(|e| panic!("{}: {e}", built.display()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_tag;
+
+    #[test]
+    fn release_tags() {
+        for tag in ["v0.2.1", "v123.45.6", "v01.2.3"] {
+            assert!(valid_tag(tag), "{tag}");
+        }
+        for tag in ["", "1.2.3", "artifacts-5", "v1.2", "v1.2.3.4", "v.2.3", "v1..3", "v1.2.", "v1.2.3-rc1", "v1.2.3+build", "v１.2.3", "v1.2.3\n"] {
+            assert!(!valid_tag(tag), "{tag:?}");
+        }
+    }
 }

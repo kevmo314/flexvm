@@ -93,6 +93,11 @@ jobs:
       - name: e2e scheduler self-test
         # Fake templates and workers, one of which cannot be spawned: its cases must fail.
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
+      - name: release pin tests
+        run: |
+          python3 scripts/test-artifacts.py
+          rustc --edition=2021 --test flexvm/build.rs -o "$RUNNER_TEMP/build-tests"
+          "$RUNNER_TEMP/build-tests"
       - name: lab teardown self-test
         # The lab scripts' process matching and cgroup cleanup (scripts/net-common.sh): rootless, no VM.
         run: ./scripts/net-common-test.sh

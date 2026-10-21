@@ -102,7 +102,7 @@ A release (`ARTIFACTS_TAG` in `scripts/versions.sh`) is built from what
 its tag names (`FC_COMMIT`; the build refuses any other), the patches, the
 recipe (`.github/workflows/release.yml` and the scripts it runs:
 `scripts/release-assets.sh`, `scripts/build-firecracker.sh`,
-`scripts/fetch.sh`) and the kernel. That list is
+`scripts/fetch.sh`, and their shared `scripts/versions.sh`) and the kernel. That list is
 the release's `inputs.txt`, and its assets never change. So a change to any
 of those inputs bumps `ARTIFACTS_TAG` in the same pull request; CI fails it
 otherwise. Then:
@@ -113,13 +113,19 @@ otherwise. Then:
    `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`, with the
    `ARTIFACTS_TAG` it names.
    `.github/workflows/release.yml` checks that `versions.sh` there names it,
-   builds the assets with `scripts/release-assets.sh`, attests their build
-   provenance and publishes them.
+   builds the assets with `scripts/release-assets.sh` in a read-only job
+   (Firecracker uses `cargo build --locked`). A separate job downloads that
+   job's uploaded artifact, attests the three assets and publishes them;
+   only it has write and signing permissions.
 3. Run `scripts/pin-artifacts.sh` on main once the release exists. It checks
    that the tag's commit is in your history, verifies the attestations
    (release.yml at that tag and commit, on a GitHub-hosted runner), and checks
    that `inputs.txt` matches the checkout. It then writes the three pins to
-   `scripts/checksums.sha256`. Merge that commit.
+   `scripts/checksums.sha256` by atomic replacement. Merge that commit.
+
+`fetch.sh` falls back to upstream assets only when their release pins are
+absent. A malformed or duplicate pin fails instead; `fetch.sh` and
+`pin-artifacts.sh` share the validator in `versions.sh`.
 
 CI's "Pinned artifacts release" check fails any change whose inputs differ
 from the pinned release's, or from those at the commit a pending tag names if it is

@@ -29,26 +29,17 @@ ASSETS=(firecracker vmlinux inputs.txt)
 # How long main may name an unpinned ARTIFACTS_TAG: tag, release and pin take well under an hour.
 RELEASE_WINDOW_HOURS=24
 
-# The pinned SHA256 of a URL, if any (a URL without a digest is malformed too).
-pinned() {
-  awk -v url="$1" '$2 == url || (NF == 1 && $1 == url) {print $1}' "$checksums"
-}
-
 # What a release is built from, by content: Firecracker's version, the commit its tag names and the patches; the
 # recipe (release.yml, which runs scripts/release-assets.sh, which runs build-firecracker.sh and fetch.sh); and the
 # kernel.
 inputs() {
   local kernel
-  kernel=$(pinned "$CI/$KERNEL")
-  if [[ ! $kernel =~ ^[[:xdigit:]]{64}$ ]]; then
-    echo "No pinned SHA256 for $CI/$KERNEL in scripts/checksums.sha256" >&2
-    return 1
-  fi
+  kernel=$(pinned "$CI/$KERNEL") || return 1
   # Each failure returns explicitly: callers test this in conditions, where errexit is off.
   printf 'firecracker %s %s\n' "$FC_VERSION" "$ARCH" || return 1
   printf 'commit %s\n' "$FC_COMMIT" || return 1
   (cd "$root/firecracker" && sha256sum -- *.patch) || return 1
-  (cd "$root" && sha256sum .github/workflows/release.yml scripts/release-assets.sh scripts/build-firecracker.sh scripts/fetch.sh) || return 1
+  (cd "$root" && sha256sum .github/workflows/release.yml scripts/release-assets.sh scripts/build-firecracker.sh scripts/fetch.sh scripts/versions.sh) || return 1
   printf 'vmlinux %s %s\n' "$kernel" "$KERNEL"
 }
 
@@ -129,12 +120,10 @@ case "${1:-}" in
     done
     pins=0
     for asset in "${ASSETS[@]}"; do
-      checksum=$(pinned "$ARTIFACTS_URL/$asset")
-      if [[ $checksum =~ ^[[:xdigit:]]{64}$ ]]; then
+      if pinned "$ARTIFACTS_URL/$asset" > /dev/null; then
         pins=$((pins + 1))
-      elif [ -n "$checksum" ]; then
-        echo "Malformed SHA256 for $ARTIFACTS_URL/$asset in scripts/checksums.sha256" >&2
-        exit 1
+      else
+        [ "$?" = 2 ] || exit 1
       fi
     done
     if [ "$pins" = 0 ]; then
@@ -162,8 +151,10 @@ case "${1:-}" in
 esac
 
 command -v gh > /dev/null || { echo "pinning needs gh (GitHub CLI) to verify the assets' build provenance" >&2; exit 1; }
-work=
-trap 'rm -rf -- "$work"' EXIT
+work='' placing=''
+trap 'rm -rf -- "$work"; rm -f -- "$placing"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 work=$(mktemp -d)
 for asset in "${ASSETS[@]}"; do
   echo "downloading $ARTIFACTS_URL/$asset"
@@ -204,5 +195,10 @@ head -1 "$work/inputs.txt"
     printf '%s %s\n' "$(sha256sum < "$work/$asset" | cut -d' ' -f1)" "$ARTIFACTS_URL/$asset"
   done
 } > "$work/checksums"
-cat "$work/checksums" > "$checksums"
+# Rename on the same filesystem: a failed write leaves the old pins intact.
+placing=$(mktemp "${checksums}.XXXXXX")
+cat "$work/checksums" > "$placing"
+chmod --reference="$checksums" "$placing"
+mv -T "$placing" "$checksums"
+placing=
 echo "pinned $ARTIFACTS_TAG in scripts/checksums.sha256; commit it"
