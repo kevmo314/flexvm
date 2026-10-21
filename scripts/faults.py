@@ -9867,6 +9867,36 @@ def rm_crashed_replacement():
     check("rm crashed replacement: swept", code == 0 and wait_for(lambda: not name_locked(A, n), 30), (code, err))
 
 
+def rm_unrecorded():
+    """#1187: a VM SIGKILLed before it records anything (no failed, lost or exited record) leaves its
+    logs and its dead holder's lock; swept (`debug gc`), only its logs. `ps -a` lists no VM of the
+    name, and `rm` (`rm -f` too) removes what it left, judging its holder dead holding the name."""
+    for force, swept in ((False, False), (True, False), (False, True), (True, True)):
+        n = "ft-rm-unrec" + ("-f" if force else "") + ("-gc" if swept else "")
+        what = ("rm -f" if force else "rm") + (", swept" if swept else "")
+        rm = ["rm", "-f", n] if force else ["rm", n]
+        ok(run(A, n))
+        pid = vm_pid(A, n)
+        os.kill(pid, signal.SIGKILL)
+        check(f"rm unrecorded ({what}): its process is gone", wait_for(lambda: not os.path.exists(f"/proc/{pid}") and not name_locked(A, n), 30))
+        log, logs = (os.path.join(A.run, "vms", f"{n}.{ext}") for ext in ("log", "logs"))
+        check(f"rm unrecorded ({what}): its log is left", os.path.lexists(log))
+        if swept:
+            code, out, err = cli(A, "debug", "gc")
+            lock = os.path.join(A.run, "vms", ".locks", f"{n}.lock")
+            check(f"rm unrecorded ({what}): swept, its log left", code == 0 and wait_for(lambda: not os.path.exists(lock), 30) and os.path.lexists(log), (code, err))
+        check(f"rm unrecorded ({what}): ps -a lists no vm of the name", n not in vms(A), vms(A).get(n))
+        code, out, err = cli(A, *rm)
+        check(f"rm unrecorded ({what}): rm removes what it left", code == 0 and out.strip() == n, (code, out, err))
+        check(f"rm unrecorded ({what}): its logs are gone", not os.path.lexists(log) and not os.path.lexists(logs))
+        check(f"rm unrecorded ({what}): the name is free", name_free(A, n, 30), vms(A).get(n))
+        code, out, err = cli(A, *rm)
+        check(f"rm unrecorded ({what}): nothing is left to remove", code != 0 and "no vm named" in err, (code, out, err))
+        ok(run(A, n))
+        code, out, err = cli(A, "rm", "-f", n)
+        check(f"rm unrecorded ({what}): a new vm of the name runs and is removed", code == 0 and name_free(A, n, 30), (code, out, err))
+
+
 def pause_renamed():
     """#1183: a rename that holds the VM's op (its checks passed) as `pause`'s SIGTSTP lands moves
     the VM on before the pause runs: pause follows the instance it signalled under its new name, and
@@ -11947,7 +11977,7 @@ SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
     run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint, kill_held_stopped=kill_held_stopped,
-    stop_renamed=stop_renamed, kill_renamed_into=kill_renamed_into, pause_renamed=pause_renamed, kill_crashed_owner=kill_crashed_owner, rm_later_exit=rm_later_exit, rm_crashed_replacement=rm_crashed_replacement,
+    stop_renamed=stop_renamed, kill_renamed_into=kill_renamed_into, pause_renamed=pause_renamed, kill_crashed_owner=kill_crashed_owner, rm_later_exit=rm_later_exit, rm_crashed_replacement=rm_crashed_replacement, rm_unrecorded=rm_unrecorded,
     terminal=terminal,
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,

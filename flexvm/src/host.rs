@@ -993,6 +993,24 @@ impl Host {
         lock_holder(&self.vms(name, "lock")?)
     }
 
+    /// What a VM that died recording nothing (SIGKILLed) left under `name`, read without the name
+    /// (`remove` decides again holding it): a holder proven dead by its full identity (pid, start,
+    /// boot and PID namespace: `Liveness::Gone`), or logs no live `run` is preparing (`unowned_logs`).
+    pub fn left_unrecorded(&self, name: &str) -> Result<bool> {
+        let dead = self.name_holder(name)?.is_some_and(|h| h.liveness() == Liveness::Gone);
+        Ok(dead || self.unowned_logs(name)?)
+    }
+
+    /// Whether `name` has logs and they are an ended VM's (`earlier_logs`, as this process, handed
+    /// none): never ones a live `run` opened to hand to the VM it starts. Logs from before their
+    /// directories are an ended VM's.
+    fn unowned_logs(&self, name: &str) -> Result<bool> {
+        Ok(match self.has_record(name, "logs") {
+            true => self.earlier_logs(name, None)?,
+            false => ["log", "log.1"].iter().any(|ext| self.vms(name, ext).is_ok_and(|p| std::fs::symlink_metadata(p).is_ok())),
+        })
+    }
+
     /// Reaps only a proven dead holder, even when no stopped VM remains to remove.
     pub fn reap_dead_holder(&self, name: &str) -> Result<()> {
         if let Some(owner) = lock_holder(&self.vms(name, "lock")?)?.filter(|o| o.liveness() == Liveness::Gone) {
@@ -3277,6 +3295,17 @@ impl NameLock {
     pub fn remove_logs(&self) -> Result<()> {
         let _logs = self.host.logs_lock(libc::LOCK_SH)?;
         self.host.retire_logs(&self.name)
+    }
+
+    /// `remove_logs` of logs no live `run` is preparing (`Host::unowned_logs`), decided holding the
+    /// name: whether there were such logs.
+    pub fn remove_unowned_logs(&self) -> Result<bool> {
+        let _logs = self.host.logs_lock(libc::LOCK_SH)?;
+        let unowned = self.host.unowned_logs(&self.name)?;
+        if unowned {
+            self.host.retire_logs(&self.name)?;
+        }
+        Ok(unowned)
     }
 
     pub fn publish(&self, e: &Entry) -> Result<()> {
