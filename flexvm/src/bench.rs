@@ -258,9 +258,6 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<
         (None, None) => None,
         _ => bail!("pass --ready-port or --ready-http, not both"),
     };
-    if iterations == 0 {
-        bail!("--iterations must be positive");
-    }
     if dirty_mib > 0 && h.to.is_none() {
         bail!("--dirty-mib needs --to");
     }

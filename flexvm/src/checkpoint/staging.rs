@@ -1,7 +1,7 @@
 //! Private staging, overlapping fsyncs, publication and revocation.
 use super::{
     chain_meta_budget, check, cname, create_at,
-    format::{sum, MAX_VMSTATE},
+    format::{manifest_text, sum, MAX_VMSTATE},
     fstat, open_dir_at,
     write::{write_pages, writer_threads, GuestPages, PagesFile},
     FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL,
@@ -134,21 +134,20 @@ impl Staging {
 
     /// Into the store for `checkpoint load`: files added with `create`/`add_file`, then `publish_as`.
     pub fn import(store: &Path) -> Result<Staging> {
-        let mut s = Staging::new(&store.join("new"), PathBuf::new())?;
-        s.by_id = true;
-        Ok(s)
+        Self::in_store(store, PathBuf::new())
     }
 
     /// Publishes what was added as the store's entry `id` (its manifest's checksum), never over
     /// one: false if one is there already (identical, by its id), and this staging goes.
+    /// The caller must first sync the store and its ancestors, once for the whole chain.
     /// `Uncertain`: published, and maybe not durably unpublished again (its manifest may stay).
-    pub fn publish_as(mut self, id: &str) -> std::result::Result<bool, CommitError> {
+    pub(super) fn publish_as(mut self, id: &str) -> std::result::Result<bool, CommitError> {
         if !self.by_id {
             return Err(CommitError::Failed("publish_as is for the store's staging".into()));
         }
         check(unsafe { libc::fsync(self.ck.as_raw_fd()) })?;
         (self.base, self.dest) = (cname(id), self.dest.with_file_name(id));
-        crate::util::sync_ancestors_fd(self.parent.as_raw_fd())?;
+        // The importer syncs the store's ancestors once before publishing its chain.
         self.publish(true)
     }
 
@@ -263,9 +262,7 @@ impl Staging {
             resources: vm.resources(),
             template_digests: meta.digests.clone(),
         };
-        let body = serde_json::to_vec_pretty(&manifest)?;
-        let id = sum(&body);
-        let text = [format!("{id}\n").as_bytes(), &body].concat();
+        let (id, text) = manifest_text(&manifest)?;
         if (text.len() + vmstate.len() + map.len()) as u64 > self.meta_left {
             let budget = chain_meta_budget();
             return Err(match manifest.parent {

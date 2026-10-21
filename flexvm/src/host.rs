@@ -3669,7 +3669,9 @@ fn pid_ns_census_in(proc: &Path, mine: u64, ns_of: &dyn Fn(&Path) -> std::io::Re
 struct PidNs<'a> {
     mine: Option<u64>,
     census: &'a dyn Fn() -> Option<HashSet<u64>>,
-    live: std::cell::OnceCell<Option<HashSet<u64>>>,
+    /// The last census (None: none taken yet), reused only to keep what it saw: a namespace it
+    /// lacks may have been made since, so a fresh one decides (`gone`).
+    live: std::cell::RefCell<Option<Option<HashSet<u64>>>>,
 }
 
 impl PidNs<'_> {
@@ -3684,10 +3686,32 @@ impl PidNs<'_> {
 
     /// Another namespace `of` is proven to have no process left only by a census of every
     /// process (`pid_ns_census`) that finds none in it. A namespace's inode can be reused once
-    /// it is gone: a live one with it then has a process, and its resources stay.
+    /// it is gone: a live one with it then has a process, and its resources stay. Only a census
+    /// taken after the resource was seen proves it: one taken before may predate its namespace,
+    /// so a namespace the last one lacks is looked for in a new one. Where none can be taken, none is retried.
     fn gone(&self, of: Option<u64>) -> bool {
         let (Some(_), Some(ns)) = (self.mine, of) else { return false };
-        self.live.get_or_init(|| (self.census)()).as_ref().is_some_and(|l| !l.contains(&ns))
+        let mut live = self.live.borrow_mut();
+        match &*live {
+            Some(None) => return false,
+            Some(Some(l)) if l.contains(&ns) => return false,
+            _ => {}
+        }
+        let fresh = (self.census)();
+        let gone = fresh.as_ref().is_some_and(|l| !l.contains(&ns));
+        *live = Some(fresh);
+        gone
+    }
+
+    /// Whether `id`, whose PID namespace is not known (`ns` None), is proven gone by `liveness` in
+    /// every PID namespace with a process left (`pid_ns_census`): never without a census. Taken
+    /// afresh, after what names `id` was seen: a namespace made since an earlier census may hold it.
+    fn gone_everywhere(&self, id: &Ident, liveness: &dyn Fn(&Ident) -> Liveness) -> bool {
+        if id.ns.is_some() {
+            return liveness(id) == Liveness::Gone;
+        }
+        let (Some(mine), Some(live)) = (self.mine, (self.census)()) else { return false };
+        std::iter::once(mine).chain(live.iter().copied()).all(|ns| liveness(&Ident { ns: Some(ns), ..id.clone() }) == Liveness::Gone)
     }
 
     fn owner_gone(&self, owner: &Ident, of: Option<u64>) -> bool {
@@ -3831,6 +3855,12 @@ fn remove_write_debris(dir: &Path, which: impl Fn(&str) -> bool) {
             let _ = std::fs::remove_file(e.path());
         }
     }
+}
+
+/// Whether `name` is a `write_file` temporary file tagged with its writer's full identity
+/// (`PID-START-BOOT[-NS]`, `util::write_tag`), not a bare pid.
+fn identified_write(name: &str) -> bool {
+    name.strip_suffix(".tmp").and_then(|n| n.rsplit_once('.')).is_some_and(|(_, tag)| tag.contains('-'))
 }
 
 /// Whether the suspended directory `dir` holds a QUARANTINE written in this boot (one that cannot be
@@ -4051,7 +4081,10 @@ impl Host {
         for dir in [self.run.join("claims"), self.run.join("vms"), self.state.join("addrs"), self.state.join("standby")] {
             remove_write_debris(&dir, |_| true);
         }
-        remove_write_debris(&self.run, |n| n.starts_with("..gens.next.") || n.starts_with("..boot"));
+        // Only by a full identity: a bare pid (or a random name, `claim_run`'s) never proves its writer gone.
+        for dir in [&self.run, &self.run.join("standby")] {
+            remove_write_debris(dir, identified_write);
+        }
         let withdrawn = self.withdraw_dead(lost);
         // After the sweep of dead holders, whose claims took their published revisions with them.
         match (withdrawn, self.sweep_live()) {
@@ -4456,7 +4489,13 @@ fn collect_owned(run: &Path) {
         }
     }
     for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {
-        let owner = load::<Ident>(&e.path().join("owner")).ok().flatten();
+        let owner = match load::<Ident>(&e.path().join("owner")) {
+            Ok(Some(owner)) => Some(owner),
+            // Killed before it wrote its owner: its name is its pid in its own PID namespace,
+            // which it does not name, so it must be gone in every one.
+            Ok(None) => e.file_name().to_str().and_then(Ident::from_key).filter(|o| ns.gone_everywhere(o, &Ident::liveness)),
+            Err(_) => None,
+        };
         if owner.is_some_and(|o| reap_swept(run, &o, true).is_ok()) {
             crate::socket::remove_left(&e.path());
             let _ = std::fs::remove_dir_all(e.path());
@@ -8210,6 +8249,77 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn ownerless_work_dirs_require_a_dead_identity() {
+        let (_dir, h) = host("ownerless");
+        let me = Ident::me();
+        let dead = Ident { start: me.start + 1, ..me.clone() };
+        for key in [dead.key(), dead.ns_key(), me.key(), "not-an-identity".into()] {
+            std::fs::create_dir_all(h.run.join("w").join(key)).unwrap();
+        }
+        let unreadable = Ident { start: me.start + 2, ..me.clone() }.work_dir(&h.run);
+        std::fs::create_dir_all(&unreadable).unwrap();
+        std::fs::write(unreadable.join("owner"), "invalid").unwrap();
+        collect_owned(&h.run);
+        // A bare `PID-START` is judged in every PID namespace, which only a census can tell.
+        assert_eq!(dead.work_dir(&h.run).exists(), pid_ns_census().is_none());
+        assert!(!h.run.join("w").join(dead.ns_key()).exists());
+        assert!(me.work_dir(&h.run).exists());
+        assert!(h.run.join("w/not-an-identity").exists());
+        assert!(unreadable.exists());
+    }
+
+    /// A work directory without its owner names a pid of no known PID namespace: gone only where
+    /// it is gone in each one a census finds, never without one.
+    #[test]
+    fn an_unnamed_namespace_is_judged_in_every_one() {
+        let id = Ident { start: Ident::me().start + 1, ns: None, ..Ident::me() };
+        let census = || Some(HashSet::from([1, 2]));
+        let ns = PidNs { mine: Some(1), census: &census, live: Default::default() };
+        assert!(ns.gone_everywhere(&id, &|_| Liveness::Gone));
+        for other in [Liveness::Alive, Liveness::Unknown] {
+            assert!(!ns.gone_everywhere(&id, &|i| if i.ns == Some(2) { other } else { Liveness::Gone }), "{other:?} in another namespace");
+            assert!(!ns.gone_everywhere(&id, &|i| if i.ns == Some(1) { other } else { Liveness::Gone }), "{other:?} in this one");
+        }
+        let none = || None;
+        let blind = PidNs { mine: Some(1), census: &none, live: Default::default() };
+        assert!(!blind.gone_everywhere(&id, &|_| Liveness::Gone), "no census, no proof");
+        // An earlier sweep's census (the cgroups') misses a namespace made since: never reused.
+        let stale = PidNs { mine: Some(1), census: &census, live: std::cell::RefCell::new(Some(Some(HashSet::from([1])))) };
+        assert!(!stale.gone_everywhere(&id, &|i| if i.ns == Some(2) { Liveness::Alive } else { Liveness::Gone }), "a census taken before");
+    }
+
+    /// A census taken before a resource was seen may predate its namespace: one the last census
+    /// lacks is looked for in a new one, and one it has is not taken again.
+    #[test]
+    fn a_namespace_made_after_the_last_census_is_looked_for_again() {
+        let taken = std::cell::Cell::new(0);
+        let seen = std::cell::RefCell::new(HashSet::from([1, 2]));
+        let census = || {
+            taken.set(taken.get() + 1);
+            Some(seen.borrow().clone())
+        };
+        let ns = PidNs { mine: Some(1), census: &census, live: Default::default() };
+        assert!(!ns.gone(Some(2)) && taken.get() == 1);
+        assert!(!ns.gone(Some(2)) && taken.get() == 1, "a namespace the last census saw: no new one");
+        // Namespace 3 is made, after that census, and writes.
+        seen.borrow_mut().insert(3);
+        assert!(!ns.gone(Some(3)), "a namespace made since the last census is alive");
+        assert_eq!(taken.get(), 2);
+        seen.borrow_mut().remove(&3);
+        assert!(!ns.gone(Some(3)), "one the last census saw stays, for a later sweep");
+        assert_eq!(taken.get(), 2);
+        assert!(ns.gone(Some(4)), "one no census taken after it was seen finds is gone");
+        assert_eq!(taken.get(), 3);
+        let none = || {
+            taken.set(taken.get() + 1);
+            None
+        };
+        let blind = PidNs { mine: Some(1), census: &none, live: Default::default() };
+        assert!(!blind.gone(Some(2)) && !blind.gone(Some(3)));
+        assert_eq!(taken.get(), 4, "where no census can be taken, it is not retried");
+    }
+
     /// #556, #563: a write's temporary file goes once its writer is proven gone (by pid, start time and
     /// boot), never a live one's nor a published record, in STATE and RUN alike.
     #[test]
@@ -8254,6 +8364,19 @@ pub(crate) mod tests {
         for (f, _) in &gens {
             std::fs::write(h.run.join(f), "").unwrap();
         }
+        let debris: Vec<_> = ["compat.json", "firecracker.json", "firecracker.pinned.json", "vmlinux.pinned.json", ".loadset-abc"]
+            .into_iter()
+            .flat_map(|name| [(format!(".{name}.{}-{}-{boot}-{ns}.tmp", me.pid, me.start + 1), false), (format!(".{name}.{mine}.tmp"), true)])
+            .collect();
+        // RUN itself and RUN/standby: by a full identity only, never a bare pid.
+        let standby = h.run.join("standby");
+        std::fs::create_dir_all(&standby).unwrap();
+        let debris: Vec<_> = debris.into_iter().chain([(".compat.json.999999971.tmp".to_string(), true)]).collect();
+        for (file, _) in &debris {
+            for dir in [&h.run, &standby] {
+                std::fs::write(dir.join(file), "").unwrap();
+            }
+        }
         let other = h.run.join(".state.json.99999999.tmp");
         std::fs::write(&other, "").unwrap();
         h.collect_garbage().unwrap();
@@ -8263,10 +8386,15 @@ pub(crate) mod tests {
             }
         }
         assert!(!old.exists());
+        for (file, kept) in &debris {
+            for dir in [&h.run, &standby] {
+                assert_eq!(dir.join(file).exists(), *kept, "{}: {file}", dir.display());
+            }
+        }
         for (f, kept) in &gens {
             assert_eq!(h.run.join(f).exists(), *kept, "{f}");
         }
-        assert!(other.exists(), "only the cursor's temporary files in RUN itself");
+        assert!(other.exists(), "in RUN itself, only a full identity proves a writer gone");
         // STATE's records, by the same rule.
         let owed = h.state.join("owed");
         let (dead, live) = (owed.join(format!(".7.{}-1-0000beef.tmp", me.pid)), owed.join(format!(".8.{mine}.tmp")));

@@ -428,6 +428,11 @@ pub(super) fn unpublish(state: &Path, ids: &[String]) -> Result<()> {
 
 fn remove_entry(store: &Path, path: &Path, id: &str) -> Result<()> {
     let gone = store.join(format!("{REMOVED}{id}"));
+    match std::fs::remove_dir_all(&gone) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     std::fs::rename(path, &gone)?;
     crate::util::sync_dir(store)?;
     std::fs::remove_dir_all(&gone)?;
