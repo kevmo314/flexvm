@@ -492,6 +492,81 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     }
 }
 
+/// A name's suspended directory (`Host::is_suspended`): a stopped (or quarantined) VM's, with who
+/// suspended it (its OWNER: none before OWNER), or debris an interrupted suspend, resume or discard left.
+#[derive(Debug, PartialEq)]
+pub enum Checkpoint {
+    Resumable { owner: Option<Ident> },
+    Debris,
+}
+
+/// One snapshot of what is recorded under a name, read without its lock unless the caller holds it
+/// (then taking it removed any debris). An invalid name has nothing recorded, and no holder gone.
+/// `moved`: a VM of it moved away, and where to if its hint reads. `logs`: their directory, or a
+/// log at its path. `holder`: its lock's record (`Host::name_holder`).
+///
+/// Read in order: the holder and whether it is gone first, then the records. A VM publishes its
+/// records (checkpoint, exit, hint) before it lets its name go, so a holder seen gone (`holder_gone`,
+/// never judged again later) never comes with records read from before they were published.
+pub struct Records {
+    pub checkpoint: Option<Checkpoint>,
+    pub exited: bool,
+    pub failed: bool,
+    pub lost: bool,
+    pub moved: Option<Option<String>>,
+    pub logs: bool,
+    pub holder: Result<Option<Ident>>,
+    gone: bool,
+}
+
+impl Records {
+    pub fn read(host: &Host, name: &str) -> Records {
+        let (holder, has) = (host.name_holder(name), |ext| host.has_record(name, ext));
+        let gone = holder_gone(&holder);
+        let checkpoint = host.suspended(name).ok().filter(|d| d.exists()).map(|d| match host.is_suspended(name) {
+            true => Checkpoint::Resumable { owner: crate::lifecycle::read_owner(&d) },
+            false => Checkpoint::Debris,
+        });
+        let (exited, failed, lost) = (has("exited"), has("failed"), has("lost"));
+        let moved = host.vms(name, "moved").ok().and_then(|p| std::fs::read_to_string(p).ok()).map(Some).or(has("moved").then_some(None));
+        let logs = ["logs", "log", "log.1"].into_iter().any(has);
+        Records { checkpoint, exited, failed, lost, moved, logs, holder, gone }
+    }
+
+    /// A stopped VM's checkpoint, not debris.
+    pub fn stopped(&self) -> bool {
+        matches!(self.checkpoint, Some(Checkpoint::Resumable { .. }))
+    }
+
+    pub fn ended(&self) -> bool {
+        self.exited || self.failed || self.lost
+    }
+
+    /// A stopped VM (or debris of one) or a record of its end.
+    pub fn recorded(&self) -> bool {
+        self.checkpoint.is_some() || self.ended()
+    }
+
+    /// `Host::holder_gone`, as judged before the records were read.
+    pub fn holder_gone(&self) -> bool {
+        self.gone
+    }
+}
+
+fn holder_gone(holder: &Result<Option<Ident>>) -> bool {
+    match holder {
+        Ok(None) => true,
+        Ok(Some(id)) => id.liveness() == Liveness::Gone,
+        Err(_) => false,
+    }
+}
+
+/// An exit status (`flexvm wait`) of an earlier instance under a name whose holder `dead` died
+/// without one: taking the dead holder's lock takes the proof that the record is not its own.
+fn stale_exit(exit: &Path, dead: &Ident) -> bool {
+    load::<Ident>(exit).is_ok_and(|recorded| recorded.is_some_and(|r| r != *dead))
+}
+
 /// Who a name lock says holds it: None for an empty lock (created, never
 /// written: no VM started under it); unreadable or corrupt is an error.
 fn lock_holder(path: &Path) -> Result<Option<Ident>> {
@@ -887,7 +962,7 @@ impl Host {
         if !resuming {
             check_new_name(name)?;
         }
-        let (lock, suspended) = (self.vms(name, "lock")?, self.suspended(name)?);
+        let lock = self.vms(name, "lock")?;
         if !resuming && self.is_suspended(name) {
             bail!("vm {name:?} exists (stopped); flexvm start or rm it");
         }
@@ -916,26 +991,23 @@ impl Host {
             // one, and taking its lock takes the proof that the record is not its own (as a sweep's
             // `collect_owned` does), so it goes before any taker can let the name go.
             let exit = self.vms(name, "exit")?;
-            if load::<Ident>(&exit).is_ok_and(|recorded| recorded.is_some_and(|r| r != *old)) {
+            if stale_exit(&exit, old) {
                 crate::util::unlink_durably(&exit)?;
             }
         }
         self.finish_rename(name)?;
-        if refuse_records {
-            for ext in ["failed", "lost"] {
-                if self.has_record(name, ext) {
-                    bail!("vm name {name:?} is taken (a {ext} vm, see flexvm ps -a): flexvm rm {name} first");
-                }
-            }
+        let r = Records::read(self, name);
+        if let Some(ext) = [("failed", r.failed), ("lost", r.lost)].into_iter().find_map(|(ext, has)| (refuse_records && has).then_some(ext)) {
+            bail!("vm name {name:?} is taken (a {ext} vm, see flexvm ps -a): flexvm rm {name} first");
         }
-        if suspended.exists() && !self.is_suspended(name) {
+        if r.checkpoint == Some(Checkpoint::Debris) {
             crate::lifecycle::remove_debris(self, name)?;
         }
-        if !resuming && suspended.exists() {
+        if !resuming && r.stopped() {
             bail!("vm {name:?} exists (stopped); flexvm start or rm it");
         }
         // Its record stays until `rm` or `start` (`take_rerun_name`) takes it.
-        if !resuming && self.has_record(name, "exited") {
+        if !resuming && r.exited {
             bail!("vm {name:?} exists (exited); flexvm start or rm it");
         }
         // A new VM of the name starts a fresh log: an earlier VM's (failed, lost, moved, or one
@@ -943,16 +1015,13 @@ impl Host {
         // Kept: this process's own, one a `run` handed to it (its token: whether or not that `run`
         // is still there), and one a live `run` opened to hand to another (`own_logs`). A resume (`start`), or a restore under the checkpoint's own name, keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
-        if !resuming
-            && !arriving
-            && (["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) || !keep_logs && self.earlier_logs(name, handed)?)
-        {
+        if !resuming && !arriving && (r.failed || r.lost || r.moved.is_some() || !keep_logs && self.earlier_logs(name, handed)?) {
             let _ = self.retire_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
         // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log,
         // and a VM that moved away keeps its hint (where it went).
-        let records: &[&str] = match (arriving, !resuming || suspended.exists() || self.has_record(name, "exited")) {
+        let records: &[&str] = match (arriving, !resuming || r.stopped() || r.exited) {
             (true, _) => &["json", "sock", "failed", "lost"],
             (false, true) => &["json", "sock", "moved", "failed", "lost"],
             (false, false) => &["json", "sock"],
@@ -983,11 +1052,7 @@ impl Host {
     /// probe of the lock, which a start takes without waiting): none, or one
     /// proven gone.
     pub fn holder_gone(&self, name: &str) -> bool {
-        match self.vms(name, "lock").and_then(|l| lock_holder(&l)) {
-            Ok(None) => true,
-            Ok(Some(id)) => id.liveness() == Liveness::Gone,
-            Err(_) => false,
-        }
+        holder_gone(&self.name_holder(name))
     }
 
     /// Who holds `name` (or held it last, and died holding it): its lock's record.
@@ -4753,10 +4818,8 @@ fn collect_owned(run: &Path) {
             // An exit status (`flexvm wait`) of an earlier instance: this one ended without
             // one, and with its lock goes the proof that the record is not its own.
             let exit = vms.join(format!("{}.exit", name.to_string_lossy()));
-            if let (Some(dead), Ok(Some(recorded))) = (&reaped, load::<Ident>(&exit)) {
-                if recorded != *dead {
-                    let _ = std::fs::remove_file(&exit);
-                }
+            if reaped.as_ref().is_some_and(|dead| stale_exit(&exit, dead)) {
+                let _ = std::fs::remove_file(&exit);
             }
             let _ = std::fs::remove_file(&path);
         }
@@ -4865,7 +4928,8 @@ pub fn generated_name(host: &Host) -> Result<String> {
     for _ in 0..100 {
         let r = u64::from_str_radix(&crate::util::random_hex(8)?, 16).unwrap_or(0);
         let name = format!("{}_{}", ADJECTIVES[(r % ADJECTIVES.len() as u64) as usize], NAMES[((r >> 32) % NAMES.len() as u64) as usize]);
-        let taken = host.alive(&name) || host.suspended(&name)?.exists() || ["failed", "lost", "moved", "exited"].iter().any(|ext| host.has_record(&name, ext));
+        let r = Records::read(host, &name);
+        let taken = host.alive(&name) || r.recorded() || r.moved.is_some();
         if !taken {
             return Ok(name);
         }
@@ -6980,6 +7044,35 @@ pub(crate) mod tests {
         let _live = h.take_name("live", true).unwrap();
         dir("live", &["GEN"]);
         assert!(h.take_name("live", false).is_err() && h.suspended("live").unwrap().exists());
+    }
+
+    #[test]
+    fn records_read_one_snapshot_of_a_name() {
+        let (_h_dir, h) = host("records");
+        let r = Records::read(&h, "none");
+        assert!(r.checkpoint.is_none() && !r.recorded() && r.moved.is_none() && !r.logs && r.holder_gone());
+        // An invalid name has nothing recorded, and no holder shown gone.
+        let r = Records::read(&h, "../x");
+        assert!(!r.recorded() && !r.holder_gone());
+        std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
+        assert_eq!(Records::read(&h, "s").checkpoint, Some(Checkpoint::Debris));
+        std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
+        assert_eq!(Records::read(&h, "s").checkpoint, Some(Checkpoint::Resumable { owner: None }));
+        std::fs::write(h.suspended("s").unwrap().join("OWNER"), serde_json::to_vec(&Ident::me()).unwrap()).unwrap();
+        let r = Records::read(&h, "s");
+        assert!(r.stopped() && r.recorded() && !r.ended() && r.checkpoint == Some(Checkpoint::Resumable { owner: Some(Ident::me()) }));
+        std::fs::write(h.vms("e", "exited").unwrap(), "{}").unwrap();
+        std::fs::write(h.vms("e", "moved").unwrap(), "b:7070").unwrap();
+        h.write_log("e", "log.1", "x");
+        let r = Records::read(&h, "e");
+        assert!(r.exited && !r.failed && r.ended() && r.logs && r.moved == Some(Some("b:7070".into())));
+        // A hint that cannot be read still shows the VM moved away.
+        std::fs::remove_file(h.vms("e", "moved").unwrap()).unwrap();
+        std::fs::create_dir(h.vms("e", "moved").unwrap()).unwrap();
+        assert_eq!(Records::read(&h, "e").moved, Some(None));
+        let _held = h.take_name("live", false).unwrap();
+        let r = Records::read(&h, "live");
+        assert!(matches!(r.holder, Ok(Some(ref id)) if *id == Ident::me()) && !r.holder_gone());
     }
 
     #[test]
