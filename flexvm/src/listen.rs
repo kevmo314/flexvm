@@ -1001,42 +1001,58 @@ fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> 
         bail!("injected fault: migration status unavailable");
     }
     let mig = req["mig"].as_u64().ok_or("missing mig")?;
-    // Held through `mig_done` or `mig_status`, which take it again (reentrant) without waiting.
-    let _l = host_lock(host)?;
     if req["done"] == json!(true) {
+        // Held through `mig_done`, which takes it again (reentrant) without waiting.
+        let _l = host_lock(host)?;
         if host.mig_done_from(mig, source)? {
             crate::info!("migration {mig}: its source says done; forgetting it");
         }
         return Ok(json!({"done": true}));
     }
-    drop(_l);
     // Bounded below the caller's two-second RPC budget (`vmproc::peer_call`). Never hold the
     // host lock while waiting: the target must be able to publish its release.
     let wait = if req["wait"] == true { Duration::from_secs(1) } else { Duration::ZERO };
-    migration_wait(wait, |by| {
-        let _l = match by {
-            None => host_lock(host)?,
-            Some(by) => host.lock_by(Some(by))?,
-        };
-        let outcome = host.mig_status(mig)?;
-        // Read the host identity with the outcome under the same lock.
-        let token = crate::migrate::host_token(host, false)?;
-        Ok((outcome, json!({"outcome": outcome, "token": token, "underlay": host.config_now().underlay_known().map(|u| u.to_string())})))
-    })
+    migration_wait(
+        wait,
+        || host.mig_stamp(mig),
+        |by| {
+            let _l = match by {
+                None => host_lock(host)?,
+                Some(by) => host.lock_by(Some(by))?,
+            };
+            let outcome = host.mig_status(mig)?;
+            // Read the host identity with the outcome under the same lock.
+            let token = crate::migrate::host_token(host, false)?;
+            Ok((outcome, json!({"outcome": outcome, "token": token, "underlay": host.config_now().underlay_known().map(|u| u.to_string())})))
+        },
+    )
 }
 
 /// Asks `status` until it is terminal (`released`, `aborted`) or `wait` passes: only the durable
 /// status decides, and the last one read is the answer. The first ask waits for the host lock as any
 /// request does (`None`); later ones only until `wait` ends, and one that fails then answers the last.
-fn migration_wait(wait: Duration, mut status: impl FnMut(Option<Instant>) -> Result<(&'static str, Value)>) -> Result<Value> {
+/// Between asks only `stamp` (the status record's, read without the host lock) is watched: asked
+/// again once it changes, else every `RECHECK` (an owner that died leaves its record as it was).
+fn migration_wait<S: PartialEq>(
+    wait: Duration,
+    mut stamp: impl FnMut() -> S,
+    mut status: impl FnMut(Option<Instant>) -> Result<(&'static str, Value)>,
+) -> Result<Value> {
     let by = Instant::now() + wait;
+    let mut seen = stamp();
     let (mut outcome, mut reply) = status(None)?;
+    let mut asked = Instant::now();
     while !matches!(outcome, "released" | "aborted") {
         let left = by.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
         std::thread::sleep(Duration::from_millis(20).min(left));
+        let now = stamp();
+        if now == seen && asked.elapsed() < RECHECK {
+            continue;
+        }
+        (seen, asked) = (now, Instant::now());
         match status(Some(by)) {
             Ok(r) => (outcome, reply) = r,
             Err(_) => break,
@@ -1044,6 +1060,9 @@ fn migration_wait(wait: Duration, mut status: impl FnMut(Option<Instant>) -> Res
     }
     Ok(reply)
 }
+
+/// How often a long-polled migration status is asked again with its record unchanged.
+const RECHECK: Duration = Duration::from_millis(250);
 
 /// `borrower`: who asks (`Peers::borrower`), from `from`.
 /// Test faults on a loan's start (#944): `lend_start_busy` answers it busy, as a held host lock
@@ -1265,10 +1284,12 @@ mod tests {
 
     #[test]
     fn migration_long_poll_only_finishes_on_terminal_status_or_timeout() {
-        let ask = |states: &[&'static str], wait: Duration| {
+        // `changing`: its record is written again before each ask, as a status that moves on.
+        let ask_with = |states: &[&'static str], wait: Duration, changing: bool| {
             let mut states = states.iter().copied();
             let (asked, mut locks) = (std::cell::Cell::new(0), vec![]);
-            let r = migration_wait(wait, |by| {
+            let stamp = || if changing { asked.get() } else { 0 };
+            let r = migration_wait(wait, stamp, |by| {
                 asked.set(asked.get() + 1);
                 locks.push(by.is_some());
                 let s = states.next().ok_or("lost status")?;
@@ -1276,6 +1297,7 @@ mod tests {
             });
             (r.ok(), asked.get(), locks)
         };
+        let ask = |states: &[&'static str], wait: Duration| ask_with(states, wait, true);
         assert_eq!(ask(&["pending", "committed", "released"], Duration::from_secs(1)), (Some(json!("released")), 3, vec![false, true, true]));
         assert_eq!(ask(&["aborted"], Duration::from_secs(1)), (Some(json!("aborted")), 1, vec![false]));
         assert_eq!(ask(&["committed"], Duration::ZERO), (Some(json!("committed")), 1, vec![false]));
@@ -1285,6 +1307,10 @@ mod tests {
         let t = Instant::now();
         assert_eq!(ask(&["committed"; 200], Duration::from_millis(200)).0, Some(json!("committed")));
         assert!(t.elapsed() < Duration::from_secs(1));
+        // An unchanged record is asked about again only every `RECHECK`, never every poll.
+        let (r, asked, _) = ask_with(&["committed"; 200], Duration::from_millis(600), false);
+        assert_eq!(r, Some(json!("committed")));
+        assert!((2..=4).contains(&asked), "asked {asked} times");
     }
 
     #[test]

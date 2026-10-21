@@ -40,6 +40,9 @@ const QUARANTINE: &str = "QUARANTINE";
 const CMD: &str = "CMD";
 /// A suspended VM's `app::RunSpec` (JSON), its `-p` ports included, when it has one other than the default.
 const SPEC: &str = "SPEC";
+/// The identity (`host::Ident`, JSON) of the VM process that suspended it: a delayed `kill` or
+/// `rm -f` of that instance undoes only its own checkpoint, never one renamed or run under the name since.
+const OWNER: &str = "OWNER";
 
 /// Set while a suspend or `checkpoint --stop` saves the VM, and for good once
 /// it did: the app log follower writes nothing past the offset the checkpoint
@@ -222,6 +225,7 @@ impl Proc {
             self.record_for_suspend()?;
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
+            staging.add_file(OWNER, &serde_json::to_vec(&self.ident)?)?;
             self.save_spec(&staging)?;
             let cmd = match self.cmd.lock().unwrap().clone() {
                 Some(cmd) => Some((cmd, self.cmd_session()?, staging.create(CMD)?)),
@@ -1079,6 +1083,11 @@ pub(crate) fn read_spec(dir: &Path) -> Result<crate::app::RunSpec> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::app::RunSpec::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Who suspended the checkpoint in `dir` (`OWNER`): None from before it was kept, or unreadable.
+pub fn read_owner(dir: &Path) -> Option<crate::host::Ident> {
+    serde_json::from_slice(&std::fs::read(dir.join(OWNER)).ok()?).ok()
 }
 
 pub fn read_gen(dir: &Path) -> Option<u64> {
