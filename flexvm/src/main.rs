@@ -1073,8 +1073,14 @@ fn run_as(
             // Its terminal gone, this client's own output is dropped: only the VM's process
             // writes the VM's logs.
             crate::info!("{v}");
-            let id =
-                host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into(), ns: None };
+            // Its pid is the one it has in its PID namespace (`pidns`), found here by that (#1139);
+            // an earlier build's reply names none, judged by its pid here.
+            let id = host::Ident {
+                pid: v["pid"].as_u64().unwrap_or(0) as u32,
+                start: v["start"].as_u64().unwrap_or(0),
+                boot: host::boot_id().into(),
+                ns: v["pidns"].as_u64(),
+            };
             follow(conn, id)
         }
         (None, Some(log)) => {

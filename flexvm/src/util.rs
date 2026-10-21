@@ -1382,7 +1382,8 @@ pub fn write_tag() -> String {
         return tag.clone();
     }
     let boot = crate::host::boot_id().get(..BOOT_TAG).filter(|b| !b.contains('-'));
-    let tag = match (crate::host::starttime(pid), boot, crate::host::pid_ns()) {
+    // Through /proc/self: /proc/PID in a /proc of an ancestor namespace is another process.
+    let tag = match (own_start(), boot, crate::host::pid_ns()) {
         (Some(start), Some(boot), Some(ns)) => format!("{pid}-{start}-{boot}-{ns}"),
         (Some(start), Some(boot), None) => format!("{pid}-{start}-{boot}"),
         _ => return pid.to_string(),

@@ -1,7 +1,9 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
-//! `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters) and holds
-//! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, spec, tty, generation}` with
+//! `RUN/standby/HASH/PID.PIDNS.sock` (HASH: 16 hex characters; PIDNS its PID namespace in hex,
+//! `sock_name`: never one of another namespace's sharing the directory, which may have its pid;
+//! an earlier build's is `PID.sock`) and holds `ID.lock` while alive (ID: `PID-START-PIDNS`,
+//! `Ident::ns_key`), and `ID.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, spec, tty, generation}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows. An
 //! `attached` claim (a foreground `run`'s, with its cgroup directory fd, which the VM joins) ends the
@@ -187,10 +189,10 @@ fn read_rank(path: &std::path::Path, me: &Ident) -> Option<usize> {
     Some(usize::MAX)
 }
 
-/// `live`, less those mid-claim (`PID-START.claim` locked; START keeps a reused pid's apart): a stop would not end them.
+/// `live`, less those mid-claim (`ID.claim` locked; START keeps a reused pid's apart, PIDNS another namespace's): a stop would not end them.
 pub fn stoppable(host: &Host, template: &str) -> Vec<Ident> {
     let Some(d) = trusted(host, template, true) else { return Vec::new() };
-    let claiming = |id: &Ident| locked(&d.join(format!("{}.claim", id.key())), libc::LOCK_SH) == Some(true);
+    let claiming = |id: &Ident| locked(&d.join(format!("{}.claim", id.ns_key())), libc::LOCK_SH) == Some(true);
     live(host, template).into_iter().filter(|id| !claiming(id)).collect()
 }
 
@@ -827,10 +829,12 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     p.standby_grant.store(inherited_grant().unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
     let d = create_dir(host, template)?;
     let me = Ident::me();
-    let id = me.key();
+    // With its PID namespace: one of another, sharing this directory, may have its pid (#1139).
+    let id = me.ns_key();
     // Its locks are in `.locks`, which only root may enter; its socket beside it.
     let l = crate::host::locks(&d);
-    let (lock_path, sock) = (l.join(format!("{id}.lock")), d.join(format!("{}.sock", me.pid)));
+    let (lock_path, stem) = (l.join(format!("{id}.lock")), sock_name(&me));
+    let sock = d.join(format!("{stem}.sock"));
     crate::socket::check(&sock)?;
     crate::host::stall("standby_lock_stall");
     // Test gate `standby_lock_gate`: held before its lock until the test lets it go.
@@ -849,7 +853,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let _ = send_json(f, &json!({"locked": true}));
     }
     let claim_path = l.join(format!("{id}.claim"));
-    p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone(), l.join(format!("{id}.take"))]);
+    p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone(), l.join(format!("{stem}.take"))]);
     // A stop while loading (relief, `rmi`) ends it between phases: what it made is torn down
     // first, and its refill is told it stopped, which is no failed start (no `.failed`).
     let stopping = || p.stop_requested().is_some();
@@ -1192,7 +1196,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "sock") && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.parse::<u32>().is_ok()))
+        .filter(|p| p.extension().is_some_and(|e| e == "sock") && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| sock_of(s).is_some()))
         .collect();
     socks.sort();
     let mut req = req.clone();
@@ -1270,11 +1274,42 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     Ok(None)
 }
 
-/// `PID.sock`'s `PID-START.take`, locked: Some(lock), Some(None) if it cannot be had (no
-/// such name, a file it cannot create: tried anyway), None if another claimer holds it.
+/// A standby's socket's name, less `.sock`: `PID.PIDNS`, its PID namespace in hex (#1139), unique
+/// among live processes of every namespace; a reused pid's is replaced under `publish_lock`. Short:
+/// a socket's path has at most 107 bytes. `PID` alone where it names no namespace.
+pub(crate) fn sock_name(id: &Ident) -> String {
+    match id.ns {
+        Some(ns) => format!("{}.{ns:x}", id.pid),
+        None => id.pid.to_string(),
+    }
+}
+
+/// The pid and PID namespace a socket's name less `.sock` (`sock_name`) names: None (the
+/// namespace) for an earlier build's `PID`; None if it is no standby's.
+pub(crate) fn sock_of(stem: &str) -> Option<(u32, Option<u64>)> {
+    let digits = |s: &str, hex: bool| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || (hex && (b'a'..=b'f').contains(&b)));
+    match stem.split_once('.') {
+        None => digits(stem, false).then(|| Some((stem.parse().ok()?, None))).flatten(),
+        Some((pid, ns)) => (digits(pid, false) && digits(ns, true)).then(|| Some((pid.parse().ok()?, Some(u64::from_str_radix(ns, 16).ok()?)))).flatten(),
+    }
+}
+
+/// What a claimer trying a socket named `stem` holds (`try_take`), less `.take`: `PID.PIDNS`
+/// itself, or for an earlier build's `PID.sock`, `PID-START` by the start time of `PID` here
+/// (None if it has none). None too for a name no standby's socket has.
+pub(crate) fn take_name(stem: &str) -> Option<String> {
+    match sock_of(stem)? {
+        (_, Some(_)) => Some(stem.into()),
+        (pid, None) => Ident::of(pid).map(|id| id.key()),
+    }
+}
+
+/// `PID.PIDNS.sock`'s `PID.PIDNS.take` (an earlier build's `PID.sock`'s `PID-START.take`), locked:
+/// Some(lock), Some(None) if it cannot be had (no such name, a file it cannot create: tried
+/// anyway), None if another claimer holds it.
 fn try_take(sock: &std::path::Path) -> Option<Option<File>> {
     let Some(stem) = sock.file_stem().and_then(|s| s.to_str()) else { return Some(None) };
-    let Some(id) = stem.parse().ok().and_then(Ident::of).map(|id| id.key()) else {
+    let Some(id) = take_name(stem) else {
         return Some(None);
     };
     let Ok(f) = crate::host::private_file(&publish_lock(sock).with_file_name(format!("{id}.take"))) else { return Some(None) };
@@ -1847,6 +1882,25 @@ mod tests {
         assert_eq!(leave_status(true, true), Some(crate::vmproc::DIED));
     }
 
+    /// #1139: a standby's socket names its PID namespace: one of another namespace with its pid has another.
+    #[test]
+    fn standby_sockets_name_their_pid_namespace() {
+        let me = Ident::me();
+        let ns = me.ns.unwrap();
+        assert_eq!(sock_name(&me), format!("{}.{ns:x}", me.pid));
+        assert_ne!(sock_name(&me), sock_name(&Ident { ns: Some(ns + 1), ..me.clone() }));
+        assert_eq!(sock_name(&Ident { ns: None, ..me.clone() }), me.pid.to_string());
+        assert_eq!(sock_of(&sock_name(&me)), Some((me.pid, Some(ns))));
+        assert_eq!(sock_of("12"), Some((12, None)));
+        assert_eq!(sock_of("12.f0a"), Some((12, Some(0xf0a))));
+        for bad in ["", ".12", "12.", "12.x", "12.F", "-1", "12-3", "12.3.4", "a", "4294967296", "1.10000000000000000"] {
+            assert_eq!(sock_of(bad), None, "{bad}");
+        }
+        assert_eq!(take_name("12.f0a").as_deref(), Some("12.f0a"));
+        assert_eq!(take_name(&me.pid.to_string()), Some(me.key()), "an earlier build's, by its start time here");
+        assert_eq!(take_name("x"), None);
+    }
+
     #[test]
     fn long_template_has_a_short_socket_path() {
         let root = crate::test_util::TempDir::new("fv-long");
@@ -1856,15 +1910,20 @@ mod tests {
         let d = create_dir(&host, &template).unwrap();
         assert!(host.run.as_os_str().len() >= 60);
         assert_eq!(d.file_name().unwrap().len(), 16);
-        for pid in [Ident::me().pid, u32::MAX] {
-            let sock = d.join(format!("{pid}.sock"));
+        // The longest a pid (under PID_MAX_LIMIT, 2^22) and a PID namespace (an inode number, 32 bits) name.
+        let longest = Ident { pid: (1 << 22) - 1, ns: Some(u32::MAX.into()), ..Ident::me() };
+        for id in [Ident::me(), longest] {
+            let sock = d.join(format!("{}.sock", sock_name(&id)));
             crate::socket::check(&sock).unwrap();
         }
-        let sock = d.join(format!("{}.sock", Ident::me().pid));
-        let taking = try_take(&sock).unwrap().unwrap();
-        assert!(try_take(&sock).is_none());
-        assert!(crate::host::locks(&d).join(format!("{}.take", Ident::me().key())).exists());
-        drop(taking);
+        // An earlier build's `PID.sock` is taken by `PID-START.take`; this one's by its own name.
+        for (stem, take) in [(Ident::me().pid.to_string(), Ident::me().key()), (sock_name(&Ident::me()), sock_name(&Ident::me()))] {
+            let sock = d.join(format!("{stem}.sock"));
+            let taking = try_take(&sock).unwrap().unwrap();
+            assert!(try_take(&sock).is_none());
+            assert!(crate::host::locks(&d).join(format!("{take}.take")).exists());
+            drop(taking);
+        }
         assert_eq!(templates(&host), [template]);
         assert_ne!(d, dir(&host, &"u".repeat(64)));
     }

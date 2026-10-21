@@ -7254,7 +7254,7 @@ def evict_peer_busy():
     is a refusal like any other: backed off, and the VM moves to the next peer."""
     n = "ft-ev-peer-busy"
     m = setup(n, mib=1)
-    # The backoff is keyed by the deciding VM process's identity (`Ident::key`: PID-START) and the peer.
+    # The backoff is keyed by the deciding VM process's identity (`Ident::ns_key`: PID-START-PIDNS) and the peer.
     v = vms(A)[n]
     with busy_peer() as stub:
         configure(A, peers=[stub.addr, B.addr])
@@ -7268,7 +7268,7 @@ def evict_peer_busy():
     # Its template first (`template`): refused there, the eviction moves on as for any refusal.
     check("evict peer busy: the stub was asked", stub.asked and set(stub.asked) <= {"template", "migrate_in"}, stub.asked)
     check("evict peer busy: moved to the next peer", moved, (where(n), log(A, n)[-1500:]))
-    check("evict peer busy: the stub is backed off", f"{v['pid']}-{v['start']} {stub.addr}" in backoff, backoff)
+    check("evict peer busy: the stub is backed off", f"{v['pid']}-{v['start']}-{v['pidns']} {stub.addr}" in backoff, backoff)
     check("evict peer busy: md5 intact", md5(B, n) == m)
     cleanup(n)
 
@@ -8680,6 +8680,12 @@ def standby_dir(run, t):
     return os.path.join(run, "standby", f"{h:016x}")
 
 
+def standby_listens(run, t, pid):
+    """Whether the standby of `t` with `pid` has its socket: `PID.PIDNS.sock` (an earlier build's `PID.sock`)."""
+    d = standby_dir(run, t)
+    return any(f.endswith(".sock") and f.split(".")[0] == str(pid) for f in os.listdir(d)) if os.path.isdir(d) else False
+
+
 def standby_socks(host, t):
     """The listening sockets of `host`'s standby VMs of `t`: those loaded, claimable."""
     d = standby_dir(host.run, t)
@@ -8718,8 +8724,8 @@ def standby_claim_caps():
     check("standby claim caps: the next claim takes that standby", r["standby"] is True and r["pid"] in ready, (r, ready))
     check("standby claim caps: uncapped, its cpu.max is max (not the refused claim's)", cpu_max(free) == "max 100000", cpu_max(free))
     check("standby claim caps: and no cap listed", vms(A)[free].get("cpus") is None, vms(A)[free])
-    # Claimable once it listens (`PID.sock`), not as soon as its lock is held.
-    claimable = lambda: [p for p in live() if os.path.exists(os.path.join(standby_dir(A.run, t), f"{p}.sock"))]
+    # Claimable once it listens (`ID.sock`), not as soon as its lock is held.
+    claimable = lambda: [p for p in live() if standby_listens(A.run, t, p)]
     check("standby claim caps: refilled", wait_for(lambda: len(claimable()) == 1, 60), (live(), claimable()))
     r = ok(cli_json(A, "run", "--name", capped, "-d", "--cpus", "0.5", "--memory", f"{cap}m", t))
     v = vms(A)[capped]
@@ -8747,7 +8753,7 @@ def standby_lost_cgroup():
         r = ok(cli_json(A, "run", "--name", first, "-d", "--cpus", "0.5", t))
         check("standby lost cgroup: the capped run starts cold", r["standby"] is not True, r)
         check("standby lost cgroup: the broken standby leaves", wait_for(lambda: not any(alive(p) for p in broken), 30), broken)
-        claimable = lambda: [p for p in standby_pids(A, t) if p not in broken and alive(p) and os.path.exists(os.path.join(standby_dir(A.run, t), f"{p}.sock"))]
+        claimable = lambda: [p for p in standby_pids(A, t) if p not in broken and alive(p) and standby_listens(A.run, t, p)]
         check("standby lost cgroup: refilled", wait_for(lambda: len(claimable()) == 1, 60), standby_pids(A, t))
         ready = claimable()
         r = ok(cli_json(A, "run", "--name", second, "-d", "--cpus", "0.5", t))
@@ -8862,7 +8868,7 @@ def standby_stalled():
     pid = standby_pids(A, t)[0]
     d = standby_dir(A.run, t)
     c = socket.socket(socket.AF_UNIX)
-    c.connect(os.path.join(d, next(f for f in os.listdir(d) if f.endswith(".sock") and f.split(".")[-2].split("-")[0] == str(pid))))
+    c.connect(os.path.join(d, next(f for f in os.listdir(d) if f.endswith(".sock") and f.split(".")[0] == str(pid))))
     c.send(b'{"name"')
     time.sleep(0.5)
     os.kill(pid, signal.SIGTERM)
@@ -10246,6 +10252,8 @@ def gc_debris():
     sbd = standby_dir(A.run, args.template)
     os.makedirs(sbd, exist_ok=True)
     sock = made(os.path.join(sbd, "999999990.sock"))
+    # This build's names its PID namespace (`PID.PIDNS.sock`, #1139): no lock of that pid there is held.
+    ns_sock = made(os.path.join(sbd, f"999999990.{pid_ns()[0]:x}.sock"))
     # The pool of a template removed meanwhile, with nothing in it but its failed refill's log (#850).
     unused = standby_dir(A.run, "ft-gc-gone")
     os.makedirs(os.path.join(unused, ".locks"), mode=0o700)
@@ -10259,7 +10267,7 @@ def gc_debris():
     check("gc: an old .moved marker goes, a recent one stays", gone(moved) and not gone(moved_new))
     check("gc: a quiet orphan log goes, a fresh one stays", gone(orphan) and not gone(fresh))
     check("gc: a live vm's log stays", not gone(os.path.join(vd, f"{n}.log")))
-    check("gc: a dead standby's socket goes", gone(sock))
+    check("gc: a dead standby's socket goes", gone(sock) and gone(ns_sock), (gone(sock), gone(ns_sock)))
     for p in (moved_new, fresh):
         if os.path.exists(p):
             os.unlink(p)
@@ -10544,6 +10552,86 @@ def pidns_control():
         if owner and owner.poll() is None:
             owner.kill()
             owner.wait()
+        cli(A, "rm", "-f", n)
+        for e in os.listdir(os.path.join(sub, "flexvm")) if os.path.isdir(os.path.join(sub, "flexvm")) else []:
+            if os.path.isdir(os.path.join(sub, "flexvm", e)):
+                with suppress(OSError):
+                    os.rmdir(os.path.join(sub, "flexvm", e))
+        for c in (os.path.join(sub, "flexvm"), sub):
+            with suppress(OSError):
+                os.rmdir(c)
+
+
+def pidns_standby():
+    """#1139: a standby VM in a PID namespace of its own (a container sharing this host's directories) names its
+    socket after that namespace (`PID.PIDNS.sock`), never this one's of its pid, and a sweep here keeps it. A run
+    in that namespace claims it, the reply naming the namespace its pid is in; from here the VM is controlled by
+    the pid it has here, and its standbys stopped. (A claim from here starts cold: a standby claims only for a
+    claimer it can see.) Its Firecracker cgroups are in a private cgroup subtree bind-mounted as its /sys/fs/cgroup,
+    and so is every sweep here."""
+    t, n = args.template, "ft-pidns-sb"
+    if not os.path.exists("/sys/fs/cgroup/cgroup.controllers") or not shutil.which("unshare"):
+        raise Skip("no cgroup2 at /sys/fs/cgroup, or no unshare")
+    scenario_vms.add(n)
+    sub = f"/sys/fs/cgroup/fvci-pidnssb-{os.getpid()}"
+    os.makedirs(os.path.join(sub, "flexvm"))
+    fv = f"{shlex.quote(BIN)} --state {shlex.quote(A.state)} --run {shlex.quote(A.run)}"
+    private = f"mount --bind {shlex.quote(sub)} /sys/fs/cgroup"
+    d = standby_dir(A.run, t)
+    socks = lambda: sorted(f for f in os.listdir(d) if f.endswith(".sock")) if os.path.isdir(d) else []
+    owner, ns = None, None
+
+    def held(ns):
+        """The held standby locks of PID namespace `ns`."""
+        locks = os.path.join(d, ".locks")
+        out = []
+        for f in os.listdir(locks) if os.path.isdir(locks) else []:
+            if f.endswith(".lock") and not f.startswith(".") and f[:-5].split("-")[2:] == [str(ns)]:
+                with open(os.path.join(locks, f)) as fd, suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    continue
+                out.append(f)
+        return out
+    try:
+        # Its shell, pid 1 there, keeps the namespace (and the standbys its pull and run start) until told to end.
+        owner = subprocess.Popen(["unshare", "-m", "-p", "-f", "--kill-child", "--mount-proc", "sh", "-c",
+                                  f"{private} && stat -L -c %i /proc/$$/ns/pid && {fv} pull {shlex.quote(t)} --standby 1 >/dev/null && read go"
+                                  f" && {fv} run --name {n} -d {shlex.quote(t)} | tr -d '\\n' && echo && read end"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=ENV, start_new_session=True)
+        ns = int(owner.stdout.readline())
+        check("pidns standby: in a PID namespace of its own", ns != pid_ns()[0], ns)
+        theirs = lambda: [f for f in socks() if f.split(".")[1:2] == [f"{ns:x}"]]
+        check("pidns standby: its socket names its namespace", wait_for(lambda: len(theirs()) == 1, 90), (socks(), f"{ns:x}"))
+        sock = theirs()[0]
+        r = subprocess.run(["unshare", "-m", "sh", "-c", f"{private} && exec {fv} debug gc"], capture_output=True, text=True, timeout=120, env=ENV)
+        check("pidns standby: a sweep here keeps its socket", r.returncode == 0 and sock in socks(), (r.returncode, r.stderr, socks()))
+        owner.stdin.write("go\n")
+        owner.stdin.flush()
+        line = owner.stdout.readline()
+        try:
+            r = json.loads(line)
+        except ValueError:
+            r = {"output": line}
+        check("pidns standby: claimed there, the reply naming its namespace", r.get("standby") is True and r.get("pidns") == ns and r.get("pid") == int(sock.split(".")[0]),
+              (r, sock))
+        code, out = sh(A, n, "echo across")
+        check("pidns standby: exec from here", code == 0 and out == "across", (code, out))
+        code, out, err = cli(A, "rm", "-f", n)
+        check("pidns standby: removed from here", code == 0 and n not in vms(A), (code, err))
+        r = cli_json(A, "pull", t, "--standby", "0")
+        check("pidns standby: its namespace's standbys stopped from here", r["ok"] and wait_for(lambda: not theirs() and not held(ns), 60), (r, socks(), held(ns)))
+    finally:
+        cli(A, "pull", t, "--standby", "0")
+        if ns is not None:
+            wait_for(lambda: not held(ns), 30)
+        if owner and owner.poll() is None:
+            with suppress(OSError):
+                owner.stdin.close()
+            with suppress(subprocess.TimeoutExpired):
+                owner.wait(30)
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait()
         cli(A, "rm", "-f", n)
         for e in os.listdir(os.path.join(sub, "flexvm")) if os.path.isdir(os.path.join(sub, "flexvm")) else []:
             if os.path.isdir(os.path.join(sub, "flexvm", e)):
@@ -11351,7 +11439,7 @@ SCENARIOS = dict(
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, loan_start_retry=loan_start_retry, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
-    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, pidns_names=pidns_names, pidns_control=pidns_control, rmi_suspend=rmi_suspend,
+    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, pidns_names=pidns_names, pidns_control=pidns_control, pidns_standby=pidns_standby, rmi_suspend=rmi_suspend,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died, fc_died_starting=fc_died_starting,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,

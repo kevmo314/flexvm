@@ -924,7 +924,7 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
             let work = unpack::open_dir_at(staging.as_raw_fd(), &cname)?;
             // mkdirat applied the umask.
             check(unsafe { libc::fchmod(work.as_raw_fd(), 0o755) }, "chmod", Path::new(name))?;
-            let path = PathBuf::from(format!("/proc/{}/fd/{}/{name}", std::process::id(), staging.as_raw_fd()));
+            let path = crate::host::fd_path(staging.as_raw_fd()).join(name);
             let mut root = Root::from_fd(work, *limits);
             unpack_layers(&mut root, img)?;
             let conf = inject(&mut root, app, init)?;
@@ -1093,7 +1093,7 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let meta = std::fs::metadata(dir)?;
     // root_owner is in every mke2fs we support; root_perms only since e2fsprogs 1.47.1.
     let root = format!("root_owner={}:{}", meta.uid(), meta.gid());
-    let image_path = format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd());
+    let image_path = crate::host::fd_path(image.as_raw_fd()).to_string_lossy().into_owned();
     let mut cmd = Command::new("mkfs.ext4");
     cmd.args(["-q", "-F", "-b", "4096", "-I", "256", "-L", "flexroot", "-N", &inodes.to_string(), "-d"]);
     cmd.arg(dir).args(["-E", &root]).arg(&image_path);
