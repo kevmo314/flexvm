@@ -3280,6 +3280,19 @@ mod exec_tests {
     /// logs, or a moved hint.
     #[test]
     fn rm_removes_what_a_vm_that_recorded_nothing_left() {
+        const CHILD: &str = "FLEXVM_TEST_RM_UNRECORDED";
+        if std::env::var_os(CHILD).is_none() {
+            // Refused for its live holder, taking the name closes its flock without an explicit
+            // unlock, the lock file left. Another test's fork can inherit that descriptor until it
+            // execs, so the `rm` that follows would find the name held (`alive`) (#1200).
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "exec_tests::rm_removes_what_a_vm_that_recorded_nothing_left"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "rm unrecorded child: {status}");
+            return;
+        }
         let root = crate::test_util::TempDir::new("rm-unrecorded");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let listed = |n: &str| vms(&host).iter().any(|v| v["name"] == n);
@@ -3329,6 +3342,19 @@ mod exec_tests {
     /// of it is removed.
     #[test]
     fn a_late_rm_of_unrecorded_logs_keeps_what_a_later_vm_left() {
+        const CHILD: &str = "FLEXVM_TEST_LATE_RM_UNRECORDED";
+        if std::env::var_os(CHILD).is_none() {
+            // A refused removal lets the name go by closing its flock, without an explicit unlock.
+            // Another test's fork can inherit that descriptor until it execs, so the `rm` that
+            // follows would find the name held (`alive`) though this Host is the test's own (#1200).
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "exec_tests::a_late_rm_of_unrecorded_logs_keeps_what_a_later_vm_left"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "late rm child: {status}");
+            return;
+        }
         let root = crate::test_util::TempDir::new("rm-unrecorded-late");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         for (record, err) in [("moved", "moved to peer; kill it there"), ("exited", "ended meanwhile"), ("failed", "ended meanwhile")] {
