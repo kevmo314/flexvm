@@ -147,6 +147,51 @@ enum Switch {
     Lost(crate::util::Error),
 }
 
+/// How long the reader waits after a device error before polling again.
+const READ_BACKOFF: Duration = Duration::from_millis(100);
+/// How often a device error that persists is logged again.
+const READ_ERROR_LOG: Duration = Duration::from_secs(60);
+
+/// The poll events that end a wait for packets: Ok(true) readable, Ok(false) timed out, an
+/// error on ERR, HUP or NVAL (never read then: an error-only event would spin).
+fn poll_ready(events: i16) -> std::io::Result<bool> {
+    match events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) {
+        0 => Ok(events & libc::POLLIN != 0),
+        bad => Err(std::io::Error::other(format!("poll events {bad:#x}"))),
+    }
+}
+
+/// The reader's device errors: each backs off `READ_BACKOFF` (no spin, and a transient error
+/// never ends the reader), and one that persists is logged at once, then every
+/// `READ_ERROR_LOG` with a count, until a read succeeds again (never hidden for good).
+#[derive(Default)]
+struct ReadErrors {
+    count: u64,
+    logged: Option<Instant>,
+}
+
+impl ReadErrors {
+    /// The line to log for this error, if one is due.
+    fn failed(&mut self, e: &std::io::Error) -> Option<String> {
+        self.count += 1;
+        let due = self.logged.is_none_or(|t| t.elapsed() >= READ_ERROR_LOG);
+        due.then(|| {
+            self.logged = Some(Instant::now());
+            match self.count {
+                1 => format!("{e}; retrying"),
+                n => format!("{e}; still failing ({n} errors); retrying"),
+            }
+        })
+    }
+
+    /// The line to log once a read succeeds after errors.
+    fn recovered(&mut self) -> Option<String> {
+        let n = std::mem::take(&mut self.count);
+        self.logged = None;
+        (n > 0).then(|| format!("reading again after {n} errors"))
+    }
+}
+
 impl Holder {
     /// None, with a warning, without TUN support: then nothing is held.
     pub fn new(dev: &str) -> Result<Option<Arc<Holder>>> {
@@ -188,7 +233,13 @@ impl Holder {
     pub fn hold(&self, ip: Ipv4Addr, mig: u64) -> Result<()> {
         let (pending, routed) = {
             let _routes = self.routes.lock().unwrap();
-            self.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
+            {
+                let mut held = self.held.lock().unwrap();
+                if held.contains_key(&ip) {
+                    bail!("already holding {ip}");
+                }
+                held.insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
+            }
             let routed = crate::net::route_dev(true, ip, self.ifindex);
             let pending = match &routed {
                 Ok(()) => self.gone.lock().unwrap().remove(&ip),
@@ -489,20 +540,40 @@ impl Holder {
         let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
         let mut wait = -1;
+        let mut errors = ReadErrors::default();
         loop {
-            if let Err(e) = eintr(|| unsafe { libc::poll(&mut pfd, 1, wait) }) {
-                return crate::log!("hold device {}: {e}", self.dev);
-            }
-            self.reading.store(true, Ordering::SeqCst);
-            // Due reports also go out under sustained traffic, not only once the device is empty.
-            let mut n = 0usize;
-            while self.read_one(&mut buf) {
-                n += 1;
-                if n % PASS == 0 {
-                    self.report_stragglers();
+            let failed = match eintr(|| unsafe { libc::poll(&mut pfd, 1, wait) }).and_then(|_| poll_ready(pfd.revents)) {
+                Ok(true) => {
+                    self.reading.store(true, Ordering::SeqCst);
+                    // Due reports also go out under sustained traffic, not only once the device is empty.
+                    let mut n = 0usize;
+                    let read = loop {
+                        match self.try_read_one(&mut buf) {
+                            Ok(true) => n += 1,
+                            Ok(false) => break Ok(()),
+                            Err(e) => break Err(e),
+                        }
+                        if n % PASS == 0 {
+                            self.report_stragglers();
+                        }
+                    };
+                    self.reading.store(false, Ordering::SeqCst);
+                    if n > 0 {
+                        if let Some(line) = errors.recovered() {
+                            crate::log!("hold device {}: {line}", self.dev);
+                        }
+                    }
+                    read.err()
                 }
+                Ok(false) => None,
+                Err(e) => Some(e),
+            };
+            if let Some(e) = failed {
+                if let Some(line) = errors.failed(&e) {
+                    crate::log!("hold device {}: {line}", self.dev);
+                }
+                std::thread::sleep(READ_BACKOFF);
             }
-            self.reading.store(false, Ordering::SeqCst);
             wait = self.report_stragglers();
         }
     }
@@ -552,21 +623,31 @@ impl Holder {
     /// Read and queued under `rx`, so packets are queued in the order they were read, by
     /// whichever thread.
     fn read_one(&self, buf: &mut [u8]) -> bool {
+        self.try_read_one(buf).unwrap_or(false)
+    }
+
+    /// `read_one`, with the device's error: the reader backs off on it, a release's drain stops.
+    fn try_read_one(&self, buf: &mut [u8]) -> std::io::Result<bool> {
         let _rx = self.rx.lock().unwrap();
-        let Ok(n) = eintr(|| unsafe { libc::read(self.tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { return false };
+        let n = match eintr(|| unsafe { libc::read(self.tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) {
+            Ok(0) => return Err(std::io::Error::other("read returned nothing")),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) => return Err(e),
+        };
         // #362: a guest frame with VIRTIO_NET_HDR_F_NEEDS_CSUM can aim checksum completion at
         // its own IP source, after the tap's ingress filter passed the original. The device
         // leaves completion to us (`open_tun`): `accept` does it only at a TCP or UDP checksum
         // field, so no forged source is queued, nor re-sent by `straggler` (whose IPPROTO_RAW
         // resend recomputes the header checksum).
         // Refused, it is counted as dropped for the address it was sent to, if it has one.
-        let Some((h, p)) = buf[..n as usize].split_at_mut_checked(VNET_HDR) else { return true };
+        let Some((h, p)) = buf[..n as usize].split_at_mut_checked(VNET_HDR) else { return Ok(true) };
         let ip = (p.len() >= 20).then(|| Ipv4Addr::new(p[16], p[17], p[18], p[19]));
         let Some(ip) = ip.filter(|_| accept(h, 0, p)) else {
             if let Some(ip) = ip {
                 self.refused(ip);
             }
-            return true;
+            return Ok(true);
         };
         let drain = match self.entry(ip) {
             Some(e) => {
@@ -585,7 +666,7 @@ impl Holder {
         if drain {
             self.drain_stragglers(|ip, p| self.resend(ip, p));
         }
-        true
+        Ok(true)
     }
 
     /// A packet for `ip` that `accept` refused: dropped where `ip`'s packets are counted, held or
@@ -1491,6 +1572,60 @@ mod tests {
     }
 
     #[test]
+    fn reader_errors_are_never_read_through_and_stay_logged() {
+        for events in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL, libc::POLLERR | libc::POLLIN] {
+            assert!(poll_ready(events).is_err());
+        }
+        assert!(poll_ready(libc::POLLIN).unwrap());
+        assert!(!poll_ready(0).unwrap());
+        let mut errors = ReadErrors::default();
+        let e = std::io::Error::from_raw_os_error(libc::EIO);
+        assert!(errors.failed(&e).unwrap().contains("retrying"));
+        assert!(errors.failed(&e).is_none(), "repeats are rate limited");
+        // A persistent error is logged again, with its count.
+        errors.logged = Some(Instant::now() - READ_ERROR_LOG);
+        assert!(errors.failed(&e).unwrap().contains("still failing (3 errors)"));
+        assert_eq!(errors.recovered().unwrap(), "reading again after 3 errors");
+        assert!(errors.recovered().is_none());
+        assert!(errors.failed(&e).unwrap().ends_with("; retrying"), "a new error after recovering is logged at once");
+    }
+
+    #[test]
+    fn failed_release_and_forget_count_late_drops_once() {
+        let h = holder(std::fs::File::open("/dev/null").unwrap().into());
+        let ip = Ipv4Addr::new(10, 100, 254, 9);
+        let e = Arc::new(Entry { mig: 1, q: Mutex::new(Queue { dropped: 2, ..Queue::default() }) });
+        h.held.lock().unwrap().insert(ip, e.clone());
+        let (mut stats, result) = h.release_local(ip, 1, &mut |_| true, || Err("route failed".into()), Duration::ZERO).unwrap();
+        assert!(result.is_err());
+        assert_eq!(stats.dropped, 2);
+        // The reader can enqueue between release_local and the caller's forget.
+        {
+            let mut q = e.q.lock().unwrap();
+            q.packets.push_back(vec![0; 20]);
+            q.bytes = 20;
+            q.dropped = 3;
+        }
+        stats.dropped += h.forget(ip, 1).dropped;
+        assert_eq!(stats.dropped, 6);
+        assert_eq!(h.forget(ip, 1).dropped, 0);
+    }
+
+    #[test]
+    fn duplicate_hold_preserves_queue_and_owner() {
+        let h = holder(std::fs::File::open("/dev/null").unwrap().into());
+        let ip = Ipv4Addr::new(10, 100, 254, 9);
+        let e = Arc::new(Entry { mig: 1, q: Mutex::new(Queue { packets: VecDeque::from([vec![0; 20]]), bytes: 20, dropped: 4, ..Queue::default() }) });
+        h.held.lock().unwrap().insert(ip, e.clone());
+        for mig in [1, 2] {
+            assert!(h.hold(ip, mig).unwrap_err().to_string().contains("already holding"));
+            assert!(Arc::ptr_eq(&h.entry(ip).unwrap(), &e));
+            let q = e.q.lock().unwrap();
+            assert_eq!((q.packets.len(), q.bytes, q.dropped), (1, 20, 4));
+        }
+    }
+
+    #[test]
     fn failed_hold_counts_queued_and_overflow_packets() {
         let h = holder(std::fs::File::open("/dev/null").unwrap().into());
         let ip = Ipv4Addr::new(10, 100, 254, 9);
@@ -1612,7 +1747,7 @@ mod tests {
             let buf = 4i32 << 20;
             unsafe { libc::setsockopt(w.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&buf as *const i32).cast(), 4) };
             for _ in 0..LATE {
-                assert_eq!(unsafe { libc::write(w.as_raw_fd(), late.as_ptr().cast(), late.len()) }, late.len() as isize);
+                assert_eq!(unsafe { libc::write(w.as_raw_fd(), late.as_ptr().cast(), late.len()) }, late.len() as isize, "{}", std::io::Error::last_os_error());
             }
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = l.local_addr().unwrap();

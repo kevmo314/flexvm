@@ -1534,15 +1534,14 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
         Ok(inj) => inj,
         Err(e) => {
             crate::log!("vm {}: dropping held packets: {e}", vm.name);
-            h.forget(ip, mig);
-            return (None, Err(e));
+            return (Some(h.forget(ip, mig)), Err(e));
         }
     };
     let Some((mut stats, switched)) = h.release_local(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), || switch(()), linger) else {
         return (None, Ok(()));
     };
     if let Err(e) = &switched {
-        h.forget(ip, mig);
+        stats.dropped += h.forget(ip, mig).dropped;
         crate::log!("vm {}: routing {ip} back to its tap after injecting the held packets: {e}", vm.name);
     }
     let tap_dropped = inj.dropped();

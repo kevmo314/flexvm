@@ -201,6 +201,8 @@ pub fn run(args: &Args) -> Result<()> {
     let template = &crate::template::name_of(args.get("template").unwrap_or("ubuntu:24.04"))?;
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
     let id = format!("{}-{}", std::process::id(), crate::migrate::migration_id());
+    // The load before the run, as the one after it is mostly the run's own.
+    let loadavg_before = std::fs::read_to_string("/proc/loadavg").ok().map(|s| s.trim().to_string());
     let (report, suffix) = match args.has("lifecycle") {
         true => (lifecycle(&hosts, args, template, &date, &id), "-lifecycle"),
         false => (runs(&hosts, args, template, &date, &id), ""),
@@ -210,6 +212,7 @@ pub fn run(args: &Args) -> Result<()> {
     report["git_sha"] = json!(sha);
     report["git_dirty"] = json!(dirty);
     report["host_context"] = host_context(template);
+    report["host_context"]["loadavg_before"] = json!(loadavg_before);
     let path = report_path(&dir, &date, &sha, &id, suffix);
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     serde_json::to_writer_pretty(file, &report)?;
@@ -225,6 +228,7 @@ fn validate(args: &Args) -> Result<()> {
         bail!("--iterations must be positive");
     }
     if args.has("lifecycle") {
+        lifecycle_sizes(args)?;
         for flag in ["warmup", "settle-ms", "ready-port", "ready-http"] {
             if args.has(flag) {
                 bail!("--{flag} is unused with --lifecycle");
@@ -358,14 +362,25 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
     Ok(sample)
 }
 
-fn lifecycle(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<Value> {
-    let iterations = args.parse_or::<u64>("iterations", 5)?;
+fn lifecycle_sizes(args: &Args) -> Result<Vec<u64>> {
     let sizes: Vec<u64> = args
         .get("dirty-mib")
         .unwrap_or("0,256,1024")
         .split(',')
         .map(|s| s.trim().parse().map_err(|_| format!("bad --dirty-mib {s:?}")))
         .collect::<std::result::Result<_, _>>()?;
+    let mut seen = std::collections::HashSet::new();
+    for size in &sizes {
+        if !seen.insert(*size) {
+            bail!("duplicate --dirty-mib size {size}");
+        }
+    }
+    Ok(sizes)
+}
+
+fn lifecycle(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<Value> {
+    let iterations = args.parse_or::<u64>("iterations", 5)?;
+    let sizes = lifecycle_sizes(args)?;
     let mut summary = Map::new();
     let mut all = Map::new();
     let mut error = None;
@@ -581,6 +596,16 @@ fn command(bin: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_lifecycle_sizes_are_rejected_before_running() {
+        for sizes in ["1,1", "0,256,0", "1, 01"] {
+            let args = Args::parse(["--lifecycle", "--dirty-mib", sizes].map(String::from)).unwrap();
+            assert!(validate(&args).unwrap_err().to_string().contains("duplicate --dirty-mib"));
+        }
+        let args = Args::parse(["--lifecycle", "--dirty-mib", "256,0,1"].map(String::from)).unwrap();
+        assert_eq!(lifecycle_sizes(&args).unwrap(), [256, 0, 1]);
+    }
 
     #[test]
     fn exec_cancellation_reaps_child() {

@@ -1024,11 +1024,14 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
     Ok(self::user::resolve_user(user, &String::from_utf8_lossy(&passwd), &String::from_utf8_lossy(&group))?)
 }
 
-/// ext4 needs blocks for directory entries and symlinks too long for their inode (60 bytes).
-/// Staging filesystems may report no allocated blocks for these, so `du` alone is insufficient.
-fn ext4_extra_kib(dir: &Path) -> Result<u64> {
+/// Estimate ext4 blocks from what each inode holds, independent of the staging filesystem's
+/// compression (its allocated blocks, `du`, undercount): a file's data regions (its logical size
+/// but for holes, which mkfs.ext4 keeps), counting a hard-linked inode once, plus directory
+/// entries, non-inline symlinks and an xattr block for each inode whose xattrs overflow it.
+fn ext4_content_kib(dir: &Path) -> Result<u64> {
     let mut dirs = vec![dir.to_path_buf()];
-    let mut kib = 0;
+    let mut kib = xattr_kib(dir)?;
+    let mut seen = std::collections::HashSet::new();
     while let Some(dir) = dirs.pop() {
         let mut bytes = 24u64; // `.` and `..`, including their entry headers.
         for entry in std::fs::read_dir(dir)? {
@@ -1037,16 +1040,89 @@ fn ext4_extra_kib(dir: &Path) -> Result<u64> {
             // Each entry has an 8-byte header and a name rounded up to 4 bytes.
             bytes += 8 + (entry.file_name().as_bytes().len() as u64).div_ceil(4) * 4;
             let metadata = entry.metadata()?;
+            if !seen.insert((metadata.dev(), metadata.ino())) {
+                continue;
+            }
+            let path = entry.path();
+            kib += xattr_kib(&path)?;
             if metadata.is_dir() {
-                dirs.push(entry.path());
+                dirs.push(path);
+            } else if metadata.is_file() {
+                kib += data_kib(&path, &metadata);
             } else if metadata.is_symlink() && metadata.len() >= 60 {
-                kib += 4;
+                kib += metadata.len().div_ceil(4096) * 4;
             }
         }
         // Leave room for directory indexing and block tails as well as the entries.
         kib += (bytes * 2).div_ceil(4096) * 4;
     }
     Ok(kib)
+}
+
+/// The 4 KiB blocks of a regular file's data. Its logical size, unless it has fewer blocks
+/// allocated (sparse, or compressed): then the blocks its data regions span, holes left out.
+fn data_kib(path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::OpenOptionsExt;
+    let len = metadata.len();
+    let full = len.div_ceil(4096) * 4;
+    if metadata.blocks() * 512 >= len {
+        return full;
+    }
+    let Ok(file) = File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) else { return full };
+    let seek = |offset: u64, whence| match unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) } {
+        n if n >= 0 => Some(n as u64),
+        _ => None,
+    };
+    let (mut at, mut blocks) = (0u64, 0u64);
+    while at < len {
+        let Some(start) = seek(at, libc::SEEK_DATA) else {
+            // ENXIO: no data past `at`. Anything else (no SEEK_DATA here): the logical size.
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENXIO) => blocks * 4,
+                _ => full,
+            };
+        };
+        let Some(end) = seek(start, libc::SEEK_HOLE) else { return full };
+        let end = end.min(len);
+        blocks += end.div_ceil(4096).saturating_sub(start / 4096);
+        at = end.max(start + 1);
+    }
+    (blocks * 4).min(full)
+}
+
+/// 4 KiB if the inode's xattrs do not fit in a 256-byte ext4 inode (`mkfs -I 256`): past its 128
+/// base and 32 extra bytes, 96 for a 4-byte header, each entry (16 bytes, its name without the
+/// prefix and its value, each rounded up to 4) and a 4-byte end. Values as listed here: ext4
+/// stores ACLs smaller.
+fn xattr_kib(path: &Path) -> Result<u64> {
+    let path = cpath(path)?;
+    let size = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Ok(0);
+    }
+    let mut names = vec![0u8; size as usize];
+    let n = unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    if n < 0 {
+        // Changed meanwhile (ERANGE), or unsupported: assume a block.
+        return Ok(4);
+    }
+    let mut used = 4 + 4;
+    for name in names[..n as usize].split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        let Ok(cname) = std::ffi::CString::new(name) else { continue };
+        let value = unsafe { libc::lgetxattr(path.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
+        if value < 0 {
+            return Ok(4);
+        }
+        let suffix = ["user.", "trusted.", "security.", "system.posix_acl_access", "system.posix_acl_default", "system."]
+            .iter()
+            .find_map(|p| name.strip_prefix(p.as_bytes()))
+            .unwrap_or(name);
+        used += 16 + (suffix.len() as u64).div_ceil(4) * 4 + (value as u64).div_ceil(4) * 4;
+        if used > 96 {
+            return Ok(4);
+        }
+    }
+    Ok(0)
 }
 
 /// `mke2fs -V` prints its version on stderr; older versions omit root xattrs with `-d`.
@@ -1082,9 +1158,7 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
             bail!("this image's root directory has ACLs or xattrs: mkfs.ext4 from e2fsprogs 1.45.7 or newer is required to keep them");
         }
     }
-    let du = run_until(Command::new("du").arg("-sk").arg(dir), interrupted)?;
-    let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
-    let kib = kib + ext4_extra_kib(dir)?;
+    let kib = ext4_content_kib(dir)?;
     let inodes = entries * 12 / 10 + 4096;
     let mib = ((kib + inodes / 4) * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
@@ -1293,15 +1367,61 @@ mod tests {
     #[test]
     fn ext4_estimate_counts_directory_and_long_symlink_blocks() {
         let dir = tmpdir("ext4-blocks");
-        assert_eq!(ext4_extra_kib(&dir).unwrap(), 4);
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 4);
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
         std::fs::write(dir.join("file"), b"contents").unwrap();
         symlink("a", dir.join("directory-link")).unwrap();
         symlink("x".repeat(59), dir.join("inline-link")).unwrap();
-        assert_eq!(ext4_extra_kib(&dir).unwrap(), 12);
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 16);
         symlink("x".repeat(60), dir.join("block-link")).unwrap();
         symlink("x".repeat(100), dir.join("a/b/long-link")).unwrap();
-        assert_eq!(ext4_extra_kib(&dir).unwrap(), 20);
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 24);
+    }
+
+    #[test]
+    fn ext4_estimate_uses_logical_sizes_and_counts_inodes_once() {
+        let dir = tmpdir("ext4-logical");
+        std::fs::write(dir.join("file"), vec![b'x'; 4097]).unwrap();
+        std::fs::hard_link(dir.join("file"), dir.join("hardlink")).unwrap();
+        symlink("file", dir.join("symlink")).unwrap();
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 12);
+        std::fs::write(dir.join("text"), vec![b'x'; 8193]).unwrap();
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 24);
+    }
+
+    #[test]
+    fn ext4_estimate_leaves_out_holes() {
+        let dir = tmpdir("ext4-sparse");
+        let file = File::create(dir.join("sparse")).unwrap();
+        file.set_len(1 << 30).unwrap();
+        file.write_all_at(b"x", 1 << 20).unwrap();
+        file.write_all_at(&[b'y'; 4097], (1 << 30) - 8192).unwrap();
+        file.sync_all().unwrap();
+        // One block at 1 MiB, two (an unaligned 4097 bytes) at the end; on a filesystem
+        // without SEEK_DATA, the logical size.
+        let kib = ext4_content_kib(&dir).unwrap();
+        assert!(kib == 4 + 12 || kib == 4 + (1 << 20), "{kib}");
+    }
+
+    #[test]
+    fn ext4_estimate_counts_overflowing_xattrs() {
+        let dir = tmpdir("ext4-xattr");
+        let set = |name: &str, key: &str, len: usize| {
+            let path = cpath(&dir.join(name)).unwrap();
+            let key = std::ffi::CString::new(key).unwrap();
+            let value = vec![b'v'; len];
+            unsafe { libc::setxattr(path.as_ptr(), key.as_ptr(), value.as_ptr().cast(), len, 0) == 0 }
+        };
+        std::fs::write(dir.join("fits"), b"").unwrap();
+        std::fs::write(dir.join("overflows"), b"").unwrap();
+        if !set("fits", "user.a", 40) {
+            return; // No user xattrs on this filesystem.
+        }
+        // 8 + 16 + 4 + 40 = 68 of 96: in the inode.
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 4);
+        // Another such: 128, a block of its own.
+        assert!(set("overflows", "user.a", 40) && set("overflows", "user.b", 40));
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 8);
     }
 
     #[test]
@@ -1311,7 +1431,7 @@ mod tests {
             std::fs::write(dir.join(format!("{i:0255}")), b"").unwrap();
         }
         // 24 bytes for dot entries, 264 per long name, doubled for headroom.
-        assert_eq!(ext4_extra_kib(&dir).unwrap(), 52);
+        assert_eq!(ext4_content_kib(&dir).unwrap(), 52);
     }
 
     #[test]
