@@ -30,6 +30,8 @@ const BURST: usize = 1024;
 const TICK: libc::c_int = 1000;
 /// Buffered sinks are sampled at most this often, whatever other forwards do.
 const ACK_INTERVAL: Duration = Duration::from_secs(1);
+/// A draining send queue does not wake poll: check it promptly while a reset is pending.
+const DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 /// How long accepting rests once out of descriptors (or memory).
 const ACCEPT_REST: Duration = Duration::from_millis(100);
 
@@ -296,7 +298,7 @@ impl Direction {
     /// True if it relayed data. Each pass takes at most BUFFER bytes per direction. A read error
     /// still writes what came before it (a reply the guest sent before resetting); a write error
     /// ends only this direction.
-    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream) -> bool {
+    fn pump(&mut self, mut from: &TcpStream, mut to: &TcpStream, reverse: &mut Self) -> bool {
         let (mut moved, mut taken, holding) = (false, 0, self.start < self.end);
         while !self.eof && self.end < BUFFER && taken < BUFFER {
             self.bytes.resize(BUFFER, 0);
@@ -330,6 +332,8 @@ impl Direction {
                 }
             }
         }
+        // A failed write takes the socket's error: its next read may only report EOF, not a reset.
+        reverse.failed |= self.broken && !reverse.eof;
         if !holding && self.start < self.end {
             // Only what its sink acknowledges from now on is progress.
             let now = Some(idle_now());
@@ -353,6 +357,10 @@ impl Direction {
             }
         }
         moved
+    }
+
+    fn reset_pending(&self) -> bool {
+        self.failed && self.eof && !self.broken && !self.done && self.start == self.end
     }
 
     /// Notes its sink's TCP taking more of what the kernel holds for it: a reader slowly emptying its
@@ -429,12 +437,8 @@ impl Connection {
         }
         (self.client_down, self.guest_down) = (self.client_down | client & DOWN, self.guest_down | guest & DOWN);
         // Both directions: what one socket sent before failing still goes out the other way.
-        // A write that fails takes its socket's error (a reset, say): reading that socket then only
-        // ends, which must not pass for its FIN.
-        let out = self.out.pump(&self.client, &self.guest);
-        self.incoming.failed |= self.out.broken && !self.incoming.eof;
-        let incoming = self.incoming.pump(&self.guest, &self.client);
-        self.out.failed |= self.incoming.broken && !self.out.eof;
+        let out = self.out.pump(&self.client, &self.guest, &mut self.incoming);
+        let incoming = self.incoming.pump(&self.guest, &self.client, &mut self.out);
         if out || incoming {
             self.active = idle_now();
             // What is still delivered keeps it: a slow reader gets the rest, and LINGER for its FIN after.
@@ -550,7 +554,8 @@ fn tcp(listeners: Vec<TcpListener>, target: SocketAddrV4, stop: BorrowedFd, cap:
             fds.push(libc::pollfd { fd: if c.connected { fd(&c.client, client, c.client_down) } else { -1 }, events: client, revents: 0 });
             fds.push(libc::pollfd { fd: fd(&c.guest, guest, c.guest_down), events: guest, revents: 0 });
         }
-        if !wait(&mut fds, stop, resting) {
+        let drain = connections.iter().any(|c| c.out.reset_pending() || c.incoming.reset_pending()).then(|| Instant::now() + DRAIN_INTERVAL);
+        if !wait(&mut fds, stop, resting.into_iter().chain(drain).min()) {
             return;
         }
         #[cfg(test)]
@@ -1535,7 +1540,7 @@ mod tests {
                 assert_eq!(unsafe { libc::ioctl(from.as_raw_fd(), libc::FIONREAD, &mut available) }, 0);
                 available as usize == BUFFER
             });
-            assert!(direction.pump(&from, &to));
+            assert!(direction.pump(&from, &to, &mut Direction::default()));
             assert_eq!((direction.start, direction.end), (0, 0));
             let mut received = vec![0; BUFFER];
             sink.read_exact(&mut received).unwrap();
@@ -1608,7 +1613,7 @@ mod tests {
         wait_until("the reply to block", || {
             connection.incoming.start = 0;
             connection.incoming.end = BUFFER;
-            !connection.incoming.pump(&connection.guest, &connection.client)
+            !connection.incoming.pump(&connection.guest, &connection.client, &mut connection.out)
         });
         reset(server);
         let mut fd = poll(&connection.guest, libc::POLLIN);
@@ -1812,7 +1817,7 @@ mod tests {
         let mut d = Direction::default();
         // Only its source's data has to arrive: the sink takes none of it.
         wait_until("the source's data", || {
-            d.pump(&from, &to);
+            d.pump(&from, &to, &mut Direction::default());
             d.end > 0
         });
         assert_eq!((d.start, d.end), (0, 1024));
@@ -1900,7 +1905,7 @@ mod tests {
         wait_until("the reply to block", || {
             (connection.incoming.start, connection.incoming.end) = (0, BUFFER);
             connection.incoming.bytes.resize(BUFFER, 42);
-            !connection.incoming.pump(&connection.guest, &connection.client)
+            !connection.incoming.pump(&connection.guest, &connection.client, &mut connection.out)
         });
         // Filled by hand, it took no baseline: its first check samples at once, and starts the interval.
         assert_eq!(connection.incoming.sampled, None);
@@ -2024,6 +2029,26 @@ mod tests {
             client.set_nonblocking(false).unwrap();
             assert_eq!(client.read(&mut [0]).unwrap_err().kind(), io::ErrorKind::ConnectionReset);
         }
+        worker.halt();
+    }
+
+    #[test]
+    fn a_drained_reply_resets_without_waiting_for_the_tick() {
+        let (addr, guest, worker) = worker(4, IDLE);
+        let mut client = small_window(addr);
+        let (mut server, _) = crate::test_util::accept_tcp(&guest);
+        echo(&mut client, &mut server);
+        let reply = [42; 10_000];
+        server.write_all(&reply).unwrap();
+        acknowledged(&server);
+        reset(server);
+        // The reply fits in the proxy's send queue, but not the client's receive window.
+        thread::sleep(Duration::from_millis(100));
+        let mut got = [0; 10_000];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(got, reply);
+        client.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        assert_eq!(client.read(&mut [0]).unwrap_err().kind(), io::ErrorKind::ConnectionReset);
         worker.halt();
     }
 
