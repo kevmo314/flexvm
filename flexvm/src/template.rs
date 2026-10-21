@@ -585,7 +585,7 @@ impl Template {
         if std::fs::metadata(&dir).ok().map(|m| (m.dev(), m.ino())) != Some((st.st_dev, st.st_ino)) {
             bail!("template {name:?} was removed (flexvm rmi) as it was opened");
         }
-        let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
+        let fixed = crate::host::fd_path(handle.as_raw_fd());
         let meta = Meta::read_from(&fixed, &dir, pinned).map_err(|e| format!("template {name:?}: {e}"))?;
         let file = File::open(fixed.join("mem"))?;
         let len = file.metadata()?.len() as usize;

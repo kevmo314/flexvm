@@ -82,7 +82,8 @@ pub fn serve(run: &Path, release: impl Fn()) {
         crate::log!("hostmem: {}: {e}: memory kept for checkpoints is not released on request", dir.display());
         return;
     }
-    let mine = dir.join(Ident::me().key());
+    // Its PID namespace in the name too (`ns_key`): another's of the same pid and start time is not it.
+    let mine = dir.join(Ident::me().ns_key());
     let mut answered = last(run).map_or(0, |r| r.0);
     loop {
         if let Err(e) = store(&mine, &answered, false) {
@@ -155,9 +156,7 @@ fn wait(run: &Path, n: u64, by: Instant) -> bool {
     let mut members = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if let Some(id) =
-            name.split_once('-').and_then(|(p, s)| Some(Ident { pid: p.parse().ok()?, start: s.parse().ok()?, boot: crate::host::boot_id().into(), ns: None }))
-        {
+        if let Some(id) = Ident::from_key(&name) {
             members.push((e.path(), id));
         }
     }
@@ -172,7 +171,8 @@ fn wait(run: &Path, n: u64, by: Instant) -> bool {
                     let _ = std::fs::remove_file(path);
                     false
                 }
-                Liveness::Alive if stopped(id.pid) => {
+                // By its pid here: one of another PID namespace has another (`local_pid`).
+                Liveness::Alive if id.local_pid().ok().flatten().is_some_and(stopped) => {
                     all = false;
                     false
                 }
@@ -205,7 +205,7 @@ pub(crate) fn forget_release(run: &Path) {
 
 #[cfg(test)]
 pub(crate) fn joined(run: &Path) -> bool {
-    answers(run).join(Ident::me().key()).exists()
+    answers(run).join(Ident::me().ns_key()).exists()
 }
 
 #[cfg(test)]
@@ -216,7 +216,7 @@ mod tests {
 
     fn member(run: &Path, id: &Ident, answered: u64) {
         crate::host::private_dir(&answers(run)).unwrap();
-        store(&answers(run).join(id.key()), &answered, false).unwrap();
+        store(&answers(run).join(id.ns_key()), &answered, false).unwrap();
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
         let t = Instant::now();
         assert!(!wait(&run, n, Instant::now() + Duration::from_millis(50)), "the silent one did not answer");
         assert!(t.elapsed() < Duration::from_secs(2));
-        assert!(answers(&run).join(silent.key()).exists());
+        assert!(answers(&run).join(silent.ns_key()).exists());
         // Stopped: it cannot answer, so it is not waited for (but it stays a member).
         unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
         let t = Instant::now();
@@ -281,7 +281,7 @@ mod tests {
         let t = Instant::now();
         assert!(!wait(&run, n, now()), "not every one answered");
         assert!(t.elapsed() < Duration::from_secs(1), "not waited for");
-        assert!(answers(&run).join(silent.key()).exists());
+        assert!(answers(&run).join(silent.ns_key()).exists());
         // Gone: not waited for, and its file removed. Its pid may be another's by now: still gone (its start differs).
         let _ = child.kill();
         let _ = child.wait();
@@ -290,7 +290,7 @@ mod tests {
         let t = Instant::now();
         assert!(wait(&run, n, now()));
         assert!(t.elapsed() < Duration::from_secs(1));
-        assert!(!answers(&run).join(gone.key()).exists() && !answers(&run).join(silent.key()).exists(), "pruned");
+        assert!(!answers(&run).join(gone.ns_key()).exists() && !answers(&run).join(silent.ns_key()).exists(), "pruned");
         drop(dir);
     }
 

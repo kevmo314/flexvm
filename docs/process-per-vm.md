@@ -211,14 +211,16 @@ RUN (default /run/flexvm, tmpfs)
   .locks/release-BOOT    numbered request to release kept checkpoint memory
   .locks/released-BOOT/  per process identity: the release request it answered
   grants-BOOTID          recent grants not yet held, counted against the reserve
-  room-ledger-BOOT       checkpoint memory taken lately, counted against the reserve
+  room-ledger-ns-BOOT    checkpoint memory taken lately, counted against the reserve (room-ledger-BOOT:
+                         an earlier build's, only read)
   evict.active           present while the host is under its eviction mark
   evict.backoff          refused VM and peer pairs and when to try them again
   standby/H/             template T's standby files, H the 16-hex hash of T's name (independent of T's length)
   standby/H/.template    T, the template's name
-  standby/H/PID.sock     a standby VM of template T (.locks/PID-START.lock while it lives)
-  standby/H/.locks/      PID-START.lock (liveness), PID-START.claim (locked while a claim is under way),
-                         PID-START.take (locked by a `run` while it tries that standby; others try another
+  standby/H/PID.NS.sock  a standby VM of template T, NS its PID namespace's inode in hex (an earlier build's:
+                         PID.sock), with .locks/PID-START-NS.lock while it lives
+  standby/H/.locks/      PID-START-NS.lock (liveness), PID-START-NS.claim (locked while a claim is under way),
+                         PID.NS.take (locked by a `run` while it tries that standby; others try another
                          first), refill (one refill of T at a time), publish (held while a socket is replaced)
   standby/H/.failed      its mtime: T's last failed refill (none for a minute after)
   standby/H/standby.log  the standby VMs' output and refill errors (standby.log.1: previous rotation)
@@ -301,7 +303,7 @@ devices whose alias names its run directory and an owner proven gone
 taps with no such alias, an earlier version's say, are never touched); a
 process with a reused pid removes its dead namesake's as it starts, as their
 names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>-<pidns>`, by the process's identity in this PID namespace or one naming none; another namespace's, as its taps, only once a census from the initial PID namespace finds none of its processes left), work directories and names (by their owner's identity, its PID namespace with it: one of another namespace by the process here in that namespace with its pid there and start time, `host::Ident::local_pid`; one this process cannot see, a sibling's, never), a standby
-VM's socket (its `PID-START.lock` free) and a lock it died before renaming in place (`.PID-START.lock`), an arrival's log (its lock in `vms/.locks` free or gone, 5 s
+VM's socket (no `PID-START-NS.lock` of its pid and namespace held) and a lock it died before renaming in place (`.PID-START-NS.lock`, judged in its PID namespace), an arrival's log (its lock in `vms/.locks` free or gone, 5 s
 old). A VM process's own cgroup (`vm-PID-START-NS`; an earlier build's `vm-PID-START`, by pid here) goes once empty
 and its owner is gone (another PID namespace's, as its taps, only once that namespace is), never
 killed (`rmdir` refuses a populated cgroup). An earlier version's
@@ -560,7 +562,7 @@ image already pulled, it only sets the count; `rmi` sets it to 0 and waits
 for its standby VMs to go) and starts
 standby VMs until there are N: each is `flexvm run --standby`, a VM process
 that restores the template, lets the guest reseed and settle, pauses, and
-listens on `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters of the template's name;
+listens on `RUN/standby/HASH/PID.NS.sock` (HASH: 16 hex characters of the template's name; NS its PID namespace;
 the claim request carries the generation key). `flexvm run` claims one (`claim
 {name, ip, cmd, generation, attached}` with its stdout/stderr passed over SCM_RIGHTS): the standby
 takes the name and address, routes, resumes, sends `START`, and becomes that

@@ -1761,6 +1761,8 @@ impl Proc {
             "ip": vm.ip.to_string(),
             "pid": self.ident.pid,
             "start": self.ident.start,
+            // The PID namespace `pid` is in: a claimer in another finds it there (`Ident::local_pid`).
+            "pidns": self.ident.ns,
             "ports": self.bound_ports(),
             "running_ms": ms(running),
             "ready_ms": ms(t.total()),
@@ -3470,8 +3472,8 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
 fn prune_peer_backoffs(backoff: &mut std::collections::HashMap<String, PeerBackoff>, now: u64) {
     // Candidates are only this tick's subset: a live VM keeps its peer cooldown even when omitted.
     let live = |key: &str, b: &PeerBackoff| -> Option<bool> {
-        let (pid, start) = key.split_once(' ')?.0.split_once('-')?;
-        Some(Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: b.boot.clone(), ns: None }.alive())
+        // `PID-START-NS` (`Ident::ns_key`): another PID namespace's is judged by its pid there.
+        Some(Ident { boot: b.boot.clone(), ..Ident::from_key(key.split_once(' ')?.0)? }.alive())
     };
     backoff.retain(|key, b| b.recent(now) && live(key, b) == Some(true));
 }
@@ -3497,7 +3499,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
             (false, _) => format!("the host is low on memory and it grows {} MiB/s", vm.growth_mib_s),
         };
         for peer in peers {
-            let key = format!("{} {peer}", vm.ident.key());
+            let key = format!("{} {peer}", vm.ident.ns_key());
             if backoff.get(&key).is_some_and(|b| !b.ready(eviction_time())) {
                 continue;
             }
@@ -5225,7 +5227,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(".template"), "t").unwrap();
         let id = Ident::of(child.id()).unwrap();
-        let path = crate::host::locks(&d).join(format!("{}.lock", id.key()));
+        let path = crate::host::locks(&d).join(format!("{}.lock", id.ns_key()));
         let lock = crate::host::Flock::new(crate::host::private_file(&path).unwrap(), libc::LOCK_EX).unwrap();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         (child, lock)
@@ -5279,9 +5281,9 @@ mod tests {
             assert!(!pressure.exists() && !active.exists());
             assert!(child.try_wait().unwrap().is_none(), "a standby was stopped");
         }
-        // Mid-claim (`PID-START.claim` locked): not counted as stopped, so eviction starts.
+        // Mid-claim (`ID.claim` locked): not counted as stopped, so eviction starts.
         let id = Ident::of(child.id()).unwrap();
-        let claim = crate::host::private_file(&crate::host::locks(&d).join(format!("{}.claim", id.key()))).unwrap();
+        let claim = crate::host::private_file(&crate::host::locks(&d).join(format!("{}.claim", id.ns_key()))).unwrap();
         let claim = crate::host::Flock::new(claim, libc::LOCK_EX).unwrap();
         relieve(&host, Some(0), false, &mut stopping);
         assert!(!pressure.exists() && active.exists());
@@ -5451,9 +5453,9 @@ mod tests {
         let mut previous = vm.ident.clone();
         previous.start += 1; // Even the same pid with a different start is another instance.
         let path = host.run.join("evict.backoff");
-        let current = format!("{} p1", vm.ident.key());
+        let current = format!("{} p1", vm.ident.ns_key());
         let mut saved = std::collections::HashMap::new();
-        for key in [current.clone(), format!("{} p1", previous.key()), "ev p1".into()] {
+        for key in [current.clone(), format!("{} p1", previous.ns_key()), "ev p1".into()] {
             let mut b = PeerBackoff::default();
             b.refuse(eviction_time());
             saved.insert(key, b);
@@ -5467,14 +5469,14 @@ mod tests {
 
     #[test]
     fn eviction_keeps_peer_backoff_for_a_live_non_candidate() {
-        let key = format!("{} refusing-peer", Ident::me().key());
+        let key = format!("{} refusing-peer", Ident::me().ns_key());
         let now = eviction_time();
         let mut b = PeerBackoff::default();
         b.refuse(now);
         let until = b.until;
         let mut backoff = std::collections::HashMap::from([(key.clone(), b)]);
         let previous = Ident { start: Ident::me().start + 1, ..Ident::me() };
-        for stale in [format!("{} refusing-peer", previous.key()), "old-name refusing-peer".into()] {
+        for stale in [format!("{} refusing-peer", previous.ns_key()), "old-name refusing-peer".into()] {
             let mut b = PeerBackoff::default();
             b.refuse(now);
             backoff.insert(stale, b);
@@ -5526,19 +5528,19 @@ mod tests {
         let backoff = || crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&host.run.join("evict.backoff")).unwrap().unwrap_or_default();
         // #658: a replacement using the same name and pid starts with no cooldown.
         let previous = Ident { start: vm.ident.start + 1, ..vm.ident.clone() };
-        let old_key = format!("{} p1", previous.key());
+        let old_key = format!("{} p1", previous.ns_key());
         let mut old = PeerBackoff::default();
         old.refuse(eviction_time());
         crate::host::store(&host.run.join("evict.backoff"), &std::collections::HashMap::from([(old_key.clone(), old)]), false).unwrap();
         evict(&host, &["p1".into(), "p2".into()], std::slice::from_ref(&vm), 100, at());
         assert_eq!(*asked.lock().unwrap(), ["p1", "p2"], "the next peer is tried");
         assert!(!backoff().contains_key(&old_key), "the previous instance's record expires");
-        assert!(backoff().get(&format!("{} p1", vm.ident.key())).is_some_and(|b| !b.ready(eviction_time())), "and the refusing one backed off");
+        assert!(backoff().get(&format!("{} p1", vm.ident.ns_key())).is_some_and(|b| !b.ready(eviction_time())), "and the refusing one backed off");
         // The VM busy here: no other peer is asked, and none is backed off for it.
         asked.lock().unwrap().clear();
         evict(&host, &["p1".into(), "busy".into(), "p3".into()], std::slice::from_ref(&vm), 100, at());
         assert_eq!(*asked.lock().unwrap(), ["busy"]);
-        assert!(!backoff().contains_key(&format!("{} busy", vm.ident.key())));
+        assert!(!backoff().contains_key(&format!("{} busy", vm.ident.ns_key())));
         let e = call(&host, "ev", json!({"op": "migrate", "to": "stop"}), Some(at())).unwrap_err();
         assert!(!e.is::<Busy>(), "{e}");
         stub.join_within().unwrap();

@@ -347,8 +347,9 @@ fn standby_pool(host: &Host, dir: &Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// `PID.sock`, and in `.locks`, `PID-START.claim` and `PID-START.take` (a claimer's) of standbys
-/// whose locks are gone, and `.PID-START.lock` (a lock not yet in place, unlocked at first) of standbys gone.
+/// `PID.PIDNS.sock` (`standby::sock_name`; an earlier build's `PID.sock`), and in `.locks`, `ID.claim` and the
+/// `.take` (a claimer's) of standbys whose locks are gone, and `.ID.lock` (a lock not yet in place, unlocked at
+/// first) of standbys gone. `ID` is `PID-START-PIDNS` (`Ident::ns_key`), or an earlier build's `PID-START`.
 fn standby_sockets(dir: &Path) {
     let locks = crate::host::locks(dir);
     // Held while a standby replaces its socket (`standby::serve`): a reused pid's new socket is seen with its lock held.
@@ -358,29 +359,32 @@ fn standby_sockets(dir: &Path) {
         let n = e.file_name().to_string_lossy().into_owned();
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
         let tmp = n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock"));
-        // A pid with no /proc entry here may still run in another pid namespace sharing this
-        // run directory: its socket goes only once no `PID-START.lock` is held (`unheld_pid_locks`).
-        // An identity that cannot be read otherwise proves nothing and the socket stays.
-        let mut no_proc = false;
-        let socket_id = n.strip_suffix(".sock").and_then(|s| s.parse::<u32>().ok()).and_then(|pid| match std::fs::symlink_metadata(format!("/proc/{pid}")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                no_proc = true;
-                Some(format!("{pid}-0"))
+        let sock = n.strip_suffix(".sock");
+        let free = if let Some(id) = tmp {
+            // Judged in its PID namespace where the name tells one (`Ident::liveness`), by its pid here where not.
+            match Ident::from_key(id) {
+                Some(owner) => owner.liveness() == Liveness::Gone,
+                None => continue,
             }
-            _ => Ident::of(pid).map(|id| id.key()),
-        });
-        let Some(id) = claim.or(tmp).or(socket_id.as_deref()) else {
-            continue;
-        };
-        let Some((pid, start)) = id.split_once('-') else { continue };
-        if [pid, start].iter().any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit())) {
-            continue;
-        }
-        let free = match (tmp, pid.parse(), start.parse()) {
-            (Some(_), Ok(pid), Ok(start)) => Ident { pid, start, boot: boot_id().into(), ns: None }.liveness() == Liveness::Gone,
-            (Some(_), ..) => false,
-            _ if no_proc => unheld_pid_locks(&locks, pid),
-            _ => lock_free(&locks.join(format!("{id}.lock")), libc::LOCK_SH),
+        } else if let Some(id) = claim.filter(|id| Ident::from_key(id).is_some()) {
+            lock_free(&locks.join(format!("{id}.lock")), libc::LOCK_SH)
+        } else {
+            // A socket, or its claimer's `PID.PIDNS.take`: a standby's of that pid and PID namespace, whatever its
+            // pid is here, while one of its locks is held.
+            match claim.or(sock).and_then(crate::standby::sock_of) {
+                Some((pid, Some(ns))) => unheld_pid_locks(&locks, pid, Some(ns)),
+                Some((pid, None)) if sock.is_some() => match std::fs::symlink_metadata(format!("/proc/{pid}")) {
+                    // An earlier build's `PID.sock`. A pid with no /proc entry here may still run in another
+                    // PID namespace sharing this run directory: its socket goes only once no lock of its pid
+                    // is held. An identity that cannot be read otherwise proves nothing and the socket stays.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => unheld_pid_locks(&locks, pid, None),
+                    _ => match Ident::of(pid) {
+                        Some(id) => lock_free(&locks.join(format!("{}.lock", id.key())), libc::LOCK_SH),
+                        None => continue,
+                    },
+                },
+                _ => continue,
+            }
         };
         if free && (claim.is_none() || locked(&e.path(), libc::LOCK_EX) == Some(false)) {
             let _ = std::fs::remove_file(e.path());
@@ -388,15 +392,15 @@ fn standby_sockets(dir: &Path) {
     }
 }
 
-/// Whether no standby lock of `pid` (`PID-START.lock`, any start) in `locks` is held; one that
-/// cannot be listed or probed counts as held.
-fn unheld_pid_locks(locks: &Path, pid: &str) -> bool {
+/// Whether no standby lock of `pid` (`ID.lock`, any start) in `locks` is held, of PID namespace `ns` where that is
+/// given (any otherwise); one that cannot be listed or probed counts as held.
+fn unheld_pid_locks(locks: &Path, pid: u32, ns: Option<u64>) -> bool {
     let Ok(entries) = std::fs::read_dir(locks) else { return false };
     for e in entries {
         let Ok(e) = e else { return false };
         let n = e.file_name();
-        let Some(start) = n.to_str().and_then(|n| n.strip_prefix(pid)?.strip_prefix('-')?.strip_suffix(".lock")) else { continue };
-        if !start.is_empty() && start.bytes().all(|b| b.is_ascii_digit()) && !lock_free(&e.path(), libc::LOCK_SH) {
+        let Some(id) = n.to_str().and_then(|n| Ident::from_key(n.strip_suffix(".lock")?)) else { continue };
+        if id.pid == pid && ns.is_none_or(|ns| id.ns == Some(ns)) && !lock_free(&e.path(), libc::LOCK_SH) {
             return false;
         }
     }
@@ -471,10 +475,31 @@ mod tests {
         let live_sock = format!("{}.sock", me.pid);
         File::create(d.join(&live_sock)).unwrap();
         File::create(d.join("999999990.sock")).unwrap();
+        // #1139: this build's `PID.PIDNS.sock` and `.take`, and `ID.claim` (ID `PID-START-PIDNS`): judged by the
+        // locks of that pid in that namespace, whatever its pid is here.
+        let ns = crate::host::pid_ns().unwrap();
+        let live_ns = File::create(l.join(format!("{}.lock", me.ns_key()))).unwrap();
+        flock(&live_ns, libc::LOCK_EX).unwrap();
+        let stem = crate::standby::sock_name(&me);
+        let (live_ns_sock, unheld) = (format!("{stem}.sock"), format!("{}.{:x}.sock", me.pid, ns + 1));
+        let (dead_tmp, dead_claim) = (format!(".999999999-1-{ns}.lock"), "5-6-9.claim");
+        for (dir, s) in [(&*d, &*live_ns_sock), (&d, &unheld), (&d, "5.9.sock"), (&d, "6.9.sock"), (&l, &format!("{stem}.take")), (&l, "6.9.take")] {
+            File::create(dir.join(s)).unwrap();
+        }
+        for s in [&dead_tmp, dead_claim, "5-7-9.claim", "5.9.take"] {
+            File::create(l.join(s)).unwrap();
+        }
+        let other_ns = File::create(l.join("5-7-9.lock")).unwrap();
+        flock(&other_ns, libc::LOCK_EX).unwrap();
         standby_sockets(&d);
         let left = |n: &str| d.join(n).exists() || l.join(n).exists();
         assert!(left(&live_sock));
         assert!(!left("999999990.sock"), "a pid with no process is gone");
+        assert!(left(&live_ns_sock) && left(&format!("{stem}.take")), "its lock is held");
+        assert!(!left(&unheld), "no lock of its pid in its namespace is held, though one of its pid here is");
+        assert!(left("5.9.sock") && left("5.9.take"), "a lock of its pid in its namespace is held, though its pid has no process here");
+        assert!(!left("6.9.sock") && !left("6.9.take"));
+        assert!(!left(&dead_tmp) && !left(dead_claim) && left("5-7-9.claim"));
         assert!(left("4-1.claim") && left("5-7.claim"), "a claim marker of a standby still here stays");
         assert!(!left("3-1.claim") && !left("5-6.claim"), "one unlocked goes once its lock is gone or names another process");
         assert!(!left("3-1.take") && left("5-7.take"), "a claimer's marker goes with its standby");

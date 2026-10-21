@@ -780,7 +780,9 @@ through, so the checkpoint is exactly the memory at the pause.
   guest's, so each keeps out of the host's reserve instead: each take is
   checked against MemAvailable less the reserve, the grants guests have
   yet to touch and what was taken lately, and debited, under the host lock
-  (`RUN/room-ledger-BOOT`, with the process that took it), so VMs copying
+  (`RUN/room-ledger-ns-BOOT`, with the process that took it and its PID
+  namespace; a flexvm before #1139's `RUN/room-ledger-BOOT` is read too,
+  never rewritten), so VMs copying
   at once, and admission, see what the others took and never take more
   than there is together (#648). It is populated after the lock goes. A
   debit counts in full until its process marks it populated (under the

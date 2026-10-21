@@ -790,6 +790,12 @@ judges it by that process. A flexvm in a namespace that cannot see it (a
 sibling container) refuses to signal it (`process 1 of PID namespace NS cannot
 be seen from this one`), and never takes it for gone. Commands that only talk
 to its control socket (`checkpoint`, `unpause`, `kill -s`) work from either.
+A flexvm whose `/proc` is not its own PID namespace's (`unshare --pid` without
+`--mount-proc`: `/proc/self/status` lists more than one `NSpid`) refuses to
+signal any VM and never takes one for gone. Standby VMs, memory debits,
+eviction backoffs and release answers are named by PID namespace too; a
+standby VM is claimed only by a `run` it can see (in its own PID namespace or
+one below it; from any other, `run` starts cold).
 
 ## Fast starts
 
@@ -807,10 +813,11 @@ listener and VM process, retried each minute (errors in `standby.log` in
 already pulled only sets the count: no registry is asked and nothing is
 rebuilt, which a pull with other options than the image's first would do.
 With other options, the pull runs first and then sets it. `rmi` sets it to 0
-first. Standby sockets are `RUN/standby/HASH/PID.sock`, where HASH is the
-16-hex hash of the template's name. Claims carry the generation key, the
+first. Standby sockets are `RUN/standby/HASH/PID.NS.sock`, where HASH is the
+16-hex hash of the template's name and NS the standby's PID namespace inode in
+hex. Claims carry the generation key, the
 VM's `--cpus`/`--memory` caps (checked against the standby's template), and
-`.locks/PID-START.lock` identifies the process while it lives. Socket paths
+`.locks/PID-START-NS.lock` identifies the process while it lives. Socket paths
 must be under 108 bytes.
 
 ## Images

@@ -2079,9 +2079,17 @@ impl Host {
         Ok((grants, pending, debits))
     }
 
-    /// Checkpoint memory taken lately (`take_room`), under the host lock: `RUN/room-ledger-BOOT`. Not the
-    /// `room-debits-BOOT` of a flexvm before #691, whose entries name no process: it would be unreadable here.
+    /// Checkpoint memory taken lately (`take_room`), under the host lock: `RUN/room-ledger-ns-BOOT`. Not the
+    /// `room-debits-BOOT` of a flexvm before #691, whose entries name no process: it would be unreadable here. Nor
+    /// the `room-ledger-BOOT` of one before #1139 (`legacy_debits`), whose entries name no PID namespace: such a
+    /// flexvm rewriting this one's would drop theirs, and judge another namespace's process by its pid here.
     fn debits(&self) -> PathBuf {
+        self.run.join(format!("room-ledger-ns-{}", boot_id()))
+    }
+
+    /// The ledger of a flexvm before #1139 (`room-ledger-BOOT`), sharing this run directory as it upgrades: its
+    /// debits count here too, judged as it judges them (by pid here), and it is only ever read, never rewritten.
+    fn legacy_debits(&self) -> PathBuf {
         self.run.join(format!("room-ledger-{}", boot_id()))
     }
 
@@ -2090,15 +2098,18 @@ impl Host {
     /// after (Linux folds each CPU's counter deltas in only that often, or once one passes its threshold), together
     /// for no more than those deltas can hide (`vmstat_drift_mib`), or in full where that cannot be told.
     fn recent_debits(&self, _l: &Locked, now: u64) -> (Option<Debits>, u64) {
-        let path = self.debits();
-        // Only a ledger that reads but does not parse can expire: a failed read (EIO) never proves its debits old.
-        let (read, unwritten) = match read_record(&path) {
-            Ok(b) => (serde_json::from_slice::<Debits>(&b).ok().map(Some), unwritten_for(&path)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Some(None), None),
-            Err(_) => (None, None),
+        let taken = |path: &Path| {
+            // Only a ledger that reads but does not parse can expire: a failed read (EIO) never proves its debits old.
+            let (read, unwritten) = match read_record(path) {
+                Ok(b) => (serde_json::from_slice::<Debits>(&b).ok().map(Some), unwritten_for(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Some(None), None),
+                Err(_) => (None, None),
+            };
+            let gone = |d: &Debit| d.owner().liveness() == Liveness::Gone;
+            debits_taken(read, unwritten, now, debit_window_ms(), vmstat_drift_mib(), gone)
         };
-        let gone = |d: &Debit| Ident { pid: d.pid, start: d.start, boot: boot_id().into(), ns: None }.liveness() == Liveness::Gone;
-        debits_taken(read, unwritten, now, debit_window_ms(), vmstat_drift_mib(), gone)
+        let (debits, mine) = taken(&self.debits());
+        (debits, mine.saturating_add(taken(&self.legacy_debits()).1))
     }
 
     /// Marks this process's takes populated whose population ended (`UNMARKED`), if the host lock is free within
@@ -2123,7 +2134,7 @@ impl Host {
     fn mark_populated(&self, debits: &mut Debits, now: u64) -> Vec<u64> {
         let (me, path) = (Ident::me(), self.debits());
         let listed: Vec<u64> = UNMARKED.lock().unwrap().iter().filter(|u| u.0 == path).map(|u| u.1).collect();
-        for d in debits.iter_mut().filter(|d| !d.populated && (d.pid, d.start) == (me.pid, me.start) && listed.contains(&d.id)) {
+        for d in debits.iter_mut().filter(|d| !d.populated && d.is(&me) && listed.contains(&d.id)) {
             (d.populated, d.at) = (true, now);
         }
         listed
@@ -2159,7 +2170,7 @@ impl Host {
         let (me, id) = (Ident::me(), ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let mut debits = debits.unwrap_or_default();
         let marked = self.mark_populated(&mut debits, boottime_ms());
-        debits.push(Debit { at: boottime_ms(), mib, pid: me.pid, start: me.start, id, populated: false });
+        debits.push(Debit { at: boottime_ms(), mib, pid: me.pid, start: me.start, id, populated: false, ns: me.ns });
         if store(&self.debits(), &debits, false).is_err() {
             return (Some(0), None);
         }
@@ -2629,6 +2640,23 @@ struct Debit {
     start: u64,
     id: u64,
     populated: bool,
+    /// Its PID namespace (`Ident::ns`): `pid` is the one it has there, judged from another
+    /// namespace by that one's (`Ident::liveness`). None: an earlier build's, judged by its pid here.
+    #[serde(default, rename = "pidns", skip_serializing_if = "Option::is_none")]
+    ns: Option<u64>,
+}
+
+impl Debit {
+    fn owner(&self) -> Ident {
+        Ident { pid: self.pid, start: self.start, boot: boot_id().into(), ns: self.ns }
+    }
+
+    /// Whether `me` took it: by pid and start time (the ledger is of this boot), and by PID namespace where it
+    /// names one. One that names none (rewritten by a writer that drops it) is still its taker's to mark, never
+    /// left unmatched and counted in full for the life of its process.
+    fn is(&self, me: &Ident) -> bool {
+        (self.pid, self.start) == (me.pid, me.start) && self.ns.is_none_or(|ns| me.ns == Some(ns))
+    }
 }
 
 /// This process's takes whose memory is populated and not yet marked so, by ledger (`Host::settle_room`).
@@ -3236,13 +3264,26 @@ impl Ident {
     /// that cannot name itself must not take a name, an address or a migration.
     pub fn me() -> Ident {
         static ME: OnceLock<Ident> = OnceLock::new();
-        ME.get_or_init(|| Ident::of(std::process::id()).expect("cannot read this process's identity (/proc/self/stat, boot id)")).clone()
+        ME.get_or_init(|| Ident::me_in(Path::new("/proc"), boot_id()).expect("cannot read this process's identity (/proc/self/stat, boot id)")).clone()
+    }
+
+    /// Through `proc/self`, which is this process whichever PID namespace `proc` is mounted for:
+    /// never `proc/PID` by its own pid, another process's in a /proc of an ancestor namespace.
+    fn me_in(proc: &Path, boot: &str) -> Option<Ident> {
+        if boot.is_empty() {
+            return None;
+        }
+        let start = parse_stat(&std::fs::read_to_string(proc.join("self/stat")).ok()?)?.1;
+        let ns = std::fs::metadata(proc.join("self/ns/pid")).ok().map(|m| std::os::unix::fs::MetadataExt::ino(&m));
+        Some(Ident { pid: std::process::id(), start, boot: boot.into(), ns })
     }
 
     /// None without a boot id: an identity without one would read as another boot's, i.e. gone.
+    /// None too where `/proc` is not this PID namespace's (`proc_is_mine`): `/proc/PID` there is
+    /// another process than `pid` here.
     pub fn of(pid: u32) -> Option<Ident> {
         let boot = boot_id();
-        if boot.is_empty() {
+        if boot.is_empty() || !proc_is_mine() {
             return None;
         }
         Some(Ident { pid, start: starttime(pid)?, boot: boot.into(), ns: pid_ns() })
@@ -3305,6 +3346,27 @@ impl Ident {
     /// `PID-START`: names what is this instance's own, never another process's that got its pid.
     pub fn key(&self) -> String {
         format!("{}-{}", self.pid, self.start)
+    }
+
+    /// `PID-START-NS` (`key`, if it names no PID namespace): apart, too, from a process of another
+    /// PID namespace sharing a directory, which may have the same pid and start time (#1139).
+    pub fn ns_key(&self) -> String {
+        match self.ns {
+            Some(ns) => format!("{}-{}-{ns}", self.pid, self.start),
+            None => self.key(),
+        }
+    }
+
+    /// Of this boot, from `ns_key` (or `key`, naming no namespace); None for any other name.
+    pub fn from_key(key: &str) -> Option<Ident> {
+        let parts: Vec<&str> = key.split('-').collect();
+        let num = |s: &str| (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
+        let (pid, start, ns) = match parts[..] {
+            [pid, start] => (num(pid)?, num(start)?, None),
+            [pid, start, ns] => (num(pid)?, num(start)?, Some(num(ns)?)),
+            _ => return None,
+        };
+        Some(Ident { pid: pid.try_into().ok()?, start, boot: boot_id().into(), ns })
     }
 
     /// Its work directory (`RUN/w/PID-START`): removing it once this one is reaped removes nothing alive.
@@ -4700,7 +4762,7 @@ impl Directory {
 
     /// A directory already opened (for reading).
     pub fn from_fd(fd: OwnedFd) -> Self {
-        Self { path: PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), fd.as_raw_fd())), fd }
+        Self { path: fd_path(fd.as_raw_fd()), fd }
     }
 
     pub fn stat(&self) -> std::io::Result<libc::stat> {
@@ -4963,16 +5025,46 @@ fn pid_liveness_by(pid: u32, stat: impl Fn(u32) -> std::io::Result<String>) -> (
 }
 
 /// Whether `/proc` numbers processes as this process's PID namespace does: `/proc/self` names
-/// this process by the pid it has (`getpid`). One mounted for another namespace (an ancestor's,
-/// kept by `unshare --pid` without `--mount-proc`) names it by the pid it has there: its pids
-/// then are not this process's, for a pidfd or a signal, nor what records name.
+/// this process by the pid it has (`getpid`), and is mounted for this very namespace. One mounted
+/// for another (an ancestor's, kept by `unshare --pid` without `--mount-proc`) names it by the pid
+/// it has there: its pids then are not this process's, for a pidfd or a signal, nor what records name.
 pub(crate) fn proc_is_mine() -> bool {
     static MINE: OnceLock<bool> = OnceLock::new();
     *MINE.get_or_init(|| proc_is_mine_in(Path::new("/proc"), std::process::id()))
 }
 
+/// `/proc/self` naming `me` can be a coincidence: an ancestor's /proc whose pid for this process
+/// equals the one it has here (after wraparound, say). Its `NSpid` tells the mount's namespace
+/// apart: one pid for each PID namespace from the mount's down to this process's own, so exactly
+/// one (`me`) only where the mount is this namespace's. A /proc that shows none (before Linux 4.1),
+/// or cannot be read, is not known to be this one's.
 fn proc_is_mine_in(proc: &Path, me: u32) -> bool {
-    std::fs::read_link(proc.join("self")).is_ok_and(|l| l.to_str().and_then(|s| s.parse::<u32>().ok()) == Some(me))
+    let named = std::fs::read_link(proc.join("self")).is_ok_and(|l| l.to_str().and_then(|s| s.parse::<u32>().ok()) == Some(me));
+    named && std::fs::read_to_string(proc.join("self/status")).is_ok_and(|s| nspid(&s) == Some(vec![me]))
+}
+
+/// The pids in a `/proc/PID/status`'s `NSpid`, outermost (the mount's PID namespace) first.
+fn nspid(status: &str) -> Option<Vec<u32>> {
+    status.lines().find_map(|l| l.strip_prefix("NSpid:"))?.split_whitespace().map(|p| p.parse().ok()).collect()
+}
+
+/// This process's pid as `/proc` numbers it (`/proc/self`), for paths through `/proc` this process
+/// hands its children (`/proc/PID/fd/N`): its own pid where `/proc` is its namespace's, the pid it
+/// has in the mount's namespace where that is an ancestor's. Unreadable: `getpid`.
+pub(crate) fn proc_pid() -> u32 {
+    static PID: OnceLock<u32> = OnceLock::new();
+    *PID.get_or_init(|| proc_pid_in(Path::new("/proc")).unwrap_or_else(std::process::id))
+}
+
+fn proc_pid_in(proc: &Path) -> Option<u32> {
+    std::fs::read_link(proc.join("self")).ok()?.to_str()?.parse().ok()
+}
+
+/// `/proc/PID/fd/N` for this process's `fd`, by its pid in `/proc` (`proc_pid`): reaches the
+/// file through the descriptor for this process and the children it hands the path to, which
+/// `/proc/self` (or `/proc/thread-self`) would not, naming each reader itself.
+pub fn fd_path(fd: std::os::fd::RawFd) -> PathBuf {
+    PathBuf::from(format!("/proc/{}/fd/{fd}", proc_pid()))
 }
 
 /// The inode of namespace `kind` (`pid`, `time`) of the process at `dir` (`/proc/PID`).
@@ -7754,11 +7846,35 @@ pub(crate) mod tests {
         // pids is this process's (#1111), however a scan of it reads.
         assert!(proc_is_mine() && proc_is_mine_in(Path::new("/proc"), std::process::id()));
         let other = d.join("other-proc");
-        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(other.join("4242/ns")).unwrap();
         std::os::unix::fs::symlink("4242", other.join("self")).unwrap();
+        let status = |nspid: &str| std::fs::write(other.join("4242/status"), format!("Name:\tflexvm\n{nspid}Uid:\t0\n")).unwrap();
+        status("NSpid:\t4242\n");
         assert!(proc_is_mine_in(&other, 4242));
         assert!(!proc_is_mine_in(&other, 1), "pid 1 here, 4242 in that /proc's namespace");
         assert!(!proc_is_mine_in(&d.join("missing"), 1));
+        // #1139: an ancestor's /proc whose pid for this process is, by coincidence, the one it has
+        // here: `NSpid` names one pid per namespace from the mount's down, so two.
+        status("NSpid:\t4242\t4242\n");
+        assert!(!proc_is_mine_in(&other, 4242), "the mount is an ancestor namespace's");
+        status("NSpid:\t4242\t1\n");
+        assert!(!proc_is_mine_in(&other, 4242) && !proc_is_mine_in(&other, 1));
+        status("");
+        assert!(!proc_is_mine_in(&other, 4242), "no NSpid (before Linux 4.1): not known to be this one's");
+        assert_eq!(nspid("NSpid:\t7\t1\n"), Some(vec![7, 1]));
+        assert_eq!(nspid("NSpid:\tx\n"), None);
+        // This process's own pid and start time through such a /proc: `self`, never `/proc/<its pid here>`.
+        assert_eq!(proc_pid_in(&other), Some(4242));
+        assert_eq!(proc_pid_in(&d.join("missing")), None);
+        assert_eq!(proc_pid(), std::process::id(), "this /proc is this namespace's");
+        assert_eq!(fd_path(3), PathBuf::from(format!("/proc/{}/fd/3", std::process::id())));
+        std::fs::write(other.join("4242/stat"), format!("4242 (flexvm) S {} 31337 0 0", "0 ".repeat(18))).unwrap();
+        std::fs::write(other.join("4242/ns/pid"), "").unwrap();
+        let read = Ident::me_in(&other, "boot").unwrap();
+        assert_eq!((read.pid, read.start, &*read.boot), (std::process::id(), 31337, "boot"));
+        assert!(read.ns.is_some());
+        assert!(Ident::me_in(&other, "").is_none() && Ident::me_in(&d.join("missing"), "boot").is_none());
+        assert_eq!(Ident::me_in(Path::new("/proc"), boot_id()), Some(Ident::me()));
         // Here (this namespace, or none named), by its pid.
         let me = Ident::me();
         assert!(me.ns.is_some() && me.ns == pid_ns());
@@ -7777,6 +7893,15 @@ pub(crate) mod tests {
         let old: Ident = serde_json::from_value(serde_json::json!({"pid": 1, "start": 2, "boot": "b"})).unwrap();
         assert_eq!(old.ns, None);
         assert_eq!(serde_json::to_value(&old).unwrap(), serde_json::json!({"pid": 1, "start": 2, "boot": "b"}));
+        // #1139: names after a process name its namespace too; an earlier build's none.
+        let named = Ident { pid: 1, start: 2, boot: boot_id().into(), ns: Some(3) };
+        assert_eq!((named.ns_key(), Ident { ns: None, ..named.clone() }.ns_key()), ("1-2-3".into(), "1-2".into()));
+        assert_eq!(Ident::from_key("1-2-3"), Some(named.clone()));
+        assert_eq!(Ident::from_key("1-2"), Some(Ident { ns: None, ..named }));
+        assert_eq!(Ident::from_key(&me.ns_key()), Some(me.clone()));
+        for bad in ["", "1", "1-", "-2", "1-2-", "1-2-3-4", "1-x", "+1-2", "1-2-3x", "4294967296-1"] {
+            assert_eq!(Ident::from_key(bad), None, "{bad}");
+        }
     }
 
     fn pidns<'a>(mine: Option<u64>, census: &'a dyn Fn() -> Option<HashSet<u64>>) -> PidNs<'a> {
@@ -9774,7 +9899,7 @@ pub(crate) mod tests {
     }
 
     fn debit(mib: u64, at: u64, owner: &Ident, populated: bool) -> Debit {
-        Debit { at, mib, pid: owner.pid, start: owner.start, id: u64::MAX, populated }
+        Debit { at, mib, pid: owner.pid, start: owner.start, id: u64::MAX, populated, ns: owner.ns }
     }
 
     /// Checkpoint memory is taken against what admission counts (#677): MemAvailable above the reserve, less the
@@ -9839,6 +9964,50 @@ pub(crate) mod tests {
         }
         let deadline = Some(std::time::Instant::now() + Duration::from_secs(30));
         assert!(h.grant_inner(AVAIL - 499, Floor::Reserve, false, deadline, || Some(AVAIL)).unwrap().is_ok());
+    }
+
+    /// #1139: a take is its process's by its PID namespace too: another namespace's process with this one's pid,
+    /// start time and take number is not marked for it, and is judged in its own namespace.
+    #[test]
+    fn debits_name_their_pid_namespace() {
+        let (_h_dir, h) = host("debit-pidns");
+        let id = u64::MAX - 2;
+        let me = Ident::me();
+        let twin = Ident { ns: Some(me.ns.unwrap() + 1), ..me.clone() };
+        let mut debits = vec![Debit { id, ..debit(500, 1, &twin, false) }, Debit { id, ..debit(300, 1, &me, false) }];
+        UNMARKED.lock().unwrap().push((h.debits(), id));
+        let marked = h.mark_populated(&mut debits, 7);
+        h.forget_marked(&marked);
+        assert_eq!(debits.iter().map(|d| (d.populated, d.at)).collect::<Vec<_>>(), [(false, 1), (true, 7)]);
+        assert_eq!(debits[0].owner(), Ident { boot: boot_id().into(), ..twin });
+        let v = serde_json::to_value(&debits[1]).unwrap();
+        assert_eq!(v["pidns"], serde_json::json!(me.ns.unwrap()));
+        let old: Debit = serde_json::from_value(serde_json::json!({"at": 1, "mib": 2, "pid": 3, "start": 4, "id": 5, "populated": false})).unwrap();
+        assert_eq!(old.ns, None, "an earlier build's: judged by its pid here");
+        // Its namespace dropped by a rewrite: still this process's to mark, not stranded in full.
+        let mut debits = vec![Debit { id, ns: None, ..debit(500, 1, &me, false) }];
+        UNMARKED.lock().unwrap().push((h.debits(), id));
+        let marked = h.mark_populated(&mut debits, 9);
+        h.forget_marked(&marked);
+        assert_eq!((debits[0].populated, debits[0].at), (true, 9));
+        assert!(!Debit { start: me.start + 1, ..debits[0].clone() }.is(&me));
+        // An earlier build's ledger is another file, which this one only reads: its debits count, it is never rewritten.
+        assert_ne!(h.debits(), h.legacy_debits());
+        let l = h.lock().unwrap();
+        assert_eq!(h.recent_debits(&l, boottime_ms()).1, 0);
+        let legacy = vec![debit(700, boottime_ms(), &Ident { ns: None, ..me.clone() }, false)];
+        store(&h.legacy_debits(), &legacy, false).unwrap();
+        let before = std::fs::read(h.legacy_debits()).unwrap();
+        store(&h.debits(), &vec![debit(300, boottime_ms(), &me, false)], false).unwrap();
+        let (debits, taken) = h.recent_debits(&l, boottime_ms());
+        assert_eq!((debits.map(|d| d.len()), taken), (Some(1), 1000), "both count; only this build's is returned to rewrite");
+        drop(l);
+        UNMARKED.lock().unwrap().push((h.debits(), u64::MAX));
+        h.settle_room(Duration::from_secs(5));
+        assert_eq!(std::fs::read(h.legacy_debits()).unwrap(), before, "the earlier build's ledger is left as it was");
+        // Unreadable, and not yet past its window: nothing may be taken (fails closed, as this build's).
+        std::fs::write(h.legacy_debits(), b"{").unwrap();
+        assert_eq!(h.recent_debits(&h.lock().unwrap(), boottime_ms()).1, u64::MAX);
     }
 
     /// The marks of populated takes are forgotten only once the ledger saying so is stored: one whose store failed
