@@ -118,14 +118,33 @@ fn record_path(path: &Path) -> std::path::PathBuf {
     record.into()
 }
 
+/// A stamp caches bytes only; the current pin or offline record is checked on every use.
+fn cached_sha256(path: &Path, asset: &Asset, run: Option<&Path>) -> Result<String> {
+    let file = File::open(path)?;
+    let before = Stamp::of(&file.metadata()?);
+    let cache = format!("{}.sha256.json", asset.name);
+    if let Some((_, hash)) = run
+        .and_then(|d| std::fs::read(d.join(&cache)).ok())
+        .and_then(|b| serde_json::from_slice::<(Stamp, String)>(&b).ok())
+        .filter(|(stamp, _)| *stamp == before)
+    {
+        return Ok(hash);
+    }
+    let mut hashed = crate::image::Hashed::new(&file);
+    std::io::copy(&mut hashed, &mut std::io::sink())?;
+    let hash = hashed.digest().trim_start_matches("sha256:").to_string();
+    if Stamp::of(&file.metadata()?) != before {
+        bail!("{} changed while hashing", path.display());
+    }
+    if let Some(run) = run {
+        let _ = crate::util::write_file(run, &cache, &serde_json::to_vec(&(before, &hash))?, false);
+    }
+    Ok(hash)
+}
+
 /// The file already at `path` must match the pin; only without a pin does `record_path` count.
 fn check_existing(path: &Path, asset: &Asset, sha256: Option<&str>) -> Result<()> {
-    let got = (|| -> Result<String> {
-        let mut f = crate::image::Hashed::new(File::open(path)?);
-        std::io::copy(&mut f, &mut std::io::sink())?;
-        Ok(f.digest().trim_start_matches("sha256:").to_string())
-    })()
-    .map_err(|e| format!("{}: cannot check its sha256: {e}", path.display()))?;
+    let got = cached_sha256(path, asset, crate::host::run_dir()).map_err(|e| format!("{}: cannot check its sha256: {e}", path.display()))?;
     if let Some(pin) = sha256 {
         if got == pin {
             return Ok(());
@@ -210,6 +229,24 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn sha256_cache_tracks_inode_and_content_changes() {
+        let dir = crate::test_util::TempDir::new("asset-cache");
+        let path = dir.join("vmlinux");
+        std::fs::write(&path, b"kernel").unwrap();
+        assert_eq!(cached_sha256(&path, &KERNEL, Some(&dir)).unwrap(), hex(b"kernel"));
+        let cache = dir.join("vmlinux.sha256.json");
+        let stamp = Stamp::of(&std::fs::metadata(&cache).unwrap());
+        assert_eq!(cached_sha256(&path, &KERNEL, Some(&dir)).unwrap(), hex(b"kernel"));
+        assert_eq!(Stamp::of(&std::fs::metadata(&cache).unwrap()), stamp, "cache hit does not rewrite");
+        std::fs::write(&path, b"changed").unwrap();
+        assert_eq!(cached_sha256(&path, &KERNEL, Some(&dir)).unwrap(), hex(b"changed"));
+        let replacement = dir.join("replacement");
+        std::fs::write(&replacement, b"new inode").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(cached_sha256(&path, &KERNEL, Some(&dir)).unwrap(), hex(b"new inode"));
+    }
 
     /// Serves `body` at `/asset` and a redirect to it at `/moved/asset`, `n` times.
     fn serve(body: &'static [u8], n: usize) -> String {
