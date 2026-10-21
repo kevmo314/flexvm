@@ -1170,7 +1170,7 @@ impl Proc {
             bail!("the source sent no memory regions");
         }
         let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig, regions };
-        self.set_name(self.host.take_name(&name, false)?);
+        self.set_name(self.host.take_arriving_name(&name)?);
         // Bound before the prepare is answered (#593, as a resume's): failing, the source never
         // pauses. Until the VM is adopted, the socket says it is starting; an abort's `finish`
         // unlinks it with the name.
@@ -1335,6 +1335,10 @@ impl Proc {
             }
         }
         drop(committed);
+        // Committed: what a VM of the name that moved away left goes (kept for an abort until now).
+        if let Err(e) = self.host.arrived(&name) {
+            crate::log!("vm {name}: clearing what the vm that moved away from here left: {e}");
+        }
         self.publish();
         Ok(vm)
     }

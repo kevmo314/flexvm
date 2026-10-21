@@ -708,10 +708,14 @@ fn real_main(args: &Args) -> Result<()> {
         Some("start") if args.has("attach") => {
             // A detached start's VM process (`start -a`, answering on FLEXVM_NOTIFY_FD) must answer
             // its parent through vmproc, even if another start won meanwhile.
-            if std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
-                stopped_to_attach(&open_host(args)?, name)?;
-            }
             let host = open_host(args)?;
+            if std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
+                stopped_to_attach(&host, name)?;
+                // Nothing to start: said before taking the name, which would clear a moved VM's hint.
+                if !host.alive(name) && !host.suspended(name)?.exists() && !host.has_record(name, "exited") {
+                    return Err(no_vm(&host, name));
+                }
+            }
             let start = rerun(&host, name)?.unwrap_or(Start::Resume { name: name.into() });
             vmproc::main(host, paths(args)?, start, notify_fd())
         }
@@ -1312,8 +1316,9 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
             }
         });
     }
+    // No status: its process (the VM, started) ended without one, so it died under this run.
     let reply = recv_json(&mut conn).ok().flatten();
-    util::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
+    util::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::DIED, |c| c as i32))
 }
 
 /// `start` (and `restart`): a running VM's process resumes it, a stopped or exited one a new
@@ -1322,6 +1327,11 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
 fn start(host: &Host, args: &Args, name: &str) -> Result<()> {
     if resume(host, name)? {
         return output(format_args!("{name}\n"));
+    }
+    // Nothing to start (no process, no stopped or exited VM): said here, before a process is
+    // spawned whose taking the name would clear a moved VM's hint.
+    if !host.alive(name) && !host.suspended(name)?.exists() && !host.has_record(name, "exited") {
+        return Err(no_vm(host, name));
     }
     match spawn_detached(host, name, &child_args(args, &["start", "--attach", "--", name]), &log_file(host, name)?, false) {
         Ok(v) => print(v),
@@ -1412,6 +1422,16 @@ fn stopped_to_attach(host: &Host, name: &str) -> Result<()> {
 
 /// Why a VM with no process cannot be paused or unpaused.
 fn not_running(host: &Host, name: &str) -> util::Error {
+    no_process(host, name, "no running vm named")
+}
+
+/// What is left of `name`, which no process runs: a stopped, exited, failed or lost VM, where
+/// it moved, or nothing (no vm named it).
+pub fn no_vm(host: &Host, name: &str) -> util::Error {
+    no_process(host, name, "no vm named")
+}
+
+fn no_process(host: &Host, name: &str, none: &str) -> util::Error {
     match host.suspended(name).map(|d| d.exists()) {
         Ok(true) => format!("vm {name} is stopped: flexvm start {name}").into(),
         _ if host.has_record(name, "exited") => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
@@ -1419,8 +1439,43 @@ fn not_running(host: &Host, name: &str) -> util::Error {
         _ if host.has_record(name, "lost") => format!("vm {name} is lost: see flexvm ps -a; flexvm rm {name} clears it").into(),
         _ => match std::fs::read_to_string(host.vms(name, "moved").unwrap_or_default()) {
             Ok(to) => format!("vm {name} moved to {to}; it runs there").into(),
-            Err(_) => format!("no running vm named {name:?}").into(),
+            Err(_) => format!("{none} {name:?}").into(),
         },
+    }
+}
+
+/// Signals the instance registered under `name`, returning its pidfd and identity: None when
+/// there is none (no registry entry, or its process gone meanwhile). Anything else that keeps
+/// it from being signalled (a process this one cannot see or tell apart, a refused signal) is
+/// an error, never "not running".
+fn signal_entry(host: &Host, name: &str, sig: i32) -> Result<Option<(host::PidFd, host::Ident)>> {
+    let Ok(e) = host.entry(name) else { return Ok(None) };
+    let Some(fd) = host::PidFd::open(&e.ident)? else { return Ok(None) };
+    match fd.signal(sig) {
+        Ok(()) => Ok(Some((fd, e.ident))),
+        Err(_) if !e.ident.alive() => Ok(None),
+        Err(e) => Err(format!("vm {name}: {e}").into()),
+    }
+}
+
+/// How long `stop` and `pause` wait for a VM that holds its name but is not registered yet (starting).
+const START_WAIT: Duration = Duration::from_secs(60);
+
+/// `signal_entry`, waiting (as `stopped_to_attach` does) while the name is held with no entry
+/// (a VM starting, or an `rm` or sweep deciding): None once nothing holds it.
+fn signal_ready(host: &Host, name: &str, sig: i32) -> Result<Option<(host::PidFd, host::Ident)>> {
+    let deadline = Instant::now() + START_WAIT;
+    loop {
+        if let Some(v) = signal_entry(host, name, sig)? {
+            return Ok(Some(v));
+        }
+        if !host.alive(name) {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1437,16 +1492,12 @@ fn stop(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
     // The instance signalled, its identity and pidfd from one read of the registry: its exit status
     // tells an app that exited first (`--rm` or attached VMs leave no exited record).
-    let signalled = host.entry(name).and_then(|e| {
-        let fd = host::PidFd::open(&e.ident)?.ok_or_else(|| format!("no vm named {name:?}"))?;
-        fd.signal(libc::SIGTERM)?;
-        Ok((fd, e.ident))
-    });
-    let (vm, ident) = match signalled {
-        Ok(v) => v,
+    let (vm, ident) = match signal_ready(host, name, libc::SIGTERM) {
+        Ok(Some(v)) => v,
         Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
-        Err(_) if !host.alive(name) && (host.suspended(name)?.exists() || host.has_record(name, "exited")) => return Ok(()),
-        Err(_) => return Err(not_running(host, name)),
+        Err(e) => return Err(e),
+        Ok(None) if host.suspended(name)?.exists() || host.has_record(name, "exited") => return Ok(()),
+        Ok(None) => return Err(not_running(host, name)),
     };
     let (start, mut seen) = (Instant::now(), false);
     while !vm.wait(Duration::from_millis(100)) {
@@ -1454,7 +1505,8 @@ fn stop(host: &Host, name: &str) -> Result<()> {
         seen |= state == "suspending" || state == "checkpointing";
         // Back to running: the suspend failed, and the VM runs on (its log says why).
         let gave_up = seen && matches!(state.as_str(), "running" | "paused");
-        if gave_up || start.elapsed() > STOP_WAIT || (!seen && start.elapsed() > Duration::from_secs(10) && state != "source") {
+        if gave_up || start.elapsed() > STOP_WAIT || (!seen && start.elapsed() > Duration::from_secs(10) && !matches!(state.as_str(), "source" | "reconciling"))
+        {
             return Err(format!("vm {name} did not suspend (it runs on); see {}", host.vms(name, "log")?.display()).into());
         }
     }
@@ -1474,14 +1526,20 @@ fn stop(host: &Host, name: &str) -> Result<()> {
 
 /// An `--rm` or attached VM's app exited: only its exit status is left. It must be the status of
 /// `ident`, the instance signalled (never an earlier one's), and not that of a kill or a death.
+/// A record from before it said whose status it is: a status flexvm gives is taken as not the app's.
 fn app_exited(exit: Option<&containers::Exit>, ident: &host::Ident) -> bool {
-    exit.is_some_and(|e| e.ident == *ident && ![vmproc::DIED, 128 + libc::SIGINT, 128 + libc::SIGQUIT].contains(&e.code))
+    exit.is_some_and(|e| e.ident == *ident && e.app.unwrap_or(![vmproc::DIED, 128 + libc::SIGINT, 128 + libc::SIGQUIT].contains(&e.code)))
 }
 
 /// SIGTSTP, and waits until its vCPUs are paused.
 fn pause(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
-    host.signal(name, libc::SIGTSTP).map_err(|e| if e.is::<host::Unseen>() { unseen(name, e) } else { not_running(host, name) })?;
+    match signal_ready(host, name, libc::SIGTSTP) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(not_running(host, name)),
+        Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
+        Err(e) => return Err(e),
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match host.entry(name).map(|e| e.state) {
@@ -1515,10 +1573,12 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     if host.entry(name).is_ok_and(|e| e.state == "source") {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
     }
-    let killed = match host.signal(name, libc::SIGINT) {
+    let killed = match signal_entry(host, name, libc::SIGINT) {
         Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
-        r => r.ok(),
+        r => r?.map(|(vm, _)| vm),
     };
+    // Test gate `kill_gate`: the name's lock probed (`alive`), the VM signalled if it had an entry.
+    host::gate("kill_gate");
     if let Some(vm) = &killed {
         if !vm.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
@@ -1532,37 +1592,31 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     if stopped {
         return remove_stopped(host, name, killed.is_some() || records()?, true).and_then(|()| done());
     }
-    // A suspend that finished first is undone: the kill wins.
-    if killed.is_some() && !host.suspended(name)?.exists() {
-        return done();
+    // Nothing signalled: what held the name (`alive`) was no registered VM, or let it go since (a
+    // start whose resume failed, a sweep, an `rm` deciding). A stopped or ended VM's records stay:
+    // `kill` is for a running VM.
+    if killed.is_none() {
+        if host.alive(name) {
+            return Err(format!(
+                "vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}",
+                host.vms(name, "log")?.display()
+            )
+            .into());
+        }
+        if records()? {
+            bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
+        }
+        return remove_stopped(host, name, false, true);
     }
+    // A suspend that finished before the kill took is undone: the kill wins.
     if host.suspended(name)?.exists() {
         let _lock = host.take_name(name, true)?;
         // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
         if host.suspended(name)?.exists() {
             lifecycle::revoke(host, name)??;
         }
-        return done();
     }
-    // Under the name, as `remove_stopped` does: a start that holds it (a rerun reading its exited
-    // record) keeps its records, and this is refused below (it is starting). Only with one to
-    // remove: taking the name clears a moved record, whose hint (kill it there) is kept.
-    let ended = ["failed", "lost", "exited"];
-    let removed = match ended.iter().any(|ext| host.has_record(name, ext)).then(|| host.take_name(name, true)) {
-        None => Vec::new(),
-        Some(Ok(_lock)) => ended.into_iter().map(|ext| Ok(std::fs::remove_file(host.vms(name, ext)?).is_ok())).collect::<Result<Vec<_>>>()?,
-        Some(Err(e)) if host::name_taken(&e) => Vec::new(),
-        Some(Err(e)) => return Err(e),
-    };
-    if !host.alive(name) && removed.contains(&true) {
-        return done();
-    }
-    if host.alive(name) {
-        return Err(
-            format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()).into()
-        );
-    }
-    remove_stopped(host, name, false, true)
+    done()
 }
 
 /// `rm` (after killing a running VM for -f): under the name, so a `start` meanwhile either
@@ -1592,7 +1646,10 @@ fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool) -> Result<()> 
         lock.remove_logs()?;
     }
     for ext in ["exited", "failed", "lost"] {
-        let _ = std::fs::remove_file(host.vms(name, ext)?);
+        match std::fs::remove_file(host.vms(name, ext)?) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("vm {name}: removing its {ext} record: {e}").into()),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -2377,14 +2434,19 @@ mod exec_tests {
     fn stop_takes_only_the_signalled_instances_app_exit() {
         let me = host::Ident::me();
         let earlier = host::Ident { pid: me.pid.wrapping_add(1), ..me.clone() };
-        let exit = |ident: &host::Ident, code| containers::Exit { ident: ident.clone(), code };
-        assert!(app_exited(Some(&exit(&me, 0)), &me));
-        assert!(app_exited(Some(&exit(&me, 4)), &me));
+        let exit = |ident: &host::Ident, code, app| containers::Exit { ident: ident.clone(), code, app };
+        for code in [0, 4, vmproc::DIED, 130, 131] {
+            assert!(app_exited(Some(&exit(&me, code, Some(true))), &me), "the app's own {code}");
+            assert!(!app_exited(Some(&exit(&me, code, Some(false))), &me), "flexvm's {code}");
+        }
+        assert!(app_exited(Some(&exit(&me, 0, None)), &me));
+        assert!(app_exited(Some(&exit(&me, 4, None)), &me));
         // An earlier instance's status (one that exited before a new one took the name, which then died unrecorded).
-        assert!(!app_exited(Some(&exit(&earlier, 0)), &me));
+        assert!(!app_exited(Some(&exit(&earlier, 0, Some(true))), &me));
         assert!(!app_exited(None, &me));
+        // A record from before `app`: flexvm's statuses are not taken as the app's.
         for code in [vmproc::DIED, 130, 131] {
-            assert!(!app_exited(Some(&exit(&me, code)), &me), "{code}");
+            assert!(!app_exited(Some(&exit(&me, code, None)), &me), "{code}");
         }
     }
 
@@ -3663,6 +3725,37 @@ mod exec_tests {
         let e = configure_listener(&mut host, Some("flexvm-no-such-host.invalid:7070"), None).unwrap_err().to_string();
         assert!(e.starts_with("listen address flexvm-no-such-host.invalid:7070: DNS lookup"), "{e}");
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn kill_never_removes_a_stopped_vm_whose_name_something_else_holds() {
+        let root = crate::test_util::TempDir::new("kill-held");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        // Held with no registry entry (a start whose resume then fails, a sweep, an `rm` deciding).
+        let held = host.take_name("web", false).unwrap();
+        let dir = host.suspended("web").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(host.vms("web", "exited").unwrap(), b"{}").unwrap();
+        let refused = remove(&host, "web", true, false).unwrap_err().to_string();
+        assert!(refused.contains("is starting"), "{refused}");
+        drop(held);
+        // Let go of meanwhile: nothing was signalled, so nothing is undone.
+        let refused = remove(&host, "web", true, false).unwrap_err().to_string();
+        assert!(refused.contains("is not running"), "{refused}");
+        assert!(dir.join("manifest.json").exists() && !dir.join("DISCARDED").exists());
+        assert!(host.has_record("web", "exited"));
+    }
+
+    #[test]
+    fn start_of_a_moved_vm_says_where_and_keeps_the_hint() {
+        let root = crate::test_util::TempDir::new("start-moved");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::write(host.vms("web", "moved").unwrap(), b"b:7070").unwrap();
+        let args = parse(&["start", "web"]);
+        assert_eq!(start(&host, &args, "web").unwrap_err().to_string(), "vm web moved to b:7070; it runs there");
+        assert!(host.has_record("web", "moved"));
+        assert_eq!(start(&host, &args, "nobody").unwrap_err().to_string(), r#"no vm named "nobody""#);
     }
 
     #[test]

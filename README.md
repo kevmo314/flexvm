@@ -268,8 +268,8 @@ flexvm ends) and its size followed. As with docker, `-it` needs a terminal.
 Stdin survives what exec does: a pause, a checkpoint, an aborted migration
 reconnect it, and the guest takes each byte once, as numbered. A stop or a
 migration ends the client (the app keeps its stdin: `attach` again after `start`,
-or on the target). `attach NAME` shows the app's output from then on; with `-i`
-it is also the app's stdin. `cp` streams a tar through flexvm-init (images need
+or on the target). `attach NAME` shows the app's output from then on; it also
+feeds the app's stdin when the app's stdin is open (`run -i`). `cp` streams a tar through flexvm-init (images need
 no `tar`): guest paths are resolved in the guest, files land there as root, and
 what comes out is unpacked without following its links, setuid bits or devices.
 A DST that is itself a link is followed only if root or the user unpacking (on
@@ -415,7 +415,8 @@ one (`unpause` that), after waiting out a stop under way.
 
 `start` of an `exited` VM runs it again: a new VM of its image under its
 name, with what it was run with (its command, `-p`, `-e`, `--entrypoint`, `--keep`,
-`--rm`, `--cpus`, `--memory`, and its `--ip` if one was given). A VM has no
+`--cpus`, `--memory`, and its `--ip` if one was given; an `--rm` VM leaves no
+`exited` record to run again). A VM has no
 disk of its own: its root is the image's read-only filesystem with an overlay
 in the guest's memory, so what it wrote ends when it exits (a `stop` keeps it,
 in the memory it saves). The rerun starts from the image's current template,

@@ -353,7 +353,13 @@ impl Proc {
             }
             Err(Restore::Uncertain(e)) => {
                 *self.cmd.lock().unwrap() = None;
-                let _ = crate::host::write_record(&dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()).as_bytes());
+                // Unrecorded, nothing holds the next start back in this boot: said, so none is tried.
+                if let Err(w) = crate::host::write_record(&dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()).as_bytes()) {
+                    bail!(
+                        "vm {name} must not be started again in this boot: {e}; recording its quarantine in {} failed too ({w}); flexvm rm it to discard its checkpoint, or start it only after a reboot",
+                        dir.join(QUARANTINE).display()
+                    )
+                }
                 bail!("vm {name} is quarantined: {e}; flexvm rm it to discard its checkpoint")
             }
             // Re-arming the checkpoint would replay what it did since.

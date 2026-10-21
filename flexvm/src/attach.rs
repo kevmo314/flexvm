@@ -1016,10 +1016,10 @@ mod tests {
         let rec = crate::app::Exited::new(0, "t".into(), None, Default::default(), Default::default(), 0);
         crate::host::write_record(&host.vms("web", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
         // Killed, then another VM made under the name exited: its records are not this attach's VM's.
-        crate::containers::record_exit(&host, "web", &crate::host::Ident { pid: 999_999_902, ..ours.clone() }, 0);
+        crate::containers::record_exit(&host, "web", &crate::host::Ident { pid: 999_999_902, ..ours.clone() }, 0, false);
         assert!(gone(&vm).unwrap_err().to_string().contains("made again"));
         // Its own end: its status.
-        crate::containers::record_exit(&host, "web", &ours, 0);
+        crate::containers::record_exit(&host, "web", &ours, 0, false);
         assert_eq!(gone(&vm).unwrap(), 0);
     }
 
