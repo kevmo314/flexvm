@@ -355,6 +355,8 @@ fn standby_sockets(dir: &Path) {
     // Held while a standby replaces its socket (`standby::serve`): a reused pid's new socket is seen with its lock held.
     // Not waited for: a standby stopped holding it would stall every sweep.
     let Ok(_publish) = crate::host::private_file(&locks.join("publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB)) else { return };
+    let held = held_pid_locks(&locks);
+    let unheld = |pid, ns| held.as_ref().is_some_and(|held| !held.contains(&(pid, ns)));
     for e in [dir, &locks].iter().flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten()) {
         let n = e.file_name().to_string_lossy().into_owned();
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
@@ -372,12 +374,12 @@ fn standby_sockets(dir: &Path) {
             // A socket, or its claimer's `PID.PIDNS.take`: a standby's of that pid and PID namespace, whatever its
             // pid is here, while one of its locks is held.
             match claim.or(sock).and_then(crate::standby::sock_of) {
-                Some((pid, Some(ns))) => unheld_pid_locks(&locks, pid, Some(ns)),
+                Some((pid, Some(ns))) => unheld(pid, Some(ns)),
                 Some((pid, None)) if sock.is_some() => match std::fs::symlink_metadata(format!("/proc/{pid}")) {
                     // An earlier build's `PID.sock`. A pid with no /proc entry here may still run in another
                     // PID namespace sharing this run directory: its socket goes only once no lock of its pid
                     // is held. An identity that cannot be read otherwise proves nothing and the socket stays.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => unheld_pid_locks(&locks, pid, None),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => unheld(pid, None),
                     _ => match Ident::of(pid) {
                         Some(id) => lock_free(&locks.join(format!("{}.lock", id.key())), libc::LOCK_SH),
                         None => continue,
@@ -392,19 +394,20 @@ fn standby_sockets(dir: &Path) {
     }
 }
 
-/// Whether no standby lock of `pid` (`ID.lock`, any start) in `locks` is held, of PID namespace `ns` where that is
-/// given (any otherwise); one that cannot be listed or probed counts as held.
-fn unheld_pid_locks(locks: &Path, pid: u32, ns: Option<u64>) -> bool {
-    let Ok(entries) = std::fs::read_dir(locks) else { return false };
-    for e in entries {
-        let Ok(e) = e else { return false };
+/// Index held standby locks once under `.locks/publish`. An unreadable lock counts as held; an unreadable
+/// directory or entry makes the whole index unknown. Include a namespace-free key for legacy sockets.
+fn held_pid_locks(locks: &Path) -> Option<std::collections::HashSet<(u32, Option<u64>)>> {
+    let mut held = std::collections::HashSet::new();
+    for e in std::fs::read_dir(locks).ok()? {
+        let e = e.ok()?;
         let n = e.file_name();
         let Some(id) = n.to_str().and_then(|n| Ident::from_key(n.strip_suffix(".lock")?)) else { continue };
-        if id.pid == pid && ns.is_none_or(|ns| id.ns == Some(ns)) && !lock_free(&e.path(), libc::LOCK_SH) {
-            return false;
+        if !lock_free(&e.path(), libc::LOCK_SH) {
+            held.insert((id.pid, id.ns));
+            held.insert((id.pid, None));
         }
     }
-    true
+    Some(held)
 }
 
 #[cfg(test)]
@@ -507,8 +510,27 @@ mod tests {
         assert!(!left(".999999999-1.lock") && left(&mine));
     }
 
-    /// A sweep skips the dir while a standby replaces its socket under its `.locks/publish` (one stopped there stalls no
-    /// sweep), sweeps it once free, and keeps that lock file.
+    #[test]
+    fn standby_lock_index_is_conservative_and_reused() {
+        let d = dir("lock-index");
+        let held = File::create(d.join("7-1-9.lock")).unwrap();
+        flock(&held, libc::LOCK_EX).unwrap();
+        File::create(d.join("8-1-9.lock")).unwrap();
+        // A symlink loop cannot be opened, even by root: unknown means held.
+        std::os::unix::fs::symlink("9-1-10.lock", d.join("9-1-10.lock")).unwrap();
+        let index = held_pid_locks(&d).unwrap();
+        assert!(index.contains(&(7, Some(9))) && index.contains(&(7, None)));
+        assert!(index.contains(&(9, Some(10))) && index.contains(&(9, None)));
+        assert!(!index.contains(&(7, Some(10))) && !index.contains(&(8, None)));
+        // All socket lookups use the snapshot, with no filesystem reads per socket.
+        drop(held);
+        std::fs::remove_file(d.join("7-1-9.lock")).unwrap();
+        assert!(index.contains(&(7, Some(9))));
+        assert!(!held_pid_locks(&d).unwrap().contains(&(7, Some(9))));
+        assert!(held_pid_locks(&d.join("missing")).is_none());
+        assert!(held_pid_locks(&d.join("8-1-9.lock")).is_none());
+    }
+
     #[test]
     fn a_standby_in_another_pid_namespace_keeps_its_socket() {
         let d = dir("pidns");
@@ -525,6 +547,8 @@ mod tests {
         assert!(!d.join("999999991.sock").exists(), "gone once no lock of its pid is held");
     }
 
+    /// A sweep skips the dir while a standby replaces its socket under its `.locks/publish` (one stopped there stalls no
+    /// sweep), sweeps it once free, and keeps that lock file.
     #[test]
     fn socket_sweep_skips_a_standby_publishing() {
         let d = dir("publish");

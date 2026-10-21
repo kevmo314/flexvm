@@ -883,7 +883,7 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let answer = |r: &Result<Value>| send_json(&mut crate::util::By { s: &conn, at: Instant::now() + ANSWER_WAIT }, &crate::util::reply(r));
     let (paths, id) = (crate::template::Paths::new(&host.state), req["id"].as_str().unwrap_or(""));
     let (only_ask, ack) = (req["have"] == true, req["ack"] == true);
-    let held = || HELD.lock().unwrap().get(id).map(|h| h.0.clone());
+    let held = || HELD.lock().unwrap().templates.get(id).map(|h| h.0.clone());
     // A received one's digests, for the source to compare: its content id is no proof of its files.
     let have = |t: &crate::template::Template| json!({"have": true, "digests": t.meta.received.then_some(&t.meta.digests)});
     if let Some(tpl) = held() {
@@ -913,7 +913,7 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
         let _slot = PUSHES.take(conn.peer_addr()?.ip()).ok_or(BUSY)?;
         answer(&Ok(json!({"have": false, "ack": ack})))?;
         asked = true;
-        let (in_use, held) = (|| host.template_users(), || HELD.lock().unwrap().keys().cloned().collect());
+        let (in_use, held) = (|| host.template_users(), || HELD.lock().unwrap().templates.keys().cloned().collect());
         let push = crate::template::Push { peer: conn.peer_addr()?.ip(), bytes: req["bytes"].as_u64(), in_use: &in_use, held: &held };
         let ready = |_: &crate::template::Meta| {
             if ack {
@@ -949,22 +949,25 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
 }
 
 /// Generations held for arrivals, by content id, until when.
-static HELD: Mutex<std::collections::BTreeMap<String, (Arc<crate::template::Template>, Instant)>> = Mutex::new(std::collections::BTreeMap::new());
-// Protected by HELD: set before inserting the first hold, cleared only when empty.
-static HOLD_SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct Held {
+    templates: std::collections::BTreeMap<String, (Arc<crate::template::Template>, Instant)>,
+    // Set before inserting the first hold, cleared only when empty.
+    sweeping: bool,
+}
+
+static HELD: Mutex<Held> = Mutex::new(Held { templates: std::collections::BTreeMap::new(), sweeping: false });
 
 /// Generations held at once at most: past it, an arrival's own `open_id` must come before any `rmi` does.
 const MAX_HELD: usize = 16;
 
 fn hold(tpl: Arc<crate::template::Template>) {
-    use std::sync::atomic::Ordering;
     let (id, mut held) = (tpl.meta.id.clone(), HELD.lock().unwrap());
-    if !HOLD_SWEEPING.load(Ordering::Relaxed) {
+    if !held.sweeping {
         if let Err(e) = std::thread::Builder::new().name("held-templates".into()).spawn(|| loop {
             let mut held = HELD.lock().unwrap();
             let now = Instant::now();
-            let Some(next) = sweep_held(&mut held, now) else {
-                HOLD_SWEEPING.store(false, Ordering::Relaxed);
+            let Some(next) = sweep_held(&mut held.templates, now) else {
+                held.sweeping = false;
                 return;
             };
             drop(held);
@@ -973,10 +976,10 @@ fn hold(tpl: Arc<crate::template::Template>) {
             crate::log!("could not hold template for arrival: {e}");
             return;
         }
-        HOLD_SWEEPING.store(true, Ordering::Relaxed);
+        held.sweeping = true;
     }
-    if held.len() < MAX_HELD || held.contains_key(&id) {
-        held.insert(id, (tpl, Instant::now() + PUSH_HOLD));
+    if held.templates.len() < MAX_HELD || held.templates.contains_key(&id) {
+        held.templates.insert(id, (tpl, Instant::now() + PUSH_HOLD));
     }
 }
 
@@ -1290,7 +1293,7 @@ mod tests {
         // Sent: its metadata acknowledged, then its data; held before the source is answered (charged to its peer).
         let (got, digests) = crate::migrate::push_template(&addr, &tpl, false).unwrap().unwrap();
         assert!(got["ms"].is_number() && digests == json!(tpl.digests().unwrap()), "{got}");
-        assert!(crate::template::Template::generation(&paths, &id).is_some() && HELD.lock().unwrap().contains_key(&id));
+        assert!(crate::template::Template::generation(&paths, &id).is_some() && HELD.lock().unwrap().templates.contains_key(&id));
         // Held: answered though every slot of this peer is taken and another arrival of it has its turn.
         let _slots: Vec<_> = (0..MAX_PUSHES_FROM).map(|_| PUSHES.take("127.0.0.1".parse().unwrap()).unwrap()).collect();
         let _turn = crate::template::turn(&paths, &id, Instant::now()).unwrap();
@@ -1300,9 +1303,9 @@ mod tests {
         assert_eq!(ask(json!({"op": "template", "id": id})).1["have"], true);
         // Hold expired: the generation on disk still answers without a receive slot, on either ask.
         drop(_turn);
-        HELD.lock().unwrap().remove(&id);
+        HELD.lock().unwrap().templates.remove(&id);
         assert!(crate::migrate::push_template(&addr, &tpl, false).unwrap().is_some());
-        HELD.lock().unwrap().remove(&id);
+        HELD.lock().unwrap().templates.remove(&id);
         assert!(crate::migrate::push_template(&addr, &tpl, true).unwrap().is_some());
         // A missing generation is answered without a slot only on a have-only ask.
         let other = "0".repeat(16);

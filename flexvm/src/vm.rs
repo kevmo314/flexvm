@@ -420,6 +420,8 @@ impl Vm {
         saved?;
         down?;
         let runs = self.pager.quiesce_export(|| self.cancel_checkpoint.load(Ordering::SeqCst) != 0)?;
+        // Test gate `ckpt_exported_gate`: the checkpoint parks with the pager quiesced.
+        crate::host::hold("ckpt_exported_gate");
         t.mark("export_runs");
         Ok(runs)
     }

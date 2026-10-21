@@ -69,7 +69,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "sigkill_restart listen_trickle suspend_cmd suspend_slow_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap pidns_names pidns_control pidns_standby arrival_overtaken "
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
-          "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash "
+          "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission ckpt_prefetch_hold standby_admission pause_lost cow_crash "
           "checkpoint_untrusted_dir run_status concurrent_start kill_rerun_race stop_self_exit unread_output quit_status ctrl_z_long_op app_log warm_ready forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked restore_route_fence "
           "resume_outcome exec_recovery_instance pause_resume collapse_abort "
           "app_abort arrival_bind_fail back_to_back evict_peer_busy kill_prepare resume_bind_fail resume_migrating rmi_suspend "
@@ -2671,7 +2671,7 @@ COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containe
         "faults/resume_suspending": 16, "image_template": 15, "pull_gc": 40, "pull_standby": 20, "checkpoint_store": 12, "checkpoint_save_load": 20, "checkpoint_load_other_build": 15, "app_lifecycle": 30, "interactive": 30, "copy": 10, "faults/arrival_flood": 14, "faults/page_conns": 14,
         "faults/page_refusals": 14, "faults/connect_after_pull": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13, "faults/collapse_abort": 13,
         "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
-        "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,
+        "faults/start_admission": 12, "faults/ckpt_prefetch_hold": 30, "faults/cow_wp_race": 11, "faults/forged_pages": 11,
         "faults/standby_admission": 11, "faults/wildcard_listen": 11, "faults/arrival_abort_route": 10,
         "faults/evict_skips_cmd": 10, "faults/listen_trickle": 10, "faults/pause_lost": 10, "faults/cow_exact": 9,
         "faults/fetch_tail_enomem": 9, "faults/plug_storm": 9, "faults/unknown": 9, "faults/fetch_enomem_stuck": 8,
