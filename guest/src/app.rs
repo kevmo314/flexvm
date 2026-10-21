@@ -14,7 +14,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -514,6 +514,27 @@ impl Drop for CheckGroup {
     }
 }
 
+/// Lets the app reopen /dev/std{in,out,err} after dropping root. Only the pipes and pty slaves
+/// made for this one process are handed over: never /dev/null or any other shared file.
+/// Uses only syscalls, so it is safe in pre_exec.
+fn chown_stdio(fd: RawFd, uid: u32, gid: u32) -> io::Result<()> {
+    const PIPEFS_MAGIC: libc::__fsword_t = 0x5049_5045;
+    const DEVPTS_MAGIC: libc::__fsword_t = 0x1cd1;
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    crate::os(unsafe { libc::fstatfs(fd, &mut fs) })?;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    crate::os(unsafe { libc::fstat(fd, &mut stat) })?;
+    let ours = match stat.st_mode & libc::S_IFMT {
+        libc::S_IFIFO => fs.f_type == PIPEFS_MAGIC,
+        libc::S_IFCHR => fs.f_type == DEVPTS_MAGIC,
+        _ => false,
+    };
+    if !ours || (stat.st_uid == uid && stat.st_gid == gid) {
+        return Ok(());
+    }
+    crate::os(unsafe { libc::fchown(fd, uid, gid) }).map(drop)
+}
+
 /// A session of its own if `own_session`, the app's credentials and, if non-root, no capabilities and
 /// no_new_privs; done by hand because CommandExt::uid would clear the supplementary groups.
 pub(crate) fn credentials(cmd: &mut Command, c: &Conf, own_session: bool) {
@@ -524,6 +545,9 @@ pub(crate) fn credentials(cmd: &mut Command, c: &Conf, own_session: bool) {
                 crate::os(libc::setsid())?;
             }
             if uid != 0 {
+                for fd in 0..=2 {
+                    chown_stdio(fd, uid, gid)?;
+                }
                 // No way back to root: drop the bounding set (EINVAL: past the kernel's last capability).
                 for cap in 0..64 {
                     if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && *libc::__errno_location() != libc::EINVAL {
@@ -672,6 +696,45 @@ fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn stdio_chown_skips_null_and_already_owned_fds() {
+        use std::os::unix::fs::MetadataExt;
+        let null = File::open("/dev/null").unwrap();
+        let before = null.metadata().unwrap();
+        chown_stdio(null.as_raw_fd(), 12345, 12345).unwrap();
+        let after = null.metadata().unwrap();
+        assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+        let (_, slave) = crate::input::openpty(None).unwrap();
+        let before = slave.metadata().unwrap();
+        chown_stdio(slave.as_raw_fd(), before.uid(), before.gid()).unwrap();
+        let after = slave.metadata().unwrap();
+        assert_eq!((before.ctime(), before.ctime_nsec()), (after.ctime(), after.ctime_nsec()));
+        // A file (say, the host's log) is never handed over: trying would fail EPERM unprivileged.
+        let dir = crate::test_util::TempDir::new("stdio-chown");
+        let file = File::create(dir.join("log")).unwrap();
+        let before = file.metadata().unwrap();
+        chown_stdio(file.as_raw_fd(), 12345, 12345).unwrap();
+        assert_eq!((before.uid(), before.gid()), (file.metadata().unwrap().uid(), file.metadata().unwrap().gid()));
+        assert_eq!(chown_stdio(-1, 101, 101).unwrap_err().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    #[ignore = "requires root to change stdio ownership and app credentials"]
+    fn nonroot_can_reopen_stdio() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        for tty in [false, true] {
+            for stdin in [false, true] {
+                let pty = tty.then(|| crate::input::openpty(None).unwrap());
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-ec", "exec 3</dev/stdin; echo out >/dev/stdout; echo err >/dev/stderr"]);
+                crate::input::stdio(&mut cmd, pty.as_ref().map(|(_, slave)| slave), stdin).unwrap();
+                credentials(&mut cmd, &parse_conf("uid 101\ngid 101").unwrap(), !tty);
+                let mut child = cmd.spawn().unwrap();
+                assert!(child.wait().unwrap().success(), "tty={tty}, stdin={stdin}");
+            }
+        }
+    }
 
     #[test]
     fn readiness_deadline_rejects_overflow() {

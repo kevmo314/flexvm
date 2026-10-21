@@ -112,6 +112,18 @@ fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str
 /// tmpfs may lack a namespace (user.* before 6.6, ACLs without TMPFS_POSIX_ACL, which our kernel
 /// has), and overlayfs's own trusted.overlay.* would change how the upper root is read.
 fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
+    copy_root_metadata_with_xattrs(lower, upper, list_xattrs)
+}
+
+fn list_xattrs(src: RawFd) -> io::Result<Vec<u8>> {
+    let n = os(unsafe { libc::flistxattr(src, std::ptr::null_mut(), 0) })?;
+    let mut names = vec![0u8; n as usize];
+    let n = os(unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) })?;
+    names.truncate(n as usize);
+    Ok(names)
+}
+
+fn copy_root_metadata_with_xattrs(lower: &str, upper: &str, list: impl FnOnce(RawFd) -> io::Result<Vec<u8>>) -> io::Result<()> {
     let lower = File::open(lower)?;
     let upper = File::open(upper)?;
     let meta = lower.metadata()?;
@@ -125,18 +137,12 @@ fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
     };
     os(unsafe { libc::fchown(dst, meta.uid(), meta.gid()) })?;
     mode(meta.mode() & 0o7777)?;
-    let names = (|| {
-        let n = os(unsafe { libc::flistxattr(src, std::ptr::null_mut(), 0) })?;
-        let mut names = vec![0u8; n as usize];
-        let n = os(unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) })?;
-        names.truncate(n as usize);
-        Ok::<_, io::Error>(names)
-    })();
-    let names = match names {
-        Ok(names) => names,
+    // Unlistable xattrs leave only the access ACL to probe for: absent, the group bits stand.
+    let (names, probed) = match list(src) {
+        Ok(names) => (names, false),
         Err(e) => {
             log(&format!("root xattrs: {e}"));
-            return no_acl();
+            (b"system.posix_acl_access\0".to_vec(), true)
         }
     };
     for name in names.split_inclusive(|&b| b == 0) {
@@ -144,12 +150,17 @@ fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
         if name.to_bytes().starts_with(b"trusted.overlay.") {
             continue;
         }
-        let copied = (|| {
+        let value = (|| {
             let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), std::ptr::null_mut(), 0) })?;
             let mut value = vec![0u8; n as usize];
             let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) })?;
-            os(unsafe { libc::fsetxattr(dst, name.as_ptr(), value.as_ptr().cast(), n as usize, 0) })
+            value.truncate(n as usize);
+            Ok::<_, io::Error>(value)
         })();
+        let copied = match value {
+            Err(e) if probed && matches!(e.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) => continue,
+            value => value.and_then(|v| os(unsafe { libc::fsetxattr(dst, name.as_ptr(), v.as_ptr().cast(), v.len(), 0) })),
+        };
         if let Err(e) = copied {
             log(&format!("root xattr {}: {e}", name.to_string_lossy()));
             if name == c"system.posix_acl_access" {
@@ -182,8 +193,14 @@ fn setup_root() -> io::Result<()> {
     os(unsafe { libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c"mnt/oldroot".as_ptr()) })?;
     std::env::set_current_dir("/")?;
     unsafe { libc::umount2(c"/mnt/oldroot".as_ptr(), libc::MNT_DETACH) };
-    mount("tmpfs", "/run", "tmpfs", 0, "mode=755,size=0")?;
-    mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777,size=0")?;
+    // The image's /run and /tmp, as Docker leaves them (their writes land in the overlay's tmpfs
+    // upper layer all the same); made only where the image has none.
+    for (dir, mode) in [("/run", 0o755), ("/tmp", 0o1777)] {
+        if std::fs::symlink_metadata(dir).is_err() {
+            std::fs::create_dir(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))?;
+        }
+    }
     std::fs::create_dir_all("/dev/pts")?;
     mount("devpts", "/dev/pts", "devpts", 0, "")?;
     std::fs::create_dir_all("/dev/shm")?;
@@ -734,6 +751,28 @@ fn request_line(r: &mut impl BufRead) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn root_group_access_is_removed_only_for_a_known_uncopied_acl() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_util::TempDir::new("root-acl-error");
+        let lower = dir.join("lower");
+        let upper = dir.join("upper");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::create_dir(&upper).unwrap();
+        std::fs::set_permissions(&lower, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (names, expected) in [
+            (Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)), 0o755),
+            (Err(std::io::Error::from_raw_os_error(libc::EACCES)), 0o755),
+            (Ok(Vec::new()), 0o755),
+            (Ok(b"user.missing\0".to_vec()), 0o755),
+            (Ok(b"system.posix_acl_access\0".to_vec()), 0o705),
+        ] {
+            // A listed but unavailable access ACL exercises the fail-closed copy path.
+            super::copy_root_metadata_with_xattrs(lower.to_str().unwrap(), upper.to_str().unwrap(), |_| names).unwrap();
+            assert_eq!(std::fs::metadata(&upper).unwrap().mode() & 0o7777, expected);
+        }
+    }
+
     #[test]
     fn overlay_upper_keeps_lower_root_metadata() {
         use std::os::fd::AsRawFd;
