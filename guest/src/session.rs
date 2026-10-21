@@ -671,180 +671,196 @@ fn open_with_spawn<'a>(
     statuses: &Statuses,
     spawn: impl FnOnce(&mut Command, &Statuses, bool) -> io::Result<(std::process::Child, Option<OwnedFd>, u64)>,
 ) -> io::Result<Option<(&'a str, u64, Attached)>> {
+    let mut conn = conn;
+    let mut spawn = Some(spawn);
+    loop {
+        match open_attempt(body, &mut conn, line, sessions, statuses, &mut spawn)? {
+            Open::Retry(output) => wait_started(&output),
+            Open::Done(attached) => return Ok(attached),
+        }
+    }
+}
+
+enum Open<'a> {
+    Retry(Session),
+    Done(Option<(&'a str, u64, Attached)>),
+}
+
+fn open_attempt<'a>(
+    body: &[u8],
+    conn: &mut Option<File>,
+    line: &'a str,
+    sessions: &Sessions,
+    statuses: &Statuses,
+    spawn: &mut Option<impl FnOnce(&mut Command, &Statuses, bool) -> io::Result<(std::process::Child, Option<OwnedFd>, u64)>>,
+) -> io::Result<Open<'a>> {
     let gone = || io::Error::other("session closed");
     let unknown = || io::Error::other("unknown session");
-    loop {
-        return Ok(Some(match parse(line)? {
-            Request::Start { id, len, argv } => {
-                let command = body.get(..len).ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
-                let fingerprint = fingerprint(command);
-                // Reads passwd and prepares the command without blocking other sessions or the reaper.
-                // A retry still attaches even if its directory or user can no longer be resolved.
-                let prepared = (|| {
-                    let command = std::str::from_utf8(command).map_err(io::Error::other)?;
-                    let spec = argv.then(|| crate::proto::Exec::decode(command).map_err(io::Error::other)).transpose()?;
-                    let (cmd, exec) = match &spec {
-                        Some(spec) => crate::app::exec_command(spec).map(|(cmd, c)| (cmd, Some(c)))?,
-                        None => (shell_command(command)?, None),
-                    };
-                    Ok::<_, io::Error>((spec, cmd, exec))
-                })();
-                // Reserve the id and capacity under the lock; spawn without it.
-                let mut table = sessions.lock().unwrap();
-                if table.ended(id) {
-                    return Err(gone());
+    let attached = match parse(line)? {
+        Request::Start { id, len, argv } => {
+            let command = body.get(..len).ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+            let fingerprint = fingerprint(command);
+            // Reads passwd and prepares the command without blocking other sessions or the reaper.
+            // A retry still attaches even if its directory or user can no longer be resolved.
+            let prepared = (|| {
+                let command = std::str::from_utf8(command).map_err(io::Error::other)?;
+                let spec = argv.then(|| crate::proto::Exec::decode(command).map_err(io::Error::other)).transpose()?;
+                let (cmd, exec) = match &spec {
+                    Some(spec) => crate::app::exec_command(spec).map(|(cmd, c)| (cmd, Some(c)))?,
+                    None => (shell_command(command)?, None),
+                };
+                Ok::<_, io::Error>((spec, cmd, exec))
+            })();
+            // Reserve the id and capacity under the lock; spawn without it.
+            let mut table = sessions.lock().unwrap();
+            if table.ended(id) {
+                return Err(gone());
+            }
+            if let Some(entry) = table.live.get(id) {
+                if entry.command != fingerprint {
+                    return Err(io::Error::other("session id already used for another command"));
                 }
-                if let Some(entry) = table.live.get(id) {
-                    if entry.command != fingerprint {
-                        return Err(io::Error::other("session id already used for another command"));
-                    }
-                    if entry.output.0.lock().unwrap().starting {
-                        let output = entry.output.clone();
-                        drop(table);
-                        wait_started(&output);
-                        continue;
-                    }
-                    return Ok(Some((id, 0, attach(&entry.output, 0, conn))));
+                if entry.output.0.lock().unwrap().starting {
+                    return Ok(Open::Retry(entry.output.clone()));
                 }
-                let (spec, mut cmd, exec) = prepared?;
-                let detached = spec.as_ref().is_some_and(|s| s.detach);
-                let (stdin, tty) = spec.as_ref().map_or((false, false), |s| (s.stdin, s.tty));
-                let detachable = detached || (stdin && tty);
-                table.admit(statuses, detached, detachable)?;
-                let pty = tty.then(|| crate::input::openpty(spec.as_ref().and_then(|s| s.size))).transpose()?;
-                // Start the pump first: if no thread can be had, nothing has run yet.
-                let (tx, rx) = mpsc::sync_channel::<(Vec<(File, u8)>, OwnedFd, u64)>(1);
-                let output = session(Output { starting: true, detached, detachable, gone: detached.then(awake), ..table.new_output() });
-                let (pumped, statuses_) = (output.clone(), statuses.clone());
-                thread::Builder::new()
-                    .spawn(move || {
-                        if let Ok((streams, exited, token)) = rx.recv() {
-                            let rest = crate::pump_until(streams, Some(exited), DRAIN, |kind, data| deliver(&pumped, kind, data));
-                            // Closed, they would kill a background process's next write with SIGPIPE.
-                            crate::discard(rest);
-                            // By token: the pid may be another child's by now, however long the client took.
-                            let exit = wait_exit(&statuses_, token, None);
-                            let mut ring = pumped.0.lock().unwrap();
-                            ring.exit = exit;
-                            if ring.detached {
-                                ring.delivered = Some(DELIVERIES.fetch_add(1, Ordering::Relaxed));
-                                ring.gone = Some(awake());
-                            }
-                            drop(ring);
-                            pumped.1.notify_all();
-                        }
-                    })
-                    .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
-                // A pty's is its own session; its process group is its pid all the same.
-                crate::input::stdio(&mut cmd, pty.as_ref().map(|(_, slave)| slave), stdin)?;
-                if pty.is_none() {
-                    cmd.process_group(0);
-                }
-                if let Some(work) = crate::mem::work_procs() {
-                    crate::mem::enter(&mut cmd, work, false);
-                }
-                // After entering the cgroup, which needs root.
-                if let Some(c) = &exec {
-                    crate::app::credentials(&mut cmd, c, false);
-                }
-                table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: 0, token: 0 });
-                drop(table);
-                let started = (|| {
-                    // argv commands also work in images without a shell.
-                    let (mut child, exited, token) = spawn(&mut cmd, statuses, true).map_err(|e| {
-                        let program = cmd.get_program().to_string_lossy().into_owned();
-                        match (&spec, e.kind()) {
-                            // The directory was checked: not found is the program (or its interpreter).
-                            (Some(_), io::ErrorKind::NotFound) => cannot_run(127, format!("cannot run {program}: {e}")),
-                            (Some(_), _) => cannot_run(126, format!("cannot run {program}: {e}")),
-                            (None, kind) => {
-                                let hint = if kind == io::ErrorKind::NotFound { " (does the image have a shell?)" } else { "" };
-                                io::Error::new(kind, format!("cannot run /bin/sh: {e}{hint}"))
-                            }
-                        }
-                    })?;
-                    // The slave's copies go with the command: the pty's master reads EOF (EIO) once its last user is gone.
-                    drop(cmd);
-                    // Failing from here on, the command is killed: left running, it would be no session's.
-                    let pid = child.id() as i32;
-                    // Unwatched, its output would be read until background processes close it, not `DRAIN` past its exit.
-                    let exited = exited.ok_or_else(|| crate::app::unwatched(statuses, pid, token, io::Error::other("cannot open a pidfd to watch it")))?;
-                    let (streams, input) =
-                        crate::input::streams(&mut child, pty.map(|(master, _)| master)).map_err(|e| crate::app::unwatched(statuses, pid, token, e))?;
-                    Ok::<_, io::Error>((streams, input, exited, pid, token))
-                })();
-                let mut table = sessions.lock().unwrap();
-                let mut ring = output.0.lock().unwrap();
-                ring.starting = false;
-                output.1.notify_all();
-                let (streams, input, exited, pid, token) = match started {
-                    Ok(started) if !ring.closed => started,
-                    result => {
-                        if !ring.closed {
-                            table.live.remove(id);
-                            ring.closed = true;
+                return Ok(Open::Done(Some((id, 0, attach(&entry.output, 0, conn.take())))));
+            }
+            let (spec, mut cmd, exec) = prepared?;
+            let detached = spec.as_ref().is_some_and(|s| s.detach);
+            let (stdin, tty) = spec.as_ref().map_or((false, false), |s| (s.stdin, s.tty));
+            let detachable = detached || (stdin && tty);
+            table.admit(statuses, detached, detachable)?;
+            let pty = tty.then(|| crate::input::openpty(spec.as_ref().and_then(|s| s.size))).transpose()?;
+            // Start the pump first: if no thread can be had, nothing has run yet.
+            let (tx, rx) = mpsc::sync_channel::<(Vec<(File, u8)>, OwnedFd, u64)>(1);
+            let output = session(Output { starting: true, detached, detachable, gone: detached.then(awake), ..table.new_output() });
+            let (pumped, statuses_) = (output.clone(), statuses.clone());
+            thread::Builder::new()
+                .spawn(move || {
+                    if let Ok((streams, exited, token)) = rx.recv() {
+                        let rest = crate::pump_until(streams, Some(exited), DRAIN, |kind, data| deliver(&pumped, kind, data));
+                        // Closed, they would kill a background process's next write with SIGPIPE.
+                        crate::discard(rest);
+                        // By token: the pid may be another child's by now, however long the client took.
+                        let exit = wait_exit(&statuses_, token, None);
+                        let mut ring = pumped.0.lock().unwrap();
+                        ring.exit = exit;
+                        if ring.detached {
+                            ring.delivered = Some(DELIVERIES.fetch_add(1, Ordering::Relaxed));
+                            ring.gone = Some(awake());
                         }
                         drop(ring);
-                        drop(table);
-                        return Err(match result {
-                            Ok((_, _, _, pid, token)) => crate::app::unwatched(statuses, pid, token, gone()),
-                            Err(e) => e,
-                        });
+                        pumped.1.notify_all();
                     }
-                };
-                ring.input = input.map(Arc::new);
-                drop(ring);
-                table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: pid, token });
-                // Attached before any output, so none is overwritten before it is sent.
-                let attached = attach(&output, 0, conn);
-                let _ = tx.send((streams, exited, token));
-                (id, 0, attached)
+                })
+                .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
+            // A pty's is its own session; its process group is its pid all the same.
+            crate::input::stdio(&mut cmd, pty.as_ref().map(|(_, slave)| slave), stdin)?;
+            if pty.is_none() {
+                cmd.process_group(0);
             }
-            Request::Attach { id, offset, claim, epoch, rejoin } => {
-                let table = sessions.lock().unwrap();
-                if epoch.is_some() && table.fence.1.is_some() && epoch != table.fence.1 {
-                    return Err(io::Error::other(ATTACHED_SINCE));
-                }
-                if table.ended(id) {
-                    return Err(gone());
-                }
-                let output = &table.live.get(id).ok_or_else(unknown)?.output;
-                if output.0.lock().unwrap().starting {
-                    let output = output.clone();
+            if let Some(work) = crate::mem::work_procs() {
+                crate::mem::enter(&mut cmd, work, false);
+            }
+            // After entering the cgroup, which needs root.
+            if let Some(c) = &exec {
+                crate::app::credentials(&mut cmd, c, false);
+            }
+            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: 0, token: 0 });
+            drop(table);
+            let started = (|| {
+                // argv commands also work in images without a shell.
+                let (mut child, exited, token) = spawn.take().expect("session spawned once")(&mut cmd, statuses, true).map_err(|e| {
+                    let program = cmd.get_program().to_string_lossy().into_owned();
+                    match (&spec, e.kind()) {
+                        // The directory was checked: not found is the program (or its interpreter).
+                        (Some(_), io::ErrorKind::NotFound) => cannot_run(127, format!("cannot run {program}: {e}")),
+                        (Some(_), _) => cannot_run(126, format!("cannot run {program}: {e}")),
+                        (None, kind) => {
+                            let hint = if kind == io::ErrorKind::NotFound { " (does the image have a shell?)" } else { "" };
+                            io::Error::new(kind, format!("cannot run /bin/sh: {e}{hint}"))
+                        }
+                    }
+                })?;
+                // The slave's copies go with the command: the pty's master reads EOF (EIO) once its last user is gone.
+                drop(cmd);
+                // Failing from here on, the command is killed: left running, it would be no session's.
+                let pid = child.id() as i32;
+                // Unwatched, its output would be read until background processes close it, not `DRAIN` past its exit.
+                let exited = exited.ok_or_else(|| crate::app::unwatched(statuses, pid, token, io::Error::other("cannot open a pidfd to watch it")))?;
+                let (streams, input) =
+                    crate::input::streams(&mut child, pty.map(|(master, _)| master)).map_err(|e| crate::app::unwatched(statuses, pid, token, e))?;
+                Ok::<_, io::Error>((streams, input, exited, pid, token))
+            })();
+            let mut table = sessions.lock().unwrap();
+            let mut ring = output.0.lock().unwrap();
+            ring.starting = false;
+            output.1.notify_all();
+            let (streams, input, exited, pid, token) = match started {
+                Ok(started) if !ring.closed => started,
+                result => {
+                    if !ring.closed {
+                        table.live.remove(id);
+                        ring.closed = true;
+                    }
+                    drop(ring);
                     drop(table);
-                    wait_started(&output);
-                    continue;
+                    return Err(match result {
+                        Ok((_, _, _, pid, token)) => crate::app::unwatched(statuses, pid, token, gone()),
+                        Err(e) => e,
+                    });
                 }
-                (id, offset, attach_claimed(output, offset, conn, claim.unwrap_or(0), epoch, rejoin)?)
+            };
+            ring.input = input.map(Arc::new);
+            drop(ring);
+            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: pid, token });
+            // Attached before any output, so none is overwritten before it is sent.
+            let attached = attach(&output, 0, conn.take());
+            let _ = tx.send((streams, exited, token));
+            (id, 0, attached)
+        }
+        Request::Attach { id, offset, claim, epoch, rejoin } => {
+            let table = sessions.lock().unwrap();
+            if epoch.is_some() && table.fence.1.is_some() && epoch != table.fence.1 {
+                return Err(io::Error::other(ATTACHED_SINCE));
             }
-            Request::Close { id } => {
-                let mut table = sessions.lock().unwrap();
-                // A start still in flight (a client interrupted at once) must not run. Closing again
-                // (a retried acknowledgement) is fine.
-                if !table.live.contains_key(id) && !table.ended(id) {
-                    table.cancel(id);
-                }
-                table.close(id, Some(statuses));
-                return Ok(None);
+            if table.ended(id) {
+                return Err(gone());
             }
-            Request::Release { id, end, code } => {
-                let mut table = sessions.lock().unwrap();
-                let Some(entry) = table.live.get(id) else { return Ok(None) };
-                let same = {
-                    let o = entry.output.0.lock().unwrap();
-                    // Sent the exit on its last attachment, none since (`attach` clears `delivered`), as an
-                    // acknowledgement on it would close it: a client attached since (from an earlier offset, say) keeps it.
-                    o.exit == Some(code) && o.end == end && o.delivered.is_some() && o.attached.is_none()
-                };
-                if !same {
-                    return Err(io::Error::other("session kept: not the one that exited so, or attached since"));
-                }
-                // Exited: its shell is reaped, there is nothing to kill.
-                table.close(id, None);
-                return Ok(None);
+            let output = &table.live.get(id).ok_or_else(unknown)?.output;
+            if output.0.lock().unwrap().starting {
+                return Ok(Open::Retry(output.clone()));
             }
-        }));
-    }
+            (id, offset, attach_claimed(output, offset, conn.take(), claim.unwrap_or(0), epoch, rejoin)?)
+        }
+        Request::Close { id } => {
+            let mut table = sessions.lock().unwrap();
+            // A start still in flight (a client interrupted at once) must not run. Closing again
+            // (a retried acknowledgement) is fine.
+            if !table.live.contains_key(id) && !table.ended(id) {
+                table.cancel(id);
+            }
+            table.close(id, Some(statuses));
+            return Ok(Open::Done(None));
+        }
+        Request::Release { id, end, code } => {
+            let mut table = sessions.lock().unwrap();
+            let Some(entry) = table.live.get(id) else { return Ok(Open::Done(None)) };
+            let same = {
+                let o = entry.output.0.lock().unwrap();
+                // Sent the exit on its last attachment, none since (`attach` clears `delivered`), as an
+                // acknowledgement on it would close it: a client attached since (from an earlier offset, say) keeps it.
+                o.exit == Some(code) && o.end == end && o.delivered.is_some() && o.attached.is_none()
+            };
+            if !same {
+                return Err(io::Error::other("session kept: not the one that exited so, or attached since"));
+            }
+            // Exited: its shell is reaped, there is nothing to kill.
+            table.close(id, None);
+            return Ok(Open::Done(None));
+        }
+    };
+    Ok(Open::Done(Some(attached)))
 }
 
 fn wait_started(output: &Session) {

@@ -116,11 +116,15 @@ fn copy_root_metadata(lower: &str, upper: &str) -> io::Result<()> {
 }
 
 fn list_xattrs(src: RawFd) -> io::Result<Vec<u8>> {
-    let n = os(unsafe { libc::flistxattr(src, std::ptr::null_mut(), 0) })?;
-    let mut names = vec![0u8; n as usize];
-    let n = os(unsafe { libc::flistxattr(src, names.as_mut_ptr().cast(), names.len()) })?;
-    names.truncate(n as usize);
-    Ok(names)
+    xattr_bytes(|buf, len| unsafe { libc::flistxattr(src, buf.cast(), len) })
+}
+
+fn xattr_bytes(mut read: impl FnMut(*mut libc::c_void, usize) -> libc::ssize_t) -> io::Result<Vec<u8>> {
+    let n = os(read(std::ptr::null_mut(), 0))?;
+    let mut bytes = vec![0u8; n as usize];
+    let n = os(read(bytes.as_mut_ptr().cast(), bytes.len()))?;
+    bytes.truncate(n as usize);
+    Ok(bytes)
 }
 
 fn copy_root_metadata_with_xattrs(lower: &str, upper: &str, list: impl FnOnce(RawFd) -> io::Result<Vec<u8>>) -> io::Result<()> {
@@ -150,13 +154,7 @@ fn copy_root_metadata_with_xattrs(lower: &str, upper: &str, list: impl FnOnce(Ra
         if name.to_bytes().starts_with(b"trusted.overlay.") {
             continue;
         }
-        let value = (|| {
-            let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), std::ptr::null_mut(), 0) })?;
-            let mut value = vec![0u8; n as usize];
-            let n = os(unsafe { libc::fgetxattr(src, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) })?;
-            value.truncate(n as usize);
-            Ok::<_, io::Error>(value)
-        })();
+        let value = xattr_bytes(|buf, len| unsafe { libc::fgetxattr(src, name.as_ptr(), buf, len) });
         let copied = match value {
             Err(e) if probed && matches!(e.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) => continue,
             value => value.and_then(|v| os(unsafe { libc::fsetxattr(dst, name.as_ptr(), v.as_ptr().cast(), v.len(), 0) })),

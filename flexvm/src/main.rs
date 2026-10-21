@@ -1121,6 +1121,8 @@ fn run_attached(host: &Host, name: &str, keep: bool, started: &host::Ident) -> R
     }
     // Test gate: its app's status in, its records not yet removed.
     host::hold("attached_cleanup_gate");
+    let last_name = containers::last_name(host, name, vm).map(|(name, _)| name);
+    let name = last_name.as_deref().unwrap_or(name);
     if !keep && !host.alive(name) && host.vms(name, "exited")?.exists() {
         // Its log stays, as a foreground run's without a terminal (its diagnostics are there alone).
         let _ = remove_stopped(host, name, true, false, Some(vm), false);
@@ -2536,6 +2538,54 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn run_attached_cleans_up_its_last_name() {
+        const CHILD: &str = "FLEXVM_TEST_ATTACHED_CLEANUP";
+        let ours = host::Ident { pid: 999_999_901, start: 1, boot: host::boot_id().into(), ns: None };
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            run_attached(&host, "old", std::env::var_os("FLEXVM_TEST_ATTACHED_KEEP").is_some(), &ours).unwrap();
+            unreachable!();
+        }
+        for keep in [false, true] {
+            let root = crate::test_util::TempDir::new("attached-cleanup");
+            let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            let record = |name, id: &host::Ident, code| {
+                let rec = app::Exited::new(code, "t".into(), None, Default::default(), Default::default(), 0);
+                host::write_record(&host.vms(name, "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
+                containers::record_exit(&host, name, id, code, true);
+            };
+            record("old", &ours, 4);
+            host.write_log("old", "log", "app diagnostics");
+            std::fs::write(host.run.join("faults.json"), serde_json::to_vec(&json!({"attached_cleanup_gate": u64::MAX})).unwrap()).unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "exec_tests::run_attached_cleans_up_its_last_name"])
+                .env(CHILD, root.as_os_str())
+                .env("FLEXVM_FAULTS", "1")
+                .env_remove("FLEXVM_TEST_ATTACHED_KEEP");
+            if keep {
+                cmd.env("FLEXVM_TEST_ATTACHED_KEEP", "1");
+            }
+            let mut child = crate::test_util::ChildGuard(cmd.spawn().unwrap());
+            let marker = host.run.join(format!("gates/attached_cleanup_gate.{}", child.id()));
+            crate::test_util::wait_until("attached cleanup gate", || marker.exists());
+            // The attachment returned and its end wait finished: a late rename must still be found.
+            for suffix in ["exit", "exited", "log"] {
+                std::fs::rename(host.vms("old", suffix).unwrap(), host.vms("new", suffix).unwrap()).unwrap();
+            }
+            let replacement = host::Ident { pid: ours.pid + 1, ..ours.clone() };
+            record("old", &replacement, 7);
+            std::fs::remove_file(marker).unwrap();
+            crate::test_util::wait_until("attached run to exit", || child.try_wait().unwrap().is_some());
+            assert_eq!(child.wait().unwrap().code(), Some(4));
+            assert_eq!(host.has_record("new", "exited"), keep);
+            assert!(host.has_record("new", "log"), "foreground diagnostics stay");
+            assert!(host.has_record("old", "exited"), "the replacement stays");
+            assert_eq!(containers::exit_record(&host, "old").unwrap().ident, replacement);
+        }
     }
 
     #[test]
