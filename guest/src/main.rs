@@ -395,7 +395,17 @@ impl Discarder {
     }
 }
 
-static DISCARDER: std::sync::OnceLock<Option<Arc<Discarder>>> = std::sync::OnceLock::new();
+static DISCARDER: Mutex<Option<Arc<Discarder>>> = Mutex::new(None);
+
+fn get_discarder(cache: &Mutex<Option<Arc<Discarder>>>, start: impl FnOnce() -> io::Result<Arc<Discarder>>) -> io::Result<Arc<Discarder>> {
+    let mut cached = cache.lock().unwrap();
+    if let Some(d) = &*cached {
+        return Ok(d.clone());
+    }
+    let d = start()?;
+    *cached = Some(d.clone());
+    Ok(d)
+}
 
 /// Hands a finished exec's still-open pipes to the discarder (closed if it is full or cannot start).
 fn discard(pipes: Vec<File>) {
@@ -403,7 +413,7 @@ fn discard(pipes: Vec<File>) {
         return;
     }
     let n = pipes.len();
-    let refused = DISCARDER.get_or_init(|| Discarder::start(MAX_DISCARDED).ok()).as_ref().map_or(n, |d| d.add(pipes));
+    let refused = get_discarder(&DISCARDER, || Discarder::start(MAX_DISCARDED)).map_or(n, |d| d.add(pipes));
     if refused > 0 {
         eprintln!("flexvm-init: closed {refused} output pipe(s) still held by a finished exec's background processes: {MAX_DISCARDED} are kept at most");
     }
@@ -833,6 +843,20 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("fifo"), &hosts).unwrap();
         assert!(super::read_etc(&hosts, 0).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn discarder_retries_failed_start_and_caches_success() {
+        use super::*;
+        let cache = Mutex::new(None);
+        assert!(get_discarder(&cache, || Err(io::Error::other("injected thread failure"))).is_err());
+        assert!(cache.lock().unwrap().is_none());
+        let d = get_discarder(&cache, || Discarder::start(2)).unwrap();
+        let again = get_discarder(&cache, || panic!("started twice")).unwrap();
+        assert!(Arc::ptr_eq(&d, &again));
+        let (read, mut write) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(d.add(vec![File::from(OwnedFd::from(read))]), 0);
+        write.write_all(b"background output after recovery").unwrap();
     }
 
     #[test]
