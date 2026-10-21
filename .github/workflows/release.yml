@@ -19,15 +19,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: build and publish ${{ github.ref_name }}
+  build:
+    name: build ${{ github.ref_name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    permissions:
-      contents: write
-      # Build provenance for the assets: scripts/pin-artifacts.sh verifies it before pinning anything.
-      id-token: write
-      attestations: write
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     env:
       TAG: ${{ github.ref_name }}
       GH_REPO: ${{ github.repository }}
@@ -57,6 +54,43 @@ jobs:
       # The recipe (hashed into inputs.txt, with this file: scripts/pin-artifacts.sh --inputs).
       - name: Build the assets
         run: ./scripts/release-assets.sh "$RUNNER_TEMP/state" "$RUNNER_TEMP/assets"
+
+      - name: Upload assets
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/assets/
+          if-no-files-found: error
+
+  release:
+    name: attest and publish ${{ github.ref_name }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      # Only this job holds signing and publishing credentials; no build scripts run here.
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/assets
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Check the assets
+        working-directory: ${{ runner.temp }}/assets
+        run: |
+          ls -l
+          sha256sum --check --strict SHA256SUMS
+          [ "$(cut -d' ' -f3 SHA256SUMS | sort | tr '\n' ' ')" = "firecracker inputs.txt vmlinux " ]
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

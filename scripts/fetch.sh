@@ -28,24 +28,18 @@ done
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 
-# The pinned SHA256 of a URL.
-pinned() {
-  local checksum
-  checksum=$(awk -v url="$1" '$2 == url {print $1}' "$root/scripts/checksums.sha256")
-  if [[ ! $checksum =~ ^[[:xdigit:]]{64}$ ]]; then
-    echo "No pinned SHA256 for $1; update scripts/checksums.sha256" >&2
-    return 1
-  fi
-  echo "$checksum"
-}
-
-if pinned "$ARTIFACTS_URL/firecracker" > /dev/null 2>&1; then
+if pinned "$ARTIFACTS_URL/firecracker" > /dev/null; then
   FC_URL=$ARTIFACTS_URL/firecracker
 else
+  [ "$?" = 2 ] || exit 1
   FC_URL=https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-$ARCH.tgz
 fi
 KERNEL_URL=$CI/$KERNEL
-if pinned "$ARTIFACTS_URL/vmlinux" > /dev/null 2>&1; then KERNEL_URL=$ARTIFACTS_URL/vmlinux; fi
+if pinned "$ARTIFACTS_URL/vmlinux" > /dev/null; then
+  KERNEL_URL=$ARTIFACTS_URL/vmlinux
+else
+  [ "$?" = 2 ] || exit 1
+fi
 
 # --urls: print what would be fetched, as `NAME URL` lines (CI keys its caches on them).
 if [ "$mode" = --urls ]; then

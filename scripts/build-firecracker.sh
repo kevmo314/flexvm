@@ -68,7 +68,7 @@ cd "$src"
 # .cargo/config.toml, so the binary is taken from the directory passed, never
 # a stale one left in build/cargo_target.
 target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-build/cargo_target}}
-cargo build --release --target x86_64-unknown-linux-musl --target-dir "$target" -p firecracker
+cargo build --locked --release --target x86_64-unknown-linux-musl --target-dir "$target" -p firecracker
 # Installed to temporary files beside their final paths, then renamed into place: a concurrent start never runs a
 # half-copied binary, and an interrupted install never leaves a short one there. firecracker.sha256 records the build:
 # A build without a release pin accepts the recorded binary.
