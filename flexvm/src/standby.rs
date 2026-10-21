@@ -1628,7 +1628,7 @@ mod tests {
     fn rank_snapshots_find_identities_and_reject_stale_or_partial_data() {
         let root = crate::test_util::TempDir::new("rank-snapshot");
         let path = root.join("ranks");
-        let ids: Vec<_> = (0..128).map(|i| Ident { start: i / 2, pid: i as u32 + 1, boot: "boot".into() }).collect();
+        let ids: Vec<_> = (0..128).map(|i| Ident { start: i / 2, pid: i as u32 + 1, boot: "boot".into(), ns: None }).collect();
         crate::host::write_record(&path, &ids.iter().flat_map(rank_entry).collect::<Vec<_>>()).unwrap();
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(read_rank(&path, id), Some(i));
@@ -1648,7 +1648,7 @@ mod tests {
     fn standby_ranks_share_one_scan_and_expire() {
         let root = crate::test_util::TempDir::new("shared-ranks");
         let base = root.join(".locks/default");
-        let ids: Vec<_> = (0..128).map(|i| Ident { start: i / 2, pid: i as u32 + 1, boot: "boot".into() }).collect();
+        let ids: Vec<_> = (0..128).map(|i| Ident { start: i / 2, pid: i as u32 + 1, boot: "boot".into(), ns: None }).collect();
         let mut scans = 0;
         for id in &ids[..64] {
             let scan = || {
@@ -1749,7 +1749,7 @@ mod tests {
     #[test]
     fn shared_ranking_uses_live_records_oldest_first() {
         let (_root, host, _paths, d) = pool("rank-live");
-        let ids: Vec<_> = [(2, 1), (1, 2), (1, 1)].into_iter().map(|(start, pid)| Ident { start, pid, boot: "boot".into() }).collect();
+        let ids: Vec<_> = [(2, 1), (1, 2), (1, 1)].into_iter().map(|(start, pid)| Ident { start, pid, boot: "boot".into(), ns: None }).collect();
         let mut held = Vec::new();
         for id in &ids {
             let path = crate::host::locks(&d).join(format!("{}.lock", id.key()));

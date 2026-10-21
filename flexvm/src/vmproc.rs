@@ -3471,7 +3471,7 @@ fn prune_peer_backoffs(backoff: &mut std::collections::HashMap<String, PeerBacko
     // Candidates are only this tick's subset: a live VM keeps its peer cooldown even when omitted.
     let live = |key: &str, b: &PeerBackoff| -> Option<bool> {
         let (pid, start) = key.split_once(' ')?.0.split_once('-')?;
-        Some(Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: b.boot.clone() }.alive())
+        Some(Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: b.boot.clone(), ns: None }.alive())
     };
     backoff.retain(|key, b| b.recent(now) && live(key, b) == Some(true));
 }
@@ -3507,7 +3507,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
             crate::info!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
             let mut replaced = false;
             let mut check = |c: &UnixStream| {
-                if Ident::of(crate::util::peer_pid(c)?).as_ref() != Some(&vm.ident) {
+                if !vm.ident.is(crate::util::peer_pid(c)?) {
                     replaced = true;
                     bail!("vm {:?} was replaced", vm.name);
                 }

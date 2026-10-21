@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn a_stale_failed_connect_never_undoes_a_fresh_pin() {
         fn process(pid: u32) -> crate::host::Ident {
-            crate::host::Ident { pid, start: 1, boot: "boot".into() }
+            crate::host::Ident { pid, start: 1, boot: "boot".into(), ns: None }
         }
         // Stale ones failing, and succeeding (they reached the process before the resume).
         for fails in [true, false] {
@@ -1010,7 +1010,7 @@ mod tests {
     fn an_attach_never_takes_a_replacements_status_for_its_vms() {
         let root = crate::test_util::TempDir::new("attach-replaced");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let ours = crate::host::Ident { pid: 999_999_901, start: 1, boot: crate::host::boot_id().into() };
+        let ours = crate::host::Ident { pid: 999_999_901, start: 1, boot: crate::host::boot_id().into(), ns: None };
         let vm = Pinned { host: host.clone(), name: "web".into(), pin: Arc::default() };
         vm.pin.lock().unwrap().pin.process = Some(ours.clone());
         let rec = crate::app::Exited::new(0, "t".into(), None, Default::default(), Default::default(), 0);

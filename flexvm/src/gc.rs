@@ -377,7 +377,7 @@ fn standby_sockets(dir: &Path) {
             continue;
         }
         let free = match (tmp, pid.parse(), start.parse()) {
-            (Some(_), Ok(pid), Ok(start)) => Ident { pid, start, boot: boot_id().into() }.liveness() == Liveness::Gone,
+            (Some(_), Ok(pid), Ok(start)) => Ident { pid, start, boot: boot_id().into(), ns: None }.liveness() == Liveness::Gone,
             (Some(_), ..) => false,
             _ if no_proc => unheld_pid_locks(&locks, pid),
             _ => lock_free(&locks.join(format!("{id}.lock")), libc::LOCK_SH),
@@ -602,7 +602,7 @@ mod tests {
         let addr = crate::host::Addr {
             seen: 4,
             holder: Some("dead".into()),
-            holder_id: Some(Ident { pid: 999_999_951, start: 1, boot: boot_id().into() }),
+            holder_id: Some(Ident { pid: 999_999_951, start: 1, boot: boot_id().into(), ns: None }),
             held: 4,
             ..Default::default()
         };
@@ -813,7 +813,7 @@ mod tests {
         let live_name = at("held.log", old);
         store_holder(&host, "held", &crate::host::Ident::me());
         let dead_name = at("dead.log", old);
-        store_holder(&host, "dead", &crate::host::Ident { pid: 999_999_940, start: 1, boot: crate::host::boot_id().into() });
+        store_holder(&host, "dead", &crate::host::Ident { pid: 999_999_940, start: 1, boot: crate::host::boot_id().into(), ns: None });
         // Free at once though another test's child, forked but not yet exec'd, shares the
         // logs lock's open file: dropping it let go explicitly.
         vm_files(&host);

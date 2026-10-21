@@ -781,6 +781,16 @@ directory, VM processes' socket directories under `/run/flexvm/s` or
 `/tmp/flexvm-s-UID`) names its PID namespace too, so processes of different
 namespaces with the same pid and start time never write to one another's.
 
+A VM process records its PID namespace with its pid (`pidns` in `ps --json`;
+`pid` is the one it has there). A flexvm sharing its run directory from an
+ancestor namespace (the host, for a VM run in a container) finds it by that
+namespace, its pid there and its start time, and controls it by the pid it has
+here: `exec`, `stop`, `pause`, `kill` and `rm -f` work, and garbage collection
+judges it by that process. A flexvm in a namespace that cannot see it (a
+sibling container) refuses to signal it (`process 1 of PID namespace NS cannot
+be seen from this one`), and never takes it for gone. Commands that only talk
+to its control socket (`checkpoint`, `unpause`, `kill -s`) work from either.
+
 ## Fast starts
 
 ```sh

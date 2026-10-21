@@ -156,7 +156,7 @@ fn wait(run: &Path, n: u64, by: Instant) -> bool {
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if let Some(id) =
-            name.split_once('-').and_then(|(p, s)| Some(Ident { pid: p.parse().ok()?, start: s.parse().ok()?, boot: crate::host::boot_id().into() }))
+            name.split_once('-').and_then(|(p, s)| Some(Ident { pid: p.parse().ok()?, start: s.parse().ok()?, boot: crate::host::boot_id().into(), ns: None }))
         {
             members.push((e.path(), id));
         }
@@ -285,7 +285,7 @@ mod tests {
         // Gone: not waited for, and its file removed. Its pid may be another's by now: still gone (its start differs).
         let _ = child.kill();
         let _ = child.wait();
-        let gone = Ident { pid: (1 << 22) - 2, start: 1, boot: silent.boot.clone() };
+        let gone = Ident { pid: (1 << 22) - 2, start: 1, boot: silent.boot.clone(), ns: None };
         member(&run, &gone, 0);
         let t = Instant::now();
         assert!(wait(&run, n, now()));

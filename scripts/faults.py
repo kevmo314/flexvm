@@ -10482,6 +10482,78 @@ def pidns_names():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def pidns_control():
+    """#1111: a VM whose process is pid 1 of a PID namespace of its own (a container on the
+    host's network, sharing this host's directories) is controlled from this namespace by the
+    pid it has here, found by its namespace's (`Ident::local_pid`): exec, pause, unpause and
+    stop reach it, and a sweep here keeps its work directory. From a sibling namespace, which
+    cannot see it, every command refuses at once, signalling nothing. The VM's Firecracker
+    cgroups are in a private cgroup subtree bind-mounted as its /sys/fs/cgroup, and so is every
+    sweep here."""
+    n = "ft-pidns-ctl"
+    if not os.path.exists("/sys/fs/cgroup/cgroup.controllers") or not shutil.which("unshare"):
+        raise Skip("no cgroup2 at /sys/fs/cgroup, or no unshare")
+    sub = f"/sys/fs/cgroup/fvci-pidnsctl-{os.getpid()}"
+    os.makedirs(os.path.join(sub, "flexvm"))
+    fv = f"{shlex.quote(BIN)} --state {shlex.quote(A.state)} --run {shlex.quote(A.run)}"
+    private = f"mount --bind {shlex.quote(sub)} /sys/fs/cgroup"
+    def within(*ns, cmd):
+        return subprocess.run(["unshare", "-m", *ns, "sh", "-c", f"{private} && exec {fv} {cmd}"], capture_output=True, text=True, timeout=120, env=ENV)
+    def row():
+        code, out, err = cli(A, "ps", "-a", "--json")
+        assert code == 0, err
+        return {v["name"]: v for v in json.loads(out)}.get(n, {})
+    owner = None
+    try:
+        owner = subprocess.Popen(["unshare", "-m", "-p", "-f", "--kill-child", "--mount-proc", "sh", "-c", f"{private} && exec {fv} run --name {n} --keep {shlex.quote(args.template)}"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
+        check("pidns control: the VM runs", wait_for(lambda: row().get("state") == "running", 60), row())
+        v = row()
+        check("pidns control: its process is pid 1 of another PID namespace", v.get("pid") == 1 and v.get("pidns") not in (None, pid_ns()[0]), v)
+        code, out = sh(A, n, "echo across")
+        check("pidns control: exec from here", code == 0 and out == "across", (code, out))
+        code, out, err = cli(A, "pause", n)
+        check("pidns control: paused from here", code == 0 and row().get("state") == "paused", (code, err, row().get("state")))
+        code, out, err = cli(A, "unpause", n)
+        check("pidns control: unpaused from here", code == 0 and row().get("state") == "running", (code, err, row().get("state")))
+        work = os.path.join(A.run, "w", f"1-{v['start']}")
+        r = within(cmd="debug gc")
+        check("pidns control: a sweep here keeps its work directory", r.returncode == 0 and os.path.exists(os.path.join(work, "owner")), (r.returncode, r.stderr))
+        code, out = sh(A, n, "echo still")
+        check("pidns control: exec after the sweep", code == 0 and out == "still", (code, out))
+        # A sibling namespace cannot see it: refused at once, nothing signalled, nothing swept.
+        for cmd in (f"exec {n} true", f"stop {n}", f"pause {n}", f"kill {n}"):
+            t = time.time()
+            r = within("-p", "-f", "--mount-proc", cmd=cmd)
+            check(f"pidns control: {cmd.split()[0]} from a sibling namespace refused", r.returncode != 0 and "cannot be seen" in r.stderr and time.time() - t < 20,
+                  (r.returncode, r.stderr, time.time() - t))
+        # A child namespace that kept this /proc: its pids there are not its own, so nothing is signalled.
+        for cmd in (f"stop {n}", f"kill {n}"):
+            r = within("-p", "-f", cmd=cmd)
+            check(f"pidns control: {cmd.split()[0]} without a /proc of its own refused", r.returncode != 0 and "/proc is not this PID namespace's" in r.stderr,
+                  (r.returncode, r.stderr))
+        r = within("-p", "-f", "--mount-proc", cmd="debug gc")
+        check("pidns control: a sibling's sweep keeps it", r.returncode == 0 and os.path.exists(os.path.join(work, "owner")) and row().get("state") == "running",
+              (r.returncode, r.stderr, row().get("state")))
+        code, out, err = cli(A, "stop", n)
+        check("pidns control: stopped from here", code == 0 and row().get("state") == "suspended", (code, err, row().get("state")))
+        check("pidns control: its namespace ended with it", wait_for(lambda: owner.poll() is not None, 30), owner.poll())
+        code, out, err = cli(A, "rm", n)
+        check("pidns control: removed", code == 0 and not row(), (code, err, row()))
+    finally:
+        if owner and owner.poll() is None:
+            owner.kill()
+            owner.wait()
+        cli(A, "rm", "-f", n)
+        for e in os.listdir(os.path.join(sub, "flexvm")) if os.path.isdir(os.path.join(sub, "flexvm")) else []:
+            if os.path.isdir(os.path.join(sub, "flexvm", e)):
+                with suppress(OSError):
+                    os.rmdir(os.path.join(sub, "flexvm", e))
+        for c in (os.path.join(sub, "flexvm"), sub):
+            with suppress(OSError):
+                os.rmdir(c)
+
+
 def lock_holders(path):
     """Pids holding a flock on the host lock directory's use lock of `path` (`host::use_lock`)."""
     st = os.stat(path)
@@ -11279,7 +11351,7 @@ SCENARIOS = dict(
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, loan_start_retry=loan_start_retry, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
-    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, pidns_names=pidns_names, rmi_suspend=rmi_suspend,
+    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, pidns_names=pidns_names, pidns_control=pidns_control, rmi_suspend=rmi_suspend,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died, fc_died_starting=fc_died_starting,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,

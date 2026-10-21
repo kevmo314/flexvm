@@ -1220,7 +1220,8 @@ mod tests {
                 "gone" => drop(name),
                 "came and went" => {
                     drop(name);
-                    let later = host::LogsOwner { id: Ident { pid: 1, start: 1, boot: host::boot_id().into() }, handoff: false, to: vec![], by: vec![] };
+                    let later =
+                        host::LogsOwner { id: Ident { pid: 1, start: 1, boot: host::boot_id().into(), ns: None }, handoff: false, to: vec![], by: vec![] };
                     let made = host.vms("job", ".made").unwrap();
                     std::fs::create_dir(&made).unwrap();
                     std::fs::write(made.join(".owner"), serde_json::to_vec(&later).unwrap()).unwrap();
@@ -1228,7 +1229,7 @@ mod tests {
                     std::fs::rename(&made, host.vms("job", "logs").unwrap()).unwrap();
                 }
                 _ => {
-                    let other = Ident { pid: 1, start: 1, boot: host::boot_id().into() };
+                    let other = Ident { pid: 1, start: 1, boot: host::boot_id().into(), ns: None };
                     std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&other).unwrap()).unwrap();
                     host.write_log("job", "log", b"a later vm's\n");
                 }
@@ -1309,7 +1310,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         std::fs::rename(&log, &prev).unwrap();
         std::fs::write(&log, b"third\n").unwrap();
-        let other = Ident { pid: 1, start: 1, boot: host::boot_id().into() };
+        let other = Ident { pid: 1, start: 1, boot: host::boot_id().into(), ns: None };
         std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&other).unwrap()).unwrap();
         assert!(rx.recv_timeout(FOLLOW_EVERY * 4).is_err(), "a rotated log is followed on, not taken for a removed one");
         drop(name);
@@ -1371,14 +1372,14 @@ mod tests {
     fn wait_reads_a_gone_vms_record_or_its_state() {
         let (_d, host) = host("wait");
         assert!(wait(&host, "nobody").unwrap_err().to_string().contains("no vm named"));
-        let gone = Ident { pid: 1, start: 1, boot: "another boot".into() };
+        let gone = Ident { pid: 1, start: 1, boot: "another boot".into(), ns: None };
         record_exit(&host, "web", &gone, 3);
         assert_eq!(wait(&host, "web").unwrap(), 3, "its record");
         std::fs::write(host.vms("db", "failed").unwrap(), "died").unwrap();
         assert_eq!(wait(&host, "db").unwrap(), crate::vmproc::DIED);
         // A holder that died holding the name, unrecorded: the record is an earlier instance's.
         std::fs::create_dir_all(host.vms("web", "lock").unwrap().parent().unwrap()).unwrap();
-        let crashed = Ident { pid: 2, start: 2, boot: "another boot".into() };
+        let crashed = Ident { pid: 2, start: 2, boot: "another boot".into(), ns: None };
         std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&crashed).unwrap()).unwrap();
         assert!(wait(&host, "web").unwrap_err().to_string().contains("without an exit status"));
         std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&gone).unwrap()).unwrap();
@@ -1397,7 +1398,7 @@ mod tests {
         let mut child = sleeper(60);
         let id = Ident::of(child.id()).unwrap();
         std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&id).unwrap()).unwrap();
-        record_exit(&host, "job", &Ident { pid: 1, start: 1, boot: "b".into() }, 1);
+        record_exit(&host, "job", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, 1);
         let h = host.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
@@ -1422,7 +1423,7 @@ mod tests {
     fn wait_finds_a_renamed_record_when_the_holder_is_already_gone() {
         let (_d, host) = host("wait-renamed-gone");
         let _lock = host.take_name("job", false).unwrap();
-        let id = Ident { pid: 1, start: 1, boot: "another boot".into() };
+        let id = Ident { pid: 1, start: 1, boot: "another boot".into(), ns: None };
         std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&id).unwrap()).unwrap();
         record_exit(&host, "job-new", &id, 143);
         assert_eq!(wait(&host, "job").unwrap(), 143);
@@ -1532,7 +1533,7 @@ mod tests {
         hash.update(&body);
         std::fs::write(dir.join("manifest.json"), [format!("{}\n", hash.finish()).as_bytes(), &body].concat()).unwrap();
         std::fs::write(dir.join("GEN"), "1").unwrap();
-        let gone = Ident { pid: 1, start: 1, boot: "another boot".into() };
+        let gone = Ident { pid: 1, start: 1, boot: "another boot".into(), ns: None };
         let a = host::Addr { seen: 1, held: 1, holder: Some(name.into()), holder_id: Some(gone), ..host::Addr::default() };
         std::fs::create_dir_all(host.state.join("addrs")).unwrap();
         host::store(&host.state.join("addrs").join(ip), &a, true).unwrap();
@@ -1545,7 +1546,7 @@ mod tests {
         suspended_vm(&host, "old", "10.0.0.9");
         host.write_log("old", "log", "hello\n");
         host.write_log("new", "log.1", "an earlier vm's\n");
-        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into() }, STOPPED);
+        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, STOPPED);
         std::fs::write(host.vms("taken", "failed").unwrap(), "died").unwrap();
         assert!(rename_stopped(&host, "old", "taken").unwrap_err().to_string().contains("taken"));
         rename_stopped(&host, "old", "new").unwrap();
@@ -1566,7 +1567,7 @@ mod tests {
     fn a_stopped_vm_whose_logs_cannot_move_is_not_renamed_at_all() {
         let (_d, host) = host("rename-logs-fail");
         suspended_vm(&host, "old", "10.0.0.9");
-        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into() }, STOPPED);
+        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, STOPPED);
         std::fs::create_dir(host.vms("old", "log").unwrap()).unwrap();
         assert!(rename_stopped(&host, "old", "new").unwrap_err().to_string().contains("not a link"));
         assert!(host.is_suspended("old") && !host.suspended("new").unwrap().exists());

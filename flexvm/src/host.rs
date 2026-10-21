@@ -2097,7 +2097,7 @@ impl Host {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Some(None), None),
             Err(_) => (None, None),
         };
-        let gone = |d: &Debit| Ident { pid: d.pid, start: d.start, boot: boot_id().into() }.liveness() == Liveness::Gone;
+        let gone = |d: &Debit| Ident { pid: d.pid, start: d.start, boot: boot_id().into(), ns: None }.liveness() == Liveness::Gone;
         debits_taken(read, unwritten, now, debit_window_ms(), vmstat_drift_mib(), gone)
     }
 
@@ -3206,10 +3206,30 @@ pub fn logs_owner(dir: &File) -> Option<LogsOwner> {
 /// Unique however pids are reused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ident {
+    /// In its own PID namespace (`ns`), as it reads its pid.
     pub pid: u32,
     pub start: u64,
     pub boot: String,
+    /// The PID namespace `pid` is in (`pid_ns`): from another (an ancestor's, the host's), the
+    /// process has another pid, found by its namespace's (`Ident::local_pid`). None: an earlier
+    /// build's record, or a name that tells none (`PID-START`), judged by its pid here.
+    #[serde(default, rename = "pidns", skip_serializing_if = "Option::is_none")]
+    pub ns: Option<u64>,
 }
+
+/// A process this one cannot see (`Ident::local_pid`): in a PID namespace that is neither this
+/// one nor one of its descendants (a sibling container's), or that it cannot read. Never a
+/// process to signal or reap, nor proof that one is gone: control it from its own namespace.
+#[derive(Debug)]
+pub struct Unseen(pub String);
+
+impl std::fmt::Display for Unseen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unseen {}
 
 impl Ident {
     /// Read once. Panics without a boot id or `/proc/self/stat`: a process
@@ -3225,7 +3245,61 @@ impl Ident {
         if boot.is_empty() {
             return None;
         }
-        Some(Ident { pid, start: starttime(pid)?, boot: boot.into() })
+        Some(Ident { pid, start: starttime(pid)?, boot: boot.into(), ns: pid_ns() })
+    }
+
+    /// Whether `pid` is judged by its pid here: in this PID namespace, or naming none.
+    fn here(&self) -> bool {
+        self.ns.is_none_or(|ns| pid_ns() == Some(ns))
+    }
+
+    /// Its pid as this process sees it (`/proc`), for a pidfd or a peer's credentials: its own in
+    /// this PID namespace; in another, the pid of the process here that is in that namespace with
+    /// its pid there (`NSpid`) and its start time. None: proven gone. `Unseen`: it cannot be told.
+    pub fn local_pid(&self) -> Result<Option<u32>> {
+        if !proc_is_mine() {
+            return Err(
+                Unseen(format!("process {}: /proc is not this PID namespace's (mount one of its own): its pids are not this process's", self.pid)).into()
+            );
+        }
+        if self.here() {
+            return Ok(Some(self.pid));
+        }
+        match self.seen() {
+            (Some(pid), Liveness::Alive) => Ok(Some(pid)),
+            (_, Liveness::Gone) => Ok(None),
+            _ => Err(Unseen(self.unseen()).into()),
+        }
+    }
+
+    fn unseen(&self) -> String {
+        let ns = self.ns.map_or("?".into(), |n| n.to_string());
+        let mine = pid_ns().map_or("unknown".into(), |n| n.to_string());
+        format!("process {} of PID namespace {ns} cannot be seen from this one ({mine}): control it from its own PID namespace, or one above it", self.pid)
+    }
+
+    /// In another PID namespace: where it is here, and whether it is alive (`seen_in`).
+    fn seen(&self) -> (Option<u32>, Liveness) {
+        seen_in(self, Path::new("/proc"), boot_id(), &proc_ns, proc_lists_all(), &|| PidNs::now().gone(self.ns))
+    }
+
+    /// Whether the process with `pid` here is this one: a peer's credentials, a pidfd just opened.
+    pub fn is(&self, pid: u32) -> bool {
+        self.liveness_at(pid) == Liveness::Alive
+    }
+
+    /// Whether `pid` here is this process (Alive), proven not to be (Gone), or cannot be told.
+    fn liveness_at(&self, pid: u32) -> Liveness {
+        if !proc_is_mine() {
+            return Liveness::Unknown;
+        }
+        if self.here() {
+            return match pid == self.pid {
+                true => self.liveness(),
+                false => Liveness::Gone,
+            };
+        }
+        at_in(self, pid, Path::new("/proc"), boot_id(), &proc_ns)
     }
 
     /// `PID-START`: names what is this instance's own, never another process's that got its pid.
@@ -3240,7 +3314,15 @@ impl Ident {
 
     /// Alive, gone on proof, or unknown (an unreadable `/proc`, say: never proof).
     pub fn liveness(&self) -> Liveness {
-        liveness_by(self, boot_id(), |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")))
+        // Another namespace's /proc (`unshare --pid` without a /proc of its own) numbers its
+        // processes by that namespace's pids: none read there is this process's to judge.
+        if !proc_is_mine() {
+            return Liveness::Unknown;
+        }
+        match self.here() {
+            true => liveness_by(self, boot_id(), |pid| std::fs::read_to_string(format!("/proc/{pid}/stat"))),
+            false => self.seen().1,
+        }
     }
 
     /// Not proven gone: what may still be running is treated as running.
@@ -3275,16 +3357,18 @@ pub fn boot_id() -> &'static str {
 pub struct PidFd(OwnedFd);
 
 impl PidFd {
+    /// By its pid here (`Ident::local_pid`): in another PID namespace, never by the pid it has there.
     pub fn open(id: &Ident) -> Result<Option<PidFd>> {
-        match crate::util::pidfd_open(id.pid) {
+        let Some(pid) = id.local_pid()? else { return Ok(None) };
+        match crate::util::pidfd_open(pid) {
             // Opened, then checked: if it is `id` now, the fd is `id`'s.
-            Ok(fd) => match id.liveness() {
+            Ok(fd) => match id.liveness_at(pid) {
                 Liveness::Alive => Ok(Some(PidFd(fd))),
                 Liveness::Gone => Ok(None),
-                Liveness::Unknown => bail!("cannot tell whether process {} is still the one meant", id.pid),
+                Liveness::Unknown => bail!("cannot tell whether process {pid} is still the one meant"),
             },
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
-            Err(e) => bail!("pidfd_open {}: {e}", id.pid),
+            Err(e) => bail!("pidfd_open {pid}: {e}"),
         }
     }
 
@@ -3379,7 +3463,7 @@ fn cgroup_owner(name: &str) -> Option<(Ident, Option<u64>)> {
         [pid, start, n, ns] if n.parse::<u64>().is_ok() => (pid, start, Some(ns.parse().ok()?)),
         _ => return None,
     };
-    Some((Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() }, ns))
+    Some((Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into(), ns: None }, ns))
 }
 
 /// Whether a Firecracker cgroup's owner is proven gone (`PidNs::owner_gone`).
@@ -3412,15 +3496,24 @@ pub(crate) fn pid_ns() -> Option<u64> {
     *NS.get_or_init(|| std::fs::metadata("/proc/self/ns/pid").ok().map(|m| m.ino()))
 }
 
+/// Whether `/proc` lists every process this one's PID namespace has: a /proc that hides some
+/// (`hidepid`, `subset`), or whose mount cannot be read, may leave out the one looked for.
+fn proc_lists_all() -> bool {
+    std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|m| proc_mount_lists_all(&m))
+}
+
+fn proc_mount_lists_all(mountinfo: &str) -> bool {
+    let at_proc: Vec<&str> = mountinfo.lines().filter(|l| l.split(' ').nth(4) == Some("/proc")).collect();
+    !at_proc.is_empty() && !at_proc.iter().any(|l| ["hidepid=", "subset="].iter().any(|o| l.contains(o)))
+}
+
 /// The PID namespaces with a process left, when this process sees every process: in the
 /// initial PID namespace only, which kernel threads are in (kthreadd, pid 2, there), with its
 /// own `/proc`. Elsewhere (a container, WSL's distribution) a namespace whose processes it
 /// cannot see would read as empty: None, and no other namespace is ever proven gone.
 fn pid_ns_census() -> Option<HashSet<u64>> {
     use std::os::unix::fs::MetadataExt;
-    // A /proc that hides processes (`hidepid`, `subset`) lists only some: no census.
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    if mounts.lines().any(|l| l.split(' ').nth(4) == Some("/proc") && ["hidepid=", "subset="].iter().any(|o| l.contains(o))) {
+    if !proc_lists_all() {
         return None;
     }
     pid_ns_census_in(Path::new("/proc"), pid_ns()?, &|dir| std::fs::metadata(dir.join("ns/pid")).map(|m| m.ino()))
@@ -3501,7 +3594,7 @@ fn parse_tap_alias(alias: &str) -> Option<(Ident, Option<u64>, &str)> {
     };
     let mut parts = rest.splitn(3, ' ');
     let (pid, start, run) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?);
-    (!run.is_empty()).then(|| (Ident { pid, start, boot: boot_id().into() }, ns, run))
+    (!run.is_empty()).then(|| (Ident { pid, start, boot: boot_id().into(), ns: None }, ns, run))
 }
 
 /// This host's taps: tun devices whose alias names its run directory (`tap_alias`), with
@@ -3533,13 +3626,20 @@ fn taps_of_at(run: &Path, net: &Path, orphaned: bool) -> Vec<(String, u32, Ident
     taps
 }
 
+/// Whether `owner`, parsed from a tap's alias naming PID namespace `of` (or none), is `h`: by its
+/// pid, start time and boot, and its namespace where both name one.
+fn same_owner(h: &Ident, owner: &Ident, of: Option<u64>) -> bool {
+    (h.pid, h.start, &h.boot) == (owner.pid, owner.start, &owner.boot) && (h.ns.is_none() || of.is_none() || h.ns == of)
+}
+
 /// A dead holder's taps here (of this PID namespace); a sweep (no holder) also collects taps from
 /// deleted run directories, and those of another PID namespace proven gone (`PidNs::gone`).
 fn dead_taps_at(run: &Path, net: &Path, holder: Option<&Ident>, ns: &PidNs) -> Vec<(String, u32, Ident)> {
     taps_of_at(run, net, holder.is_none())
         .into_iter()
         .filter(|(_, _, owner, of)| match holder {
-            Some(h) => ns.own(*of) && h == owner && owner.liveness() == Liveness::Gone,
+            // The alias names the namespace apart from its owner (None in the Ident parsed).
+            Some(h) => ns.own(*of) && same_owner(h, owner, *of) && h.liveness() == Liveness::Gone,
             None => ns.owner_gone(owner, *of),
         })
         .map(|(n, i, o, _)| (n, i, o))
@@ -3587,7 +3687,7 @@ fn write_debris_by(path: &Path, ns: &PidNs) -> bool {
             } else if !now.starts_with(boot) {
                 true
             } else {
-                ns.owner_gone(&Ident { pid, start, boot: now.into() }, of)
+                ns.owner_gone(&Ident { pid, start, boot: now.into(), ns: None }, of)
             }
         }
         (None, None) => !Path::new(&format!("/proc/{pid}")).exists() || older_than_boot(path),
@@ -3694,7 +3794,7 @@ fn scope_owner(name: &str) -> Option<(Ident, Option<u64>)> {
         [pid, start, ns] => (pid, start, Some(ns.parse().ok()?)),
         _ => return None,
     };
-    Some((Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() }, ns))
+    Some((Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into(), ns: None }, ns))
 }
 
 /// Keep a live owner's scope even when empty: `join_cgroup` may need it for rollback.
@@ -4862,6 +4962,126 @@ fn pid_liveness_by(pid: u32, stat: impl Fn(u32) -> std::io::Result<String>) -> (
     }
 }
 
+/// Whether `/proc` numbers processes as this process's PID namespace does: `/proc/self` names
+/// this process by the pid it has (`getpid`). One mounted for another namespace (an ancestor's,
+/// kept by `unshare --pid` without `--mount-proc`) names it by the pid it has there: its pids
+/// then are not this process's, for a pidfd or a signal, nor what records name.
+pub(crate) fn proc_is_mine() -> bool {
+    static MINE: OnceLock<bool> = OnceLock::new();
+    *MINE.get_or_init(|| proc_is_mine_in(Path::new("/proc"), std::process::id()))
+}
+
+fn proc_is_mine_in(proc: &Path, me: u32) -> bool {
+    std::fs::read_link(proc.join("self")).is_ok_and(|l| l.to_str().and_then(|s| s.parse::<u32>().ok()) == Some(me))
+}
+
+/// The inode of namespace `kind` (`pid`, `time`) of the process at `dir` (`/proc/PID`).
+fn proc_ns(dir: &Path, kind: &str) -> std::io::Result<u64> {
+    std::fs::metadata(dir.join("ns").join(kind)).map(|m| m.ino())
+}
+
+/// Where `id`, of another PID namespace than this process's, is in `proc` (this one's `/proc`),
+/// reading a process's namespace with `ns_of`: the process in `id`'s namespace with its start
+/// time and its pid there (the last of `NSpid`), Alive (a zombie: Gone). None found is proof of
+/// it gone only where `proc` lists every process (`complete`: `proc_lists_all`) and its namespace is seen: one with a process here is this namespace's
+/// descendant, every process of which is here too; or one a census proves gone (`gone`). A
+/// sibling's (or an ancestor's) processes are not here, and nothing tells them: Unknown, as is
+/// any process whose namespace or status cannot be read but for its having exited.
+fn seen_in(
+    id: &Ident,
+    proc: &Path,
+    boot: &str,
+    ns_of: &dyn Fn(&Path, &str) -> std::io::Result<u64>,
+    complete: bool,
+    gone: &dyn Fn() -> bool,
+) -> (Option<u32>, Liveness) {
+    if boot.is_empty() || id.boot.is_empty() {
+        return (None, Liveness::Unknown);
+    }
+    if id.boot != boot {
+        return (None, Liveness::Gone);
+    }
+    let Some(want) = id.ns else { return (None, Liveness::Unknown) };
+    let exited = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH);
+    let (mut seen, mut unreadable) = (false, false);
+    let Ok(entries) = std::fs::read_dir(proc) else { return (None, Liveness::Unknown) };
+    for e in entries {
+        let Ok(e) = e else { return (None, Liveness::Unknown) };
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let dir = e.path();
+        match ns_of(&dir, "pid") {
+            Ok(ns) if ns == want => seen = true,
+            Ok(_) => continue,
+            Err(e) if exited(&e) => continue,
+            Err(_) => {
+                unreadable = true;
+                continue;
+            }
+        }
+        match at_in(id, pid, proc, boot, ns_of) {
+            Liveness::Gone => {}
+            Liveness::Alive => return (Some(pid), Liveness::Alive),
+            Liveness::Unknown => unreadable = true,
+        }
+    }
+    match () {
+        _ if unreadable => (None, Liveness::Unknown),
+        _ if (seen && complete) || gone() => (None, Liveness::Gone),
+        _ => (None, Liveness::Unknown),
+    }
+}
+
+/// Whether `pid` in `proc` is `id` (of another PID namespace): in its namespace, with its pid
+/// there (`NSpid`'s last) and its start time, and not a zombie. Gone: it is another, or none. A
+/// start time is read as the reader's time namespace offsets it: one that differs proves
+/// another process only where `pid` is in this process's time namespace (`self`'s).
+fn at_in(id: &Ident, pid: u32, proc: &Path, boot: &str, ns_of: &dyn Fn(&Path, &str) -> std::io::Result<u64>) -> Liveness {
+    if boot.is_empty() || id.boot.is_empty() || id.ns.is_none() {
+        return Liveness::Unknown;
+    }
+    if id.boot != boot {
+        return Liveness::Gone;
+    }
+    let dir = proc.join(pid.to_string());
+    let exited = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH);
+    let read = |name: &str| std::fs::read_to_string(dir.join(name));
+    let start = match read("stat") {
+        Err(e) if exited(&e) => return Liveness::Gone,
+        Err(_) => return Liveness::Unknown,
+        Ok(stat) => match parse_stat(&stat) {
+            None => return Liveness::Unknown,
+            Some(("Z", _)) => return Liveness::Gone,
+            Some((_, start)) => start,
+        },
+    };
+    match ns_of(&dir, "pid") {
+        Ok(ns) if Some(ns) == id.ns => {}
+        Ok(_) => return Liveness::Gone,
+        Err(e) if exited(&e) => return Liveness::Gone,
+        Err(_) => return Liveness::Unknown,
+    }
+    let status = match read("status") {
+        Err(e) if exited(&e) => return Liveness::Gone,
+        Err(_) => return Liveness::Unknown,
+        Ok(s) => s,
+    };
+    let Some(inner) = status.lines().find_map(|l| l.strip_prefix("NSpid:")).and_then(|l| l.split_whitespace().last()).and_then(|p| p.parse::<u32>().ok())
+    else {
+        return Liveness::Unknown;
+    };
+    if inner != id.pid {
+        return Liveness::Gone;
+    }
+    if start == id.start {
+        return Liveness::Alive;
+    }
+    match (ns_of(&dir, "time"), ns_of(&proc.join("self"), "time")) {
+        (Ok(theirs), Ok(mine)) if theirs == mine => Liveness::Gone,
+        (Err(e), _) if exited(&e) => Liveness::Gone,
+        _ => Liveness::Unknown,
+    }
+}
+
 /// State and start time from `/proc/PID/stat`.
 fn parse_stat(stat: &str) -> Option<(&str, u64)> {
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
@@ -5613,7 +5833,7 @@ pub(crate) mod tests {
         // Another user who may write above could move `box` away and put a fabricated tree there.
         std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o775)).unwrap();
         assert!(open().err().unwrap().to_string().contains("above host trees"));
-        assert!(reap(&h.run, &Ident { pid: 999999932, start: 1, boot: boot_id().into() }).is_err(), "nor reaped through");
+        assert!(reap(&h.run, &Ident { pid: 999999932, start: 1, boot: boot_id().into(), ns: None }).is_err(), "nor reaped through");
         // Sticky (like /tmp): nobody else may rename what is ours.
         std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o1777)).unwrap();
         open().unwrap();
@@ -5905,7 +6125,7 @@ pub(crate) mod tests {
     }
 
     fn dead_owner(h: &Host, pid: u32, fcs: &[&Ident]) -> Ident {
-        let dead = Ident { pid, start: 1, boot: boot_id().into() };
+        let dead = Ident { pid, start: 1, boot: boot_id().into(), ns: None };
         let dir = dead.work_dir(&h.run);
         for (i, fc) in fcs.iter().enumerate() {
             std::fs::create_dir_all(dir.join(i.to_string())).unwrap();
@@ -6217,7 +6437,7 @@ pub(crate) mod tests {
         assert!(fc.done());
         let fc = Sleeper::new();
         dead_owner(&h, 999_999_903, &[&fc.1]);
-        reap(&h.run, &Ident { pid: 999_999_903, start: 2, boot: boot_id().into() }).unwrap();
+        reap(&h.run, &Ident { pid: 999_999_903, start: 2, boot: boot_id().into(), ns: None }).unwrap();
         assert!(!fc.done());
         // A killed holder's name is let go of by the garbage collector; a live one's is not.
         let fc = Sleeper::new();
@@ -6236,7 +6456,7 @@ pub(crate) mod tests {
         let (fc, fc2) = (Sleeper::new(), Sleeper::new());
         let (dead, dead2) = (dead_owner(&h, 999_999_905, &[&fc.1]), dead_owner(&h, 999_999_906, &[&fc2.1]));
         store(&h.vms("w", "lock").unwrap(), &dead, false).unwrap();
-        store(&h.vms("w", "exit").unwrap(), &exit(&Ident { pid: 1, start: 1, boot: "earlier".into() }, 143), false).unwrap();
+        store(&h.vms("w", "exit").unwrap(), &exit(&Ident { pid: 1, start: 1, boot: "earlier".into(), ns: None }, 143), false).unwrap();
         store(&h.vms("w2", "lock").unwrap(), &dead2, false).unwrap();
         store(&h.vms("w2", "exit").unwrap(), &exit(&dead2, 3), false).unwrap();
         collect_owned(&h.run);
@@ -7339,7 +7559,7 @@ pub(crate) mod tests {
             let rec = h.addr(&h.lock().unwrap(), ip(x)).unwrap();
             assert!(rec.holder.is_none() && rec.holder_id.is_none() && rec.leaving.is_none(), "{x}: {rec:?}");
             assert!(!h.owed_path(mig).exists(), "{x}: nothing is owed");
-            assert!(!h.owes(&Ident { pid, start: 1, boot: boot_id().into() }), "{x}: its target may forget it");
+            assert!(!h.owes(&Ident { pid, start: 1, boot: boot_id().into(), ns: None }), "{x}: its target may forget it");
         }
     }
 
@@ -7385,13 +7605,14 @@ pub(crate) mod tests {
 
     #[test]
     fn cgroups_name_their_process() {
-        let owner = Ident { pid: 4242, start: 77, boot: boot_id().into() };
+        let owner = Ident { pid: 4242, start: 77, boot: boot_id().into(), ns: None };
         // An earlier build's name has no namespace; this one's does (#1082).
         assert_eq!(cgroup_owner("idle-4242-77-3"), Some((owner.clone(), None)));
         assert_eq!(cgroup_owner("idle-4242-77-3-4026531836"), Some((owner.clone(), Some(4_026_531_836))));
         assert_eq!(idle_cgroup_in(&owner, 3, None), "idle-4242-77-3");
         assert_eq!(idle_cgroup_in(&owner, 3, Some(9)), "idle-4242-77-3-9");
-        assert_eq!(cgroup_owner(&idle_cgroup(5)), Some((Ident::me(), pid_ns())));
+        // The namespace is the name's, apart from the owner judged by it (`PidNs`).
+        assert_eq!(cgroup_owner(&idle_cgroup(5)), Some((Ident { ns: None, ..Ident::me() }, pid_ns())));
         assert!(pid_ns().is_some());
         for cg in [
             "vm-4242",
@@ -7412,7 +7633,7 @@ pub(crate) mod tests {
         }
         // A dead owner's: judged by its pid in its own namespace, or with none named; another
         // namespace's only once a census of every process finds none left in it.
-        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into(), ns: None };
         let census = || Some(HashSet::from([100, 200]));
         let host = pidns(Some(100), &census);
         assert!(cgroup_owner_gone(&idle_cgroup_in(&dead, 0, Some(100)), &host));
@@ -7462,6 +7683,100 @@ pub(crate) mod tests {
         assert_eq!(pid_ns_census_in(&d.join("missing"), 100, &|_: &Path| Ok(100)), None);
         let unknown = || None;
         assert!(!pidns(Some(100), &unknown).gone(Some(300)));
+    }
+
+    /// #1111: a process of another PID namespace is found by that namespace, its pid there and
+    /// its start time, never by the pid it has there; and proven gone only where its namespace
+    /// is seen (or a census proves that gone), never from a sibling's.
+    #[test]
+    fn other_pid_namespaces_processes_are_found_by_their_namespace() {
+        let d = crate::test_util::TempDir::new("pidns-seen");
+        let proc = d.join("proc");
+        // (pid here, its namespace, NSpid, state, start time, time namespace)
+        let procs = [(100, 200, "100\t1", "S", 500, 1), (101, 200, "101\t7", "Z", 600, 1), (102, 300, "102\t1", "S", 500, 1), (1, 100, "1", "S", 5, 1)];
+        for (pid, _, nspid, state, start, _) in procs {
+            let dir = proc.join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stat"), format!("{pid} (a b) {state} {} {start} 0 0", "0 ".repeat(18))).unwrap();
+            std::fs::write(dir.join("status"), format!("Name:\tx\nNSpid:\t{nspid}\n")).unwrap();
+        }
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        let other_time = std::sync::atomic::AtomicBool::new(false);
+        let unreadable = std::sync::atomic::AtomicBool::new(false);
+        let ns_of = |dir: &Path, kind: &str| -> std::io::Result<u64> {
+            let name = dir.file_name().unwrap().to_str().unwrap();
+            if kind == "time" {
+                return Ok(if name == "100" && other_time.load(std::sync::atomic::Ordering::SeqCst) { 2 } else { 1 });
+            }
+            if name == "1" && unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(procs.iter().find(|p| p.0.to_string() == name).map_or(0, |p| p.1 as u64))
+        };
+        let boot = "boot";
+        let id = |pid, start, ns| Ident { pid, start, boot: boot.into(), ns: Some(ns) };
+        let seen = |id: &Ident, gone: bool| seen_in(id, &proc, boot, &ns_of, true, &|| gone);
+        // Pid 1 there is 100 here, never the namesake of another namespace (102), nor pid 1 here.
+        assert_eq!(seen(&id(1, 500, 200), false), (Some(100), Liveness::Alive));
+        assert_eq!(at_in(&id(1, 500, 200), 100, &proc, boot, &ns_of), Liveness::Alive);
+        assert_eq!(at_in(&id(1, 500, 200), 102, &proc, boot, &ns_of), Liveness::Gone);
+        assert_eq!(at_in(&id(1, 500, 200), 1, &proc, boot, &ns_of), Liveness::Gone);
+        // Another start time with its pid there: another process. A zombie: gone.
+        assert_eq!(seen(&id(1, 501, 200), false), (None, Liveness::Gone));
+        assert_eq!(seen(&id(7, 600, 200), false), (None, Liveness::Gone));
+        assert_eq!(seen(&id(9, 500, 200), false), (None, Liveness::Gone), "its namespace is seen: all of it is");
+        assert_eq!(seen(&id(1, 500, 200), true).1, Liveness::Alive);
+        // A /proc that may leave processes out (`hidepid`, `subset`): one of its namespace seen
+        // (100), the one looked for (pid 9 there) silently not listed, proves nothing.
+        assert_eq!(seen_in(&id(9, 500, 200), &proc, boot, &ns_of, false, &|| false), (None, Liveness::Unknown));
+        assert_eq!(seen_in(&id(1, 500, 200), &proc, boot, &ns_of, false, &|| false), (Some(100), Liveness::Alive));
+        let line = |opts: &str| format!("22 26 0:5 / /proc rw,nosuid shared:12 - proc proc rw{opts}\n");
+        assert!(proc_mount_lists_all(&line("")));
+        assert!(!proc_mount_lists_all(&line(",hidepid=invisible")));
+        assert!(!proc_mount_lists_all(&format!("{}{}", line(""), line(",subset=pid"))));
+        assert!(!proc_mount_lists_all("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"), "no /proc mount read: not known complete");
+        // A start time read through another time namespace's offsets proves nothing.
+        other_time.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(at_in(&id(1, 501, 200), 100, &proc, boot, &ns_of), Liveness::Unknown);
+        assert_eq!(seen(&id(1, 501, 200), false), (None, Liveness::Unknown));
+        other_time.store(false, std::sync::atomic::Ordering::SeqCst);
+        // A namespace with no process here (a sibling's): unknown, unless a census proves it gone.
+        assert_eq!(seen(&id(1, 500, 400), false), (None, Liveness::Unknown));
+        assert_eq!(seen(&id(1, 500, 400), true), (None, Liveness::Gone));
+        // A process whose namespace cannot be read may be it: unknown.
+        unreadable.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(seen(&id(9, 500, 200), false), (None, Liveness::Unknown));
+        unreadable.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Another boot's is gone; without boot ids, nothing tells.
+        assert_eq!(seen_in(&id(1, 500, 200), &proc, "other", &ns_of, true, &|| false), (None, Liveness::Gone));
+        assert_eq!(seen_in(&id(1, 500, 200), &proc, "", &ns_of, true, &|| false), (None, Liveness::Unknown));
+        // A /proc of another PID namespace names this process by another pid: none of its
+        // pids is this process's (#1111), however a scan of it reads.
+        assert!(proc_is_mine() && proc_is_mine_in(Path::new("/proc"), std::process::id()));
+        let other = d.join("other-proc");
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink("4242", other.join("self")).unwrap();
+        assert!(proc_is_mine_in(&other, 4242));
+        assert!(!proc_is_mine_in(&other, 1), "pid 1 here, 4242 in that /proc's namespace");
+        assert!(!proc_is_mine_in(&d.join("missing"), 1));
+        // Here (this namespace, or none named), by its pid.
+        let me = Ident::me();
+        assert!(me.ns.is_some() && me.ns == pid_ns());
+        assert_eq!(me.local_pid().unwrap(), Some(me.pid));
+        assert!(me.is(me.pid) && !me.is(me.pid + 1));
+        assert_eq!(Ident { ns: None, ..me.clone() }.local_pid().unwrap(), Some(me.pid));
+        // An unseen one's pid is an error, never a pid to signal.
+        let sibling = Ident { ns: Some(u64::MAX), ..me.clone() };
+        let e = sibling.local_pid().unwrap_err();
+        assert!(e.is::<Unseen>(), "{e}");
+        assert!(PidFd::open(&sibling).is_err_and(|e| e.is::<Unseen>()));
+        assert!(!sibling.is(me.pid));
+        // Records: `pidns`, and an earlier build's without it read as none.
+        let v = serde_json::to_value(&me).unwrap();
+        assert_eq!(v["pidns"], serde_json::json!(me.ns.unwrap()));
+        let old: Ident = serde_json::from_value(serde_json::json!({"pid": 1, "start": 2, "boot": "b"})).unwrap();
+        assert_eq!(old.ns, None);
+        assert_eq!(serde_json::to_value(&old).unwrap(), serde_json::json!({"pid": 1, "start": 2, "boot": "b"}));
     }
 
     fn pidns<'a>(mine: Option<u64>, census: &'a dyn Fn() -> Option<HashSet<u64>>) -> PidNs<'a> {
@@ -8018,7 +8333,7 @@ pub(crate) mod tests {
     #[test]
     fn taps_are_this_hosts_by_their_alias() {
         let (_h_dir, h) = host("alias");
-        let me = Ident::me();
+        let me = Ident { ns: None, ..Ident::me() };
         let alias = tap_alias(&h.run, &me);
         assert_eq!(parse_tap_alias(&alias), Some((me.clone(), pid_ns(), &*h.run.to_string_lossy())));
         for bad in [
@@ -8040,13 +8355,13 @@ pub(crate) mod tests {
         // An earlier build's alias names no namespace; the run directory may have spaces.
         assert_eq!(parse_tap_alias("flexvm 1 2 /run/a b").map(|(o, ns, r)| (o.pid, o.start, ns, r)), Some((1, 2, None, "/run/a b")));
         assert_eq!(parse_tap_alias("flexvm pidns:7 1 2 /run/a b").map(|(o, ns, r)| (o.pid, o.start, ns, r)), Some((1, 2, Some(7), "/run/a b")));
-        let one = Ident { pid: 1, start: 2, boot: String::new() };
+        let one = Ident { pid: 1, start: 2, boot: String::new(), ns: None };
         assert_eq!(tap_alias_in(Path::new("/run/x"), &one, None), "flexvm 1 2 /run/x");
         assert_eq!(tap_alias_in(Path::new("/run/x"), &one, Some(7)), "flexvm pidns:7 1 2 /run/x");
         let net = h.run.join("net");
         let other = h.run.join("other");
         std::fs::create_dir(&other).unwrap();
-        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into(), ns: None };
         let dev = |name: &str, index: u32, alias: &str, tun: bool| {
             let d = net.join(name);
             std::fs::create_dir_all(&d).unwrap();
@@ -8077,7 +8392,8 @@ pub(crate) mod tests {
         let run = d.join("run");
         std::fs::create_dir(&run).unwrap();
         let net = d.join("net");
-        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        // A holder as a lock records it now: with its PID namespace, which the alias names apart.
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into(), ns: pid_ns() };
         let reused = Ident { start: 2, ..dead.clone() };
         let other = Ident { pid: 999_999_932, ..dead.clone() };
         let live = Ident::me();
@@ -8098,7 +8414,11 @@ pub(crate) mod tests {
         }
         let mut taps = dead_taps_at(&run, &net, Some(&dead), &PidNs::now());
         taps.sort_by_key(|t| t.1);
-        assert_eq!(taps, vec![("dead-0".into(), 10, dead.clone()), ("dead-1".into(), 11, dead.clone())]);
+        let parsed = Ident { ns: None, ..dead.clone() };
+        assert_eq!(taps, vec![("dead-0".into(), 10, parsed.clone()), ("dead-1".into(), 11, parsed)]);
+        // An earlier build's holder (no namespace recorded) is the same owner; one of another namespace is not.
+        assert_eq!(dead_taps_at(&run, &net, Some(&Ident { ns: None, ..dead.clone() }), &PidNs::now()).len(), 2);
+        assert!(dead_taps_at(&run, &net, Some(&Ident { ns: Some(pid_ns().unwrap() + 1), ..dead.clone() }), &PidNs::now()).is_empty());
         assert!(dead_taps_at(&run, &net, Some(&live), &PidNs::now()).is_empty(), "a live holder's taps stay");
         assert!(dead_taps_at(&run, &net, Some(&Ident { boot: String::new(), ..dead }), &PidNs::now()).is_empty(), "unknown is not proof of death");
         assert_eq!(dead_taps_at(&run, &net, None, &PidNs::now()).len(), 5, "the sweep also collects other dead holders and orphaned hosts");
@@ -8111,7 +8431,7 @@ pub(crate) mod tests {
         let other = d.join("private run");
         let net = d.join("net");
         std::fs::create_dir(&other).unwrap();
-        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into(), ns: None };
         for (name, index, owner, tun) in [("dead", 10, dead.clone(), true), ("live", 11, Ident::me(), true), ("not-tun", 12, dead.clone(), false)] {
             let dev = net.join(name);
             std::fs::create_dir_all(&dev).unwrap();
@@ -8138,7 +8458,7 @@ pub(crate) mod tests {
         std::fs::create_dir(&run).unwrap();
         std::fs::create_dir(&other).unwrap();
         let (net, orphan) = (d.join("net"), d.join("missing"));
-        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into(), ns: None };
         // This host is namespace 100; 200 has a process left, 210 none.
         for (name, index, run, ns) in [
             ("mine", 10, &run, Some(100)),
@@ -8234,6 +8554,7 @@ pub(crate) mod tests {
         let mut removed = false;
         sweep_scope_with(&cg, &pidns(Some(100), &blind), |_| removed = true);
         assert!(!removed, "never without a census");
+        let me = Ident { ns: None, ..me };
         assert_eq!(scope_owner(&format!("vm-{}-7", me.key())), Some((me.clone(), Some(7))));
         assert_eq!(scope_owner(&format!("vm-{}", me.key())), Some((me, None)));
     }
@@ -8249,7 +8570,7 @@ pub(crate) mod tests {
         assert_eq!(liveness_by(&me, "", stat), Liveness::Unknown);
         assert_eq!(liveness_by(&Ident { boot: "other".into(), ..me.clone() }, boot_id(), stat), Liveness::Gone);
         let (_h_dir, h) = host("noboot");
-        let dead = Ident { pid: 999_999_931, start: 1, boot: String::new() };
+        let dead = Ident { pid: 999_999_931, start: 1, boot: String::new(), ns: None };
         assert!(reap(&h.run, &dead).is_err(), "never reaped as another boot's");
         assert!(!boot_id().is_empty() && Ident::of(std::process::id()).is_some_and(|i| i.boot == boot_id()));
     }
@@ -9481,7 +9802,7 @@ pub(crate) mod tests {
         assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000, "expired by age");
         // Not populated: in full while its process runs, gone with it.
         let me = Ident::me();
-        let gone = Ident { pid: (1 << 22) - 2, start: 1, boot: me.boot.clone() };
+        let gone = Ident { pid: (1 << 22) - 2, start: 1, boot: me.boot.clone(), ns: None };
         store(&h.debits(), &vec![debit(700, t0, &gone, false), debit(300, t0, &me, false)], false).unwrap();
         assert_eq!(take_at(&h, 1, read, || ()).0, AVAIL - 1000 - 300);
         // Unreadable: nothing taken, and none left (never no bound); unreadable debits written just now leave none.
@@ -9550,7 +9871,7 @@ pub(crate) mod tests {
     #[test]
     fn debits_count_in_full_unless_the_drift_bound_is_known() {
         let (now, window) = (100_000, 60_000);
-        let (me, gone) = (Ident::me(), Ident { pid: 7, start: 7, boot: String::new() });
+        let (me, gone) = (Ident::me(), Ident { pid: 7, start: 7, boot: String::new(), ns: None });
         let debits = Some(Some(vec![
             debit(10, now - 100, &me, true),
             debit(500, now - 30_000, &me, true),
