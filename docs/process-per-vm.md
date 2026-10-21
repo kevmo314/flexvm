@@ -300,7 +300,7 @@ devices whose alias names its run directory and an owner proven gone
 (another host's taps, whatever their names read as under this prefix, and
 taps with no such alias, an earlier version's say, are never touched); a
 process with a reused pid removes its dead namesake's as it starts, as their
-names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>-<pidns>`, by the process's identity in this PID namespace or one naming none; another namespace's, as its taps, only once a census from the initial PID namespace finds none of its processes left), work directories, names, a standby
+names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>-<pidns>`, by the process's identity in this PID namespace or one naming none; another namespace's, as its taps, only once a census from the initial PID namespace finds none of its processes left), work directories and names (by their owner's identity, its PID namespace with it: one of another namespace by the process here in that namespace with its pid there and start time, `host::Ident::local_pid`; one this process cannot see, a sibling's, never), a standby
 VM's socket (its `PID-START.lock` free) and a lock it died before renaming in place (`.PID-START.lock`), an arrival's log (its lock in `vms/.locks` free or gone, 5 s
 old). A VM process's own cgroup (`vm-PID-START-NS`; an earlier build's `vm-PID-START`, by pid here) goes once empty
 and its owner is gone (another PID namespace's, as its taps, only once that namespace is), never

@@ -1073,7 +1073,8 @@ fn run_as(
             // Its terminal gone, this client's own output is dropped: only the VM's process
             // writes the VM's logs.
             crate::info!("{v}");
-            let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
+            let id =
+                host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into(), ns: None };
             follow(conn, id)
         }
         (None, Some(log)) => {
@@ -1388,6 +1389,11 @@ fn not_running(host: &Host, name: &str) -> util::Error {
     }
 }
 
+/// A VM whose process runs in a PID namespace this one cannot see (`host::Unseen`): never signalled by its pid.
+fn unseen(name: &str, e: util::Error) -> util::Error {
+    host::Unseen(format!("vm {name}: {e}")).into()
+}
+
 /// How long `stop` waits for a suspend: its copy of the VM's memory to disk.
 const STOP_WAIT: Duration = Duration::from_secs(600);
 
@@ -1396,6 +1402,7 @@ fn stop(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
     let vm = match host.signal(name, libc::SIGTERM) {
         Ok(vm) => vm,
+        Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
         Err(_) if !host.alive(name) && (host.suspended(name)?.exists() || host.has_record(name, "exited")) => return Ok(()),
         Err(_) => return Err(not_running(host, name)),
     };
@@ -1421,7 +1428,7 @@ fn stop(host: &Host, name: &str) -> Result<()> {
 /// SIGTSTP, and waits until its vCPUs are paused.
 fn pause(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
-    host.signal(name, libc::SIGTSTP).map_err(|_| not_running(host, name))?;
+    host.signal(name, libc::SIGTSTP).map_err(|e| if e.is::<host::Unseen>() { unseen(name, e) } else { not_running(host, name) })?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match host.entry(name).map(|e| e.state) {
@@ -1455,7 +1462,10 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     if host.entry(name).is_ok_and(|e| e.state == "source") {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
     }
-    let killed = host.signal(name, libc::SIGINT).ok();
+    let killed = match host.signal(name, libc::SIGINT) {
+        Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
+        r => r.ok(),
+    };
     if let Some(vm) = &killed {
         if !vm.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
@@ -2065,6 +2075,7 @@ fn exec_request(
             Ok(Ok(StreamEnd::Detached)) => return Ok(0),
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
             Err(e) if e.is::<Replaced>() => return Err(format!("{e} (session {id})").into()),
+            Err(e) if e.is::<host::Unseen>() => return Err(e),
             Err(e) => {
                 // A new interactive command fails at once; a running one (or a VM's
                 // main command) waits for its VM to resume, or for a checkpoint (a
@@ -2128,7 +2139,15 @@ pub(crate) fn connect_same(host: &Host, name: &str, req: &Value, at: Instant, pi
         // The process that listens; a VM's own main command needs no check: no other takes the name while it holds it.
         let pid = util::peer_pid(c)?;
         if pid != std::process::id() {
-            let entry = host.entry(name).ok().filter(|e| e.ident.pid == pid && e.gen != 0);
+            // Its pid as this process sees it: in another PID namespace, not the one it has there.
+            // One this process cannot see (a sibling container's) is not waited for: it never will.
+            let entry = host.entry(name).ok().filter(|e| e.gen != 0);
+            if let Some(Err(e)) = entry.as_ref().filter(|e| !e.ident.is(pid)).map(|e| e.ident.local_pid()) {
+                if e.is::<host::Unseen>() {
+                    return Err(unseen(name, e));
+                }
+            }
+            let entry = entry.filter(|e| e.ident.is(pid));
             let now = entry.as_ref().and_then(|e| Some(Instance { ip: e.ip?, gen: e.gen }));
             same_instance(
                 name,
