@@ -823,6 +823,20 @@ def fc_pid(host, name):
     return vms(host)[name]["firecracker"]
 
 
+def unanswered(host, name):
+    """Why `name`'s guest may not answer: what its Firecracker's threads (vCPUs, and the VMM thread that runs vsock)
+    and its VM process's wait on, and the end of the guest's console (Firecracker's log, in its working directory)."""
+    try:
+        v = vms(host)[name]
+        with open(f"/proc/{v['firecracker']}/cwd/firecracker.log", "rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - 4000))
+            console = f.read().decode(errors="replace")
+        return {"state": v.get("state"), "failed": v.get("failed"), "guest_retries": v.get("guest_retries"),
+                "firecracker": threads_of(v["firecracker"]), "vm process": threads_of(v["pid"]), "console": console}
+    except Exception as e:
+        return f"no account of {name}: {type(e).__name__}: {e}"
+
+
 def died_with_process(label, host, name, pid, fc, killed):
     """After a SIGKILL of `name`'s VM process `pid` (at `killed`): its Firecracker `fc` dies (PDEATHSIG), and the name
     is let go. Each is waited for (#653): the name's lock goes with the dying process's last file, which can be a
@@ -5495,7 +5509,8 @@ def writer_check(host, name):
                                "[ \"$t\" != \"$s\" ] && cat /tmp/mw.status")
     rows = [l.split() for l in out.splitlines() if l.startswith("thread")]
     if code != 0 or not rows:
-        return None, 0, out
+        # flexvm's own error, not the check's: the exec never reached the guest (#1211).
+        return None, 0, (f"{out}; {unanswered(host, name)}" if out.startswith("flexvm:") else out)
     errors = sum(int(r[r.index("cont_errors") + 1]) + int(r[r.index("full_errors") + 1]) for r in rows)
     return errors, sum(int(r[r.index("k") + 1]) for r in rows), out
 
