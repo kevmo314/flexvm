@@ -1066,28 +1066,20 @@ fn run_as(
         unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
     }
     match (taken, log) {
-        (Some(_), Some(_)) if attached => run_attached(host, &name, args.has("keep")),
+        (Some((v, _)), Some(_)) if attached => run_attached(host, &name, args.has("keep"), &started(&v)),
         (Some((v, _)), Some(_)) => print(v),
         (Some((v, conn)), None) => {
             // Its terminal gone, this client's own output is dropped: only the VM's process
             // writes the VM's logs.
             crate::info!("{v}");
-            // Its pid is the one it has in its PID namespace (`pidns`), found here by that (#1139);
-            // an earlier build's reply names none, judged by its pid here.
-            let id = host::Ident {
-                pid: v["pid"].as_u64().unwrap_or(0) as u32,
-                start: v["start"].as_u64().unwrap_or(0),
-                boot: host::boot_id().into(),
-                ns: v["pidns"].as_u64(),
-            };
-            follow(conn, id)
+            follow(conn, started(&v))
         }
         (None, Some(log)) => {
             // The child takes the name made up here.
             let child = [&["--name".to_string(), name.clone()][..], &args.child_args].concat();
             let v = spawn_detached(host, &name, &child, &log, attached)?;
             match attached {
-                true => run_attached(host, &name, args.has("keep")),
+                true => run_attached(host, &name, args.has("keep"), &started(&v)),
                 false => print(v),
             }
         }
@@ -1107,17 +1099,30 @@ fn run_as(
     }
 }
 
+/// The VM process a run started or claimed, from its reply. Its pid is the one it has in its PID
+/// namespace (`pidns`), found here by that (#1139); an earlier build's reply names none, judged by
+/// its pid here (one naming no pid is no process's: nothing is ever taken for its own).
+fn started(v: &Value) -> host::Ident {
+    host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into(), ns: v["pidns"].as_u64() }
+}
+
 /// A foreground `run -i`/`-t`: attached to its app from its first byte, it exits with it. As a foreground run's,
-/// its VM leaves no exited record (unless detached from, when it is a background VM's like any other).
-fn run_attached(host: &Host, name: &str, keep: bool) -> Result<()> {
-    let code = attach::attach(host, name, Some(0))?;
+/// its VM (`vm`, the instance it started) leaves no exited record (unless detached from, when it is a background
+/// VM's like any other). Only its own records go: another VM may have run and ended under the name since (#1206).
+/// Its own: the process the attachment last reached (a resume's, after a stop and start), else, its app done
+/// before any connection, the one it started.
+fn run_attached(host: &Host, name: &str, keep: bool, started: &host::Ident) -> Result<()> {
+    let (code, last) = attach::attach_to(host, name, Some(0))?;
+    let vm = last.as_ref().unwrap_or(started);
     let until = Instant::now() + Duration::from_secs(10);
     while !keep && host.alive(name) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Test gate: its app's status in, its records not yet removed.
+    host::hold("attached_cleanup_gate");
     if !keep && !host.alive(name) && host.vms(name, "exited")?.exists() {
         // Its log stays, as a foreground run's without a terminal (its diagnostics are there alone).
-        let _ = remove_stopped(host, name, true, false, None, false);
+        let _ = remove_stopped(host, name, true, false, Some(vm), false);
     }
     util::exit(code)
 }

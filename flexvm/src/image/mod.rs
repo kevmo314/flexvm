@@ -1040,7 +1040,8 @@ fn ext4_content_kib(dir: &Path) -> Result<u64> {
             // Each entry has an 8-byte header and a name rounded up to 4 bytes.
             bytes += 8 + (entry.file_name().as_bytes().len() as u64).div_ceil(4) * 4;
             let metadata = entry.metadata()?;
-            if !seen.insert((metadata.dev(), metadata.ino())) {
+            // Only a hard-linked inode can be met again (directories have no hard links).
+            if !metadata.is_dir() && metadata.nlink() > 1 && !seen.insert((metadata.dev(), metadata.ino())) {
                 continue;
             }
             let path = entry.path();

@@ -9933,6 +9933,76 @@ def rm_later_exit():
     check("rm later exit: wait gives the later vm's exit status", code == 0 and out.strip() == "7", (code, out, err))
 
 
+def attached_later_exit():
+    """#1206: a foreground `run -i` whose cleanup is delayed (held at `attached_cleanup_gate`, its app's
+    status in) while, its records removed, another VM of the name runs in the background and exits removes none of that
+    VM's records: it is left exited, with its own status, and `flexvm wait` gives it."""
+    n = "ft-attached-later-exit"
+    scenario_vms.add(n)
+    clear_gate(A, "attached_cleanup_gate")
+    attached = None
+    fault(A, "attached_cleanup_gate", 600000)
+    try:
+        attached = spawn_cli(A, "run", "-i", "--name", n, args.template, "sh", "-c", "exit 3",
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("attached later exit: the attached run is held", wait_for(lambda: attached.pid in reached(A, "attached_cleanup_gate"), 120),
+              reached(A, "attached_cleanup_gate"))
+        check("attached later exit: the attached vm exited", wait_for(lambda: not name_locked(A, n) and vms(A).get(n, {}).get("status") == 3, 30), vms(A).get(n))
+        # Its exited record removed by another client, the name is free for the later VM.
+        code, out, err = cli(A, "rm", n)
+        check("attached later exit: rm of the attached vm", code == 0, (code, out, err))
+        gated_app(n, 7)
+        check("attached later exit: the later vm runs", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+        ended = lambda: vms(A).get(n, {}).get("state") == "exited" and vms(A)[n].get("status") == 7
+        tell_exit(n, "attached later exit", ended)
+        check("attached later exit: the later vm exited", wait_for(ended, 30), vms(A).get(n))
+    finally:
+        release(A, "attached_cleanup_gate")
+    if attached:
+        out, err = communicate_process(attached, 60)
+        check("attached later exit: the attached run gives its app's status", attached.returncode == 3, (attached.returncode, out, err[-300:]))
+    check("attached later exit: the later vm's records stay", vms(A).get(n, {}).get("state") == "exited" and vms(A)[n].get("status") == 7, vms(A).get(n))
+    code, out, err = cli(A, "wait", n)
+    check("attached later exit: wait gives the later vm's exit status", code == 0 and out.strip() == "7", (code, out, err))
+    cli(A, "rm", n)
+
+
+def attached_resumed_exit():
+    """#1206: a foreground `run -i` whose VM is stopped and started meanwhile (its client paused through
+    both) follows the resumed VM, and once its app exits removes that VM's records, its own: no exited
+    record is left (it had no --keep)."""
+    n = "ft-attached-resumed"
+    scenario_vms.add(n)
+    app = "while [ ! -e /tmp/go ]; do sleep 0.05; done; exit 4"
+    attached = spawn_cli(A, "run", "-i", "--name", n, args.template, "sh", "-c", app,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        check("attached resumed exit: the vm runs", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 60), vms(A).get(n))
+        # Attached (its output follow open) before it is paused.
+        time.sleep(1)
+        os.kill(attached.pid, signal.SIGSTOP)
+        try:
+            code, out, err = cli(A, "stop", n)
+            check("attached resumed exit: stopped", code == 0 and vms(A).get(n, {}).get("state") == "suspended", (code, err, vms(A).get(n)))
+            code, out, err = cli(A, "start", n)
+            check("attached resumed exit: started again", code == 0 and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), (code, err, vms(A).get(n)))
+        finally:
+            os.kill(attached.pid, signal.SIGCONT)
+        # Its follow ended with the stopped process: it reconnects (every 200 ms) to the resumed one first.
+        time.sleep(3)
+        check("attached resumed exit: still attached", attached.poll() is None, attached.poll())
+        ended = lambda: attached.poll() is not None or vms(A).get(n, {}).get("state") == "exited"
+        tell_exit(n, "attached resumed exit", ended)
+        out, err = communicate_process(attached, 60)
+        check("attached resumed exit: the attached run gives its app's status", attached.returncode == 4, (attached.returncode, out, err[-300:]))
+        check("attached resumed exit: no exited record left", wait_for(lambda: n not in vms(A), 10), vms(A).get(n))
+    finally:
+        if attached.poll() is None:
+            attached.kill()
+            attached.wait()
+        cli(A, "rm", "-f", n)
+
+
 def rm_crashed_replacement():
     """#1185: two delayed `rm -f`s (held at `kill_gate` after their signals) of a VM that ends, a new
     VM of the name then running and dying unrecorded (SIGKILL: the first VM's exit record stale). The
@@ -12085,7 +12155,7 @@ SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
     run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint, kill_held_stopped=kill_held_stopped, kill_starting=kill_starting, restart_renamed=restart_renamed, rename_moved_hint=rename_moved_hint,
-    stop_renamed=stop_renamed, kill_renamed_into=kill_renamed_into, pause_renamed=pause_renamed, kill_crashed_owner=kill_crashed_owner, rm_later_exit=rm_later_exit, rm_crashed_replacement=rm_crashed_replacement, rm_unrecorded=rm_unrecorded,
+    stop_renamed=stop_renamed, kill_renamed_into=kill_renamed_into, pause_renamed=pause_renamed, kill_crashed_owner=kill_crashed_owner, rm_later_exit=rm_later_exit, attached_later_exit=attached_later_exit, attached_resumed_exit=attached_resumed_exit, rm_crashed_replacement=rm_crashed_replacement, rm_unrecorded=rm_unrecorded,
     terminal=terminal,
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,
