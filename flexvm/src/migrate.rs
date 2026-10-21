@@ -1890,8 +1890,10 @@ mod tests {
         let many = format!("[{}\"junk\"]", (0..=MAX_PRELOAD).map(|p| format!("{p},")).collect::<String>());
         let err = decode("[]", &many).unwrap_err();
         assert!(err.contains(&format!("preload: more than {MAX_PRELOAD} items")), "{err}");
-        let err = decode("[]", r#"[2,2,"junk"]"#).unwrap_err();
-        assert!(err.contains("preload: item 1 out of order"), "{err}");
+        for preload in [r#"[2,2,"junk"]"#, r#"[3,0,"junk"]"#] {
+            let err = decode("[]", preload).unwrap_err();
+            assert!(err.contains("preload: item 1 out of order"), "{err}");
+        }
     }
 
     /// The header line is capped by what an honest source could send for the guest's memory, a run per page.

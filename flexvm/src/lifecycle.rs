@@ -1123,6 +1123,7 @@ pub fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
     let dir = host.suspended(name)?;
     let (ip, gen) = (read_manifest(&dir).ok().map(|m| m.ip), read_gen(&dir));
     mark_durably(&dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
+    // DISCARDED already prevents resume; failed cleanup leaves only debris for the name's next holder.
     delete_consumed(name, &dir);
     Ok(free_address(host, name, ip, gen))
 }

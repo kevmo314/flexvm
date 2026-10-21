@@ -483,31 +483,12 @@ impl Pages {
         n: usize,
         from: u8,
         stop: Option<&dyn Fn() -> bool>,
-        populate: impl FnMut(usize, usize) -> io::Result<usize>,
-    ) -> (usize, io::Result<()>) {
-        self.install_prepared(first, n, from, stop, None, populate)
-    }
-
-    /// `install`, calling `prepare(page, count)` on each copy's pages before taking `events` for it (once per page),
-    /// e.g. to fault a copy's source in without holding up the event thread.
-    pub fn install_prepared(
-        &self,
-        first: usize,
-        n: usize,
-        from: u8,
-        stop: Option<&dyn Fn() -> bool>,
-        prepare: Option<&dyn Fn(usize, usize)>,
         mut populate: impl FnMut(usize, usize) -> io::Result<usize>,
     ) -> (usize, io::Result<()>) {
-        let (end, mut resolved, mut i, mut prepared) = (first + n, 0, first, first);
+        let (end, mut resolved, mut i) = (first + n, 0, first);
         while i < end {
             // Bound the copy while holding events: REMOVE and fault batches need its write lock.
             let copy_end = end.min(i + COPY_RUN);
-            if let Some(prepare) = prepare.filter(|_| prepared < copy_end) {
-                let from = prepared.max(i);
-                prepare(from, copy_end - from);
-                prepared = copy_end;
-            }
             let installing = self.events.read().unwrap();
             if self.get(i) == DISCARDED {
                 resolved += self.settle(i, false, from) as usize;
@@ -720,36 +701,6 @@ mod tests {
         result.unwrap();
         assert_eq!(resolved, 513);
         assert_eq!(copies, (0..513).step_by(32).map(|p| (p, (513 - p).min(32))).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn install_prepares_each_copy_once_before_taking_events() {
-        for n in [1, 31, 33, 256] {
-            let mut pages = Pages::new(n);
-            pages.fill(0, n, REMOTE);
-            assert_eq!(pages.claim(0, n, REMOTE, |_| true), n);
-            {
-                let removing = pages.removing();
-                pages.discard(&removing, n / 2, n / 2 + 1);
-            }
-            let prepared = std::cell::RefCell::new(Vec::new());
-            let prepare = |p: usize, c: usize| {
-                // Not under `events`: a writer could take it meanwhile.
-                drop(pages.events.try_write().expect("prepare runs without events held"));
-                assert!((1..=COPY_RUN).contains(&c));
-                prepared.borrow_mut().push((p, c));
-            };
-            let (resolved, result) = pages.install_prepared(0, n, REMOTE, None, Some(&prepare), |p, count| {
-                let ready = prepared.borrow().last().map_or(0, |&(a, c)| a + c);
-                assert!(p + count <= ready, "copy of {p}+{count} before its source was prepared ({ready})");
-                Ok(count.min(17))
-            });
-            result.unwrap();
-            assert_eq!(resolved, n);
-            let ranges = prepared.into_inner();
-            assert_eq!(ranges.iter().map(|r| r.1).sum::<usize>(), n, "each page once");
-            assert!(ranges.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0), "in order, contiguous: {ranges:?}");
-        }
     }
 
     #[test]

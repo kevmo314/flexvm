@@ -1620,23 +1620,28 @@ fn vms(host: &Host) -> Vec<Value> {
             vms.extend(lifecycle::describe_suspended(host, &n));
         }
     }
-    for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".failed").map(String::from)).filter(|n| !host.alive(n)) {
-        let Ok(failed) = host.vms(&n, "failed") else { continue };
-        vms.push(json!({"name": n, "state": "failed", "error": std::fs::read_to_string(failed).unwrap_or_default()}));
-    }
-    for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".exited").map(String::from)).filter(|n| !host.alive(n)) {
-        let Ok(path) = host.vms(&n, "exited") else { continue };
-        match app::Exited::read(&path) {
-            Ok(r) => vms.push(json!({"name": n, "state": "exited", "status": r.status, "template": r.template, "exited_at": r.at, "ports": r.spec.ports})),
-            Err(e) => vms.push(json!({"name": n, "state": "exited", "error": e.to_string()})),
-        }
-    }
-    // Lost with the host (`Host::after_boot`), unless a record of its failure says more.
-    for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".lost").map(String::from)).filter(|n| !host.alive(n)) {
-        let (Ok(lost), Ok(failed)) = (host.vms(&n, "lost"), host.vms(&n, "failed")) else { continue };
-        if !failed.exists() {
-            vms.push(json!({"name": n, "state": "lost", "error": std::fs::read_to_string(lost).unwrap_or_default()}));
-        }
+    // Failed, then exited, then lost (with the host, `Host::after_boot`), each in directory order.
+    const RECORDS: [&str; 3] = ["failed", "exited", "lost"];
+    let mut records: Vec<(usize, String)> = names(host.run.join("vms"))
+        .filter_map(|f| f.rsplit_once('.').and_then(|(n, ext)| Some((RECORDS.iter().position(|&r| r == ext)?, n.to_string()))))
+        .filter(|(_, n)| !host.alive(n))
+        .collect();
+    records.sort_by_key(|r| r.0);
+    for (state, n) in records.into_iter().map(|(i, n)| (RECORDS[i], n)) {
+        let Ok(path) = host.vms(&n, state) else { continue };
+        let error = match state {
+            "exited" => match app::Exited::read(&path) {
+                Ok(r) => {
+                    vms.push(json!({"name": n, "state": state, "status": r.status, "template": r.template, "exited_at": r.at, "ports": r.spec.ports}));
+                    continue;
+                }
+                Err(e) => e.to_string(),
+            },
+            // Unless a record of its failure says more.
+            "lost" if host.has_record(&n, "failed") => continue,
+            _ => std::fs::read_to_string(path).unwrap_or_default(),
+        };
+        vms.push(json!({"name": n, "state": state, "error": error}));
     }
     vms
 }
