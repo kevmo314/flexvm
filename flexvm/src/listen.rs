@@ -689,7 +689,10 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
         "source" => serde_json::from_value(req["ident"].clone())
             .map_err(|e| format!("bad ident: {e}").into())
             // One whose migration's outcome this host still owes counts as there: its target keeps the record it will ask about.
-            .map(|id: crate::host::Ident| json!({"gone": id.liveness() == crate::host::Liveness::Gone && !host.owes(&id)})),
+            .and_then(|id: crate::host::Ident| {
+                let token = crate::migrate::host_token(host, false)?;
+                Ok(json!({"gone": id.liveness() == crate::host::Liveness::Gone && !host.owes(&id), "token": token}))
+            }),
         op => Err(format!("unknown op {op:?}").into()),
     };
     let reply = crate::util::reply(&reply);

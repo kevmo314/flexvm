@@ -231,13 +231,7 @@ impl Reached {
     }
 
     fn ask_wait(&self, mig: u64, wait: bool) -> Result<Value> {
-        let r = peer_call(&self.at.to_string(), json!({"op": "migration", "mig": mig, "wait": wait}))?;
-        match &self.token {
-            Some(t) if r["token"].as_str() != Some(t) => {
-                bail!("{} (for {}) is not the host migration {mig} went to: it answers as {}", self.at, self.to, r["token"])
-            }
-            _ => Ok(r),
-        }
+        peer_query(&self.at.to_string(), self.token.as_deref(), json!({"op": "migration", "mig": mig, "wait": wait}))
     }
 
     fn wait_status(&self, mig: u64) -> Result<Value> {
@@ -249,12 +243,27 @@ impl Reached {
     }
 }
 
+/// A migration peer's answer is evidence only when it names the recorded host.
+fn peer_query(at: &str, token: Option<&str>, req: Value) -> Result<Value> {
+    let r = peer_call(at, req)?;
+    if token.is_some_and(|t| r["token"].as_str() != Some(t)) {
+        bail!("{at} is not the recorded migration peer: it answers as {}", r["token"]);
+    }
+    Ok(r)
+}
+
+pub(crate) fn source_gone(source: &str, token: Option<&str>, by: &crate::host::Ident) -> Result<bool> {
+    // Older records cannot prove which host answers at the advertised address.
+    let token = token.ok_or("migration source has no recorded host token")?;
+    peer_query(source, Some(token), json!({"op": "source", "ident": by})).map(|r| r["gone"] == true)
+}
+
 /// The outcome of migration `mig` to `to`, owed since its source here died (`Host::settle_owed`): asked where
 /// the source reached its target. Only a record from before they were kept asks `to` by name.
 pub(crate) fn owed_outcome(host: &crate::host::Host, to: &str, mig: u64) -> Result<String> {
     let r = match Reached::load(host, mig)? {
         Some(reached) => reached.ask(mig)?,
-        None => peer_call(to, json!({"op": "migration", "mig": mig}))?,
+        None => peer_query(to, None, json!({"op": "migration", "mig": mig}))?,
     };
     Ok(r["outcome"].as_str().unwrap_or_default().to_string())
 }
@@ -270,8 +279,8 @@ pub(crate) fn owed_done(host: &crate::host::Host, to: &str, mig: u64) {
     }
 }
 
-/// This host's identity, for a migration's source (`Reached`): random, kept in `STATE/token` from the first
-/// prepare it answers (`create`) on, so a restarted listener answers as the same host. None if there is none yet.
+/// This host's migration identity: random, kept in `STATE/token` from the first prepare it sends or
+/// answers (`create`) on, so a restarted listener answers as the same host. None if there is none yet.
 pub(crate) fn host_token(host: &crate::host::Host, create: bool) -> Result<Option<String>> {
     let path = host.state.join("token");
     if let Some(t) = crate::host::load::<String>(&path)? {
@@ -560,6 +569,7 @@ impl Proc {
                 "rev": self.rev(),
                 "source": source,
                 "source_ident": crate::host::Ident::me(),
+                "source_token": host_token(&self.host, true)?,
                 "rss_mib": vm.rss() >> 20,
                 // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
                 "plugged_mib": vm.hotplug_plugged(),
@@ -1213,7 +1223,7 @@ impl Proc {
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo. Never past the guest's size.
         self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req), Some(until)).map_err(late)?;
         let l = self.host.lock_by(Some(until)).map_err(late)?;
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin_from(mig, &source.addr, by, Some(ip), Some(from))?);
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin_from(mig, &source.addr, by, Some(ip), Some(from))?.with_token(req["source_token"].as_str()));
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
         let gen = req["gen"].as_u64().unwrap_or(0);
@@ -1989,6 +1999,33 @@ mod tests {
         assert!(outcome(&reached("t:1", other, Some("target")), 7, Duration::ZERO).is_none(), "no answer, never aborted");
         assert!(matches!(outcome(&reached("t:1", target, Some("target")), 7, Duration::ZERO), Some(Outcome::Committed(_))));
         assert!(matches!(outcome(&reached("t:1", other, None), 7, Duration::ZERO), Some(Outcome::Aborted)));
+    }
+
+    /// #1214: a different host at the advertised source address cannot retire its released outcome.
+    #[test]
+    fn only_the_recorded_source_can_retire_a_released_migration() {
+        let root = crate::test_util::TempDir::new("source-token");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        for (i, (reply, token, retired)) in [
+            (json!({"gone": true, "token": "other"}), Some("source"), false),
+            (json!({"gone": true}), Some("source"), false),
+            (json!({"gone": false, "token": "source"}), Some("source"), false),
+            (json!({"gone": true, "token": "source"}), Some("source"), true),
+            (json!({"gone": true, "token": "source"}), None, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (at, _) = answering(reply);
+            let id = i as u64;
+            let mut record = host.mig_begin(id, &at.to_string(), Some(crate::host::Ident::me()), None).unwrap().with_token(token);
+            record.commit(&host.lock().unwrap()).unwrap();
+            record.release(None, None).unwrap();
+            host.retire_migrations();
+            let stored = crate::host::load::<Value>(&host.state.join("migs").join(id.to_string())).unwrap().unwrap();
+            assert_eq!(stored["token"].as_str(), token);
+            assert_eq!(stored["done_until_ms"].is_u64(), retired, "{stored}");
+        }
     }
 
     #[test]

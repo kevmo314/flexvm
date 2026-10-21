@@ -2522,7 +2522,7 @@ impl Host {
         }
         let peer = peer.map(|p| p.to_canonical());
         store(&self.mig_path(id), &Mig::Pending { owner: Ident::me(), ip, peer }, true)?;
-        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), peer, by, ip })
+        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), token: None, peer, by, ip })
     }
 
     /// A record whose process died becomes aborted once its Firecrackers are
@@ -2574,11 +2574,11 @@ impl Host {
     pub fn mig_done(&self, id: u64) -> Result<bool> {
         let l = self.lock()?;
         match load(&self.mig_path(id))? {
-            Some(Mig::Released { ip, source, peer, by, done_until_ms: None }) => {
+            Some(Mig::Released { ip, source, token, peer, by, done_until_ms: None }) => {
                 if let Some(ip) = ip {
                     self.settle_arrived(&l, ip, id)?;
                 }
-                let done = Mig::Released { source, peer, by, ip: None, done_until_ms: Some(wall_ms() + MIG_DONE_MS) };
+                let done = Mig::Released { source, token, peer, by, ip: None, done_until_ms: Some(wall_ms() + MIG_DONE_MS) };
                 store(&self.mig_path(id), &done, true)?;
                 Ok(true)
             }
@@ -2840,12 +2840,10 @@ impl Host {
     /// Any doubt keeps the record: a source that still waits must find it.
     pub fn retire_migrations(&self) {
         // At most five records (and thus five two-second peer calls) per pass.
-        self.retire_migrations_with(5, |source, by| {
-            crate::vmproc::peer_call(source, serde_json::json!({"op": "source", "ident": by})).map(|r| r["gone"] == true)
-        });
+        self.retire_migrations_with(5, crate::migrate::source_gone);
     }
 
-    fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, &Ident) -> Result<bool>) {
+    fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, Option<&str>, &Ident) -> Result<bool>) {
         let Ok(lock) = private_file(&locks(&self.run).join("retire")) else { return };
         let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
         // Migration writers hold the host lock; never sweep an in-progress write.
@@ -2868,14 +2866,14 @@ impl Host {
                 break;
             }
             seen = Some(id);
-            let (source, by) = match load(&self.mig_path(id)) {
+            let (source, token, by) = match load(&self.mig_path(id)) {
                 Ok(Some(Mig::Released { done_until_ms: Some(until), .. })) => {
                     if wall_ms() >= until {
                         let _ = crate::util::unlink_durably(&self.mig_path(id));
                     }
                     continue;
                 }
-                Ok(Some(Mig::Released { source, by, .. })) => (source, by),
+                Ok(Some(Mig::Released { source, token, by, .. })) => (source, token, by),
                 _ => {
                     spent += 1;
                     let _ = self.mig_status(id);
@@ -2887,7 +2885,7 @@ impl Host {
             if unavailable.contains(&source) {
                 continue;
             }
-            match query(&source, &by) {
+            match query(&source, token.as_deref(), &by) {
                 Ok(true) => {
                     crate::info!("migration {id}: its source at {source} is gone; forgetting it");
                     let _ = self.mig_done(id);
@@ -3186,6 +3184,9 @@ pub enum Mig {
     Released {
         #[serde(default)]
         source: String,
+        /// The source host identity, checked before believing it is gone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         /// The address the source migrated from, which alone may say it is done.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer: Option<IpAddr>,
@@ -3232,6 +3233,7 @@ pub struct MigRecord {
     pub id: u64,
     committed: bool,
     source: String,
+    token: Option<String>,
     peer: Option<IpAddr>,
     by: Option<Ident>,
     /// The VM's address: once released, its claim here is no longer `arriving`.
@@ -3239,6 +3241,11 @@ pub struct MigRecord {
 }
 
 impl MigRecord {
+    pub fn with_token(mut self, token: Option<&str>) -> Self {
+        self.token = token.map(String::from);
+        self
+    }
+
     pub fn with_peer(mut self, peer: IpAddr) -> Self {
         self.peer = Some(peer.to_canonical());
         self
@@ -3277,7 +3284,14 @@ impl MigRecord {
             let done = self.host.lock_by(within.map(|w| start + w)).and_then(|l| {
                 store(
                     &self.host.mig_path(self.id),
-                    &Mig::Released { source: self.source.clone(), peer: self.peer, by: self.by.clone(), ip: self.ip, done_until_ms: None },
+                    &Mig::Released {
+                        source: self.source.clone(),
+                        token: self.token.clone(),
+                        peer: self.peer,
+                        by: self.by.clone(),
+                        ip: self.ip,
+                        done_until_ms: None,
+                    },
                     true,
                 )?;
                 // Released first, with the address: what a crash leaves undone, the record finishes.
@@ -7318,13 +7332,14 @@ pub(crate) mod tests {
         // What an older binary reads: released, by the source's process.
         let old: serde_json::Value = serde_json::from_slice(&std::fs::read(h.mig_path(1)).unwrap()).unwrap();
         assert!(old["state"] == "released" && old["source"] == "source:7070" && old["by"].is_object(), "{old}");
-        h.retire_migrations_with(0, |_, _| panic!("done ones cost no budget"));
-        h.retire_migrations_with(1, |_, _| panic!("done ones need no peer call"));
+        h.retire_migrations_with(0, |_, _, _| panic!("done ones cost no budget"));
+        h.retire_migrations_with(1, |_, _, _| panic!("done ones need no peer call"));
         assert_eq!(h.mig_status(1).unwrap(), "released");
         let Mig::Released { done_until_ms, .. } = before else { unreachable!() };
         assert!(done_until_ms.unwrap() > wall_ms() + MIG_DONE_MS - 60_000);
-        store(&h.mig_path(1), &Mig::Released { source: "source:7070".into(), peer: Some(peer), by: None, ip: None, done_until_ms: Some(0) }, true).unwrap();
-        h.retire_migrations_with(1, |_, _| panic!("expired"));
+        store(&h.mig_path(1), &Mig::Released { source: "source:7070".into(), token: None, peer: Some(peer), by: None, ip: None, done_until_ms: Some(0) }, true)
+            .unwrap();
+        h.retire_migrations_with(1, |_, _, _| panic!("expired"));
         assert!(!h.mig_path(1).exists());
     }
 
@@ -7547,12 +7562,12 @@ pub(crate) mod tests {
         mig(21, Mig::Committed { owner: committed, peer: None });
         // Released, then killed before its address was settled: its own VM, a loan of it too (it came home).
         claim(ips[14], "released", Some(dead(999_999_943)), 4, &|a| a.arriving = Some(22));
-        mig(22, Mig::Released { source: String::new(), peer: None, by: None, ip: Some(ips[14]), done_until_ms: None });
+        mig(22, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[14]), done_until_ms: None });
         claim(ips[15], "homecoming", Some(dead(999_999_944)), 4, &|a| (a.arriving, a.lent) = (Some(23), Some(4)));
-        mig(23, Mig::Released { source: String::new(), peer: None, by: None, ip: Some(ips[15]), done_until_ms: None });
+        mig(23, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[15]), done_until_ms: None });
         // Arrived and settled, then a source again: the old release is no proof.
         claim(ips[16], "left-again", Some(dead(999_999_945)), 4, &|a| a.leaving = leaving(41));
-        mig(24, Mig::Released { source: String::new(), peer: None, by: None, ip: Some(ips[16]), done_until_ms: None });
+        mig(24, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[16]), done_until_ms: None });
         let before: Vec<Addr> = ips.iter().map(|&i| h.addr(&l, i).unwrap()).collect();
         drop(l);
         h.withdraw_dead(false).unwrap();
@@ -8075,7 +8090,7 @@ pub(crate) mod tests {
         let gone = dead_owner(&h, 999_999_952, &[]);
         let a = Addr { seen: 4, lent: Some(4), holder: Some("vm".into()), holder_id: Some(gone), held: 4, arriving: Some(30), ..Addr::default() };
         h.put_addr(x, &a, false).unwrap();
-        store(&h.mig_path(30), &Mig::Released { source: "s".into(), peer: None, by: None, ip: Some(x), done_until_ms: None }, false).unwrap();
+        store(&h.mig_path(30), &Mig::Released { source: "s".into(), token: None, peer: None, by: None, ip: Some(x), done_until_ms: None }, false).unwrap();
         // The source is done before any sweep: settle the address before keeping only the outcome.
         h.mig_done(30).unwrap();
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
@@ -9835,7 +9850,7 @@ pub(crate) mod tests {
     fn released_migration(h: &Host, id: u64, source: &str) {
         store(
             &h.mig_path(id),
-            &Mig::Released { source: source.into(), peer: None, by: Some(Ident { start: id, ..Ident::me() }), ip: None, done_until_ms: None },
+            &Mig::Released { source: source.into(), token: None, peer: None, by: Some(Ident { start: id, ..Ident::me() }), ip: None, done_until_ms: None },
             false,
         )
         .unwrap();
@@ -9855,7 +9870,7 @@ pub(crate) mod tests {
         let other = h.clone();
         let (done, finished) = std::sync::mpsc::channel();
         let sweep = std::thread::spawn(move || {
-            other.retire_migrations_with(0, |_, _| panic!("no records"));
+            other.retire_migrations_with(0, |_, _, _| panic!("no records"));
             done.send(()).unwrap();
         });
         assert!(finished.recv_timeout(Duration::from_millis(50)).is_err(), "sweep must wait for writers' host lock");
@@ -9903,10 +9918,10 @@ pub(crate) mod tests {
         for id in 1..=8 {
             released_migration(&h, id, "reachable");
         }
-        h.retire_migrations_with(0, |_, _| panic!("zero budget must not query"));
+        h.retire_migrations_with(0, |_, _, _| panic!("zero budget must not query"));
         assert!(!h.run.join(".retire.next").exists());
         let mut queried = Vec::new();
-        h.retire_migrations_with(3, |_, by| {
+        h.retire_migrations_with(3, |_, _, by| {
             queried.push(by.start);
             Ok(false)
         });
@@ -9923,7 +9938,7 @@ pub(crate) mod tests {
         }
         let pass = |h: &Host| {
             let mut queried = Vec::new();
-            h.retire_migrations_with(2, |_, by| {
+            h.retire_migrations_with(2, |_, _, by| {
                 queried.push(by.start);
                 Ok(false)
             });
@@ -9944,10 +9959,10 @@ pub(crate) mod tests {
         for (id, source) in [(1, "unreachable"), (2, "reachable"), (3, "unreachable"), (4, "reachable"), (5, "unknown"), (6, "unreachable")] {
             released_migration(&h, id, source);
         }
-        store(&h.mig_path(7), &Mig::Released { source: "reachable".into(), peer: None, by: None, ip: None, done_until_ms: None }, false).unwrap();
+        store(&h.mig_path(7), &Mig::Released { source: "reachable".into(), token: None, peer: None, by: None, ip: None, done_until_ms: None }, false).unwrap();
         released_migration(&h, 8, "");
         let mut queried = Vec::new();
-        h.retire_migrations_with(8, |source, by| {
+        h.retire_migrations_with(8, |source, _, by| {
             queried.push(by.start);
             match source {
                 "unreachable" | "unknown" => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
@@ -9959,7 +9974,7 @@ pub(crate) mod tests {
         assert_eq!(h.mig_status(4).unwrap(), "released");
         assert!([1, 2, 3, 5, 6, 7, 8].iter().all(|id| h.mig_path(*id).exists()));
         queried.clear();
-        h.retire_migrations_with(3, |_, by| {
+        h.retire_migrations_with(3, |_, _, by| {
             queried.push(by.start);
             Ok(false)
         });
@@ -9973,7 +9988,7 @@ pub(crate) mod tests {
         let gc = private_file(&locks(&h.run).join("gc")).unwrap();
         flock(&gc, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         let mut queried = false;
-        h.retire_migrations_with(1, |_, _| {
+        h.retire_migrations_with(1, |_, _, _| {
             let retirement = File::open(locks(&h.run).join("retire")).unwrap();
             assert!(flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_err());
             queried = true;
@@ -9982,7 +9997,7 @@ pub(crate) mod tests {
         assert!(queried, "the local cleanup lock does not block retirement");
         let retirement = File::open(locks(&h.run).join("retire")).unwrap();
         flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).unwrap();
-        h.retire_migrations_with(1, |_, _| panic!("busy retirement must be skipped"));
+        h.retire_migrations_with(1, |_, _, _| panic!("busy retirement must be skipped"));
     }
 
     #[test]
@@ -10003,7 +10018,7 @@ pub(crate) mod tests {
         let (forked, mut told) = std::os::unix::net::UnixStream::pair().unwrap();
         told.set_read_timeout(Some(WAIT)).unwrap();
         let mut spawner = None;
-        h.retire_migrations_with(1, |_, _| {
+        h.retire_migrations_with(1, |_, _, _| {
             // Another thread forks while the pass holds its lock, and its child is slow to
             // exec, as one making a cgroup scope in `pre_exec` is.
             let fd = forked.as_raw_fd();
@@ -10231,8 +10246,12 @@ pub(crate) mod tests {
         r.settle(true);
         assert_eq!(h.mig_status(7).unwrap(), "released");
         // A source that cannot be asked keeps its released record.
-        store(&h.mig_path(8), &Mig::Released { source: "127.0.0.1:1".into(), peer: None, by: Some(Ident::me()), ip: None, done_until_ms: None }, false)
-            .unwrap();
+        store(
+            &h.mig_path(8),
+            &Mig::Released { source: "127.0.0.1:1".into(), token: None, peer: None, by: Some(Ident::me()), ip: None, done_until_ms: None },
+            false,
+        )
+        .unwrap();
         // Only proof retires: another boot, no such pid, or another process with the pid.
         let me = Ident::me();
         assert_eq!(me.liveness(), Liveness::Alive);
