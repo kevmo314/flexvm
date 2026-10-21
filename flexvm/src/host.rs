@@ -2843,7 +2843,7 @@ impl Host {
         self.retire_migrations_with(5, crate::migrate::source_gone);
     }
 
-    fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, Option<&str>, &Ident) -> Result<bool>) {
+    fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, Option<&str>, Option<IpAddr>, &Ident) -> Result<bool>) {
         let Ok(lock) = private_file(&locks(&self.run).join("retire")) else { return };
         let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
         // Migration writers hold the host lock; never sweep an in-progress write.
@@ -2866,14 +2866,14 @@ impl Host {
                 break;
             }
             seen = Some(id);
-            let (source, token, by) = match load(&self.mig_path(id)) {
+            let (source, token, peer, by) = match load(&self.mig_path(id)) {
                 Ok(Some(Mig::Released { done_until_ms: Some(until), .. })) => {
                     if wall_ms() >= until {
                         let _ = crate::util::unlink_durably(&self.mig_path(id));
                     }
                     continue;
                 }
-                Ok(Some(Mig::Released { source, token, by, .. })) => (source, token, by),
+                Ok(Some(Mig::Released { source, token, peer, by, .. })) => (source, token, peer, by),
                 _ => {
                     spent += 1;
                     let _ = self.mig_status(id);
@@ -2885,7 +2885,7 @@ impl Host {
             if unavailable.contains(&source) {
                 continue;
             }
-            match query(&source, token.as_deref(), &by) {
+            match query(&source, token.as_deref(), peer, &by) {
                 Ok(true) => {
                     crate::info!("migration {id}: its source at {source} is gone; forgetting it");
                     let _ = self.mig_done(id);
@@ -7332,14 +7332,14 @@ pub(crate) mod tests {
         // What an older binary reads: released, by the source's process.
         let old: serde_json::Value = serde_json::from_slice(&std::fs::read(h.mig_path(1)).unwrap()).unwrap();
         assert!(old["state"] == "released" && old["source"] == "source:7070" && old["by"].is_object(), "{old}");
-        h.retire_migrations_with(0, |_, _, _| panic!("done ones cost no budget"));
-        h.retire_migrations_with(1, |_, _, _| panic!("done ones need no peer call"));
+        h.retire_migrations_with(0, |_, _, _, _| panic!("done ones cost no budget"));
+        h.retire_migrations_with(1, |_, _, _, _| panic!("done ones need no peer call"));
         assert_eq!(h.mig_status(1).unwrap(), "released");
         let Mig::Released { done_until_ms, .. } = before else { unreachable!() };
         assert!(done_until_ms.unwrap() > wall_ms() + MIG_DONE_MS - 60_000);
         store(&h.mig_path(1), &Mig::Released { source: "source:7070".into(), token: None, peer: Some(peer), by: None, ip: None, done_until_ms: Some(0) }, true)
             .unwrap();
-        h.retire_migrations_with(1, |_, _, _| panic!("expired"));
+        h.retire_migrations_with(1, |_, _, _, _| panic!("expired"));
         assert!(!h.mig_path(1).exists());
     }
 
@@ -9870,7 +9870,7 @@ pub(crate) mod tests {
         let other = h.clone();
         let (done, finished) = std::sync::mpsc::channel();
         let sweep = std::thread::spawn(move || {
-            other.retire_migrations_with(0, |_, _, _| panic!("no records"));
+            other.retire_migrations_with(0, |_, _, _, _| panic!("no records"));
             done.send(()).unwrap();
         });
         assert!(finished.recv_timeout(Duration::from_millis(50)).is_err(), "sweep must wait for writers' host lock");
@@ -9918,10 +9918,10 @@ pub(crate) mod tests {
         for id in 1..=8 {
             released_migration(&h, id, "reachable");
         }
-        h.retire_migrations_with(0, |_, _, _| panic!("zero budget must not query"));
+        h.retire_migrations_with(0, |_, _, _, _| panic!("zero budget must not query"));
         assert!(!h.run.join(".retire.next").exists());
         let mut queried = Vec::new();
-        h.retire_migrations_with(3, |_, _, by| {
+        h.retire_migrations_with(3, |_, _, _, by| {
             queried.push(by.start);
             Ok(false)
         });
@@ -9938,7 +9938,7 @@ pub(crate) mod tests {
         }
         let pass = |h: &Host| {
             let mut queried = Vec::new();
-            h.retire_migrations_with(2, |_, _, by| {
+            h.retire_migrations_with(2, |_, _, _, by| {
                 queried.push(by.start);
                 Ok(false)
             });
@@ -9962,7 +9962,7 @@ pub(crate) mod tests {
         store(&h.mig_path(7), &Mig::Released { source: "reachable".into(), token: None, peer: None, by: None, ip: None, done_until_ms: None }, false).unwrap();
         released_migration(&h, 8, "");
         let mut queried = Vec::new();
-        h.retire_migrations_with(8, |source, _, by| {
+        h.retire_migrations_with(8, |source, _, _, by| {
             queried.push(by.start);
             match source {
                 "unreachable" | "unknown" => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
@@ -9974,7 +9974,7 @@ pub(crate) mod tests {
         assert_eq!(h.mig_status(4).unwrap(), "released");
         assert!([1, 2, 3, 5, 6, 7, 8].iter().all(|id| h.mig_path(*id).exists()));
         queried.clear();
-        h.retire_migrations_with(3, |_, _, by| {
+        h.retire_migrations_with(3, |_, _, _, by| {
             queried.push(by.start);
             Ok(false)
         });
@@ -9988,7 +9988,7 @@ pub(crate) mod tests {
         let gc = private_file(&locks(&h.run).join("gc")).unwrap();
         flock(&gc, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         let mut queried = false;
-        h.retire_migrations_with(1, |_, _, _| {
+        h.retire_migrations_with(1, |_, _, _, _| {
             let retirement = File::open(locks(&h.run).join("retire")).unwrap();
             assert!(flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_err());
             queried = true;
@@ -9997,7 +9997,7 @@ pub(crate) mod tests {
         assert!(queried, "the local cleanup lock does not block retirement");
         let retirement = File::open(locks(&h.run).join("retire")).unwrap();
         flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).unwrap();
-        h.retire_migrations_with(1, |_, _, _| panic!("busy retirement must be skipped"));
+        h.retire_migrations_with(1, |_, _, _, _| panic!("busy retirement must be skipped"));
     }
 
     #[test]
@@ -10018,7 +10018,7 @@ pub(crate) mod tests {
         let (forked, mut told) = std::os::unix::net::UnixStream::pair().unwrap();
         told.set_read_timeout(Some(WAIT)).unwrap();
         let mut spawner = None;
-        h.retire_migrations_with(1, |_, _, _| {
+        h.retire_migrations_with(1, |_, _, _, _| {
             // Another thread forks while the pass holds its lock, and its child is slow to
             // exec, as one making a cgroup scope in `pre_exec` is.
             let fd = forked.as_raw_fd();

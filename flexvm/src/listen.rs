@@ -271,9 +271,9 @@ fn spawn_request(builder: std::thread::Builder, work: impl FnOnce() + Send + 'st
     }
 }
 
-fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Wait, deadline: Instant) {
+fn serve(host: &Host, peers: &Peers, conn: TcpStream, slot: Wait, deadline: Instant) {
     let _ = conn.set_nodelay(true);
-    if let Err(e) = handle(host, peers, conn, deadline, &LOCKING) {
+    if let Err(e) = handle(host, peers, conn, deadline, &LOCKING, Some(slot)) {
         log_refusal(e);
     }
 }
@@ -635,11 +635,18 @@ pub fn activated() -> Option<TcpListener> {
 }
 
 /// From a peer: they are authenticated by address only (`main`), the network between them is trusted.
-fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, locking: &'static AtomicUsize) -> Result<()> {
+fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, locking: &'static AtomicUsize, mut slot: Option<Wait>) -> Result<()> {
     let line = read_line_by(&conn, deadline)?;
     let req: Value = serde_json::from_slice(&line)?;
     let op = req["op"].as_str().unwrap_or("");
-    let locking = matches!(op, "migration" | "route" | "lend").then(|| Slot::take(locking, MAX_LOCKING));
+    // Migration reads reacquire both slots; neither is held across a long-poll sleep.
+    let active = if op == "migration" { slot.take().map(|s| (s.0.clone(), s.1)) } else { None };
+    let slots = || {
+        let active = active.as_ref().map(|(pool, from)| pool.take(*from).ok_or(BUSY)).transpose()?;
+        let locking = Slot::take(locking, MAX_LOCKING).ok_or(BUSY)?;
+        Ok((active, locking))
+    };
+    let locking = matches!(op, "route" | "lend").then(|| Slot::take(locking, MAX_LOCKING));
     let reply = match op {
         // Checked by the arrival (`check_vm_ip`) against these, as route and lend are: a name
         // with no addresses yet, its lookup under way (a peer just added), is waited for.
@@ -655,7 +662,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
         _ if matches!(locking, Some(None)) => Err(BUSY.into()),
         "migration" => (|| {
             if req["done"] != true {
-                return migration(host, &req, |_, _| false);
+                return migration(host, &req, |_, _| false, slots);
             }
             let cfg = host.config_now();
             let from = conn.peer_addr()?.ip();
@@ -664,9 +671,14 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
             let (sender, (name, _)) = (peers.sender(&cfg, from), peers.borrower(&cfg, from));
             // The peer it came from by any of its addresses (a record from before they were kept has
             // none), or the one its source named itself as: it may have resolved elsewhere since.
-            migration(host, &req, |source, peer| {
-                peer.is_some_and(|p| is_peer(&sender, p)) || source == name || source.parse::<SocketAddr>().is_ok_and(|a| is_peer(&sender, a.ip()))
-            })
+            migration(
+                host,
+                &req,
+                |source, peer| {
+                    peer.is_some_and(|p| is_peer(&sender, p)) || source == name || source.parse::<SocketAddr>().is_ok_and(|a| is_peer(&sender, a.ip()))
+                },
+                slots,
+            )
         })(),
         // Its peers by address, those configured by name too, and the one asking.
         // And their configured underlays; a withdrawal goes by the asking peer's own (`Peers::sender`).
@@ -999,12 +1011,13 @@ fn host_lock(host: &Host) -> Result<crate::host::Locked> {
     })
 }
 
-fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> bool) -> Result<Value> {
+fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> bool, slots: impl Fn() -> Result<(Option<Wait>, Slot)>) -> Result<Value> {
     if fault("status") {
         bail!("injected fault: migration status unavailable");
     }
     let mig = req["mig"].as_u64().ok_or("missing mig")?;
     if req["done"] == json!(true) {
+        let _slots = slots()?;
         // Held through `mig_done`, which takes it again (reentrant) without waiting.
         let _l = host_lock(host)?;
         if host.mig_done_from(mig, source)? {
@@ -1019,6 +1032,7 @@ fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> 
         wait,
         || host.mig_stamp(mig),
         |by| {
+            let _slots = slots()?;
             let _l = match by {
                 None => host_lock(host)?,
                 Some(by) => host.lock_by(Some(by))?,
@@ -1061,6 +1075,7 @@ fn migration_wait<S: PartialEq>(
             Err(_) => break,
         }
     }
+    reply["waited"] = json!(!wait.is_zero());
     Ok(reply)
 }
 
@@ -1296,9 +1311,17 @@ mod tests {
                 asked.set(asked.get() + 1);
                 locks.push(by.is_some());
                 let s = states.next().ok_or("lost status")?;
-                Ok((s, json!(s)))
+                Ok((s, json!({"outcome": s})))
             });
-            (r.ok(), asked.get(), locks)
+            (
+                r.map(|r| {
+                    assert_eq!(r["waited"], !wait.is_zero());
+                    r["outcome"].clone()
+                })
+                .ok(),
+                asked.get(),
+                locks,
+            )
         };
         let ask = |states: &[&'static str], wait: Duration| ask_with(states, wait, true);
         assert_eq!(ask(&["pending", "committed", "released"], Duration::from_secs(1)), (Some(json!("released")), 3, vec![false, true, true]));
@@ -1314,6 +1337,38 @@ mod tests {
         let (r, asked, _) = ask_with(&["committed"; 200], Duration::from_millis(600), false);
         assert_eq!(r, Some(json!("committed")));
         assert!((2..=4).contains(&asked), "asked {asked} times");
+    }
+
+    #[test]
+    fn migration_long_poll_releases_listener_slots_between_reads() {
+        use crate::test_util::JoinWithin;
+        use std::io::Write;
+        let (_root, host) = crate::host::tests::host("poll-slots");
+        let _record = host.mig_begin(7, "source:7070", None, None).unwrap();
+        static LOCKING: AtomicUsize = AtomicUsize::new(0);
+        let active = Waiting::new(1, 1);
+        let from = "127.0.0.1".parse().unwrap();
+        let slot = active.take(from).unwrap();
+        let (client, server) = pair();
+        writeln!(&client, "{}", json!({"op": "migration", "mig": 7, "wait": true})).unwrap();
+        let worker = std::thread::spawn(move || {
+            handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, Some(slot)).unwrap();
+        });
+        let by = Instant::now() + Duration::from_secs(2);
+        while !active.held.lock().unwrap().is_empty() {
+            assert!(Instant::now() < by);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Let the first read finish, then occupy both budgets during the sleep.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!worker.is_finished());
+        let _active = active.take(from).expect("sleeping poll kept its active slot");
+        let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
+        assert_eq!(full.len(), MAX_LOCKING, "sleeping poll kept its locking slot");
+        worker.join_within().unwrap();
+        let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
+        assert_eq!(reply["result"]["outcome"], "pending");
+        assert_eq!(reply["result"]["waited"], true);
     }
 
     #[test]
@@ -1554,7 +1609,12 @@ mod tests {
             r.release(None, None).unwrap();
             // The host lock is shared by this process's threads: a parallel test's may make it busy.
             let ask = |from: &[IpAddr]| loop {
-                match migration(&host, &json!({"mig": id, "done": true}), |_, p| p.is_some_and(|p| is_peer(from, p))) {
+                match migration(
+                    &host,
+                    &json!({"mig": id, "done": true}),
+                    |_, p| p.is_some_and(|p| is_peer(from, p)),
+                    || Ok((None, Slot::take(&LOCKING, MAX_LOCKING).unwrap())),
+                ) {
                     Err(e) if e.to_string() == BUSY => continue,
                     r => break r,
                 }
@@ -2042,7 +2102,7 @@ mod tests {
             let (start, mut line) = (Instant::now(), req.to_string().into_bytes());
             line.push(b'\n');
             (&client).write_all(&line).unwrap();
-            handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING).unwrap();
+            handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, None).unwrap();
             let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
             (reply, start.elapsed())
         };
