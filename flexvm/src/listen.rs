@@ -1009,11 +1009,40 @@ fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> 
         }
         return Ok(json!({"done": true}));
     }
-    let outcome = host.mig_status(mig)?;
-    // Which host answers (`migrate::Reached`): one that never saw `mig` also says aborted.
-    let token = crate::migrate::host_token(host, false)?;
-    // Under the host lock: never a lookup.
-    Ok(json!({"outcome": outcome, "token": token, "underlay": host.config_now().underlay_known().map(|u| u.to_string())}))
+    drop(_l);
+    // Bounded below the caller's two-second RPC budget (`vmproc::peer_call`). Never hold the
+    // host lock while waiting: the target must be able to publish its release.
+    let wait = if req["wait"] == true { Duration::from_secs(1) } else { Duration::ZERO };
+    migration_wait(wait, |by| {
+        let _l = match by {
+            None => host_lock(host)?,
+            Some(by) => host.lock_by(Some(by))?,
+        };
+        let outcome = host.mig_status(mig)?;
+        // Read the host identity with the outcome under the same lock.
+        let token = crate::migrate::host_token(host, false)?;
+        Ok((outcome, json!({"outcome": outcome, "token": token, "underlay": host.config_now().underlay_known().map(|u| u.to_string())})))
+    })
+}
+
+/// Asks `status` until it is terminal (`released`, `aborted`) or `wait` passes: only the durable
+/// status decides, and the last one read is the answer. The first ask waits for the host lock as any
+/// request does (`None`); later ones only until `wait` ends, and one that fails then answers the last.
+fn migration_wait(wait: Duration, mut status: impl FnMut(Option<Instant>) -> Result<(&'static str, Value)>) -> Result<Value> {
+    let by = Instant::now() + wait;
+    let (mut outcome, mut reply) = status(None)?;
+    while !matches!(outcome, "released" | "aborted") {
+        let left = by.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20).min(left));
+        match status(Some(by)) {
+            Ok(r) => (outcome, reply) = r,
+            Err(_) => break,
+        }
+    }
+    Ok(reply)
 }
 
 /// `borrower`: who asks (`Peers::borrower`), from `from`.
@@ -1233,6 +1262,30 @@ pub(crate) fn routable_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_long_poll_only_finishes_on_terminal_status_or_timeout() {
+        let ask = |states: &[&'static str], wait: Duration| {
+            let mut states = states.iter().copied();
+            let (asked, mut locks) = (std::cell::Cell::new(0), vec![]);
+            let r = migration_wait(wait, |by| {
+                asked.set(asked.get() + 1);
+                locks.push(by.is_some());
+                let s = states.next().ok_or("lost status")?;
+                Ok((s, json!(s)))
+            });
+            (r.ok(), asked.get(), locks)
+        };
+        assert_eq!(ask(&["pending", "committed", "released"], Duration::from_secs(1)), (Some(json!("released")), 3, vec![false, true, true]));
+        assert_eq!(ask(&["aborted"], Duration::from_secs(1)), (Some(json!("aborted")), 1, vec![false]));
+        assert_eq!(ask(&["committed"], Duration::ZERO), (Some(json!("committed")), 1, vec![false]));
+        // A later failure (a busy lock, say) answers the last status read; only a first one is an error.
+        assert_eq!(ask(&["committed"], Duration::from_secs(1)).0, Some(json!("committed")));
+        assert_eq!(ask(&[], Duration::from_secs(1)).0, None);
+        let t = Instant::now();
+        assert_eq!(ask(&["committed"; 200], Duration::from_millis(200)).0, Some(json!("committed")));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn one_sweep_expires_holds_and_preserves_refreshes() {

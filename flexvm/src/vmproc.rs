@@ -1344,6 +1344,7 @@ impl Proc {
             return crate::log!("vm {n}: registry: injected fault: not published");
         }
         let e = Entry {
+            processes: None,
             name: n.clone(),
             ident: self.ident.clone(),
             ip: Some(vm.ip),

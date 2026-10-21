@@ -1171,6 +1171,10 @@ impl Host {
                 self.entry(name).ok()
             })
             .collect();
+        let processes = Arc::new(OnceLock::new());
+        for entry in &mut out {
+            entry.processes = Some(processes.clone());
+        }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -3261,6 +3265,9 @@ impl Drop for NameLock {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Entry {
+    /// One lazy process scan shared by an entries() pass; never persisted.
+    #[serde(skip)]
+    pub(crate) processes: Option<Arc<OnceLock<ProcessMap>>>,
     pub ports: Vec<crate::ports::Port>,
     /// Its run settings (`-e`, `--entrypoint`, `--keep`, `--rm`, `--ip`), for `inspect`.
     #[serde(skip_serializing_if = "crate::app::RunSpec::is_default")]
@@ -3309,7 +3316,15 @@ impl Entry {
         if proc_is_mine() && ns_of(&proc.join("self"), "pid").ok() == Some(ns) {
             return read(&proc.join(pid.to_string()));
         }
-        std::fs::read_dir(proc).ok()?.flatten().filter(|e| e.file_name().to_str().is_some_and(|n| n.parse::<u32>().is_ok())).find_map(|e| read(&e.path()))
+        let local;
+        let map = match &self.processes {
+            Some(shared) => shared.get_or_init(|| ProcessMap::read(proc, ns_of)),
+            None => {
+                local = ProcessMap::read(proc, ns_of);
+                &local
+            }
+        };
+        read(&proc.join(map.pids.get(&(ns, pid))?.to_string()))
     }
 }
 
@@ -3527,6 +3542,15 @@ impl Ident {
             true => liveness_by(self, boot_id(), |pid| std::fs::read_to_string(format!("/proc/{pid}/stat"))),
             false => self.seen().1,
         }
+    }
+
+    /// `liveness`, finding one of another PID namespace in a batch's one scan of `/proc` (`map`,
+    /// taken after the batch was observed) instead of a scan of its own.
+    fn liveness_by_map<'m>(&self, map: impl FnOnce() -> &'m ProcessMap) -> Liveness {
+        if !proc_is_mine() || self.here() {
+            return self.liveness();
+        }
+        map().seen(self, Path::new("/proc"), boot_id(), &proc_ns, proc_lists_all(), &|| PidNs::now().gone(self.ns)).1
     }
 
     /// Not proven gone: what may still be running is treated as running.
@@ -4598,12 +4622,17 @@ fn collect_owned(run: &Path) {
         let owner = load::<Ident>(&e.path().join("owner"));
         (e, owner)
     });
+    let processes = std::cell::OnceCell::new();
     ns.for_observed(work, |(e, owner), ns| {
         let owner = match owner {
             Ok(Some(owner)) => Some(owner),
             // Killed before it wrote its owner: its name is its pid in its own PID namespace,
             // which it does not name, so it must be gone in every one.
-            Ok(None) => e.file_name().to_str().and_then(Ident::from_key).filter(|o| ns.gone_everywhere(o, &Ident::liveness)),
+            Ok(None) => e
+                .file_name()
+                .to_str()
+                .and_then(Ident::from_key)
+                .filter(|o| ns.gone_everywhere(o, &|id| id.liveness_by_map(|| processes.get_or_init(|| ProcessMap::read(Path::new("/proc"), &proc_ns))))),
             Err(_) => None,
         };
         if owner.is_some_and(|o| reap_swept(run, &o, true).is_ok()) {
@@ -5339,6 +5368,91 @@ fn seen_in(
         _ if unreadable => (None, Liveness::Unknown),
         _ if (seen && complete) || gone() => (None, Liveness::Gone),
         _ => (None, Liveness::Unknown),
+    }
+}
+
+/// A batch's NSpid index. Unreadable processes prevent proving absence, globally
+/// if their namespace is unknown, or only within their known namespace otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct ProcessMap {
+    pids: HashMap<(u64, u32), u32>,
+    namespaces: HashSet<u64>,
+    unreadable: HashSet<u64>,
+    incomplete: bool,
+}
+
+impl ProcessMap {
+    fn read(proc: &Path, ns_of: &dyn Fn(&Path, &str) -> std::io::Result<u64>) -> Self {
+        let mut out = Self::default();
+        let exited = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH);
+        let Ok(entries) = std::fs::read_dir(proc) else {
+            out.incomplete = true;
+            return out;
+        };
+        for e in entries {
+            let Ok(e) = e else {
+                out.incomplete = true;
+                continue;
+            };
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            let ns = match ns_of(&e.path(), "pid") {
+                Ok(ns) => ns,
+                Err(e) => {
+                    out.incomplete |= !exited(&e);
+                    continue;
+                }
+            };
+            out.namespaces.insert(ns);
+            match std::fs::read_to_string(e.path().join("status")) {
+                Ok(status) => match nspid(&status).and_then(|p| p.last().copied()) {
+                    Some(inner) => {
+                        out.pids.insert((ns, inner), pid);
+                    }
+                    None => {
+                        out.unreadable.insert(ns);
+                    }
+                },
+                Err(e) if exited(&e) => {}
+                Err(_) => {
+                    out.unreadable.insert(ns);
+                }
+            }
+        }
+        out
+    }
+
+    fn seen(
+        &self,
+        id: &Ident,
+        proc: &Path,
+        boot: &str,
+        ns_of: &dyn Fn(&Path, &str) -> std::io::Result<u64>,
+        complete: bool,
+        gone: &dyn Fn() -> bool,
+    ) -> (Option<u32>, Liveness) {
+        if boot.is_empty() || id.boot.is_empty() {
+            return (None, Liveness::Unknown);
+        }
+        if id.boot != boot {
+            return (None, Liveness::Gone);
+        }
+        let Some(ns) = id.ns else { return (None, Liveness::Unknown) };
+        if let Some(&pid) = self.pids.get(&(ns, id.pid)) {
+            // Revalidate identity, including start time and time namespace, at use.
+            match at_in(id, pid, proc, boot, ns_of) {
+                Liveness::Alive => return (Some(pid), Liveness::Alive),
+                Liveness::Unknown => return (None, Liveness::Unknown),
+                Liveness::Gone => {}
+            }
+        }
+        if self.incomplete || self.unreadable.contains(&ns) {
+            return (None, Liveness::Unknown);
+        }
+        if (complete && self.namespaces.contains(&ns)) || gone() {
+            (None, Liveness::Gone)
+        } else {
+            (None, Liveness::Unknown)
+        }
     }
 }
 
@@ -8079,6 +8193,59 @@ pub(crate) mod tests {
         assert!(!pidns(Some(100), &unknown).gone(Some(300)));
     }
 
+    #[test]
+    fn observed_ownerless_batch_shares_one_process_map() {
+        let root = crate::test_util::TempDir::new_in(&std::env::temp_dir(), "process-batch");
+        let observed = std::cell::Cell::new(0);
+        let scans = std::cell::Cell::new(0);
+        let census = || {
+            assert_eq!(observed.get(), 100);
+            Some(HashSet::from([1, 2]))
+        };
+        let ns_of = |_: &Path, _: &str| {
+            scans.set(scans.get() + 1);
+            Ok(2)
+        };
+        let candidates = (0..100).map(|_| {
+            observed.set(observed.get() + 1);
+            // A namespace created while observing candidates must be indexed too.
+            std::fs::create_dir_all(root.join("100")).unwrap();
+            std::fs::write(root.join("100/status"), "NSpid: 100 7\n").unwrap();
+            std::fs::write(root.join("100/stat"), format!("100 (vm) S {} 500 0 0", "0 ".repeat(18))).unwrap();
+            Ident { pid: 7, start: 500, boot: "boot".into(), ns: None }
+        });
+        let map = std::cell::OnceCell::new();
+        pidns(Some(2), &census).for_observed(candidates, |id, batch| {
+            assert!(!batch.gone_everywhere(&id, &|id| map.get_or_init(|| ProcessMap::read(&root, &ns_of)).seen(id, &root, "boot", &ns_of, true, &|| false).1));
+        });
+        assert_eq!(scans.get(), 101, "one scan, plus one identity revalidation per candidate");
+    }
+
+    #[test]
+    fn rss_entries_share_one_map_and_revalidate_namespace() {
+        let root = crate::test_util::TempDir::new_in(&std::env::temp_dir(), "rss-batch");
+        for (pid, inner) in [(100, 7), (101, 8)] {
+            std::fs::create_dir_all(root.join(pid.to_string())).unwrap();
+            std::fs::write(root.join(format!("{pid}/status")), format!("NSpid: {pid} {inner}\nVmRSS: 1024 kB\n")).unwrap();
+        }
+        let calls = std::cell::Cell::new(0);
+        let changed = std::cell::Cell::new(false);
+        let ns_of = |dir: &Path, _: &str| {
+            calls.set(calls.get() + 1);
+            Ok(if dir.ends_with("self") || changed.get() { 1 } else { 2 })
+        };
+        let shared = Arc::new(OnceLock::new());
+        let entry =
+            |pid| Entry { ident: Ident { ns: Some(2), ..Ident::default() }, firecracker: Some(pid), processes: Some(shared.clone()), ..Entry::default() };
+        assert_eq!(entry(7).rss_in(&root, &ns_of), Some(1 << 20));
+        let before = calls.get();
+        assert_eq!(entry(8).rss_in(&root, &ns_of), Some(1 << 20));
+        assert_eq!(calls.get() - before, 2, "only self and the indexed process, no new scan");
+        changed.set(true);
+        assert_eq!(entry(7).rss_in(&root, &ns_of), None, "a reused outer pid in another namespace is rejected");
+        assert!(!serde_json::to_value(entry(7)).unwrap().as_object().unwrap().contains_key("processes"));
+    }
+
     /// #1111: a process of another PID namespace is found by that namespace, its pid there and
     /// its start time, never by the pid it has there; and proven gone only where its namespace
     /// is seen (or a census proves that gone), never from a sibling's.
@@ -8109,7 +8276,12 @@ pub(crate) mod tests {
         };
         let boot = "boot";
         let id = |pid, start, ns| Ident { pid, start, boot: boot.into(), ns: Some(ns) };
-        let seen = |id: &Ident, gone: bool| seen_in(id, &proc, boot, &ns_of, true, &|| gone);
+        let seen = |id: &Ident, gone: bool| {
+            let single = seen_in(id, &proc, boot, &ns_of, true, &|| gone);
+            let batch = ProcessMap::read(&proc, &ns_of).seen(id, &proc, boot, &ns_of, true, &|| gone);
+            assert_eq!(batch, single, "batch and single lookup agree");
+            single
+        };
         // Pid 1 there is 100 here, never the namesake of another namespace (102), nor pid 1 here.
         assert_eq!(seen(&id(1, 500, 200), false), (Some(100), Liveness::Alive));
         assert_eq!(at_in(&id(1, 500, 200), 100, &proc, boot, &ns_of), Liveness::Alive);
