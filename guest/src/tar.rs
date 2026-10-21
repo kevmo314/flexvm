@@ -274,7 +274,9 @@ fn walk(
         ..Default::default()
     };
     hook(Step::Typed, path);
-    if node.st.st_nlink > 1 && !matches!(node.kind(), libc::S_IFDIR | libc::S_IFSOCK) {
+    // A device is archived by each name: it has no data to save, and an unpacker that skips devices (the host) would
+    // find a link entry's target missing.
+    if node.st.st_nlink > 1 && !matches!(node.kind(), libc::S_IFDIR | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK) {
         match links.entry((node.st.st_dev, node.st.st_ino)) {
             Entry::Occupied(first) => {
                 let mut h = header(&node.st, name);
@@ -1118,6 +1120,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore] // root: mknod of a device needs CAP_MKNOD (CI's root step runs it)
+    fn hard_linked_devices_skipped_by_the_host_do_not_fail_the_copy() {
+        let t = Tmp::new("hard-linked-devices");
+        std::fs::create_dir_all(t.s("src")).unwrap();
+        let null = cstr(t.s("src/a").as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mknod(null.as_ptr(), libc::S_IFCHR | 0o600, libc::makedev(1, 3)) }, 0);
+        std::fs::hard_link(t.s("src/a"), t.s("src/b")).unwrap();
+        std::fs::write(t.s("src/c"), b"x").unwrap();
+        let tar = tar_of(&t.s("src"));
+        unpack_to(&tar, Dest::Guest(&t.s("out"), &top_of(&t.s("src")).unwrap())).unwrap();
+        assert_eq!(std::fs::read(t.s("out/c")).unwrap(), b"x");
+        assert!(std::fs::symlink_metadata(t.s("out/b")).is_err());
     }
 
     /// Archives `src` with `swap` run once, at `step` of the entry at `at`; returns the archive's entries' names and data.
