@@ -227,13 +227,21 @@ impl Reached {
 
     /// The target's answer about `mig`: an error, never an outcome, from a host that is not it.
     fn ask(&self, mig: u64) -> Result<Value> {
-        let r = peer_call(&self.at.to_string(), json!({"op": "migration", "mig": mig}))?;
+        self.ask_wait(mig, false)
+    }
+
+    fn ask_wait(&self, mig: u64, wait: bool) -> Result<Value> {
+        let r = peer_call(&self.at.to_string(), json!({"op": "migration", "mig": mig, "wait": wait}))?;
         match &self.token {
             Some(t) if r["token"].as_str() != Some(t) => {
                 bail!("{} (for {}) is not the host migration {mig} went to: it answers as {}", self.at, self.to, r["token"])
             }
             _ => Ok(r),
         }
+    }
+
+    fn wait_status(&self, mig: u64) -> Result<Value> {
+        self.ask_wait(mig, true).or_else(|_| self.ask(mig))
     }
 
     fn done(&self, mig: u64) {
@@ -714,14 +722,20 @@ impl Proc {
         thread::spawn(move || {
             let mut delay = Duration::from_millis(20);
             loop {
-                match reached.ask(mig).map(|r| r["outcome"].clone()) {
+                let asked = std::time::Instant::now();
+                match reached.wait_status(mig).map(|r| r["outcome"].clone()) {
                     Ok(o) if o == "released" => break,
                     Ok(o) if o == "aborted" => {
                         return p.abort_later(mig, &format!("{to} lost the vm before it had all its memory; it runs here again, from the pause"));
                     }
-                    _ => thread::sleep(delay),
+                    // A target that waited (`listen::migration`) is asked again at once.
+                    Ok(_) if asked.elapsed() >= Duration::from_millis(500) => delay = Duration::from_millis(20),
+                    // An older one answers at once, without waiting: polled with backoff, as before.
+                    _ => {
+                        thread::sleep(delay);
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
                 }
-                delay = (delay * 2).min(Duration::from_secs(5));
             }
             // One last try, never a retry loop: until `finish` the source stays unkillable, keeps its
             // name, claim and paused Firecracker, and a migration back here waits. `retry_route` already
@@ -1976,6 +1990,29 @@ mod tests {
         assert!(outcome(&reached("t:1", other, Some("target")), 7, Duration::ZERO).is_none(), "no answer, never aborted");
         assert!(matches!(outcome(&reached("t:1", target, Some("target")), 7, Duration::ZERO), Some(Outcome::Committed(_))));
         assert!(matches!(outcome(&reached("t:1", other, None), 7, Duration::ZERO), Some(Outcome::Aborted)));
+    }
+
+    #[test]
+    fn lost_long_poll_falls_back_to_identity_checked_status() {
+        use crate::test_util::JoinWithin;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for wait in [true, false] {
+                let (mut c, _) = crate::test_util::accept_tcp(&listener);
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut BufReader::new(&c), &mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(req["wait"], wait);
+                if !wait {
+                    writeln!(c, "{}", json!({"ok": true, "result": {"outcome": "released", "token": "target"}})).unwrap();
+                }
+            }
+        });
+        assert_eq!(reached("t:1", at, Some("target")).wait_status(7).unwrap()["outcome"], "released");
+        server.join_within().unwrap();
+        let (other, _) = answering(json!({"outcome": "released", "token": "other"}));
+        assert!(reached("t:1", other, Some("target")).wait_status(7).is_err());
     }
 
     /// A dead source's owed outcome is asked where it reached its target, never by the target's name again, and the
