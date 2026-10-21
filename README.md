@@ -230,7 +230,7 @@ Both carry an `error` in `ps --json` and `inspect`.
 | `quarantined` | a stopped VM that cannot be started (its address generation is unknown); `run --checkpoint` its directory with a new name and `--ip auto`, or `flexvm rm` it |
 | `exited` | its app (or CMD) exited in the background, with the status `ps` shows; `flexvm start` runs it again, `flexvm rm` removes it |
 | `failed` | died under its process (exit 124); `ps -a --json` (or `/run/flexvm/vms/NAME.failed`) gives the reason and Firecracker's post-mortem summary (last lines, plus the start of a guest crash report); `flexvm logs NAME` has the full tail (up to 64 KiB), until `flexvm rm` |
-| `lost` | ran here when the host went down (a reboot, or its process was SIGKILLed); its address is withdrawn, until `flexvm rm` |
+| `lost` | ran here when the host went down, recorded during post-reboot recovery; its address is withdrawn, until `flexvm rm` |
 
 The last five are stopped: `ps` lists them with `-a`. Standby VMs are not
 listed: `flexvm images` shows their configured count in `STANDBY`.
@@ -308,9 +308,10 @@ VM's log stays available to read until `rm`. `rm` (including `rm -f` of a
 running VM) deletes both `NAME.log` and `NAME.log.1`, as `docker rm` does, so a
 new VM with the same name starts with a fresh log. For a post-mortem, read
 `logs` before `rm`, or `kill` first: `kill` keeps the log (with what the VM
-wrote as it ended) until the hourly sweep or the name's next VM, which starts
-a fresh log. A foreground `run -i`/`-t` leaves its log too. A foreground VM's output is its
-terminal's, so its log holds only what came after a closed terminal. Foreground `run`,
+wrote as it ended) until `rm`, the name's next VM (which starts a fresh
+log), or the sweep of a log unwritten for an hour. A foreground `run -i`/`-t`
+leaves its log too. A foreground VM's output is its terminal's, so its log
+holds only what came after a closed terminal. Foreground `run`,
 `start -a` and `attach` print only the app's output, errors and warnings;
 flexvm's and flexvm-init's informational messages go to the log alone, and
 also to stderr with the global `--verbose` (`-v`) or `FLEXVM_LOG=debug`.
@@ -344,9 +345,10 @@ the host as the client. Each mapping uses one thread, with up to 256 TCP
 connections or UDP client sessions; UDP sessions expire after 60 idle
 seconds. At the TCP cap, a new client can replace the connection idle
 longest if it has been idle for at least 60 seconds. TCP buffers are bounded
-and support half-close. Killing or removing the VM closes its listeners and connections. Process death closes
-them in the kernel immediately, so garbage collection has no forwarding
-rules or reservations left to remove.
+and support half-close. Killing or removing the VM closes its listeners and
+resets (RST) TCP connections not yet finished, so a cut-off stream never
+reads as a clean end. Process death closes them in the kernel immediately,
+so garbage collection has no forwarding rules or reservations left to remove.
 
 `stop` releases the ports and saves their configuration with the stopped
 VM, as an exited VM's record does. `start` binds them again, and refuses if
@@ -356,8 +358,8 @@ checkpoint. Migration does **not** recreate the forwards on the target. The
 source keeps them, reaching the VM through its route to the target, until
 the target has all the VM's memory, and drops them then; a migration that
 aborts before that leaves the VM here with its forwards. Existing proxied
-connections end with them; use routed VM addresses for services that must
-remain reachable through migration.
+connections end with them (unfinished TCP forwards are reset); use routed VM
+addresses for services that must remain reachable through migration.
 
 ## Stop, start, pause, kill, rm
 
@@ -404,6 +406,8 @@ parentheses work as well, sent to the pid `ps` shows.
 
 `stop` of an already stopped or exited VM succeeds without changing it.
 `restart` of a failed or lost VM names that state and points to `ps -a` and `rm`.
+A VM process SIGKILLed records nothing (`lost` is only for VMs found dead
+after a reboot); `rm NAME` removes the name lock and logs it left.
 
 A stopped VM keeps its name and address. `start` restores it in a new
 process, in the background whether it first ran in the foreground or with
