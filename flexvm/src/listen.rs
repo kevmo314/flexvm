@@ -984,8 +984,10 @@ fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> 
         return Ok(json!({"done": true}));
     }
     let outcome = host.mig_status(mig)?;
+    // Which host answers (`migrate::Reached`): one that never saw `mig` also says aborted.
+    let token = crate::migrate::host_token(host, false)?;
     // Under the host lock: never a lookup.
-    Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay_known().map(|u| u.to_string())}))
+    Ok(json!({"outcome": outcome, "token": token, "underlay": host.config_now().underlay_known().map(|u| u.to_string())}))
 }
 
 /// `borrower`: who asks (`Peers::borrower`), from `from`.

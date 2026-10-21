@@ -2403,11 +2403,8 @@ impl Host {
         let host = self.clone();
         self.settle_owed_with(
             5,
-            |to, id| {
-                let r = crate::vmproc::peer_call(to, serde_json::json!({"op": "migration", "mig": id}))?;
-                Ok(r["outcome"].as_str().unwrap_or_default().to_string())
-            },
-            |to, id| drop(crate::vmproc::peer_call(to, serde_json::json!({"op": "migration", "mig": id, "done": true}))),
+            |to, id| crate::migrate::owed_outcome(&host, to, id),
+            |to, id| crate::migrate::owed_done(&host, to, id),
             |_, _| host.deliver_withdrawals(),
         );
     }
