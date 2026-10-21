@@ -1094,16 +1094,11 @@ fn page_runs<'a>(list: &'a [u64], mappings: &'a [Mapping]) -> impl Iterator<Item
 
 /// Checks what a migration source sent before the target uses any of it: its page runs (as `remote_pages` does) against
 /// the guest memory regions it named, which the pager later holds to Firecracker's, and its preload list, which must be
-/// ascending, without repeats, and only of pages the runs make REMOTE (as the source picks them, `remote_among`).
+/// only of pages the runs make REMOTE (as the source picks them, `remote_among`). `Incoming::decode` has already
+/// bounded the preload list and checked that it is ascending without repeats.
 pub fn check_incoming(runs: &Runs, preload: &[u64], regions: &[(u64, u64)]) -> Result<()> {
-    if preload.len() > MAX_PRELOAD {
-        bail!("{} pages to preload, more than {MAX_PRELOAD}", preload.len());
-    }
     let mappings: Vec<Mapping> = regions.iter().map(|&(offset, size)| Mapping { base_host_virt_addr: 0, size: size as usize, offset }).collect();
     remote_pages(runs, &mappings)?;
-    if let Some(w) = preload.windows(2).find(|w| w[0] >= w[1]) {
-        bail!("preload list out of order: page {} before {}", w[0], w[1]);
-    }
     let remote = remote_among(runs, preload.iter().copied());
     if let Some(p) = preload.get(remote.iter().zip(preload).take_while(|(a, b)| a == b).count()) {
         bail!("preload page {p} is not a remote page");

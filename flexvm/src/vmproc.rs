@@ -1856,9 +1856,7 @@ impl Proc {
         let mut early = self.early.lock().unwrap();
         // Until those before it are replayed (`serve`), as it would overtake them.
         if self.vm.get().is_none() || !early.is_empty() {
-            if sig != libc::SIGHUP {
-                early.push(sig);
-            }
+            early.push(sig);
             return;
         }
         drop(early);
@@ -2863,7 +2861,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         let _ = crate::util::readable(&fd, Duration::from_secs(3600));
         // Taken, and a SIGTERM's suspend reserved, under `taking` (`ask_resume`).
         let taking = s.taking.lock().unwrap();
-        let Some(sig) = crate::util::take_signal(&signals) else { continue };
+        let Some(sig) = crate::util::take_signal(&signals).filter(|&sig| sig != libc::SIGHUP) else { continue };
         if matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
             s.resumes.took();
         }
