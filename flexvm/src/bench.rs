@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -38,10 +38,27 @@ struct OwnedVm<'a> {
 
 impl Drop for OwnedVm<'_> {
     fn drop(&mut self) {
-        for host in &self.hosts {
-            if let Err(e) = self.h.cli(host, &["rm", "-f", self.name]) {
-                crate::log!("bench: cleanup {}: {e}", self.name);
+        // The target first: a migration's source refuses removal until the target is gone, then ends or
+        // resumes from the pause (a rollback), and is removed on a retry. One that ended moved to the
+        // target, removed already, is gone.
+        let deadline = Instant::now() + self.h.timeout;
+        let mut left: Vec<&Host> = self.hosts.iter().rev().copied().collect();
+        let mut target_removed = false;
+        while !left.is_empty() {
+            let mut retry = Vec::new();
+            for host in left {
+                let source = self.hosts.len() > 1 && std::ptr::eq(host, self.hosts[0]);
+                match self.h.cli(host, &["rm", "-f", self.name]) {
+                    Ok(_) => target_removed |= !source,
+                    Err(e) if source && e.to_string().contains("migration in progress") && Instant::now() < deadline => retry.push(host),
+                    Err(e) if source && target_removed && e.to_string().contains("kill it there") => {}
+                    Err(e) => crate::log!("bench: cleanup {}: {e}", self.name),
+                }
             }
+            if !retry.is_empty() {
+                thread::sleep(Duration::from_millis(100));
+            }
+            left = retry;
         }
     }
 }
@@ -80,6 +97,26 @@ fn wait(cancelled: &AtomicBool, timeout: Duration, what: &str, cond: impl Fn() -
     }
 }
 
+// Exec's signal waiters live only in the child. Cancellation reaps it before owned VMs unwind.
+fn wait_exec(child: &mut Child, cancelled: &AtomicBool) -> Result<ExitStatus> {
+    let result = (|| loop {
+        check(cancelled)?;
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(1));
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+fn report_path(dir: &str, date: &str, sha: &str, id: &str, suffix: &str) -> String {
+    format!("{dir}/{date}-{}-{id}{suffix}.json", &sha[..7])
+}
+
 impl Hosts {
     fn check(&self) -> Result<()> {
         check(&self.cancelled)
@@ -101,6 +138,22 @@ impl Hosts {
             bail!("flexvm {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
         }
         Ok(serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
+    }
+
+    fn exec(&self, host: &Host, name: &str, cmd: &str) -> Result<bool> {
+        self.check()?;
+        // Its output stays off bench's stdout, which carries only the report path.
+        let mut child = Command::new("/proc/self/exe")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .arg("--state")
+            .arg(&host.state)
+            .arg("--run")
+            .arg(&host.run)
+            .args(["exec", name, "sh", "-c", cmd])
+            .spawn()?;
+        Ok(wait_exec(&mut child, &self.cancelled)?.success())
     }
 
     fn state(host: &Host, name: &str) -> String {
@@ -157,7 +210,7 @@ pub fn run(args: &Args) -> Result<()> {
     report["git_sha"] = json!(sha);
     report["git_dirty"] = json!(dirty);
     report["host_context"] = host_context(template);
-    let path = format!("{dir}/{date}-{}{suffix}.json", &sha[..7]);
+    let path = report_path(&dir, &date, &sha, &id, suffix);
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     serde_json::to_writer_pretty(file, &report)?;
     crate::output(format_args!("{path}\n"))?;
@@ -268,7 +321,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
         if dirty_mib > 0 {
             // /tmp is a tmpfs, so this lands in guest memory.
             let cmd = format!("dd if=/dev/urandom of=/tmp/dirty bs=1M count={dirty_mib} 2>/dev/null");
-            if crate::exec(&h.a, name, &json!({"argv": ["sh", "-c", cmd]}))? != 0 {
+            if !h.exec(&h.a, name, &cmd)? {
                 bail!("dirtying guest memory failed");
             }
         }
@@ -276,7 +329,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
         // (pages still being pulled): the difference is the post-copy stall.
         let read = |host: &Host| -> Result<Option<f64>> {
             let t = Instant::now();
-            if dirty_mib > 0 && crate::exec(host, name, &json!({"argv": ["sh", "-c", "cat /tmp/dirty > /dev/null"]}))? != 0 {
+            if dirty_mib > 0 && !h.exec(host, name, "cat /tmp/dirty > /dev/null")? {
                 bail!("reading guest memory back failed");
             }
             Ok((dirty_mib > 0).then(|| ms(t.elapsed())))
@@ -362,7 +415,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64) -> Result<Value> {
     h.cli(&h.a, &["run", "--name", name, "-d", template])?;
     let mut owned = OwnedVm { h, name, hosts: vec![&h.a], checkpoint: None };
     h.check()?;
-    if mib > 0 && crate::exec(&h.a, name, &json!({"argv": ["sh", "-c", format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null")]}))? != 0 {
+    if mib > 0 && !h.exec(&h.a, name, &format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null"))? {
         bail!("dirtying guest memory failed");
     }
     let (mut p, mut r) = (Vec::new(), Vec::new());
@@ -533,6 +586,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exec_cancellation_reaps_child() {
+        let cancelled = AtomicBool::new(false);
+        for code in [0, 7] {
+            let mut child = Command::new("sh").args(["-c", &format!("exit {code}")]).spawn().unwrap();
+            assert_eq!(wait_exec(&mut child, &cancelled).unwrap().code(), Some(code));
+        }
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        cancelled.store(true, Ordering::Relaxed);
+        assert_eq!(wait_exec(&mut child, &cancelled).unwrap_err().to_string(), "benchmark interrupted");
+        assert!(child.try_wait().unwrap().is_some());
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child.id() as i32, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[test]
+    fn same_second_reports_are_distinct() {
+        let dir = crate::test_util::TempDir::new("bench-reports");
+        for suffix in ["", "-lifecycle"] {
+            for id in ["123-1", "123-2"] {
+                let path = report_path(dir.to_str().unwrap(), "2026-10-20T12-00-00Z", "abcdef0123", id, suffix);
+                assert!(path.ends_with(&format!("-abcdef0-{id}{suffix}.json")));
+                let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+                serde_json::to_writer(file, &json!({"status": "failed", "error": id, "samples_ms": [1]})).unwrap();
+            }
+            for id in ["123-1", "123-2"] {
+                let path = report_path(dir.to_str().unwrap(), "2026-10-20T12-00-00Z", "abcdef0123", id, suffix);
+                let report: Value = serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+                assert_eq!(report["error"], id);
+                assert_eq!(report["samples_ms"], json!([1]));
+            }
+        }
+    }
+
+    #[test]
     fn cancellation_stops_waits_and_runs_cleanup() {
         const CHILD: &str = "FLEXVM_TEST_BENCH_SIGNAL";
         if let Some(sig) = std::env::var_os(CHILD) {
@@ -545,9 +633,12 @@ mod tests {
             std::fs::create_dir_all(&names).unwrap();
             std::os::unix::fs::symlink("../missing", names.join("bench-test")).unwrap();
             let owned = OwnedCheckpoint { state: &dir, id: "bench-test".into() };
+            let mut child = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
             unsafe {
                 libc::kill(libc::getpid(), sig.to_str().unwrap().parse().unwrap());
             }
+            assert!(wait_exec(&mut child, &cancelled).unwrap_err().to_string().contains("interrupted"));
+            assert!(child.try_wait().unwrap().is_some());
             assert!(wait(&cancelled, Duration::from_secs(1), "signal", || false).unwrap_err().to_string().contains("interrupted"));
             assert!(wait(&cancelled, Duration::from_secs(1), "already ready", || true).is_err());
             assert!(check(&cancelled).is_err());

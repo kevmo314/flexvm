@@ -979,7 +979,11 @@ Lifecycle checkpoint sizes are in `checkpoint_data_mib`, grouped by dirty-memory
 size with one value per completed trial, outside `summary_ms` and `samples_ms`.
 On a failed trial or SIGINT/SIGTERM, bench cleans up owned VMs and checkpoints,
 writes completed measured samples with `status: failed` and an `error`, then exits
-with an error. Successful reports have `status: ok`; warmups are never included.
+with an error. Guest execs run in separate client processes, stopped and reaped on
+cancellation; their signal waiters cannot bypass bench cleanup or accumulate in bench.
+Guest read timings include the exec client's startup and exit.
+Reports use `{date}-{sha7}-{run-id}[-lifecycle].json`, so same-second runs keep
+separate reports. Successful reports have `status: ok`; warmups are never included.
 
 | option | default | what |
 |---|---|---|
