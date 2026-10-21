@@ -9436,11 +9436,11 @@ def run_status():
     ok(set_standby(A, args.template, 0))
 
 
-def gated_app(n, status):
+def gated_app(n, status, *opts):
     """`run -d` of VM `n` whose app exits with `status` once /tmp/go is there (each run's own: none at its start)."""
     scenario_vms.add(n)
     app = json.dumps(["sh", "-c", f"while [ ! -e /tmp/go ]; do sleep 0.05; done; exit {status}"])
-    ok(cli_json(A, "run", "--name", n, "-d", "--entrypoint", app, args.template))
+    ok(cli_json(A, "run", "--name", n, "-d", *opts, "--entrypoint", app, args.template))
 
 
 def app_ends(n, status):
@@ -9524,6 +9524,35 @@ def stop_self_exit():
     check("stop self exit: exited, with the app's status", vms(A).get(n, {}).get("state") == "exited" and vms(A)[n].get("status") == 4, vms(A).get(n))
     code, out, err = cli(A, "start", n)
     check("stop self exit: start runs it again", code == 0 and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), (code, err, vms(A).get(n)))
+    # #1161: an `--rm` VM leaves no exited record, only its exit status: its stop succeeds too, and it is gone.
+    n = "ft-stop-exit-rm"
+    gated_app(n, 4, "--rm")
+    pid = vm_pid(A, n)
+    clear_gate(A, "app_exit_stall")
+    with armed_fault(A, "app_exit_stall", 30000):
+        code, out = sh(A, n, "touch /tmp/go")
+        check("stop self exit --rm: told to exit", code == 0, out)
+        check("stop self exit --rm: ending, stalled", wait_for(lambda: pid in reached(A, "app_exit_stall"), 30), reached(A, "app_exit_stall"))
+        code, out, err = cli(A, "stop", n)
+    check("stop self exit --rm: stop succeeds", code == 0 and out == n, (code, out, err))
+    check("stop self exit --rm: it is gone", n not in vms(A), vms(A).get(n))
+
+
+def migrated_hint():
+    """#1161: `kill`, `stop` and `exec` on the host a VM migrated away from say where it went (kill it
+    there), and leave its moved record, so each says it again."""
+    n = "ft-moved-hint"
+    setup(n, mib=1)
+    ok(migrate(A, n, B))
+    assert_released(B, n)
+    moved = os.path.join(A.run, "vms", f"{n}.moved")
+    check("migrated hint: A has its moved record", os.path.exists(moved))
+    for _ in range(2):
+        for argv in (("kill", n), ("stop", n), ("exec", n, "true")):
+            code, out, err = cli(A, *argv)
+            check(f"migrated hint: {argv[0]} says it moved to B", code != 0 and f"moved to {B.addr}" in err, (code, out, err))
+            check(f"migrated hint: {argv[0]} leaves the moved record", os.path.exists(moved))
+    check("migrated hint: still runs on B", where(n) == {B: "running"}, where(n))
 
 
 def unread_output():
@@ -11576,7 +11605,7 @@ def isolate(scenario):
 SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
-    run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit,
+    run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint,
     terminal=terminal,
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,

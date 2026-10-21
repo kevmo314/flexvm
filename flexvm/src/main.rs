@@ -1417,7 +1417,10 @@ fn not_running(host: &Host, name: &str) -> util::Error {
         _ if host.has_record(name, "exited") => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
         _ if host.has_record(name, "failed") => format!("vm {name} has failed: see flexvm ps -a; flexvm rm {name} clears it").into(),
         _ if host.has_record(name, "lost") => format!("vm {name} is lost: see flexvm ps -a; flexvm rm {name} clears it").into(),
-        _ => format!("no running vm named {name:?}").into(),
+        _ => match std::fs::read_to_string(host.vms(name, "moved").unwrap_or_default()) {
+            Ok(to) => format!("vm {name} moved to {to}; it runs there").into(),
+            Err(_) => format!("no running vm named {name:?}").into(),
+        },
     }
 }
 
@@ -1432,8 +1435,15 @@ const STOP_WAIT: Duration = Duration::from_secs(600);
 /// SIGTERM, and waits until the VM is suspended (its process gone). Stopped or exited: a no-op.
 fn stop(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
-    let vm = match host.signal(name, libc::SIGTERM) {
-        Ok(vm) => vm,
+    // The instance signalled, its identity and pidfd from one read of the registry: its exit status
+    // tells an app that exited first (`--rm` or attached VMs leave no exited record).
+    let signalled = host.entry(name).and_then(|e| {
+        let fd = host::PidFd::open(&e.ident)?.ok_or_else(|| format!("no vm named {name:?}"))?;
+        fd.signal(libc::SIGTERM)?;
+        Ok((fd, e.ident))
+    });
+    let (vm, ident) = match signalled {
+        Ok(v) => v,
         Err(e) if e.is::<host::Unseen>() => return Err(unseen(name, e)),
         Err(_) if !host.alive(name) && (host.suspended(name)?.exists() || host.has_record(name, "exited")) => return Ok(()),
         Err(_) => return Err(not_running(host, name)),
@@ -1452,10 +1462,20 @@ fn stop(host: &Host, name: &str) -> Result<()> {
     if host.suspended(name)?.exists() || host.has_record(name, "exited") {
         return Ok(());
     }
-    match std::fs::read_to_string(host.vms(name, "moved")?) {
-        Ok(to) => Err(format!("vm {name} moved to {to} before it was stopped; stop it there").into()),
-        Err(_) => Err(format!("vm {name} ended without suspending; see {}", host.vms(name, "log")?.display()).into()),
+    if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
+        return Err(format!("vm {name} moved to {to} before it was stopped; stop it there").into());
     }
+    let died = ["failed", "lost"].iter().any(|ext| host.has_record(name, ext));
+    match !died && app_exited(containers::exit_record(host, name).as_ref(), &ident) {
+        true => Ok(()),
+        false => Err(format!("vm {name} ended without suspending; see {}", host.vms(name, "log")?.display()).into()),
+    }
+}
+
+/// An `--rm` or attached VM's app exited: only its exit status is left. It must be the status of
+/// `ident`, the instance signalled (never an earlier one's), and not that of a kill or a death.
+fn app_exited(exit: Option<&containers::Exit>, ident: &host::Ident) -> bool {
+    exit.is_some_and(|e| e.ident == *ident && ![vmproc::DIED, 128 + libc::SIGINT, 128 + libc::SIGQUIT].contains(&e.code))
 }
 
 /// SIGTSTP, and waits until its vCPUs are paused.
@@ -1525,11 +1545,14 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         return done();
     }
     // Under the name, as `remove_stopped` does: a start that holds it (a rerun reading its exited
-    // record) keeps its records, and this is refused below (it is starting).
-    let removed = match host.take_name(name, true) {
-        Ok(_lock) => ["failed", "lost", "exited"].into_iter().map(|ext| Ok(std::fs::remove_file(host.vms(name, ext)?).is_ok())).collect::<Result<Vec<_>>>()?,
-        Err(e) if host::name_taken(&e) => Vec::new(),
-        Err(e) => return Err(e),
+    // record) keeps its records, and this is refused below (it is starting). Only with one to
+    // remove: taking the name clears a moved record, whose hint (kill it there) is kept.
+    let ended = ["failed", "lost", "exited"];
+    let removed = match ended.iter().any(|ext| host.has_record(name, ext)).then(|| host.take_name(name, true)) {
+        None => Vec::new(),
+        Some(Ok(_lock)) => ended.into_iter().map(|ext| Ok(std::fs::remove_file(host.vms(name, ext)?).is_ok())).collect::<Result<Vec<_>>>()?,
+        Some(Err(e)) if host::name_taken(&e) => Vec::new(),
+        Some(Err(e)) => return Err(e),
     };
     if !host.alive(name) && removed.contains(&true) {
         return done();
@@ -2349,6 +2372,21 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn stop_takes_only_the_signalled_instances_app_exit() {
+        let me = host::Ident::me();
+        let earlier = host::Ident { pid: me.pid.wrapping_add(1), ..me.clone() };
+        let exit = |ident: &host::Ident, code| containers::Exit { ident: ident.clone(), code };
+        assert!(app_exited(Some(&exit(&me, 0)), &me));
+        assert!(app_exited(Some(&exit(&me, 4)), &me));
+        // An earlier instance's status (one that exited before a new one took the name, which then died unrecorded).
+        assert!(!app_exited(Some(&exit(&earlier, 0)), &me));
+        assert!(!app_exited(None, &me));
+        for code in [vmproc::DIED, 130, 131] {
+            assert!(!app_exited(Some(&exit(&me, code)), &me), "{code}");
+        }
     }
 
     #[test]
