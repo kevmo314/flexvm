@@ -1348,27 +1348,45 @@ mod tests {
         static LOCKING: AtomicUsize = AtomicUsize::new(0);
         let active = Waiting::new(1, 1);
         let from = "127.0.0.1".parse().unwrap();
-        let slot = active.take(from).unwrap();
-        let (client, server) = pair();
-        writeln!(&client, "{}", json!({"op": "migration", "mig": 7, "wait": true})).unwrap();
-        let worker = std::thread::spawn(move || {
-            handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, Some(slot)).unwrap();
-        });
-        let by = Instant::now() + Duration::from_secs(2);
-        while !active.held.lock().unwrap().is_empty() {
-            assert!(Instant::now() < by);
-            std::thread::sleep(Duration::from_millis(1));
+        // Parallel tests share the process's host lock: a poll they delay past its wait is tried again.
+        for _ in 0..10 {
+            let slot = active.take(from).unwrap();
+            let (client, server) = pair();
+            writeln!(&client, "{}", json!({"op": "migration", "mig": 7, "wait": true})).unwrap();
+            // Held here so the first read is seen taking its slots, then seen done.
+            let held = host.lock().unwrap();
+            let worker = {
+                let host = host.clone();
+                std::thread::spawn(move || {
+                    handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, Some(slot)).unwrap();
+                })
+            };
+            let until = |held: bool| {
+                let by = Instant::now() + Duration::from_secs(2);
+                while active.held.lock().unwrap().is_empty() == held {
+                    assert!(Instant::now() < by);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            until(true);
+            drop(held);
+            until(false);
+            // The first read done: occupy both budgets during the sleep.
+            let active = active.take(from);
+            let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
+            let sleeping = !worker.is_finished();
+            worker.join_within().unwrap();
+            let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
+            if !sleeping || reply["ok"] != true {
+                continue;
+            }
+            assert!(active.is_some(), "sleeping poll kept its active slot");
+            assert_eq!(full.len(), MAX_LOCKING, "sleeping poll kept its locking slot");
+            assert_eq!(reply["result"]["outcome"], "pending");
+            assert_eq!(reply["result"]["waited"], true);
+            return;
         }
-        // Let the first read finish, then occupy both budgets during the sleep.
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!worker.is_finished());
-        let _active = active.take(from).expect("sleeping poll kept its active slot");
-        let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
-        assert_eq!(full.len(), MAX_LOCKING, "sleeping poll kept its locking slot");
-        worker.join_within().unwrap();
-        let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
-        assert_eq!(reply["result"]["outcome"], "pending");
-        assert_eq!(reply["result"]["waited"], true);
+        panic!("every poll was delayed past its wait");
     }
 
     #[test]
@@ -1613,7 +1631,7 @@ mod tests {
                     &host,
                     &json!({"mig": id, "done": true}),
                     |_, p| p.is_some_and(|p| is_peer(from, p)),
-                    || Ok((None, Slot::take(&LOCKING, MAX_LOCKING).unwrap())),
+                    || Ok((None, Slot::take(&LOCKING, MAX_LOCKING).ok_or(BUSY)?)),
                 ) {
                     Err(e) if e.to_string() == BUSY => continue,
                     r => break r,
