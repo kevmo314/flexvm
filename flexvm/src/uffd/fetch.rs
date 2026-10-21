@@ -286,6 +286,8 @@ pub(super) struct LaneQueue {
     pub(super) sent: usize,
     /// The fetcher is writing requests on `conn` (see `Lane::flush`).
     writing: bool,
+    /// Bytes requested separately at the front of each run (faults only).
+    head: usize,
 }
 
 struct Queued {
@@ -303,7 +305,7 @@ impl Lane {
         q.jobs.push_back(Queued { job, req });
         if !q.writing && q.sent + 1 == q.jobs.len() {
             if let Some(conn) = &q.conn {
-                let (buf, len) = request(req.0, req.1, PAGE_SIZE);
+                let (buf, len) = request(req.0, req.1, q.head);
                 let n = unsafe { libc::send(conn.as_raw_fd(), buf.as_ptr().cast(), len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
                 match n {
                     n if n == len as isize => q.sent += 1,
@@ -334,9 +336,10 @@ impl Lane {
 
     /// Takes `conn` for requests, and writes those not out yet. Updates the front job's request to `req` after a
     /// partial fetch detached the connection. Every write ends by `at`, the deadline of the fetcher's attempt.
-    fn flush(&self, conn: &TcpStream, req: Option<(u64, usize)>, at: Instant) -> io::Result<()> {
+    fn flush(&self, conn: &TcpStream, req: Option<(u64, usize)>, head: usize, at: Instant) -> io::Result<()> {
         let mut q = self.q.lock().unwrap();
         if q.conn.is_none() {
+            q.head = head;
             q.conn = Some(conn.try_clone()?);
             q.sent = 0;
         }
@@ -349,7 +352,7 @@ impl Lane {
         while q.sent < q.jobs.len() {
             let mut out = Vec::new();
             for j in q.jobs.range(q.sent..) {
-                let (buf, len) = request(j.req.0, j.req.1, PAGE_SIZE);
+                let (buf, len) = request(j.req.0, j.req.1, q.head);
                 out.extend_from_slice(&buf[..len]);
             }
             let upto = q.jobs.len();
@@ -395,17 +398,17 @@ impl Link {
         PageClient::new(stream, &self.source, at)
     }
 
-    /// Reads guest memory, optionally from `lane`'s queued request. Reconnects until `stopped` says so or the outage is too long.
+    /// Reads guest memory, optionally from `lane`'s queued request, with `head` bytes requested separately.
+    /// Reconnects until `stopped` says so or the outage is too long.
     pub(super) fn fetch_with(
         &mut self,
         lane: Option<&Lane>,
         offset: u64,
         buf: &mut [u8],
+        head: usize,
         stopped: &dyn Fn() -> bool,
         progress: &mut dyn FnMut(&[u8]) -> bool,
     ) -> io::Result<()> {
-        // A fault waits for the first page of its run: it is asked for first.
-        let head = if lane.is_some() { PAGE_SIZE } else { 0 };
         loop {
             if stopped() {
                 return Err(io::Error::other(FetchFailure::Cancelled));
@@ -437,8 +440,8 @@ impl Link {
                 !(draining && stopped())
             };
             let res = match lane {
-                Some(lane) if buf.is_empty() => lane.flush(&client.stream.s.s, None, at),
-                Some(lane) => lane.flush(&client.stream.s.s, Some((offset, buf.len())), at).and_then(|()| client.recv(buf, head, &mut counted, at)),
+                Some(lane) if buf.is_empty() => lane.flush(&client.stream.s.s, None, head, at),
+                Some(lane) => lane.flush(&client.stream.s.s, Some((offset, buf.len())), head, at).and_then(|()| client.recv(buf, head, &mut counted, at)),
                 None => client.fetch(offset, buf, head, &mut counted, at),
             };
             match res {
@@ -772,7 +775,7 @@ mod probe_tests {
                 checks.set(checks.get() + 1);
                 finish && checks.get() > 1
             };
-            let e = link.fetch_with(None, 0, &mut [], &stopped, &mut |_| true).unwrap_err();
+            let e = link.fetch_with(None, 0, &mut [], 0, &stopped, &mut |_| true).unwrap_err();
             assert_eq!(fatal(&e), !finish);
             assert_eq!(checks.get(), 2, "completion checked before and after connecting");
         }
@@ -791,7 +794,7 @@ mod probe_tests {
                 let stop = !remote_done && done;
                 stop || remote == 0
             };
-            let e = link.fetch_with(None, 0, &mut [], &stopped, &mut |_| true).unwrap_err();
+            let e = link.fetch_with(None, 0, &mut [], 0, &stopped, &mut |_| true).unwrap_err();
             assert!(matches!(fetch_failure(&e), Some(FetchFailure::Cancelled)));
             assert!(start.elapsed() < CONNECT_TIMEOUT, "did not wait out the backoff");
             assert!(link.down.is_none(), "no connect after completion or stop");

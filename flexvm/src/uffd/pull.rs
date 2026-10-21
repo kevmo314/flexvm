@@ -53,7 +53,14 @@ impl Pager {
                         if i == FAULT_FETCHERS - 1 && buf.is_empty() {
                             crate::host::hold("fetch_connect_gate");
                         }
-                        link.fetch_with(Some(&p.lanes[i]), off, buf, &|| stop.load(Ordering::SeqCst) || p.remote_left() == 0, progress)
+                        link.fetch_with(
+                            Some(&p.lanes[i]),
+                            off,
+                            buf,
+                            if puller { 0 } else { PAGE_SIZE },
+                            &|| stop.load(Ordering::SeqCst) || p.remote_left() == 0,
+                            progress,
+                        )
                     })
                 }
                 (None, None) => return self.fail("remote pages but nowhere to pull them from".into()),
