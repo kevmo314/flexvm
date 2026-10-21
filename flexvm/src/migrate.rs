@@ -117,6 +117,14 @@ fn capped<T: de::DeserializeOwned>(raw: &RawValue, max: usize, after: fn(&T, &T)
     de::Deserializer::deserialize_seq(&mut serde_json::Deserializer::from_str(raw.get()), List(max, after))
 }
 
+struct PreparedIn {
+    vm: crate::vm::Prepared,
+    ip: Ipv4Addr,
+    source: Source,
+    name: String,
+    load_set: Vec<u64>,
+}
+
 enum Outcome {
     Committed(Value),
     Aborted,
@@ -872,7 +880,8 @@ impl Proc {
         };
         // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app; `attaches`: -i and -t too.
         let (prepared, token) = prepared;
-        let result = json!({"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true, "follows_app": true, "attaches": true, "token": token});
+        let result =
+            json!({"timings_ms": prep.json(), "load_set": prepared.load_set, "hold_switch2": true, "follows_app": true, "attaches": true, "token": token});
         send_json(&mut w, &json!({"ok": true, "result": result}))?;
         let deadline = Instant::now()
             + match () {
@@ -881,7 +890,7 @@ impl Proc {
                 _ => INCOMING_WAIT,
             };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
-        let pager = prepared.0.pager.clone();
+        let pager = prepared.vm.pager.clone();
         // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
         let owed = &std::sync::atomic::AtomicU64::new(arrival_owed(u64::MAX, usize::MAX));
         // Set before the commit adopts the VM, so no operation run from then on (a migration onward, a checkpoint)
@@ -890,7 +899,7 @@ impl Proc {
         *self.held_in.lock().unwrap() = Some(revoked.clone());
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
             // A copy: `prepared` goes to `take_in`.
-            let regions = &prepared.2.regions.clone();
+            let regions = &prepared.source.regions.clone();
             let line = crate::util::recv_line_max(&mut r, header_max(regions))?.ok_or("source hung up before sending the vmstate")?;
             let hdr: Incoming = serde_json::from_str(&line)?;
             let (runs, pages) = hdr.decode(regions).map_err(|e| format!("bad migration header: {e}"))?;
@@ -899,7 +908,7 @@ impl Proc {
             let mut t = Phases::new();
             // Before anything counts or walks them: a bad page index would otherwise overflow, or hang the preload.
             crate::uffd::check_incoming(&runs, &pages, regions).map_err(|e| format!("bad migration header: {e}"))?;
-            let sizes = arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64());
+            let sizes = arrival_sizes(&runs, &prepared.vm.template(), req["plugged_mib"].as_u64());
             // The guest ran on while this side prepared: what it pulls now is admitted
             // before anything is seeded or loaded, else refused while the source can resume.
             self.admit_arrival(sizes, arrival_floor(req), deadline)?;
@@ -1129,7 +1138,7 @@ impl Proc {
         t: &mut Phases,
         until: Instant,
         going: &dyn Fn() -> Result<()>,
-    ) -> Result<(crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>)> {
+    ) -> Result<PreparedIn> {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         // The peers' addresses as the listener goes by (it waited for a name just added), else as a
         // restore's are known; and the source's.
@@ -1211,7 +1220,7 @@ impl Proc {
             bail!("injected fault: preparing failed");
         }
         going()?;
-        Ok((vm.unrouted(ifindex), ip, source, name, load_set))
+        Ok(PreparedIn { vm: vm.unrouted(ifindex), ip, source, name, load_set })
     }
 
     /// Every check that can still abort runs before the commit; the host lock
@@ -1219,7 +1228,7 @@ impl Proc {
     #[allow(clippy::too_many_arguments)]
     fn take_in(
         &self,
-        (prepared, ip, source, name, _): (crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>),
+        PreparedIn { vm: prepared, ip, source, name, .. }: PreparedIn,
         shared: bool,
         runs: Runs,
         state: &[u8],
