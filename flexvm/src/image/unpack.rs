@@ -253,14 +253,16 @@ impl At {
 }
 
 pub struct Hashed<R> {
-    inner: R,
+    pub(super) inner: R,
+    // The opened cache file, retained for eviction after verification.
+    pub(super) identity: Option<(u64, u64)>,
     hash: Sha256,
     pub n: u64,
 }
 
 impl<R> Hashed<R> {
     pub fn new(inner: R) -> Self {
-        Hashed { inner, hash: Sha256::new(), n: 0 }
+        Hashed { inner, identity: None, hash: Sha256::new(), n: 0 }
     }
 
     pub fn digest(&self) -> String {
@@ -291,10 +293,24 @@ pub struct Meta {
 /// Calls `f` for each tar entry, counted in `seen` up to `max`. Metadata
 /// entries are read here within `MAX_META`, not whole by the tar crate.
 pub fn each_entry<R: Read>(r: R, seen: &mut u64, max: u64, mut f: impl FnMut(&mut tar::Entry<'_, R>, Meta) -> Result<()>) -> Result<()> {
-    use tar::EntryType as T;
     let mut ar = tar::Archive::new(r);
+    visit_entries(ar.entries()?, seen, max, &mut f)
+}
+
+pub(super) fn each_entry_seek<R: Read + io::Seek>(r: R, seen: &mut u64, max: u64, mut f: impl FnMut(&mut tar::Entry<'_, R>, Meta) -> Result<()>) -> Result<()> {
+    let mut ar = tar::Archive::new(r);
+    visit_entries(ar.entries_with_seek()?, seen, max, &mut f)
+}
+
+fn visit_entries<R: Read>(
+    entries: tar::Entries<'_, R>,
+    seen: &mut u64,
+    max: u64,
+    f: &mut impl FnMut(&mut tar::Entry<'_, R>, Meta) -> Result<()>,
+) -> Result<()> {
+    use tar::EntryType as T;
     let (mut name, mut link, mut pax, mut bytes) = (None, None, None, 0);
-    for e in ar.entries()?.raw(true) {
+    for e in entries.raw(true) {
         let mut e = e?;
         *seen += 1;
         if *seen > max {
@@ -320,6 +336,13 @@ pub fn each_entry<R: Read>(r: R, seen: &mut u64, max: u64, mut f: impl FnMut(&mu
         }
         let mut data = Vec::with_capacity(e.size() as usize);
         (&mut e).take(left).read_to_end(&mut data)?;
+        if kind == T::XGlobalHeader {
+            for ext in tar::PaxExtensions::new(&data) {
+                if ext.map_err(|_| "bad PAX record")?.key_bytes().starts_with(b"GNU.sparse.") {
+                    bail!("GNU sparse PAX entries are not supported");
+                }
+            }
+        }
         match slot {
             Some(Some(_)) => bail!("repeated {kind:?} metadata before one tar entry"),
             Some(s) => (*s, bytes) = (Some(data), bytes + e.size()),
@@ -347,6 +370,7 @@ fn describe<R: Read>(e: &tar::Entry<R>, name: Option<Vec<u8>>, link: Option<Vec<
         let value = ext.value_bytes();
         let num = || std::str::from_utf8(value).ok()?.parse::<u64>().ok();
         match ext.key().map_err(|_| "bad PAX key")? {
+            k if k.starts_with("GNU.sparse.") => bail!("GNU sparse PAX entries are not supported"),
             "path" => path = value.to_vec(),
             "linkpath" => link = Some(value.to_vec()),
             "uid" => uid = num().ok_or("bad PAX uid")? as u32,
@@ -1208,6 +1232,103 @@ pub(super) mod tests {
         let mut v = raw_entry(b"PaxHeader", T::XHeader, data.len() as u64);
         v[512..512 + data.len()].copy_from_slice(&data);
         v
+    }
+
+    #[test]
+    fn pax_sparse_formats_are_rejected_before_extraction() {
+        for key in [
+            "GNU.sparse.map",
+            "GNU.sparse.size",
+            "GNU.sparse.numblocks",
+            "GNU.sparse.offset",
+            "GNU.sparse.numbytes",
+            "GNU.sparse.major",
+            "GNU.sparse.minor",
+            "GNU.sparse.name",
+            "GNU.sparse.realsize",
+        ] {
+            let s = Sandbox::new("pax-sparse");
+            let bytes = end([pax(&[(key, "1")]), raw_entry(b"GNUSparseFile.0/file", T::Regular, 512)].concat());
+            let error = s.apply(Limits::default(), &bytes);
+            assert!(error.contains("GNU sparse PAX"), "{key}: {error}");
+            assert!(!s.root.join("GNUSparseFile.0").exists());
+        }
+    }
+
+    #[test]
+    fn seekable_entries_match_sequential_ones() {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&end(raw_entry(b"inner", T::Regular, 3000))).unwrap();
+        let gz = gz.finish().unwrap();
+        let long = format!("blobs/sha256/{}", "a".repeat(200));
+        let mut b = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, data: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_uid(0);
+            h.set_gid(0);
+            h.set_mtime(0);
+            b.append_data(&mut h, path, data).unwrap();
+        };
+        add("index.json", b"{}");
+        add("layer.tar.gz", &gz);
+        add(&long, &[7u8; 5000]);
+        add("empty", b"");
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(T::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_mtime(0);
+        b.append_link(&mut h, "link", "layer.tar.gz").unwrap();
+        let mut bytes = b.into_inner().unwrap();
+        // A PAX path, as Docker writes for long names.
+        bytes.splice(0..0, [pax(&[("path", "pax/name")]), raw_entry(b"placeholder", T::Regular, 700)].concat());
+        let seen = |seek: bool| {
+            let mut v = Vec::new();
+            let mut f = |e: &mut tar::Entry<'_, io::Cursor<&[u8]>>, m: Meta| {
+                v.push((m.path, m.link, e.raw_file_position(), e.size(), e.header().entry_type()));
+                Ok(())
+            };
+            let r = io::Cursor::new(&bytes[..]);
+            if seek { each_entry_seek(r, &mut 0, 100, &mut f) } else { each_entry(r, &mut 0, 100, &mut f) }.unwrap();
+            v
+        };
+        let (sequential, seeking) = (seen(false), seen(true));
+        assert_eq!(sequential.len(), 6);
+        assert_eq!(sequential, seeking);
+        assert_eq!(seeking[0].0, PathBuf::from("pax/name"));
+        assert_eq!(seeking[3].0, PathBuf::from(&long));
+        let (_, _, at, len, _) = seeking[2];
+        assert_eq!(&bytes[at as usize..][..len as usize], &gz[..]);
+    }
+
+    #[test]
+    fn seekable_entries_skip_payloads_but_read_pax_metadata() {
+        struct HeadersOnly(io::Cursor<Vec<u8>>);
+        impl Read for HeadersOnly {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let pos = self.0.position();
+                assert!(!(1536..5632).contains(&pos), "read file payload at {pos}");
+                self.0.read(buf)
+            }
+        }
+        impl io::Seek for HeadersOnly {
+            fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+        let bytes = end([pax(&[("path", "actual")]), raw_entry(b"placeholder", T::Regular, 4096), raw_entry(b"next", T::Regular, 0)].concat());
+        let mut paths = Vec::new();
+        each_entry_seek(HeadersOnly(io::Cursor::new(bytes)), &mut 0, 10, |_, meta| {
+            paths.push(meta.path);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(paths, [PathBuf::from("actual"), PathBuf::from("next")]);
     }
 
     #[test]

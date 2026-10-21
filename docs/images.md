@@ -43,17 +43,24 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   are not supported. Indexes resolve to linux/amd64. Blobs
   are streamed to `STATE/images/blobs/sha256/` and checked against their
   digests; gzip, zstd and uncompressed layers are supported. Archives are read
-  in place (layers are located inside the tarball, not extracted). Registry
+  in place (layers are located inside the tarball, not extracted); indexing
+  seeks past layer payloads. GNU sparse PAX layers are rejected. Image indexes
+  prefer linux/amd64 with no variant, then v1, then v2; v3 and v4 (which
+  need AVX2 or AVX-512) are never selected. Registry
   credentials go only over HTTPS, to the registry's own host (port included)
   or to a token service on a fixed list: auth.docker.io for Docker Hub
   (registry-1.docker.io) and gitlab.com for registry.gitlab.com. The list is
   keyed by the registry being pulled from, never by the realm its
   `WWW-Authenticate` names, so a registry cannot redirect credentials to
   another host. Other token services, including a self-hosted GitLab's,
-  get anonymous requests, and redirects to blob storage carry none.
+  get anonymous requests, and redirects to blob storage carry none. Private
+  pulls that require credentials at a separate token host are unsupported,
+  including a token service on the registry hostname at a different port.
   Logged and reported URLs omit query strings and userinfo, so signed
   redirect URLs never appear in logs. A layer whose cached blob is found
-  corrupt is evicted and downloaded again, at most once per layer.
+  corrupt is evicted and downloaded again, at most once per layer. Eviction
+  checks the opened file’s identity so it preserves a concurrently replaced
+  blob. Concurrent downloads of a digest share a lock and recheck the cache.
 - **Cache permissions.** `STATE/images` and the directories in it are mode
   0700, and their files (layer blobs, and each root filesystem's `.ext4`,
   its `.conf`, which holds the `--env` values, and its `.ok` marker) are
