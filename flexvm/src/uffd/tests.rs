@@ -116,16 +116,23 @@ fn install_runs_past_partial_copies_eexist_and_discards() {
     assert_eq!(p.claim(0, 6, REMOTE, |_| true), 6);
     discard(&p, 3);
     let mut calls = Vec::new();
-    let (resolved, res) = p.install(0, 6, REMOTE, None, |first, n| {
-        calls.push((first, n));
-        if first == 0 {
-            Ok(1)
-        } else if first == 1 {
-            Err(os(libc::EEXIST))
-        } else {
-            Ok(n)
-        }
-    });
+    let (resolved, res) = p.install(
+        0,
+        6,
+        REMOTE,
+        None,
+        |_| Ok(()),
+        |first, n| {
+            calls.push((first, n));
+            if first == 0 {
+                Ok(1)
+            } else if first == 1 {
+                Err(os(libc::EEXIST))
+            } else {
+                Ok(n)
+            }
+        },
+    );
     res.unwrap();
     assert_eq!(calls, [(0, 3), (1, 2), (2, 1), (4, 2)]);
     assert_eq!(resolved, 6);
@@ -260,22 +267,31 @@ fn streamed_installs_add_up() {
                 Ok(())
             };
             let mut retry = |_: &io::Error| retries;
-            let (r, _) = p.fetch_install(first, n, &mut vec![0u8; n * PAGE_SIZE], &mut fetch, &stop, &mut retry, |pg, c, src| {
-                assert!(src.len() >= c * PAGE_SIZE);
-                for i in 0..c {
-                    assert!(src[i * PAGE_SIZE..(i + 1) * PAGE_SIZE].iter().all(|&b| b == (pg + i) as u8), "page {} gets its own data", pg + i);
-                }
-                match rand(10) {
-                    0 => Err(os(libc::EEXIST)),
-                    1 => {
-                        // A REMOVE is queued; the event thread reads it.
-                        p.read_gen.fetch_add(1, Ordering::SeqCst);
-                        Err(os(libc::EAGAIN))
+            let (r, _) = p.fetch_install(
+                first,
+                n,
+                &mut vec![0u8; n * PAGE_SIZE],
+                &mut fetch,
+                &stop,
+                &mut retry,
+                |_| Ok(()),
+                |pg, c, src| {
+                    assert!(src.len() >= c * PAGE_SIZE);
+                    for i in 0..c {
+                        assert!(src[i * PAGE_SIZE..(i + 1) * PAGE_SIZE].iter().all(|&b| b == (pg + i) as u8), "page {} gets its own data", pg + i);
                     }
-                    2 => Err(os(libc::EIO)),
-                    _ => Ok(1 + rand(c)),
-                }
-            });
+                    match rand(10) {
+                        0 => Err(os(libc::EEXIST)),
+                        1 => {
+                            // A REMOVE is queued; the event thread reads it.
+                            p.read_gen.fetch_add(1, Ordering::SeqCst);
+                            Err(os(libc::EAGAIN))
+                        }
+                        2 => Err(os(libc::EIO)),
+                        _ => Ok(1 + rand(c)),
+                    }
+                },
+            );
             // Only pages a failed install gave back can be REMOTE again by then.
             resolved += discarded;
             resolved += r;
@@ -297,7 +313,7 @@ fn discard_forgets_failure_history_over_a_range() {
     let p = pages(&[REMOTE; 256]);
     for page in [0, 63, 64, 127, 128, 255] {
         assert_eq!(p.claim(page, 1, REMOTE, |_| true), 1);
-        assert!(p.install(page, 1, REMOTE, None, |_, _| Err(os(libc::ENOMEM))).1.is_err());
+        assert!(p.install(page, 1, REMOTE, None, |_| Ok(()), |_, _| Err(os(libc::ENOMEM))).1.is_err());
     }
     assert_eq!(p.claim(64, 1, REMOTE, |_| true), 1);
     assert_eq!(p.discard(&p.removing(), 1, 255), 253);
@@ -333,7 +349,7 @@ fn failure_history_follows_the_pages() {
         }
     };
     p.claim(0, 4, REMOTE, |_| true);
-    assert!(p.install(0, 4, REMOTE, None, enomem(2)).1.is_err());
+    assert!(p.install(0, 4, REMOTE, None, |_| Ok(()), enomem(2)).1.is_err());
     assert_eq!(states(&p)[..4], [PRESENT, PRESENT, REMOTE, REMOTE]);
     let first = p.failing_since(0, 8).expect("page 2 noted");
     assert_eq!(p.failing_since(0, 2), None, "pages that went in are not");
@@ -341,25 +357,25 @@ fn failure_history_follows_the_pages() {
     // Claimed again (by anyone) and failing again: the first time sticks.
     thread::sleep(Duration::from_millis(5));
     p.claim(2, 2, REMOTE, |_| true);
-    assert!(p.install(2, 2, REMOTE, None, enomem(2)).1.is_err());
+    assert!(p.install(2, 2, REMOTE, None, |_| Ok(()), enomem(2)).1.is_err());
     assert_eq!(p.failing_since(2, 1), Some(first));
     // In at last: forgotten.
     p.claim(2, 2, REMOTE, |_| true);
-    assert!(p.install(2, 2, REMOTE, None, |_, c| Ok(c)).1.is_ok());
+    assert!(p.install(2, 2, REMOTE, None, |_| Ok(()), |_, c| Ok(c)).1.is_ok());
     assert_eq!(p.failing_since(0, 8), None);
     assert_eq!(p.failing_len.load(Ordering::SeqCst), 0);
     // Discarded instead, while given back or while claimed: forgotten too.
     for claimed in [false, true] {
         let p = pages(&[REMOTE; 2]);
         p.claim(0, 2, REMOTE, |_| true);
-        assert!(p.install(0, 2, REMOTE, None, enomem(0)).1.is_err());
+        assert!(p.install(0, 2, REMOTE, None, |_| Ok(()), enomem(0)).1.is_err());
         assert!(p.failing_since(0, 1).is_some());
         if claimed {
             p.claim(0, 1, REMOTE, |_| true);
         }
         discard(&p, 0);
         if claimed {
-            assert!(p.install(0, 1, REMOTE, None, |_, _| panic!("discarded")).1.is_ok());
+            assert!(p.install(0, 1, REMOTE, None, |_| Ok(()), |_, _| panic!("discarded")).1.is_ok());
         }
         assert_eq!(p.failing_since(0, 2), None, "claimed {claimed}");
         assert_eq!(p.failing_len.load(Ordering::SeqCst), 0);
@@ -385,13 +401,22 @@ fn failed_install_stops_the_fetch() {
         };
         let stop = AtomicBool::new(stopped);
         let mut installs = 0;
-        let (resolved, res) = p.fetch_install(0, 64, &mut vec![0u8; 64 * PAGE_SIZE], &mut fetch, &stop, &mut |_| true, |pg, _, _| {
-            installs += 1;
-            match pg {
-                0 => Ok(1),
-                _ => Err(os(libc::ENOMEM)),
-            }
-        });
+        let (resolved, res) = p.fetch_install(
+            0,
+            64,
+            &mut vec![0u8; 64 * PAGE_SIZE],
+            &mut fetch,
+            &stop,
+            &mut |_| true,
+            |_| Ok(()),
+            |pg, _, _| {
+                installs += 1;
+                match pg {
+                    0 => Ok(1),
+                    _ => Err(os(libc::ENOMEM)),
+                }
+            },
+        );
         assert!(matches!(res, Err(Failed::Install(_))));
         assert_eq!(resolved, 1);
         assert_eq!(installs, 2, "nothing installed after the failure");
@@ -415,11 +440,11 @@ fn settling_wakes_waiting_faults() {
         unsafe { libc::read(fd, (&mut n as *mut u64).cast(), 8) == 8 }
     };
     p.claim(0, 2, REMOTE, |_| true);
-    assert!(p.install(0, 2, REMOTE, None, |_, n| Ok(n)).1.is_ok());
+    assert!(p.install(0, 2, REMOTE, None, |_| Ok(()), |_, n| Ok(n)).1.is_ok());
     assert!(!woken(), "nobody waits");
     p.waiting.store(true, Ordering::SeqCst);
     p.claim(2, 2, REMOTE, |_| true);
-    assert!(p.install(2, 2, REMOTE, None, |_, n| Ok(n)).1.is_ok());
+    assert!(p.install(2, 2, REMOTE, None, |_| Ok(()), |_, n| Ok(n)).1.is_ok());
     assert!(woken(), "installed");
     p.claim(4, 2, REMOTE, |_| true);
     p.release(4, 2, REMOTE);
@@ -427,7 +452,7 @@ fn settling_wakes_waiting_faults() {
     p.claim(6, 2, REMOTE, |_| true);
     discard(&p, 6);
     discard(&p, 7);
-    assert!(p.install(6, 2, REMOTE, None, |_, _| panic!("discarded pages are not copied")).1.is_ok());
+    assert!(p.install(6, 2, REMOTE, None, |_| Ok(()), |_, _| panic!("discarded pages are not copied")).1.is_ok());
     assert!(woken(), "discarded while claimed");
     assert!(!woken());
     assert_eq!(states(&p), [PRESENT, PRESENT, PRESENT, PRESENT, REMOTE, REMOTE, ZERO, ZERO]);
@@ -446,13 +471,20 @@ fn eagain_waits_for_events_read() {
             discard(&p, 1);
             p.events_read();
         });
-        let (resolved, res) = p.install(0, 2, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |_, n| {
-            calls += 1;
-            match p.read_gen.load(Ordering::SeqCst) {
-                0 => Err(os(libc::EAGAIN)),
-                _ => Ok(n),
-            }
-        });
+        let (resolved, res) = p.install(
+            0,
+            2,
+            REMOTE,
+            Some(&|| stop.load(Ordering::SeqCst)),
+            |_| Ok(()),
+            |_, n| {
+                calls += 1;
+                match p.read_gen.load(Ordering::SeqCst) {
+                    0 => Err(os(libc::EAGAIN)),
+                    _ => Ok(n),
+                }
+            },
+        );
         assert!(res.is_ok());
         assert_eq!(resolved, 2);
     });
@@ -687,12 +719,21 @@ fn a_slow_source_that_keeps_delivering_is_not_lost() {
     };
     let stop = AtomicBool::new(false);
     let mut got = vec![0u8; n];
-    let (resolved, res) = p.fetch_install(0, n, &mut vec![0u8; n * PAGE_SIZE], &mut fetch, &stop, &mut |e| partial(e), |pg, c, src| {
-        for i in 0..c {
-            got[pg + i] = src[i * PAGE_SIZE];
-        }
-        Ok(c)
-    });
+    let (resolved, res) = p.fetch_install(
+        0,
+        n,
+        &mut vec![0u8; n * PAGE_SIZE],
+        &mut fetch,
+        &stop,
+        &mut |e| partial(e),
+        |_| Ok(()),
+        |pg, c, src| {
+            for i in 0..c {
+                got[pg + i] = src[i * PAGE_SIZE];
+            }
+            Ok(c)
+        },
+    );
     assert!(
         res.is_ok(),
         "{:?}",
@@ -796,10 +837,17 @@ fn claimed_pages_have_one_installer() {
     assert_eq!(p.claim(0, 8, REMOTE, |_| true), 0);
     assert_eq!(p.claim(3, 8, REMOTE, |i| i != 3), 0);
     let mut calls = Vec::new();
-    let (resolved, res) = p.install(0, 2, REMOTE, None, |i, n| {
-        calls.push((i, n));
-        Ok(n)
-    });
+    let (resolved, res) = p.install(
+        0,
+        2,
+        REMOTE,
+        None,
+        |_| Ok(()),
+        |i, n| {
+            calls.push((i, n));
+            Ok(n)
+        },
+    );
     assert!(res.is_ok());
     assert_eq!((resolved, calls), (2, vec![(0, 2)]));
     assert_eq!(states(&p), [PRESENT, PRESENT, BASE, REMOTE]);
@@ -813,15 +861,22 @@ fn remove_during_copy_waits_for_settle() {
     p.claim(0, 2, REMOTE, |_| true);
     let removed = AtomicBool::new(false);
     thread::scope(|scope| {
-        let (resolved, res) = p.install(0, 2, REMOTE, None, |_, n| {
-            scope.spawn(|| {
-                discard(&p, 1);
-                removed.store(true, Ordering::SeqCst);
-            });
-            thread::sleep(Duration::from_millis(50));
-            assert!(!removed.load(Ordering::SeqCst), "REMOVE applied mid-copy");
-            Ok(n)
-        });
+        let (resolved, res) = p.install(
+            0,
+            2,
+            REMOTE,
+            None,
+            |_| Ok(()),
+            |_, n| {
+                scope.spawn(|| {
+                    discard(&p, 1);
+                    removed.store(true, Ordering::SeqCst);
+                });
+                thread::sleep(Duration::from_millis(50));
+                assert!(!removed.load(Ordering::SeqCst), "REMOVE applied mid-copy");
+                Ok(n)
+            },
+        );
         assert!(res.is_ok());
         assert_eq!(resolved, 2);
     });
@@ -845,7 +900,7 @@ fn partial_copies_and_errors() {
     let p = pages(&[REMOTE; 6]);
     p.claim(0, 6, REMOTE, |_| true);
     let mut script = vec![Ok(2), Err(os(libc::EEXIST)), Err(os(libc::EIO))].into_iter();
-    let (resolved, res) = p.install(0, 6, REMOTE, None, |_, _| script.next().unwrap());
+    let (resolved, res) = p.install(0, 6, REMOTE, None, |_| Ok(()), |_, _| script.next().unwrap());
     assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EIO));
     assert_eq!(states(&p), [PRESENT, PRESENT, PRESENT, REMOTE, REMOTE, REMOTE]);
     assert_eq!(resolved, 3);
@@ -855,14 +910,14 @@ fn partial_copies_and_errors() {
 fn eagain_retries_only_with_a_stop_flag() {
     let p = pages(&[BASE; 2]);
     p.claim(0, 2, BASE, |_| true);
-    let (_, res) = p.install(0, 2, BASE, None, |_, _| Err(os(libc::EAGAIN)));
+    let (_, res) = p.install(0, 2, BASE, None, |_| Ok(()), |_, _| Err(os(libc::EAGAIN)));
     assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
     assert_eq!(states(&p), [BASE, BASE]);
 
     let stop = AtomicBool::new(false);
     p.claim(0, 2, BASE, |_| true);
     let mut script = vec![Err(os(libc::EAGAIN)), Ok(2)].into_iter();
-    let (resolved, res) = p.install(0, 2, BASE, Some(&|| stop.load(Ordering::SeqCst)), |_, _| script.next().unwrap());
+    let (resolved, res) = p.install(0, 2, BASE, Some(&|| stop.load(Ordering::SeqCst)), |_| Ok(()), |_, _| script.next().unwrap());
     assert!(res.is_ok());
     assert_eq!((states(&p), resolved), (vec![PRESENT, PRESENT], 0));
 }
@@ -1057,7 +1112,7 @@ fn interrupted_cold_prefetch_keeps_admission_until_completed() {
         if ticks == 2 {
             // Faults may have supplied the pages meanwhile. Unquiesce still has to finish the interrupted pass.
             assert_eq!(pager.pages().claim(0, 1, BASE, |_| true), 1);
-            pager.pages().install(0, 1, BASE, None, |_, n| Ok(n)).1.unwrap();
+            pager.pages().install(0, 1, BASE, None, |_| Ok(()), |_, n| Ok(n)).1.unwrap();
             pager.unquiesce();
         }
     }));
@@ -1176,17 +1231,24 @@ fn prefetch_racing_remove() {
     p.claim(0, 3, BASE, |_| true);
     assert_eq!(p.claim(0, 3, BASE, |_| true), 0, "a fault waits for the prefetch");
     discard(&p, 0);
-    let (_, res) = p.install(0, 3, BASE, None, |i, n| {
-        assert_eq!((i, n), (1, 2));
-        Ok(n)
-    });
+    let (_, res) = p.install(
+        0,
+        3,
+        BASE,
+        None,
+        |_| Ok(()),
+        |i, n| {
+            assert_eq!((i, n), (1, 2));
+            Ok(n)
+        },
+    );
     assert!(res.is_ok());
     assert_eq!(states(&p), [ZERO, PRESENT, PRESENT]);
     // A discarded page whose neighbours fail to copy ends ZERO, not BASE.
     let p = pages(&[BASE; 2]);
     p.claim(0, 2, BASE, |_| true);
     discard(&p, 0);
-    let (_, res) = p.install(0, 2, BASE, None, |_, _| Err(os(libc::ENOMEM)));
+    let (_, res) = p.install(0, 2, BASE, None, |_| Ok(()), |_, _| Err(os(libc::ENOMEM)));
     assert!(res.is_err());
     assert_eq!(states(&p), [ZERO, BASE]);
 }
@@ -1254,15 +1316,22 @@ fn remote_accounting_adds_up() {
                 script.push((rand(5), rand(64)));
             }
             let mut script = script.into_iter();
-            let (r, _) = p.install(first, n, REMOTE, None, |_, m| {
-                let (outcome, k) = script.next().unwrap_or((4, 0));
-                match outcome {
-                    0 => Err(os(libc::EEXIST)),
-                    1 => Err(os(libc::EAGAIN)),
-                    2 => Err(os(libc::EIO)),
-                    _ => Ok(1 + k % m),
-                }
-            });
+            let (r, _) = p.install(
+                first,
+                n,
+                REMOTE,
+                None,
+                |_| Ok(()),
+                |_, m| {
+                    let (outcome, k) = script.next().unwrap_or((4, 0));
+                    match outcome {
+                        0 => Err(os(libc::EEXIST)),
+                        1 => Err(os(libc::EAGAIN)),
+                        2 => Err(os(libc::EIO)),
+                        _ => Ok(1 + k % m),
+                    }
+                },
+            );
             resolved += r;
         }
         let s = states(&p);
@@ -1368,7 +1437,7 @@ fn removes_apply_to_whole_ranges() {
     let failing = |pg: usize| p.failing_since(pg, 1).is_some();
     for pg in [CHUNK + 2, CHUNK + 4] {
         assert_eq!(p.claim(pg, 1, REMOTE, |_| true), 1);
-        assert!(p.install(pg, 1, REMOTE, None, |_, _| Err(os(libc::ENOMEM))).1.is_err());
+        assert!(p.install(pg, 1, REMOTE, None, |_| Ok(()), |_, _| Err(os(libc::ENOMEM))).1.is_err());
         assert!(failing(pg));
     }
     assert_eq!(p.claim(CHUNK + 2, 2, REMOTE, |_| true), 2);
@@ -1404,7 +1473,7 @@ fn eagain_with_a_stop_flag_keeps_the_run_and_its_failure_history_clear() {
     let stop = AtomicBool::new(false);
     p.claim(0, 4, REMOTE, |_| true);
     let mut script = vec![Err(os(libc::EAGAIN)), Ok(2), Err(os(libc::EAGAIN)), Ok(2)].into_iter();
-    let (resolved, res) = p.install(0, 4, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |_, _| script.next().unwrap());
+    let (resolved, res) = p.install(0, 4, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |_| Ok(()), |_, _| script.next().unwrap());
     assert!(res.is_ok());
     assert_eq!((resolved, states(&p)), (4, vec![PRESENT; 4]));
     assert_eq!(p.failing_since(0, 4), None);
@@ -1412,17 +1481,24 @@ fn eagain_with_a_stop_flag_keeps_the_run_and_its_failure_history_clear() {
 
     let p = pages(&[BASE; 4]);
     p.claim(0, 4, BASE, |_| true);
-    let (_, res) = p.install(0, 4, BASE, Some(&|| stop.load(Ordering::SeqCst)), |_, _| {
-        stop.store(true, Ordering::SeqCst);
-        Err(os(libc::EAGAIN))
-    });
+    let (_, res) = p.install(
+        0,
+        4,
+        BASE,
+        Some(&|| stop.load(Ordering::SeqCst)),
+        |_| Ok(()),
+        |_, _| {
+            stop.store(true, Ordering::SeqCst);
+            Err(os(libc::EAGAIN))
+        },
+    );
     assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
     assert_eq!(states(&p), [BASE; 4], "given back once stopped");
 
     // Preload's: a REMOVE that is never drained ends the retry at its deadline.
     let deadline = Instant::now() + Duration::from_millis(30);
     p.claim(0, 4, BASE, |_| true);
-    let (_, res) = p.install(0, 4, BASE, Some(&|| Instant::now() >= deadline), |_, _| Err(os(libc::EAGAIN)));
+    let (_, res) = p.install(0, 4, BASE, Some(&|| Instant::now() >= deadline), |_| Ok(()), |_, _| Err(os(libc::EAGAIN)));
     assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
     assert!(Instant::now() >= deadline);
     assert_eq!(states(&p), [BASE; 4]);

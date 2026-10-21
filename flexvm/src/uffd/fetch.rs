@@ -44,12 +44,13 @@ impl Pages {
         fetch: &mut FetchAny<'_>,
         stop: &AtomicBool,
         retry: &mut dyn FnMut(&io::Error) -> bool,
+        mut wake: impl FnMut(usize) -> io::Result<()>,
         mut populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
     ) -> (usize, std::result::Result<(), Failed>) {
         // Installs pages `from..to` (counted from `first`) out of `data`, which holds them from page `base` on.
         let mut install = |from: usize, to: usize, data: &[u8], base: usize| {
             let src = |p: usize, c: usize| &data[(p - first - base) * PAGE_SIZE..(p - first - base + c) * PAGE_SIZE];
-            self.install(first + from, to - from, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |p, c| populate(p, c, src(p, c)))
+            self.install(first + from, to - from, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), &mut wake, |p, c| populate(p, c, src(p, c)))
         };
         // Pages from `first` installed (or given back by a failed install).
         let (mut done, mut resolved) = (0, 0);
@@ -247,7 +248,7 @@ impl Pager {
         fetch: &mut FetchAny<'_>,
         populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
     ) -> std::result::Result<(), Failed> {
-        let (resolved, res) = self.pages().fetch_install(first, n, buf, fetch, &self.stop, &mut |e| self.retry_fetch(e), populate);
+        let (resolved, res) = self.pages().fetch_install(first, n, buf, fetch, &self.stop, &mut |e| self.retry_fetch(e), |p| self.wake(p), populate);
         self.pulled(resolved);
         match res {
             Err(Failed::Fetch(_)) if resolved == n => Ok(()),

@@ -546,10 +546,17 @@ impl Pager {
                 let n = pages.claim(i, prepared_end - i, BASE, |p| self.base.has_data(p) == data);
                 if n > 0 {
                     let stop = || self.quiesce.load(Ordering::SeqCst);
-                    let (_, installed) = pages.install(i, n, BASE, Some(&stop), |p, c| {
-                        let src = prepared.as_ref().map(|buf| &buf[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE]);
-                        populate(p, c, src)
-                    });
+                    let (_, installed) = pages.install(
+                        i,
+                        n,
+                        BASE,
+                        Some(&stop),
+                        |p| self.wake(p),
+                        |p, c| {
+                            let src = prepared.as_ref().map(|buf| &buf[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE]);
+                            populate(p, c, src)
+                        },
+                    );
                     // Even the final run can return its claims when quiesce interrupts an EAGAIN retry.
                     cut |= installed.is_err_and(|e| e.raw_os_error() == Some(libc::EAGAIN));
                 }
@@ -604,10 +611,14 @@ impl Pager {
                         let n = pages.claim(page, end - index, REMOTE, |_| true);
                         if n > 0 {
                             let src = |p: usize, c: usize| &data[(index + p - page) * PAGE_SIZE..(index + p - page + c) * PAGE_SIZE];
-                            let (resolved, res) =
-                                pages.install(page, n, REMOTE, Some(&|| self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline), |p, c| {
-                                    self.populate(p, c, Some(src(p, c)))
-                                });
+                            let (resolved, res) = pages.install(
+                                page,
+                                n,
+                                REMOTE,
+                                Some(&|| self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline),
+                                |p| self.wake(p),
+                                |p, c| self.populate(p, c, Some(src(p, c))),
+                            );
                             self.pulled(resolved);
                             installed += resolved;
                             res?;

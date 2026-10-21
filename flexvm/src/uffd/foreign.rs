@@ -283,7 +283,7 @@ mod tests {
         let mut pages = Pages::new(4);
         pages.fill(0, 4, REMOTE);
         assert_eq!(pages.claim(0, 2, REMOTE, |_| true), 2);
-        let _ = pages.install(0, 2, REMOTE, None, |_, _| Err(io::Error::from_raw_os_error(libc::EEXIST)));
+        let _ = pages.install(0, 2, REMOTE, None, |_| Ok(()), |_, _| Err(io::Error::from_raw_os_error(libc::EEXIST)));
         assert_eq!(foreign_count(&pages, &[0, 1, 2], |_| true), (3, Some(0)));
         // Without pagemap access, EEXIST still proves these pages foreign.
         assert_eq!(foreign_count(&pages, &[], |_| true), (2, Some(0)));
@@ -297,21 +297,21 @@ mod tests {
         let pages = Pages::new(8);
         let eexist = || Err(io::Error::from_raw_os_error(libc::EEXIST));
         assert_eq!(pages.claim(0, 2, BASE, |_| true), 2);
-        let _ = pages.install(0, 2, BASE, None, |p, _| if p == 1 { eexist() } else { Ok(1) });
+        let _ = pages.install(0, 2, BASE, None, |_| Ok(()), |p, _| if p == 1 { eexist() } else { Ok(1) });
         let mut pages = pages;
         pages.fill(4, 2, REMOTE);
         pages.fill(6, 1, ZERO);
         assert_eq!(pages.claim(4, 2, REMOTE, |_| true), 2);
-        let _ = pages.install(4, 2, REMOTE, None, |_, _| eexist());
+        let _ = pages.install(4, 2, REMOTE, None, |_| Ok(()), |_, _| eexist());
         // A zero-fill that finds the page mapped is the zap race `Pages` describes, not a foreign page.
         assert_eq!(pages.claim(6, 1, ZERO, |_| true), 1);
-        let _ = pages.install(6, 1, ZERO, None, |_, _| eexist());
+        let _ = pages.install(6, 1, ZERO, None, |_| Ok(()), |_, _| eexist());
         assert_eq!(*pages.preset.lock().unwrap(), vec![(1, BASE), (4, REMOTE), (5, REMOTE)]);
         // A template hole found mapped is zero either way: not noted, nor counted past the kept ones.
         let _ = pages.base_data.set(Box::new(|p| p != 2));
         pages.fill(2, 2, BASE);
         assert_eq!(pages.claim(2, 2, BASE, |_| true), 2);
-        let _ = pages.install(2, 2, BASE, None, |_, _| eexist());
+        let _ = pages.install(2, 2, BASE, None, |_| Ok(()), |_, _| eexist());
         assert_eq!(*pages.preset.lock().unwrap(), vec![(1, BASE), (4, REMOTE), (5, REMOTE), (3, BASE)]);
         assert_eq!(pages.preset_more.load(Ordering::Relaxed), 0);
     }

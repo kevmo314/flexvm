@@ -254,12 +254,21 @@ mod tests {
                     Ok(())
                 })
             };
-            let (resolved, result) = pages.fetch_install(first, n, &mut vec![0; n * PAGE_SIZE], &mut fetch, &stop, &mut |_| false, |page, count, data| {
-                for (i, chunk) in data.chunks(PAGE_SIZE).enumerate() {
-                    assert!(chunk.iter().all(|&b| b == (page + i) as u8));
-                }
-                Ok(count)
-            });
+            let (resolved, result) = pages.fetch_install(
+                first,
+                n,
+                &mut vec![0; n * PAGE_SIZE],
+                &mut fetch,
+                &stop,
+                &mut |_| false,
+                |_| Ok(()),
+                |page, count, data| {
+                    for (i, chunk) in data.chunks(PAGE_SIZE).enumerate() {
+                        assert!(chunk.iter().all(|&b| b == (page + i) as u8));
+                    }
+                    Ok(count)
+                },
+            );
             let done = if fail { STREAM_RUN } else { n };
             assert_eq!(resolved, done);
             assert_eq!(result.is_err(), fail);
@@ -282,7 +291,8 @@ mod tests {
                 Ok(())
             })
         };
-        let (resolved, result) = pages.fetch_install(0, n, &mut vec![0; n * PAGE_SIZE], &mut fetch, &stop, &mut |_| false, |_, _, _| Err(os(libc::ENOMEM)));
+        let (resolved, result) =
+            pages.fetch_install(0, n, &mut vec![0; n * PAGE_SIZE], &mut fetch, &stop, &mut |_| false, |_| Ok(()), |_, _, _| Err(os(libc::ENOMEM)));
         assert_eq!(resolved, 0);
         assert!(matches!(result, Err(Failed::Install(_))));
         assert_eq!(reads, 1);

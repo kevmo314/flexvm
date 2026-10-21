@@ -475,14 +475,16 @@ impl Pages {
 
     /// Installs claimed pages `[first, first + n)` with `populate(page, count)`, which returns how many pages from
     /// `page` it populated (UFFDIO_COPY may stop part way) and wakes their waiters. Pages discarded before their copy
-    /// are skipped; EEXIST counts as populated. EAGAIN is retried until `stop` says to, or without `stop` ends the
-    /// install. Unfinished pages are given back. Returns the REMOTE pages resolved and the error, if any.
+    /// are skipped; EEXIST counts as populated after `wake(page)` succeeds. EAGAIN is retried until `stop` says to,
+    /// or without `stop` ends the install. Unfinished pages are given back. Returns the REMOTE pages resolved and
+    /// the error, if any.
     pub fn install(
         &self,
         first: usize,
         n: usize,
         from: u8,
         stop: Option<&dyn Fn() -> bool>,
+        mut wake: impl FnMut(usize) -> io::Result<()>,
         mut populate: impl FnMut(usize, usize) -> io::Result<usize>,
     ) -> (usize, io::Result<()>) {
         let (end, mut resolved, mut i) = (first + n, 0, first);
@@ -509,6 +511,15 @@ impl Pages {
                     if from == BASE || from == REMOTE {
                         self.note_preset(i, from);
                     }
+                    // COPY/ZEROPAGE return EEXIST without waking, even without DONTWAKE. The existing
+                    // mapping may have been installed with DONTWAKE, so wake before publishing PRESENT.
+                    if let Err(e) = wake(i) {
+                        if from == REMOTE {
+                            self.note_failure(i);
+                        }
+                        return (resolved + self.release(i, end - i, from), Err(e));
+                    }
+                    self.woke(i, 1);
                     self.mark_dirty(i);
                     resolved += self.settle(i, true, from) as usize;
                     i += 1;
@@ -689,15 +700,93 @@ mod tests {
     }
 
     #[test]
+    fn install_wakes_existing_pages_before_settling() {
+        for from in [BASE, REMOTE, ZERO] {
+            let mut pages = Pages::new(8);
+            pages.fill(0, 8, from);
+            assert_eq!(pages.claim(2, 5, from, |_| true), 5);
+            pages.discard(&pages.removing(), 5, 6);
+            pages.waiting.store(true, Ordering::SeqCst);
+            let read = Instant::now();
+            pages.park(3, read);
+            pages.park(6, read);
+            let mut woken = Vec::new();
+            let (resolved, result) = pages.install(
+                2,
+                5,
+                from,
+                None,
+                |p| {
+                    assert_eq!(pages.get(p), INFLIGHT, "wake before publishing PRESENT");
+                    woken.push(p);
+                    Ok(())
+                },
+                |p, _| match p {
+                    2 | 4 => Ok(1),
+                    3 | 6 => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+                    _ => panic!("discarded page must not be populated"),
+                },
+            );
+            result.unwrap();
+            assert_eq!(resolved, if from == REMOTE { 5 } else { 0 });
+            assert_eq!(woken, [3, 6], "wake only the individual EEXIST pages");
+            for p in [2, 3, 4, 6] {
+                assert_eq!(pages.get(p), PRESENT);
+                assert!(pages.is_dirty(p));
+            }
+            assert_eq!(pages.get(5), ZERO);
+            assert!(pages.unpark(3, read).is_some());
+            assert!(pages.unpark(6, read).is_some());
+        }
+    }
+
+    #[test]
+    fn install_failed_wake_releases_unfinished_pages() {
+        let mut pages = Pages::new(3);
+        pages.fill(0, 3, REMOTE);
+        assert_eq!(pages.claim(0, 3, REMOTE, |_| true), 3);
+        pages.waiting.store(true, Ordering::SeqCst);
+        let read = Instant::now();
+        pages.park(1, read);
+        let (resolved, result) = pages.install(
+            0,
+            3,
+            REMOTE,
+            None,
+            |p| {
+                assert_eq!(p, 1);
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            },
+            |p, _| if p == 0 { Ok(1) } else { Err(io::Error::from_raw_os_error(libc::EEXIST)) },
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+        assert_eq!(resolved, 1);
+        assert_eq!(pages.get(0), PRESENT);
+        for p in [1, 2] {
+            assert_eq!(pages.get(p), REMOTE);
+            assert!(!pages.is_dirty(p));
+        }
+        assert!(pages.unpark(1, read).is_none());
+        assert!(pages.failing_since(1, 1).is_some());
+    }
+
+    #[test]
     fn install_uses_full_capped_runs() {
         let mut pages = Pages::new(513);
         pages.fill(0, 513, REMOTE);
         assert_eq!(pages.claim(0, 513, REMOTE, |_| true), 513);
         let mut copies = Vec::new();
-        let (resolved, result) = pages.install(0, 513, REMOTE, None, |p, count| {
-            copies.push((p, count));
-            Ok(count)
-        });
+        let (resolved, result) = pages.install(
+            0,
+            513,
+            REMOTE,
+            None,
+            |_| Ok(()),
+            |p, count| {
+                copies.push((p, count));
+                Ok(count)
+            },
+        );
         result.unwrap();
         assert_eq!(resolved, 513);
         assert_eq!(copies, (0..513).step_by(32).map(|p| (p, (513 - p).min(32))).collect::<Vec<_>>());
@@ -714,13 +803,20 @@ mod tests {
                 pages.discard(&removing, n / 2, n / 2 + 1);
             }
             let mut copied = 0;
-            let (resolved, result) = pages.install(0, n, REMOTE, None, |p, count| {
-                assert!((1..=32).contains(&count));
-                assert!(!(p..p + count).contains(&(n / 2)));
-                let done = count.min(17);
-                copied += done;
-                Ok(done)
-            });
+            let (resolved, result) = pages.install(
+                0,
+                n,
+                REMOTE,
+                None,
+                |_| Ok(()),
+                |p, count| {
+                    assert!((1..=32).contains(&count));
+                    assert!(!(p..p + count).contains(&(n / 2)));
+                    let done = count.min(17);
+                    copied += done;
+                    Ok(done)
+                },
+            );
             result.unwrap();
             assert_eq!(resolved, n);
             assert_eq!(copied, n - 1);
@@ -753,21 +849,28 @@ mod tests {
                 .is_ok());
             assert_eq!(pages.claim(first, 100, REMOTE, |_| true), 100);
             let mut calls = 0;
-            let (resolved, result) = pages.install(first, 100, REMOTE, None, |p, n| {
-                calls += 1;
-                match calls {
-                    1 | 3 => {
-                        let done = if calls == 1 { 3 } else { n };
-                        end.store(p + done, Ordering::Relaxed);
-                        Ok(done)
+            let (resolved, result) = pages.install(
+                first,
+                100,
+                REMOTE,
+                None,
+                |_| Ok(()),
+                |p, n| {
+                    calls += 1;
+                    match calls {
+                        1 | 3 => {
+                            let done = if calls == 1 { 3 } else { n };
+                            end.store(p + done, Ordering::Relaxed);
+                            Ok(done)
+                        }
+                        2 => {
+                            end.store(p + 1, Ordering::Relaxed);
+                            Err(io::Error::from_raw_os_error(libc::EEXIST))
+                        }
+                        _ => Err(io::Error::from_raw_os_error(libc::EIO)),
                     }
-                    2 => {
-                        end.store(p + 1, Ordering::Relaxed);
-                        Err(io::Error::from_raw_os_error(libc::EEXIST))
-                    }
-                    _ => Err(io::Error::from_raw_os_error(libc::EIO)),
-                }
-            });
+                },
+            );
             assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
             let end = end.load(Ordering::Relaxed);
             assert_eq!(resolved, end - first);
@@ -794,8 +897,14 @@ mod tests {
                         assert_ne!(pages.dirty[p / 64].load(Ordering::SeqCst) & (1 << (p % 64)), 0);
                     }
                 });
-                let (resolved, result) =
-                    pages.install(0, pages.len(), from, None, |p, n| if p % 3 != 0 { Ok(n) } else { Err(io::Error::from_raw_os_error(libc::EEXIST)) });
+                let (resolved, result) = pages.install(
+                    0,
+                    pages.len(),
+                    from,
+                    None,
+                    |_| Ok(()),
+                    |p, n| if p % 3 != 0 { Ok(n) } else { Err(io::Error::from_raw_os_error(libc::EEXIST)) },
+                );
                 result.unwrap();
                 assert_eq!(resolved, if from == REMOTE { pages.len() } else { 0 });
             });
