@@ -1874,7 +1874,7 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
     let kernel_file = File::open(&kernel)?;
     let kernel_component = hash_open_file(&kernel_file, &kernel)?;
-    let kernel_source = format!("/proc/{}/fd/{}", std::process::id(), kernel_file.as_raw_fd());
+    let kernel_source = crate::host::fd_path(kernel_file.as_raw_fd());
     let sockets = SocketRoot::unique(&std::fs::canonicalize(dir)?)?;
     let start = Instant::now();
     let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
@@ -3491,6 +3491,8 @@ pub(crate) mod tests {
         let original = hash_open_file(&file, &f.paths.kernel).unwrap();
         f.replace("kernel", b"replacement kernel");
         assert_eq!(hash_open_file(&file, &f.paths.kernel).unwrap().hash, original.hash);
+        let source = crate::host::fd_path(file.as_raw_fd());
+        assert_eq!(hash_file(&source).unwrap().hash, original.hash, "the boot source reaches the pinned descriptor");
         assert_ne!(hash_file(&f.paths.kernel).unwrap().hash, original.hash);
     }
 

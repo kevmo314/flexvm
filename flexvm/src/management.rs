@@ -409,9 +409,13 @@ fn prune_blobs(paths: &Paths) -> Result<()> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if entry.file_type()?.is_file() && name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let hex = |n: &str| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit());
+        if entry.file_type()?.is_file() && hex(&name) {
             std::fs::remove_file(entry.path())?;
             output(format_args!("Deleted blob: sha256:{name}\n"))?;
+        } else if name.strip_suffix(".verified").is_some_and(hex) {
+            // A blob's verification stamp (`image::registry::verified_stamp`) goes with it.
+            std::fs::remove_file(entry.path())?;
         }
     }
     crate::util::sync_dir(&dir)?;
@@ -529,6 +533,7 @@ mod tests {
         std::fs::create_dir_all(&blobs).unwrap();
         let digest = "a".repeat(64);
         std::fs::write(blobs.join(&digest), b"download cache").unwrap();
+        std::fs::write(blobs.join(format!("{digest}.verified")), b"stamp").unwrap();
         let outside = root.join("outside");
         std::fs::write(&outside, b"keep").unwrap();
         std::os::unix::fs::symlink(&outside, blobs.join("b".repeat(64))).unwrap();
@@ -541,6 +546,7 @@ mod tests {
         drop(held);
         prune_blobs(&paths).unwrap();
         assert!(!blobs.join(&digest).exists());
+        assert!(!blobs.join(format!("{digest}.verified")).exists(), "a blob's stamp goes with it");
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
         assert!(blobs.join("download.part").exists());
         std::fs::rename(&blobs, root.join("saved-blobs")).unwrap();

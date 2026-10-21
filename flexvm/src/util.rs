@@ -1371,7 +1371,7 @@ pub const BOOT_TAG: usize = 8;
 /// What names this process in `write_file`'s temporary files: `PID-START-BOOT-NS` (its start time,
 /// the first `BOOT_TAG` characters of the boot id and its PID namespace, `host::pid_ns`), so a sweep
 /// tells a dead writer's from a live one that got its pid, in this boot or after a reboot
-/// (`host::write_debris_of`), and writers in other PID namespaces with the same pid and start time
+/// (`host::write_debris_by`), and writers in other PID namespaces with the same pid and start time
 /// (in a directory they share, a templates directory say) never write to one file (#1084). Without a
 /// PID namespace to name, `PID-START-BOOT`; a bare PID if the start time or boot id cannot be read.
 pub fn write_tag() -> String {
