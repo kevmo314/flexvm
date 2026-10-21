@@ -9490,10 +9490,20 @@ def gated_app(n, status, *opts):
     ok(cli_json(A, "run", "--name", n, "-d", *opts, "--entrypoint", app, args.template))
 
 
+def tell_exit(n, label, ending):
+    """Tell `n`'s gated app to exit, by a detached exec (it waits for no status the VM's end could cut
+    off). Even its start can lose the race with the VM it ends (#1179): a failed exec counts only when
+    `ending()` then holds, which only the app's exit makes so. Returns whether it was told."""
+    code, out, err = cli(A, "exec", "-d", n, "sh", "-c", "touch /tmp/go")
+    out = (out + err).strip()
+    told = code == 0 or wait_for(ending, 30)
+    check(f"{label}: told to exit", told, out)
+    return told
+
+
 def app_ends(n, status):
-    code, out = sh(A, n, "touch /tmp/go")
-    check(f"{n}: told to exit", code == 0, out)
-    return wait_for(lambda: vms(A).get(n, {}).get("state") == "exited" and vms(A)[n].get("status") == status, 30)
+    ended = lambda: vms(A).get(n, {}).get("state") == "exited" and vms(A)[n].get("status") == status
+    return tell_exit(n, n, ended) and wait_for(ended, 30)
 
 
 def concurrent_start():
@@ -9563,8 +9573,7 @@ def stop_self_exit():
     pid = vm_pid(A, n)
     clear_gate(A, "app_exit_stall")
     with armed_fault(A, "app_exit_stall", 30000):
-        code, out = sh(A, n, "touch /tmp/go")
-        check("stop self exit: told to exit", code == 0, out)
+        tell_exit(n, "stop self exit", lambda: pid in reached(A, "app_exit_stall"))
         check("stop self exit: ending, stalled", wait_for(lambda: pid in reached(A, "app_exit_stall"), 30), reached(A, "app_exit_stall"))
         code, out, err = cli(A, "stop", n)
     check("stop self exit: stop succeeds", code == 0 and out == n, (code, out, err))
@@ -9577,8 +9586,7 @@ def stop_self_exit():
     pid = vm_pid(A, n)
     clear_gate(A, "app_exit_stall")
     with armed_fault(A, "app_exit_stall", 30000):
-        code, out = sh(A, n, "touch /tmp/go")
-        check("stop self exit --rm: told to exit", code == 0, out)
+        tell_exit(n, "stop self exit --rm", lambda: pid in reached(A, "app_exit_stall"))
         check("stop self exit --rm: ending, stalled", wait_for(lambda: pid in reached(A, "app_exit_stall"), 30), reached(A, "app_exit_stall"))
         code, out, err = cli(A, "stop", n)
     check("stop self exit --rm: stop succeeds", code == 0 and out == n, (code, out, err))
