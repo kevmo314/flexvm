@@ -554,17 +554,17 @@ fn stdin_lost(name: &str, e: &util::Error) -> ! {
 /// `attach NAME`, and a foreground `run -i`/`-t` (from 0): the app's output from `from` (None: from now on),
 /// and stdin to it if it was run with `-i`, until it exits (its status) or the client detaches.
 pub fn attach(host: &Host, name: &str, from: Option<u64>) -> Result<i32> {
-    attach_to(host, name, from).map(|(code, _)| code)
+    attach_to(host, name, from).map(|(code, _, _)| code)
 }
 
 /// `attach`, and the VM process it last reached and verified (`connect_same`): the one its app's status is
 /// from, a resume's or a migration's if one replaced the process first reached. None: it reached none (an
-/// app done before the first connection).
-pub fn attach_to(host: &Host, name: &str, from: Option<u64>) -> Result<(i32, Option<crate::host::Ident>)> {
+/// app done before the first connection). Also returns its last name, following renames, for cleanup.
+pub fn attach_to(host: &Host, name: &str, from: Option<u64>) -> Result<(i32, Option<crate::host::Ident>, String)> {
     let vm = Pinned { host: host.clone(), name: name.to_string(), pin: Arc::default() };
     let code = attach_pinned(&vm, name, from)?;
     let last = vm.pin.lock().unwrap().pin.process.clone();
-    Ok((code, last))
+    Ok((code, last, vm.name()))
 }
 
 fn attach_pinned(vm: &Pinned, name: &str, from: Option<u64>) -> Result<i32> {
@@ -1026,13 +1026,42 @@ mod tests {
         // `run -i ... true`: its VM gone before the first connection, its exited record left.
         let rec = crate::app::Exited::new(0, "t".into(), None, Default::default(), Default::default(), 0);
         crate::host::write_record(&host.vms("fast", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
-        assert_eq!(attach(&host, "fast", Some(0)).unwrap(), 0);
+        assert_eq!(attach_to(&host, "fast", Some(0)).unwrap(), (0, None, "fast".into()));
         let rec = crate::app::Exited::new(3, "t".into(), None, Default::default(), Default::default(), 0);
         crate::host::write_record(&host.vms("fast", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
         assert_eq!(attach(&host, "fast", Some(0)).unwrap(), 3);
         // Nothing at all: an error still; and `attach NAME` to a VM that ended before, as docker's.
         assert!(attach(&host, "never", Some(0)).is_err());
         assert!(attach(&host, "fast", None).is_err());
+    }
+
+    #[test]
+    fn a_renamed_attach_keeps_its_last_name_for_cleanup() {
+        let root = crate::test_util::TempDir::new("attach-renamed");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let ours = crate::host::Ident { pid: 999_999_901, start: 1, boot: crate::host::boot_id().into(), ns: None };
+        let vm = Pinned { host: host.clone(), name: "old".into(), pin: Arc::default() };
+        {
+            let l = host.lock().unwrap();
+            let c = host.claim_new(&l, "old", None).unwrap();
+            {
+                let mut s = vm.pin.lock().unwrap();
+                (s.pin.vm, s.pin.process) = (Some(crate::Instance { ip: c.ip, gen: c.gen }), Some(ours.clone()));
+            }
+            assert!(host.rename_holder(&l, c.ip, "old", "new", None).unwrap());
+            assert_eq!(vm.name(), "new");
+            host.release(&l, c.ip, "new", None).unwrap();
+            c.keep();
+        }
+        let rec = crate::app::Exited::new(4, "t".into(), None, Default::default(), Default::default(), 0);
+        crate::host::write_record(&host.vms("new", "exited").unwrap(), &serde_json::to_vec(&rec).unwrap()).unwrap();
+        crate::containers::record_exit(&host, "new", &ours, 4, true);
+        assert_eq!(gone(&vm).unwrap(), 4);
+        // Its address released, the attachment still names the records to clean up.
+        let name = vm.name();
+        assert_eq!(name, "new");
+        crate::remove_stopped(&host, &name, true, false, Some(&ours), false).unwrap();
+        assert!(!host.has_record("new", "exited"));
     }
 
     #[test]
