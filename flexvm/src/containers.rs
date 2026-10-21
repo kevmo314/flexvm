@@ -436,6 +436,10 @@ pub fn rename(host: &Host, from: &str, to: &str) -> Result<()> {
 /// are held throughout, so no start of either runs meanwhile; the directory and the claim move
 /// together under the host lock, so no sweep or claim sees one moved without the other.
 fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
+    rename_stopped_with_sync(host, from, to, crate::util::sync_dir)
+}
+
+fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce(&std::path::Path) -> std::io::Result<()>) -> Result<()> {
     if !host.is_suspended(from) && host.has_record(from, "exited") {
         return rename_exited(host, from, to);
     }
@@ -464,9 +468,16 @@ fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
         let _moves = host::suspended_moves(&host.state, libc::LOCK_EX)?;
         crate::util::write_file(&parent, &journal.file_name().unwrap_or_default().to_string_lossy(), from.as_bytes(), true)?;
         let moved = std::fs::rename(&dir, &dest).map_err(|e| format!("renaming {} to {}: {e}", dir.display(), dest.display()));
-        if let Err(e) = moved.and_then(|()| crate::util::sync_dir(&parent).map_err(|e| format!("syncing {}: {e}", parent.display()))) {
+        if let Err(e) = moved {
             let _ = crate::util::unlink_durably(&journal);
             return Err(e.into());
+        }
+        // The checkpoint is at `to` now, maybe not durably: the journal stays, so the claim stays
+        // `from`'s, held by the directory at either name, and the next to take `to` moves it.
+        if let Err(e) = sync(&parent) {
+            drop((_moves, l));
+            let records = move_records(host, from, to).err().map_or(String::new(), |r| format!("; moving its logs: {r}"));
+            bail!("vm {from}: renamed to {to}, but syncing {}: {e}{records}; its address moves to {to} when it is next resumed", parent.display());
         }
         if let Some(ip) = ip {
             if let Err(e) = host.rename_holder(&l, ip, from, to, None) {
@@ -1495,6 +1506,35 @@ mod tests {
         std::fs::write(host.rename_journal("other").unwrap(), "new").unwrap();
         drop(host.take_name("other", false).unwrap());
         assert!(!host.rename_journal("other").unwrap().exists() && host.is_suspended("new"));
+    }
+
+    #[test]
+    fn a_rename_sync_failure_keeps_the_claim_and_recovers() {
+        let (_d, host) = host("rename-sync-fail");
+        let ip = "10.0.0.7".parse().unwrap();
+        suspended_vm(&host, "old", "10.0.0.7");
+        let error = rename_stopped_with_sync(&host, "old", "new", |parent| {
+            assert_eq!(parent, host.state.join("suspended"));
+            assert!(!host.is_suspended("old") && host.is_suspended("new"));
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("renamed to new, but syncing"), "{error}");
+        assert_eq!(std::fs::read_to_string(host.rename_journal("new").unwrap()).unwrap(), "old");
+        assert!(host.vms("new", "logs").unwrap().exists() && !host.vms("old", "logs").unwrap().exists(), "its logs moved too");
+        let l = host.lock().unwrap();
+        // Held (what a sweep asks): never withdrawn while the journal names where it went.
+        assert_eq!(host.holder(&l, ip).unwrap().as_deref(), Some("old"));
+        assert!(host.current(&l, ip, 1).unwrap());
+        drop(l);
+
+        drop(host.take_name("new", true).unwrap());
+        assert!(!host.rename_journal("new").unwrap().exists());
+        let l = host.lock().unwrap();
+        assert_eq!(host.holder(&l, ip).unwrap().as_deref(), Some("new"));
+        let gen = crate::lifecycle::read_gen(&host.suspended("new").unwrap()).unwrap();
+        assert_eq!(gen, 1);
+        assert!(host.current(&l, ip, gen).unwrap());
     }
 
     #[test]
