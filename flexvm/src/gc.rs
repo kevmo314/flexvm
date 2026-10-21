@@ -262,9 +262,9 @@ fn vm_files(host: &Host) {
         if logs.is_none() || age.is_none_or(|a| a <= ORPHAN_LOG_TTL) {
             continue;
         }
-        // Not a VM's name: never one of its logs.
-        let Ok(suspended) = host.suspended(name) else { continue };
-        let orphan = host.holder_gone(name) && !suspended.exists() && !["failed", "moved", "lost", "exited"].iter().any(|ext| host.has_record(name, ext));
+        // Not a VM's name (nothing recorded, its holder not gone): never one of its logs.
+        let r = crate::host::Records::read(host, name);
+        let orphan = r.holder_gone() && !r.recorded() && r.moved.is_none();
         if orphan && lifetime {
             let _ = host.retire_logs(name);
         } else if orphan {

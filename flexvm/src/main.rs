@@ -1434,15 +1434,13 @@ pub fn no_vm(host: &Host, name: &str) -> util::Error {
 
 fn no_process(host: &Host, name: &str, none: &str) -> util::Error {
     // A stopped VM's checkpoint, not debris (consumed by a resume, or being discarded).
-    match host.is_suspended(name) {
-        true => format!("vm {name} is stopped: flexvm start {name}").into(),
-        _ if host.has_record(name, "exited") => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
-        _ if host.has_record(name, "failed") => format!("vm {name} has failed: see flexvm ps -a; flexvm rm {name} clears it").into(),
-        _ if host.has_record(name, "lost") => format!("vm {name} is lost: see flexvm ps -a; flexvm rm {name} clears it").into(),
-        _ => match std::fs::read_to_string(host.vms(name, "moved").unwrap_or_default()) {
-            Ok(to) => format!("vm {name} moved to {to}; it runs there").into(),
-            Err(_) => format!("{none} {name:?}").into(),
-        },
+    match host::Records::read(host, name) {
+        r if r.stopped() => format!("vm {name} is stopped: flexvm start {name}").into(),
+        r if r.exited => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
+        r if r.failed => format!("vm {name} has failed: see flexvm ps -a; flexvm rm {name} clears it").into(),
+        r if r.lost => format!("vm {name} is lost: see flexvm ps -a; flexvm rm {name} clears it").into(),
+        host::Records { moved: Some(Some(to)), .. } => format!("vm {name} moved to {to}; it runs there").into(),
+        _ => format!("{none} {name:?}").into(),
     }
 }
 
@@ -1532,17 +1530,18 @@ fn stop(host: &Host, name: &str) -> Result<String> {
     let name = last.as_str();
     // Suspended by the instance signalled, as its checkpoint's OWNER says: never debris (a checkpoint
     // consumed by a resume that then died) or another instance's.
-    if host.is_suspended(name) && host.suspended(name).ok().and_then(|d| lifecycle::read_owner(&d)).is_some_and(|o| o == ident) {
+    let r = host::Records::read(host, name);
+    if matches!(&r.checkpoint, Some(host::Checkpoint::Resumable { owner: Some(o) }) if *o == ident) {
         return Ok(last);
     }
     // Its app exited first (the VM was ending, so took no suspend): stopped all the same.
-    if host.has_record(name, "exited") {
+    if r.exited {
         return Ok(last);
     }
-    if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
+    if let Some(Some(to)) = r.moved {
         return Err(format!("vm {shown} moved to {to} before it was stopped; stop it there").into());
     }
-    let died = ["failed", "lost"].iter().any(|ext| host.has_record(name, ext));
+    let died = r.failed || r.lost;
     // Its own exit record, as read and checked (a later instance of the name may replace it since).
     match !died && app_exited(exit.as_ref(), &ident) {
         true => Ok(last),
@@ -1603,13 +1602,13 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     }
     // Its tap and route go now, not at a sweep; best effort, as taking the name reaps again where it must.
     let _ = host.reap_dead_holder(name);
-    let records = || -> Result<bool> { Ok(host.suspended(name)?.exists() || ["failed", "lost", "exited"].iter().any(|ext| host.has_record(name, ext))) };
-    if !alive && !stopped && records()? {
+    let records = || host::Records::read(host, name).recorded();
+    if !alive && !stopped && records() {
         bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
     }
     let done = || output(format_args!("{name}\n"));
     if !running {
-        return remove_stopped(host, name, records()?, true, None, false).and_then(|()| done());
+        return remove_stopped(host, name, records(), true, None, false).and_then(|()| done());
     }
     // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
     let not_source = |e: &host::Entry| -> Result<()> {
@@ -1662,7 +1661,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         return done();
     }
     if stopped {
-        return remove_stopped(host, name, records()?, true, None, true).and_then(|()| done());
+        return remove_stopped(host, name, records(), true, None, true).and_then(|()| done());
     }
     // Nothing signalled: what held the name (`alive`) was no registered VM, or let it go since (a
     // start whose resume failed, a sweep, an `rm` deciding). A stopped or ended VM's records stay:
@@ -1672,7 +1671,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
             format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()).into()
         );
     }
-    if records()? {
+    if records() {
         bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
     }
     nothing_to_remove(host, name)
@@ -1727,20 +1726,18 @@ fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host:
         Err(_) if host.alive(name) => bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"),
         Err(e) => return Err(e),
     };
-    if !had {
-        let recorded = host.suspended(name)?.exists() || ["exited", "failed", "lost"].iter().any(|ext| host.has_record(name, ext));
-        let moved = std::fs::read_to_string(host.vms(name, "moved")?);
-        if moved.is_ok() || host.has_record(name, "moved") || recorded {
-            lock.release_to_prior();
-            return Err(match moved {
-                Ok(to) => format!("vm {name} moved to {to}; kill it there").into(),
-                Err(_) if host.has_record(name, "moved") => format!("vm {name} moved away; kill it where it runs").into(),
-                Err(_) => format!("vm {name} ended meanwhile (see flexvm ps -a): left as it is; flexvm rm {name} removes it").into(),
-            });
-        }
+    // Held: taking the name removed any debris, so a checkpoint is a stopped VM's.
+    let r = host::Records::read(host, name);
+    if !had && (r.moved.is_some() || r.recorded()) {
+        lock.release_to_prior();
+        return Err(match r.moved {
+            Some(Some(to)) => format!("vm {name} moved to {to}; kill it there").into(),
+            Some(None) => format!("vm {name} moved away; kill it where it runs").into(),
+            None => format!("vm {name} ended meanwhile (see flexvm ps -a): left as it is; flexvm rm {name} removes it").into(),
+        });
     }
     if let Some(id) = of {
-        let checkpoint = host.suspended(name)?.exists();
+        let checkpoint = r.stopped();
         match owns(host, &lock, id, checkpoint) {
             Some(true) => {}
             // Another instance's: left as found, its dead holder's record too (#1185).
@@ -1749,12 +1746,12 @@ fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host:
                 return Ok(());
             }
             // Nothing left of any VM under the name: nothing to remove.
-            None if !checkpoint && !["exited", "failed", "lost", "log"].iter().any(|ext| host.has_record(name, ext)) => return Ok(()),
+            // Its log alone, as before `Records` (never its logs' directory or `log.1`).
+            None if !checkpoint && !r.ended() && !host.has_record(name, "log") => return Ok(()),
             None => return Err(unconfirmed(name, name)),
         }
     }
-    // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
-    if host.suspended(name)?.exists() {
+    if r.stopped() {
         lifecycle::revoke(host, name)??;
     }
     if logs && had {
@@ -1783,12 +1780,15 @@ fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host:
 /// Why there is nothing under `name` to remove: a VM starting (holding the name, or a `run`
 /// preparing its logs), one that moved away, or no VM at all.
 fn nothing_to_remove(host: &Host, name: &str) -> Result<()> {
-    if host.alive(name) || host.has_record(name, "logs") && !host.left_unrecorded(name)? {
+    // Read once no process was seen holding the name: a VM that moved away wrote its hint before letting it go.
+    let alive = host.alive(name);
+    let r = host::Records::read(host, name);
+    if alive || r.logs && !host.left_unrecorded(name)? {
         bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
     }
-    match std::fs::read_to_string(host.vms(name, "moved")?) {
-        Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
-        Err(_) => Err(format!("no vm named {name:?}").into()),
+    match r.moved {
+        Some(Some(to)) => Err(format!("vm {name} moved to {to}; kill it there").into()),
+        _ => Err(format!("no vm named {name:?}").into()),
     }
 }
 

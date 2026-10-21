@@ -106,27 +106,31 @@ pub fn last_name(host: &Host, name: &str, id: &Ident) -> Option<(String, Exit)> 
 
 /// The status of `name` with no process running it.
 fn ended(host: &Host, name: &str) -> Result<i32> {
-    let has = |ext: &str| host.has_record(name, ext);
+    // The exit record first, then the holder (`Records::read`), as an instance writes one before it lets the name go.
     let record = exit_record(host, name);
+    let r = crate::host::Records::read(host, name);
     // A holder that died without unlocking left its identity: unless the record is its own, it
     // ended unrecorded (SIGKILL, a crash), and the record is an earlier instance's.
-    let crashed = host.name_holder(name).ok().flatten().filter(|h| record.as_ref().is_none_or(|r| r.ident != *h));
-    if crashed.is_some() && !has("failed") && !has("lost") {
+    let crashed = r.holder.as_ref().ok().and_then(Option::as_ref).filter(|h| record.as_ref().is_none_or(|e| e.ident != **h));
+    if crashed.is_some() && !r.failed && !r.lost {
         bail!("vm {name} ended without an exit status (killed with SIGKILL, or its process crashed); see {}", host.vms(name, "log")?.display());
     }
     match record {
-        Some(r) if crashed.is_none() => Ok(r.code),
-        _ if crashed.is_none() && host.is_suspended(name) => Ok(STOPPED),
+        Some(e) if crashed.is_none() => Ok(e.code),
+        _ if crashed.is_none() && r.stopped() => Ok(STOPPED),
         // Its command or app exited (`app::Exited`), its own record gone (a sweep's).
-        _ if crashed.is_none() && has("exited") => Ok(crate::app::Exited::read(&host.vms(name, "exited")?)?.status),
-        _ if has("failed") || has("lost") => Ok(crate::vmproc::DIED),
+        _ if crashed.is_none() && r.exited => Ok(crate::app::Exited::read(&host.vms(name, "exited")?)?.status),
+        _ if r.failed || r.lost => Ok(crate::vmproc::DIED),
         _ => Err(crate::no_vm(host, name)),
     }
 }
 
 /// Whether anything is left of `name` here: a process, a stopped VM, or a record of its end.
 fn known(host: &Host, name: &str) -> bool {
-    host.alive(name) || host.is_suspended(name) || ["failed", "lost", "exited"].iter().any(|ext| host.has_record(name, ext))
+    host.alive(name) || {
+        let r = crate::host::Records::read(host, name);
+        r.stopped() || r.ended()
+    }
 }
 
 /// Writes to stdout: false once its reader is gone.
@@ -443,12 +447,13 @@ fn rename_stopped(host: &Host, from: &str, to: &str) -> Result<()> {
 }
 
 fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce(&std::path::Path) -> std::io::Result<()>) -> Result<()> {
-    if !host.is_suspended(from) && host.has_record(from, "exited") {
+    let r = crate::host::Records::read(host, from);
+    if !r.stopped() && r.exited {
         return rename_exited(host, from, to);
     }
-    if !host.is_suspended(from) {
-        return Err(match ["failed", "lost"].iter().find(|ext| host.has_record(from, ext)) {
-            Some(ext) => format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed").into(),
+    if !r.stopped() {
+        return Err(match [("failed", r.failed), ("lost", r.lost)].into_iter().find(|(_, has)| *has) {
+            Some((ext, _)) => format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed").into(),
             None => crate::no_vm(host, from),
         });
     }
@@ -890,9 +895,8 @@ fn align(text: &str) -> String {
 /// What gc keeps: an exit record of a name with nothing else left, once it is `ttl` old, goes.
 pub fn stale_exit(host: &Host, name: &str, path: &Path, ttl: Duration) -> bool {
     let old = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > ttl);
-    let logs = ["logs", "log", "log.1"].iter().any(|ext| host.has_record(name, ext));
-    let exited = host.has_record(name, "exited");
-    old && host.holder_gone(name) && !host.suspended(name).is_ok_and(|d| d.exists()) && !logs && !exited
+    let r = crate::host::Records::read(host, name);
+    old && r.holder_gone() && r.checkpoint.is_none() && !r.logs && !r.exited
 }
 
 #[cfg(test)]
