@@ -4,6 +4,7 @@
 //! target directory is reached one component at a time from directory fds, never through a symlink.
 
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -168,7 +169,7 @@ pub fn create(src: &str, out: &mut dyn Write) -> io::Result<()> {
         return Err(with(src, io::Error::from_raw_os_error(libc::ENOTDIR)));
     }
     let dev = node.st.st_dev;
-    walk(out, node, Path::new(path), name.into_bytes(), dev)?;
+    walk(out, node, Path::new(path), name.into_bytes(), dev, &mut HashMap::new())?;
     out.write_all(&[0; BLOCK * 2])?;
     out.flush()
 }
@@ -256,7 +257,14 @@ fn names(d: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
 
 /// `dev`: the device the copy started on. A directory on another (/proc, /sys, /dev under `cp vm:/`) is
 /// archived as an empty one, as `tar --one-file-system` does.
-fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>, dev: libc::dev_t) -> io::Result<()> {
+fn walk(
+    out: &mut dyn Write,
+    node: Node,
+    path: &Path,
+    name: Vec<u8>,
+    dev: libc::dev_t,
+    links: &mut HashMap<(libc::dev_t, libc::ino_t), Vec<u8>>,
+) -> io::Result<()> {
     let header = |st: &libc::stat, path: Vec<u8>| Header {
         path,
         mode: st.st_mode,
@@ -266,6 +274,18 @@ fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>, dev: libc::
         ..Default::default()
     };
     hook(Step::Typed, path);
+    if node.st.st_nlink > 1 && !matches!(node.kind(), libc::S_IFDIR | libc::S_IFSOCK) {
+        match links.entry((node.st.st_dev, node.st.st_ino)) {
+            Entry::Occupied(first) => {
+                let mut h = header(&node.st, name);
+                (h.kind, h.link) = (b'1', first.get().clone());
+                return write_header(out, &h);
+            }
+            Entry::Vacant(first) => {
+                first.insert(name.clone());
+            }
+        }
+    }
     match node.kind() {
         libc::S_IFDIR => {
             let (d, st) = node.read().map_err(|e| with(path.display(), e))?;
@@ -284,7 +304,7 @@ fn walk(out: &mut dyn Write, node: Node, path: &Path, name: Vec<u8>, dev: libc::
                     Err(err) if err.raw_os_error() == Some(libc::ENOENT) => continue,
                     r => r.map_err(|err| with(p.display(), err))?,
                 };
-                walk(out, child, &p, [&h.path[..], b"/", &e].concat(), dev)?;
+                walk(out, child, &p, [&h.path[..], b"/", &e].concat(), dev, links)?;
             }
             Ok(())
         }
@@ -1048,6 +1068,56 @@ mod tests {
         assert!(std::fs::symlink_metadata(t.0.join("dst/tolink")).unwrap().file_type().is_symlink());
         unpack_to(&tar_of(&format!("{}/", t.s("tolink"))), Dest::Cp(&t.s("followed"))).unwrap();
         assert_eq!(std::fs::read(t.0.join("followed/a/b/c.txt")).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    fn hard_links_are_archived_once_and_round_trip() {
+        for kind in [b'0', b'2', b'6'] {
+            let t = Tmp::new("hard-links");
+            std::fs::create_dir_all(t.s("src/z")).unwrap();
+            let first = format!("a{}", "x".repeat(100));
+            let path = t.0.join("src").join(&first);
+            match kind {
+                b'0' => std::fs::write(&path, b"hello\n").unwrap(),
+                b'2' => symlink("missing", &path).unwrap(),
+                _ => assert_eq!(unsafe { libc::mkfifo(cstr(path.as_os_str().as_bytes()).unwrap().as_ptr(), 0o640) }, 0),
+            }
+            for name in ["b", "c"] {
+                std::fs::hard_link(&path, t.0.join("src/z").join(name)).unwrap();
+            }
+            for suffix in ["", "/."] {
+                let src = format!("{}{suffix}", t.s("src"));
+                let tar = tar_of(&src);
+                let mut r = &tar[..];
+                let mut rd = Reader { r: &mut r, left: 0 };
+                let mut entries = Vec::new();
+                while let Some(h) = rd.next().unwrap() {
+                    if h.kind != b'5' {
+                        entries.push(h);
+                    }
+                }
+                assert_eq!(entries.len(), 3);
+                let top = if suffix.is_empty() { "src" } else { "." };
+                assert_eq!(entries[0].path, format!("{top}/{first}").as_bytes());
+                assert_eq!(entries[0].kind, kind);
+                assert_eq!(entries[0].size, if kind == b'0' { 6 } else { 0 });
+                for h in &entries[1..] {
+                    assert_eq!(h.kind, b'1');
+                    assert_eq!(h.size, 0);
+                    assert_eq!(h.link, entries[0].path);
+                }
+                let dst = t.s(if suffix.is_empty() { "named" } else { "contents" });
+                unpack_to(&tar, Dest::Guest(&dst, &top_of(&src).unwrap())).unwrap();
+                let original = std::fs::symlink_metadata(Path::new(&dst).join(&first)).unwrap();
+                for name in ["z/b", "z/c"] {
+                    let linked = std::fs::symlink_metadata(Path::new(&dst).join(name)).unwrap();
+                    assert_eq!((linked.dev(), linked.ino()), (original.dev(), original.ino()));
+                }
+                if kind == b'0' {
+                    assert_eq!(std::fs::read(Path::new(&dst).join("z/b")).unwrap(), b"hello\n");
+                }
+            }
+        }
     }
 
     /// Archives `src` with `swap` run once, at `step` of the entry at `at`; returns the archive's entries' names and data.
