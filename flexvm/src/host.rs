@@ -553,6 +553,67 @@ impl Records {
     }
 }
 
+/// A name held to decide whose its records are (`rm`, `kill`, `rename`), with what is recorded
+/// under it read holding it: taking it removed any debris, so a checkpoint is a stopped VM's (and
+/// its `holder` is the taker). Dropped, the name is let go as found, a dead holder's record
+/// (`NameLock::prior`) put back (#1185), unless `take` or `revoke` consumed it.
+pub struct HeldName {
+    lock: NameLock,
+    pub records: Records,
+}
+
+/// `HeldName::verdict`. Unknown: nothing shows whose the records are. Nothing: none of any VM's are left.
+#[derive(Debug, PartialEq)]
+pub enum Verdict {
+    Mine,
+    Theirs,
+    Unknown,
+    Nothing,
+}
+
+impl HeldName {
+    pub fn new(mut lock: NameLock) -> HeldName {
+        lock.to_prior = true;
+        let records = Records::read(&lock.host, &lock.name);
+        HeldName { lock, records }
+    }
+
+    /// Whether what is under the name is what `ident` left. A stopped VM: who suspended it, as its
+    /// checkpoint says. Its other records: a holder that died holding the name (the newest one to
+    /// hold it) is theirs; else its exit record's instance is (a rename into the name, or another
+    /// VM's end under it, replaces that record; a sweep, or taking the name, removes one a later
+    /// holder's death made stale).
+    pub fn verdict(&self, ident: &Ident) -> Verdict {
+        let (r, l, of) = (&self.records, &self.lock, |same| if same { Verdict::Mine } else { Verdict::Theirs });
+        if let Some(Checkpoint::Resumable { owner: Some(owner) }) = &r.checkpoint {
+            return of(owner == ident);
+        }
+        if let Some(prior) = &l.prior {
+            return of(prior == ident);
+        }
+        match crate::containers::exit_record(&l.host, &l.name) {
+            Some(e) => of(e.ident == *ident),
+            // Its log alone, as before `Records` (never its logs' directory or `log.1`).
+            None if !r.stopped() && !r.ended() && !l.host.has_record(&l.name, "log") => Verdict::Nothing,
+            None => Verdict::Unknown,
+        }
+    }
+
+    /// What is under the name is the taker's: let go as an ordinary holder's.
+    pub fn take(self) -> NameLock {
+        let mut lock = self.lock;
+        lock.to_prior = false;
+        lock
+    }
+
+    /// `take`, discarding the stopped VM under the name (`lifecycle::revoke`).
+    pub fn revoke(self) -> Result<NameLock> {
+        let lock = self.take();
+        crate::lifecycle::revoke(&lock.host, &lock.name)??;
+        Ok(lock)
+    }
+}
+
 fn holder_gone(holder: &Result<Option<Ident>>) -> bool {
     match holder {
         Ok(None) => true,
@@ -1031,7 +1092,7 @@ impl Host {
         }
         f.set_len(0)?;
         f.write_all_at(&serde_json::to_vec(&Ident::me())?, 0)?;
-        Ok(NameLock { name: name.into(), prior, keep_lock: false, host: self.clone(), _file: f })
+        Ok(NameLock { name: name.into(), prior, to_prior: false, host: self.clone(), _file: f })
     }
 
     /// `start` of an exited VM: its name, and its record's path, which the rerun reads under it
@@ -3337,26 +3398,13 @@ pub struct NameLock {
     /// Who held the name last, and died holding it (its lock's record left behind): nothing took
     /// the name since.
     pub prior: Option<Ident>,
-    /// Let go with the dead holder's record left in place (`release_to_prior`).
-    keep_lock: bool,
+    /// Let go as found (`HeldName`): a dead holder's record (`prior`) is put back.
+    to_prior: bool,
     host: Host,
     _file: File,
 }
 
 impl NameLock {
-    /// Lets the name go as it was found: a dead holder's record (`prior`) is put back, so what
-    /// shows the records under the name are not its own (`flexvm wait`, a later `rm -f`) survives
-    /// a taker that decided to leave them. Without a prior, an ordinary release.
-    pub fn release_to_prior(mut self) {
-        if let Some(p) = &self.prior {
-            let restored = serde_json::to_vec(p).map_err(std::io::Error::other).and_then(|b| {
-                self._file.set_len(0)?;
-                self._file.write_all_at(&b, 0)
-            });
-            self.keep_lock = restored.is_ok();
-        }
-    }
-
     /// Explicit removal clears both rotations before the name can be reused. A detached run's parent
     /// opens its log before the child takes the name, so clearing at the child's start is too late.
     pub fn remove_logs(&self) -> Result<()> {
@@ -3382,8 +3430,12 @@ impl NameLock {
 
 impl Drop for NameLock {
     fn drop(&mut self) {
+        // Let go as found: a dead holder's record put back, so what shows the records under the name
+        // are not its own (`flexvm wait`, a later `rm -f`) survives a taker that decided to leave them.
+        let back = self.prior.as_ref().filter(|_| self.to_prior).and_then(|p| serde_json::to_vec(p).ok());
+        let keep_lock = back.is_some_and(|b| self._file.set_len(0).and_then(|()| self._file.write_all_at(&b, 0)).is_ok());
         // Unlinked while held: a taker re-checks the path after locking.
-        let exts: &[&str] = if self.keep_lock { &["json", "sock"] } else { &["json", "sock", "lock"] };
+        let exts: &[&str] = if keep_lock { &["json", "sock"] } else { &["json", "sock", "lock"] };
         for ext in exts {
             // Checked when taken.
             if let Ok(path) = self.host.vms(&self.name, ext) {
