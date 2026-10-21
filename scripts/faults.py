@@ -416,6 +416,21 @@ def name_free(host, name, timeout=10):
     return wait_for(lambda: name not in vms(host) and not os.path.exists(lock), timeout)
 
 
+def name_locked(host, name):
+    """Whether a process holds `name` on `host` (its lock), as `Host::alive` tells."""
+    try:
+        f = open(os.path.join(host.run, "vms", ".locks", f"{name}.lock"))
+    except FileNotFoundError:
+        return False
+    with f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+
+
 def wait_released(target, name, source=None, timeout=120):
     """Waits until the source's copy of `name` is gone (its process exits once
     the target has every page, or its VM is gone) and the target's pull ended;
@@ -9585,6 +9600,65 @@ def migrated_hint():
             check(f"migrated hint: {argv[0]} says it moved to B", code != 0 and f"moved to {B.addr}" in err, (code, out, err))
             check(f"migrated hint: {argv[0]} leaves the moved record", os.path.exists(moved))
     check("migrated hint: still runs on B", where(n) == {B: "running"}, where(n))
+    # #1173: `start` says it too, before anything takes the name (which clears the hint).
+    for argv in (("start", n), ("start", "-a", n)):
+        code, out, err = cli(A, *argv)
+        check(f"migrated hint: {' '.join(argv[:-1])} says it moved to B", code != 0 and f"moved to {B.addr}" in err, (code, out, err))
+        check(f"migrated hint: {' '.join(argv[:-1])} leaves the moved record", os.path.exists(moved))
+    # #1173: a migration back that fails at its commit leaves the hint (and the VM on B).
+    clear_gate(A, "commit_fail")
+    with armed_fault(A, "commit_fail", 60000):
+        r = migrate(B, n, A)
+    check("migrated hint: the migration back fails", not r.get("ok") and "committing failed" in r.get("error", ""), r)
+    check("migrated hint: A has it still", wait_for(lambda: os.path.exists(moved), 15))
+    name_free(A, n)
+    code, out, err = cli(A, "kill", n)
+    check("migrated hint: kill says it moved to B after the failed migration back", code != 0 and f"moved to {B.addr}" in err, (code, out, err))
+    check("migrated hint: runs on B after the failed migration back", where(n) == {B: "running"}, where(n))
+    # One back that commits clears it: the VM runs on A.
+    ok(migrate(B, n, A))
+    assert_released(A, n, source=B)
+    check("migrated hint: the migration back clears the moved record", not os.path.exists(moved) and where(n) == {A: "running"}, where(n))
+
+
+def kill_held_stopped():
+    """#1173: `kill` of a stopped VM while something else holds its name (a start whose resume
+    then fails) never discards its checkpoint: refused while the name is held ("is starting"),
+    and, once let go of meanwhile, refused as not running (kill is for a running VM). The VM
+    then starts again, intact."""
+    n = "ft-kill-held"
+    m = setup(n, mib=1)
+    code, out, err = cli(A, "stop", n)
+    check("kill held: stopped", code == 0 and vms(A).get(n, {}).get("state") == "suspended", (code, err, vms(A).get(n)))
+    for g in ("resume_unmarked_gate", "kill_gate", "resume_fence_fail"):
+        clear_gate(A, g)
+    killer = None
+    fault(A, "resume_fence_fail", 600000)
+    fault(A, "resume_unmarked_gate", 600000)
+    try:
+        starter = spawn_cli(A, "start", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("kill held: a start holds the name, its resume held", wait_for(lambda: reached(A, "resume_unmarked_gate"), 60), reached(A, "resume_unmarked_gate"))
+        code, out, err = cli(A, "kill", n)
+        check("kill held: kill is refused while it is held", code != 0 and "is starting" in err, (code, out, err))
+        # A kill that saw the name held, and signalled nothing, decides only after the start let it go.
+        fault(A, "kill_gate", 600000)
+        killer = spawn_cli(A, "kill", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("kill held: the kill saw the name held", wait_for(lambda: reached(A, "kill_gate"), 30), reached(A, "kill_gate"))
+        release(A, "resume_unmarked_gate")
+        out, err = communicate_process(starter, 120)
+        check("kill held: the start fails (refused at its fence)", starter.returncode != 0, (starter.returncode, err[-300:]))
+        check("kill held: the name is let go of", wait_for(lambda: not name_locked(A, n), 30))
+    finally:
+        fault(A, "resume_fence_fail", 0)
+        release(A, "resume_unmarked_gate")
+        release(A, "kill_gate")
+    if killer:
+        out, err = communicate_process(killer, 60)
+        check("kill held: then refused, not running", killer.returncode != 0 and "is not running" in err, (killer.returncode, out, err))
+    check("kill held: still stopped, its checkpoint kept", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+    code, out, err = cli(A, "start", n)
+    check("kill held: starts again", code == 0 and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), (code, err, vms(A).get(n)))
+    check("kill held: md5 intact", md5(A, n, tries=3) == m)
 
 
 def unread_output():
@@ -11637,7 +11711,7 @@ def isolate(scenario):
 SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
-    run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint,
+    run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint, kill_held_stopped=kill_held_stopped,
     terminal=terminal,
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,

@@ -835,29 +835,52 @@ impl Host {
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
-        self.take_name_as(name, resuming, false, handed(), false)
+        self.take_name_as(name, resuming, false, handed(), false, false)
     }
 
     /// `take_name` of a new name by the VM process a `run` handed its logs to with `token`
     /// (`own_logs`): a claimed standby, told in the claim.
     pub fn take_handed_name(&self, name: &str, token: Option<&str>) -> Result<NameLock> {
-        self.take_name_as(name, false, false, token, false)
+        self.take_name_as(name, false, false, token, false, false)
     }
 
     /// `take_name` of a new name for a VM (`rename`): a `failed` or `lost` record of it is
     /// refused, decided holding the name, never cleared.
     pub fn take_unrecorded_name(&self, name: &str) -> Result<NameLock> {
-        self.take_name_as(name, false, true, handed(), false)
+        self.take_name_as(name, false, true, handed(), false, false)
     }
 
     /// `take_name` of a new name for a restore: `own`, of the checkpoint's own name, it is that
     /// VM going on, so it keeps the name's logs as `start` does (a failed, lost or moved VM's
     /// still go); under another name (a fork), a fresh log.
     pub fn take_restoring_name(&self, name: &str, own: bool) -> Result<NameLock> {
-        self.take_name_as(name, false, false, handed(), own)
+        self.take_name_as(name, false, false, handed(), own, false)
     }
 
-    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool, handed: Option<&str>, keep_logs: bool) -> Result<NameLock> {
+    /// `take_name` of a new name for a VM migrating in: a VM of it that moved away leaves its hint
+    /// (`NAME.moved`, where it went) and its logs until the arrival commits (`arrived`), so an
+    /// arrival that fails leaves them as they were.
+    pub fn take_arriving_name(&self, name: &str) -> Result<NameLock> {
+        self.take_name_as(name, false, false, handed(), false, true)
+    }
+
+    /// An arrival under `name` (held) committed: the hint of a VM that moved away goes, as do
+    /// the logs that are not this one's (`take_name` retires them for any other new VM).
+    pub fn arrived(&self, name: &str) -> Result<()> {
+        // The hint goes whatever becomes of the logs: the VM runs here now.
+        let moved = self.has_record(name, "moved");
+        let unhinted = match std::fs::remove_file(self.vms(name, "moved")?) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("removing its moved record: {e}").into()),
+            _ => Ok(()),
+        };
+        let retired = self.logs_lock(libc::LOCK_SH).and_then(|_logs| match moved || self.earlier_logs(name, handed())? {
+            true => self.retire_logs(name).map_err(|e| format!("retiring the earlier logs: {e}").into()),
+            false => Ok(()),
+        });
+        unhinted.and(retired)
+    }
+
+    fn take_name_as(&self, name: &str, resuming: bool, refuse_records: bool, handed: Option<&str>, keep_logs: bool, arriving: bool) -> Result<NameLock> {
         if !resuming {
             check_new_name(name)?;
         }
@@ -909,14 +932,19 @@ impl Host {
         // Kept: this process's own, one a `run` handed to it (its token: whether or not that `run`
         // is still there), and one a live `run` opened to hand to another (`own_logs`). A resume (`start`), or a restore under the checkpoint's own name, keeps its VM's.
         let _logs = self.logs_lock(libc::LOCK_SH)?;
-        if !resuming && (["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) || !keep_logs && self.earlier_logs(name, handed)?) {
+        if !resuming
+            && !arriving
+            && (["failed", "lost", "moved"].iter().any(|ext| self.has_record(name, ext)) || !keep_logs && self.earlier_logs(name, handed)?)
+        {
             let _ = self.retire_logs(name);
         }
         // A resume clears them only for a VM it can go on with (stopped or exited): one refused
-        // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log.
-        let records: &[&str] = match !resuming || suspended.exists() || self.has_record(name, "exited") {
-            true => &["json", "sock", "moved", "failed", "lost"],
-            false => &["json", "sock", "moved"],
+        // for want of a checkpoint leaves them, so the name's next `run` still starts a fresh log,
+        // and a VM that moved away keeps its hint (where it went).
+        let records: &[&str] = match (arriving, !resuming || suspended.exists() || self.has_record(name, "exited")) {
+            (true, _) => &["json", "sock", "failed", "lost"],
+            (false, true) => &["json", "sock", "moved", "failed", "lost"],
+            (false, false) => &["json", "sock"],
         };
         for ext in records {
             let _ = std::fs::remove_file(self.vms(name, ext)?);
@@ -6672,6 +6700,29 @@ pub(crate) mod tests {
         let _name = h.take_name("web", true).unwrap();
         assert!(!h.has_record("web", "failed"));
         assert_eq!(std::fs::read_to_string(h.vms("web", "log").unwrap()).unwrap(), "resume");
+    }
+
+    #[test]
+    fn a_moved_hint_stays_until_an_arrival_commits_or_a_new_vm_takes_the_name() {
+        let (_dir, h) = host("moved-hint");
+        std::fs::write(h.vms("web", "moved").unwrap(), "b:7070").unwrap();
+        h.write_log("web", "log", "before it moved");
+        // A resume with nothing to resume (`start -a` of a VM that moved away) leaves it.
+        drop(h.take_name("web", true).unwrap());
+        assert!(h.has_record("web", "moved") && h.has_record("web", "log"));
+        // An arrival leaves it, and the logs, until it commits (one that aborts leaves them as they were).
+        drop(h.take_arriving_name("web").unwrap());
+        assert!(h.has_record("web", "moved") && h.has_record("web", "log"));
+        let lock = h.take_arriving_name("web").unwrap();
+        h.arrived("web").unwrap();
+        assert!(!h.has_record("web", "moved") && !h.has_record("web", "log"));
+        drop(lock);
+        // Logs that cannot be retired never keep the hint of a VM that runs here now.
+        std::fs::write(h.vms("web", "moved").unwrap(), "b:7070").unwrap();
+        std::fs::create_dir_all(h.vms("web", "log.1").unwrap()).unwrap();
+        let _lock = h.take_arriving_name("web").unwrap();
+        assert!(h.arrived("web").is_err());
+        assert!(!h.has_record("web", "moved"));
     }
 
     #[test]

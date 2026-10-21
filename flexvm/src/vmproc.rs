@@ -1355,6 +1355,9 @@ impl Proc {
             cpus: vm.resources().cpus,
             state: match vm.state() {
                 State::Source(mig) if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) => "reconciling",
+                // A source ignores SIGTERM: one taken as its migration prepared (its suspend
+                // reserved) waits for the migration, which `rm -f` and routing go by meanwhile.
+                state @ State::Source(_) => state.name(),
                 // SIGCONT does nothing then: `flexvm unpause` waits for the suspend instead.
                 _ if *self.suspending.lock().unwrap() == Suspend::Suspending => "suspending",
                 state => state.name(),
@@ -1402,7 +1405,7 @@ impl Proc {
         }
         // Before the name goes: `flexvm wait` reads it as this instance's.
         if let Some(n) = self.name.lock().unwrap().as_ref() {
-            crate::containers::record_exit(&self.host, &n.name, &self.ident, code);
+            crate::containers::record_exit(&self.host, &n.name, &self.ident, code, exited);
         }
         drop(self.name.lock().unwrap().take());
         for f in self.files.lock().unwrap().drain(..) {
@@ -3860,7 +3863,7 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant, c
         } else if host.is_suspended(name) {
             format!("vm {name:?} is stopped; flexvm start {name} first")
         } else {
-            format!("no vm named {name:?}")
+            crate::no_vm(host, name).to_string()
         }
     };
     let c = crate::util::By { s: (), at }.left().and_then(|left| crate::util::connect_unix(&sock, left)).map_err(unavailable)?;

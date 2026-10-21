@@ -24,11 +24,15 @@ pub struct Exit {
     #[serde(flatten)]
     pub ident: Ident,
     pub code: i32,
+    /// Whether `code` is its app's (or command's) own status, not one flexvm gave it (a kill, a
+    /// stop, a death): unknown in a record from before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<bool>,
 }
 
-pub fn record_exit(host: &Host, name: &str, ident: &Ident, code: i32) {
+pub fn record_exit(host: &Host, name: &str, ident: &Ident, code: i32, app: bool) {
     if let Ok(path) = host.vms(name, "exit") {
-        if let Err(e) = host::store(&path, &Exit { ident: ident.clone(), code }, false) {
+        if let Err(e) = host::store(&path, &Exit { ident: ident.clone(), code, app: Some(app) }, false) {
             crate::log!("vm {name}: recording its exit status: {e}");
         }
     }
@@ -117,7 +121,7 @@ fn ended(host: &Host, name: &str) -> Result<i32> {
         // Its command or app exited (`app::Exited`), its own record gone (a sweep's).
         _ if crashed.is_none() && has("exited") => Ok(crate::app::Exited::read(&host.vms(name, "exited")?)?.status),
         _ if has("failed") || has("lost") => Ok(crate::vmproc::DIED),
-        _ => bail!("no vm named {name:?}"),
+        _ => Err(crate::no_vm(host, name)),
     }
 }
 
@@ -446,7 +450,7 @@ fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce
     if !host.is_suspended(from) {
         return Err(match ["failed", "lost"].iter().find(|ext| host.has_record(from, ext)) {
             Some(ext) => format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed").into(),
-            None => format!("no vm named {from:?}").into(),
+            None => crate::no_vm(host, from),
         });
     }
     let _from = take_rename_name(host, from)?;
@@ -1384,7 +1388,7 @@ mod tests {
         let (_d, host) = host("wait");
         assert!(wait(&host, "nobody").unwrap_err().to_string().contains("no vm named"));
         let gone = Ident { pid: 1, start: 1, boot: "another boot".into(), ns: None };
-        record_exit(&host, "web", &gone, 3);
+        record_exit(&host, "web", &gone, 3, false);
         assert_eq!(wait(&host, "web").unwrap(), 3, "its record");
         std::fs::write(host.vms("db", "failed").unwrap(), "died").unwrap();
         assert_eq!(wait(&host, "db").unwrap(), crate::vmproc::DIED);
@@ -1409,7 +1413,7 @@ mod tests {
         let mut child = sleeper(60);
         let id = Ident::of(child.id()).unwrap();
         std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&id).unwrap()).unwrap();
-        record_exit(&host, "job", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, 1);
+        record_exit(&host, "job", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, 1, false);
         let h = host.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
@@ -1422,7 +1426,7 @@ mod tests {
             assert!(!waiter.is_finished(), "an earlier instance's record is not this one's");
             asleep(tid)
         });
-        record_exit(&host, "job", &id, 5);
+        record_exit(&host, "job", &id, 5, false);
         assert!(!waiter.is_finished(), "it must wait for the holder's process even with its exit record present");
         child.kill().unwrap();
         child.wait().unwrap();
@@ -1436,7 +1440,7 @@ mod tests {
         let _lock = host.take_name("job", false).unwrap();
         let id = Ident { pid: 1, start: 1, boot: "another boot".into(), ns: None };
         std::fs::write(host.vms("job", "lock").unwrap(), serde_json::to_vec(&id).unwrap()).unwrap();
-        record_exit(&host, "job-new", &id, 143);
+        record_exit(&host, "job-new", &id, 143, false);
         assert_eq!(wait(&host, "job").unwrap(), 143);
     }
 
@@ -1470,7 +1474,7 @@ mod tests {
         let (mut again, id) = spawn();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         let waiting = waiter();
-        record_exit(&host, "job", &later_id, 0);
+        record_exit(&host, "job", &later_id, 0, false);
         again.kill().unwrap();
         again.wait().unwrap();
         let e = waiting.join().unwrap().unwrap_err().to_string();
@@ -1479,7 +1483,7 @@ mod tests {
         let (mut renamed, id) = spawn();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         let waiting = waiter();
-        record_exit(&host, "job-new", &id, 143);
+        record_exit(&host, "job-new", &id, 143, false);
         renamed.kill().unwrap();
         renamed.wait().unwrap();
         assert_eq!(waiting.join().unwrap().unwrap(), 143);
@@ -1586,7 +1590,7 @@ mod tests {
         suspended_vm(&host, "old", "10.0.0.9");
         host.write_log("old", "log", "hello\n");
         host.write_log("new", "log.1", "an earlier vm's\n");
-        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, STOPPED);
+        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, STOPPED, false);
         std::fs::write(host.vms("taken", "failed").unwrap(), "died").unwrap();
         assert!(rename_stopped(&host, "old", "taken").unwrap_err().to_string().contains("taken"));
         rename_stopped(&host, "old", "new").unwrap();
@@ -1607,7 +1611,7 @@ mod tests {
     fn a_stopped_vm_whose_logs_cannot_move_is_not_renamed_at_all() {
         let (_d, host) = host("rename-logs-fail");
         suspended_vm(&host, "old", "10.0.0.9");
-        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, STOPPED);
+        record_exit(&host, "old", &Ident { pid: 1, start: 1, boot: "b".into(), ns: None }, STOPPED, false);
         std::fs::create_dir(host.vms("old", "log").unwrap()).unwrap();
         assert!(rename_stopped(&host, "old", "new").unwrap_err().to_string().contains("not a link"));
         assert!(host.is_suspended("old") && !host.suspended("new").unwrap().exists());
