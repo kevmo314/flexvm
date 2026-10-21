@@ -2177,14 +2177,21 @@ mod tests {
 
     #[test]
     fn a_burst_of_datagrams_reaches_the_guest_and_back() {
+        // Nothing here may drop a datagram, so nothing is lost but to a bug. A whole burst can queue
+        // in one socket (the listener, or the guest before it reads): at about 1 KiB of kernel
+        // memory each, 64 fit three times over in the default 208 KiB receive buffer, where 200
+        // nearly filled it. And 127.0.0.2, not 127.0.0.1: WSL's mirrored networking routes UDP to
+        // 127.0.0.1 out through the Windows host, which drops some of a burst under load and counts
+        // none of it. Only the guest's replies to the forwarder's sessions still go that way.
         retry_ports(|| {
-            const N: usize = 200;
-            let guest = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            const N: usize = 64;
+            let ip = Ipv4Addr::new(127, 0, 0, 2);
+            let guest = UdpSocket::bind((ip, 0)).unwrap();
             guest.set_read_timeout(Some(WAIT)).unwrap();
-            let host_port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
-            let p = mapping(host_port, guest.local_addr().unwrap().port(), Protocol::Udp);
-            let _f = Forwarder::start(std::slice::from_ref(&p), Ipv4Addr::LOCALHOST)?;
-            let clients: Vec<_> = (0..4).map(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()).collect();
+            let host_port = UdpSocket::bind((ip, 0)).unwrap().local_addr().unwrap().port();
+            let p = Port { ip: Some(ip.into()), ..mapping(host_port, guest.local_addr().unwrap().port(), Protocol::Udp) };
+            let _f = Forwarder::start(std::slice::from_ref(&p), ip)?;
+            let clients: Vec<_> = (0..4).map(|_| UdpSocket::bind((ip, 0)).unwrap()).collect();
             for c in &clients {
                 c.set_read_timeout(Some(WAIT)).unwrap();
             }
