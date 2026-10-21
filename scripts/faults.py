@@ -9825,6 +9825,48 @@ def rm_later_exit():
     check("rm later exit: wait gives the later vm's exit status", code == 0 and out.strip() == "7", (code, out, err))
 
 
+def rm_crashed_replacement():
+    """#1185: two delayed `rm -f`s (held at `kill_gate` after their signals) of a VM that ends, a new
+    VM of the name then running and dying unrecorded (SIGKILL: the first VM's exit record stale). The
+    first removal rejects the new VM's records, and leaves the proof of that: `flexvm wait` never
+    gives the first VM's status as the new one's, and the second removal never takes its logs."""
+    n = "ft-rm-crashed-repl"
+    ok(run(A, n))
+    clear_gate(A, "kill_gate")
+    first = second = None
+    fault(A, "kill_gate", 600000)
+    try:
+        first = spawn_cli(A, "rm", "-f", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        second = spawn_cli(A, "rm", "-f", n, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("rm crashed replacement: both rms signalled, then held",
+              wait_for(lambda: {first.pid, second.pid} <= set(reached(A, "kill_gate")), 30), reached(A, "kill_gate"))
+        # The second goes on only after the first is done.
+        os.kill(second.pid, signal.SIGSTOP)
+        check("rm crashed replacement: the killed vm is gone", name_free(A, n, 30), vms(A).get(n))
+        ok(run(A, n))
+        pid = vm_pid(A, n)
+        os.kill(pid, signal.SIGKILL)
+        check("rm crashed replacement: the later vm died", wait_for(lambda: not os.path.exists(f"/proc/{pid}"), 30))
+        release(A, "kill_gate")
+        out, err = communicate_process(first, 60)
+        check("rm crashed replacement: the first rm succeeds", first.returncode == 0 and out.strip() == n, (first.returncode, out, err))
+        code, out, err = cli(A, "wait", n)
+        check("rm crashed replacement: wait never gives the first vm's status", code != 0 and "without an exit status" in err, (code, out, err))
+    finally:
+        release(A, "kill_gate")
+        if second:
+            os.kill(second.pid, signal.SIGCONT)
+    if second:
+        out, err = communicate_process(second, 60)
+        check("rm crashed replacement: the second rm succeeds", second.returncode == 0 and out.strip() == n, (second.returncode, out, err))
+    check("rm crashed replacement: the later vm's log is kept", os.path.lexists(os.path.join(A.run, "vms", f"{n}.log")))
+    code, out, err = cli(A, "wait", n)
+    check("rm crashed replacement: wait still never gives the first vm's status", code != 0 and "without an exit status" in err, (code, out, err))
+    # Its tap, route and name are a sweep's to collect (SIGKILLed): the one that would come, now.
+    code, out, err = cli(A, "debug", "gc")
+    check("rm crashed replacement: swept", code == 0 and wait_for(lambda: not name_locked(A, n), 30), (code, err))
+
+
 def pause_renamed():
     """#1183: a rename that holds the VM's op (its checks passed) as `pause`'s SIGTSTP lands moves
     the VM on before the pause runs: pause follows the instance it signalled under its new name, and
@@ -11905,7 +11947,7 @@ SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
     run_status=run_status, concurrent_start=concurrent_start, kill_rerun_race=kill_rerun_race, stop_self_exit=stop_self_exit, migrated_hint=migrated_hint, kill_held_stopped=kill_held_stopped,
-    stop_renamed=stop_renamed, kill_renamed_into=kill_renamed_into, pause_renamed=pause_renamed, kill_crashed_owner=kill_crashed_owner, rm_later_exit=rm_later_exit,
+    stop_renamed=stop_renamed, kill_renamed_into=kill_renamed_into, pause_renamed=pause_renamed, kill_crashed_owner=kill_crashed_owner, rm_later_exit=rm_later_exit, rm_crashed_replacement=rm_crashed_replacement,
     terminal=terminal,
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,

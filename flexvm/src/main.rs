@@ -1662,7 +1662,7 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
 /// when nothing shows whose it is. A stopped VM (`checkpoint`): who suspended it, as its checkpoint
 /// says. Its other records: a holder that died holding the name (the newest one to hold it) is
 /// theirs; else its exit record's instance is (a rename into the name, or another VM's end under
-/// it, replaces that record; a sweep removes one a later holder's death made stale).
+/// it, replaces that record; a sweep, or taking the name, removes one a later holder's death made stale).
 fn owns(host: &Host, lock: &host::NameLock, ident: &host::Ident, checkpoint: bool) -> Option<bool> {
     if checkpoint {
         if let Some(owner) = host.suspended(&lock.name).ok().and_then(|d| lifecycle::read_owner(&d)) {
@@ -1704,7 +1704,11 @@ fn remove_stopped(host: &Host, name: &str, had: bool, logs: bool, of: Option<&ho
         let checkpoint = host.suspended(name)?.exists();
         match owns(host, &lock, id, checkpoint) {
             Some(true) => {}
-            Some(false) => return Ok(()),
+            // Another instance's: left as found, its dead holder's record too (#1185).
+            Some(false) => {
+                lock.release_to_prior();
+                return Ok(());
+            }
             // Nothing left of any VM under the name: nothing to remove.
             None if !checkpoint && !["exited", "failed", "lost", "log"].iter().any(|ext| host.has_record(name, ext)) => return Ok(()),
             None => return Err(unconfirmed(name, name)),
@@ -3136,8 +3140,9 @@ mod exec_tests {
         let lock = take(Some(&b));
         assert_eq!(owns(&host, &lock, &a, true), Some(false));
         drop(lock);
-        // A suspended, then died before recording its exit; a sweep took its lock (and the stale record).
-        std::fs::remove_file(host.vms("web", "exit").unwrap()).unwrap();
+        // A suspended, then died before recording its exit; a sweep took its lock (and the stale
+        // record, as taking B's did: #1185).
+        assert!(containers::exit_record(&host, "web").is_none(), "taking a dead holder's name drops an earlier instance's exit status");
         checkpoint(Some(&a));
         let lock = take(None);
         assert_eq!(owns(&host, &lock, &a, true), Some(true), "its checkpoint says it suspended it");
@@ -3160,6 +3165,36 @@ mod exec_tests {
         assert_eq!(containers::exit_record(&host, "web").map(|e| e.ident), Some(b.clone()), "a later vm's exit status is kept");
         remove_stopped(&host, "web", true, true, Some(&b)).unwrap();
         assert!(containers::exit_record(&host, "web").is_none());
+    }
+
+    /// #1185: a delayed `rm -f` signalled A; B took the name and crashed holding it, unrecorded. The
+    /// removal rejects B's records, and letting the name go leaves the proof of that: `wait` never
+    /// gives A's status as B's, and a second delayed removal of A never takes B's logs for A's.
+    #[test]
+    fn a_rejected_delayed_rm_leaves_a_crashed_replacements_records_its_own() {
+        let root = crate::test_util::TempDir::new("rm-rejects");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let (a, b) = (dead_ident(), dead_ident());
+        containers::record_exit(&host, "web", &a, 130, false);
+        std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&b).unwrap()).unwrap();
+        std::fs::write(host.vms("web", "log").unwrap(), "b's log").unwrap();
+        for _ in 0..2 {
+            remove_stopped(&host, "web", true, true, Some(&a)).unwrap();
+            assert_eq!(std::fs::read_to_string(host.vms("web", "log").unwrap()).unwrap(), "b's log", "b's logs are kept");
+            assert_eq!(host.name_holder("web").unwrap(), Some(b.clone()), "b's death is still on record");
+            let e = containers::wait(&host, "web").unwrap_err().to_string();
+            assert!(e.contains("without an exit status"), "never a's status: {e}");
+        }
+        // Even with the dead holder's record gone after all (a sweep), the stale exit is too.
+        std::fs::remove_file(host.vms("web", "lock").unwrap()).unwrap();
+        assert!(containers::exit_record(&host, "web").is_none());
+        let e = remove_stopped(&host, "web", true, true, Some(&a)).unwrap_err().to_string();
+        assert!(e.contains("could not confirm"), "{e}");
+        assert!(host.has_record("web", "log"));
+        // B's own removal takes them.
+        std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&b).unwrap()).unwrap();
+        remove_stopped(&host, "web", true, true, Some(&b)).unwrap();
+        assert!(!host.has_record("web", "log"));
     }
 
     #[test]

@@ -910,6 +910,13 @@ impl Host {
         let prior = serde_json::from_slice::<Ident>(&bytes).ok().filter(|o| *o != Ident::me());
         if let Some(old) = &prior {
             reap(&self.run, old)?;
+            // An exit status (`flexvm wait`) of an earlier instance: the dead holder ended without
+            // one, and taking its lock takes the proof that the record is not its own (as a sweep's
+            // `collect_owned` does), so it goes before any taker can let the name go.
+            let exit = self.vms(name, "exit")?;
+            if load::<Ident>(&exit).is_ok_and(|recorded| recorded.is_some_and(|r| r != *old)) {
+                crate::util::unlink_durably(&exit)?;
+            }
         }
         self.finish_rename(name)?;
         if refuse_records {
@@ -953,7 +960,7 @@ impl Host {
         }
         f.set_len(0)?;
         f.write_all_at(&serde_json::to_vec(&Ident::me())?, 0)?;
-        Ok(NameLock { name: name.into(), prior, host: self.clone(), _file: f })
+        Ok(NameLock { name: name.into(), prior, keep_lock: false, host: self.clone(), _file: f })
     }
 
     /// `start` of an exited VM: its name, and its record's path, which the rerun reads under it
@@ -3245,11 +3252,26 @@ pub struct NameLock {
     /// Who held the name last, and died holding it (its lock's record left behind): nothing took
     /// the name since.
     pub prior: Option<Ident>,
+    /// Let go with the dead holder's record left in place (`release_to_prior`).
+    keep_lock: bool,
     host: Host,
     _file: File,
 }
 
 impl NameLock {
+    /// Lets the name go as it was found: a dead holder's record (`prior`) is put back, so what
+    /// shows the records under the name are not its own (`flexvm wait`, a later `rm -f`) survives
+    /// a taker that decided to leave them. Without a prior, an ordinary release.
+    pub fn release_to_prior(mut self) {
+        if let Some(p) = &self.prior {
+            let restored = serde_json::to_vec(p).map_err(std::io::Error::other).and_then(|b| {
+                self._file.set_len(0)?;
+                self._file.write_all_at(&b, 0)
+            });
+            self.keep_lock = restored.is_ok();
+        }
+    }
+
     /// Explicit removal clears both rotations before the name can be reused. A detached run's parent
     /// opens its log before the child takes the name, so clearing at the child's start is too late.
     pub fn remove_logs(&self) -> Result<()> {
@@ -3265,7 +3287,8 @@ impl NameLock {
 impl Drop for NameLock {
     fn drop(&mut self) {
         // Unlinked while held: a taker re-checks the path after locking.
-        for ext in ["json", "sock", "lock"] {
+        let exts: &[&str] = if self.keep_lock { &["json", "sock"] } else { &["json", "sock", "lock"] };
+        for ext in exts {
             // Checked when taken.
             if let Ok(path) = self.host.vms(&self.name, ext) {
                 let _ = std::fs::remove_file(path);
