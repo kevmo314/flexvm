@@ -398,7 +398,8 @@ fn message(uds: &Path, line: &str, timeout: Duration) -> Result<String> {
 
 /// The guest's hostname and /etc/hosts entry: `name`. An agent that predates it keeps "flexvm".
 pub fn set_hostname(uds: &Path, name: &str) -> Result<()> {
-    match message(uds, &format!("HOSTNAME {name}"), TIMEOUT)?.as_str() {
+    // Named, as a timeout alone does not say which step of a resume or restore went unanswered (#1211).
+    match message(uds, &format!("HOSTNAME {name}"), TIMEOUT).map_err(|e| format!("setting its hostname: {e}"))?.as_str() {
         "ok" => Ok(()),
         m if m.starts_with("unknown request") => Ok(()),
         m => bail!("setting its hostname: {}", m.trim_start_matches("error: ")),
