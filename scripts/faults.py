@@ -7385,6 +7385,56 @@ def start_admission():
     rm_ckpt(path)
 
 
+def live_holds(host):
+    """`host`'s held admission grants (RUN/.locks/holds), as their file names: a dead owner's file stays, its lock free."""
+    d = os.path.join(host.run, ".locks", "holds")
+
+    def held(name):
+        try:
+            with open(os.path.join(d, name)) as f:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+    return sorted(f for f in (os.listdir(d) if os.path.isdir(d) else []) if not f.startswith(".") and held(f))
+
+
+def ckpt_prefetch_hold():
+    """#1159: a checkpoint that cuts a cold start's working-set prefetch short keeps the start's admission
+    hold, past its grant's window, until the prefetch it starts again finishes; one whose VM stops with the
+    checkpoint lets the hold go with the VM."""
+    for stop in (False, True):
+        n, path = f"ft-ckpt-hold{'-stop' if stop else ''}", ckpt_path(f"ft-ckpt-hold{'-stop' if stop else ''}")
+        label = "ckpt prefetch hold" + (" (stop)" if stop else "")
+        res = {}
+        try:
+            with armed_fault(A, ("prefetch_park", "ckpt_exported_gate"), 300000):
+                ok(run(A, n))
+                pid = vm_pid(A, n)
+                if not wait_for(lambda: parked(A, "prefetch_park", pid) > 0, 30):
+                    raise Skip("its template has no working set to prefetch")
+                check(f"{label}: held while it prefetches", live_holds(A), live_holds(A))
+                t = threading.Thread(target=lambda: res.update(r=checkpoint(A, n, path, stop=stop)))
+                t.start()
+                check(f"{label}: the checkpoint quiesced the pager", wait_for(lambda: parked(A, "ckpt_exported_gate", pid) > 0, 60))
+                # The prefetch goes on, sees the quiesce and stops short.
+                clear_gate(A, "prefetch_park")
+                time.sleep(11)  # past its grant's window
+                check(f"{label}: still held, its prefetch cut short", live_holds(A), live_holds(A))
+                clear_gate(A, "ckpt_exported_gate")
+                t.join()
+            check(f"{label}: checkpointed", res["r"]["ok"], res["r"])
+            check(f"{label}: the hold goes, once {'its vm stops' if stop else 'the prefetch finishes'}", wait_for(lambda: not live_holds(A), 30), live_holds(A))
+            if not stop:
+                check(f"{label}: it runs on", vms(A).get(n, {}).get("state") == "running" and sh(A, n, "true")[0] == 0, vms(A).get(n))
+        finally:
+            disarm()
+            cleanup(n)
+            rm_ckpt(path)
+
+
 class mem_available_as:
     """`host`'s admissions and eviction see `mib` MiB available (RUN/mem_available_mib,
     read with FLEXVM_FAULTS) in place of this machine's MemAvailable."""
@@ -11541,7 +11591,7 @@ SCENARIOS = dict(
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
     mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_claim_orphan=standby_claim_orphan, standby_claim_cgroupns=standby_claim_cgroupns, standby_claim_orphan_migrating=standby_claim_orphan_migrating, standby_concurrent_claims=standby_concurrent_claims, standby_claim_caps=standby_claim_caps, standby_lost_cgroup=standby_lost_cgroup, standby_claim_setup_fail=standby_claim_setup_fail, evict_latency=evict_latency,
-    start_admission=start_admission, standby_admission=standby_admission,
+    start_admission=start_admission, ckpt_prefetch_hold=ckpt_prefetch_hold, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,

@@ -1038,6 +1038,56 @@ fn export_does_not_wait_for_cold_prefetch_read() {
 }
 
 #[test]
+fn interrupted_cold_prefetch_keeps_admission_until_completed() {
+    let (_dir, pager) = prefetch_pager("prefetch-admission");
+    let pager = Arc::new(pager);
+    assert_eq!(pager.remote_left(), 0, "a cold start has no remote pages to keep its hold");
+    pager.prefetching.store(RUNNING, Ordering::SeqCst);
+    pager.quiesce_export(|| false).unwrap();
+    assert!(!pager.prefetch_pass_with(|_, _, _| panic!("quiesced")));
+    let mut ticks = 0;
+    let deadline = Instant::now() + crate::test_util::WAIT;
+    assert!(pager.wait_pulled_every(Duration::from_millis(1), |mib| {
+        assert!(Instant::now() < deadline, "prefetch never completed after unquiesce");
+        ticks += 1;
+        if ticks <= 2 {
+            assert_eq!(mib, pager.base.working_set_mib(), "keep charging the interrupted working set");
+            assert_eq!(pager.prefetching.load(Ordering::SeqCst), CUT);
+        }
+        if ticks == 2 {
+            // Faults may have supplied the pages meanwhile. Unquiesce still has to finish the interrupted pass.
+            assert_eq!(pager.pages().claim(0, 1, BASE, |_| true), 1);
+            pager.pages().install(0, 1, BASE, None, |_, n| Ok(n)).1.unwrap();
+            pager.unquiesce();
+        }
+    }));
+    assert!(ticks >= 2, "an interrupted pass must not end admission");
+    assert_eq!(pager.prefetching.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn quiesce_during_final_prefetch_install_keeps_admission() {
+    let (_dir, pager) = prefetch_pager("prefetch-final-cut");
+    pager.prefetching.store(RUNNING, Ordering::SeqCst);
+    assert!(!pager.prefetch_pass_with(|_, _, _| {
+        pager.quiesce.store(true, Ordering::SeqCst);
+        Err(io::Error::from_raw_os_error(libc::EAGAIN))
+    }));
+    assert_eq!(pager.pages().get(0), BASE);
+    assert!(pager.prefetch_cut.load(Ordering::SeqCst));
+    assert!(!pager.wait_pulled_every(Duration::from_millis(1), |_| pager.stop()));
+}
+
+#[test]
+fn interrupted_prefetch_wait_ends_when_vm_stops() {
+    let (_dir, pager) = prefetch_pager("prefetch-admission-stop");
+    pager.prefetching.store(RUNNING, Ordering::SeqCst);
+    pager.quiesce_export(|| false).unwrap();
+    assert!(!pager.prefetch_pass_with(|_, _, _| panic!("quiesced")));
+    assert!(!pager.wait_pulled_every(Duration::from_millis(1), |_| pager.stop()));
+}
+
+#[test]
 fn prefetch_installs_prepared_template_bytes() {
     let (_dir, pager) = prefetch_pager("prefetch-prepared");
     let mut copied = 0;

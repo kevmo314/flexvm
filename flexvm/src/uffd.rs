@@ -69,9 +69,10 @@ pub use wp::Frozen;
 
 pub const MAX_PRELOAD: usize = 4096;
 
-/// `Pager::prefetching`.
+/// `Pager::prefetching`: `RUNNING` and above still owe the working set.
 const DUE: u8 = 1;
 const RUNNING: u8 = 2;
+const CUT: u8 = 3;
 
 /// Pages copied per sequential template fault (see `Pager::template_next`).
 pub const FAULT_AROUND: usize = 16;
@@ -237,7 +238,7 @@ pub struct Runtime {
     /// The page after the last template fault: only sequential template reads copy `FAULT_AROUND` pages, avoiding
     /// sixteenfold amplification for strided reads of guest page structs.
     template_next: AtomicUsize,
-    /// The working-set prefetch: 0, `DUE` or `RUNNING` (its pages still to come).
+    /// The working-set prefetch: 0 (finished/absent), `DUE`, `RUNNING` or `CUT` (quiesced, still owed).
     prefetching: AtomicU8,
     failed: OnceLock<PagerFailure>,
     stop: AtomicBool,
@@ -515,6 +516,8 @@ impl Pager {
                     i += 1;
                     continue;
                 }
+                // Test gate `prefetch_park`: a run parks here, off the prefetch gate, so a checkpoint can quiesce it.
+                crate::host::hold("prefetch_park");
                 // Holes were zero at snapshot time (mostly free memory the guest allocates again); map them too, or
                 // each one costs a fault. Prepare a homogeneous run before claiming it.
                 let data = self.base.has_data(i);
@@ -543,17 +546,20 @@ impl Pager {
                 let n = pages.claim(i, prepared_end - i, BASE, |p| self.base.has_data(p) == data);
                 if n > 0 {
                     let stop = || self.quiesce.load(Ordering::SeqCst);
-                    let _ = pages.install(i, n, BASE, Some(&stop), |p, c| {
+                    let (_, installed) = pages.install(i, n, BASE, Some(&stop), |p, c| {
                         let src = prepared.as_ref().map(|buf| &buf[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE]);
                         populate(p, c, src)
                     });
+                    // Even the final run can return its claims when quiesce interrupts an EAGAIN retry.
+                    cut |= installed.is_err_and(|e| e.raw_os_error() == Some(libc::EAGAIN));
                 }
                 i += n.max(1);
             }
         }
-        // Done (for now) first, so a prefetch `unquiesce` starts again is not counted as done.
-        self.prefetching.store(0, Ordering::SeqCst);
+        // Publish completion only for a finished pass. A cut still owes the working set, including while
+        // `unquiesce` takes the cut back and starts another pass. Set this before publishing the restart.
         let cut = cut && !self.stop.load(Ordering::SeqCst);
+        self.prefetching.store(if cut { CUT } else { 0 }, Ordering::SeqCst);
         self.prefetch_cut.store(cut, Ordering::SeqCst);
         // Whichever of this and `unquiesce` takes the cut back goes on.
         cut && !self.quiesce.load(Ordering::SeqCst) && self.prefetch_cut.swap(false, Ordering::SeqCst)
@@ -661,10 +667,11 @@ impl Pager {
         self.wait_for(timeout, || self.remote_left() == 0)
     }
 
-    /// `wait_pulled(None)`, and for a working-set prefetch that runs (one never started does not hold it up), telling
-    /// `tick` every `every` meanwhile how many MiB are still to come: remote pages, and the working set while due.
+    /// `wait_pulled(None)`, and for a working-set prefetch that runs or that `quiesce_export` cut short (one never
+    /// started does not hold it up; a cut one until it finishes or the pager stops), telling `tick` every `every`
+    /// meanwhile how many MiB are still to come: remote pages, and the working set while due.
     pub fn wait_pulled_every(&self, every: Duration, mut tick: impl FnMut(u64)) -> bool {
-        while !self.wait_for(Some(every), || self.remote_left() == 0 && self.prefetching.load(Ordering::SeqCst) != RUNNING) {
+        while !self.wait_for(Some(every), || self.remote_left() == 0 && self.prefetching.load(Ordering::SeqCst) < RUNNING) {
             if self.stop.load(Ordering::SeqCst) {
                 return false;
             }
