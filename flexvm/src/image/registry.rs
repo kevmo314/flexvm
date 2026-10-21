@@ -17,6 +17,7 @@ use ureq::Timeout;
 use super::reference::Reference;
 use super::unpack::{Hashed, MAX_DOCUMENT};
 use crate::bail;
+use crate::template::Stamp;
 use crate::util::{sync_dir, Result};
 
 pub const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
@@ -824,23 +825,56 @@ pub(super) fn blob_lock(blobs: &Path, digest: &str) -> Result<crate::host::HeldL
     })?)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BLOB_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl FnOnce() -> Result<R>) -> Result<PathBuf> {
     let path = blob_path(blobs, digest)?;
     let dir = path.parent().unwrap().to_path_buf();
     let private = super::private_blobs(blobs)?;
     let _lock = blob_lock(blobs, digest)?;
+    // Persistent across processes: waiters under the digest lock need only stat the file
+    // just published. A replaced inode or a write (even with restored mtime) invalidates it.
+    // Best effort: a cache that cannot take one (read-only, say) is hashed each time.
+    let verified = verified_stamp(&path);
+    let remember = |stamp: Stamp| {
+        if let Ok(bytes) = serde_json::to_vec(&(stamp, digest)) {
+            let _ = super::replace(&verified, |f| Ok(f.write_all(&bytes)?));
+        }
+    };
     if path.exists() {
         let reader = super::private_file(private.as_ref(), &path)?;
-        let len = reader.metadata()?.len();
-        let mut cached = Hashed::new(reader.take(size.saturating_add(1)));
+        let metadata = reader.metadata()?;
+        let before = Stamp::of(&metadata);
+        // Only one this user wrote (`replace` makes it 0600): in a shared or symlinked cache,
+        // another could otherwise vouch for a blob it put there.
+        let recorded = super::private_file(private.as_ref(), &verified)
+            .ok()
+            .filter(|f| {
+                f.metadata().is_ok_and(|m| {
+                    std::os::unix::fs::MetadataExt::uid(&m) == unsafe { libc::geteuid() } && std::os::unix::fs::MetadataExt::mode(&m) & 0o022 == 0
+                })
+            })
+            .and_then(|f| serde_json::from_reader::<_, (Stamp, String)>(f.take(4096)).ok());
+        if metadata.len() == size && recorded.is_some_and(|(stamp, hash)| stamp == before && hash == digest) {
+            sync_dir(&dir)?;
+            return Ok(path);
+        }
+        #[cfg(test)]
+        BLOB_HASHES.with(|n| n.set(n.get() + 1));
+        let mut cached = Hashed::new((&reader).take(size.saturating_add(1)));
         std::io::copy(&mut cached, &mut std::io::sink())?;
-        if len == size && cached.n == size && cached.digest() == digest {
+        if metadata.len() == size && cached.n == size && cached.digest() == digest && Stamp::of(&reader.metadata()?) == before {
+            remember(before);
             sync_dir(&dir)?;
             return Ok(path);
         }
         crate::log!("image: cached blob {digest} is corrupt; downloading it again");
     }
     let mut r = Hashed::new(download()?.take(size.saturating_add(1)));
+    let mut published = None;
     super::replace(&path, |f| {
         std::io::copy(&mut r, f)?;
         if r.n != size {
@@ -849,8 +883,11 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
         if r.digest() != digest {
             bail!("blob {digest} downloaded with digest {}", r.digest());
         }
+        published = Some(f.try_clone()?);
         Ok(())
     })?;
+    // Stat the descriptor we wrote, not a potentially replaced pathname; rename changes ctime.
+    remember(Stamp::of(&published.unwrap().metadata()?));
     sync_dir(&dir)?;
     Ok(path)
 }
@@ -884,6 +921,12 @@ pub(super) fn sweep_parts(dir: &Path) {
 
 pub fn sha256_hex(data: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(data))
+}
+
+/// `blobs/sha256/<hex>.verified`: the (dev, inode, size, ctime) a full hash of blob `path` last
+/// found right (`cached_blob`), removed with the blob.
+pub(super) fn verified_stamp(path: &Path) -> PathBuf {
+    path.with_extension("verified")
 }
 
 /// `blobs/sha256/<hex>`, refusing anything that is not a sha256 digest.
@@ -1233,6 +1276,7 @@ pub(super) mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     barrier.wait();
+                    BLOB_HASHES.with(|n| n.set(0));
                     let path = cached_blob(&digest, 4, &dir, || {
                         downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(20));
@@ -1240,10 +1284,51 @@ pub(super) mod tests {
                     })
                     .unwrap();
                     assert_eq!(std::fs::read(path).unwrap(), b"good");
+                    BLOB_HASHES.with(|n| assert_eq!(n.get(), 0, "waiters reuse the verified publication"));
                 });
             }
         });
         assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn verified_blob_stamps_detect_changes() {
+        use std::fs::{File, FileTimes};
+        // Another user's stamp is never trusted (as root, one chowned to nobody).
+        let owners: &[&str] = if unsafe { libc::geteuid() } == 0 { &["owner"] } else { &[] };
+        for change in ["replace", "rewrite", "truncate", "stamp", "size"].iter().chain(owners).copied() {
+            let dir = super::super::unpack::tests::tmpdir(&format!("blob-stamp-{change}"));
+            let digest = sha256_hex(b"good");
+            let path = cached_blob(&digest, 4, &dir, || Ok(&b"good"[..])).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            match change {
+                "replace" => {
+                    let replacement = dir.join("replacement");
+                    std::fs::write(&replacement, b"evil").unwrap();
+                    std::fs::rename(replacement, &path).unwrap();
+                }
+                "rewrite" => {
+                    std::fs::write(&path, b"evil").unwrap();
+                    File::options().write(true).open(&path).unwrap().set_times(FileTimes::new().set_modified(metadata.modified().unwrap())).unwrap();
+                }
+                "truncate" => std::fs::write(&path, b"x").unwrap(),
+                "stamp" => std::fs::write(path.with_extension("verified"), b"invalid").unwrap(),
+                "owner" => std::os::unix::fs::chown(verified_stamp(&path), Some(65534), Some(65534)).unwrap(),
+                "size" => {}
+                _ => unreachable!(),
+            }
+            BLOB_HASHES.with(|n| n.set(0));
+            let mut downloads = 0;
+            let size = if change == "size" { 5 } else { 4 };
+            let result = cached_blob(&digest, size, &dir, || {
+                downloads += 1;
+                Ok(&b"good"[..])
+            });
+            BLOB_HASHES.with(|n| assert_eq!(n.get(), 1, "{change} invalidates the stamp"));
+            assert_eq!(downloads, usize::from(!matches!(change, "stamp" | "owner")));
+            assert_eq!(result.is_err(), change == "size");
+            assert_eq!(std::fs::read(&path).unwrap(), b"good");
+        }
     }
 
     #[test]

@@ -1838,16 +1838,16 @@ impl Host {
         };
         let l = self.lock()?;
         let mut unreadable = None;
-        for e in entries.flatten() {
+        PidNs::now().for_observed(entries.flatten(), |e, ns| {
             let name = e.file_name().to_string_lossy().into_owned();
             let stale = match name.strip_prefix('.') {
-                Some(_) => write_debris_of(&e.path()),
+                Some(_) => write_debris_by(&e.path(), ns),
                 None => match (name.parse::<Ipv4Addr>(), load::<Live>(&e.path())) {
                     (Ok(ip), Ok(Some(live))) if live.id.liveness() == Liveness::Gone => match self.addr(&l, ip) {
                         Ok(a) => a.holder_id.as_ref() != Some(&live.id),
                         Err(e) => {
                             unreadable.get_or_insert(e);
-                            continue;
+                            return;
                         }
                     },
                     (Ok(_), Ok(_)) => false,
@@ -1857,7 +1857,7 @@ impl Host {
             if stale {
                 let _ = std::fs::remove_file(e.path());
             }
-        }
+        });
         match unreadable {
             Some(e) => Err(e),
             None => Ok(()),
@@ -3667,16 +3667,28 @@ fn pid_ns_census_in(proc: &Path, mine: u64, ns_of: &dyn Fn(&Path) -> std::io::Re
 /// or named by none (an earlier build's), by its pid here; in another, only as a whole: gone
 /// once that namespace has no process left (`gone`), never by its pid.
 struct PidNs<'a> {
+    /// All candidates were observed before this instance took its census.
+    observed: bool,
     mine: Option<u64>,
     census: &'a dyn Fn() -> Option<HashSet<u64>>,
     /// The last census (None: none taken yet), reused only to keep what it saw: a namespace it
-    /// lacks may have been made since, so a fresh one decides (`gone`).
+    /// lacks may have been made since, so a fresh one decides (`gone`) outside an observed batch.
     live: std::cell::RefCell<Option<Option<HashSet<u64>>>>,
 }
 
 impl PidNs<'_> {
     fn now() -> PidNs<'static> {
-        PidNs { mine: pid_ns(), census: &pid_ns_census, live: Default::default() }
+        PidNs { observed: false, mine: pid_ns(), census: &pid_ns_census, live: Default::default() }
+    }
+
+    /// Observe the whole batch before judging any candidate, so one lazy census can prove
+    /// absence for all of them. Never use this instance for resources discovered by `visit`.
+    fn for_observed<T>(&self, candidates: impl IntoIterator<Item = T>, mut visit: impl FnMut(T, &PidNs)) {
+        let candidates: Vec<_> = candidates.into_iter().collect();
+        let batch = PidNs { observed: true, mine: self.mine, census: self.census, live: Default::default() };
+        for candidate in candidates {
+            visit(candidate, &batch);
+        }
     }
 
     /// Whether `of` (an owner's namespace) is judged by its pids here.
@@ -3688,12 +3700,14 @@ impl PidNs<'_> {
     /// process (`pid_ns_census`) that finds none in it. A namespace's inode can be reused once
     /// it is gone: a live one with it then has a process, and its resources stay. Only a census
     /// taken after the resource was seen proves it: one taken before may predate its namespace,
-    /// so a namespace the last one lacks is looked for in a new one. Where none can be taken, none is retried.
+    /// so a namespace the last one lacks is looked for in a new one, unless all candidates were
+    /// observed first (`for_observed`). Where none can be taken, none is retried.
     fn gone(&self, of: Option<u64>) -> bool {
         let (Some(_), Some(ns)) = (self.mine, of) else { return false };
         let mut live = self.live.borrow_mut();
         match &*live {
             Some(None) => return false,
+            Some(Some(l)) if self.observed => return !l.contains(&ns),
             Some(Some(l)) if l.contains(&ns) => return false,
             _ => {}
         }
@@ -3710,7 +3724,12 @@ impl PidNs<'_> {
         if id.ns.is_some() {
             return liveness(id) == Liveness::Gone;
         }
-        let (Some(mine), Some(live)) = (self.mine, (self.census)()) else { return false };
+        let Some(mine) = self.mine else { return false };
+        let mut census = self.live.borrow_mut();
+        if !self.observed || census.is_none() {
+            *census = Some((self.census)());
+        }
+        let Some(Some(live)) = &*census else { return false };
         std::iter::once(mine).chain(live.iter().copied()).all(|ns| liveness(&Ident { ns: Some(ns), ..id.clone() }) == Liveness::Gone)
     }
 
@@ -3776,15 +3795,18 @@ fn same_owner(h: &Ident, owner: &Ident, of: Option<u64>) -> bool {
 /// A dead holder's taps here (of this PID namespace); a sweep (no holder) also collects taps from
 /// deleted run directories, and those of another PID namespace proven gone (`PidNs::gone`).
 fn dead_taps_at(run: &Path, net: &Path, holder: Option<&Ident>, ns: &PidNs) -> Vec<(String, u32, Ident)> {
-    taps_of_at(run, net, holder.is_none())
-        .into_iter()
-        .filter(|(_, _, owner, of)| match holder {
+    let mut dead = Vec::new();
+    ns.for_observed(taps_of_at(run, net, holder.is_none()), |(name, index, owner, of), ns| {
+        let gone = match holder {
             // The alias names the namespace apart from its owner (None in the Ident parsed).
-            Some(h) => ns.own(*of) && same_owner(h, owner, *of) && h.liveness() == Liveness::Gone,
-            None => ns.owner_gone(owner, *of),
-        })
-        .map(|(n, i, o, _)| (n, i, o))
-        .collect()
+            Some(h) => ns.own(of) && same_owner(h, &owner, of) && h.liveness() == Liveness::Gone,
+            None => ns.owner_gone(&owner, of),
+        };
+        if gone {
+            dead.push((name, index, owner));
+        }
+    });
+    dead
 }
 
 /// A holder's taps, or a sweep's (including orphaned hosts). Deleting a tap also
@@ -3802,11 +3824,7 @@ pub type Withdrawn = (String, Ipv4Addr, u64);
 /// proven gone. TAG `PID-START-BOOT` (`util::write_tag`) names its process: gone once that
 /// process is, or written in another boot. A bare PID (an older flexvm's, or one that could not
 /// name itself) is gone once no process has that pid, or once the file is older than this boot.
-pub(crate) fn write_debris_of(path: &Path) -> bool {
-    write_debris_by(path, &PidNs::now())
-}
-
-/// `write_debris_of`, judging a writer of another PID namespace (`util::write_tag`'s `NS`) by `ns`:
+/// Judging a writer of another PID namespace (`util::write_tag`'s `NS`) by `ns`:
 /// never by its pid, only once its namespace is proven gone (#1084).
 fn write_debris_by(path: &Path, ns: &PidNs) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
@@ -3846,15 +3864,16 @@ fn older_than_boot(path: &Path) -> bool {
     matches!((mtime, btime), (Some(m), Some(b)) if m < b)
 }
 
-/// Removes, among `dir`'s entries whose names pass `which`, `write_file` debris (`write_debris_of`):
+/// Removes, among `dir`'s entries whose names pass `which`, `write_file` debris (`write_debris_by`):
 /// never a published record (no leading dot) nor a live writer's temporary file.
 fn remove_write_debris(dir: &Path, which: impl Fn(&str) -> bool) {
     let ns = PidNs::now();
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if e.file_name().to_str().is_some_and(&which) && write_debris_by(&e.path(), &ns) {
+    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten().filter(|e| e.file_name().to_str().is_some_and(&which));
+    ns.for_observed(entries, |e, ns| {
+        if write_debris_by(&e.path(), ns) {
             let _ = std::fs::remove_file(e.path());
         }
-    }
+    });
 }
 
 /// Whether `name` is a `write_file` temporary file tagged with its writer's full identity
@@ -4480,16 +4499,20 @@ fn collect_owned(run: &Path) {
     }
     // Firecrackers' by identity: once their process is gone no other makes one under their name.
     let ns = PidNs::now();
-    for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
+    ns.for_observed(std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten(), |e, ns| {
         let n = e.file_name().to_string_lossy().into_owned();
         if n.starts_with("vm-") {
-            sweep_scope(&e.path(), &ns);
-        } else if cgroup_owner_gone(&n, &ns) {
+            sweep_scope(&e.path(), ns);
+        } else if cgroup_owner_gone(&n, ns) {
             let _ = crate::fc::remove_cgroup(&e.path());
         }
-    }
-    for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {
-        let owner = match load::<Ident>(&e.path().join("owner")) {
+    });
+    let work = std::fs::read_dir(run.join("w")).into_iter().flatten().flatten().map(|e| {
+        let owner = load::<Ident>(&e.path().join("owner"));
+        (e, owner)
+    });
+    ns.for_observed(work, |(e, owner), ns| {
+        let owner = match owner {
             Ok(Some(owner)) => Some(owner),
             // Killed before it wrote its owner: its name is its pid in its own PID namespace,
             // which it does not name, so it must be gone in every one.
@@ -4500,7 +4523,7 @@ fn collect_owned(run: &Path) {
             crate::socket::remove_left(&e.path());
             let _ = std::fs::remove_dir_all(e.path());
         }
-    }
+    });
     // Names whose holder was killed: taken (so no one else holds them) and let go,
     // as `NameLock` would have. `failed` records stay for `ps -a`, `moved` ones for `stop`, `rm` and `exec`.
     let vms = run.join("vms");
@@ -8035,7 +8058,7 @@ pub(crate) mod tests {
     }
 
     fn pidns<'a>(mine: Option<u64>, census: &'a dyn Fn() -> Option<HashSet<u64>>) -> PidNs<'a> {
-        PidNs { mine, census, live: Default::default() }
+        PidNs { observed: false, mine, census, live: Default::default() }
     }
 
     fn owned(taps: Vec<(String, u32, Ident, Option<u64>)>) -> Vec<(String, u32, Ident)> {
@@ -8275,17 +8298,17 @@ pub(crate) mod tests {
     fn an_unnamed_namespace_is_judged_in_every_one() {
         let id = Ident { start: Ident::me().start + 1, ns: None, ..Ident::me() };
         let census = || Some(HashSet::from([1, 2]));
-        let ns = PidNs { mine: Some(1), census: &census, live: Default::default() };
+        let ns = PidNs { observed: false, mine: Some(1), census: &census, live: Default::default() };
         assert!(ns.gone_everywhere(&id, &|_| Liveness::Gone));
         for other in [Liveness::Alive, Liveness::Unknown] {
             assert!(!ns.gone_everywhere(&id, &|i| if i.ns == Some(2) { other } else { Liveness::Gone }), "{other:?} in another namespace");
             assert!(!ns.gone_everywhere(&id, &|i| if i.ns == Some(1) { other } else { Liveness::Gone }), "{other:?} in this one");
         }
         let none = || None;
-        let blind = PidNs { mine: Some(1), census: &none, live: Default::default() };
+        let blind = PidNs { observed: false, mine: Some(1), census: &none, live: Default::default() };
         assert!(!blind.gone_everywhere(&id, &|_| Liveness::Gone), "no census, no proof");
         // An earlier sweep's census (the cgroups') misses a namespace made since: never reused.
-        let stale = PidNs { mine: Some(1), census: &census, live: std::cell::RefCell::new(Some(Some(HashSet::from([1])))) };
+        let stale = PidNs { observed: false, mine: Some(1), census: &census, live: std::cell::RefCell::new(Some(Some(HashSet::from([1])))) };
         assert!(!stale.gone_everywhere(&id, &|i| if i.ns == Some(2) { Liveness::Alive } else { Liveness::Gone }), "a census taken before");
     }
 
@@ -8299,7 +8322,7 @@ pub(crate) mod tests {
             taken.set(taken.get() + 1);
             Some(seen.borrow().clone())
         };
-        let ns = PidNs { mine: Some(1), census: &census, live: Default::default() };
+        let ns = PidNs { observed: false, mine: Some(1), census: &census, live: Default::default() };
         assert!(!ns.gone(Some(2)) && taken.get() == 1);
         assert!(!ns.gone(Some(2)) && taken.get() == 1, "a namespace the last census saw: no new one");
         // Namespace 3 is made, after that census, and writes.
@@ -8315,9 +8338,35 @@ pub(crate) mod tests {
             taken.set(taken.get() + 1);
             None
         };
-        let blind = PidNs { mine: Some(1), census: &none, live: Default::default() };
+        let blind = PidNs { observed: false, mine: Some(1), census: &none, live: Default::default() };
         assert!(!blind.gone(Some(2)) && !blind.gone(Some(3)));
         assert_eq!(taken.get(), 4, "where no census can be taken, it is not retried");
+    }
+
+    #[test]
+    fn observed_candidates_share_one_census_without_reusing_an_earlier_one() {
+        let observed = std::cell::Cell::new(0);
+        let taken = std::cell::Cell::new(0);
+        let census = || {
+            assert_eq!(observed.get(), 1000, "all candidates must precede the census");
+            taken.set(taken.get() + 1);
+            Some(HashSet::from([1, 3]))
+        };
+        let ns = PidNs { observed: false, mine: Some(1), census: &census, live: std::cell::RefCell::new(Some(Some(HashSet::from([1])))) };
+        let candidates = (0..1000).map(|i| {
+            observed.set(observed.get() + 1);
+            PathBuf::from(format!(".record.{i}-1-{}-2.tmp", &boot_id()[..crate::util::BOOT_TAG]))
+        });
+        ns.for_observed(candidates, |path, batch| {
+            assert!(write_debris_by(&path, batch));
+            assert!(!batch.gone(Some(3)), "a namespace made before observation must survive");
+            let id = Ident { ns: None, ..Ident::me() };
+            assert!(batch.gone_everywhere(&id, &|_| Liveness::Gone));
+            assert!(!batch.gone_everywhere(&id, &|i| if i.ns == Some(3) { Liveness::Alive } else { Liveness::Gone }));
+        });
+        assert_eq!(taken.get(), 1, "dead files and ownerless directories share a census");
+        ns.for_observed([Some(3)], |of, batch| assert!(!batch.gone(of)));
+        assert_eq!(taken.get(), 2, "a later batch must take a new census");
     }
 
     /// #556, #563: a write's temporary file goes once its writer is proven gone (by pid, start time and

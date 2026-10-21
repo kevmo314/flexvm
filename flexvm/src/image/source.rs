@@ -166,6 +166,7 @@ impl Layer {
                 let path = blob_path(blobs, digest)?;
                 let m = std::fs::symlink_metadata(&path)?;
                 if identity == Some((m.dev(), m.ino())) {
+                    let _ = std::fs::remove_file(super::registry::verified_stamp(&path));
                     std::fs::remove_file(path)?;
                 }
                 Ok(())
@@ -595,8 +596,11 @@ mod tests {
         assert!(!layer.src.evicted());
         // Read as it is; the check as it is unpacked evicts it.
         std::fs::write(&path, b"evil").unwrap();
+        let stamp = super::super::registry::verified_stamp(&path);
+        std::fs::write(&stamp, b"stamp").unwrap();
         assert!(read(&layer).unwrap_err().to_string().contains("has digest"));
         assert!(layer.src.evicted() && !path.exists());
+        assert!(!stamp.exists(), "eviction removes the blob's stamp");
         // Opening it again downloads it (here the registry hangs up).
         assert!(layer.open().is_err());
         // A blob of the wrong size is hashed: one whose digest does not match goes too.
