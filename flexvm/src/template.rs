@@ -3895,7 +3895,10 @@ pub(crate) mod tests {
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
         let removable = std::fs::remove_file(stuck.join("file")).is_ok(); // as root
         let res = sweep(&f.paths);
-        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // As root the sweep could remove it all.
+        if stuck.exists() {
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         res.unwrap();
         assert!(removable || stuck.exists());
         assert!(Staging::new(&f.paths, "t").is_ok());
