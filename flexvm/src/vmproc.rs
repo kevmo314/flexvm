@@ -1781,7 +1781,7 @@ impl Proc {
         let sock = self.host.sock(&self.name())?;
         let _ = std::fs::remove_file(&sock);
         // Bound in `RUN/vms/.locks` (0700, where its lock is held), never reachable by others.
-        let private = crate::host::locks(sock.parent().ok_or("control socket has no directory")?).join(format!(".{}.sock", std::process::id()));
+        let private = crate::host::locks(sock.parent().ok_or("control socket has no directory")?).join(crate::socket::private_name());
         let l = crate::socket::bind_private(&private, &sock).map_err(|e| format!("vm {}: no control socket at {}: {e}", self.name(), sock.display()))?;
         thread::Builder::new().spawn(move || {
             for c in l.incoming() {
@@ -4901,7 +4901,7 @@ mod tests {
         let inode = std::fs::metadata(&sock).unwrap().ino();
         // Moved from the 0700 lock directory, already private.
         assert_eq!(std::fs::metadata(&sock).unwrap().mode() & 0o777, 0o600);
-        assert!(!crate::host::locks(sock.parent().unwrap()).join(format!(".{}.sock", std::process::id())).exists());
+        assert!(!crate::host::locks(sock.parent().unwrap()).join(crate::socket::private_name()).exists());
         p.serve_control().unwrap();
         assert_eq!(std::fs::metadata(&sock).unwrap().ino(), inode);
         let mut c = UnixStream::connect(&sock).unwrap();

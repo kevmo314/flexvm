@@ -1013,7 +1013,7 @@ impl Host {
     }
 
     fn write_owner(&self, name: &str, dir: &File, to: Option<&str>) -> Result<()> {
-        let tmp = std::ffi::CString::new(format!("{OWNER}.{}", std::process::id()))?;
+        let tmp = std::ffi::CString::new(format!("{OWNER}.{}", crate::util::write_tag()))?;
         let pending = to.and_then(|_| logs_owner(dir)).filter(|o| o.handoff);
         // One `by` per token: unknown (None) for one an earlier version recorded.
         let (mut tokens, mut by): (Vec<String>, Vec<Option<Ident>>) = match pending {

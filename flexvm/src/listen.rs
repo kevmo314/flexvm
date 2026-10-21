@@ -768,7 +768,10 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant,
     // arrival's log is told from a live one's and swept (`gc`), and a later listener
     // counts it, by its peer (`earlier_arrivals`).
     let n = ARRIVAL.fetch_add(1, Ordering::Relaxed);
-    let file = format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, std::process::id());
+    // `.incoming-PID.NS-N-PEER.log`: by PID namespace too (`standby::own_name`), so a listener of
+    // another sharing this run directory with this pid never takes this one's name, nor removes
+    // its lock as it fails to (#1146).
+    let file = format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, crate::standby::own_name());
     let vms = host.run.join("vms");
     let (log_path, lock_path) = (vms.join(&file), crate::host::locks(&vms).join(&file));
     // Retried until the file locked is the path's: a sweep may remove a lock with no log yet
@@ -818,10 +821,10 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant,
 }
 
 /// Live arrivals that other listener processes started (an earlier one, before a
-/// restart), by peer: their `.incoming-LPID-N-PEER.log` files, each locked for its
+/// restart), by peer: their `.incoming-LPID.NS-N-PEER.log` files (an earlier build's `LPID`), each locked for its
 /// arrival's life. One with no peer in its name counts toward the total only.
 fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
-    let me = std::process::id().to_string();
+    let me = crate::standby::own_name();
     let mut n = HashMap::new();
     for e in std::fs::read_dir(crate::host::locks(&host.run.join("vms"))).into_iter().flatten().flatten() {
         let name = e.file_name();
@@ -1891,10 +1894,11 @@ mod tests {
         };
         let other = std::process::id() + 1;
         // This one's own and dead ones do not count: the memory has the former.
-        let mut held: Vec<_> = (0..MAX_ARRIVALS_FROM).map(|i| log(format!(".incoming-{}-{i}-127.0.0.1.log", std::process::id()), true)).collect();
+        let mut held: Vec<_> = (0..MAX_ARRIVALS_FROM).map(|i| log(format!(".incoming-{}-{i}-127.0.0.1.log", crate::standby::own_name()), true)).collect();
         held.extend((0..MAX_ARRIVALS).map(|i| log(format!(".incoming-{other}-{}-127.0.0.1.log", 100 + i), false)));
         assert!(earlier_arrivals(&host).is_empty());
-        let mine: Vec<_> = (0..MAX_ARRIVALS_FROM).map(|i| log(format!(".incoming-{other}-{i}-127.0.0.1.log"), true)).collect();
+        // Another PID namespace's listener with this pid counts too (#1146).
+        let mine: Vec<_> = (0..MAX_ARRIVALS_FROM).map(|i| log(format!(".incoming-{}.1-{i}-127.0.0.1.log", std::process::id()), true)).collect();
         assert_eq!(earlier_arrivals(&host), HashMap::from([("127.0.0.1".parse().unwrap(), MAX_ARRIVALS_FROM)]));
         refused("arriving here already");
         // The peer's quota is free again; others' arrivals (one of an older name, with

@@ -185,13 +185,16 @@ RUN (default /run/flexvm, tmpfs)
   vms/NAME.logs/.owner            whose lifetime it is: its VM's process, or a run handing it to one (JSON)
   vms/NAME.{log,log.1}            links into NAME.logs/
   vms/.NAME.logs.X.gone           a retired lifetime being removed (swept if a writer added to it meanwhile)
-  vms/.locks/NAME.lock            liveness lock; .incoming-*.log, an arrival's lock
+  vms/.locks/NAME.lock            liveness lock; .incoming-*.log, an arrival's lock; .PID.NS.sock, a control
+                                  socket being bound (`socket::bind_private`; swept under the directory's lock,
+                                  an earlier build's .PID.sock only once its pid is gone here and a minute old)
   vms/NAME.{failed,moved}         why a VM died (until `rm` or name reuse); where it migrated to (an hour)
   vms/NAME.exit                   the process's exit status and identity (`flexvm wait`)
   vms/NAME.exited                 a background VM's app exit status and run config (until `start` or `rm`)
   vms/NAME.lost                   a VM lost with the host, recorded before its address is withdrawn (until `rm` or name reuse)
   .boot                  the boot id once this boot's recovery completed (`gc::after_boot`)
-  vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.logs/log) or refused; locked by the arrival
+  vms/.incoming-LPID.NS-N-PEER.log an arrival's log until it is accepted (as NAME.logs/log) or refused; locked by the
+                                  arrival; LPID.NS its listener's pid and PID namespace (an earlier build's: LPID)
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc                   when garbage was last swept periodically
   .X.PID-START-BOOT-NS.tmp `util::write_file`'s temporary files here and in STATE (and wherever it writes): swept once their
@@ -221,7 +224,8 @@ RUN (default /run/flexvm, tmpfs)
                          PID.sock), with .locks/PID-START-NS.lock while it lives
   standby/H/.locks/      PID-START-NS.lock (liveness), PID-START-NS.claim (locked while a claim is under way),
                          PID.NS.take (locked by a `run` while it tries that standby; others try another
-                         first), refill (one refill of T at a time), publish (held while a socket is replaced)
+                         first), refill (one refill of T at a time), publish (held while a socket is replaced),
+                         .PID.NS.sock (a socket being bound, as vms/.locks/)
   standby/H/.failed      its mtime: T's last failed refill (none for a minute after)
   standby/H/standby.log  the standby VMs' output and refill errors (standby.log.1: previous rotation)
   standby/.pressure      its mtime: when pressure last stopped standby VMs (no refill for a minute)
@@ -232,7 +236,11 @@ RUN (default /run/flexvm, tmpfs)
                          process with its pid never shares it): `owner` (pid, start time), `sockets`
                          (the path of its socket directory, `socket::RECORD`, named by a hash of this
                          directory and the PID namespace that made it, so a sweep from another removes it),
-                         and per Firecracker a directory with `fc` (its pid and start time)
+                         and per Firecracker a directory with `fc` (its pid and start time). Its name has no
+                         PID namespace: processes of two with the same pid and start time sharing RUN would
+                         share it, but a sweep judges it by `owner` (which names the namespace), never by name
+  gates/NAME.PID         test markers (FLEXVM_FAULTS=1 only): a process got to gate NAME; never swept, read
+                         only by tests, which run their VMs in one PID namespace
 ```
 
 **host.json** is edited by hand; only `flexvm listen` writes a key (`listen`).

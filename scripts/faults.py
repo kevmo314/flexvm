@@ -10540,6 +10540,11 @@ def pidns_control():
             r = within("-p", "-f", cmd=cmd)
             check(f"pidns control: {cmd.split()[0]} without a /proc of its own refused", r.returncode != 0 and "/proc is not this PID namespace's" in r.stderr,
                   (r.returncode, r.stderr))
+        # #1146: nor does it start a VM, whose Firecracker's /proc/PID there would be another process.
+        for cmd in (f"run --name {n}-x -d {shlex.quote(args.template)}", f"run --name {n}-x {shlex.quote(args.template)} true"):
+            r = within("-p", "-f", cmd=cmd)
+            check(f"pidns control: {cmd.split()[-1]} run without a /proc of its own refused", r.returncode != 0 and "no vm can start here" in r.stderr and f"{n}-x" not in vms(A),
+                  (r.returncode, r.stderr))
         r = within("-p", "-f", "--mount-proc", cmd="debug gc")
         check("pidns control: a sibling's sweep keeps it", r.returncode == 0 and os.path.exists(os.path.join(work, "owner")) and row().get("state") == "running",
               (r.returncode, r.stderr, row().get("state")))
@@ -10553,6 +10558,7 @@ def pidns_control():
             owner.kill()
             owner.wait()
         cli(A, "rm", "-f", n)
+        cli(A, "rm", "-f", f"{n}-x")
         for e in os.listdir(os.path.join(sub, "flexvm")) if os.path.isdir(os.path.join(sub, "flexvm")) else []:
             if os.path.isdir(os.path.join(sub, "flexvm", e)):
                 with suppress(OSError):
@@ -10562,12 +10568,23 @@ def pidns_control():
                 os.rmdir(c)
 
 
+def own_cgroup():
+    """Whether this process is in the cgroup2 directory its /proc/self/cgroup names (`util::my_cgroup`), which a
+    foreground `run` it starts passes to the standby it claims."""
+    with suppress(OSError, StopIteration):
+        cg = next(l[3:] for l in open("/proc/self/cgroup").read().splitlines() if l.startswith("0::"))
+        with open(os.path.join("/sys/fs/cgroup", cg.strip("/"), "cgroup.procs")) as f:
+            return str(os.getpid()) in f.read().split()
+    return False
+
+
 def pidns_standby():
     """#1139: a standby VM in a PID namespace of its own (a container sharing this host's directories) names its
     socket after that namespace (`PID.PIDNS.sock`), never this one's of its pid, and a sweep here keeps it. A run
     in that namespace claims it, the reply naming the namespace its pid is in; from here the VM is controlled by
-    the pid it has here, and its standbys stopped. (A claim from here starts cold: a standby claims only for a
-    claimer it can see.) Its Firecracker cgroups are in a private cgroup subtree bind-mounted as its /sys/fs/cgroup,
+    the pid it has here, and its standbys stopped. A detached run here claims it too, its claimer unseen there
+    (#1146); a foreground one here, whose VM would join its cgroup, which the standby cannot prove its claimer's,
+    starts cold. Its Firecracker cgroups are in a private cgroup subtree bind-mounted as its /sys/fs/cgroup,
     and so is every sweep here."""
     t, n = args.template, "ft-pidns-sb"
     if not os.path.exists("/sys/fs/cgroup/cgroup.controllers") or not shutil.which("unshare"):
@@ -10618,6 +10635,20 @@ def pidns_standby():
         check("pidns standby: exec from here", code == 0 and out == "across", (code, out))
         code, out, err = cli(A, "rm", "-f", n)
         check("pidns standby: removed from here", code == 0 and n not in vms(A), (code, err))
+        check("pidns standby: refilled there", wait_for(lambda: len(theirs()) == 1, 90), (socks(), f"{ns:x}"))
+        sock = theirs()[0]
+        if own_cgroup():
+            code, out, err = cli(A, "run", "--name", n, t, "echo cold")
+            check("pidns standby: a foreground run from here starts cold", code == 0 and "cold" in out and sock in socks(), (code, out, err, socks()))
+            cli(A, "rm", "-f", n)
+        r = cli_json(A, "run", "--name", n, "-d", t)
+        r = r.get("result") if isinstance(r.get("result"), dict) else r
+        check("pidns standby: a detached run from here claims it", r.get("standby") is True and r.get("pidns") == ns and r.get("pid") == int(sock.split(".")[0]),
+              (r, sock))
+        code, out = sh(A, n, "echo claimed")
+        check("pidns standby: exec in the VM claimed from here", code == 0 and out == "claimed", (code, out))
+        code, out, err = cli(A, "rm", "-f", n)
+        check("pidns standby: removed again", code == 0 and n not in vms(A), (code, err))
         r = cli_json(A, "pull", t, "--standby", "0")
         check("pidns standby: its namespace's standbys stopped from here", r["ok"] and wait_for(lambda: not theirs() and not held(ns), 60), (r, socks(), held(ns)))
     finally:

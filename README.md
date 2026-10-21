@@ -795,7 +795,16 @@ A flexvm whose `/proc` is not its own PID namespace's (`unshare --pid` without
 signal any VM and never takes one for gone. Standby VMs, memory debits,
 eviction backoffs and release answers are named by PID namespace too; a
 standby VM is claimed only by a `run` it can see (in its own PID namespace or
-one below it; from any other, `run` starts cold).
+one below it), or by a `-d` or `-i`/`-t` one (whose VM joins no cgroup of its)
+from any other. A plain foreground `run` from an ancestor namespace starts
+cold on a cgroup2 host: its VM joins its cgroup, which the standby cannot prove the claimer's (it reads its
+pid as 0, and a pidfd passed gives no pid there, nor can be signalled from
+there). A flexvm whose `/proc` is not its own starts no VM at all (`/proc is
+not this PID namespace's`): what it reads there of its Firecrackers (their
+executable, fds, memory maps, threads, network namespace) would be other
+processes'. A build from before #1139 reads a standby's lock by pid and start
+time alone, and may signal a process of another PID namespace with both; run
+one build on hosts that share a run directory across namespaces.
 
 ## Fast starts
 

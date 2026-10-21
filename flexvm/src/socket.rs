@@ -36,19 +36,31 @@ pub fn bind_private(private: &Path, sock: &Path) -> io::Result<std::os::unix::ne
     if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
         return Err(denied(private, "must be owned by this user and closed to group and others"));
     }
-    // Held from the sweep until the socket is moved out: a `.PID.sock` seen under it is no bind's in
-    // progress (a process reusing a dead one's pid waits here), only one a bind left behind. One whose
-    // pid runs stays all the same: it may be a bind by a flexvm from before this lock.
+    // Held from the sweep until the socket is moved out: a `.PID.NS.sock` (`private_name`) seen under
+    // it is no bind's in progress, only one a bind left behind, whatever its pid. An earlier build's
+    // `.PID.sock` may be a bind of one from before this lock: it goes only once its pid is gone here
+    // and it is older than any bind takes, as a pid alone cannot tell, its binder being perhaps of
+    // another PID namespace sharing the directory, with that pid there (#1146).
     let _bind = crate::host::Flock::new(dir.try_clone()?, libc::LOCK_EX)?;
     let opened = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
     for entry in fs::read_dir(&opened)? {
         let entry = entry?;
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.strip_prefix('.')).and_then(|s| s.strip_suffix(".sock")).and_then(|s| s.parse::<libc::pid_t>().ok())
-        else {
+        let Some(owner) = name.to_str().and_then(|s| s.strip_prefix('.')?.strip_suffix(".sock")).and_then(crate::standby::sock_of) else {
             continue;
         };
-        if pid > 0 && entry.file_type()?.is_socket() && unsafe { libc::kill(pid, 0) } < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        if !entry.file_type()?.is_socket() {
+            continue;
+        }
+        let stale = match owner {
+            (_, Some(_)) => true,
+            (pid, None) => {
+                let gone = libc::pid_t::try_from(pid)
+                    .is_ok_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+                gone && crate::host::unwritten_for(&entry.path()).is_some_and(|a| a > STALE_BIND)
+            }
+        };
+        if stale {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -61,6 +73,16 @@ pub fn bind_private(private: &Path, sock: &Path) -> io::Result<std::os::unix::ne
         let _ = fs::remove_file(&short);
     }
     placed.map(|()| listener)
+}
+
+/// Longer than an earlier build's bind ever lies at its private name, bound and not yet moved.
+const STALE_BIND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// This process's private name for `bind_private` in a directory its binds share: `.PID.NS.sock`, NS
+/// its PID namespace in hex (`host::pid_ns`), as a standby's socket is named (`standby::sock_name`),
+/// so binders of other namespaces with its pid never take it; `.PID.sock` where none can be read.
+pub fn private_name() -> String {
+    format!(".{}.sock", crate::standby::own_name())
 }
 
 /// Whether `c`'s peer is root or this process's user: one a 0600 socket would admit.
@@ -277,15 +299,31 @@ mod tests {
             assert_eq!(bind_private(&staging, &sock).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         }
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // An earlier build's `.PID.sock`: judged by its pid here, and only once older than a bind.
         let dead = dir.join(".2147483647.sock");
+        let fresh = dir.join(".2147483645.sock");
         let live = dir.join(format!(".{}.sock", std::process::id()));
         let plain = dir.join(".2147483646.sock");
-        let _dead = std::os::unix::net::UnixListener::bind(&dead).unwrap();
-        let _live = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        // `.PID.NS.sock`: a bind holding the lock made it, so one seen under it is left over, its pid alive or not.
+        let left = [dir.join(format!(".{}.{:x}.sock", std::process::id(), 0xabcdefu64)), dir.join(".2147483647.1f.sock")];
+        let other = dir.join(".1.2.3.sock");
+        let _socks: Vec<_> = [&dead, &fresh, &live, &left[0], &left[1], &other].iter().map(|p| std::os::unix::net::UnixListener::bind(p).unwrap()).collect();
+        for p in [&dead, &live] {
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            let old = [libc::timespec { tv_sec: 1, tv_nsec: 0 }; 2];
+            assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), old.as_ptr(), 0) }, 0);
+        }
         fs::write(&plain, b"keep").unwrap();
         let _l = bind_private(&dir.join("staging"), &sock).unwrap();
-        assert!(!dead.exists());
-        assert!(live.exists() && plain.exists());
+        assert!(!dead.exists() && !left[0].exists() && !left[1].exists());
+        assert!(live.exists() && plain.exists() && fresh.exists() && other.exists());
+    }
+
+    #[test]
+    fn private_names_name_the_pid_namespace() {
+        let name = private_name();
+        let stem = name.strip_prefix('.').and_then(|n| n.strip_suffix(".sock")).unwrap();
+        assert_eq!(crate::standby::sock_of(stem), Some((std::process::id(), crate::host::pid_ns())));
     }
 
     #[test]
