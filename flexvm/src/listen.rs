@@ -948,29 +948,41 @@ fn push(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     Ok(())
 }
 
-/// Generations held for arrivals, by content id, until when: one hold (and thread) each, however often asked.
+/// Generations held for arrivals, by content id, until when.
 static HELD: Mutex<std::collections::BTreeMap<String, (Arc<crate::template::Template>, Instant)>> = Mutex::new(std::collections::BTreeMap::new());
+// Protected by HELD: set before inserting the first hold, cleared only when empty.
+static HOLD_SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Generations held at once at most: past it, an arrival's own `open_id` must come before any `rmi` does.
 const MAX_HELD: usize = 16;
 
 fn hold(tpl: Arc<crate::template::Template>) {
+    use std::sync::atomic::Ordering;
     let (id, mut held) = (tpl.meta.id.clone(), HELD.lock().unwrap());
-    if held.len() >= MAX_HELD && !held.contains_key(&id) || held.insert(id.clone(), (tpl, Instant::now() + PUSH_HOLD)).is_some() {
-        return;
-    }
-    drop(held);
-    std::thread::spawn(move || loop {
-        let mut held = HELD.lock().unwrap();
-        // Gone already (another hold's thread ended it): nothing left to end.
-        let Some(left) = held.get(&id).map(|h| h.1.saturating_duration_since(Instant::now())) else { return };
-        if left.is_zero() {
-            held.remove(&id);
+    if !HOLD_SWEEPING.load(Ordering::Relaxed) {
+        if let Err(e) = std::thread::Builder::new().name("held-templates".into()).spawn(|| loop {
+            let mut held = HELD.lock().unwrap();
+            let now = Instant::now();
+            let Some(next) = sweep_held(&mut held, now) else {
+                HOLD_SWEEPING.store(false, Ordering::Relaxed);
+                return;
+            };
+            drop(held);
+            std::thread::sleep(next.saturating_duration_since(now));
+        }) {
+            crate::log!("could not hold template for arrival: {e}");
             return;
         }
-        drop(held);
-        std::thread::sleep(left);
-    });
+        HOLD_SWEEPING.store(true, Ordering::Relaxed);
+    }
+    if held.len() < MAX_HELD || held.contains_key(&id) {
+        held.insert(id, (tpl, Instant::now() + PUSH_HOLD));
+    }
+}
+
+fn sweep_held<T>(held: &mut std::collections::BTreeMap<String, (T, Instant)>, now: Instant) -> Option<Instant> {
+    held.retain(|_, (_, until)| *until > now);
+    held.values().map(|(_, until)| *until).min()
 }
 
 /// The host lock, waited for `LOCK_WAIT` at most: then refused as busy.
@@ -1218,6 +1230,23 @@ pub(crate) fn routable_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_sweep_expires_holds_and_preserves_refreshes() {
+        let now = Instant::now();
+        let template = Arc::new(());
+        let mut held = std::collections::BTreeMap::new();
+        for i in 0..MAX_HELD {
+            held.insert(i.to_string(), (template.clone(), now));
+        }
+        let refreshed = now + PUSH_HOLD;
+        held.get_mut("0").unwrap().1 = refreshed;
+        assert_eq!(sweep_held(&mut held, now), Some(refreshed));
+        assert_eq!(held.len(), 1);
+        assert_eq!(Arc::strong_count(&template), 2);
+        assert_eq!(sweep_held(&mut held, refreshed), None);
+        assert_eq!(Arc::strong_count(&template), 1);
+    }
 
     /// A push refused once its metadata is read, before its data; answered from the hold without a slot or turn;
     /// asked again (`have`) as a source does right before its prepare (#824).

@@ -1934,6 +1934,10 @@ impl Proc {
                 crate::info!("vm {}: migrating away; it ends once the target has its memory", vm.name);
                 Ok(())
             }
+            libc::SIGTERM if self.destroy_code().is_some() => {
+                crate::info!("vm {}: being destroyed; not suspending", vm.name);
+                Ok(())
+            }
             libc::SIGTERM => match self.reserve_suspend() {
                 None => {
                     crate::info!("vm {}: a suspend is already under way, or the vm is ending", vm.name);
@@ -1950,7 +1954,23 @@ impl Proc {
                     .map(drop)
                     .map_err(|e| format!("suspending: {e}").into()),
             },
-            libc::SIGINT | libc::SIGQUIT => Err(self.destroy(128 + sig)),
+            // Off the signal thread too, so a SIGTSTP or SIGCONT is not held behind it. Marked first, as `destroy`
+            // does: a SIGTERM or pause taken after this one yields to it, as when it ran here.
+            libc::SIGINT | libc::SIGQUIT => match self.arc() {
+                Some(p) => {
+                    let code = 128 + sig;
+                    self.destroying.store(code, Ordering::SeqCst);
+                    thread::Builder::new()
+                        .name("signal-destroy".into())
+                        .spawn(move || crate::log!("vm {}: signal {sig}: {}", p.name(), p.destroy(code)))
+                        .map(drop)
+                        .map_err(|e| {
+                            let _ = self.destroying.compare_exchange(code, 0, Ordering::SeqCst, Ordering::SeqCst);
+                            format!("destroying: {e}").into()
+                        })
+                }
+                None => Err(self.destroy(128 + sig)),
+            },
             _ => Ok(()),
         };
         res.map_err(|e| {
@@ -1962,9 +1982,9 @@ impl Proc {
     /// `slot`: its place among `MAX_CONTROL`, which a session trades for one among `MAX_SESSIONS`
     /// once parsed, and a page-server request for one among `MAX_PAGES`.
     fn control(self: &Arc<Self>, c: UnixStream, slot: Slot) {
-        let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-        let got = crate::util::recv_with_fds(&c, crate::util::MAX_LINE as usize, || Ok(()))
-            .and_then(|(line, fds)| Ok((serde_json::from_slice::<Value>(&line)?, fds)));
+        let at = Instant::now() + Duration::from_secs(10);
+        let got =
+            crate::util::recv_with_fds_by(&c, crate::util::MAX_LINE as usize, at).and_then(|(line, fds)| Ok((serde_json::from_slice::<Value>(&line)?, fds)));
         let (req, fds) = match got {
             Ok(got) => got,
             Err(e) => return drop(send_json(&mut &c, &json!({"ok": false, "error": format!("bad request: {e}")}))),

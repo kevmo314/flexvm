@@ -527,10 +527,17 @@ pub struct Host {
     cfg_stamp: Option<Stamp>,
     /// Last good reload, shared by this Host's clones, never by unrelated Hosts.
     cfg_seen: Arc<Mutex<Option<(Stamp, Config)>>>,
+    /// Live unannounced loans; a directory change by another process invalidates it.
+    loan_ips: Arc<Mutex<Option<LoanIndex>>>,
+}
+
+fn unannounced_loan(a: &Addr) -> bool {
+    a.loan.is_some() && a.lent.is_some() && a.via.is_none() && a.holder.is_none()
 }
 
 /// mtime and inode: `store` renames, so a rewrite in the same mtime tick differs too.
 type Stamp = (SystemTime, u64);
+type LoanIndex = (Stamp, std::collections::BTreeSet<Ipv4Addr>);
 fn stamp(path: &Path) -> Option<Stamp> {
     std::fs::metadata(path).ok().and_then(|m| Some((m.modified().ok()?, m.ino())))
 }
@@ -676,7 +683,7 @@ impl Host {
             .map_err(|e| format!("{}: {e} (see README: Configuration)", state.join("host.json").display()))?
             .unwrap_or_default();
         cfg.run = Some(run.clone());
-        let host = Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)) };
+        let host = Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)), loan_ips: Default::default() };
         drop(_held);
         Ok(host)
     }
@@ -1201,7 +1208,22 @@ impl Host {
             crate::util::write_file(marker.parent().ok_or("no directory")?, &ip.to_string(), boot_id().as_bytes(), false)
                 .map_err(|e| format!("{}: {e}", marker.display()))?;
         }
+        let before = stamp(&self.state.join("addrs"));
         store(&self.addr_path(ip), a, durable)?;
+        let mut index = self.loan_ips.lock().unwrap();
+        if let Some((saved, ips)) = index.as_mut() {
+            match stamp(&self.state.join("addrs")) {
+                Some(after) if Some(*saved) == before => {
+                    if unannounced_loan(a) {
+                        ips.insert(ip);
+                    } else {
+                        ips.remove(&ip);
+                    }
+                    *saved = after;
+                }
+                _ => *index = None,
+            }
+        }
         if durable {
             let _ = std::fs::remove_file(&marker);
         }
@@ -1380,7 +1402,7 @@ impl Host {
     /// The borrower has claimed the loan: it no longer expires. Repeated claims are idempotent.
     /// Claimed by `borrower`, or from one of the addresses the loan's borrower had when lent.
     pub fn start_loan(&self, l: &Locked, ip: Ipv4Addr, gen: u64, borrower: &str, from: Option<std::net::IpAddr>) -> Result<()> {
-        self.expire_loans(l, wall_ms());
+        self.expire_loan(l, ip, self.addr(l, ip)?, wall_ms())?;
         let a = self.addr(l, ip)?;
         if a.lent != Some(gen) || !a.current(gen) {
             bail!("{ip} generation {gen} is no longer lent");
@@ -1391,20 +1413,49 @@ impl Host {
         self.update(l, ip, true, |a| a.loan.iter_mut().for_each(|b| b.until_ms = None))
     }
 
+    /// Live loans only after the first scan. All address writes are under the host lock;
+    /// our writes update the index, and another process's rename invalidates it.
+    fn loan_addresses(&self, l: &Locked) -> Vec<Ipv4Addr> {
+        let dir = self.state.join("addrs");
+        let current = stamp(&dir);
+        let mut index = self.loan_ips.lock().unwrap();
+        if let Some((_, ips)) = index.as_ref().filter(|(saved, _)| Some(*saved) == current) {
+            return ips.iter().copied().collect();
+        }
+        let ips: std::collections::BTreeSet<_> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .filter(|&ip| self.addr(l, ip).is_ok_and(|a| unannounced_loan(&a)))
+            .collect();
+        let result = ips.iter().copied().collect();
+        *index = current.map(|stamp| (stamp, ips));
+        result
+    }
+
+    /// Withdraws an expired loan; true if it is still unannounced.
+    fn expire_loan(&self, l: &Locked, ip: Ipv4Addr, a: Addr, now: u64) -> Result<bool> {
+        if !unannounced_loan(&a) {
+            return Ok(false);
+        }
+        if a.loan.as_ref().unwrap().until_ms.is_none_or(|until| now < until) {
+            return Ok(true);
+        }
+        self.observe_and(l, ip, a.lent.unwrap(), 0, None, |_| ())?;
+        Ok(false)
+    }
+
     /// Withdraws loans past their expiry; the loans not yet announced that remain.
     /// A record that cannot be read is skipped: it neither expires nor counts.
     fn expire_loans(&self, l: &Locked, now: u64) -> Vec<(Ipv4Addr, Addr)> {
-        let ips = std::fs::read_dir(self.state.join("addrs")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok());
         let mut left = Vec::new();
-        for ip in ips {
+        for ip in self.loan_addresses(l) {
             let Ok(a) = self.addr(l, ip) else { continue };
-            // Lent, and not running anywhere known: neither announced elsewhere nor come home.
-            let (Some(b), Some(gen), None, None) = (&a.loan, a.lent, a.via, &a.holder) else { continue };
-            if b.until_ms.is_none_or(|until| now < until) {
-                left.push((ip, a));
-            } else if let Err(e) = self.observe_and(l, ip, gen, 0, None, |_| ()) {
-                // Withdrawn: a late claim or announcement of this generation is stale.
-                crate::log!("expiring the loan of {ip}: {e}");
+            match self.expire_loan(l, ip, a.clone(), now) {
+                Ok(true) => left.push((ip, a)),
+                Ok(false) => {}
+                Err(e) => crate::log!("expiring the loan of {ip}: {e}"),
             }
         }
         left
@@ -3989,6 +4040,8 @@ impl Host {
 
     fn collect_garbage_with(&self, lost: bool) -> Result<Vec<Withdrawn>> {
         if let Ok(l) = self.lock() {
+            // Rescanned whole: another process's write within one directory mtime tick would leave the index stale.
+            *self.loan_ips.lock().unwrap() = None;
             self.expire_loans(&l, wall_ms());
         }
         collect_dead_taps(&self.run, None);
@@ -6599,6 +6652,40 @@ pub(crate) mod tests {
         // Withdrawn by its borrower: no loan left.
         h.observe_and(&l, n(4), gens[3], 0, None, |_| ()).unwrap();
         assert!(h.addr(&l, n(4)).unwrap().loan.is_none());
+    }
+
+    #[test]
+    fn loan_index_tracks_own_writes_and_reloads_other_process_writes() {
+        // Address operations need only these stores, independent of host setup's
+        // ownership checks on the directories above the test fixture.
+        let dir = crate::test_util::TempDir::new("loan-index");
+        let (state, run) = (dir.join("state"), dir.join("run"));
+        std::fs::create_dir_all(state.join("addrs")).unwrap();
+        std::fs::create_dir_all(run.join("claims")).unwrap();
+        let h = Host {
+            state,
+            run,
+            cfg: Config { vm_ips: "10.9.0.1-10.9.0.3".into(), ..Config::default() },
+            cfg_stamp: None,
+            cfg_seen: Default::default(),
+            loan_ips: Default::default(),
+        };
+        let l = h.lock().unwrap();
+        let first = ip("10.9.0.1");
+        let second = ip("10.9.0.2");
+        let gen = h.lend_new(&l, first, "a", true).unwrap();
+        assert_eq!(h.loan_addresses(&l), [first]);
+        h.observe_and(&l, first, gen, 1, Some(ip("192.0.2.1")), |_| ()).unwrap();
+        assert!(h.loan_addresses(&l).is_empty());
+        // Another process uses the same host lock, but has its own cache.
+        let mut other = h.clone();
+        other.loan_ips = Default::default();
+        let gen = other.lend_new(&l, second, "b", true).unwrap();
+        assert_eq!(h.loan_addresses(&l), [second]);
+        other.update(&l, second, true, |a| a.loan.as_mut().unwrap().until_ms = Some(0)).unwrap();
+        assert!(h.start_loan(&l, second, gen, "b", None).is_err());
+        assert!(h.addr(&l, second).unwrap().withdrawn);
+        assert!(h.loan_addresses(&l).is_empty());
     }
 
     /// A fresh VM is never given this host's gateway or own address (#1078): allocation skips

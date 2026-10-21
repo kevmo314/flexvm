@@ -280,7 +280,7 @@ pub struct Runtime {
     /// Test fault: this many background pull copies fail (ENOMEM), one after another.
     pub pull_fail: AtomicU32,
     /// Initial page states and their origin, applied when Firecracker connects (see `seed`).
-    initial: Mutex<Option<(Runs, Origin)>>,
+    initial: Mutex<Initial>,
     /// Signalled by `seed` and `stop`, for a handshake waiting for the seed.
     seeded: Condvar,
     /// Firecracker connects before the page states are known (a prepared load, see `expect_seed`): the handshake waits
@@ -293,6 +293,19 @@ impl std::ops::Deref for Pager {
     type Target = Runtime;
     fn deref(&self) -> &Runtime {
         &self.runtime
+    }
+}
+
+#[derive(Default)]
+struct Initial {
+    seed: Option<(Runs, Origin)>,
+    consumed: bool,
+}
+
+impl Initial {
+    fn take(&mut self) -> Option<(Runs, Origin)> {
+        self.consumed = true;
+        self.seed.take()
     }
 }
 
@@ -311,7 +324,7 @@ impl Pager {
             // Closed until its VM process attaches it to the host's and refreshes it (`cow::Room::closed`).
             runtime: Runtime {
                 template_next: AtomicUsize::new(usize::MAX),
-                initial: Mutex::new(initial),
+                initial: Mutex::new(Initial { seed: initial, consumed: false }),
                 mem_room: crate::cow::Room::closed(),
                 ..Runtime::default()
             },
@@ -361,10 +374,10 @@ impl Pager {
     /// snapshot.
     pub fn seed(&self, runs: Runs, origin: Origin) -> Result<()> {
         let mut initial = self.initial.lock().unwrap();
-        if self.pages.get().is_some() || initial.is_some() {
+        if initial.consumed || initial.seed.is_some() || self.pages.get().is_some() {
             bail!("pager already seeded");
         }
-        *initial = Some((runs, origin));
+        initial.seed = Some((runs, origin));
         self.seeded.notify_all();
         Ok(())
     }
@@ -423,7 +436,7 @@ impl Pager {
         let initial = {
             // No deadline of its own: the migration's protocol deadline drops the prepared VM, which stops the pager.
             let mut initial = self.initial.lock().unwrap();
-            while initial.is_none() && self.awaiting_seed.load(Ordering::SeqCst) {
+            while initial.seed.is_none() && self.awaiting_seed.load(Ordering::SeqCst) {
                 if self.stop.load(Ordering::SeqCst) {
                     bail!("stopped before the page states arrived");
                 }
@@ -1033,12 +1046,21 @@ impl Pager {
         self.base.working_set.iter().skip(skip).step_by(step).map(|&(f, n)| (f as usize, (f + n) as usize))
     }
 
-    /// `ranges` (as `[first, end)`) cut at region ends and into pieces of at most `max` pages.
+    /// `ranges` (as `[first, end)`) cut at region-relative 2 MiB boundaries and at `max` pages.
     fn chunks<'a>(&'a self, ranges: impl IntoIterator<Item = (usize, usize)> + 'a, max: usize) -> impl Iterator<Item = (usize, usize)> + 'a {
         ranges.into_iter().flat_map(move |(a, b)| {
             self.mappings().iter().flat_map(move |m| {
                 let (from, to) = (a.max(m.span().0), b.min(m.span().1));
-                (from..to).step_by(max).map(move |c| (c, c.saturating_add(max).min(to)))
+                let mut next = from;
+                std::iter::from_fn(move || {
+                    if next >= to {
+                        return None;
+                    }
+                    let first = next;
+                    let chunk = ARM_CHUNK - (first - m.span().0) % ARM_CHUNK;
+                    next = first.saturating_add(max.min(chunk)).min(to);
+                    Some((first, next))
+                })
             })
         })
     }
