@@ -624,7 +624,7 @@ impl Proc {
         if FINISHING.swap(true, Ordering::SeqCst) {
             return false;
         }
-        thread::spawn(move || {
+        let spawned = thread::Builder::new().name("finish-resume".into()).spawn(move || {
             struct Done;
             impl Drop for Done {
                 fn drop(&mut self) {
@@ -676,13 +676,18 @@ impl Proc {
                 crate::log!("vm {}: gave up finishing its resume after {} s: {}", vm.name, GUEST_WAIT.as_secs(), failed.as_deref().unwrap_or("not running"));
             }
         });
+        if let Err(e) = spawned {
+            FINISHING.store(false, Ordering::SeqCst);
+            crate::log!("vm {}: could not finish resume in the background: {e}", self.name());
+            return false;
+        }
         true
     }
 
     /// Release disk admission and a consumed checkpoint once the pull finishes.
     fn watch_checkpoint_pull(&self, vm: Arc<Vm>, dir: PathBuf, to_load: u64) {
         let p = self.arc();
-        thread::spawn(move || {
+        if let Err(e) = thread::Builder::new().name("checkpoint-pull".into()).spawn(move || {
             let pulled = p.as_ref().map_or_else(|| vm.pager.wait_pulled(None), |p| p.wait_pulled(&vm));
             crate::info!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
             if let Some(p) = p {
@@ -696,7 +701,9 @@ impl Proc {
                     delete_consumed(&vm.name.get(), &dir);
                 }
             }
-        });
+        }) {
+            crate::log!("vm {}: could not watch checkpoint pull: {e}", self.name());
+        }
     }
 
     /// Without `cow` the VM stays paused (`Checkpointing`) for the write, and

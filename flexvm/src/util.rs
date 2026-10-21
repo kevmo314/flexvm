@@ -1455,6 +1455,11 @@ pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd], at: Instant) ->
     By { s, at }.write_all(&line[n..])
 }
 
+/// Receives a control request under one deadline, including every fragment.
+pub fn recv_with_fds_by(s: &UnixStream, max: usize, at: Instant) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+    recv_with_fds(s, max, || s.set_read_timeout(Some(By { s: (), at }.left()?)))
+}
+
 /// The peer must send nothing after the line until it has an answer. `ready` is
 /// called before each read: an error ends the wait.
 pub fn recv_with_fds(s: &UnixStream, max: usize, mut ready: impl FnMut() -> io::Result<()>) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
@@ -1467,7 +1472,14 @@ pub fn recv_with_fds(s: &UnixStream, max: usize, mut ready: impl FnMut() -> io::
         }
         ready()?;
         let (n, received) = recvmsg_fds(s.as_raw_fd(), &mut buf)?;
+        // Bound the whole request, including descriptors attached to later fragments.
+        if fds.len() + received.len() > 64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "too many request fds"));
+        }
         fds.extend(received);
+        if line.len() + n > max {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "request line too long"));
+        }
         if n == 0 {
             break;
         }
@@ -2659,6 +2671,44 @@ mod tests {
         a.shutdown(std::net::Shutdown::Read).unwrap();
         assert_eq!((&b).write(b"late\n").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(io::read_to_string(&a).unwrap(), "sent\n");
+    }
+
+    #[test]
+    fn request_fds_are_capped_across_fragments() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let mut reads = 0;
+        let e = recv_with_fds(&b, 64, || {
+            reads += 1;
+            send_with_fds(&a, b"x", &[null.as_raw_fd(); 32], Instant::now() + Duration::from_secs(1))
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        assert_eq!(reads, 3);
+        assert!(e.to_string().contains("too many request fds"));
+    }
+
+    #[test]
+    fn request_trickle_cannot_extend_the_deadline() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        let writer = std::thread::spawn(move || {
+            while (&a).write_all(b" ").is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let e = recv_with_fds_by(&b, 4096, start + Duration::from_millis(100)).unwrap_err();
+        assert!(matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        b.shutdown(std::net::Shutdown::Both).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn request_line_limit_includes_the_final_fragment() {
+        let (a, b) = UnixStream::pair().unwrap();
+        (&a).write_all(b"12345\n").unwrap();
+        assert_eq!(recv_with_fds(&b, 4, || Ok(())).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

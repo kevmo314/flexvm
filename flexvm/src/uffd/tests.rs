@@ -1390,3 +1390,23 @@ fn eagain_with_a_stop_flag_keeps_the_run_and_its_failure_history_clear() {
     assert!(Instant::now() >= deadline);
     assert_eq!(states(&p), [BASE; 4]);
 }
+
+#[test]
+fn seed_is_refused_after_handshake_consumption_before_pages_are_set() {
+    let (_dir, mut pager) = prefetch_pager("late-seed");
+    pager.runtime.pages = OnceLock::new();
+    assert!(pager.initial.lock().unwrap().take().is_none());
+    let origin = Origin::Peer(Source { addr: "127.0.0.1:1".into(), vm: "v".into(), mig: 1, regions: vec![] });
+    assert!(pager.seed(vec![], origin).unwrap_err().to_string().contains("already seeded"));
+    assert!(pager.pages.get().is_none());
+}
+
+#[test]
+fn working_set_chunks_stay_within_region_relative_arm_boundaries() {
+    let (_dir, mut pager) = prefetch_pager("ws-boundaries");
+    pager.runtime.mappings = vec![Mapping { offset: (256 * PAGE_SIZE) as u64, size: 1024 * PAGE_SIZE, base_host_virt_addr: 0 }].into();
+    for max in [PREFETCH_RUN, PULL_RUN] {
+        let runs: Vec<_> = pager.chunks([(750, 800)], max).collect();
+        assert_eq!(runs, [(750, 768), (768, 800)]);
+    }
+}

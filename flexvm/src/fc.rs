@@ -106,12 +106,13 @@ impl Firecracker {
         };
         let id = crate::host::Ident::of(fc.pid()).ok_or_else(|| fc.post_mortem())?;
         crate::host::store(&dir.join("fc"), &id, false)?;
-        retry(ready, Duration::from_micros(200), || -> Result<Result<UnixStream>> {
+        let connection = retry(ready, Duration::from_micros(200), || -> Result<Result<UnixStream>> {
             if !fc.alive() {
                 return Ok(Err(fc.post_mortem().into()));
             }
             Ok(Ok(UnixStream::connect(&fc.sockets.api)?))
         })??;
+        *fc.api.connection.borrow_mut() = Some(BufReader::new(crate::util::By { s: connection, at: std::time::Instant::now() }));
         Ok(fc)
     }
 
@@ -1110,6 +1111,19 @@ mod tests {
         let api = Api::default();
         assert!(call(&api, &server.path).unwrap_err().to_string().contains("400"));
         assert_eq!(call(&api, &server.path).unwrap(), serde_json::json!({"n": 2}));
+    }
+
+    #[test]
+    fn api_uses_the_readiness_connection_for_its_first_request() {
+        let server = Server::new(|listener| {
+            let mut r = accept(&listener);
+            answer(&mut r, NO_CONTENT);
+            no_more(&listener);
+        });
+        let s = UnixStream::connect(&server.path).unwrap();
+        let api = Api::default();
+        *api.connection.borrow_mut() = Some(BufReader::new(crate::util::By { s, at: std::time::Instant::now() }));
+        call(&api, &server.path).unwrap();
     }
 
     #[test]
