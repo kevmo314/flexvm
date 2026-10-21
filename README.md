@@ -1025,6 +1025,8 @@ and `resume_client` include signal dispatch and state polling at 1 ms intervals;
 they are client-observed times, with each trial reporting ten cycles' median.
 Lifecycle checkpoint sizes are in `checkpoint_data_mib`, grouped by dirty-memory
 size with one value per completed trial, outside `summary_ms` and `samples_ms`.
+A lifecycle `--dirty-mib` list that repeats a size is rejected. `host_context` has the
+host's `loadavg` after the run and `loadavg_before` it.
 On a failed trial or SIGINT/SIGTERM, bench cleans up owned VMs and checkpoints,
 writes completed measured samples with `status: failed` and an `error`, then exits
 with an error. Guest execs run in separate client processes, stopped and reaped on
