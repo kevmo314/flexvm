@@ -36,19 +36,27 @@ const TXQ: usize = 10000;
 /// test process, and one that misses a deadline breaks the stream the test checks (#1069).
 const SLACK: u32 = if cfg!(test) { 20 } else { 1 };
 const ACCEPT_WAIT: Duration = Duration::from_secs(1).saturating_mul(SLACK);
-const SYNC_WAIT: Duration = Duration::from_millis(250).saturating_mul(SLACK);
+// The stream's waits for the target, as in production (`SLACK` stretches them in unit tests).
+// Each that waits on the target's injections (all but `ACCEPT_WAIT`) leaves room for all it may
+// wait for a full tap (`TAP_BUDGET`, for its whole stream): a guest slowly taking a backlog never
+// breaks the stream (#1245).
+const SYNC_WAIT_BASE: Duration = Duration::from_millis(250).saturating_add(TAP_BUDGET);
 /// For the target to take the address over: a route change, which waits for RTNL. The
 /// address stays held here meanwhile, so waiting loses nothing.
-const SWITCH_WAIT: Duration = Duration::from_secs(2).saturating_mul(SLACK);
-const FLUSH_WAIT: Duration = Duration::from_millis(400).saturating_mul(SLACK);
-const REPLY_WAIT: Duration = Duration::from_secs(1).saturating_mul(SLACK);
+const SWITCH_WAIT_BASE: Duration = Duration::from_secs(2).saturating_add(TAP_BUDGET);
+const FLUSH_WAIT_BASE: Duration = Duration::from_millis(400).saturating_add(TAP_BUDGET);
+const REPLY_WAIT_BASE: Duration = Duration::from_secs(1).saturating_add(TAP_BUDGET);
+const SYNC_WAIT: Duration = SYNC_WAIT_BASE.saturating_mul(SLACK);
+const SWITCH_WAIT: Duration = SWITCH_WAIT_BASE.saturating_mul(SLACK);
+const FLUSH_WAIT: Duration = FLUSH_WAIT_BASE.saturating_mul(SLACK);
+const REPLY_WAIT: Duration = REPLY_WAIT_BASE.saturating_mul(SLACK);
 /// How long an injection waits for a full tap's guest to take a frame (`Injector::send`): within
-/// the stream's waits for the target (`SYNC_WAIT`, `FLUSH_WAIT`), so a guest that stopped
-/// reading costs one such wait, not one per packet.
+/// the stream's waits for the target, so a guest that stopped reading costs one such wait, not
+/// one per packet.
 const TAP_STALL: Duration = Duration::from_millis(200);
 /// All an injector waits for a full tap, however slowly its guest takes frames: a release (an
-/// address held, a tap plugged meanwhile) is bounded by it.
-const TAP_BUDGET: Duration = Duration::from_secs(1);
+/// address held, a tap plugged meanwhile) is bounded by it, and the stream's waits allow for it.
+pub(crate) const TAP_BUDGET: Duration = Duration::from_secs(1);
 /// Between tries at a full tap.
 const TAP_RETRY: Duration = Duration::from_micros(200);
 /// How long a let-go address's stragglers (`Holder::gone`) are re-sent or counted.
@@ -2012,6 +2020,99 @@ mod tests {
         drop(sender);
     }
 
+    /// A tap opened as Firecracker opens one (without its offloads), deleted when dropped.
+    struct TestTap {
+        name: String,
+        fd: OwnedFd,
+    }
+
+    impl Drop for TestTap {
+        fn drop(&mut self) {
+            crate::net::delete_tap(&self.name);
+        }
+    }
+
+    fn test_tap(prefix: &str) -> TestTap {
+        let name = format!("{prefix}{:x}t0", std::process::id());
+        crate::net::create_tap(&name, "test").unwrap();
+        let raw = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        assert!(raw >= 0, "open /dev/net/tun: {}", std::io::Error::last_os_error());
+        let t = TestTap { name, fd: unsafe { OwnedFd::from_raw_fd(raw) } };
+        let mut req = crate::net::ifreq(&t.name).unwrap();
+        req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+        assert_eq!(unsafe { libc::ioctl(t.fd.as_raw_fd(), libc::TUNSETIFF, &req) }, 0, "TUNSETIFF: {}", std::io::Error::last_os_error());
+        crate::net::set_link_up(&t.name, true).unwrap();
+        t
+    }
+
+    /// A frame off a test tap, as its guest would take it.
+    fn read(fd: &OwnedFd) -> bool {
+        let mut buf = [0u8; 2048];
+        unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) > 0 }
+    }
+
+    /// Needs root: `sudo cargo test -- --ignored`. #1245: a guest taking a backlog slowly (32
+    /// frames every 100 ms: never a stall) has the target wait all of `TAP_BUDGET` for its tap.
+    /// A source on the production waits (not stretched, as `SYNC_WAIT` and the rest are in
+    /// unit tests) still gets each answer in time: the stream is never broken, its reply in.
+    #[test]
+    #[ignore]
+    fn a_slowly_taken_backlog_stays_within_the_production_waits() {
+        let _root = crate::test_util::root_net_lock();
+        let t = test_tap("slo");
+        let (_address, ip) = root_address();
+        let (p, n) = (udp_to(ip), 3 * crate::net::TAP_QUEUE as usize);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (srv, _) = l.accept().unwrap();
+        let stop = AtomicBool::new(false);
+        // Bounded: a failed assertion here would otherwise leave the scope waiting for its guest.
+        let guest_for = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Ordering::SeqCst) && guest_for.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    (0..32).for_each(|_| {
+                        read(&t.fd);
+                    });
+                }
+            });
+            let target = s.spawn(|| {
+                let mut r = BufReader::new(By { s: srv, at: Instant::now() });
+                assert!(wait_start(&mut r, Instant::now() + ACCEPT_WAIT));
+                receive(&mut r, ip, &t.name, true, &Mutex::new(false), Instant::now() + crate::migrate::HELD_STREAM, &mut || true)
+            });
+            // As `send` streams, on the production waits.
+            let start = Instant::now();
+            write_by(&c, &START.to_be_bytes(), start + Duration::from_secs(1)).unwrap();
+            let mut ack = [0u8; 1];
+            By { s: &c, at: start + Duration::from_secs(1) }.read_exact(&mut ack).unwrap();
+            assert_eq!(&ack, b"a");
+            let mut frames = Vec::new();
+            for _ in 0..n {
+                frames.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                frames.extend_from_slice(&p);
+            }
+            for chunk in frames.chunks(48 << 10) {
+                write_by(&c, chunk, Instant::now() + FLUSH_WAIT_BASE).expect("each flush within FLUSH_WAIT");
+            }
+            write_by(&c, &SYNC.to_be_bytes(), Instant::now() + FLUSH_WAIT_BASE).unwrap();
+            let synced = Instant::now();
+            By { s: &c, at: synced + SYNC_WAIT_BASE }.read_exact(&mut ack).expect("confirmed within SYNC_WAIT");
+            assert_eq!(&ack, b"s");
+            let synced = synced.elapsed();
+            write_by(&c, &0u32.to_be_bytes(), Instant::now() + FLUSH_WAIT_BASE).unwrap();
+            let reply = read_reply(&c, Instant::now() + REPLY_WAIT_BASE).expect("the reply within REPLY_WAIT");
+            stop.store(true, Ordering::SeqCst);
+            let refused = target.join().unwrap();
+            let (injected, dropped) = (reply["injected"].as_u64().unwrap(), reply["dropped"].as_u64().unwrap());
+            assert_eq!(injected + dropped, n as u64, "{reply}");
+            assert!(refused > 0 && injected > crate::net::TAP_QUEUE as u64, "it waited for the tap: {reply}, refused {refused}");
+            // Past the 250 ms the stream allowed before (#1245): the target's injection waited.
+            assert!(synced > Duration::from_millis(250), "{reply}: confirmed {synced:?} after SYNC");
+        });
+    }
+
     /// Needs root: `sudo cargo test -- --ignored`. More frames than a tap queues (#1245): a guest
     /// taking them, late, gets them all; one that takes none costs one `TAP_STALL`, the rest
     /// refused at once, as is any once it stalled; a paused one (not waited for) costs nothing;
@@ -2022,31 +2123,22 @@ mod tests {
     #[ignore]
     fn injecting_past_a_full_tap_waits_for_its_guest() {
         let _root = crate::test_util::root_net_lock();
-        let tap = format!("inj{:x}t0", std::process::id());
+        let t = test_tap("inj");
+        let (tap, fd) = (t.name.as_str(), &t.fd);
         let (_address, ip) = root_address();
-        crate::net::create_tap(&tap, "test").unwrap();
-        let raw = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-        assert!(raw >= 0, "open /dev/net/tun: {}", std::io::Error::last_os_error());
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut req = crate::net::ifreq(&tap).unwrap();
-        req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
-        assert_eq!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) }, 0, "TUNSETIFF: {}", std::io::Error::last_os_error());
-        crate::net::set_link_up(&tap, true).unwrap();
         let n = 3 * crate::net::TAP_QUEUE as usize;
         let p = udp_to(ip);
-        let read = |fd: &OwnedFd| {
-            let mut buf = [0u8; 2048];
-            unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) > 0 }
-        };
         let drain = |fd: &OwnedFd| while read(fd) {};
         // A guest that starts taking frames only once the tap is full.
-        let inj = Injector::new(&tap, true).unwrap();
+        let inj = Injector::new(tap, true).unwrap();
         let (stop, got) = (AtomicBool::new(false), AtomicUsize::new(0));
+        // Bounded: a failed assertion here would otherwise leave the scope waiting for its guest.
+        let guest_for = Instant::now();
         let sent = std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(Duration::from_millis(50));
-                while !stop.load(Ordering::SeqCst) {
-                    if read(&fd) {
+                while !stop.load(Ordering::SeqCst) && guest_for.elapsed() < Duration::from_secs(30) {
+                    if read(fd) {
                         got.fetch_add(1, Ordering::SeqCst);
                     } else {
                         std::thread::sleep(Duration::from_micros(50));
@@ -2061,7 +2153,7 @@ mod tests {
         assert_eq!((sent, got.load(Ordering::SeqCst), inj.dropped()), (n, n, 0), "refused {}", inj.refused());
         assert!(inj.refused() > 0, "the tap filled");
         // A guest that takes none: one wait, then the rest refused at once, even after it takes one.
-        let inj = Injector::new(&tap, true).unwrap();
+        let inj = Injector::new(tap, true).unwrap();
         let start = Instant::now();
         let sent = (0..n).filter(|_| inj.send(&p)).count();
         assert_eq!(sent, crate::net::TAP_QUEUE as usize, "as many as the tap queues");
@@ -2069,29 +2161,31 @@ mod tests {
         assert!(inj.refused() >= (n - sent) as u64, "{}", inj.refused());
         assert_eq!(inj.dropped(), 0, "not counted twice");
         // Its ring frees slots a batch at a time.
-        assert!((0..64).all(|_| read(&fd)) && inj.send(&p), "room for one");
+        assert!((0..64).all(|_| read(fd)) && inj.send(&p), "room for one");
         let start = Instant::now();
         let more = (0..200).filter(|_| inj.send(&p)).count();
         assert!(more < 200 && start.elapsed() < TAP_STALL / 2, "no wait once stalled: {more}, {:?}", start.elapsed());
-        drain(&fd);
+        drain(fd);
         // A paused guest: never waited for.
-        let inj = Injector::new(&tap, false).unwrap();
+        let inj = Injector::new(tap, false).unwrap();
         let start = Instant::now();
         let sent = (0..n).filter(|_| inj.send(&p)).count();
         assert_eq!(sent, crate::net::TAP_QUEUE as usize);
         assert!(start.elapsed() < TAP_STALL / 2, "{:?}", start.elapsed());
         assert_eq!((inj.refused(), inj.dropped()), ((n - sent) as u64, 0));
-        drain(&fd);
+        drain(fd);
         // A guest taking 32 frames every 100 ms (its ring frees slots a batch at a time): waited
         // for within the budget, then not.
-        let inj = Injector::new(&tap, true).unwrap();
+        let inj = Injector::new(tap, true).unwrap();
         let stop = AtomicBool::new(false);
+        // Bounded: a failed assertion here would otherwise leave the scope waiting for its guest.
+        let guest_for = Instant::now();
         let (sent, took) = std::thread::scope(|s| {
             s.spawn(|| {
-                while !stop.load(Ordering::SeqCst) {
+                while !stop.load(Ordering::SeqCst) && guest_for.elapsed() < Duration::from_secs(30) {
                     std::thread::sleep(Duration::from_millis(100));
                     (0..32).for_each(|_| {
-                        read(&fd);
+                        read(fd);
                     });
                 }
             });
@@ -2103,9 +2197,9 @@ mod tests {
         assert!(sent > crate::net::TAP_QUEUE as usize && sent < n, "{sent}");
         assert!(took < TAP_BUDGET + TAP_STALL * 3, "{took:?}");
         assert_eq!(inj.dropped(), 0);
-        drain(&fd);
+        drain(fd);
         // A stream broken off (no end, no reply): its refusals are still accounted for.
-        let before = tap_tx_dropped(&tap).unwrap();
+        let before = tap_tx_dropped(tap).unwrap();
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (srv, _) = l.accept().unwrap();
@@ -2124,13 +2218,11 @@ mod tests {
         });
         let mut r = BufReader::new(By { s: srv, at: Instant::now() + Duration::from_secs(10) });
         assert!(wait_start(&mut r, Instant::now() + Duration::from_secs(10)));
-        let accounted = receive(&mut r, ip, &tap, true, &Mutex::new(false), Instant::now() + Duration::from_secs(10), &mut || true);
+        let accounted = receive(&mut r, ip, tap, true, &Mutex::new(false), Instant::now() + Duration::from_secs(10), &mut || true);
         sender.join().unwrap();
-        let counted = tap_tx_dropped(&tap).unwrap() - before;
+        let counted = tap_tx_dropped(tap).unwrap() - before;
         assert!(counted > 0 && accounted == counted, "accounted {accounted} of the tap's {counted}");
-        drain(&fd);
-        drop(fd);
-        crate::net::delete_tap(&tap);
+        drain(fd);
     }
 
     /// Needs root: `sudo cargo test -- --ignored`. A sender that looked the route up before a

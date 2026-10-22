@@ -41,7 +41,7 @@ const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 /// preflight (`incoming_gate`) or right after it (`leave_gate`) lets it go when it is done, not against them.
 pub const LONG_PREFLIGHT: Duration = Duration::from_secs(300);
 const HOLD_FENCE: Duration = Duration::from_millis(250);
-const HELD_STREAM: Duration = Duration::from_secs(2);
+pub(crate) const HELD_STREAM: Duration = Duration::from_secs(2).saturating_add(crate::hold::TAP_BUDGET);
 /// How long a same-host target's hold, let go, watches for a packet sent along the old route
 /// (the VM runs meanwhile: no downtime).
 const STRAGGLERS: Duration = Duration::from_millis(5);
