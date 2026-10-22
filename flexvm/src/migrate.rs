@@ -41,7 +41,7 @@ const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 /// preflight (`incoming_gate`) or right after it (`leave_gate`) lets it go when it is done, not against them.
 pub const LONG_PREFLIGHT: Duration = Duration::from_secs(300);
 const HOLD_FENCE: Duration = Duration::from_millis(250);
-const HELD_STREAM: Duration = Duration::from_secs(2);
+pub(crate) const HELD_STREAM: Duration = Duration::from_secs(2).saturating_add(crate::hold::TAP_BUDGET);
 /// How long a same-host target's hold, let go, watches for a packet sent along the old route
 /// (the VM runs meanwhile: no downtime).
 const STRAGGLERS: Duration = Duration::from_millis(5);
@@ -1116,9 +1116,8 @@ impl Proc {
             crate::host::stall("handoff_stall");
             crate::host::gate("handoff_gate");
             if hold::wait_start(&mut r, (fence + HOLD_FENCE).min(deadline)) {
-                if let Some(reported) = hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over) {
-                    vm.tap_drops_reported(reported);
-                }
+                let running = vm.state() == State::Running;
+                vm.tap_drops_reported(hold::receive(&mut r, vm.ip, &vm.tap, running, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over));
             } else {
                 crate::log!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
             }
@@ -1597,7 +1596,8 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
     if !h.holding_for(ip, mig) {
         return (None, Ok(()));
     }
-    let inj = match crate::net::set_link_up(&vm.tap, true).and_then(|()| hold::Injector::new(&vm.tap)) {
+    // A paused guest (an abort's, a checkpoint's, before they resume it) takes nothing: not waited for.
+    let inj = match crate::net::set_link_up(&vm.tap, true).and_then(|()| hold::Injector::new(&vm.tap, vm.state() == State::Running)) {
         Ok(inj) => inj,
         Err(e) => {
             crate::log!("vm {}: dropping held packets: {e}", vm.name);
@@ -1613,7 +1613,8 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
     }
     let tap_dropped = inj.dropped();
     (stats.injected, stats.dropped_target) = (stats.packets, tap_dropped);
-    vm.tap_drops_reported(tap_dropped);
+    // Its refused sends are in the tap's count too: in `stats.dropped` where never taken.
+    vm.tap_drops_reported(tap_dropped + inj.refused());
     // Closing a packet socket waits for an RCU grace period; the VM need not.
     thread::spawn(move || drop(inj));
     (Some(stats), switched)
