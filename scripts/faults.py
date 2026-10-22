@@ -930,6 +930,100 @@ def basic(swept=False):
     check("basic: an unknown id is fenced as aborted", s3["result"]["outcome"] == "aborted", s3)
 
 
+EVAC_MAX = int(os.environ.get("EVAC_MAX", "12"))
+EVAC_MIB = int(os.environ.get("EVAC_MIB", "32"))
+
+
+def evacuate():
+    """Many small VMs, memory dirtied in each, all migrated A->B at once (post-copy): each arrives running
+    with its address and memory, no address is on both hosts, every release completes, B's records retire
+    once A says done, and both listeners answer meanwhile. As many VMs as memory allows (EVAC_MAX at most):
+    started while MemAvailable stays above 6 GiB, the run stopped below 5 GiB."""
+    if mem_available() < 8 << 10:
+        raise Skip(f"needs 8 GiB available, has {mem_available()} MiB")
+    low = threading.Event()
+    stop = threading.Event()
+
+    def watch():
+        while not stop.wait(1):
+            if mem_available() < 5 << 10:
+                low.set()
+                return
+
+    watcher = start_thread(target=watch, daemon=True)
+    earlier = set(undone_migs(os.path.join(B.state, "migs")))
+    names, digest = [], {}
+    try:
+        while len(names) < EVAC_MAX and mem_available() >= 6 << 10 and not low.is_set():
+            n = f"ft-ev-{len(names)}"
+            digest[n] = setup(n, mib=EVAC_MIB)
+            names.append(n)
+        check(f"evacuate: started {len(names)} VMs ({mem_available()} MiB left)", len(names) >= 2 and not low.is_set(), len(names))
+        if low.is_set():
+            return
+        before = vms(A)
+        ips = {n: before[n]["ip"] for n in names}
+        check("evacuate: distinct addresses on A", len(set(ips.values())) == len(names), {ip: [n for n in names if ips[n] == ip] for ip in ips.values() if list(ips.values()).count(ip) > 1})
+        results, latency = {}, {A: [], B: []}
+
+        def go(n):
+            t = time.time()
+            results[n] = (migrate(A, n, B, timeout=300), time.time() - t)
+
+        def ask(h):
+            while not stop.is_set() and not low.is_set():
+                t = time.time()
+                r = peer(h, {"op": "migration", "mig": 12345}, timeout=10)
+                latency[h].append((time.time() - t, r.get("ok")))
+                time.sleep(0.5)
+
+        askers = [start_thread(target=ask, args=(h,), daemon=True) for h in (A, B)]
+        t0 = time.time()
+        threads = []
+        for n in names:
+            threads.append(start_thread(target=go, args=(n,)))
+            time.sleep(0.1)
+        for t in threads:
+            t.join()
+        took = time.time() - t0
+        failed = {n: r for n, (r, _) in results.items() if not r["ok"]}
+        check(f"evacuate: all {len(names)} migrate calls succeed (in {took:.1f} s, slowest {max(d for _, d in results.values()):.1f} s)",
+              not failed and not low.is_set(), failed)
+        released = {n: wait_released(B, n, timeout=300) for n in names}
+        took = time.time() - t0
+        check(f"evacuate: every release completes ({took:.1f} s after the first migrate)",
+              all(r["released"] is True and not r["failed"] for r in released.values()),
+              {n: r for n, r in released.items() if r["released"] is not True or r["failed"]})
+        on_a, on_b = vms(A), vms(B)
+        live = lambda v: {n: x for n, x in v.items() if x.get("pid") and n in names}
+        on_a, on_b = live(on_a), live(on_b)
+        check("evacuate: none left on A", not on_a, sorted(on_a))
+        check("evacuate: each running on B with its address",
+              all(on_b.get(n, {}).get("state") == "running" and on_b[n]["ip"] == ips[n] for n in names),
+              {n: (on_b.get(n, {}).get("state"), on_b.get(n, {}).get("ip"), ips[n]) for n in names if on_b.get(n, {}).get("ip") != ips[n] or on_b.get(n, {}).get("state") != "running"})
+        everywhere = [v["ip"] for h in (A, B) for v in vms(h).values() if v.get("pid")]
+        dup = {ip for ip in everywhere if everywhere.count(ip) > 1}
+        check("evacuate: no address on two VMs", not dup, dup)
+        bad = {n: m for n in names if (m := md5(B, n, tries=3)) != digest[n]}
+        check("evacuate: memory intact on B", not bad, bad)
+        mine = lambda: set(undone_migs(os.path.join(B.state, "migs"))) - earlier
+        check("evacuate: B's records retire once A says done", wait_for(lambda: not mine(), 60), sorted(mine()))
+        stop.set()
+        for t in askers:
+            t.join()
+        for h in (A, B):
+            worst = max((d for d, _ in latency[h]), default=0)
+            check(f"evacuate: {h}'s listener answered throughout (worst {worst:.2f} s of {len(latency[h])})",
+                  latency[h] and all(r for _, r in latency[h]) and worst < 3, [x for x in latency[h] if not x[1] or x[0] >= 3][:5])
+    finally:
+        stop.set()
+        check("evacuate: MemAvailable stayed above 5 GiB", not low.is_set(), mem_available())
+        # Gone at once, not after the scenario: memory is what this scenario is short of.
+        for n in names:
+            for h in (A, B):
+                kill(h, n)
+
+
 def route():
     n = "ft-route"
     m = setup(n)
@@ -12259,7 +12353,7 @@ SCENARIOS = dict(
     start_admission=start_admission, ckpt_prefetch_hold=ckpt_prefetch_hold, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
-    basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
+    basic=basic, evacuate=evacuate, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
     quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_burst=exec_burst, exec_stalled_cap=exec_stalled_cap, exec_pause_grace=exec_pause_grace, exec_ckpt_stalled=exec_ckpt_stalled, guest_hang=guest_hang,
     source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded,
