@@ -968,13 +968,20 @@ def evacuate():
 
         def go(n):
             t = time.time()
-            results[n] = (migrate(A, n, B, timeout=300), time.time() - t)
+            try:
+                r = migrate(A, n, B, timeout=300)
+            except Exception as e:  # a timeout included: a migrate that never answered failed
+                r = {"ok": False, "error": repr(e)}
+            results[n] = (r, time.time() - t)
 
         def ask(h):
             while not stop.is_set() and not low.is_set():
                 t = time.time()
-                r = peer(h, {"op": "migration", "mig": 12345}, timeout=10)
-                latency[h].append((time.time() - t, r.get("ok")))
+                try:
+                    r = peer(h, {"op": "migration", "mig": 12345}, timeout=10)
+                    latency[h].append((time.time() - t, r.get("ok"), r.get("error")))
+                except Exception as e:  # unanswered or garbled: a failed sample, and monitoring goes on
+                    latency[h].append((time.time() - t, False, repr(e)))
                 time.sleep(0.5)
 
         askers = [start_thread(target=ask, args=(h,), daemon=True) for h in (A, B)]
@@ -986,8 +993,8 @@ def evacuate():
         for t in threads:
             t.join()
         took = time.time() - t0
-        failed = {n: r for n, (r, _) in results.items() if not r["ok"]}
-        check(f"evacuate: all {len(names)} migrate calls succeed (in {took:.1f} s, slowest {max(d for _, d in results.values()):.1f} s)",
+        failed = {n: results[n][0] if n in results else "no result" for n in names if n not in results or not results[n][0]["ok"]}
+        check(f"evacuate: all {len(names)} migrate calls succeed (in {took:.1f} s, slowest {max((d for _, d in results.values()), default=0):.1f} s)",
               not failed and not low.is_set(), failed)
         released = {n: wait_released(B, n, timeout=300) for n in names}
         took = time.time() - t0
@@ -1012,9 +1019,9 @@ def evacuate():
         for t in askers:
             t.join()
         for h in (A, B):
-            worst = max((d for d, _ in latency[h]), default=0)
+            worst = max((d for d, _, _ in latency[h]), default=0)
             check(f"evacuate: {h}'s listener answered throughout (worst {worst:.2f} s of {len(latency[h])})",
-                  latency[h] and all(r for _, r in latency[h]) and worst < 3, [x for x in latency[h] if not x[1] or x[0] >= 3][:5])
+                  latency[h] and all(ok for _, ok, _ in latency[h]) and worst < 3, [x for x in latency[h] if not x[1] or x[0] >= 3][:5])
     finally:
         stop.set()
         check("evacuate: MemAvailable stayed above 5 GiB", not low.is_set(), mem_available())
