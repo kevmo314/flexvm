@@ -643,8 +643,9 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
     let op = req["op"].as_str().unwrap_or("");
     // Done must get through even when this source's release polls fill its migration cap.
     let migration_slot = if op == "migration" && req["done"] != true { slot.as_ref().map(|s| MIGRATIONS.take(s.1).ok_or(BUSY)).transpose() } else { Ok(None) };
-    // Migration reads reacquire both slots; neither is held across a long-poll sleep.
-    let active = if op == "migration" { slot.take().map(|s| (s.0.clone(), s.1)) } else { None };
+    // Migration reads reacquire both slots; neither is held across a long-poll sleep. Done never
+    // sleeps on a poll, so it keeps its active slot (its peer lookup wait included) for its life.
+    let active = if op == "migration" && req["done"] != true { slot.take().map(|s| (s.0.clone(), s.1)) } else { None };
     let slots = || {
         let active = active.as_ref().map(|(pool, from)| pool.take(*from).ok_or(BUSY)).transpose()?;
         let locking = Slot::take(locking, MAX_LOCKING).ok_or(BUSY)?;
