@@ -1115,17 +1115,19 @@ fn run_attached(host: &Host, name: &str, keep: bool, started: &host::Ident) -> R
     let (code, last, name) = attach::attach_to(host, name, Some(0))?;
     let name = name.as_str();
     let vm = last.as_ref().unwrap_or(started);
-    let until = Instant::now() + Duration::from_secs(10);
-    while !keep && host.alive(name) && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // Test gate: its app's status in, its records not yet removed.
-    host::hold("attached_cleanup_gate");
-    let last_name = containers::last_name(host, name, vm).map(|(name, _)| name);
-    let name = last_name.as_deref().unwrap_or(name);
-    if !keep && !host.alive(name) && host.vms(name, "exited")?.exists() {
-        // Its log stays, as a foreground run's without a terminal (its diagnostics are there alone).
-        let _ = remove_stopped(host, name, true, false, Some(vm), false);
+    if !keep {
+        let until = Instant::now() + Duration::from_secs(10);
+        while host.alive(name) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Test gate: its app's status in, its records not yet removed.
+        host::hold("attached_cleanup_gate");
+        let last_name = containers::last_name(host, name, vm).map(|(name, _)| name);
+        let name = last_name.as_deref().unwrap_or(name);
+        if !host.alive(name) && host.vms(name, "exited")?.exists() {
+            // Its log stays, as a foreground run's without a terminal (its diagnostics are there alone).
+            let _ = remove_stopped(host, name, true, false, Some(vm), false);
+        }
     }
     util::exit(code)
 }
@@ -2570,6 +2572,14 @@ mod exec_tests {
                 cmd.env("FLEXVM_TEST_ATTACHED_KEEP", "1");
             }
             let mut child = crate::test_util::ChildGuard(cmd.spawn().unwrap());
+            if keep {
+                crate::test_util::wait_until("kept attached run to exit", || child.try_wait().unwrap().is_some());
+                assert_eq!(child.wait().unwrap().code(), Some(4));
+                assert!(host.has_record("old", "exited"));
+                assert!(host.has_record("old", "log"));
+                assert_eq!(containers::exit_record(&host, "old").unwrap().ident, ours);
+                continue;
+            }
             let marker = host.run.join(format!("gates/attached_cleanup_gate.{}", child.id()));
             crate::test_util::wait_until("attached cleanup gate", || marker.exists());
             // The attachment returned and its end wait finished: a late rename must still be found.
@@ -2581,7 +2591,7 @@ mod exec_tests {
             std::fs::remove_file(marker).unwrap();
             crate::test_util::wait_until("attached run to exit", || child.try_wait().unwrap().is_some());
             assert_eq!(child.wait().unwrap().code(), Some(4));
-            assert_eq!(host.has_record("new", "exited"), keep);
+            assert!(!host.has_record("new", "exited"));
             assert!(host.has_record("new", "log"), "foreground diagnostics stay");
             assert!(host.has_record("old", "exited"), "the replacement stays");
             assert_eq!(containers::exit_record(&host, "old").unwrap().ident, replacement);
