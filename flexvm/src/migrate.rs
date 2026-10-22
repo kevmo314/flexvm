@@ -2228,10 +2228,8 @@ mod tests {
         let (at, asked) = answering(json!({"outcome": "released", "token": "target"}));
         reached("unresolvable.invalid:7070", at, Some("target")).record(&host, 3).unwrap();
         assert_eq!(owed_outcome(&host, "unresolvable.invalid:7070", 3).unwrap(), "released");
+        // #1241: a spent shared budget still allows one attempt.
         owed_done(&host, "unresolvable.invalid:7070", 3, Instant::now());
-        assert!(Reached::load(&host, 3).unwrap().is_some(), "no acknowledgement budget: keep the record");
-        assert_eq!(asked.load(Ordering::SeqCst), 1);
-        owed_done(&host, "unresolvable.invalid:7070", 3, Instant::now() + Duration::from_secs(5));
         assert_eq!(asked.load(Ordering::SeqCst), 2);
         assert!(Reached::load(&host, 3).unwrap().is_none());
         assert!(owed_outcome(&host, "unresolvable.invalid:7070", 3).is_err(), "by name, which does not resolve");
