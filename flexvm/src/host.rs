@@ -2861,13 +2861,16 @@ impl Host {
         ids.sort_unstable();
         let start = last.map_or(0, |last| ids.partition_point(|id| *id <= last));
         ids.rotate_left(start);
-        let (mut unavailable, mut spent, mut seen) = (HashSet::new(), 0, None);
+        let (mut unavailable, mut spent, mut seen, mut skipped) = (HashSet::new(), 0, None, false);
         // Done ones only go once their day is up, costing no peer call nor budget (but a read).
         for &id in ids.iter().take(budget.saturating_mul(200)) {
             if spent == budget {
                 break;
             }
-            seen = Some(id);
+            let previous = seen;
+            if !skipped {
+                seen = Some(id);
+            }
             let (source, token, peer, by) = match load(&self.mig_path(id)) {
                 Ok(Some(Mig::Released { done_until_ms: Some(until), .. })) => {
                     if wall_ms() >= until {
@@ -2889,6 +2892,9 @@ impl Host {
             }
             let Some(by) = by.filter(|_| !source.is_empty()) else { continue };
             if unavailable.contains(&source) {
+                // Resume at the first skipped record, even if later sources answer.
+                seen = previous;
+                skipped = true;
                 continue;
             }
             match query(&source, token.as_deref(), peer, &by) {
@@ -10006,12 +10012,53 @@ pub(crate) mod tests {
         assert_eq!(queried, [1, 2, 4, 5]);
         assert_eq!(h.mig_status(4).unwrap(), "released");
         assert!([1, 2, 3, 5, 6, 7, 8].iter().all(|id| h.mig_path(*id).exists()));
+        assert_eq!(load::<u64>(&h.run.join(".retire.next")).unwrap(), Some(2));
         queried.clear();
         h.retire_migrations_with(3, |_, _, _, by| {
             queried.push(by.start);
             Ok(false)
         });
-        assert_eq!(queried, [1, 2, 3], "a later pass retries the endpoint");
+        assert_eq!(queried, [3, 5, 6], "a later pass starts at the first skipped record");
+    }
+
+    #[test]
+    fn retirement_retries_skipped_records_across_wraparound() {
+        let (_h_dir, h) = host("retire-skipped");
+        for id in 1..=3 {
+            released_migration(&h, id, "unreachable");
+        }
+        for expected in [1, 2, 3, 1] {
+            let mut queried = Vec::new();
+            h.retire_migrations_with(3, |_, _, _, by| {
+                queried.push(by.start);
+                Err("source unavailable".into())
+            });
+            assert_eq!(queried, [expected]);
+            assert_eq!(load::<u64>(&h.run.join(".retire.next")).unwrap(), Some(expected));
+        }
+        assert!((1..=3).all(|id| matches!(load::<Mig>(&h.mig_path(id)).unwrap(), Some(Mig::Released { done_until_ms: None, .. }))));
+    }
+
+    #[test]
+    fn retirement_identity_doubt_does_not_block_later_records() {
+        let (_h_dir, h) = host("retire-identity");
+        for (id, source) in [(150, "source"), (200, "other"), (201, "source"), (202, "source")] {
+            released_migration(&h, id, source);
+            let mut record = load::<Mig>(&h.mig_path(id)).unwrap().unwrap();
+            if let Mig::Released { token, .. } = &mut record {
+                *token = Some(if id == 201 { "stale" } else { "right" }.into());
+            }
+            store(&h.mig_path(id), &record, false).unwrap();
+        }
+        let mut queried = Vec::new();
+        h.retire_migrations_with(4, |_, token, _, by| {
+            queried.push(by.start);
+            Ok(token == Some("right"))
+        });
+        assert_eq!(queried, [150, 200, 201, 202]);
+        for id in [150, 200, 201, 202] {
+            assert!(matches!(load::<Mig>(&h.mig_path(id)).unwrap(), Some(Mig::Released { done_until_ms, .. }) if done_until_ms.is_some() == (id != 201)));
+        }
     }
 
     #[test]

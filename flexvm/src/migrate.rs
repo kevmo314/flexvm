@@ -247,15 +247,17 @@ fn peer_query(at: &str, token: Option<&str>, req: Value) -> Result<Value> {
 
 pub(crate) fn source_gone(source: &str, token: Option<&str>, peer: Option<IpAddr>, by: &crate::host::Ident) -> Result<bool> {
     let (conn, r) = crate::util::rpc(source, Duration::from_millis(500), Instant::now() + Duration::from_secs(2), &json!({"op": "source", "ident": by}))?;
+    Ok(source_reply_gone(token, peer, conn.peer_addr().ok().map(|a| a.ip()), &r))
+}
+
+fn source_reply_gone(token: Option<&str>, peer: Option<IpAddr>, connected: Option<IpAddr>, r: &Value) -> bool {
     // Before host tokens were kept, only the recorded connection peer can vouch for the source.
     let same = match token {
         Some(token) => r["token"].as_str() == Some(token),
-        None => peer.is_some_and(|p| conn.peer_addr().is_ok_and(|a| a.ip().to_canonical() == p.to_canonical())),
+        None => peer.is_some_and(|p| connected.is_some_and(|a| a.to_canonical() == p.to_canonical())),
     };
-    if !same {
-        bail!("{source} is not the recorded migration source");
-    }
-    Ok(r["gone"] == true)
+    // Identity doubt belongs to this record, not every record at the address.
+    same && r["gone"] == true
 }
 
 /// The outcome of migration `mig` to `to`, owed since its source here died (`Host::settle_owed`): asked where
@@ -2077,6 +2079,24 @@ mod tests {
         std::fs::write(Reached::path(&host, 4), "{").unwrap();
         assert!(owed_outcome(&host, &at.to_string(), 4).is_err());
         assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn source_reply_requires_the_recorded_identity_and_explicit_gone() {
+        let peer = Some("192.0.2.1".parse().unwrap());
+        let mapped = Some("::ffff:192.0.2.1".parse().unwrap());
+        let other = Some("192.0.2.2".parse().unwrap());
+        let gone = json!({"token": "right", "gone": true});
+        assert!(source_reply_gone(Some("right"), peer, other, &gone));
+        assert!(!source_reply_gone(Some("stale"), peer, peer, &gone));
+        assert!(!source_reply_gone(Some("right"), peer, peer, &json!({"gone": true})), "older sources cannot vouch for a token");
+        assert!(source_reply_gone(None, peer, mapped, &json!({"gone": true})));
+        assert!(!source_reply_gone(None, peer, other, &gone));
+        assert!(!source_reply_gone(None, peer, None, &gone));
+        assert!(!source_reply_gone(None, None, peer, &gone));
+        for reply in [json!({"token": "right"}), json!({"token": "right", "gone": false}), json!({"token": "right", "gone": "true"})] {
+            assert!(!source_reply_gone(Some("right"), peer, peer, &reply));
+        }
     }
 
     /// A record goes once its source is gone and owes nothing; a live source's stays.
