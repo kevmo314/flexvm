@@ -1116,9 +1116,8 @@ impl Proc {
             crate::host::stall("handoff_stall");
             crate::host::gate("handoff_gate");
             if hold::wait_start(&mut r, (fence + HOLD_FENCE).min(deadline)) {
-                if let Some(reported) = hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over) {
-                    vm.tap_drops_reported(reported);
-                }
+                let running = vm.state() == State::Running;
+                vm.tap_drops_reported(hold::receive(&mut r, vm.ip, &vm.tap, running, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over));
             } else {
                 crate::log!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
             }
@@ -1597,7 +1596,8 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
     if !h.holding_for(ip, mig) {
         return (None, Ok(()));
     }
-    let inj = match crate::net::set_link_up(&vm.tap, true).and_then(|()| hold::Injector::new(&vm.tap)) {
+    // A paused guest (an abort's, a checkpoint's, before they resume it) takes nothing: not waited for.
+    let inj = match crate::net::set_link_up(&vm.tap, true).and_then(|()| hold::Injector::new(&vm.tap, vm.state() == State::Running)) {
         Ok(inj) => inj,
         Err(e) => {
             crate::log!("vm {}: dropping held packets: {e}", vm.name);
