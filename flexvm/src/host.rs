@@ -2699,7 +2699,7 @@ impl Host {
     /// and at the peers, which frees the address. Otherwise it is asked again.
     pub fn settle_owed(&self) {
         let host = self.clone();
-        // Foreground GC shares one acknowledgement budget across the whole pass.
+        // Foreground GC shares one retry budget from its first done; each record still gets one two-second attempt.
         let mut deadline = None;
         self.settle_owed_with(
             5,
