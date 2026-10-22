@@ -2696,10 +2696,12 @@ impl Host {
     /// and at the peers, which frees the address. Otherwise it is asked again.
     pub fn settle_owed(&self) {
         let host = self.clone();
+        // Foreground GC shares one acknowledgement budget across the whole pass.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         self.settle_owed_with(
             5,
             |to, id| crate::migrate::owed_outcome(&host, to, id),
-            |to, id| crate::migrate::owed_done(&host, to, id),
+            |to, id| crate::migrate::owed_done(&host, to, id, deadline),
             |_, _| host.deliver_withdrawals(),
         );
     }
