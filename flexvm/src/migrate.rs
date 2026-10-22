@@ -245,9 +245,27 @@ fn peer_query(at: &str, token: Option<&str>, req: Value) -> Result<Value> {
     Ok(r)
 }
 
-pub(crate) fn source_gone(source: &str, token: Option<&str>, peer: Option<IpAddr>, by: &crate::host::Ident) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceReply {
+    Gone,
+    Keep,
+    Mismatch,
+}
+
+pub(crate) fn source_gone(source: &str, token: Option<&str>, peer: Option<IpAddr>, by: &crate::host::Ident) -> Result<SourceReply> {
     let (conn, r) = crate::util::rpc(source, Duration::from_millis(500), Instant::now() + Duration::from_secs(2), &json!({"op": "source", "ident": by}))?;
-    Ok(source_reply_gone(token, peer, conn.peer_addr().ok().map(|a| a.ip()), &r))
+    Ok(source_reply(token, peer, conn.peer_addr().ok().map(|a| a.ip()), &r))
+}
+
+fn source_reply(token: Option<&str>, peer: Option<IpAddr>, connected: Option<IpAddr>, r: &Value) -> SourceReply {
+    // A missing token (an older peer) is doubt, not evidence of a different host.
+    if token.zip(r["token"].as_str()).is_some_and(|(expected, actual)| expected != actual) {
+        SourceReply::Mismatch
+    } else if source_reply_gone(token, peer, connected, r) {
+        SourceReply::Gone
+    } else {
+        SourceReply::Keep
+    }
 }
 
 fn source_reply_gone(token: Option<&str>, peer: Option<IpAddr>, connected: Option<IpAddr>, r: &Value) -> bool {
@@ -2197,6 +2215,22 @@ mod tests {
         std::fs::write(Reached::path(&host, 4), "{").unwrap();
         assert!(owed_outcome(&host, &at.to_string(), 4).is_err());
         assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn source_mismatch_requires_an_explicit_different_token() {
+        for (reply, expected) in [
+            (json!({"token": "other", "gone": true}), SourceReply::Mismatch),
+            (json!({"token": "other", "gone": false}), SourceReply::Mismatch),
+            (json!({"token": "right", "gone": true}), SourceReply::Gone),
+            (json!({"token": "right", "gone": false}), SourceReply::Keep),
+            (json!({"gone": true}), SourceReply::Keep),
+            (json!({"token": null}), SourceReply::Keep),
+            (json!({"token": 7}), SourceReply::Keep),
+        ] {
+            assert_eq!(source_reply(Some("right"), None, None, &reply), expected);
+        }
+        assert_eq!(source_reply(None, None, None, &json!({"token": "other", "gone": true})), SourceReply::Keep);
     }
 
     #[test]

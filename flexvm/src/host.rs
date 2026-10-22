@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::bail;
+use crate::migrate::SourceReply;
 use crate::net::IpRange;
 use crate::util::{Error, Result};
 
@@ -26,6 +27,8 @@ const MAX_UNANNOUNCED_LOANS: usize = 64;
 pub(crate) const LOAN_WAIT_MS: u64 = 5 * 60 * 1000;
 /// Legacy released records with no verifiable source identity expire after thirty days.
 const MIG_LEGACY_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Retry unavailable retirement sources after one minute.
+const RETIRE_RETRY_MS: u64 = 60_000;
 /// How long a done migration's outcome is kept (`Host::mig_done`).
 const MIG_DONE_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -2576,11 +2579,11 @@ impl Host {
     pub fn mig_done(&self, id: u64) -> Result<bool> {
         let l = self.lock()?;
         match load(&self.mig_path(id))? {
-            Some(Mig::Released { ip, source, token, peer, by, done_until_ms: None }) => {
+            Some(Mig::Released { ip, source, token, peer, by, done_until_ms: None, .. }) => {
                 if let Some(ip) = ip {
                     self.settle_arrived(&l, ip, id)?;
                 }
-                let done = Mig::Released { source, token, peer, by, ip: None, done_until_ms: Some(wall_ms() + MIG_DONE_MS) };
+                let done = Mig::Released { source, token, peer, by, ip: None, done_until_ms: Some(wall_ms() + MIG_DONE_MS), mismatch_since_ms: None };
                 store(&self.mig_path(id), &done, true)?;
                 Ok(true)
             }
@@ -2697,11 +2700,11 @@ impl Host {
     pub fn settle_owed(&self) {
         let host = self.clone();
         // Foreground GC shares one acknowledgement budget across the whole pass.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut deadline = None;
         self.settle_owed_with(
             5,
             |to, id| crate::migrate::owed_outcome(&host, to, id),
-            |to, id| crate::migrate::owed_done(&host, to, id, deadline),
+            |to, id| crate::migrate::owed_done(&host, to, id, owed_deadline(&mut deadline, std::time::Instant::now())),
             |_, _| host.deliver_withdrawals(),
         );
     }
@@ -2841,13 +2844,17 @@ impl Host {
     }
 
     /// Retires aborted arrivals and released records whose source is proven gone.
-    /// Any doubt keeps the record, except identity-less legacy releases after thirty days.
+    /// Any doubt keeps the record, except legacy releases and continuous token mismatches after thirty days.
     pub fn retire_migrations(&self) {
-        // At most five records (and thus five two-second peer calls) per pass.
+        // At most five peer calls per pass; cached unavailable sources cost only a bounded scan.
         self.retire_migrations_with(5, crate::migrate::source_gone);
     }
 
-    fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, Option<&str>, Option<IpAddr>, &Ident) -> Result<bool>) {
+    fn retire_migrations_with(&self, budget: usize, query: impl FnMut(&str, Option<&str>, Option<IpAddr>, &Ident) -> Result<SourceReply>) {
+        self.retire_migrations_at(budget, wall_ms(), query);
+    }
+
+    fn retire_migrations_at(&self, budget: usize, now: u64, mut query: impl FnMut(&str, Option<&str>, Option<IpAddr>, &Ident) -> Result<SourceReply>) {
         let Ok(lock) = private_file(&locks(&self.run).join("retire")) else { return };
         let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
         // Migration writers hold the host lock; never sweep an in-progress write.
@@ -2863,24 +2870,28 @@ impl Host {
         ids.sort_unstable();
         let start = last.map_or(0, |last| ids.partition_point(|id| *id <= last));
         ids.rotate_left(start);
-        let (mut unavailable, mut spent, mut seen, mut skipped) = (HashSet::new(), 0, None, false);
+        let retry = self.run.join(".retire.unavailable");
+        let mut unavailable = load::<HashMap<String, u64>>(&retry).ok().flatten().unwrap_or_default();
+        unavailable.retain(|_, until| *until > now && *until <= now.saturating_add(RETIRE_RETRY_MS));
+        let (mut spent, mut seen) = (0, None);
         // Done ones only go once their day is up, costing no peer call nor budget (but a read).
         for &id in ids.iter().take(budget.saturating_mul(200)) {
             if spent == budget {
                 break;
             }
-            let previous = seen;
-            if !skipped {
-                seen = Some(id);
-            }
-            let (source, token, peer, by) = match load(&self.mig_path(id)) {
-                Ok(Some(Mig::Released { done_until_ms: Some(until), .. })) => {
+            seen = Some(id);
+            let Ok(Some(record)) = load::<Mig>(&self.mig_path(id)) else {
+                spent += 1;
+                continue;
+            };
+            let (source, token, peer, by) = match record.clone() {
+                Mig::Released { done_until_ms: Some(until), .. } => {
                     if wall_ms() >= until {
                         let _ = crate::util::unlink_durably(&self.mig_path(id));
                     }
                     continue;
                 }
-                Ok(Some(Mig::Released { source, token, peer, by, .. })) => (source, token, peer, by),
+                Mig::Released { source, token, peer, by, .. } => (source, token, peer, by),
                 _ => {
                     spent += 1;
                     let _ = self.mig_status(id);
@@ -2893,29 +2904,54 @@ impl Host {
                 continue;
             }
             let Some(by) = by.filter(|_| !source.is_empty()) else { continue };
-            if unavailable.contains(&source) {
-                // Resume at the first skipped record, even if later sources answer.
-                seen = previous;
-                skipped = true;
+            if unavailable.contains_key(&source) {
+                spent -= 1;
+                self.retire_reply(id, &record, SourceReply::Keep, now);
                 continue;
             }
-            match query(&source, token.as_deref(), peer, &by) {
-                Ok(true) => {
-                    crate::info!("migration {id}: its source at {source} is gone; forgetting it");
-                    let _ = self.mig_done(id);
-                }
-                Ok(false) => (),
-                Err(_) => {
-                    unavailable.insert(source);
-                }
-            }
+            let reply = query(&source, token.as_deref(), peer, &by).unwrap_or_else(|_| {
+                unavailable.insert(source, now.saturating_add(RETIRE_RETRY_MS));
+                SourceReply::Keep
+            });
+            self.retire_reply(id, &record, reply, now);
         }
+        let _ = store(&retry, &unavailable, false);
         if let Some(id) = seen {
             if let Err(e) = store(&cursor, &id, false) {
                 crate::log!("migration retirement cursor: {e}");
             }
         }
     }
+
+    fn retire_reply(&self, id: u64, expected: &Mig, reply: SourceReply, now: u64) {
+        if reply == SourceReply::Keep && matches!(expected, Mig::Released { mismatch_since_ms: None, .. }) {
+            return;
+        }
+        let Ok(_l) = self.lock() else { return };
+        let path = self.mig_path(id);
+        let Ok(Some(mut record)) = load::<Mig>(&path) else { return };
+        // A peer call runs outside the host lock; never overwrite a concurrent done or release.
+        if &record != expected {
+            return;
+        }
+        let Mig::Released { mismatch_since_ms, .. } = &mut record else { return };
+        if reply == SourceReply::Gone
+            || (reply == SourceReply::Mismatch
+                && mismatch_since_ms.is_some_and(|since| now.checked_sub(since).is_some_and(|age| age >= MIG_LEGACY_AGE.as_millis() as u64)))
+        {
+            let _ = self.mig_done(id);
+            return;
+        }
+        *mismatch_since_ms = if reply == SourceReply::Mismatch { Some(mismatch_since_ms.filter(|since| *since <= now).unwrap_or(now)) } else { None };
+        if &record != expected {
+            let _ = store(&path, &record, true);
+        }
+    }
+}
+
+// The shared done budget starts only when there is an acknowledgement to send.
+fn owed_deadline(deadline: &mut Option<std::time::Instant>, now: std::time::Instant) -> std::time::Instant {
+    *deadline.get_or_insert(now + Duration::from_secs(5))
 }
 
 /// Recent grants, as (boot-clock ms, MiB, id).
@@ -3214,6 +3250,10 @@ pub enum Mig {
         /// An older binary reads it as released and retires it once the source process is gone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         done_until_ms: Option<u64>,
+        /// First explicit token mismatch; cleared by any other answer or failed query.
+        /// Older writers may drop this field, conservatively restarting the thirty days.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mismatch_since_ms: Option<u64>,
     },
 }
 
@@ -3305,6 +3345,7 @@ impl MigRecord {
                         by: self.by.clone(),
                         ip: self.ip,
                         done_until_ms: None,
+                        mismatch_since_ms: None,
                     },
                     true,
                 )?;
@@ -7351,8 +7392,12 @@ pub(crate) mod tests {
         assert_eq!(h.mig_status(1).unwrap(), "released");
         let Mig::Released { done_until_ms, .. } = before else { unreachable!() };
         assert!(done_until_ms.unwrap() > wall_ms() + MIG_DONE_MS - 60_000);
-        store(&h.mig_path(1), &Mig::Released { source: "source:7070".into(), token: None, peer: Some(peer), by: None, ip: None, done_until_ms: Some(0) }, true)
-            .unwrap();
+        store(
+            &h.mig_path(1),
+            &Mig::Released { source: "source:7070".into(), token: None, peer: Some(peer), by: None, ip: None, done_until_ms: Some(0), mismatch_since_ms: None },
+            true,
+        )
+        .unwrap();
         h.retire_migrations_with(1, |_, _, _, _| panic!("expired"));
         assert!(!h.mig_path(1).exists());
     }
@@ -7576,12 +7621,12 @@ pub(crate) mod tests {
         mig(21, Mig::Committed { owner: committed, peer: None });
         // Released, then killed before its address was settled: its own VM, a loan of it too (it came home).
         claim(ips[14], "released", Some(dead(999_999_943)), 4, &|a| a.arriving = Some(22));
-        mig(22, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[14]), done_until_ms: None });
+        mig(22, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[14]), done_until_ms: None, mismatch_since_ms: None });
         claim(ips[15], "homecoming", Some(dead(999_999_944)), 4, &|a| (a.arriving, a.lent) = (Some(23), Some(4)));
-        mig(23, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[15]), done_until_ms: None });
+        mig(23, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[15]), done_until_ms: None, mismatch_since_ms: None });
         // Arrived and settled, then a source again: the old release is no proof.
         claim(ips[16], "left-again", Some(dead(999_999_945)), 4, &|a| a.leaving = leaving(41));
-        mig(24, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[16]), done_until_ms: None });
+        mig(24, Mig::Released { source: String::new(), token: None, peer: None, by: None, ip: Some(ips[16]), done_until_ms: None, mismatch_since_ms: None });
         let before: Vec<Addr> = ips.iter().map(|&i| h.addr(&l, i).unwrap()).collect();
         drop(l);
         h.withdraw_dead(false).unwrap();
@@ -8104,7 +8149,12 @@ pub(crate) mod tests {
         let gone = dead_owner(&h, 999_999_952, &[]);
         let a = Addr { seen: 4, lent: Some(4), holder: Some("vm".into()), holder_id: Some(gone), held: 4, arriving: Some(30), ..Addr::default() };
         h.put_addr(x, &a, false).unwrap();
-        store(&h.mig_path(30), &Mig::Released { source: "s".into(), token: None, peer: None, by: None, ip: Some(x), done_until_ms: None }, false).unwrap();
+        store(
+            &h.mig_path(30),
+            &Mig::Released { source: "s".into(), token: None, peer: None, by: None, ip: Some(x), done_until_ms: None, mismatch_since_ms: None },
+            false,
+        )
+        .unwrap();
         // The source is done before any sweep: settle the address before keeping only the outcome.
         h.mig_done(30).unwrap();
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
@@ -9864,7 +9914,15 @@ pub(crate) mod tests {
     fn released_migration(h: &Host, id: u64, source: &str) {
         store(
             &h.mig_path(id),
-            &Mig::Released { source: source.into(), token: None, peer: None, by: Some(Ident { start: id, ..Ident::me() }), ip: None, done_until_ms: None },
+            &Mig::Released {
+                source: source.into(),
+                token: None,
+                peer: None,
+                by: Some(Ident { start: id, ..Ident::me() }),
+                ip: None,
+                done_until_ms: None,
+                mismatch_since_ms: None,
+            },
             false,
         )
         .unwrap();
@@ -9938,7 +9996,8 @@ pub(crate) mod tests {
             (5, MIG_LEGACY_AGE * 2, Some("source"), None, Some(Ident::me()), false),
             (6, MIG_LEGACY_AGE * 2, None, Some(ip("192.0.2.1").into()), Some(Ident::me()), false),
         ] {
-            let record = Mig::Released { source: "source".into(), token: token.map(String::from), peer, by, ip: None, done_until_ms: None };
+            let record =
+                Mig::Released { source: "source".into(), token: token.map(String::from), peer, by, ip: None, done_until_ms: None, mismatch_since_ms: None };
             store(&h.mig_path(id), &record, false).unwrap();
             File::open(h.mig_path(id)).unwrap().set_modified(now - age).unwrap();
             h.retire_migrations_with(20, |_, _, _, _| Err("source unavailable".into()));
@@ -9964,7 +10023,7 @@ pub(crate) mod tests {
         let mut queried = Vec::new();
         h.retire_migrations_with(3, |_, _, _, by| {
             queried.push(by.start);
-            Ok(false)
+            Ok(SourceReply::Keep)
         });
         assert_eq!(queried, [1, 2, 3]);
         assert_eq!(load::<u64>(&h.run.join(".retire.next")).unwrap(), Some(3));
@@ -9981,7 +10040,7 @@ pub(crate) mod tests {
             let mut queried = Vec::new();
             h.retire_migrations_with(2, |_, _, _, by| {
                 queried.push(by.start);
-                Ok(false)
+                Ok(SourceReply::Keep)
             });
             queried
         };
@@ -9995,50 +10054,131 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retirement_skips_unavailable_endpoints_only_for_this_pass() {
+    fn retirement_skips_cached_unavailable_endpoints() {
         let (_h_dir, h) = host("retire-endpoints");
         for (id, source) in [(1, "unreachable"), (2, "reachable"), (3, "unreachable"), (4, "reachable"), (5, "unknown"), (6, "unreachable")] {
             released_migration(&h, id, source);
         }
-        store(&h.mig_path(7), &Mig::Released { source: "reachable".into(), token: None, peer: None, by: None, ip: None, done_until_ms: None }, false).unwrap();
+        store(
+            &h.mig_path(7),
+            &Mig::Released { source: "reachable".into(), token: None, peer: None, by: None, ip: None, done_until_ms: None, mismatch_since_ms: None },
+            false,
+        )
+        .unwrap();
         released_migration(&h, 8, "");
         let mut queried = Vec::new();
         h.retire_migrations_with(8, |source, _, _, by| {
             queried.push(by.start);
             match source {
                 "unreachable" | "unknown" => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
-                "reachable" => Ok(by.start == 4),
+                "reachable" => Ok(if by.start == 4 { SourceReply::Gone } else { SourceReply::Keep }),
                 _ => panic!("invalid source must not be queried"),
             }
         });
         assert_eq!(queried, [1, 2, 4, 5]);
         assert_eq!(h.mig_status(4).unwrap(), "released");
         assert!([1, 2, 3, 5, 6, 7, 8].iter().all(|id| h.mig_path(*id).exists()));
-        assert_eq!(load::<u64>(&h.run.join(".retire.next")).unwrap(), Some(2));
+        assert_eq!(load::<u64>(&h.run.join(".retire.next")).unwrap(), Some(8));
         queried.clear();
         h.retire_migrations_with(3, |_, _, _, by| {
             queried.push(by.start);
-            Ok(false)
+            Ok(SourceReply::Keep)
         });
-        assert_eq!(queried, [3, 5, 6], "a later pass starts at the first skipped record");
+        assert_eq!(queried, [2], "cached failures do not pin the cursor or spend the query budget");
     }
 
     #[test]
-    fn retirement_retries_skipped_records_across_wraparound() {
+    fn retirement_caches_dead_runs_across_passes_and_retries_after_expiry() {
         let (_h_dir, h) = host("retire-skipped");
-        for id in 1..=3 {
+        for id in 1..=1000 {
             released_migration(&h, id, "unreachable");
         }
-        for expected in [1, 2, 3, 1] {
-            let mut queried = Vec::new();
-            h.retire_migrations_with(3, |_, _, _, by| {
-                queried.push(by.start);
-                Err("source unavailable".into())
-            });
-            assert_eq!(queried, [expected]);
-            assert_eq!(load::<u64>(&h.run.join(".retire.next")).unwrap(), Some(expected));
+        for id in 1001..=1010 {
+            released_migration(&h, id, "reachable");
         }
-        assert!((1..=3).all(|id| matches!(load::<Mig>(&h.mig_path(id)).unwrap(), Some(Mig::Released { done_until_ms: None, .. }))));
+        let pass = |h: &Host, now| {
+            let mut queried = Vec::new();
+            h.retire_migrations_at(5, now, |source, _, _, by| {
+                queried.push(by.start);
+                if source == "unreachable" {
+                    Err("unavailable".into())
+                } else {
+                    Ok(SourceReply::Keep)
+                }
+            });
+            queried
+        };
+        assert_eq!(pass(&h, 1000), [1]);
+        assert_eq!(load::<u64>(&h.run.join(".retire.next")).unwrap(), Some(1000));
+        let reopened = Host::open(&h.state, &h.run).unwrap();
+        assert_eq!(pass(&reopened, 1001), [1001, 1002, 1003, 1004, 1005]);
+        assert_eq!(pass(&reopened, 1002), [1006, 1007, 1008, 1009, 1010]);
+        assert!(pass(&reopened, 1003).is_empty());
+        assert_eq!(pass(&reopened, 1000 + RETIRE_RETRY_MS), [1001, 1002, 1003, 1004, 1005]);
+        assert_eq!(pass(&reopened, 1001 + RETIRE_RETRY_MS), [1006, 1007, 1008, 1009, 1010]);
+        assert_eq!(pass(&reopened, 1002 + RETIRE_RETRY_MS), [1]);
+        assert!((1..=1010).all(|id| matches!(load::<Mig>(&h.mig_path(id)).unwrap(), Some(Mig::Released { done_until_ms: None, .. }))));
+    }
+
+    #[test]
+    fn retirement_requires_persisted_continuous_mismatch() {
+        let (_h_dir, h) = host("retire-mismatch");
+        released_migration(&h, 1, "source");
+        let mut record = load::<Mig>(&h.mig_path(1)).unwrap().unwrap();
+        if let Mig::Released { token, .. } = &mut record {
+            *token = Some("old".into());
+        }
+        store(&h.mig_path(1), &record, true).unwrap();
+        let age = MIG_LEGACY_AGE.as_millis() as u64;
+        let first = age * 2;
+        File::open(h.mig_path(1)).unwrap().set_modified(UNIX_EPOCH).unwrap();
+        let pass = |h: &Host, now, reply| {
+            let mut reply = Some(reply);
+            h.retire_migrations_at(1, now, |_, _, _, _| reply.take().unwrap());
+            load::<Mig>(&h.mig_path(1)).unwrap().unwrap()
+        };
+        assert!(matches!(pass(&h, first, Ok(SourceReply::Mismatch)), Mig::Released { mismatch_since_ms: Some(t), done_until_ms: None, .. } if t == first));
+        let reopened = Host::open(&h.state, &h.run).unwrap();
+        assert!(
+            matches!(pass(&reopened, first + age - 1, Ok(SourceReply::Mismatch)), Mig::Released { mismatch_since_ms: Some(t), done_until_ms: None, .. } if t == first)
+        );
+        for reply in [Ok(SourceReply::Keep), Err("unavailable".into())] {
+            assert!(matches!(pass(&h, first + age, reply), Mig::Released { mismatch_since_ms: None, done_until_ms: None, .. }));
+            pass(&h, first + age + RETIRE_RETRY_MS, Ok(SourceReply::Mismatch));
+        }
+        let restart = first + age + RETIRE_RETRY_MS;
+        assert!(
+            matches!(pass(&h, restart - 1, Ok(SourceReply::Mismatch)), Mig::Released { mismatch_since_ms: Some(t), done_until_ms: None, .. } if t == restart - 1),
+            "clock rollback restarts the timer"
+        );
+        assert!(matches!(pass(&h, restart - 1 + age, Ok(SourceReply::Mismatch)), Mig::Released { done_until_ms: Some(_), mismatch_since_ms: None, .. }));
+    }
+
+    #[test]
+    fn retirement_mismatch_preserves_concurrent_done_and_legacy_records() {
+        let (_h_dir, h) = host("retire-mismatch-race");
+        let old = serde_json::json!({"state": "released", "source": "source", "token": "old", "by": Ident::me()});
+        let record: Mig = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(record, Mig::Released { mismatch_since_ms: None, .. }));
+        store(&h.mig_path(1), &record, true).unwrap();
+        h.retire_migrations_at(1, 1000, |_, _, _, _| {
+            h.mig_done(1).unwrap();
+            Ok(SourceReply::Mismatch)
+        });
+        assert!(matches!(load::<Mig>(&h.mig_path(1)).unwrap(), Some(Mig::Released { done_until_ms: Some(_), mismatch_since_ms: None, .. })));
+        let mut with_time = old;
+        with_time["mismatch_since_ms"] = 123.into();
+        let parsed: Mig = serde_json::from_value(with_time).unwrap();
+        assert!(matches!(parsed, Mig::Released { mismatch_since_ms: Some(123), .. }));
+    }
+
+    #[test]
+    fn owed_done_budget_starts_at_first_acknowledgement() {
+        let start = std::time::Instant::now();
+        let mut deadline = None;
+        let after_queries = start + Duration::from_secs(10);
+        assert_eq!(owed_deadline(&mut deadline, after_queries), after_queries + Duration::from_secs(5));
+        assert_eq!(owed_deadline(&mut deadline, after_queries + Duration::from_secs(2)), after_queries + Duration::from_secs(5));
     }
 
     #[test]
@@ -10055,7 +10195,7 @@ pub(crate) mod tests {
         let mut queried = Vec::new();
         h.retire_migrations_with(4, |_, token, _, by| {
             queried.push(by.start);
-            Ok(token == Some("right"))
+            Ok(if token == Some("right") { SourceReply::Gone } else { SourceReply::Mismatch })
         });
         assert_eq!(queried, [150, 200, 201, 202]);
         for id in [150, 200, 201, 202] {
@@ -10074,7 +10214,7 @@ pub(crate) mod tests {
             let retirement = File::open(locks(&h.run).join("retire")).unwrap();
             assert!(flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_err());
             queried = true;
-            Ok(false)
+            Ok(SourceReply::Keep)
         });
         assert!(queried, "the local cleanup lock does not block retirement");
         let retirement = File::open(locks(&h.run).join("retire")).unwrap();
@@ -10116,7 +10256,7 @@ pub(crate) mod tests {
                 crate::test_util::status(&mut cmd).unwrap();
             }));
             std::io::Read::read_exact(&mut told, &mut [0]).unwrap();
-            Ok(false)
+            Ok(SourceReply::Keep)
         });
         let retirement = File::open(locks(&h.run).join("retire")).unwrap();
         let free = flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_ok();
@@ -10330,7 +10470,15 @@ pub(crate) mod tests {
         // A source that cannot be asked keeps its released record.
         store(
             &h.mig_path(8),
-            &Mig::Released { source: "127.0.0.1:1".into(), token: None, peer: None, by: Some(Ident::me()), ip: None, done_until_ms: None },
+            &Mig::Released {
+                source: "127.0.0.1:1".into(),
+                token: None,
+                peer: None,
+                by: Some(Ident::me()),
+                ip: None,
+                done_until_ms: None,
+                mismatch_since_ms: None,
+            },
             false,
         )
         .unwrap();
