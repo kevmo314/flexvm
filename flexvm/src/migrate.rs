@@ -226,16 +226,9 @@ impl Reached {
     }
 
     /// The target's answer about `mig`: an error, never an outcome, from a host that is not it.
-    fn ask(&self, mig: u64) -> Result<Value> {
-        self.ask_wait(mig, false)
-    }
-
-    fn ask_wait(&self, mig: u64, wait: bool) -> Result<Value> {
-        peer_query(&self.at.to_string(), self.token.as_deref(), json!({"op": "migration", "mig": mig, "wait": wait}))
-    }
-
-    fn wait_status(&self, mig: u64) -> Result<Value> {
-        self.ask_wait(mig, true).or_else(|_| self.ask(mig))
+    fn ask(&self, mig: u64, wait: bool) -> Result<Value> {
+        let ask = |wait| peer_query(&self.at.to_string(), self.token.as_deref(), json!({"op": "migration", "mig": mig, "wait": wait}));
+        ask(wait).or_else(|e| if wait { ask(false) } else { Err(e) })
     }
 
     fn done(&self, mig: u64) {
@@ -252,17 +245,24 @@ fn peer_query(at: &str, token: Option<&str>, req: Value) -> Result<Value> {
     Ok(r)
 }
 
-pub(crate) fn source_gone(source: &str, token: Option<&str>, by: &crate::host::Ident) -> Result<bool> {
-    // Older records cannot prove which host answers at the advertised address.
-    let token = token.ok_or("migration source has no recorded host token")?;
-    peer_query(source, Some(token), json!({"op": "source", "ident": by})).map(|r| r["gone"] == true)
+pub(crate) fn source_gone(source: &str, token: Option<&str>, peer: Option<IpAddr>, by: &crate::host::Ident) -> Result<bool> {
+    let (conn, r) = crate::util::rpc(source, Duration::from_millis(500), Instant::now() + Duration::from_secs(2), &json!({"op": "source", "ident": by}))?;
+    // Before host tokens were kept, only the recorded connection peer can vouch for the source.
+    let same = match token {
+        Some(token) => r["token"].as_str() == Some(token),
+        None => peer.is_some_and(|p| conn.peer_addr().is_ok_and(|a| a.ip().to_canonical() == p.to_canonical())),
+    };
+    if !same {
+        bail!("{source} is not the recorded migration source");
+    }
+    Ok(r["gone"] == true)
 }
 
 /// The outcome of migration `mig` to `to`, owed since its source here died (`Host::settle_owed`): asked where
 /// the source reached its target. Only a record from before they were kept asks `to` by name.
 pub(crate) fn owed_outcome(host: &crate::host::Host, to: &str, mig: u64) -> Result<String> {
     let r = match Reached::load(host, mig)? {
-        Some(reached) => reached.ask(mig)?,
+        Some(reached) => reached.ask(mig, false)?,
         None => peer_query(to, None, json!({"op": "migration", "mig": mig}))?,
     };
     Ok(r["outcome"].as_str().unwrap_or_default().to_string())
@@ -732,14 +732,13 @@ impl Proc {
         thread::spawn(move || {
             let mut delay = Duration::from_millis(20);
             loop {
-                let asked = std::time::Instant::now();
-                match reached.wait_status(mig).map(|r| r["outcome"].clone()) {
-                    Ok(o) if o == "released" => break,
-                    Ok(o) if o == "aborted" => {
+                match reached.ask(mig, true) {
+                    Ok(r) if r["outcome"] == "released" => break,
+                    Ok(r) if r["outcome"] == "aborted" => {
                         return p.abort_later(mig, &format!("{to} lost the vm before it had all its memory; it runs here again, from the pause"));
                     }
                     // A target that waited (`listen::migration`) is asked again at once.
-                    Ok(_) if asked.elapsed() >= Duration::from_millis(500) => delay = Duration::from_millis(20),
+                    Ok(r) if r["waited"] == true => delay = Duration::from_millis(20),
                     // An older one answers at once, without waiting: polled with backoff, as before.
                     _ => {
                         thread::sleep(delay);
@@ -1520,7 +1519,7 @@ fn retry(what: &str, mut f: impl FnMut() -> Result<()>) -> bool {
 fn outcome(reached: &Reached, mig: u64, patience: Duration) -> Option<Outcome> {
     let start = Instant::now();
     loop {
-        if let Ok(r) = reached.ask(mig) {
+        if let Ok(r) = reached.ask(mig, false) {
             match r["outcome"].as_str() {
                 Some("committed" | "released") => return Some(Outcome::Committed(r)),
                 Some("aborted") => return Some(Outcome::Aborted),
@@ -1994,31 +1993,41 @@ mod tests {
         let (other, _) = answering(json!({"outcome": "aborted", "token": "other"}));
         let (unnamed, _) = answering(json!({"outcome": "aborted"}));
         let (target, _) = answering(json!({"outcome": "committed", "token": "target"}));
-        assert!(reached("t:1", other, Some("target")).ask(7).is_err());
-        assert!(reached("t:1", unnamed, Some("target")).ask(7).is_err());
+        assert!(reached("t:1", other, Some("target")).ask(7, false).is_err());
+        assert!(reached("t:1", unnamed, Some("target")).ask(7, false).is_err());
         assert!(outcome(&reached("t:1", other, Some("target")), 7, Duration::ZERO).is_none(), "no answer, never aborted");
         assert!(matches!(outcome(&reached("t:1", target, Some("target")), 7, Duration::ZERO), Some(Outcome::Committed(_))));
         assert!(matches!(outcome(&reached("t:1", other, None), 7, Duration::ZERO), Some(Outcome::Aborted)));
+        let old = reached("t:1", unnamed, None).ask(7, true).unwrap();
+        assert_eq!(old["outcome"], "aborted");
+        assert!(old["waited"].is_null(), "older replies remain usable without claiming a wait");
     }
 
     /// #1214: a different host at the advertised source address cannot retire its released outcome.
     #[test]
     fn only_the_recorded_source_can_retire_a_released_migration() {
         let root = crate::test_util::TempDir::new("source-token");
-        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
-        for (i, (reply, token, retired)) in [
-            (json!({"gone": true, "token": "other"}), Some("source"), false),
-            (json!({"gone": true}), Some("source"), false),
-            (json!({"gone": false, "token": "source"}), Some("source"), false),
-            (json!({"gone": true, "token": "source"}), Some("source"), true),
-            (json!({"gone": true, "token": "source"}), None, false),
+        for (i, (reply, token, peer, retired)) in [
+            (json!({"gone": true, "token": "other"}), Some("source"), Some("127.0.0.1"), false),
+            (json!({"gone": true}), Some("source"), Some("127.0.0.1"), false),
+            (json!({"gone": false, "token": "source"}), Some("source"), None, false),
+            (json!({"gone": true, "token": "source"}), Some("source"), None, true),
+            (json!({"gone": true, "token": "source"}), None, None, false),
+            (json!({"gone": true}), None, Some("127.0.0.1"), true),
+            (json!({"gone": true}), None, Some("::ffff:127.0.0.1"), true),
+            (json!({"gone": true}), None, Some("127.0.0.2"), false),
+            (json!({"gone": false}), None, Some("127.0.0.1"), false),
+            (json!({}), None, Some("127.0.0.1"), false),
         ]
         .into_iter()
         .enumerate()
         {
+            let dir = root.join(i.to_string());
+            let host = crate::host::Host::open(&dir.join("state"), &dir.join("run")).unwrap();
             let (at, _) = answering(reply);
             let id = i as u64;
-            let mut record = host.mig_begin(id, &at.to_string(), Some(crate::host::Ident::me()), None).unwrap().with_token(token);
+            let mut record =
+                host.mig_begin_from(id, &at.to_string(), Some(crate::host::Ident::me()), None, peer.map(|p| p.parse().unwrap())).unwrap().with_token(token);
             record.commit(&host.lock().unwrap()).unwrap();
             record.release(None, None).unwrap();
             host.retire_migrations();
@@ -2045,10 +2054,10 @@ mod tests {
                 }
             }
         });
-        assert_eq!(reached("t:1", at, Some("target")).wait_status(7).unwrap()["outcome"], "released");
+        assert_eq!(reached("t:1", at, Some("target")).ask(7, true).unwrap()["outcome"], "released");
         server.join_within().unwrap();
         let (other, _) = answering(json!({"outcome": "released", "token": "other"}));
-        assert!(reached("t:1", other, Some("target")).wait_status(7).is_err());
+        assert!(reached("t:1", other, Some("target")).ask(7, true).is_err());
     }
 
     /// A dead source's owed outcome is asked where it reached its target, never by the target's name again, and the
