@@ -13,6 +13,14 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 const BLOCK: usize = 512;
+/// Inodes pinned for hard links; beyond this, archive each name in full.
+const MAX_LINKS: usize = 128;
+
+struct Link {
+    fd: OwnedFd,
+    name: Vec<u8>,
+    left: libc::nlink_t,
+}
 
 /// To stderr, which the host's lints keep to `writeln!`.
 macro_rules! warn {
@@ -263,7 +271,7 @@ fn walk(
     path: &Path,
     name: Vec<u8>,
     dev: libc::dev_t,
-    links: &mut HashMap<(libc::dev_t, libc::ino_t), Vec<u8>>,
+    links: &mut HashMap<(libc::dev_t, libc::ino_t), Link>,
 ) -> io::Result<()> {
     let header = |st: &libc::stat, path: Vec<u8>| Header {
         path,
@@ -277,14 +285,25 @@ fn walk(
     // A device is archived by each name: it has no data to save, and an unpacker that skips devices (the host) would
     // find a link entry's target missing.
     if node.st.st_nlink > 1 && !matches!(node.kind(), libc::S_IFDIR | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK) {
-        match links.entry((node.st.st_dev, node.st.st_ino)) {
-            Entry::Occupied(first) => {
+        let key = (node.st.st_dev, node.st.st_ino);
+        if let Entry::Occupied(mut first) = links.entry(key) {
+            let valid = fstat(first.get().fd.as_raw_fd()).is_ok_and(|st| (st.st_dev, st.st_ino) == key && st.st_nlink > 0);
+            if valid {
                 let mut h = header(&node.st, name);
-                (h.kind, h.link) = (b'1', first.get().clone());
+                (h.kind, h.link) = (b'1', first.get().name.clone());
+                first.get_mut().left -= 1;
+                if first.get().left == 0 {
+                    first.remove();
+                }
                 return write_header(out, &h);
             }
-            Entry::Vacant(first) => {
-                first.insert(name.clone());
+            first.remove();
+        }
+        // Holding the first inode prevents reuse after unlink, until its remaining names are seen.
+        // If no descriptor is available, full copies still preserve the contents.
+        if links.len() < MAX_LINKS {
+            if let Ok(fd) = node.fd.try_clone() {
+                links.insert(key, Link { fd, name: name.clone(), left: node.st.st_nlink - 1 });
             }
         }
     }
@@ -1120,6 +1139,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1230: a stale cache entry must not substitute another inode's archived contents.
+    #[test]
+    fn hard_link_cache_checks_the_pinned_inode() {
+        for replaced in [false, true] {
+            let t = Tmp::new("link-identity");
+            std::fs::write(t.s("a"), b"old").unwrap();
+            std::fs::hard_link(t.s("a"), t.s("b")).unwrap();
+            let old = Node::open(libc::AT_FDCWD, &cstr(t.s("a").as_bytes()).unwrap(), libc::O_NOFOLLOW).unwrap();
+            let path = if replaced {
+                std::fs::write(t.s("c"), b"new").unwrap();
+                std::fs::hard_link(t.s("c"), t.s("d")).unwrap();
+                t.s("c")
+            } else {
+                t.s("b")
+            };
+            let node = Node::open(libc::AT_FDCWD, &cstr(path.as_bytes()).unwrap(), libc::O_NOFOLLOW).unwrap();
+            let key = (node.st.st_dev, node.st.st_ino);
+            // Simulate the reused-inode cache hit without relying on the filesystem's allocator.
+            // With no replacement, the identity matches but the pinned inode has no links left.
+            let mut links = HashMap::from([(key, Link { fd: old.fd, name: b"first".to_vec(), left: 1 })]);
+            let (a, b) = (t.s("a"), t.s("b"));
+            HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |step, _| {
+                    assert_eq!(step, Step::Typed);
+                    std::fs::remove_file(&a).unwrap();
+                    std::fs::remove_file(&b).unwrap();
+                }));
+            });
+            let mut tar = Vec::new();
+            let result = walk(&mut tar, node, Path::new(&path), b"next".to_vec(), key.0, &mut links);
+            HOOK.with(|h| h.borrow_mut().take());
+            result.unwrap();
+            let mut input = &tar[..];
+            let mut rd = Reader { r: &mut input, left: 0 };
+            let h = rd.next().unwrap().unwrap();
+            assert_eq!(h.kind, b'0');
+            let mut data = Vec::new();
+            rd.data(h.size, &mut data).unwrap();
+            assert_eq!(data, if replaced { b"new" } else { b"old" });
+        }
+    }
+
+    #[test]
+    fn hard_link_cache_is_bounded_and_releases_completed_entries() {
+        let t = Tmp::new("link-limit");
+        let mut links = HashMap::new();
+        for pass in ["a", "b"] {
+            for i in 0..=MAX_LINKS {
+                if pass == "a" {
+                    std::fs::write(t.s(&format!("a{i}")), b"data").unwrap();
+                    std::fs::hard_link(t.s(&format!("a{i}")), t.s(&format!("b{i}"))).unwrap();
+                }
+                let path = t.s(&format!("{pass}{i}"));
+                let node = Node::open(libc::AT_FDCWD, &cstr(path.as_bytes()).unwrap(), libc::O_NOFOLLOW).unwrap();
+                let dev = node.st.st_dev;
+                let mut tar = Vec::new();
+                walk(&mut tar, node, Path::new(&path), format!("{pass}{i}").into_bytes(), dev, &mut links).unwrap();
+                let mut input = &tar[..];
+                let mut rd = Reader { r: &mut input, left: 0 };
+                let h = rd.next().unwrap().unwrap();
+                let linked = pass == "b" && i < MAX_LINKS;
+                assert_eq!(h.kind, if linked { b'1' } else { b'0' });
+                if linked {
+                    assert_eq!(h.link, format!("a{i}").as_bytes());
+                    assert_eq!(links.len(), MAX_LINKS - i - 1);
+                } else {
+                    let mut data = Vec::new();
+                    rd.data(h.size, &mut data).unwrap();
+                    assert_eq!(data, b"data");
+                }
+                assert!(links.len() <= MAX_LINKS);
+            }
+        }
+        // The uncached pair's second name can start a new entry after space is released.
+        assert_eq!(links.len(), 1);
     }
 
     #[test]
