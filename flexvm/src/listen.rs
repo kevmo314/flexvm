@@ -22,7 +22,7 @@ use crate::util::{send_json, Result, Slot};
 const MAX_ACTIVE: usize = 512;
 const MAX_ACTIVE_FROM: usize = MAX_ACTIVE / 2;
 static ACTIVE: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM));
-/// Migration requests keep this count even while long polls release their active slots.
+/// Migration reads keep this count even while long polls release their active slots.
 static MIGRATIONS: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM));
 /// Of those, requests that take the host lock (`route`, `lend`, `migration`); more are
 /// refused as busy. The rest stay for requests that need none, page handoffs above all,
@@ -641,7 +641,8 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
     let line = read_line_by(&conn, deadline)?;
     let req: Value = serde_json::from_slice(&line)?;
     let op = req["op"].as_str().unwrap_or("");
-    let _migration = if op == "migration" { slot.as_ref().map(|s| MIGRATIONS.take(s.1).ok_or(BUSY)).transpose()? } else { None };
+    // Done must get through even when this source's release polls fill its migration cap.
+    let migration_slot = if op == "migration" && req["done"] != true { slot.as_ref().map(|s| MIGRATIONS.take(s.1).ok_or(BUSY)).transpose() } else { Ok(None) };
     // Migration reads reacquire both slots; neither is held across a long-poll sleep.
     let active = if op == "migration" { slot.take().map(|s| (s.0.clone(), s.1)) } else { None };
     let slots = || {
@@ -662,7 +663,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
         }
         "pages" => return pages(host, &req, conn),
         "template" => return push(host, &req, conn),
-        _ if matches!(locking, Some(None)) => Err(BUSY.into()),
+        _ if migration_slot.is_err() || matches!(locking, Some(None)) => Err(BUSY.into()),
         "migration" => (|| {
             if req["done"] != true {
                 return migration(host, &req, |_, _| false, slots);
@@ -1353,22 +1354,41 @@ mod tests {
     #[test]
     fn migration_requests_keep_a_per_peer_cap() {
         use std::io::Write;
+        static LOCKING: AtomicUsize = AtomicUsize::new(0);
         let (_root, host) = crate::host::tests::host("migration-cap");
         let from = "192.0.2.122".parse().unwrap();
         let active = Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM);
         let held: Vec<_> = (0..MAX_ACTIVE_FROM).map(|_| MIGRATIONS.take(from).unwrap()).collect();
         assert!(MIGRATIONS.take("::ffff:192.0.2.122".parse().unwrap()).is_none());
         assert!(MIGRATIONS.take("192.0.2.123".parse().unwrap()).is_some());
-        for extra in [json!({}), json!({"wait": true}), json!({"done": true})] {
+        for extra in [json!({}), json!({"wait": true}), json!({"done": false}), json!({"done": "true"})] {
             let (client, server) = pair();
             let mut req = json!({"op": "migration", "mig": 7});
             req.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             writeln!(&client, "{req}").unwrap();
-            // Refused before any host lock or peer lookup, even for done and non-wait requests.
-            let e = handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, active.take(from)).unwrap_err();
-            assert_eq!(e.to_string(), BUSY);
+            // Refused before any host lock or peer lookup, with the legacy error envelope.
+            handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, active.take(from)).unwrap();
+            let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
+            assert_eq!(reply, json!({"ok": false, "error": BUSY}));
+            assert_eq!(crate::util::answer(Some(reply), "peer", "failed").unwrap_err().to_string(), BUSY);
             assert!(active.held.lock().unwrap().is_empty());
         }
+        // The lock is process-wide: hold it reentrantly so parallel tests cannot make done busy.
+        let _l = host.lock().unwrap();
+        let mut record = host.mig_begin(7, "127.0.0.1:7070", None, None).unwrap().with_peer("127.0.0.1".parse().unwrap());
+        record.commit(&_l).unwrap();
+        record.release(None, None).unwrap();
+        assert!(host.mig_stamp(7).is_some());
+        let (client, server) = pair();
+        writeln!(&client, "{}", json!({"op": "migration", "mig": 7, "done": true})).unwrap();
+        handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, active.take(from)).unwrap();
+        let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
+        assert_eq!(reply, json!({"ok": true, "result": {"done": true}}));
+        let record: Value = crate::host::load(&host.state.join("migs/7")).unwrap().unwrap();
+        assert!(record["done_until_ms"].is_u64(), "done retires the released record despite sibling polls: {record}");
+        assert_eq!(host.mig_status(7).unwrap(), "released");
+        assert_eq!(MIGRATIONS.held.lock().unwrap().get(&from), Some(&MAX_ACTIVE_FROM));
+        assert!(active.held.lock().unwrap().is_empty());
         drop(held);
         assert!(MIGRATIONS.take(from).is_some(), "capacity returns when requests end");
     }
