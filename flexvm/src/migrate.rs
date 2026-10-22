@@ -1613,7 +1613,8 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
     }
     let tap_dropped = inj.dropped();
     (stats.injected, stats.dropped_target) = (stats.packets, tap_dropped);
-    vm.tap_drops_reported(tap_dropped);
+    // Its refused sends are in the tap's count too: in `stats.dropped` where never taken.
+    vm.tap_drops_reported(tap_dropped + inj.refused());
     // Closing a packet socket waits for an RCU grace period; the VM need not.
     thread::spawn(move || drop(inj));
     (Some(stats), switched)

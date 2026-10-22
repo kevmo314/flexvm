@@ -2729,6 +2729,14 @@ def same_host_backlog():
     udp_across_migrations("same host backlog", "ft-backlog", burst=10, source_fault="tap_backlog")
 
 
+def same_host_long_hold():
+    """#1245: a source held its address long (a slow target: `admitted_stall` makes it 3 s), so
+    more packets than the target's tap queues (3k datagrams/s: some 9000, its queue 4096) are
+    injected there at once. The injection waits for the guest to take them, never dropping
+    what a full tap refuses: nothing held is lost, nor counted twice."""
+    udp_across_migrations("same host long hold", "ft-long-hold", "admitted_stall", burst=3)
+
+
 def same_host_bulk_tcp():
     """#411: a bulk TCP download into a VM (the host's TCP sends TSO frames to its tap) moving
     there and back: nothing held is dropped, and the download goes on after each move. (TSO
@@ -12380,7 +12388,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died, fc_died_starting=fc_died_starting,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
-    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_qdisc_backlog=same_host_qdisc_backlog, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_qdisc_backlog=same_host_qdisc_backlog, same_host_backlog=same_host_backlog, same_host_long_hold=same_host_long_hold, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, handoff_onward=handoff_onward, handoff_rename=handoff_rename, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, target_renamed=target_renamed, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, arrival_bind_fail=arrival_bind_fail, back_to_back=back_to_back, app_abort=app_abort,

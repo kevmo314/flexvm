@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,12 @@ const SYNC_WAIT: Duration = Duration::from_millis(250).saturating_mul(SLACK);
 const SWITCH_WAIT: Duration = Duration::from_secs(2).saturating_mul(SLACK);
 const FLUSH_WAIT: Duration = Duration::from_millis(400).saturating_mul(SLACK);
 const REPLY_WAIT: Duration = Duration::from_secs(1).saturating_mul(SLACK);
+/// How long an injection waits for a full tap's guest to take a frame (`Injector::send`): within
+/// the stream's waits for the target (`SYNC_WAIT`, `FLUSH_WAIT`), so a guest that stopped
+/// reading costs one such wait, not one per packet.
+const TAP_STALL: Duration = Duration::from_millis(200);
+/// Between tries at a full tap.
+const TAP_RETRY: Duration = Duration::from_micros(200);
 /// How long a let-go address's stragglers (`Holder::gone`) are re-sent or counted.
 const GONE_FOR: Duration = Duration::from_secs(30);
 /// Stragglers are logged at most this often per address after the first report.
@@ -887,6 +893,11 @@ pub struct Injector {
     ifindex: u32,
     header: [u8; 14],
     tx_dropped: u64,
+    /// Sends a full tap refused (`ENOBUFS`), each also in its `tx_dropped`: tried again, or
+    /// counted by the caller as dropped, never in `dropped` (#1245).
+    refused: AtomicU64,
+    /// When the tap last took a frame (or this was made).
+    took: Mutex<Instant>,
 }
 
 impl Injector {
@@ -906,7 +917,15 @@ impl Injector {
         header[..6].copy_from_slice(&crate::net::GUEST_MAC);
         header[6..12].copy_from_slice(&crate::net::GATEWAY_MAC);
         header[12..].copy_from_slice(&[0x08, 0x00]);
-        Ok(Injector { fd, tap: tap.into(), ifindex: crate::net::ifindex(tap)?, header, tx_dropped: tap_tx_dropped(tap).unwrap_or(0) })
+        Ok(Injector {
+            fd,
+            tap: tap.into(),
+            ifindex: crate::net::ifindex(tap)?,
+            header,
+            tx_dropped: tap_tx_dropped(tap).unwrap_or(0),
+            refused: AtomicU64::new(0),
+            took: Mutex::new(Instant::now()),
+        })
     }
 
     pub fn send(&self, packet: &[u8]) -> bool {
@@ -925,12 +944,36 @@ impl Injector {
         msg.msg_namelen = std::mem::size_of_val(&addr) as u32;
         msg.msg_iov = iov.as_mut_ptr();
         msg.msg_iovlen = iov.len();
-        unsafe { libc::sendmsg(self.fd.as_raw_fd(), &msg, libc::MSG_DONTWAIT) == (self.header.len() + packet.len()) as isize }
+        let len = (self.header.len() + packet.len()) as isize;
+        // A tap queues only so many frames (its txqueuelen) for its guest to take: a hold's backlog
+        // can be more, injected faster than a guest takes them. Refused, the frame waits for the
+        // guest to make room, while it takes any within `TAP_STALL` (#1245).
+        loop {
+            let n = unsafe { libc::sendmsg(self.fd.as_raw_fd(), &msg, libc::MSG_DONTWAIT) };
+            if n == len {
+                *self.took.lock().unwrap() = Instant::now();
+                return true;
+            }
+            if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOBUFS) {
+                return false;
+            }
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            if self.took.lock().unwrap().elapsed() >= TAP_STALL {
+                return false;
+            }
+            std::thread::sleep(TAP_RETRY);
+        }
     }
 
-    /// Dropped by the tap since this was made (with the guest's own traffic): reported with the injected packets.
+    /// Dropped by the tap since this was made (with the guest's own traffic), but for the sends it
+    /// refused (`refused`), which the caller counts: reported with the injected packets.
     pub fn dropped(&self) -> u64 {
-        tap_tx_dropped(&self.tap).unwrap_or(0).saturating_sub(self.tx_dropped)
+        tap_tx_dropped(&self.tap).unwrap_or(0).saturating_sub(self.tx_dropped).saturating_sub(self.refused())
+    }
+
+    /// The sends the full tap refused, each in its `tx_dropped` (`Vm::tap_drops_reported`).
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
     }
 }
 
@@ -967,7 +1010,7 @@ pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
 
 /// Injects only while `revoked` is false; on `SWITCH`, `take_over` takes the address (false if it
 /// could not, which the source is told). Refused if too many streams are being received.
-/// Returns how many tap drops were reported with them (`Injector::dropped`), if they were.
+/// Returns how many of the tap's drops it counted (`Injector::dropped`, `Injector::refused`), if it reported them.
 pub fn receive(
     r: &mut BufReader<By<TcpStream>>,
     ip: Ipv4Addr,
@@ -1014,7 +1057,7 @@ pub fn receive(
     }
     let tap_dropped = inj.dropped();
     let reply = json!({"injected": injected, "dropped": dropped + tap_dropped});
-    let replied = write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| tap_dropped);
+    let replied = write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| tap_dropped + inj.refused());
     // Reply before closing: even a failed spawn closes inline only after reporting the counts.
     // Closing a packet socket waits for an RCU grace period (tens of ms).
     if let Err(e) = std::thread::Builder::new().name("injector-close".into()).spawn(move || drop(inj)) {
@@ -1357,7 +1400,15 @@ mod tests {
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let injector = Injector { fd: stream.into(), tap: String::new(), ifindex: 0, header: [7; 14], tx_dropped: 0 };
+        let injector = Injector {
+            fd: stream.into(),
+            tap: String::new(),
+            ifindex: 0,
+            header: [7; 14],
+            tx_dropped: 0,
+            refused: AtomicU64::new(0),
+            took: Mutex::new(Instant::now()),
+        };
         for packet in [b"".as_slice(), b"payload", &[42; 1500]] {
             assert!(injector.send(packet));
             let mut frame = vec![0; 14 + packet.len()];
@@ -1901,6 +1952,63 @@ mod tests {
         drop(fd);
         crate::net::delete_tap(&tap);
         drop(sender);
+    }
+
+    /// Needs root: `sudo cargo test -- --ignored`. More frames than a tap queues (#1245): a guest
+    /// taking them, late, gets them all; one that takes none costs one `TAP_STALL`, the rest
+    /// refused at once. Either way the tap's count of what it refused is not reported as
+    /// dropped too (the caller counts the sends that failed).
+    #[test]
+    #[ignore]
+    fn injecting_past_a_full_tap_waits_for_its_guest() {
+        let _root = crate::test_util::root_net_lock();
+        let tap = format!("inj{:x}t0", std::process::id());
+        let (_address, ip) = root_address();
+        crate::net::create_tap(&tap, "test").unwrap();
+        let raw = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        assert!(raw >= 0, "open /dev/net/tun: {}", std::io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut req = crate::net::ifreq(&tap).unwrap();
+        req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+        assert_eq!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) }, 0, "TUNSETIFF: {}", std::io::Error::last_os_error());
+        crate::net::set_link_up(&tap, true).unwrap();
+        let n = 3 * crate::net::TAP_QUEUE as usize;
+        let p = udp_to(ip);
+        let read = |fd: &OwnedFd| {
+            let mut buf = [0u8; 2048];
+            unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) > 0 }
+        };
+        // A guest that starts taking frames only once the tap is full.
+        let inj = Injector::new(&tap).unwrap();
+        let (stop, got) = (AtomicBool::new(false), AtomicUsize::new(0));
+        let sent = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                while !stop.load(Ordering::SeqCst) {
+                    if read(&fd) {
+                        got.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                }
+            });
+            let sent = (0..n).filter(|_| inj.send(&p)).count();
+            crate::test_util::wait_until("the guest to take them", || got.load(Ordering::SeqCst) >= sent);
+            stop.store(true, Ordering::SeqCst);
+            sent
+        });
+        assert_eq!((sent, got.load(Ordering::SeqCst), inj.dropped()), (n, n, 0), "refused {}", inj.refused());
+        assert!(inj.refused() > 0, "the tap filled");
+        // A guest that takes none: one wait, then the rest refused at once.
+        let inj = Injector::new(&tap).unwrap();
+        let start = Instant::now();
+        let sent = (0..n).filter(|_| inj.send(&p)).count();
+        assert_eq!(sent, crate::net::TAP_QUEUE as usize, "as many as the tap queues");
+        assert!(start.elapsed() < TAP_STALL * 5, "{:?}", start.elapsed());
+        assert!(inj.refused() >= (n - sent) as u64, "{}", inj.refused());
+        assert_eq!(inj.dropped(), 0, "not counted twice");
+        drop(fd);
+        crate::net::delete_tap(&tap);
     }
 
     /// Needs root: `sudo cargo test -- --ignored`. A sender that looked the route up before a

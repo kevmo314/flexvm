@@ -65,7 +65,7 @@ FAULTS = ("basic route route_abort route_abandoned lost_ack unknown refused page
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare forged_vmstate slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded signals suspend_gen standby standby_vm_ips restore_ip_peer loan_start_retry spoof_filter killed_migrated "
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims standby_claim_caps standby_lost_cgroup standby_claim_setup_fail fc_died fc_died_starting cow_grow plug_race plug_storm suspend_debris revoked_publication "
-          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_qdisc_backlog same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff handoff_onward handoff_rename announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill target_renamed mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
+          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_qdisc_backlog same_host_backlog same_host_long_hold same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff handoff_onward handoff_rename announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill target_renamed mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_slow_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap pidns_names pidns_control pidns_standby arrival_overtaken "
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
@@ -2726,7 +2726,7 @@ COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containe
         "faults/suspend_slow_cmd": 4, "faults/unlend_retry": 4, "faults/ckpt_ancestor_corrupt": 3,
         "faults/ckpt_packet_hold": 3, "faults/same_host_order": 3, "faults/suspend_died": 3,
         # From local runs (about half a CI runner's time), doubled.
-        "faults/rmi_suspend": 22, "faults/standby_refill_mark": 18, "faults/standby_relief_no_vm": 17, "faults/back_to_back": 14,
+        "faults/same_host_long_hold": 34, "faults/rmi_suspend": 22, "faults/standby_refill_mark": 18, "faults/standby_relief_no_vm": 17, "faults/back_to_back": 14,
         "faults/resume_migrating": 11, "faults/standby_claim_orphan_migrating": 9, "faults/standby_claim_orphan": 7,
         "faults/app_abort": 5, "faults/evict_peer_busy": 4, "faults/arrival_bind_fail": 3, "faults/kill_prepare": 3,
         "faults/standby_claim_cgroupns": 3, "faults/resume_bind_fail": 3,
