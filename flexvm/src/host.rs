@@ -24,6 +24,8 @@ use crate::util::{Error, Result};
 const MAX_UNANNOUNCED_LOANS: usize = 64;
 /// Until the borrower claims it (`Host::start_loan`).
 pub(crate) const LOAN_WAIT_MS: u64 = 5 * 60 * 1000;
+/// Legacy released records with no verifiable source identity expire after thirty days.
+const MIG_LEGACY_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// How long a done migration's outcome is kept (`Host::mig_done`).
 const MIG_DONE_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -2837,7 +2839,7 @@ impl Host {
     }
 
     /// Retires aborted arrivals and released records whose source is proven gone.
-    /// Any doubt keeps the record: a source that still waits must find it.
+    /// Any doubt keeps the record, except identity-less legacy releases after thirty days.
     pub fn retire_migrations(&self) {
         // At most five records (and thus five two-second peer calls) per pass.
         self.retire_migrations_with(5, crate::migrate::source_gone);
@@ -2881,6 +2883,10 @@ impl Host {
                 }
             };
             spent += 1;
+            if token.is_none() && peer.is_none() && unwritten_for(&self.mig_path(id)).is_some_and(|age| age >= MIG_LEGACY_AGE) {
+                let _ = self.mig_done(id);
+                continue;
+            }
             let Some(by) = by.filter(|_| !source.is_empty()) else { continue };
             if unavailable.contains(&source) {
                 continue;
@@ -9910,6 +9916,33 @@ pub(crate) mod tests {
             assert_eq!(h.addr(&l, x).unwrap(), expected);
             assert_eq!([h.addr(&l, y).unwrap(), h.addr(&l, z).unwrap()], unchanged);
         }
+    }
+
+    #[test]
+    fn retirement_ages_out_only_identityless_legacy_releases() {
+        let (_h_dir, h) = host("retire-legacy");
+        let now = SystemTime::now();
+        for (id, age, token, peer, by, retired) in [
+            (1, Duration::ZERO, None, None, None, false),
+            (2, MIG_LEGACY_AGE - Duration::from_secs(86400), None, None, Some(Ident::me()), false),
+            (3, MIG_LEGACY_AGE + Duration::from_secs(86400), None, None, None, true),
+            (4, MIG_LEGACY_AGE + Duration::from_secs(86400), None, None, Some(Ident::me()), true),
+            (5, MIG_LEGACY_AGE * 2, Some("source"), None, Some(Ident::me()), false),
+            (6, MIG_LEGACY_AGE * 2, None, Some(ip("192.0.2.1").into()), Some(Ident::me()), false),
+        ] {
+            let record = Mig::Released { source: "source".into(), token: token.map(String::from), peer, by, ip: None, done_until_ms: None };
+            store(&h.mig_path(id), &record, false).unwrap();
+            File::open(h.mig_path(id)).unwrap().set_modified(now - age).unwrap();
+            h.retire_migrations_with(20, |_, _, _, _| Err("source unavailable".into()));
+            let stored = load::<Mig>(&h.mig_path(id)).unwrap().unwrap();
+            assert!(matches!(stored, Mig::Released { done_until_ms, .. } if done_until_ms.is_some() == retired), "record {id}");
+            assert_eq!(h.mig_status(id).unwrap(), "released", "age-out retains the terminal tombstone");
+        }
+        // An unknown age (a future timestamp) is not evidence for expiry.
+        released_migration(&h, 7, "source");
+        File::open(h.mig_path(7)).unwrap().set_modified(now + MIG_LEGACY_AGE).unwrap();
+        h.retire_migrations_with(20, |_, _, _, _| Err("source unavailable".into()));
+        assert!(matches!(load::<Mig>(&h.mig_path(7)).unwrap(), Some(Mig::Released { done_until_ms: None, .. })));
     }
 
     #[test]

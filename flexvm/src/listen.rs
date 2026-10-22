@@ -22,6 +22,8 @@ use crate::util::{send_json, Result, Slot};
 const MAX_ACTIVE: usize = 512;
 const MAX_ACTIVE_FROM: usize = MAX_ACTIVE / 2;
 static ACTIVE: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM));
+/// Migration requests keep this count even while long polls release their active slots.
+static MIGRATIONS: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM));
 /// Of those, requests that take the host lock (`route`, `lend`, `migration`); more are
 /// refused as busy. The rest stay for requests that need none, page handoffs above all,
 /// however long the lock's holder keeps it (a stalled disk, a stopped VM process).
@@ -639,6 +641,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
     let line = read_line_by(&conn, deadline)?;
     let req: Value = serde_json::from_slice(&line)?;
     let op = req["op"].as_str().unwrap_or("");
+    let _migration = if op == "migration" { slot.as_ref().map(|s| MIGRATIONS.take(s.1).ok_or(BUSY)).transpose()? } else { None };
     // Migration reads reacquire both slots; neither is held across a long-poll sleep.
     let active = if op == "migration" { slot.take().map(|s| (s.0.clone(), s.1)) } else { None };
     let slots = || {
@@ -1348,55 +1351,59 @@ mod tests {
     }
 
     #[test]
+    fn migration_requests_keep_a_per_peer_cap() {
+        use std::io::Write;
+        let (_root, host) = crate::host::tests::host("migration-cap");
+        let from = "192.0.2.122".parse().unwrap();
+        let active = Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM);
+        let held: Vec<_> = (0..MAX_ACTIVE_FROM).map(|_| MIGRATIONS.take(from).unwrap()).collect();
+        assert!(MIGRATIONS.take("::ffff:192.0.2.122".parse().unwrap()).is_none());
+        assert!(MIGRATIONS.take("192.0.2.123".parse().unwrap()).is_some());
+        for extra in [json!({}), json!({"wait": true}), json!({"done": true})] {
+            let (client, server) = pair();
+            let mut req = json!({"op": "migration", "mig": 7});
+            req.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            writeln!(&client, "{req}").unwrap();
+            // Refused before any host lock or peer lookup, even for done and non-wait requests.
+            let e = handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, active.take(from)).unwrap_err();
+            assert_eq!(e.to_string(), BUSY);
+            assert!(active.held.lock().unwrap().is_empty());
+        }
+        drop(held);
+        assert!(MIGRATIONS.take(from).is_some(), "capacity returns when requests end");
+    }
+
+    #[test]
     fn migration_long_poll_releases_listener_slots_between_reads() {
-        use crate::test_util::JoinWithin;
         use std::io::Write;
         let (_root, host) = crate::host::tests::host("poll-slots");
+        // The lock is process-wide: keep it on this thread, where status reads take it reentrantly.
+        let _l = host.lock().unwrap();
         let _record = host.mig_begin(7, "source:7070", None, None).unwrap();
         static LOCKING: AtomicUsize = AtomicUsize::new(0);
         let active = Waiting::new(1, 1);
-        let from = "127.0.0.1".parse().unwrap();
-        // Parallel tests share the process's host lock: a first read they make busy is tried again.
-        for _ in 0..10 {
-            let slot = active.take(from).unwrap();
-            let (client, server) = pair();
-            writeln!(&client, "{}", json!({"op": "migration", "mig": 7, "wait": true})).unwrap();
-            let (slept, sleeping) = std::sync::mpsc::channel();
-            let (go, proceed) = std::sync::mpsc::channel::<()>();
-            let worker = {
-                let host = host.clone();
-                std::thread::spawn(move || {
-                    // The first sleep between reads waits here until both budgets were tried.
-                    let mut first = true;
-                    POLL_SLEEP.with(|hook| {
-                        *hook.borrow_mut() = Some(Box::new(move || {
-                            if std::mem::take(&mut first) {
-                                let _ = slept.send(());
-                                let _ = proceed.recv();
-                            }
-                        }))
-                    });
-                    handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, Some(slot)).unwrap();
-                })
-            };
-            // Disconnected instead if the poll ended without sleeping: its first read was busy, or took the whole wait.
-            let in_wait = sleeping.recv().is_ok();
-            let active = active.take(from);
-            let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
-            let _ = go.send(());
-            worker.join_within().unwrap();
-            let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
-            if !in_wait {
-                assert!(reply["error"] == BUSY || reply["result"]["outcome"] == "pending", "{reply}");
-                continue;
-            }
-            assert!(active.is_some(), "sleeping poll kept its active slot");
-            assert_eq!(full.len(), MAX_LOCKING, "sleeping poll kept its locking slot");
-            assert_eq!(reply["result"]["outcome"], "pending");
-            assert_eq!(reply["result"]["waited"], true);
-            return;
-        }
-        panic!("every poll's first read was busy or slow");
+        let from = "192.0.2.124".parse().unwrap();
+        let slot = active.take(from).unwrap();
+        let (client, server) = pair();
+        writeln!(&client, "{}", json!({"op": "migration", "mig": 7, "wait": true})).unwrap();
+        let slept = Arc::new(AtomicUsize::new(0));
+        POLL_SLEEP.with(|hook| {
+            let (active, slept) = (active.clone(), slept.clone());
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(active.take(from).is_some(), "sleeping poll kept its active slot");
+                let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
+                assert_eq!(full.len(), MAX_LOCKING, "sleeping poll kept its locking slot");
+                assert_eq!(MIGRATIONS.held.lock().unwrap().get(&from), Some(&1), "sleeping poll must keep its per-peer count");
+                slept.fetch_add(1, Ordering::SeqCst);
+            }));
+        });
+        handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, Some(slot)).unwrap();
+        POLL_SLEEP.with(|hook| *hook.borrow_mut() = None);
+        let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
+        assert!(slept.load(Ordering::SeqCst) > 0);
+        assert_eq!(reply["result"]["outcome"], "pending");
+        assert_eq!(reply["result"]["waited"], true);
+        assert!(!MIGRATIONS.held.lock().unwrap().contains_key(&from), "completed request releases its count");
     }
 
     #[test]
