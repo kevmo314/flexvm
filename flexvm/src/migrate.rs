@@ -307,27 +307,22 @@ pub(crate) fn owed_done(host: &crate::host::Host, to: &str, mig: u64, deadline: 
 fn done(at: &str, mig: u64, deadline: Instant) -> bool {
     retry_done(
         deadline,
-        || {
-            crate::util::rpc(
-                at,
-                Duration::from_millis(500),
-                deadline.min(Instant::now() + Duration::from_secs(2)),
-                &json!({"op": "migration", "mig": mig, "done": true}),
-            )
-            .map(|(_, r)| r)
-        },
+        |rpc_deadline| crate::util::rpc(at, Duration::from_millis(500), rpc_deadline, &json!({"op": "migration", "mig": mig, "done": true})).map(|(_, r)| r),
         thread::sleep,
         Instant::now,
     )
 }
 
-fn retry_done(deadline: Instant, mut call: impl FnMut() -> Result<Value>, mut nap: impl FnMut(Duration), now: impl Fn() -> Instant) -> bool {
+fn retry_done(deadline: Instant, mut call: impl FnMut(Instant) -> Result<Value>, mut nap: impl FnMut(Duration), now: impl Fn() -> Instant) -> bool {
     let mut delay = Duration::from_millis(100);
     for attempt in 0..10 {
-        if now() >= deadline {
+        let at = now();
+        if attempt > 0 && at >= deadline {
             return false;
         }
-        let Err(e) = call() else { return true };
+        // Every record gets one full attempt, even after slow outcome queries spend the shared budget.
+        let rpc_deadline = at + Duration::from_secs(2);
+        let Err(e) = call(if attempt == 0 { rpc_deadline } else { rpc_deadline.min(deadline) }) else { return true };
         let why = e.to_string();
         if attempt == 9 || !(why == crate::listen::BUSY || why.ends_with(&format!(": {}", crate::listen::BUSY))) {
             return false;
@@ -1686,7 +1681,7 @@ mod tests {
             let (mut calls, mut naps) = (0, vec![]);
             retry_done(
                 now + Duration::from_secs(60),
-                || {
+                |_| {
                     calls += 1;
                     if calls < 3 {
                         Err(busy.clone().into())
@@ -1703,7 +1698,7 @@ mod tests {
         let (mut calls, mut naps) = (0, vec![]);
         retry_done(
             now + Duration::from_secs(60),
-            || {
+            |_| {
                 calls += 1;
                 Err(crate::listen::BUSY.into())
             },
@@ -1716,7 +1711,7 @@ mod tests {
             let mut calls = 0;
             retry_done(
                 now + Duration::from_secs(60),
-                || {
+                |_| {
                     calls += 1;
                     Err(error.into())
                 },
@@ -1726,7 +1721,7 @@ mod tests {
             assert_eq!(calls, 1);
         }
         // An older target's successful reply need not have any new fields.
-        retry_done(now + Duration::from_secs(60), || Ok(Value::Null), |_| panic!("success must not be retried"), || now);
+        retry_done(now + Duration::from_secs(60), |_| Ok(Value::Null), |_| panic!("success must not be retried"), || now);
     }
 
     #[test]
@@ -1737,18 +1732,47 @@ mod tests {
         for _ in 0..5 {
             assert!(!retry_done(
                 deadline,
-                || {
+                |rpc_deadline| {
                     calls += 1;
-                    now.set((now.get() + Duration::from_secs(2)).min(deadline));
+                    now.set(rpc_deadline);
                     Err(crate::listen::BUSY.into())
                 },
                 |d| now.set(now.get() + d),
                 || now.get(),
             ));
         }
-        assert_eq!(calls, 3);
-        assert_eq!(now.get(), deadline);
-        assert!(!retry_done(deadline, || panic!("budget spent"), |_| panic!("budget spent"), || now.get()));
+        assert_eq!(calls, 7);
+        assert_eq!(now.get(), deadline + Duration::from_secs(8));
+    }
+
+    #[test]
+    fn done_after_slow_outcomes_gets_one_full_attempt_per_record() {
+        let start = Instant::now();
+        let now = std::cell::Cell::new(start);
+        let deadline = start + Duration::from_secs(5);
+        let mut calls = 0;
+        for record in 0..5 {
+            // Later records are released only after slow queries spend the shared budget.
+            now.set(now.get() + Duration::from_secs(2));
+            let done = retry_done(
+                deadline,
+                |rpc_deadline| {
+                    calls += 1;
+                    assert_eq!(rpc_deadline, now.get() + Duration::from_secs(2));
+                    if record == 0 {
+                        Ok(Value::Null)
+                    } else {
+                        now.set(rpc_deadline);
+                        Err(crate::listen::BUSY.into())
+                    }
+                },
+                |_| panic!("spent shared budget must not retry"),
+                || now.get(),
+            );
+            assert_eq!(done, record == 0);
+        }
+        assert_eq!(calls, 5);
+        assert_eq!(now.get(), start + Duration::from_secs(18));
     }
 
     #[test]
