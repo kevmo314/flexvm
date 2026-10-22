@@ -3222,17 +3222,27 @@ struct Plan {
     short: bool,
     /// Balloon statistics inside the post-resize delay cannot establish recovery.
     stale: bool,
+    /// The guest has a step more free than its headroom: clear of the boundary
+    /// a slow fill's readings jitter across.
+    recovered: bool,
 }
 
 impl Plan {
+    /// A refusal starts an episode; a grant, its ceiling or a fresh reading clear of
+    /// the boundary ends it, and each episode is logged once.
     fn starved(&self, was: bool, refused: bool) -> bool {
-        // A fresh guest request can be refused before the next controller tick.
-        // That tick must not clear the refusal just because stale statistics
-        // suppress its growth (charge = 0): the guest's next retry would log it again.
         if self.stale {
+            // A fresh guest request can be refused before the next controller tick.
+            // That tick must not clear the refusal just because stale statistics
+            // suppress its growth (charge = 0): the guest's next retry would log it again.
             was
+        } else if self.short {
+            // Refused again, or granted (or at its ceiling, where moving it cannot help).
+            refused
         } else {
-            self.short && refused
+            // A guest filling slowly, its growth refused, reads just above its headroom
+            // and then below it again (#1242): only clear recovery ends the episode.
+            was && !self.recovered
         }
     }
 }
@@ -3254,6 +3264,7 @@ impl Sizes {
         // Balloon statistics lag a plug by up to a second.
         let stale = !asked && since < Duration::from_millis(1500);
         let short = avail < headroom;
+        let recovered = avail >= headroom + STEP_MIB;
         let urgent = short && !stale;
         if plugged > requested && !urgent {
             return None; // shrinking
@@ -3266,7 +3277,7 @@ impl Sizes {
         } else {
             plugged
         };
-        Some(Plan { settle, new, charge: new.saturating_sub(requested.max(plugged)), short, stale })
+        Some(Plan { settle, new, charge: new.saturating_sub(requested.max(plugged)), short, stale, recovered })
     }
 }
 
@@ -5629,10 +5640,16 @@ mod tests {
     #[test]
     fn memory_hints_only_grow() {
         for avail in [7800, 99999999 >> 10, u64::MAX] {
-            assert_eq!(SIZES.plan(8192, 8192, avail, secs(11), true, false), Some(Plan { settle: false, new: 8192, charge: 0, short: false, stale: false }));
+            assert_eq!(
+                SIZES.plan(8192, 8192, avail, secs(11), true, false),
+                Some(Plan { settle: false, new: 8192, charge: 0, short: false, stale: false, recovered: true })
+            );
         }
         // Balloon statistics still reclaim surplus memory.
-        assert_eq!(SIZES.plan(8192, 8192, 7800, secs(11), false, false), Some(Plan { settle: false, new: 4736, charge: 0, short: false, stale: false }));
+        assert_eq!(
+            SIZES.plan(8192, 8192, 7800, secs(11), false, false),
+            Some(Plan { settle: false, new: 4736, charge: 0, short: false, stale: false, recovered: true })
+        );
         // A fresh hint bypasses the statistics delay and grows promptly.
         let p = SIZES.plan(8192, 8192, 0, Duration::ZERO, true, false).unwrap();
         assert!(p.new > 8192 && p.charge == p.new - 8192 && p.short, "{p:?}");
@@ -5645,7 +5662,7 @@ mod tests {
         assert_eq!(SIZES.plan(5248, 4096, 512, secs(5), false, false), None);
         // Stalled: settled at what is plugged; a tick right after (stale stats) does not grow.
         let p = SIZES.plan(5248, 4096, 512, secs(11), false, false).unwrap();
-        assert_eq!(p, Plan { settle: true, new: 4096, charge: 0, short: true, stale: true });
+        assert_eq!(p, Plan { settle: true, new: 4096, charge: 0, short: true, stale: true, recovered: false });
         // The guest asking grows from what is plugged, charging the growth once.
         let p = SIZES.plan(5248, 4096, 512, secs(11), true, false).unwrap();
         assert!(p.settle && p.new > 4096 && p.charge == p.new - 4096, "{p:?}");
@@ -5659,9 +5676,15 @@ mod tests {
         // Shrink 8192 -> 4736 outstanding, plenty free: busy.
         assert_eq!(SIZES.plan(4736, 8192, 7800, secs(5), false, false), None);
         // Stalled: settled at 8192, and the shrink delay restarts (no new target yet).
-        assert_eq!(SIZES.plan(4736, 8192, 7800, secs(11), false, false), Some(Plan { settle: true, new: 8192, charge: 0, short: false, stale: true }));
+        assert_eq!(
+            SIZES.plan(4736, 8192, 7800, secs(11), false, false),
+            Some(Plan { settle: true, new: 8192, charge: 0, short: false, stale: true, recovered: true })
+        );
         // 10 s later the shrink is chosen again, from what is plugged.
-        assert_eq!(SIZES.plan(8192, 8192, 7800, secs(11), false, false), Some(Plan { settle: false, new: 4736, charge: 0, short: false, stale: false }));
+        assert_eq!(
+            SIZES.plan(8192, 8192, 7800, secs(11), false, false),
+            Some(Plan { settle: false, new: 4736, charge: 0, short: false, stale: false, recovered: true })
+        );
     }
 
     #[test]
@@ -5709,6 +5732,16 @@ mod tests {
             let tick = SIZES.plan(8192, 8192, 0, Duration::from_millis(ms), false, false).unwrap();
             assert!(tick.charge > 0);
             assert!(observe(tick, true));
+        }
+        // A slow fill reads just above its headroom (8448 MiB: 2112) between refusals,
+        // as fresh statistics or a hint (#1242): still the same episode.
+        for avail in [2112, 2112 + STEP_MIB - 1] {
+            for asked in [false, true] {
+                let reading = SIZES.plan(8192, 8192, avail, secs(2), asked, false).unwrap();
+                assert!(!reading.short && reading.charge == 0, "{reading:?}");
+                assert!(observe(reading, false));
+                assert!(observe(hint(), true));
+            }
         }
         // A granted step really ends the refusal; another refusal starts a new episode.
         assert!(!observe(hint(), false));
