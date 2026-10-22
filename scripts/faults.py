@@ -2880,16 +2880,22 @@ def udp_stream(ip, burst=1):
     went quiet for as long as a migration's hold on a loaded host, which then held nothing (#1046).
     Yields how many it sent (`.value`), which is final once the block ends it."""
     ctx = multiprocessing.get_context("fork")
-    sent, stop = ctx.Value("q", 0, lock=False), ctx.Event()
+    sent, stop, parent = ctx.Value("q", 0, lock=False), ctx.Event(), os.getpid()
 
     def stream():
         # Exits at once, never flushing what other threads of the parent left buffered.
         code = 0
         try:
+            # Gone with this process, however it ends (a SIGTERM or a timeout's kill skips the
+            # `finally` below): killed as it dies, and checked after, in case it died first.
+            import ctypes
+            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+            if os.getppid() != parent:
+                os._exit(0)
             with suppress(OSError):
                 os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(1))
             s, i = socket.socket(socket.AF_INET, socket.SOCK_DGRAM), 0
-            while not stop.is_set():
+            while not stop.is_set() and os.getppid() == parent:
                 for _ in range(burst):
                     s.sendto(b"%08d\n" % i, (ip, 9000))
                     i += 1
