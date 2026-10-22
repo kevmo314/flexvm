@@ -84,6 +84,8 @@ pub fn prepare_by() -> Instant {
 /// take them all; many at once still can, each for `ADMIT_WAIT`.
 const MAX_WAITING: usize = 64;
 const MAX_WAITING_FROM: usize = 4;
+/// Refusal readers leave room for other peers even when one floods the listener.
+const MAX_REFUSING_FROM: usize = 16;
 /// Unknown addresses held while a name that has addresses is looked up again
 /// (a peer by name may be back on a new one, #311): a budget of its own, so
 /// non-peers, which always find such a lookup to wait for, never take the
@@ -272,9 +274,9 @@ fn accept(listener: &TcpListener, host: &Arc<Host>, peers: &Peers, waits: &Waiti
 /// Read the request before replying, so a client still sending it does not lose the reply
 /// to a reset. Refusal workers are bounded too; beyond that, drain only queued bytes.
 fn refuse_busy(conn: TcpStream, deadline: Instant) {
-    static REFUSING: AtomicUsize = AtomicUsize::new(0);
+    static REFUSING: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_WAITING, MAX_REFUSING_FROM));
     log_refusal(BUSY);
-    let Some(slot) = Slot::take(&REFUSING, MAX_WAITING) else {
+    let Some(slot) = conn.peer_addr().ok().and_then(|a| REFUSING.take(a.ip())) else {
         refuse(conn, BUSY, None);
         return;
     };
@@ -1336,6 +1338,26 @@ pub(crate) fn routable_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_readers_limit_each_peer_and_release_their_slots() {
+        let waiting = Waiting::new(MAX_WAITING, MAX_REFUSING_FROM);
+        let peer = "192.0.2.1".parse().unwrap();
+        let mapped = "::ffff:192.0.2.1".parse().unwrap();
+        let mut held: Vec<_> = (0..MAX_REFUSING_FROM).map(|_| waiting.take(peer).unwrap()).collect();
+        assert!(waiting.take(peer).is_none());
+        assert!(waiting.take(mapped).is_none());
+        for n in 2..=4 {
+            let other = format!("192.0.2.{n}").parse().unwrap();
+            held.extend((0..MAX_REFUSING_FROM).map(|_| waiting.take(other).unwrap()));
+        }
+        assert!(waiting.take("192.0.2.5".parse().unwrap()).is_none());
+        held.pop();
+        assert!(waiting.take("192.0.2.5".parse().unwrap()).is_some());
+        drop(held);
+        assert!(waiting.take(peer).is_some());
+        assert!(waiting.held.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn busy_refusal_reads_the_request_and_uses_the_legacy_reply() {

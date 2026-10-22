@@ -232,7 +232,7 @@ impl Reached {
     }
 
     fn done(&self, mig: u64) {
-        done(&self.at.to_string(), mig);
+        let _ = peer_call(&self.at.to_string(), json!({"op": "migration", "mig": mig, "done": true}));
     }
 }
 
@@ -271,33 +271,57 @@ pub(crate) fn owed_outcome(host: &crate::host::Host, to: &str, mig: u64) -> Resu
 }
 
 /// Tells the target of an owed migration that this host is done with its record.
-pub(crate) fn owed_done(host: &crate::host::Host, to: &str, mig: u64) {
+pub(crate) fn owed_done(host: &crate::host::Host, to: &str, mig: u64, deadline: Instant) {
     match Reached::load(host, mig) {
         Ok(Some(reached)) => {
-            reached.done(mig);
-            Reached::forget(host, mig);
+            if done(&reached.at.to_string(), mig, deadline) {
+                Reached::forget(host, mig);
+            }
         }
-        _ => done(to, mig),
+        _ => {
+            done(to, mig, deadline);
+        }
     }
 }
 
 /// Best effort: only an explicit BUSY is retried. Older peers use the same error text;
 /// failure leaves the target's record for retirement to prove the source gone.
-fn done(at: &str, mig: u64) {
-    retry_done(|| peer_call(at, json!({"op": "migration", "mig": mig, "done": true})), thread::sleep);
+fn done(at: &str, mig: u64, deadline: Instant) -> bool {
+    retry_done(
+        deadline,
+        || {
+            crate::util::rpc(
+                at,
+                Duration::from_millis(500),
+                deadline.min(Instant::now() + Duration::from_secs(2)),
+                &json!({"op": "migration", "mig": mig, "done": true}),
+            )
+            .map(|(_, r)| r)
+        },
+        thread::sleep,
+        Instant::now,
+    )
 }
 
-fn retry_done(mut call: impl FnMut() -> Result<Value>, mut nap: impl FnMut(Duration)) {
+fn retry_done(deadline: Instant, mut call: impl FnMut() -> Result<Value>, mut nap: impl FnMut(Duration), now: impl Fn() -> Instant) -> bool {
     let mut delay = Duration::from_millis(100);
     for attempt in 0..10 {
-        let Err(e) = call() else { return };
+        if now() >= deadline {
+            return false;
+        }
+        let Err(e) = call() else { return true };
         let why = e.to_string();
         if attempt == 9 || !(why == crate::listen::BUSY || why.ends_with(&format!(": {}", crate::listen::BUSY))) {
-            return;
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(now());
+        if delay >= remaining {
+            return false;
         }
         nap(delay);
         delay = (delay * 2).min(Duration::from_secs(5));
     }
+    false
 }
 
 /// This host's migration identity: random, kept in `STATE/token` from the first prepare it sends or
@@ -1639,9 +1663,11 @@ mod tests {
 
     #[test]
     fn done_retries_only_busy_with_bounded_backoff() {
+        let now = Instant::now();
         for busy in [crate::listen::BUSY.to_string(), format!("127.0.0.1:7070: {}", crate::listen::BUSY)] {
             let (mut calls, mut naps) = (0, vec![]);
             retry_done(
+                now + Duration::from_secs(60),
                 || {
                     calls += 1;
                     if calls < 3 {
@@ -1651,33 +1677,60 @@ mod tests {
                     }
                 },
                 |d| naps.push(d),
+                || now,
             );
             assert_eq!(calls, 3);
             assert_eq!(naps, [Duration::from_millis(100), Duration::from_millis(200)]);
         }
         let (mut calls, mut naps) = (0, vec![]);
         retry_done(
+            now + Duration::from_secs(60),
             || {
                 calls += 1;
                 Err(crate::listen::BUSY.into())
             },
             |d| naps.push(d),
+            || now,
         );
         assert_eq!(calls, 10);
         assert_eq!(naps.iter().map(Duration::as_millis).collect::<Vec<_>>(), [100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000]);
         for error in ["peer hung up", "unknown op", "not the source", "host busy, try again later"] {
             let mut calls = 0;
             retry_done(
+                now + Duration::from_secs(60),
                 || {
                     calls += 1;
                     Err(error.into())
                 },
                 |_| panic!("non-BUSY must not be retried"),
+                || now,
             );
             assert_eq!(calls, 1);
         }
         // An older target's successful reply need not have any new fields.
-        retry_done(|| Ok(Value::Null), |_| panic!("success must not be retried"));
+        retry_done(now + Duration::from_secs(60), || Ok(Value::Null), |_| panic!("success must not be retried"), || now);
+    }
+
+    #[test]
+    fn done_retries_share_a_deadline_across_records_and_count_rpc_time() {
+        let now = std::cell::Cell::new(Instant::now());
+        let deadline = now.get() + Duration::from_secs(5);
+        let mut calls = 0;
+        for _ in 0..5 {
+            assert!(!retry_done(
+                deadline,
+                || {
+                    calls += 1;
+                    now.set((now.get() + Duration::from_secs(2)).min(deadline));
+                    Err(crate::listen::BUSY.into())
+                },
+                |d| now.set(now.get() + d),
+                || now.get(),
+            ));
+        }
+        assert_eq!(calls, 3);
+        assert_eq!(now.get(), deadline);
+        assert!(!retry_done(deadline, || panic!("budget spent"), |_| panic!("budget spent"), || now.get()));
     }
 
     #[test]
@@ -2133,7 +2186,10 @@ mod tests {
         let (at, asked) = answering(json!({"outcome": "released", "token": "target"}));
         reached("unresolvable.invalid:7070", at, Some("target")).record(&host, 3).unwrap();
         assert_eq!(owed_outcome(&host, "unresolvable.invalid:7070", 3).unwrap(), "released");
-        owed_done(&host, "unresolvable.invalid:7070", 3);
+        owed_done(&host, "unresolvable.invalid:7070", 3, Instant::now());
+        assert!(Reached::load(&host, 3).unwrap().is_some(), "no acknowledgement budget: keep the record");
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        owed_done(&host, "unresolvable.invalid:7070", 3, Instant::now() + Duration::from_secs(5));
         assert_eq!(asked.load(Ordering::SeqCst), 2);
         assert!(Reached::load(&host, 3).unwrap().is_none());
         assert!(owed_outcome(&host, "unresolvable.invalid:7070", 3).is_err(), "by name, which does not resolve");
