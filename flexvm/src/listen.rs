@@ -1379,7 +1379,7 @@ mod tests {
                     handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING, Some(slot)).unwrap();
                 })
             };
-            // Disconnected instead if the poll ended without sleeping (its first read was busy).
+            // Disconnected instead if the poll ended without sleeping: its first read was busy, or took the whole wait.
             let in_wait = sleeping.recv().is_ok();
             let active = active.take(from);
             let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
@@ -1387,7 +1387,7 @@ mod tests {
             worker.join_within().unwrap();
             let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
             if !in_wait {
-                assert_eq!(reply["error"], BUSY, "{reply}");
+                assert!(reply["error"] == BUSY || reply["result"]["outcome"] == "pending", "{reply}");
                 continue;
             }
             assert!(active.is_some(), "sleeping poll kept its active slot");
@@ -1396,7 +1396,7 @@ mod tests {
             assert_eq!(reply["result"]["waited"], true);
             return;
         }
-        panic!("every poll's first read was busy");
+        panic!("every poll's first read was busy or slow");
     }
 
     #[test]
