@@ -636,8 +636,9 @@ the claimed VM ran: then it ends with 124, and its claimer too.
 ## Memory controller and eviction
 
 Each VM process resizes its own VM once a second exactly as before
-(virtio-mem steps, starved flag: refused by the host, or throttled at its
-mark, and only while it runs here; a guest at its own ceiling is not
+(virtio-mem steps, starved flag: refused by the host, until a grant or a
+step more free than its headroom, or throttled at its mark, and only while
+it runs here; a guest at its own ceiling is not
 starved, as moving it cannot help, nor is a migration's source sitting at its
 mark through the pull, whose mark is not raised while lifted or not running),
 and publishes how fast its memory
