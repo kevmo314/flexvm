@@ -232,7 +232,7 @@ impl Reached {
     }
 
     fn done(&self, mig: u64) {
-        drop(peer_call(&self.at.to_string(), json!({"op": "migration", "mig": mig, "done": true})));
+        done(&self.at.to_string(), mig);
     }
 }
 
@@ -277,7 +277,26 @@ pub(crate) fn owed_done(host: &crate::host::Host, to: &str, mig: u64) {
             reached.done(mig);
             Reached::forget(host, mig);
         }
-        _ => drop(peer_call(to, json!({"op": "migration", "mig": mig, "done": true}))),
+        _ => done(to, mig),
+    }
+}
+
+/// Best effort: only an explicit BUSY is retried. Older peers use the same error text;
+/// failure leaves the target's record for retirement to prove the source gone.
+fn done(at: &str, mig: u64) {
+    retry_done(|| peer_call(at, json!({"op": "migration", "mig": mig, "done": true})), thread::sleep);
+}
+
+fn retry_done(mut call: impl FnMut() -> Result<Value>, mut nap: impl FnMut(Duration)) {
+    let mut delay = Duration::from_millis(100);
+    for attempt in 0..10 {
+        let Err(e) = call() else { return };
+        let why = e.to_string();
+        if attempt == 9 || !(why == crate::listen::BUSY || why.ends_with(&format!(": {}", crate::listen::BUSY))) {
+            return;
+        }
+        nap(delay);
+        delay = (delay * 2).min(Duration::from_secs(5));
     }
 }
 
@@ -1617,6 +1636,49 @@ fn check_app_support(to: &str, name: &str, prepared: &Value, spec: &crate::app::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_retries_only_busy_with_bounded_backoff() {
+        for busy in [crate::listen::BUSY.to_string(), format!("127.0.0.1:7070: {}", crate::listen::BUSY)] {
+            let (mut calls, mut naps) = (0, vec![]);
+            retry_done(
+                || {
+                    calls += 1;
+                    if calls < 3 {
+                        Err(busy.clone().into())
+                    } else {
+                        Ok(json!({"done": true}))
+                    }
+                },
+                |d| naps.push(d),
+            );
+            assert_eq!(calls, 3);
+            assert_eq!(naps, [Duration::from_millis(100), Duration::from_millis(200)]);
+        }
+        let (mut calls, mut naps) = (0, vec![]);
+        retry_done(
+            || {
+                calls += 1;
+                Err(crate::listen::BUSY.into())
+            },
+            |d| naps.push(d),
+        );
+        assert_eq!(calls, 10);
+        assert_eq!(naps.iter().map(Duration::as_millis).collect::<Vec<_>>(), [100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000]);
+        for error in ["peer hung up", "unknown op", "not the source", "host busy, try again later"] {
+            let mut calls = 0;
+            retry_done(
+                || {
+                    calls += 1;
+                    Err(error.into())
+                },
+                |_| panic!("non-BUSY must not be retried"),
+            );
+            assert_eq!(calls, 1);
+        }
+        // An older target's successful reply need not have any new fields.
+        retry_done(|| Ok(Value::Null), |_| panic!("success must not be retried"));
+    }
 
     #[test]
     fn older_targets_must_support_the_app_and_run_settings() {

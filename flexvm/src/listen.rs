@@ -18,7 +18,7 @@ use crate::bail;
 use crate::host::{fault, Host};
 use crate::util::{send_json, Result, Slot};
 
-/// Requests handled at once; more connections are closed unanswered.
+/// Requests handled at once; more connections are refused as busy.
 const MAX_ACTIVE: usize = 512;
 const MAX_ACTIVE_FROM: usize = MAX_ACTIVE / 2;
 static ACTIVE: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM));
@@ -240,7 +240,10 @@ fn accept(listener: &TcpListener, host: &Arc<Host>, peers: &Peers, waits: &Waiti
         // peer just added, a peer by name back on a new address).
         let waiting = match peers.check(&host.config_now().peers, from) {
             Admission::Peer => {
-                let Some(slot) = ACTIVE.take(from) else { continue };
+                let Some(slot) = ACTIVE.take(from) else {
+                    refuse_busy(conn, deadline);
+                    continue;
+                };
                 let (host, peers) = (Arc::clone(host), peers.clone());
                 spawn_request(std::thread::Builder::new(), move || serve(&host, &peers, conn, slot, deadline));
                 continue;
@@ -260,9 +263,30 @@ fn accept(listener: &TcpListener, host: &Arc<Host>, peers: &Peers, waits: &Waiti
             match admitted.then(|| ACTIVE.take(from)).flatten() {
                 Some(slot) => serve(&host, &peers, conn, slot, deadline),
                 None if !admitted => not_a_peer(conn, from),
-                None => {}
+                None => refuse_busy(conn, deadline),
             }
         });
+    }
+}
+
+/// Read the request before replying, so a client still sending it does not lose the reply
+/// to a reset. Refusal workers are bounded too; beyond that, drain only queued bytes.
+fn refuse_busy(conn: TcpStream, deadline: Instant) {
+    static REFUSING: AtomicUsize = AtomicUsize::new(0);
+    log_refusal(BUSY);
+    let Some(slot) = Slot::take(&REFUSING, MAX_WAITING) else {
+        refuse(conn, BUSY, None);
+        return;
+    };
+    spawn_request(std::thread::Builder::new(), move || {
+        let _slot = slot;
+        busy_reply(conn, deadline.min(Instant::now() + LOCK_WAIT));
+    });
+}
+
+fn busy_reply(conn: TcpStream, deadline: Instant) {
+    if read_line_by(&conn, deadline).is_ok() {
+        refuse(conn, BUSY, Some(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -1312,6 +1336,27 @@ pub(crate) fn routable_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_refusal_reads_the_request_and_uses_the_legacy_reply() {
+        use std::io::Write;
+        let (mut client, server) = pair();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        refuse_busy(server, Instant::now() + REQUEST_DEADLINE);
+        writeln!(client, "{}", json!({"op": "migration", "mig": 7, "done": true})).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let reply = crate::util::recv_json(&mut std::io::BufReader::new(client)).unwrap().unwrap();
+        assert_eq!(reply, json!({"ok": false, "error": BUSY}));
+        assert_eq!(crate::util::answer(Some(reply), "peer", "failed").unwrap_err().to_string(), BUSY);
+    }
+
+    #[test]
+    fn busy_refusal_does_not_wait_past_its_deadline() {
+        let (mut client, server) = pair();
+        busy_reply(server, Instant::now());
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+    }
 
     #[test]
     fn migration_long_poll_only_finishes_on_terminal_status_or_timeout() {
