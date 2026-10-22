@@ -83,9 +83,10 @@ RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd
 # GiB-scale guests (pages_dead, source_killed_basic, which runs source_killed, pull_died, kill_source,
 # kill_refused_checkpoint, quiet_source, checkpoint_crash, suspend_disk_freed), long device and
 # eviction sequences (cow_reports_held, evict_*), THP collapse cut short by a failed checkpoint
-# (collapse_ckpt_fail) and a stalled shrink: scheduled, one at a time (--jobs 1).
+# (collapse_ckpt_fail), a stalled shrink and an evacuation of many VMs at once (evacuate): scheduled, one at a
+# time (--jobs 1).
 HEAVY_FAULTS = ("pages_dead source_killed_basic pull_died kill_source kill_refused_checkpoint quiet_source checkpoint_crash suspend_disk_freed "
-                "cow_reports_held collapse_ckpt_fail shrink_stall evict_no_pingpong evict_grower")
+                "cow_reports_held collapse_ckpt_fail shrink_stall evict_no_pingpong evict_grower evacuate")
 # SCENARIOS keys in no shard, each with why: the ones another scenario runs as part of itself.
 UNSHARDED = {"source_killed": "heavy's source_killed_basic runs it, then basic"}
 SHARDS = {"pr": FAULTS + " " + RECOVERY_FAULTS, "main": FAULTS, "recovery": RECOVERY_FAULTS, "heavy": HEAVY_FAULTS}
@@ -2734,7 +2735,7 @@ COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containe
         "faults/evict_no_pingpong": 95, "faults/pull_died": 60, "faults/evict_grower": 50, "faults/cow_reports_held": 45,
         "faults/shrink_stall": 45, "faults/pages_dead": 40, "faults/source_killed_basic": 35, "faults/kill_refused_checkpoint": 35,
         "faults/quiet_source": 32, "faults/kill_source": 32, "faults/checkpoint_crash": 30, "faults/suspend_disk_freed": 23,
-        "faults/collapse_ckpt_fail": 12}
+        "faults/collapse_ckpt_fail": 12, "faults/evacuate": 25}
 BATCH_S = 20
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
