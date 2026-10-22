@@ -16,7 +16,7 @@ CI=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$CI_VERSION/$ARCH
 # --inputs: Firecracker's version, commit and patches, the build recipe, the kernel) bumps this in the same change;
 # see RELEASING in README.md. Tags use vMAJOR.MINOR.PATCH (artifacts-5 was the last artifacts-N; v0.1.0 was the first source release).
 # A release's assets never change.
-ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.2.1}
+ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.2.2}
 ARTIFACTS_URL=https://github.com/numerataz/flexvm/releases/download/$ARTIFACTS_TAG
 
 # The pinned SHA256 of a URL; 2 means absent, 1 means malformed or unreadable. Callers set root (the checkout).
