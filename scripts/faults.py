@@ -26,7 +26,7 @@ a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
 """
 from contextlib import ExitStack, contextmanager, suppress
 
-import argparse, base64, fcntl, glob, ipaddress, json, shlex, shutil, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, base64, fcntl, glob, ipaddress, json, multiprocessing, shlex, shutil, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -2873,6 +2873,45 @@ def udp_received(host, n, sent, timeout=10):
     return wait_for(lambda: got() >= sent, timeout)
 
 
+@contextmanager
+def udp_stream(ip, burst=1):
+    """A UDP sequence stream to `ip`'s port 9000 (`burst` datagrams every millisecond), from a process of
+    its own, real-time where it may be: a thread of this one, sharing its GIL and scheduled as any other,
+    went quiet for as long as a migration's hold on a loaded host, which then held nothing (#1046).
+    Yields how many it sent (`.value`), which is final once the block ends it."""
+    ctx = multiprocessing.get_context("fork")
+    sent, stop = ctx.Value("q", 0, lock=False), ctx.Event()
+
+    def stream():
+        # Exits at once, never flushing what other threads of the parent left buffered.
+        code = 0
+        try:
+            with suppress(OSError):
+                os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(1))
+            s, i = socket.socket(socket.AF_INET, socket.SOCK_DGRAM), 0
+            while not stop.is_set():
+                for _ in range(burst):
+                    s.sendto(b"%08d\n" % i, (ip, 9000))
+                    i += 1
+                sent.value = i
+                time.sleep(0.001)
+        except BaseException:
+            traceback.print_exc()
+            code = 1
+        os._exit(code)
+
+    p = ctx.Process(target=stream, daemon=True)
+    p.start()
+    try:
+        yield sent
+    finally:
+        stop.set()
+        p.join(10)
+        if p.is_alive():
+            p.kill()
+            p.join()
+
+
 def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=None, counted=False):
     """A UDP sequence stream to `n` (`burst` datagrams every millisecond)
     across migrations A to B, back and to B again, `target_fault` (one or a
@@ -2887,49 +2926,51 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     ok(run(A, n))
     ip = vm_ip(A, n)
     udp_receiver(A, n)
-    stop, sent = threading.Event(), [0]
-
-    def stream():
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        while not stop.is_set():
-            for _ in range(burst):
-                s.sendto(b"%08d\n" % sent[0], (ip, 9000))
-                sent[0] += 1
-            time.sleep(0.001)
-
-    t = start_thread(target=stream, daemon=True)
-    time.sleep(0.5)
-    held, at, took, logs = [], [], [], []
+    held, at, took, logs, arrivals = [], [], [], [], []
     hops = ((A, B), (B, A), (A, B))
-    for i, (src, dst) in enumerate(hops):
-        with armed_fault(dst, target_faults, 60000):
-            if source_fault:
-                fault(src, source_fault, 60000)
-            at.append(sent[0])
-            r = migrate(src, n, dst)
-            if source_fault:
-                fault(src, source_fault, 0)
-            held.append((r.get("result") or {}).get("held") or r.get("error"))
-            assert_released(dst, n, src)
-            # The source's log once its process is gone (what it dropped as it left is in it),
-            # before the VM arrives there again and starts a new one (each host's last log is
-            # read at the end).
-            src_log = log(src, n)
-            if any(d is src for _, d in hops[i + 1:]):
-                logs.append(src_log)
-            if source_fault:
-                took.append([l for l in src_log.splitlines() if "took what was queued on its tap" in l])
-        time.sleep(0.3)
-    stop.set()
-    t.join(10)
+    with udp_stream(ip, burst) as sent:
+        time.sleep(0.5)
+        for i, (src, dst) in enumerate(hops):
+            with armed_fault(dst, target_faults, 60000):
+                if source_fault:
+                    fault(src, source_fault, 60000)
+                at.append(sent.value)
+                r = migrate(src, n, dst)
+                if source_fault:
+                    fault(src, source_fault, 0)
+                held.append((r.get("result") or {}).get("held") or r.get("error"))
+                assert_released(dst, n, src)
+                # The source's log once its process is gone (what it dropped as it left is in it),
+                # before the VM arrives there again and starts a new one (each host's last log is
+                # read at the end). It arrived there by the hop before.
+                src_log = log(src, n)
+                if any(d is src for _, d in hops[i + 1:]):
+                    logs.append(src_log)
+                if i:
+                    arrivals.append(src_log)
+                if source_fault:
+                    took.append([l for l in src_log.splitlines() if "took what was queued on its tap" in l])
+            time.sleep(0.3)
+    sent = sent.value
     check(f"{label}: migrated, running on B", where(n) == {B: "running"}, where(n))
+    # What each hop held: its source from just before the pause until the target took the address
+    # over (all of the downtime), then, sharing its routes, the target's own hold until its switch
+    # (the last packets it injected). A stream gap as long as one of them, which a loaded host can
+    # still make, leaves it empty: each hop held some in one of the two, and the sources in some hop.
+    let_go = lambda t: ([int(m) for m in re.findall(r"let go of \S+ after [\d.]+ ms, (\d+) packets injected", t)] or [0])[-1]
+    last = hops[-1][1]
+    if isinstance(held[-1], dict) and not held[-1].get("packets"):
+        # Its hand-off may still be logging.
+        wait_for(lambda: let_go(log(last, n)), 5)
+    targets = [let_go(t) for t in arrivals + [log(last, n)]]
     check(f"{label}: packets held each time, all injected",
-          all(isinstance(h, dict) and h.get("packets", 0) > 0 and h.get("injected") == h.get("packets") and h.get("dropped") == 0
-              and h.get("dropped_target") == 0 for h in held), held)
-    udp_received(B, n, sent[0])
+          all(isinstance(h, dict) and h.get("injected") == h.get("packets") and h.get("dropped") == 0 and h.get("dropped_target") == 0
+              and (h.get("packets", 0) > 0 or t > 0) for h, t in zip(held, targets)) and any(isinstance(h, dict) and h.get("packets") for h in held),
+          {"sources": held, "targets": targets})
+    udp_received(B, n, sent)
     code, out = sh(B, n, "cat /tmp/udp")
     got = [int(x) for x in out.split()] if code == 0 else []
-    missing = sorted(set(range(sent[0])) - set(got))
+    missing = sorted(set(range(sent)) - set(got))
     runs = [[a, b] for a, b in zip([m for i, m in enumerate(missing) if i == 0 or missing[i - 1] != m - 1],
                                   [m for i, m in enumerate(missing) if i + 1 == len(missing) or missing[i + 1] != m + 1])]
     udp = sh(B, n, "grep Udp: /proc/net/snmp; grep Ip: /proc/net/snmp; cd /sys/class/net/eth0/statistics && echo Eth: rx_packets rx_dropped && "
@@ -2942,7 +2983,7 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     # Frames its eth0 took (a datagram's, and the few others), and dropped.
     if len(udp) >= 6 and udp[4].startswith("Eth:"):
         guest.update(dict(zip(udp[4].split()[1:], udp[5].split()[1:])))
-    detail = (f"sent {sent[0]}, migrations began at {at}, {len(missing)} missing, runs {runs[:10]}; the guest: {guest}, "
+    detail = (f"sent {sent}, migrations began at {at}, {len(missing)} missing, runs {runs[:10]}; the guest: {guest}, "
               f"{'socat receiving' if udp[-1:] == ['receiving'] else 'socat gone'}")
     dropped = {h: [l for l in log(h, n).splitlines() if "dropped" in l or "dropping" in l] for h in (A, B)}
     dropped["earlier sources"] = [l for t in logs for l in t.splitlines() if "dropped" in l or "dropping" in l]
