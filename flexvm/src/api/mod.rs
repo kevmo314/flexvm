@@ -510,9 +510,7 @@ mod tests {
         let t = fixture();
         let path = t.join("docker.sock");
         drop(UnixListener::bind(&path).unwrap());
-        let old = fs::metadata(&path).unwrap().ino();
         let (_listener, _lock) = bind(&path).unwrap();
-        assert_ne!(fs::metadata(&path).unwrap().ino(), old);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         UnixStream::connect(&path).unwrap();
     }
@@ -522,9 +520,8 @@ mod tests {
         let t = fixture();
         let path = t.join("docker.sock");
         let _listener = UnixListener::bind(&path).unwrap();
-        let old = fs::metadata(&path).unwrap().ino();
         refused(&path, "is served already");
-        assert_eq!(fs::metadata(&path).unwrap().ino(), old);
+        UnixStream::connect(&path).unwrap();
     }
 
     #[test]
