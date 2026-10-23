@@ -159,6 +159,22 @@ fn ports(host_config: &Value, exposed: &[String]) -> Result<Vec<String>, Error> 
     Ok(out)
 }
 
+/// `HostConfig.RestartPolicy` as `run --restart`'s value (None: `no`).
+fn restart(policy: &Value) -> Result<Option<String>, Error> {
+    let max = policy["MaximumRetryCount"].as_u64().unwrap_or(0);
+    let name = policy["Name"].as_str().unwrap_or("");
+    let value = match name {
+        "" | "no" => None,
+        "always" | "unless-stopped" | "on-failure" => Some(name.to_string()),
+        p => return Err(Error::bad(format!("invalid restart policy {p:?}"))),
+    };
+    match (value, max) {
+        (v, 0) => Ok(v),
+        (Some(v), n) if v == "on-failure" => Ok(Some(format!("on-failure:{n}"))),
+        _ => Err(Error::bad(format!("invalid restart policy: maximum retry count can only be used with 'on-failure' ({name:?})"))),
+    }
+}
+
 /// What docker's settings ask that flexvm has nothing for: refused, never ignored.
 fn refuse_unsupported(config: &Value, host_config: &Value, name: &str) -> Result<(), Error> {
     let host = |k: &str| &host_config[k];
@@ -217,10 +233,8 @@ fn refuse_unsupported(config: &Value, host_config: &Value, name: &str) -> Result
         "" | "flexvm" => {}
         r => return Err(Error::unsupported(format!("runtime {r:?}"))),
     }
-    match host("RestartPolicy")["Name"].as_str().unwrap_or("") {
-        "" | "no" => {}
-        p => return Err(Error::unsupported(format!("restart policy {p:?}"))),
-    }
+    // `restart` builds the `--restart` it becomes; any other policy name is docker's error too.
+    restart(host("RestartPolicy"))?;
     for (key, what) in
         [("Volumes", "volumes"), ("Healthcheck", "health checks"), ("MacAddress", "MAC addresses"), ("NetworkDisabled", "a VM without its network")]
     {
@@ -295,6 +309,9 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     if host_config["AutoRemove"] == true {
         run.push("--rm".into());
     }
+    if let Some(r) = restart(&host_config["RestartPolicy"])? {
+        run.extend(["--restart".to_string(), r]);
+    }
     if let Some(m) = host_config["Memory"].as_u64().filter(|&m| m > 0) {
         run.extend(["--memory".to_string(), m.to_string()]);
     }
@@ -363,7 +380,6 @@ mod tests {
         for (c, h, what) in [
             (json!({}), json!({"Binds": ["/a:/b"]}), "bind mounts"),
             (json!({}), json!({"NetworkMode": "host"}), "network mode"),
-            (json!({}), json!({"RestartPolicy": {"Name": "always"}}), "restart policy"),
             (json!({"Volumes": {"/data": {}}}), json!({}), "volumes"),
             (json!({"Hostname": "other"}), json!({}), "hostname"),
             (json!({"Healthcheck": {"Test": ["CMD", "true"]}}), json!({}), "health checks"),
@@ -373,5 +389,17 @@ mod tests {
             assert!(e.status == hyper::StatusCode::NOT_IMPLEMENTED && e.message.contains(what), "{what}: {e:?}");
         }
         refuse_unsupported(&json!({"Healthcheck": {"Test": ["NONE"]}}), &json!({}), "web").unwrap();
+    }
+
+    #[test]
+    fn restart_policies_become_run_restart() {
+        let r = |p: Value| restart(&p);
+        assert_eq!(r(json!(null)).unwrap(), None);
+        assert_eq!(r(json!({"Name": "no"})).unwrap(), None);
+        assert_eq!(r(json!({"Name": "always"})).unwrap().as_deref(), Some("always"));
+        assert_eq!(r(json!({"Name": "unless-stopped", "MaximumRetryCount": 0})).unwrap().as_deref(), Some("unless-stopped"));
+        assert_eq!(r(json!({"Name": "on-failure", "MaximumRetryCount": 3})).unwrap().as_deref(), Some("on-failure:3"));
+        assert_eq!(r(json!({"Name": "always", "MaximumRetryCount": 3})).unwrap_err().status, hyper::StatusCode::BAD_REQUEST);
+        assert_eq!(r(json!({"Name": "sometimes"})).unwrap_err().status, hyper::StatusCode::BAD_REQUEST);
     }
 }

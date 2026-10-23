@@ -93,7 +93,9 @@ pub async fn stop(api: &Arc<Api>, key: &str, q: Query) -> Reply {
         }
     }
     let (name, v) = found(api, key).await?;
-    if !state(&v).running {
+    // A restarting one is stopped too: `flexvm stop` ends its restarts.
+    let st = state(&v);
+    if !st.running && st.status != "restarting" {
         return empty(StatusCode::NOT_MODIFIED);
     }
     api.run(&["stop", "--", &name]).await?;

@@ -165,6 +165,34 @@ app exits within about a second and stdin is not a terminal, `run` says
 `bash exited at once (it needs a terminal?): use flexvm run -it ubuntu:24.04`:
 a shell with no terminal reads end-of-file and exits.
 
+```sh
+flexvm run -d --restart on-failure:5 --name worker myjob:1   # run again when it fails, at most 5 times
+flexvm run -d --restart always --name web nginx:1.27         # run again whenever it exits, and after a reboot
+```
+
+`--restart POLICY` (with `-d`) runs a background VM again when its app (or
+CMD) exits, as docker's restart policies do: `always`; `unless-stopped`
+(the same, but after a reboot only if it was not stopped); `on-failure`
+(on a status other than 0), `on-failure:N` at most N times; `no`, the
+default. It runs again from its image, as `start` of an exited VM does,
+after a backoff of 100 ms that doubles with each restart up to a minute,
+and starts from 100 ms again once its app ran 10 s. Meanwhile `ps -a`
+lists it `exited (STATUS), restarting`; `inspect` shows its policy, its
+count and its last backoff under `config.run.restart`. There is no daemon:
+the exiting VM's process leaves a worker of its own behind (in its own
+session and cgroup, as a VM process is) that waits out the backoff and
+starts it. A `stop` (also of one waiting to restart), `kill`, `rm`,
+`rename` or another `start` of it meanwhile ends that: a VM asked to stop
+is not run again, and `start` by hand begins its count again. A start that
+fails (its image removed, the host short of memory) is tried again with a
+growing backoff while it waits. A VM with a policy keeps what runs it again
+in the state directory too (`STATE/restart/NAME.json`), so the first full
+recovery after a reboot (see [Under systemd](#under-systemd); any command
+run as root does it) runs again those the reboot lost (as lost: status 124),
+and starts `always`'s stopped ones, as docker does when its daemon starts.
+A VM that fails (its Firecracker dies) is not restarted: its `failed`
+record stays for a post-mortem. `--restart` conflicts with `--rm`.
+
 `-e K=V` (again for more; a bare `-e K` takes `K` from this environment, and
 is left out if it has none), `--env-file FILE` (Docker's form: `K=V` lines,
 `#` comments; `-e` wins over it) and `--entrypoint CMD` (words, or a JSON
@@ -1050,11 +1078,13 @@ translated from docker's settings as it is created, and of those settings as
 given (its labels, which `inspect` and `--filter label=` show while its VM is
 there). `Cmd` and `Entrypoint` become `--entrypoint` (the app's argv, as
 docker's make it from the image's); `Env`, `-p` (a free port for docker's
-any), `--memory`, `--cpus`, `--rm`, `-i`, `-t` and an `--ip` given for the
+any), `--memory`, `--cpus`, `--rm`, `--restart` (docker's restart policies), `-i`, `-t` and an `--ip` given for the
 `bridge` network carry over. A setting with nothing under it is refused,
 not ignored: bind mounts and volumes, other networks, DNS settings, health
 checks, a working directory or user other than the image's (they are
-`pull` options), and limits flexvm does not keep. `docker stop` suspends
+`pull` options), and limits flexvm does not keep. A VM waiting out its
+restart policy's backoff is docker's `restarting`, and `docker stop` ends
+its restarts. `docker stop` suspends
 the VM to disk, so `docker start` resumes it where it was; `docker kill`
 (SIGKILL) destroys it, leaving no record, as `flexvm kill` does.
 

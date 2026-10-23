@@ -46,6 +46,114 @@ pub struct RunSpec {
     /// `-t`: the app runs on a pty.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub tty: bool,
+    /// `--restart`: the VM is run again when its app exits (`Restart`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Restart>,
+}
+
+/// `--restart POLICY`: docker's restart policies, for a background VM. Its app's exit runs the VM again
+/// (from its image, as `start` of an exited VM does) after a backoff, unless the policy says not; a
+/// `stop` or a `kill` (the VM asked to end) never does, and neither does a `start`, `rm` or another run
+/// of the name meanwhile. Its count and backoff are kept with it (`count`, `delay_ms`), and a `start`
+/// by hand begins them again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Restart {
+    pub policy: Policy,
+    /// `on-failure:N`: at most N restarts (0: no limit).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max: u32,
+    /// Restarts so far.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub count: u32,
+    /// The last backoff (ms), doubled for the next (from 100 ms up to a minute) unless the app ran 10 s.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub delay_ms: u64,
+}
+
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Policy {
+    /// On every exit of its app; and after a reboot, a stopped one too.
+    Always,
+    /// As `always`, but after a reboot only if it was not stopped.
+    UnlessStopped,
+    /// On an exit with a status other than 0, at most `max` times.
+    OnFailure,
+}
+
+/// The backoff before a first restart, doubled for each next one up to `MAX_BACKOFF`.
+pub const FIRST_BACKOFF: Duration = Duration::from_millis(100);
+pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// An app that ran this long starts the backoff again from `FIRST_BACKOFF`.
+pub const RAN_LONG: Duration = Duration::from_secs(10);
+
+impl Restart {
+    /// `--restart`'s value: `no` (None), `always`, `unless-stopped`, `on-failure` or `on-failure:N`.
+    pub fn parse(s: &str) -> Result<Option<Restart>> {
+        let (policy, max) = s.split_once(':').map_or((s, None), |(p, n)| (p, Some(n)));
+        let policy = match policy {
+            "no" if max.is_none() => return Ok(None),
+            "always" => Policy::Always,
+            "unless-stopped" => Policy::UnlessStopped,
+            "on-failure" => Policy::OnFailure,
+            _ => bail!("bad --restart {s:?}: give no, always, unless-stopped, on-failure or on-failure:N"),
+        };
+        let max = match max {
+            None => 0,
+            Some(n) if policy == Policy::OnFailure => {
+                n.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(|| format!("bad --restart {s:?}: on-failure:N takes a positive count"))?
+            }
+            Some(_) => bail!("bad --restart {s:?}: only on-failure takes a count"),
+        };
+        Ok(Some(Restart { policy, max, count: 0, delay_ms: 0 }))
+    }
+
+    /// Whether an exit of its app with `code`, after it ran for `ran`, runs it again: then the backoff before
+    /// that, counted (`count`, `delay_ms`).
+    pub fn next(&mut self, code: i32, ran: Duration) -> Option<Duration> {
+        if self.policy == Policy::OnFailure && (code == 0 || (self.max > 0 && self.count >= self.max)) {
+            return None;
+        }
+        let last = Duration::from_millis(self.delay_ms);
+        let delay = match ran >= RAN_LONG || last.is_zero() {
+            true => FIRST_BACKOFF,
+            false => (last * 2).min(MAX_BACKOFF),
+        };
+        self.count = self.count.saturating_add(1);
+        self.delay_ms = delay.as_millis() as u64;
+        Some(delay)
+    }
+
+    /// After a reboot, whether a VM it lost runs again (`stopped`: one stopped by hand, on disk).
+    pub fn after_boot(&self, stopped: bool) -> bool {
+        match self.policy {
+            Policy::Always => true,
+            Policy::UnlessStopped | Policy::OnFailure => !stopped,
+        }
+    }
+
+    /// Begun again: a `start` by hand.
+    pub fn reset(&mut self) {
+        (self.count, self.delay_ms) = (0, 0);
+    }
+}
+
+impl std::fmt::Display for Restart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let p = match self.policy {
+            Policy::Always => "always",
+            Policy::UnlessStopped => "unless-stopped",
+            Policy::OnFailure => "on-failure",
+        };
+        match self.max {
+            0 => write!(f, "{p}"),
+            n => write!(f, "{p}:{n}"),
+        }
+    }
 }
 
 /// The most of the app's settings sent to the guest (hex-encoded on its request line).
@@ -94,6 +202,9 @@ impl RunSpec {
 
     /// Refused before anything starts: what the template's app cannot take.
     pub fn check(&self, image: Option<&ImageMeta>) -> Result<()> {
+        if self.restart.is_some() && self.rm {
+            bail!("--restart and --rm conflict: a vm run again must keep its exited record");
+        }
         if self.entrypoint.as_ref().is_some_and(|e| e.is_empty() || e[0].is_empty()) {
             bail!("--entrypoint needs a program");
         }
@@ -141,6 +252,8 @@ pub struct Exited {
     /// Its command's or app's exit status (128+signal for a signal).
     pub status: i32,
     pub template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
     pub resources: crate::vm::Resources,
@@ -148,11 +261,15 @@ pub struct Exited {
     pub spec: RunSpec,
     /// When it exited (seconds since the epoch).
     pub at: u64,
+    /// Its restart policy runs it again then (ms since the epoch; `restart::due`), unless something else
+    /// starts, removes or runs the name first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_due: Option<u64>,
 }
 
 impl Exited {
     pub fn new(status: i32, template: String, cmd: Option<String>, resources: crate::vm::Resources, spec: RunSpec, at: u64) -> Exited {
-        Exited { status, template, cmd, resources, spec, at }
+        Exited { status, template, template_id: None, cmd, resources, spec, at, restart_due: None }
     }
 
     pub fn read(path: &std::path::Path) -> Result<Exited> {
@@ -306,6 +423,7 @@ mod tests {
             ports: ports.clone(),
             stdin: true,
             tty: true,
+            restart: Some(Restart { policy: Policy::OnFailure, max: 3, count: 1, delay_ms: 200 }),
         };
         assert_eq!(serde_json::from_value::<RunSpec>(serde_json::to_value(&s).unwrap()).unwrap(), s);
         assert_eq!(serde_json::to_string(&RunSpec::default()).unwrap(), "{}");
@@ -320,6 +438,53 @@ mod tests {
         assert!(serde_json::to_value(&e).unwrap().get("ports").is_none(), "the ports are written once, in the spec");
         std::fs::write(dir.join("z.exited"), "garbage").unwrap();
         assert!(Exited::read(&dir.join("z.exited")).is_err());
+    }
+
+    #[test]
+    fn restart_policies_read_as_dockers() {
+        assert_eq!(Restart::parse("no").unwrap(), None);
+        for (s, policy, max) in [
+            ("always", Policy::Always, 0),
+            ("unless-stopped", Policy::UnlessStopped, 0),
+            ("on-failure", Policy::OnFailure, 0),
+            ("on-failure:3", Policy::OnFailure, 3),
+        ] {
+            let r = Restart::parse(s).unwrap().unwrap();
+            assert_eq!((r.policy, r.max), (policy, max), "{s}");
+            assert_eq!(r.to_string(), s);
+        }
+        for bad in ["", "sometimes", "always:3", "no:1", "on-failure:0", "on-failure:x", "on-failure:-1"] {
+            assert!(Restart::parse(bad).is_err(), "{bad}");
+        }
+        let both = RunSpec { restart: Restart::parse("always").unwrap(), rm: true, ..Default::default() };
+        assert!(both.check(None).unwrap_err().to_string().contains("conflict"));
+        // Serialized as it reads.
+        let r = Restart::parse("unless-stopped").unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&r).unwrap(), serde_json::json!({"policy": "unless-stopped"}));
+    }
+
+    #[test]
+    fn restarts_back_off_and_count_as_dockers() {
+        let ms = |d: Option<Duration>| d.map(|d| d.as_millis() as u64);
+        let mut a = Restart::parse("always").unwrap().unwrap();
+        let quick = Duration::from_millis(50);
+        assert_eq!([ms(a.next(0, quick)), ms(a.next(1, quick)), ms(a.next(0, quick))], [Some(100), Some(200), Some(400)]);
+        assert_eq!(a.count, 3);
+        // Ran 10 s: from the first backoff again.
+        assert_eq!(ms(a.next(0, RAN_LONG)), Some(100));
+        for _ in 0..20 {
+            a.next(1, quick);
+        }
+        assert_eq!(a.delay_ms, MAX_BACKOFF.as_millis() as u64, "capped at a minute");
+        let mut f = Restart::parse("on-failure:2").unwrap().unwrap();
+        assert_eq!(f.next(0, quick), None, "a success ends it");
+        assert!(f.next(1, quick).is_some() && f.next(1, quick).is_some());
+        assert_eq!(f.next(1, quick), None, "at most twice");
+        f.reset();
+        assert!(f.next(2, quick).is_some(), "a start by hand counts again");
+        assert!(Restart::parse("always").unwrap().unwrap().after_boot(true));
+        let u = Restart::parse("unless-stopped").unwrap().unwrap();
+        assert!(u.after_boot(false) && !u.after_boot(true));
     }
 
     #[test]

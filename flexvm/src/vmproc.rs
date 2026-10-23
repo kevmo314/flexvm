@@ -699,6 +699,10 @@ pub struct Runtime {
     pub cmd: Mutex<Option<String>>,
     /// `run`'s app settings and `-p` ports, and what becomes of the VM once its app exits (`app::RunSpec`).
     pub spec: Mutex<crate::app::RunSpec>,
+    /// What it keeps for its restart policy after a reboot (`restart::keep`), under which name, as last written.
+    restart_kept: Mutex<Option<(String, Vec<u8>)>>,
+    /// A SIGTERM (`flexvm stop`) came: an app's exit as it lands is never restarted (a stop ends a restart loop).
+    stop_asked: AtomicBool,
     /// Its `run`'s stdin is a terminal: no hint when its app exits at once.
     pub tty: AtomicBool,
     /// In the foreground (a `run` or `start -a` follows it): it leaves no exited record.
@@ -1374,6 +1378,28 @@ impl Proc {
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
             crate::log!("vm {n}: registry: {e}");
         }
+        self.keep_restart(&n, vm);
+    }
+
+    /// With a restart policy, what runs the VM again after a reboot (`restart::keep`), kept up to date under its name.
+    fn keep_restart(&self, name: &str, vm: &Vm) {
+        let spec = self.spec.lock().unwrap().clone();
+        if spec.restart.is_none() {
+            return;
+        }
+        let rec = crate::app::Exited::new(0, vm.template.name.clone(), self.cmd.lock().unwrap().clone(), vm.resources(), spec, 0);
+        let bytes = serde_json::to_vec(&rec).unwrap_or_default();
+        let mut kept = self.restart_kept.lock().unwrap();
+        if kept.as_ref().is_some_and(|(n, b)| n == name && *b == bytes) {
+            return;
+        }
+        if let Some((old, _)) = kept.as_ref().filter(|(n, _)| n != name) {
+            crate::restart::forget(&self.host, old);
+        }
+        match crate::restart::keep(&self.host, name, &rec) {
+            Ok(()) => *kept = Some((name.to_string(), bytes)),
+            Err(e) => crate::log!("vm {name}: keeping its restart policy's record: {e}"),
+        }
     }
 
     /// The one way the process ends, holding `op`.
@@ -1403,8 +1429,10 @@ impl Proc {
         if let Some(dir) = self.consumed.lock().unwrap().take() {
             crate::lifecycle::delete_consumed(&self.name(), &dir);
         }
-        if exited {
-            self.record_exit(code);
+        // A restart it scheduled keeps its record for a reboot; any other end ends its policy's.
+        let again = exited && self.record_exit(code);
+        if let Some((kept, _)) = self.restart_kept.lock().unwrap().take().filter(|_| !again) {
+            crate::restart::forget(&self.host, &kept);
         }
         // Before the name goes: `flexvm wait` reads it as this instance's.
         if let Some(n) = self.name.lock().unwrap().as_ref() {
@@ -1433,18 +1461,41 @@ impl Proc {
     }
 
     /// A background VM whose command or app exited leaves `RUN/vms/NAME.exited` (under its name,
-    /// so a `run` or `start` of the name waits for it), unless `run --rm`.
-    fn record_exit(&self, code: i32) {
+    /// so a `run` or `start` of the name waits for it), unless `run --rm`. Its restart policy may run it
+    /// again (`restart::on_exit`): then the record says when, a worker is left to (`restart::schedule`), and
+    /// this returns true.
+    fn record_exit(&self, code: i32) -> bool {
         let spec = self.spec.lock().unwrap().clone();
-        let (Some(vm), Ok(path)) = (self.vm.get(), self.host.vms(&self.name(), "exited")) else { return };
+        let name = self.name();
+        let (Some(vm), Ok(path)) = (self.vm.get(), self.host.vms(&name, "exited")) else { return false };
         if self.attached.load(Ordering::SeqCst) || spec.rm {
-            return;
+            return false;
         }
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let cmd = self.cmd.lock().unwrap().clone();
-        let rec = crate::app::Exited::new(code, vm.template.name.clone(), cmd, vm.resources(), spec, at);
+        let mut rec = crate::app::Exited {
+            template_id: Some(vm.template.meta.id.clone()),
+            ..crate::app::Exited::new(code, vm.template.name.clone(), cmd, vm.resources(), spec, at)
+        };
+        // How long its app ran: a resumed VM's, started by another process, ran at least that long.
+        let ran = self.app_started.lock().unwrap().map_or(crate::app::RAN_LONG, |t| t.elapsed());
+        let again = !self.stop_asked.load(Ordering::SeqCst) && crate::restart::on_exit(&mut rec, ran);
         if let Err(e) = crate::host::store_private(&path, &rec, true) {
             crate::log!("vm {}: its exited record {}: {e}", vm.name, path.display());
+            return false;
+        }
+        if !again {
+            return false;
+        }
+        if let Err(e) = crate::restart::keep(&self.host, &name, &rec) {
+            crate::log!("vm {name}: keeping its restart policy's record: {e}");
+        }
+        match crate::restart::schedule(&self.host, &name) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::log!("vm {name}: scheduling its restart: {e}");
+                false
+            }
         }
     }
 
@@ -1680,7 +1731,11 @@ impl Proc {
         // A rerun is what its record says, read under the name: never one another start replaced meanwhile.
         let (template, want) = match &record {
             Some(path) => {
-                let r = crate::app::Exited::read(path)?;
+                let mut r = crate::app::Exited::read(path)?;
+                // A start by hand (no restart due) begins its policy's count and backoff again.
+                if let (None, Some(restart)) = (r.restart_due, r.spec.restart.as_mut()) {
+                    restart.reset();
+                }
                 *self.cmd.lock().unwrap() = r.cmd;
                 *self.resources.lock().unwrap() = r.resources;
                 let ip = r.spec.ip;
@@ -1897,6 +1952,9 @@ impl Proc {
     }
 
     fn dispatch(self: &Arc<Self>, sig: i32) {
+        if sig == libc::SIGTERM {
+            self.stop_asked.store(true, Ordering::SeqCst);
+        }
         if !matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
             let _ = self.handle(sig);
             return;

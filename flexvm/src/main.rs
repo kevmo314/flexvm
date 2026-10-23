@@ -24,6 +24,7 @@ mod management;
 mod migrate;
 mod net;
 mod ports;
+mod restart;
 mod socket;
 mod standby;
 mod template;
@@ -70,6 +71,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --keep                         stay up once the app exits (without: the VM exits with it, with its
                                      status; a background one is then listed exited until rm or start)
       --rm                           leave no exited record once a background VM exits
+      --restart POLICY               with -d: run it again when its app exits (no, always, unless-stopped,
+                                     on-failure[:N]; backoff 100 ms doubling to 1 min), and after a reboot
       --checkpoint NAME|ID           start it from a stored checkpoint instead of IMAGE (its name and
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
@@ -493,9 +496,11 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
             "standby",
             "incoming",
             "publish",
+            "restart",
         ],
     ),
     ("standby-refill", 2, &[]), // Internal delayed refill worker.
+    ("restart-due", 2, &[]),    // Internal: a restart policy's (`restart::due`).
     ("ps", 1, &["all", "json", "quiet", "filter", "format"]),
     ("exec", 2, &["detach", "interactive", "tty", "env", "workdir", "user"]),
     ("attach", 2, &[]),
@@ -549,7 +554,7 @@ fn check_applies(args: &Args) -> Result<()> {
         if !args.rest.is_empty() {
             bail!("run --checkpoint takes no CMD: the checkpoint's command cannot be replaced");
         }
-        if let Some(f) = ["env", "env-file", "entrypoint", "keep", "rm", "interactive", "tty"].into_iter().find(|f| args.has(f)) {
+        if let Some(f) = ["env", "env-file", "entrypoint", "keep", "rm", "interactive", "tty", "restart"].into_iter().find(|f| args.has(f)) {
             bail!("--{f} does not apply to run --checkpoint: the checkpoint's app runs already");
         }
     } else if cmd == "run" && args.has("paused") {
@@ -623,6 +628,11 @@ fn check_applies(args: &Args) -> Result<()> {
         bail!("{cmd} takes no empty word {empty:?}");
     }
     let interactive = args.has("interactive") || args.has("tty");
+    // Only a background VM leaves the exited record a restart runs again (a foreground one's process is its run's).
+    // (A detached run's VM process has its parent's flags but -d, and answers on FLEXVM_NOTIFY_FD.)
+    if cmd == "run" && args.get("restart").is_some_and(|r| r != "no") && !args.has("detach") && !internal && std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
+        bail!("--restart applies to a background vm: give -d");
+    }
     if cmd == "run" && args.has("keep") && !args.rest.is_empty() && !interactive {
         bail!("--keep applies to the image's app: with CMD, the vm ends with CMD");
     }
@@ -660,7 +670,7 @@ pub fn open_host(args: &Args) -> Result<Host> {
         None => host::default_run(&state)?,
     };
     let host = Host::open(&state, &run)?;
-    let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "listen" | "pull"));
+    let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "listen" | "pull" | "restart-due"));
     if let Err(e) = gc::after_boot(&host, !partly) {
         if gc::first_boot_warning(&host, host::boot_id()) {
             crate::log!("flexvm: recovering after boot: {e}");
@@ -686,6 +696,10 @@ fn real_main(args: &Args) -> Result<()> {
     let call = |req: Value| print(vmproc::call(&open_host(args)?, name, req, None)?);
     match pos.first().copied() {
         Some("standby-refill") => standby::retry(&open_host(args)?, &template::name_of(name)?),
+        Some("restart-due") => {
+            let host = open_host(args)?;
+            restart::due(&host, name, |n| start(&host, args, n))
+        }
         Some("pull") => pull(args, name),
         Some("images") => images(&open_host(args)?, &paths(args)?, args),
         Some("tag") => print(template::tag(&paths(args)?, name, arg2.ok_or("tag needs SRC DST")?)?),
@@ -1187,7 +1201,8 @@ fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec>
         None if (stdin || tty) && !args.rest.is_empty() => Some(args.rest.clone()),
         None => None,
     };
-    Ok(app::RunSpec { env, entrypoint, keep: args.has("keep"), rm: args.has("rm"), ip, ports: port_specs(args)?, stdin, tty })
+    let restart = args.get("restart").map(app::Restart::parse).transpose()?.flatten();
+    Ok(app::RunSpec { env, entrypoint, keep: args.has("keep"), rm: args.has("rm"), ip, ports: port_specs(args)?, stdin, tty, restart })
 }
 
 /// `start` of an exited VM (`app::Exited`): a new run under its name, as its record (read under
@@ -1559,7 +1574,11 @@ fn stop(host: &Host, name: &str) -> Result<String> {
     let mut vm = match Tracked::signal(host, name, libc::SIGTERM, &|_| Ok(()))? {
         Some(vm) => vm,
         // A stopped VM's checkpoint, not debris (a consumed or discarded one) under its name.
-        None if host.is_suspended(name) || host.has_record(name, "exited") => return Ok(name.into()),
+        // An exited one whose restart policy would run it again is not (docker's stop ends a restart loop).
+        None if host.is_suspended(name) || host.has_record(name, "exited") => {
+            restart::cancel(host, name)?;
+            return Ok(name.into());
+        }
         None => return Err(not_running(host, name)),
     };
     let (start, mut seen) = (Instant::now(), false);
@@ -1574,6 +1593,10 @@ fn stop(host: &Host, name: &str) -> Result<String> {
         }
     }
     let (Ended { last, exit, shown, records: r }, ident) = (vm.ended(host), &vm.ident);
+    // Its app exited as the stop came: a restart that instance scheduled (before it took the SIGTERM) is not run.
+    if r.exited && exit.as_ref().is_some_and(|e| e.ident == *ident) {
+        restart::cancel(host, &last)?;
+    }
     // Suspended by the instance signalled, as its checkpoint's OWNER says (never debris, a checkpoint consumed by a
     // resume that then died, or another instance's), or its app exited first (the VM, ending, took no suspend).
     if matches!(&r.checkpoint, Some(host::Checkpoint::Resumable { owner: Some(o) }) if o == ident) || r.exited {
@@ -1834,7 +1857,11 @@ fn vms(host: &Host) -> Vec<Value> {
         let error = match state {
             "exited" => match app::Exited::read(&path) {
                 Ok(r) => {
-                    vms.push(json!({"name": n, "state": state, "status": r.status, "template": r.template, "exited_at": r.at, "ports": r.spec.ports}));
+                    let mut v = json!({"name": n, "state": state, "status": r.status, "template": r.template, "exited_at": r.at, "ports": r.spec.ports});
+                    if let Some(due) = r.restart_due {
+                        v["restart_due_ms"] = json!(due);
+                    }
+                    vms.push(v);
                     continue;
                 }
                 Err(e) => e.to_string(),
@@ -1877,6 +1904,9 @@ fn ps(host: &Host, args: &Args) -> Result<()> {
         let [a, b, image, mut d, e, g, h, starved] = ["Name", "IP", "Image", "State", "PID", "RSS", "MaxMiB", "Starved"].map(|k| containers::field(v, k));
         if let Some(status) = v["status"].as_i64().filter(|_| d == "exited") {
             d = format!("exited ({status})");
+            if v["restart_due_ms"].is_u64() {
+                d += ", restarting";
+            }
         }
         let cpus = v["cpus"].as_f64().map_or_else(|| containers::field(v, "VCPUs"), |c| c.to_string());
         let ports: Vec<ports::Port> = serde_json::from_value(v["ports"].clone()).unwrap_or_default();
