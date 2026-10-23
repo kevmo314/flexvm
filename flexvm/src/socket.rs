@@ -2,6 +2,7 @@
 
 use std::fs::{self, DirBuilder};
 use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,13 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use crate::util::Result;
+
+/// Take systemd's fd 3 once at startup; no child inherits it.
+pub fn activated() -> Option<OwnedFd> {
+    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
+    let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    (pid == std::process::id() && n >= 1 && unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) } == 0).then(|| unsafe { OwnedFd::from_raw_fd(3) })
+}
 
 /// Linux sun_path includes the terminating NUL.
 pub fn check(path: &Path) -> io::Result<()> {
@@ -263,6 +271,37 @@ impl Drop for Sockets {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn activation_checks_environment_and_sets_cloexec() {
+        if let Ok(case) = std::env::var("FLEXVM_TEST_ACTIVATION") {
+            let fd = super::activated();
+            assert_eq!(fd.is_some(), case == "valid");
+            if let Some(fd) = fd {
+                use std::os::fd::AsRawFd;
+                assert_eq!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+            }
+            return;
+        }
+        for (case, setup) in [
+            ("valid", "LISTEN_PID=$$ LISTEN_FDS=1"),
+            ("wrong-pid", "LISTEN_PID=0 LISTEN_FDS=1"),
+            ("no-fds", "LISTEN_PID=$$ LISTEN_FDS=0"),
+            ("invalid", "LISTEN_PID=$$ LISTEN_FDS=invalid"),
+            ("missing", ""),
+        ] {
+            let script = format!("exec 3</dev/null; {setup} exec \"$0\" --exact socket::tests::activation_checks_environment_and_sets_cloexec --quiet");
+            let status = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .arg(std::env::current_exe().unwrap())
+                .env_remove("LISTEN_PID")
+                .env_remove("LISTEN_FDS")
+                .env("FLEXVM_TEST_ACTIVATION", case)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{case}");
+        }
+    }
 
     fn fixture() -> crate::test_util::TempDir {
         // Leave room for the longest socket suffix regardless of TMPDIR's length.
