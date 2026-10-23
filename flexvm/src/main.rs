@@ -734,7 +734,10 @@ fn real_main(args: &Args) -> Result<()> {
         }
         Some("attach") => {
             let host = open_host(args)?;
-            util::exit(attach::attach(&host, name, None)?)
+            // From the app's first byte rather than from now: the Docker API's attach of a container it starts.
+            let from = std::env::var("FLEXVM_ATTACH_FROM").ok().and_then(|f| f.parse().ok());
+            std::env::remove_var("FLEXVM_ATTACH_FROM");
+            util::exit(attach::attach(&host, name, from)?)
         }
         Some("cp") => {
             let host = open_host(args)?;
@@ -1051,13 +1054,16 @@ fn run_as(
     let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
     // A foreground -i or -t runs it in the background, and attaches to it (as `attach`).
     let attached = (args.has("interactive") || args.has("tty")) && !args.has("detach") && !tried;
+    // A `run -d` its caller attaches to next (the Docker API's start of a container a client attaches to):
+    // its app's end waits for that, as a foreground `run -i`'s does. A cold start's VM process reads it itself.
+    let attacher = attached || (!tried && args.has("detach") && std::env::var_os("FLEXVM_ATTACHER").is_some());
     // A claimed standby VM writes where this process would, to opens made here (`own`).
     let log = (args.has("detach") || attached).then(|| new_run_log(host, &name)).transpose()?;
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
     let tty = log.is_none() && std::io::stdin().is_terminal();
-    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none(), "attacher": attached, "logs_handoff": log.as_ref().map(|l| l.token.as_str())});
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": tty, "verbose": util::verbose(), "attached": log.is_none(), "attacher": attacher, "logs_handoff": log.as_ref().map(|l| l.token.as_str())});
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A foreground claim's signals wait from before it is sent: the VM it makes gets them
@@ -1082,7 +1088,7 @@ fn run_as(
         (None, Some(log)) => {
             // The child takes the name made up here.
             let child = [&["--name".to_string(), name.clone()][..], &args.child_args].concat();
-            let v = spawn_detached(host, &name, &child, &log, attached)?;
+            let v = spawn_detached(host, &name, &child, &log, attacher)?;
             match attached {
                 true => run_attached(host, &name, args.has("keep"), &started(&v)),
                 false => print(v),

@@ -616,6 +616,12 @@ pub async fn route(api: &Arc<Api>, req: Request<Incoming>, words: &[&str]) -> Op
         (hyper::Method::POST, [id, "unpause"]) => lifecycle::pause(api, id, false).await,
         (hyper::Method::POST, [id, "rename"]) => lifecycle::rename(api, id, q).await,
         (hyper::Method::DELETE, [id]) => lifecycle::remove(api, id, q).await,
+        (hyper::Method::POST, [id, "attach"]) => super::streams::attach(api, id, req).await,
+        (hyper::Method::POST, [id, "resize"]) => super::streams::resize_container(api, id, q).await,
+        (hyper::Method::POST, [id, "exec"]) => match super::body_json(req).await {
+            Ok(body) => super::streams::exec_create(api, id, body).await,
+            Err(e) => Err(e),
+        },
         _ => return None,
     })
 }

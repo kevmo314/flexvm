@@ -2562,6 +2562,7 @@ def docker_api_with(d):
     A.kill(vm)
     A.rm(job)
     docker_lifecycle(d)
+    docker_streams(d)
 
 
 def docker_lifecycle(d):
@@ -2604,6 +2605,49 @@ def docker_lifecycle(d):
     check("container prune: none of them left", job not in left and gone not in left, (pruned, left))
     refused = d("run", "-d", "-v", "/tmp:/data", t, "true", check=False)
     check("a bind mount: refused, saying so", refused.returncode != 0 and "not supported by flexvm" in refused.stderr, refused.stderr)
+
+
+def image_for_docker():
+    """A template of --image's (as image_template pulls it), for what needs an image's app: None with --no-image."""
+    if args.no_image:
+        return None
+    name = args.template + "-dk"
+    layout = image_layout()
+    if layout:
+        flexvm("pull", layout, "--tag", name, "--vcpus", "2", "--max", "2048", timeout=600)
+    else:
+        pull_template(name, ["--vcpus", "2", "--max", "2048"])
+    return name
+
+
+def docker_streams(d):
+    """exec (its streams apart, stdin, a pty, -d) and attach (docker run's, from its app's first byte)."""
+    vm = "e2e-dk-exec"
+    A.vms.add(vm)
+    d("run", "-d", "--name", vm, args.template, "sleep", "600")
+    r = d("exec", vm, "sh", "-c", "echo to-out; echo to-err >&2; exit 7", check=False)
+    check("exec: stdout, stderr and status apart", (r.returncode, r.stdout, r.stderr) == (7, "to-out\n", "to-err\n"), (r.returncode, r.stdout, r.stderr))
+    r = d("exec", "-i", vm, "sh", "-c", "cat; echo done", input="from-stdin\n")
+    check("exec -i: stdin, to its end", r.stdout == "from-stdin\ndone\n", repr(r.stdout))
+    r = d("exec", "-t", vm, "sh", "-c", "tty; stty size")
+    lines = r.stdout.replace("\r", "").split("\n")
+    check("exec -t: on a pty, its size set", lines[0].startswith("/dev/pts/") and len(lines[1].split()) == 2, repr(r.stdout))
+    d("exec", "-d", vm, "sh", "-c", "sleep 1; touch /tmp/e2e-detached")
+    check("exec -d: runs on, detached", wait_for(lambda: d("exec", vm, "test", "-f", "/tmp/e2e-detached", check=False).returncode == 0, 30))
+    d("rm", "-f", vm)
+    image = image_for_docker()
+    if image is None:
+        return print("  (attach: no image, --no-image)")
+    run, piped = "e2e-dk-attached", "e2e-dk-piped"
+    A.vms.update([run, piped])
+    r = d("run", "--name", run, image, "sh", "-c", "echo hello-attached; echo to-err >&2; exit 2", check=False, timeout=180)
+    check("run, attached: its app's output from its first byte, and its status", r.returncode == 2 and "hello-attached" in r.stdout
+          and "to-err" in r.stderr, (r.returncode, r.stdout, r.stderr))
+    check("run, attached: left exited", d("inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", run).stdout.split() == ["exited", "2"])
+    r = d("run", "-i", "--rm", "--name", piped, image, "sh", "-c", "cat; echo end", input="piped-in\n", timeout=180)
+    check("run -i --rm: stdin to the app, to its end", r.stdout == "piped-in\nend\n", repr(r.stdout))
+    check("run --rm: nothing left", piped not in d("ps", "-a", "--format", "{{.Names}}").stdout)
+    d("rm", run)
 
 
 @case
@@ -2808,7 +2852,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "docker_api": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "docker_api": 30, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,

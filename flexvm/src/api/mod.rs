@@ -11,6 +11,7 @@ mod containers;
 mod create;
 mod images;
 mod lifecycle;
+mod streams;
 mod system;
 
 use std::convert::Infallible;
@@ -89,6 +90,7 @@ pub struct Api {
     pub paths: Paths,
     /// `--state`, `--run` (and `--verbose`) as this process was given them: a command it runs gets them first.
     pub globals: Vec<String>,
+    pub streams: streams::Streams,
 }
 
 impl Api {
@@ -114,7 +116,7 @@ pub fn main(host: Host, paths: Paths, globals: Vec<String>, socket: Option<&str>
         crate::log!("flexvm api: serving the Docker Engine API (v{API_VERSION}) on unix://{}", at.display());
     }
     listener.set_nonblocking(true)?;
-    let api = Arc::new(Api { host, paths, globals });
+    let api = Arc::new(Api { host, paths, globals, streams: Default::default() });
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).max_blocking_threads(64).enable_all().build()?;
     rt.block_on(async { serve(tokio::net::UnixListener::from_std(listener)?, api).await })
 }
@@ -237,6 +239,14 @@ async fn route(api: &Arc<Api>, req: Request<Incoming>) -> Reply {
         (&Method::GET | &Method::HEAD, ["_ping"]) => system::ping(&method),
         (&Method::GET, ["version"]) => system::version(api).await,
         (&Method::GET, ["info"]) => system::info(api).await,
+        (_, ["exec", rest @ ..]) => {
+            let rest: Vec<String> = rest.iter().map(|w| w.to_string()).collect();
+            let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+            match streams::route(api, req, &rest).await {
+                Some(r) => r,
+                None => Err(unrouted(&method, path)),
+            }
+        }
         (_, ["containers", rest @ ..]) => {
             let rest: Vec<String> = rest.iter().map(|w| w.to_string()).collect();
             let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
