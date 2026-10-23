@@ -565,6 +565,10 @@ pub(crate) fn valid_id(id: &str) -> bool {
 impl Template {
     pub fn resolve(paths: &Paths, name: &str) -> Result<PathBuf> {
         check_name(name)?;
+        // API-created containers run their retained generation, even after its tag moves.
+        if let Some(dir) = Self::generation(paths, name) {
+            return Ok(dir);
+        }
         let link = paths.templates.join(name);
         match std::fs::read_link(&link) {
             Ok(target) => Ok(paths.templates.join(target)),

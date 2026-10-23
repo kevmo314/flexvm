@@ -5120,6 +5120,23 @@ pub fn recorded_template_users(state: &Path, place: &str) -> std::collections::B
             Err(err) => unreadable.push(err.to_string()),
         }
     }
+    // Docker-created containers have no VM yet, but retain their selected generation.
+    for entry in crate::checkpoint::entries(&state.join("api/containers")) {
+        match entry {
+            Ok(path) if path.extension().is_some_and(|e| e == "json") => {
+                match std::fs::read(&path).map_err(crate::util::Error::from).and_then(|bytes| Ok(serde_json::from_slice::<crate::api::create::Record>(&bytes)?))
+                {
+                    Ok(r) if !r.generation.is_empty() => {
+                        ids.insert(r.generation);
+                    }
+                    Ok(_) => {}
+                    Err(e) => unreadable.push(e.to_string()),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => unreadable.push(e.to_string()),
+        }
+    }
     // Names cannot hide a checkpoint's template: their listing does not matter here.
     for manifest in crate::checkpoint::managed(state).map(|c| c.and_then(|(_, m)| m)) {
         match manifest {
@@ -5129,7 +5146,7 @@ pub fn recorded_template_users(state: &Path, place: &str) -> std::collections::B
     }
     // It may use any generation: all stay, and `rmi` or `image prune` says why.
     if !unreadable.is_empty() {
-        ids.insert(format!("{}a checkpoint {place} cannot be read ({})", crate::template::KEEP_ALL, unreadable.join("; ")));
+        ids.insert(format!("{}a container or checkpoint record {place} cannot be read ({})", crate::template::KEEP_ALL, unreadable.join("; ")));
     }
     ids
 }

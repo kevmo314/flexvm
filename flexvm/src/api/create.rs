@@ -21,6 +21,12 @@ pub struct Record {
     /// The image as given, and its template.
     pub image: String,
     pub template: String,
+    /// The immutable generation selected at create time.
+    #[serde(default)]
+    pub generation: String,
+    /// A rename holds this destination until the VM and record have moved.
+    #[serde(default)]
+    pub reserved: bool,
     /// Docker's `Config` and `HostConfig`, as given.
     pub config: Value,
     pub host_config: Value,
@@ -81,6 +87,9 @@ pub fn remove(api: &Api, name: &str) {
 /// `vms` (`ps -a`'s) with each record: a VM's under `docker`, a container not started yet as one `created`.
 pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
     for r in load_all(api) {
+        if r.reserved {
+            continue;
+        }
         match vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
             Some(v) => v["docker"] = json!(r),
             None if !r.started => {
@@ -96,7 +105,17 @@ pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
 }
 
 fn strings(v: &Value) -> Option<Vec<String>> {
-    v.as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+    v.as_array().map(|_| images::strings(v))
+}
+
+/// Resolve Docker's optional app overrides, preserving empty argv words. Only `[""]` clears
+/// an entrypoint; an explicitly supplied entrypoint also drops the image's default command.
+pub fn app(config: &Value, entrypoint: Vec<String>, cmd: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let e = strings(&config["Entrypoint"]);
+    let c = strings(&config["Cmd"]);
+    let cmd = c.unwrap_or(if e.is_some() { Vec::new() } else { cmd });
+    let entrypoint = e.map(|e| if e == [""] { Vec::new() } else { e }).unwrap_or(entrypoint);
+    (entrypoint, cmd)
 }
 
 /// Whether docker's setting `v` is its default (absent, null, false, 0, empty).
@@ -264,8 +283,14 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     }
     let host_config = body["HostConfig"].clone();
     let image = config["Image"].as_str().filter(|i| !i.is_empty()).ok_or_else(|| Error::bad("config has no Image"))?.to_string();
-    let template = crate::template::name_of(&image).map_err(|e| Error::bad(e.to_string()))?;
-    let tpl = images::linked(api, &template).and_then(|id| images::meta(api, &id)).ok_or_else(|| Error::missing(format!("No such image: {image}")))?;
+    let template = crate::template::name_of(&image).ok();
+    let linked = template.as_ref().and_then(|name| images::linked(api, name));
+    let generation = linked
+        .clone()
+        .or_else(|| crate::template::generation_by_prefix(&api.paths, image.strip_prefix("sha256:").unwrap_or(&image)).ok())
+        .ok_or_else(|| Error::missing(format!("No such image: {image}")))?;
+    let template = if linked.is_some() { template.unwrap() } else { generation.clone() };
+    let tpl = images::meta(api, &generation).ok_or_else(|| Error::missing(format!("No such image: {image}")))?;
     refuse_unsupported(&config, &host_config, name)?;
     let meta = tpl.image.as_ref();
     let image_config = images::config(api, &tpl);
@@ -281,10 +306,8 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     let mut cmd_words = Vec::new();
     // Docker's Entrypoint and Cmd: given (an empty Entrypoint clears the image's), else the image's; a new
     // entrypoint drops the image's command.
-    let (entrypoint, cmd) = (strings(&config["Entrypoint"]), strings(&config["Cmd"]));
-    if entrypoint.is_some() || cmd.is_some() {
-        let e = entrypoint.clone().map(|e| e.into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>()).unwrap_or(image_entrypoint);
-        let c = cmd.unwrap_or(if entrypoint.is_some() { Vec::new() } else { image_cmd });
+    if config["Entrypoint"].is_array() || config["Cmd"].is_array() {
+        let (e, c) = app(&config, image_entrypoint, image_cmd);
         let app: Vec<String> = e.into_iter().chain(c).collect();
         match (app == argv, app.is_empty(), meta.is_some()) {
             (true, _, _) => {}
@@ -339,18 +362,121 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
             run.extend(["--ip".to_string(), ip.to_string()]);
         }
     }
-    run.push(template.clone());
+    run.push(generation.clone());
     if !cmd_words.is_empty() {
         run.push("--".into());
         run.extend(cmd_words);
     }
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    Ok(Record { name: name.to_string(), created, run, image, template, config, host_config, started: false })
+    Ok(Record { name: name.to_string(), created, run, image, template, generation, reserved: false, config, host_config, started: false })
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub fn fixture() -> (crate::test_util::TempDir, std::sync::Arc<Api>) {
+        let d = crate::test_util::TempDir::new("api-create");
+        let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let api = std::sync::Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![] });
+        image(&api, "aaaa1111", json!({"Entrypoint": ["/bin/sh", "-c", ""], "Cmd": ["default"], "Labels": {"keep": "image"}, "Env": ["A=image", "B=image"]}));
+        std::os::unix::fs::symlink(".gen/aaaa1111", api.paths.templates.join("image")).unwrap();
+        (d, api)
+    }
+
+    pub fn image(api: &Api, id: &str, config: Value) {
+        let blob = serde_json::to_vec(&json!({"config": config})).unwrap();
+        let digest = crate::image::registry::sha256_hex(&blob);
+        let path = crate::image::registry::blob_path(&api.host.state.join("images/blobs"), &digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, blob).unwrap();
+        let generation = api.paths.templates.join(crate::template::GENERATIONS).join(id);
+        std::fs::create_dir_all(&generation).unwrap();
+        let argv: Vec<_> = images::strings(&config["Entrypoint"]).into_iter().chain(images::strings(&config["Cmd"])).collect();
+        let meta = json!({
+            "compatibility": {"cpu": "", "tsc_khz": 0, "tsc_control": false, "msrs": [], "firecracker": "", "features": {}, "xsave": {}},
+            "vcpus": 1, "mem_mib": 1, "max_mib": 1, "plugged_mib": 0, "kernel": "", "rootfs": "", "id": id, "components": {},
+            "image": {"source": "image", "digest": "sha256:source", "config_digest": digest, "app_conf": "", "argv": argv, "warm": false}
+        });
+        std::fs::write(generation.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn app_overrides_distinguish_null_empty_arrays_and_the_clearing_sentinel() {
+        let entrypoint = vec!["sh".into(), "-c".into(), "".into()];
+        let cmd = vec!["default".into()];
+        for config in [json!({}), json!({"Entrypoint": null, "Cmd": null})] {
+            assert_eq!(app(&config, entrypoint.clone(), cmd.clone()), (entrypoint.clone(), cmd.clone()));
+        }
+        for e in [json!([]), json!([""])] {
+            assert_eq!(app(&json!({"Entrypoint": e, "Cmd": ["echo", ""]}), entrypoint.clone(), cmd.clone()), (vec![], vec!["echo".into(), "".into()]));
+        }
+        assert_eq!(app(&json!({"Entrypoint": ["sh", "-c", ""]}), vec![], cmd.clone()), (entrypoint.clone(), vec![]));
+        assert_eq!(app(&json!({"Cmd": []}), entrypoint.clone(), cmd), (entrypoint, vec![]));
+    }
+
+    #[test]
+    fn create_accepts_names_and_local_ids_but_not_ambiguous_prefixes() {
+        let (_d, api) = fixture();
+        for image in ["image", "aaaa1111", "aaaa", "sha256:aaaa1111", "sha256:aaaa"] {
+            let r = translate(&api, "web", &json!({"Image": image})).unwrap();
+            assert_eq!(r.generation, "aaaa1111");
+            assert_eq!(r.run.last().unwrap(), "aaaa1111");
+            assert_eq!(crate::template::name_of(r.run.last().unwrap()).unwrap(), "aaaa1111");
+        }
+        image(&api, "aaaa2222", json!({"Cmd": ["other"]}));
+        for image in ["aaaa", "sha256:aaaa", "bbbb", "missing"] {
+            assert_eq!(translate(&api, "web", &json!({"Image": image})).unwrap_err().status, hyper::StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[test]
+    fn created_generation_survives_retagging_and_is_released_on_removal() {
+        let (_d, api) = fixture();
+        let r = translate(&api, "web", &json!({"Image": "image"})).unwrap();
+        assert!(store(&api, &r, true).unwrap());
+        image(&api, "bbbb2222", json!({"Cmd": ["other"]}));
+        std::fs::remove_file(api.paths.templates.join("image")).unwrap();
+        std::os::unix::fs::symlink(".gen/bbbb2222", api.paths.templates.join("image")).unwrap();
+        let r = load(&api, "web").unwrap();
+        assert_eq!(r.run.last().unwrap(), "aaaa1111");
+        assert_eq!(crate::template::Template::resolve(&api.paths, r.run.last().unwrap()).unwrap(), api.paths.templates.join(".gen/aaaa1111"));
+        assert!(api.host.template_users().contains("aaaa1111"));
+        assert!(crate::host::recorded_template_users(&api.host.state, "shared").contains("aaaa1111"));
+        assert!(crate::template::prune(&api.paths, Some("aaaa1111"), &|| api.host.template_users(), false).unwrap().is_empty());
+        let v = merge(&api, vec![]).pop().unwrap();
+        let d = super::super::containers::Detail::read(&api, &v);
+        assert_eq!(d.image_id, "sha256:aaaa1111");
+        assert_eq!(d.entrypoint, ["/bin/sh", "-c", ""]);
+        remove(&api, "web");
+        assert!(!api.host.template_users().contains("aaaa1111"));
+    }
+
+    #[test]
+    fn create_and_inspect_share_optional_app_overrides_and_empty_arguments() {
+        let (_d, api) = fixture();
+        for (overrides, expected) in [
+            (json!({"Cmd": ["override", ""]}), vec!["/bin/sh", "-c", "", "override", ""]),
+            (json!({"Entrypoint": ["/bin/sh", "-c", ""]}), vec!["/bin/sh", "-c", ""]),
+            (json!({"Entrypoint": [""], "Cmd": ["echo", ""]}), vec!["echo", ""]),
+            (json!({"Entrypoint": [], "Cmd": ["echo"]}), vec!["echo"]),
+            (json!({"Entrypoint": null, "Cmd": null}), vec!["/bin/sh", "-c", "", "default"]),
+            (json!({"Cmd": []}), vec!["/bin/sh", "-c", ""]),
+        ] {
+            let mut body = overrides;
+            body["Image"] = json!("image");
+            body["Env"] = json!(["A=container", "B", "C=new"]);
+            let r = translate(&api, "web", &body).unwrap();
+            let d = super::super::containers::Detail::read(&api, &json!({"name": "web", "state": "created", "docker": r}));
+            assert_eq!(d.entrypoint.iter().chain(&d.cmd).map(String::as_str).collect::<Vec<_>>(), expected);
+            assert_eq!(d.env, ["B=image", "A=container", "C=new"]);
+            if let Some(words) = r.run.windows(2).find(|w| w[0] == "--entrypoint") {
+                assert_eq!(serde_json::from_str::<Vec<String>>(&words[1]).unwrap(), expected);
+            } else {
+                assert_eq!(expected, ["/bin/sh", "-c", "", "default"]);
+            }
+        }
+    }
 
     #[test]
     fn port_bindings_become_publish_flags() {

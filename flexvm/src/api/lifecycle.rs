@@ -29,6 +29,8 @@ pub async fn create(api: &Arc<Api>, q: Query, body: Value) -> Reply {
     }
     let record = api
         .blocking(move |api| {
+            std::fs::create_dir_all(&api.paths.templates)?;
+            let _templates = crate::template::templates_lock(&api.paths, libc::LOCK_SH)?;
             for _ in 0..20 {
                 let name = match &given {
                     Some(n) => n.clone(),
@@ -151,26 +153,72 @@ pub async fn rename(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     if name == to {
         return empty(StatusCode::NO_CONTENT);
     }
+    rename_to(api, name, &v, to, |from, to| {
+        let api = api.clone();
+        async move { api.run(&["rename", "--", &from, &to]).await.map(drop) }
+    })
+    .await
+}
+
+async fn rename_to<F, Fut>(api: &Arc<Api>, name: String, v: &Value, to: String, move_vm: F) -> Reply
+where
+    F: Fn(String, String) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<(), Error>> + Send,
+{
+    // Reserve before touching the VM, including for VMs that have no Docker record.
     let record: Option<Record> = serde_json::from_value(v["docker"].clone()).ok();
-    if v["state"] != "created" {
-        api.run(&["rename", "--", &name, &to]).await?;
+    let mut reserved = record.clone().unwrap_or(Record {
+        name: name.clone(),
+        created: 0,
+        run: Vec::new(),
+        image: String::new(),
+        template: String::new(),
+        generation: String::new(),
+        reserved: false,
+        config: Value::Null,
+        host_config: Value::Null,
+        started: true,
+    });
+    reserved.name = to.clone();
+    reserved.reserved = true;
+    let reservation = reserved.clone();
+    api.blocking(move |api| {
+        let taken = api.host.alive(&reservation.name) || crate::vms(&api.host).iter().any(|v| v["name"] == reservation.name);
+        if taken || !create::store(api, &reservation, true)? {
+            return Ok(Err(Error::conflict(format!("Conflict. The container name \"/{}\" is already in use", reservation.name))));
+        }
+        Ok(Ok(()))
+    })
+    .await??;
+    let moved = v["state"] != "created";
+    let result = async {
+        if moved {
+            move_vm(name.clone(), to.clone()).await?;
+        }
+        reserved.reserved = false;
+        if record.is_some() {
+            if let Err(e) = api.blocking(move |api| create::store(api, &reserved, false).map(drop)).await {
+                if moved {
+                    move_vm(to.clone(), name.clone()).await?;
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     }
-    if let Some(mut r) = record {
-        let created = v["state"] == "created";
-        api.blocking(move |api| {
-            let taken = api.host.alive(&to) || create::merge(api, crate::vms(&api.host)).iter().any(|v| v["name"] == to.as_str());
-            if created && taken {
-                return Ok(Err(Error::conflict(format!("Conflict. The container name \"/{to}\" is already in use"))));
-            }
-            r.name = to;
-            if !create::store(api, &r, true)? {
-                return Ok(Err(Error::conflict(format!("Conflict. The container name \"/{}\" is already in use", r.name))));
-            }
+    .await;
+    let success = result.is_ok();
+    api.blocking(move |api| {
+        if !success || record.is_none() {
+            create::remove(api, &to);
+        }
+        if success {
             create::remove(api, &name);
-            Ok(Ok(()))
-        })
-        .await??;
-    }
+        }
+        Ok(())
+    })
+    .await?;
+    result?;
     empty(StatusCode::NO_CONTENT)
 }
 
@@ -212,7 +260,8 @@ pub async fn prune(api: &Arc<Api>, q: Query) -> Reply {
     let vms = all(api).await?;
     let mut deleted = Vec::new();
     for v in vms.iter().filter(|v| !state(v).running) {
-        let labels = v["docker"]["config"]["Labels"].as_object().cloned().unwrap_or_default();
+        let vm = v.clone();
+        let labels = api.blocking(move |api| Ok(super::containers::Detail::read(api, &vm).labels)).await?;
         let has = |l: &str| match l.split_once('=') {
             Some((k, val)) => labels.get(k).and_then(Value::as_str) == Some(val),
             None => labels.contains_key(l),
@@ -226,4 +275,95 @@ pub async fn prune(api: &Arc<Api>, q: Query) -> Reply {
         }
     }
     ok(&json!({"ContainersDeleted": deleted, "SpaceReclaimed": 0}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use create::tests::fixture;
+
+    #[tokio::test]
+    async fn rename_reserves_created_names_before_moving_any_vm() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        let b = create::translate(&api, "b", &json!({"Image": "image", "Labels": {"owner": "b"}})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        create::store(&api, &b, true).unwrap();
+        for docker in [json!(a), Value::Null] {
+            let v = json!({"name": "a", "state": "running", "docker": docker});
+            let e = rename_to(&api, "a".into(), &v, "b".into(), |_, _| async { panic!("must not move VM") }).await.unwrap_err();
+            assert_eq!(e.status, StatusCode::CONFLICT);
+            assert_eq!(create::load(&api, "a"), Some(a.clone()));
+            assert_eq!(create::load(&api, "b"), Some(b.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_releases_reservation_on_cli_failure_and_rolls_back_store_failure() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        let v = json!({"name": "a", "state": "running", "docker": a});
+        let e = rename_to(&api, "a".into(), &v, "b".into(), |_, _| async {
+            assert!(create::load(&api, "b").unwrap().reserved);
+            assert!(create::merge(&api, vec![]).iter().all(|v| v["name"] != "b"));
+            assert!(create::load(&api, "b").is_some(), "listing must not remove the reservation");
+            Err(Error::bad("CLI failed"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(e.message, "CLI failed");
+        assert_eq!(create::load(&api, "a"), Some(a.clone()));
+        assert!(create::load(&api, "b").is_none());
+
+        let calls = std::sync::Mutex::new(Vec::new());
+        let path = api.host.state.join("api/containers/b.json");
+        rename_to(&api, "a".into(), &v, "b".into(), |from, to| {
+            let (calls, path) = (&calls, &path);
+            async move {
+                calls.lock().unwrap().push((from.to_string(), to.to_string()));
+                if from == "a" {
+                    std::fs::remove_file(path).unwrap();
+                    std::fs::create_dir(path).unwrap(); // Force final record publication to fail.
+                } else {
+                    std::fs::remove_dir(path).unwrap();
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(*calls.lock().unwrap(), [("a".into(), "b".into()), ("b".into(), "a".into())]);
+        assert_eq!(create::load(&api, "a"), Some(a));
+        assert!(create::load(&api, "b").is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_moves_created_records_without_a_vm() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        rename(&api, "a", Query::parse("name=b")).await.unwrap();
+        assert!(create::load(&api, "a").is_none());
+        let mut b = a;
+        b.name = "b".into();
+        assert_eq!(create::load(&api, "b"), Some(b));
+    }
+
+    #[tokio::test]
+    async fn prune_uses_image_labels_and_container_overrides() {
+        let (_d, api) = fixture();
+        for (name, labels) in [("inherited", json!({})), ("overridden", json!({"keep": "container"}))] {
+            let r = create::translate(&api, name, &json!({"Image": "image", "Labels": labels})).unwrap();
+            create::store(&api, &r, true).unwrap();
+        }
+        prune(&api, Query::parse(r#"filters={"label!":["keep"]}"#)).await.unwrap();
+        assert!(create::load(&api, "inherited").is_some());
+        assert!(create::load(&api, "overridden").is_some());
+        prune(&api, Query::parse(r#"filters={"label":["keep=image"]}"#)).await.unwrap();
+        assert!(create::load(&api, "inherited").is_none());
+        assert!(create::load(&api, "overridden").is_some());
+        prune(&api, Query::parse(r#"filters={"label!":["keep=image"]}"#)).await.unwrap();
+        assert!(create::load(&api, "overridden").is_none());
+    }
 }
