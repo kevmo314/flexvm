@@ -252,6 +252,8 @@ pub struct Exited {
     /// Its command's or app's exit status (128+signal for a signal).
     pub status: i32,
     pub template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
     pub resources: crate::vm::Resources,
@@ -267,7 +269,7 @@ pub struct Exited {
 
 impl Exited {
     pub fn new(status: i32, template: String, cmd: Option<String>, resources: crate::vm::Resources, spec: RunSpec, at: u64) -> Exited {
-        Exited { status, template, cmd, resources, spec, at, restart_due: None }
+        Exited { status, template, template_id: None, cmd, resources, spec, at, restart_due: None }
     }
 
     pub fn read(path: &std::path::Path) -> Result<Exited> {

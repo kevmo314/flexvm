@@ -257,14 +257,10 @@ async fn route(api: &Arc<Api>, req: Request<Incoming>) -> Reply {
         (&Method::GET | &Method::HEAD, ["_ping"]) => system::ping(&method),
         (&Method::GET, ["version"]) => system::version(api).await,
         (&Method::GET, ["info"]) => system::info(api).await,
-        (_, ["containers", rest @ ..]) => {
-            let rest: Vec<String> = rest.iter().map(|w| w.to_string()).collect();
-            let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
-            match containers::route(api, req, &rest).await {
-                Some(r) => r,
-                None => Err(unrouted(&method, path)),
-            }
-        }
+        (_, ["containers", rest @ ..]) => match containers::route(api, req, rest).await {
+            Some(r) => r,
+            None => Err(unrouted(&method, path)),
+        },
         _ => Err(unrouted(&method, path)),
     }
 }

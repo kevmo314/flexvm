@@ -1473,7 +1473,10 @@ impl Proc {
         }
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let cmd = self.cmd.lock().unwrap().clone();
-        let mut rec = crate::app::Exited::new(code, vm.template.name.clone(), cmd, vm.resources(), spec, at);
+        let mut rec = crate::app::Exited {
+            template_id: Some(vm.template.meta.id.clone()),
+            ..crate::app::Exited::new(code, vm.template.name.clone(), cmd, vm.resources(), spec, at)
+        };
         // How long its app ran: a resumed VM's, started by another process, ran at least that long.
         let ran = self.app_started.lock().unwrap().map_or(crate::app::RAN_LONG, |t| t.elapsed());
         let again = !self.stop_asked.load(Ordering::SeqCst) && crate::restart::on_exit(&mut rec, ran);

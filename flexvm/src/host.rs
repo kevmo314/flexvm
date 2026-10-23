@@ -3857,6 +3857,12 @@ pub fn boot_id() -> &'static str {
 
 pub struct PidFd(OwnedFd);
 
+impl AsRawFd for PidFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 impl PidFd {
     /// By its pid here (`Ident::local_pid`): in another PID namespace, never by the pid it has there.
     pub fn open(id: &Ident) -> Result<Option<PidFd>> {
