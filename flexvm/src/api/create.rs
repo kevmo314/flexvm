@@ -90,28 +90,24 @@ pub fn remove(api: &Api, name: &str) {
 pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
     for mut r in load_all(api) {
         if r.reserved {
-            if r.reservation_owner.as_ref().is_some_and(|id| id.liveness() != crate::host::Liveness::Gone) {
-                // The VM may have moved even though publication (and rollback) failed. Keep its
-                // settings visible while the owner lives, without releasing an active reservation.
-                if !r.image.is_empty() {
-                    if let Some(v) = vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
-                        r.reserved = false;
-                        r.reservation_owner = None;
-                        r.started = true;
-                        v["docker"] = json!(r);
-                    }
+            let live = r.reservation_owner.as_ref().is_some_and(|id| id.liveness() != crate::host::Liveness::Gone);
+            let listed = vms.iter().any(|v| v["name"] == r.name.as_str());
+            // A stub (a VM with no Docker record) has nothing to keep; a live owner's VM that has not
+            // moved yet is not this record's.
+            if r.image.is_empty() || !listed && (live || !api.host.alive(&r.name)) {
+                if !live {
+                    remove(api, &r.name);
                 }
                 continue;
             }
-            if r.image.is_empty() || (!vms.iter().any(|v| v["name"] == r.name.as_str()) && !api.host.alive(&r.name)) {
-                remove(api, &r.name);
-                continue;
-            }
-            // The owner died after moving the VM: retain its Docker settings at the destination.
+            // The VM moved: its Docker settings are at the destination even if publication (and
+            // rollback) failed. A dead owner's are kept; a live owner's reservation stays its own.
             r.reserved = false;
             r.reservation_owner = None;
             r.started = true;
-            let _ = store(api, &r, false);
+            if !live {
+                let _ = store(api, &r, false);
+            }
         }
         match vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
             Some(v) => v["docker"] = json!(r),
