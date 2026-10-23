@@ -2604,6 +2604,14 @@ def docker_lifecycle(d):
     check("container prune: none of them left", job not in left and gone not in left, (pruned, left))
     refused = d("run", "-d", "-v", "/tmp:/data", t, "true", check=False)
     check("a bind mount: refused, saying so", refused.returncode != 0 and "not supported by flexvm" in refused.stderr, refused.stderr)
+    # A restart policy is `run --restart`'s: run once more on its failure, then left exited, its count in inspect.
+    flaky = "e2e-dk-restart"
+    A.vms.add(flaky)
+    d("run", "-d", "--name", flaky, "--restart", "on-failure:1", t, "sh", "-c", "exit 5")
+    fmt = "{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}} {{.HostConfig.RestartPolicy.Name}}"
+    check("--restart on-failure:1: restarted once, then exited", wait_for(lambda: d("inspect", "-f", fmt, flaky).stdout.split() == ["exited", "5", "1", "on-failure"], 60),
+          d("inspect", "-f", fmt, flaky).stdout)
+    d("rm", flaky)
 
 
 @case

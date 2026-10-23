@@ -72,6 +72,8 @@ pub fn state(v: &Value) -> State {
         // Docker's stop: its process ended as SIGTERM ends one (`flexvm wait` says 143). Its memory is on disk,
         // so `start` resumes it where it was.
         "suspended" => s("exited", false, false, false, 128 + libc::SIGTERM as i64),
+        // Its restart policy runs it again soon (`restart_due_ms`): docker's restarting.
+        "exited" if v["restart_due_ms"].is_u64() => s("restarting", false, false, false, v["status"].as_i64().unwrap_or(0)),
         "exited" => s("exited", false, false, false, v["status"].as_i64().unwrap_or(0)),
         // Stopped, but kept from starting (`quarantined`), failed or lost (a reboot): as `flexvm wait` says.
         "quarantined" | "failed" | "lost" | "unknown" => s("dead", false, false, true, crate::vmproc::DIED as i64),
@@ -134,6 +136,10 @@ fn status_line(st: &State, started: Option<u64>, finished: Option<u64>) -> Strin
             None => format!("Exited ({})", st.exit_code),
         },
         "created" => "Created".into(),
+        "restarting" => match ago(finished) {
+            Some(a) => format!("Restarting ({}) {a} ago", st.exit_code),
+            None => format!("Restarting ({})", st.exit_code),
+        },
         _ => "Dead".into(),
     }
 }
@@ -319,7 +325,7 @@ impl Detail {
             "Path": argv.first().cloned().unwrap_or_default(),
             "Args": argv.get(1..).unwrap_or_default(),
             "State": {
-                "Status": st.status, "Running": st.running, "Paused": st.paused, "Restarting": false, "OOMKilled": false, "Dead": st.dead,
+                "Status": st.status, "Running": st.running, "Paused": st.paused, "Restarting": st.status == "restarting", "OOMKilled": false, "Dead": st.dead,
                 "Pid": pid, "ExitCode": st.exit_code, "Error": st.error,
                 "StartedAt": time(self.started), "FinishedAt": if st.running { NEVER.to_string() } else { time(self.finished) },
             },
@@ -329,7 +335,7 @@ impl Detail {
             "HostsPath": "",
             "LogPath": self.config["log"].as_str().unwrap_or_default(),
             "Name": format!("/{}", self.name),
-            "RestartCount": 0,
+            "RestartCount": run["restart"]["count"].as_u64().unwrap_or(0),
             "Driver": "flexvm",
             "Platform": "linux",
             "MountLabel": "",
@@ -339,7 +345,7 @@ impl Detail {
             "HostConfig": {
                 "NetworkMode": "bridge",
                 "PortBindings": self.port_map(),
-                "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+                "RestartPolicy": {"Name": run["restart"]["policy"].as_str().unwrap_or("no"), "MaximumRetryCount": run["restart"]["max"].as_u64().unwrap_or(0)},
                 "AutoRemove": run["rm"] == true,
                 "NanoCpus": cpus.map_or(0, |c| (c * 1e9) as u64),
                 "Memory": self.config["max_mib"].as_u64().map_or(0, |m| m << 20),
@@ -651,6 +657,8 @@ mod tests {
         assert_eq!((st("paused").status, st("paused").paused, st("paused").running), ("paused", true, true));
         assert_eq!((st("suspended").status, st("suspended").exit_code), ("exited", 143));
         assert_eq!((st("exited").status, st("exited").exit_code), ("exited", 3));
+        let due = state(&json!({"name": "v", "state": "exited", "status": 1, "restart_due_ms": 5}));
+        assert_eq!((due.status, due.exit_code, status_line(&due, None, None)), ("restarting", 1, "Restarting (1)".to_string()));
         assert_eq!((st("lost").status, st("lost").dead, st("failed").exit_code), ("dead", true, 124));
         assert_eq!(status_line(&st("exited"), None, Some(now() - 300)), "Exited (3) 5 minutes ago");
         assert_eq!(status_line(&st("running"), Some(now() - 7300), None), "Up 2 hours");

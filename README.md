@@ -1078,11 +1078,13 @@ translated from docker's settings as it is created, and of those settings as
 given (its labels, which `inspect` and `--filter label=` show while its VM is
 there). `Cmd` and `Entrypoint` become `--entrypoint` (the app's argv, as
 docker's make it from the image's); `Env`, `-p` (a free port for docker's
-any), `--memory`, `--cpus`, `--rm`, `-i`, `-t` and an `--ip` given for the
+any), `--memory`, `--cpus`, `--rm`, `--restart` (docker's restart policies), `-i`, `-t` and an `--ip` given for the
 `bridge` network carry over. A setting with nothing under it is refused,
 not ignored: bind mounts and volumes, other networks, DNS settings, health
 checks, a working directory or user other than the image's (they are
-`pull` options), and limits flexvm does not keep. `docker stop` suspends
+`pull` options), and limits flexvm does not keep. A VM waiting out its
+restart policy's backoff is docker's `restarting`, and `docker stop` ends
+its restarts. `docker stop` suspends
 the VM to disk, so `docker start` resumes it where it was; `docker kill`
 (SIGKILL) destroys it, leaving no record, as `flexvm kill` does.
 
