@@ -42,7 +42,8 @@ pub async fn create(api: &Arc<Api>, q: Query, body: Value) -> Reply {
                         Ok(r) => r,
                         Err(e) => return Ok(Err(e)),
                     };
-                    if create::store(api, &r, true)? {
+                    let renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+                    if !renames.contains_key(&name) && create::store(api, &r, true)? {
                         return Ok(Ok(r));
                     }
                 }
@@ -165,24 +166,24 @@ pub async fn rename(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     .map_err(|e| Error::from(crate::util::Error::from(e.to_string())))?
 }
 
-struct Rename<'a> {
-    api: &'a Api,
+struct Rename {
+    api: Arc<Api>,
     names: [String; 2],
 }
 
-impl<'a> Rename<'a> {
-    fn begin(api: &'a Api, name: &str, to: &str) -> Result<Self, Error> {
+impl Rename {
+    fn begin(api: &Arc<Api>, name: &str, to: &str) -> Result<Self, Error> {
         let mut renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
         if renames.contains_key(name) || renames.contains_key(to) {
             return Err(Error::conflict("a rename is already in progress"));
         }
         renames.insert(name.to_string(), to.to_string());
         renames.insert(to.to_string(), name.to_string());
-        Ok(Self { api, names: [name.to_string(), to.to_string()] })
+        Ok(Self { api: api.clone(), names: [name.to_string(), to.to_string()] })
     }
 }
 
-impl Drop for Rename<'_> {
+impl Drop for Rename {
     fn drop(&mut self) {
         let mut renames = self.api.renames.lock().unwrap_or_else(|e| e.into_inner());
         for name in &self.names {
@@ -196,24 +197,38 @@ where
     F: Fn(String, String) -> Fut + Send,
     Fut: std::future::Future<Output = Result<(), Error>> + Send,
 {
-    let _rename = Rename::begin(api, &name, &to)?;
-    // Reserve before touching the VM, including for VMs that have no Docker record.
-    let record: Option<Record> = serde_json::from_value(v["docker"].clone()).ok();
-    let mut reserved = record.clone().unwrap_or(Record { started: true, ..Record::default() });
-    reserved.name = to.clone();
-    reserved.reserved = true;
-    reserved.reservation_owner = Some(crate::host::Ident::me());
-    let reservation = reserved.clone();
-    api.blocking(move |api| {
-        let vms = create::merge(api);
-        let taken = api.host.alive(&reservation.name) || vms.iter().any(|v| v["name"] == reservation.name);
-        if taken || !create::store(api, &reservation, true)? {
-            return Ok(Err(Error::conflict(format!("Conflict. The container name \"/{}\" is already in use", reservation.name))));
-        }
-        Ok(Ok(()))
-    })
-    .await??;
+    let (owner, source, destination) = (api.clone(), name.clone(), to.clone());
     let moved = v["state"] != "created";
+    let had_record = !v["docker"].is_null();
+    // Reload after acquiring the names: found() may describe a replaced or newly started container.
+    let (rename, record, mut reserved) = api
+        .blocking(move |api| {
+            let rename = match Rename::begin(&owner, &source, &destination) {
+                Ok(rename) => rename,
+                Err(e) => return Ok(Err(e)),
+            };
+            let record = create::load(api, &source);
+            if record.is_none() && (had_record || !moved) {
+                return Ok(Err(Error::missing(format!("No such container: {source}"))));
+            }
+            // Started since found() saw it created. (A listed VM whose record still says created was started by a
+            // run_created that never re-stored it: it is started.)
+            if record.as_ref().is_some_and(|r| r.started && !moved) {
+                return Ok(Err(Error::conflict(format!("Container {source} was started during the rename: try again"))));
+            }
+            let mut reserved = record.clone().unwrap_or_default();
+            reserved.started |= moved;
+            reserved.name = destination;
+            reserved.reserved = true;
+            reserved.reservation_owner = Some(crate::host::Ident::me());
+            let vms = create::merge(api);
+            let taken = api.host.alive(&reserved.name) || vms.iter().any(|v| v["name"] == reserved.name);
+            if taken || !create::store(api, &reserved, true)? {
+                return Ok(Err(Error::conflict(format!("Conflict. The container name \"/{}\" is already in use", reserved.name))));
+            }
+            Ok(Ok((rename, record, reserved)))
+        })
+        .await??;
     let mut stranded = false;
     let result = async {
         if moved {
@@ -222,8 +237,9 @@ where
         reserved.reserved = false;
         reserved.reservation_owner = None;
         let published = reserved.clone();
+        let source = name.clone();
         if record.is_some() {
-            if let Err(e) = api.blocking(move |api| create::store(api, &published, false).map(drop)).await {
+            if let Err(e) = api.blocking(move |api| create::publish_rename(api, &source, &published)).await {
                 if moved {
                     if let Err(rollback) = move_vm(to.clone(), name.clone()).await {
                         stranded = true;
@@ -241,10 +257,11 @@ where
     .await;
     let success = result.is_ok();
     api.blocking(move |api| {
+        let _rename = rename;
         if (!success && !stranded) || record.is_none() {
             create::remove(api, &to);
         }
-        if success {
+        if success && record.is_none() {
             create::remove(api, &name);
         }
         Ok(())
@@ -324,6 +341,143 @@ mod tests {
     use super::*;
     use create::tests::fixture;
     use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn stale_created_rename_cannot_duplicate_the_record() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        let (_, stale) = found(&api, "a").await.unwrap();
+        rename(&api, "a", Query::parse("name=b")).await.unwrap();
+        let e = rename_to(&api, "a".into(), &stale, "c".into(), |_, _| async { panic!("created VM") }).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::NOT_FOUND);
+        assert!(create::load(&api, "c").is_none());
+        assert_eq!(create::load(&api, "b").unwrap().config, a.config);
+        assert!(api.renames.lock().unwrap().is_empty());
+        assert_eq!(create::merge(&api).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_created_rename_reloads_a_replacement_record() {
+        let (_d, api) = fixture();
+        create(&api, Query::parse("name=a"), json!({"Image": "image", "Labels": {"owner": "old"}})).await.unwrap();
+        let (_, stale) = found(&api, "a").await.unwrap();
+        rename(&api, "a", Query::parse("name=b")).await.unwrap();
+        create(&api, Query::parse("name=a"), json!({"Image": "image", "Labels": {"owner": "new"}})).await.unwrap();
+        let mut replacement = create::load(&api, "a").unwrap();
+        rename_to(&api, "a".into(), &stale, "c".into(), |_, _| async { panic!("created VM") }).await.unwrap();
+        replacement.name = "c".into();
+        assert_eq!(create::load(&api, "c"), Some(replacement));
+        assert_eq!(create::load(&api, "b").unwrap().config["Labels"]["owner"], "old");
+        assert!(create::load(&api, "a").is_none());
+        assert!(api.renames.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_created_rename_refuses_a_now_started_record() {
+        let (_d, api) = fixture();
+        create(&api, Query::parse("name=a"), json!({"Image": "image"})).await.unwrap();
+        let (_, stale) = found(&api, "a").await.unwrap();
+        let mut started = create::load(&api, "a").unwrap();
+        started.started = true;
+        create::store(&api, &started, false).unwrap();
+        let e = rename_to(&api, "a".into(), &stale, "c".into(), |_, _| async { panic!("stale VM") }).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(create::load(&api, "a"), Some(started));
+        assert!(create::load(&api, "c").is_none());
+        assert!(api.renames.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_cannot_reuse_a_source_until_rename_cleanup() {
+        for with_record in [false, true] {
+            let (_d, api) = fixture();
+            if with_record {
+                let mut a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+                a.started = true;
+                create::store(&api, &a, true).unwrap();
+            }
+            let v = json!({"name": "a", "state": "running", "docker": create::load(&api, "a")});
+            rename_to(&api, "a".into(), &v, "b".into(), |_, _| async {
+                // The VM has moved and the source name is free on the host. Also exercise
+                // the window after publication has retired the source record.
+                create::remove(&api, "a");
+                for name in ["a", "b"] {
+                    let e = create(&api, Query::parse(&format!("name={name}")), json!({"Image": "image"})).await.unwrap_err();
+                    assert_eq!(e.status, StatusCode::CONFLICT);
+                }
+                assert!(create::load(&api, "a").is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(api.renames.lock().unwrap().is_empty());
+            create(&api, Query::parse("name=a"), json!({"Image": "image", "Labels": {"owner": "new"}})).await.unwrap();
+            assert_eq!(create::load(&api, "a").unwrap().config["Labels"]["owner"], "new");
+        }
+    }
+
+    #[test]
+    fn created_publication_and_retirement_share_merges_lock() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        let rename = Rename::begin(&api, "a", "b").unwrap();
+        let mut b = a;
+        b.name = "b".into();
+        let lock = api.renames.lock().unwrap();
+        let writer = api.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            sent.send(()).unwrap();
+            create::publish_rename(&writer, "a", &b).unwrap();
+            sent.send(()).unwrap();
+        });
+        received.recv().unwrap();
+        assert!(received.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        assert!(create::load(&api, "a").is_some());
+        assert!(create::load(&api, "b").is_none());
+        drop(lock);
+        thread.join().unwrap();
+        let rows = create::merge(&api);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "b");
+        drop(rename);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contended_rename_begin_and_cleanup_leave_the_worker_free() {
+        for finishing in [false, true] {
+            let (_d, api) = fixture();
+            let rename = finishing.then(|| Rename::begin(&api, "a", "b").unwrap());
+            let holder = api.clone();
+            let (ready, waiting) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let _lock = holder.renames.lock().unwrap();
+                ready.send(()).unwrap();
+                released.recv_timeout(std::time::Duration::from_secs(2)).is_ok()
+            });
+            waiting.recv().unwrap();
+            let task = tokio::spawn(async move {
+                if let Some(rename) = rename {
+                    api.blocking(move |_| {
+                        drop(rename);
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    let v = json!({"state": "created"});
+                    assert!(rename_to(&api, "a".into(), &v, "b".into(), |_, _| async { unreachable!() }).await.is_err());
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = release.send(());
+            task.await.unwrap();
+            assert!(thread.join().unwrap(), "rename blocked the Tokio worker");
+        }
+    }
 
     #[test]
     fn merge_lists_and_loads_records_under_the_rename_lock() {
@@ -456,7 +610,8 @@ mod tests {
     #[tokio::test]
     async fn rename_reserves_created_names_before_moving_any_vm() {
         let (_d, api) = fixture();
-        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        let mut a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        a.started = true;
         let b = create::translate(&api, "b", &json!({"Image": "image", "Labels": {"owner": "b"}})).unwrap();
         create::store(&api, &a, true).unwrap();
         create::store(&api, &b, true).unwrap();
@@ -472,7 +627,8 @@ mod tests {
     #[tokio::test]
     async fn rename_releases_reservation_on_cli_failure_and_rolls_back_store_failure() {
         let (_d, api) = fixture();
-        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        let mut a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        a.started = true;
         create::store(&api, &a, true).unwrap();
         let v = json!({"name": "a", "state": "running", "docker": a});
         let e = rename_to(&api, "a".into(), &v, "b".into(), |_, _| async {
@@ -512,7 +668,8 @@ mod tests {
     #[tokio::test]
     async fn failed_rename_rollback_keeps_the_destination_config() {
         let (_d, api) = fixture();
-        let a = create::translate(&api, "a", &json!({"Image": "image", "Labels": {"keep": "config"}})).unwrap();
+        let mut a = create::translate(&api, "a", &json!({"Image": "image", "Labels": {"keep": "config"}})).unwrap();
+        a.started = true;
         create::store(&api, &a, true).unwrap();
         let v = json!({"name": "a", "state": "running", "docker": a});
         let path = api.host.state.join("api/containers/b.json");
