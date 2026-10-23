@@ -44,7 +44,7 @@ pub fn find<'a>(vms: &'a [Value], key: &str) -> Result<&'a Value, Error> {
 
 /// The VMs, as `ps -a` lists them, and the containers created and not started yet (`create::merge`).
 pub async fn all(api: &Arc<Api>) -> Result<Vec<Value>, Error> {
-    api.blocking(|api| Ok(super::create::merge(api, crate::vms(&api.host)))).await
+    api.blocking(|api| Ok(super::create::merge(api))).await
 }
 
 /// A VM's state as docker's.
@@ -184,7 +184,7 @@ impl Detail {
         let image_config = meta.as_ref().and_then(|m| images::config(api, m));
         let argv: Vec<String> = meta.as_ref().and_then(|m| m.image.as_ref()).map(|i| i.argv.clone()).unwrap_or_default();
         let run = &config["run"];
-        let (mut entrypoint, mut cmd) = images::app(&argv, image_config.as_ref());
+        let (mut entrypoint, mut cmd, _) = images::app(&argv, image_config.as_ref());
         // `--entrypoint` is the app's whole argv; `run IMAGE CMD`'s command is a shell's.
         if run["entrypoint"].is_array() {
             (entrypoint, cmd) = (images::strings(&run["entrypoint"]), Vec::new());
@@ -470,7 +470,7 @@ pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
     for (_, value) in filters.iter().filter(|(k, _)| k == "name") {
         validate_name(value)?;
     }
-    let details = api.blocking(|api| Ok(super::create::merge(api, crate::vms(&api.host)).iter().map(|v| Detail::read(api, v)).collect::<Vec<_>>())).await?;
+    let details = api.blocking(|api| Ok(super::create::merge(api).iter().map(|v| Detail::read(api, v)).collect::<Vec<_>>())).await?;
     let mut out = Vec::new();
     for d in &details {
         let mut keep = all || d.state.running || filters.iter().any(|(k, _)| k == "status" || k == "exited");
@@ -498,7 +498,7 @@ pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
 /// `GET /containers/{id}/json`.
 pub async fn inspect(api: &Arc<Api>, key: &str) -> Reply {
     let key = key.to_string();
-    let d = api.blocking(move |api| Ok(find(&super::create::merge(api, crate::vms(&api.host)), &key).map(|v| Detail::read(api, v)))).await??;
+    let d = api.blocking(move |api| Ok(find(&super::create::merge(api), &key).map(|v| Detail::read(api, v)))).await??;
     ok(&d.inspect())
 }
 
@@ -757,7 +757,7 @@ mod tests {
     fn fixture() -> (crate::test_util::TempDir, Arc<Api>) {
         let d = crate::test_util::TempDir::new("api-containers");
         let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
-        let api = Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![] });
+        let api = Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![], renames: Default::default() });
         (d, api)
     }
 

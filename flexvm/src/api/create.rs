@@ -87,30 +87,44 @@ pub fn remove(api: &Api, name: &str) {
 }
 
 /// `vms` (`ps -a`'s) with each record: a VM's under `docker`, a container not started yet as one `created`.
-pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
+pub fn merge(api: &Api) -> Vec<Value> {
+    merge_with(api, || crate::vms(&api.host))
+}
+
+pub(super) fn merge_with(api: &Api, list: impl FnOnce() -> Vec<Value>) -> Vec<Value> {
+    let renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+    let mut vms = list();
     for mut r in load_all(api) {
         if r.reserved {
-            let live = r.reservation_owner.as_ref().is_some_and(|id| id.liveness() != crate::host::Liveness::Gone);
-            let listed = vms.iter().any(|v| v["name"] == r.name.as_str());
-            // A stub (a VM with no Docker record) has nothing to keep; a live owner's VM that has not
-            // moved yet is not this record's.
-            if r.image.is_empty() || !listed && (live || !api.host.alive(&r.name)) {
-                if !live {
-                    remove(api, &r.name);
+            let live = r.reservation_owner.as_ref().is_some_and(|id| {
+                if *id == crate::host::Ident::me() {
+                    renames.contains_key(&r.name)
+                } else {
+                    id.liveness() != crate::host::Liveness::Gone
+                }
+            });
+            if live {
+                // Only attach the destination's overlay once the source VM has actually moved.
+                if r.started && !r.image.is_empty() && renames.get(&r.name).is_some_and(|source| !vms.iter().any(|v| v["name"] == source.as_str())) {
+                    if let Some(v) = vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
+                        v["docker"] = json!(r);
+                    }
                 }
                 continue;
             }
-            // The VM moved: its Docker settings are at the destination even if publication (and
-            // rollback) failed. A dead owner's are kept; a live owner's reservation stays its own.
+            let listed = vms.iter().any(|v| v["name"] == r.name.as_str());
+            if r.image.is_empty() || !listed && !api.host.alive(&r.name) {
+                remove(api, &r.name);
+                continue;
+            }
             r.reserved = false;
             r.reservation_owner = None;
             r.started = true;
-            if !live {
-                let _ = store(api, &r, false);
-            }
+            let _ = store(api, &r, false);
         }
         match vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
             Some(v) => v["docker"] = json!(r),
+            None if r.started && renames.contains_key(&r.name) => continue,
             None if !r.started => {
                 let created = json!({"name": r.name, "state": "created", "template": r.template, "created": r.created, "docker": r});
                 vms.insert(0, created);
@@ -318,7 +332,10 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     let meta = tpl.image.as_ref();
     let image_config = images::config(api, &tpl);
     let argv: Vec<String> = meta.map(|i| i.argv.clone()).unwrap_or_default();
-    let (image_entrypoint, image_cmd) = images::app(&argv, image_config.as_ref());
+    let (image_entrypoint, image_cmd, matched) = images::app(&argv, image_config.as_ref());
+    if config["Entrypoint"].as_array().is_some_and(|e| e.is_empty()) && config["Cmd"].as_array().is_none_or(|c| c.is_empty()) && !argv.is_empty() && !matched {
+        return Err(Error::unsupported("clearing the entrypoint without a command: the image's Entrypoint and Cmd are unavailable"));
+    }
     for (key, flag) in [("WorkingDir", "a working directory"), ("User", "a user")] {
         let image = image_config.as_ref().and_then(|c| c[key].as_str()).unwrap_or("");
         if let Some(v) = config[key].as_str().filter(|v| !v.is_empty() && *v != image) {
@@ -401,7 +418,7 @@ pub(super) mod tests {
     pub fn fixture() -> (crate::test_util::TempDir, std::sync::Arc<Api>) {
         let d = crate::test_util::TempDir::new("api-create");
         let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
-        let api = std::sync::Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![] });
+        let api = std::sync::Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![], renames: Default::default() });
         image(&api, "aaaa1111", json!({"Entrypoint": ["/bin/sh", "-c", ""], "Cmd": ["default"], "Labels": {"keep": "image"}, "Env": ["A=image", "B=image"]}));
         std::os::unix::fs::symlink(".gen/aaaa1111", api.paths.templates.join("image")).unwrap();
         (d, api)
@@ -431,12 +448,26 @@ pub(super) mod tests {
         r.reserved = true;
         r.reservation_owner = Some(crate::host::Ident { boot: "old".into(), ..Default::default() });
         store(&api, &r, true).unwrap();
-        assert!(merge(&api, vec![]).is_empty());
+        assert!(merge_with(&api, Vec::new).is_empty());
         assert!(load(&api, "web").is_none());
         store(&api, &r, true).unwrap();
-        let rows = merge(&api, vec![json!({"name": "web", "state": "running"})]);
+        let rows = merge_with(&api, || vec![json!({"name": "web", "state": "running"})]);
         assert_eq!(rows[0]["docker"]["config"], r.config);
         assert!(!load(&api, "web").unwrap().reserved);
+    }
+
+    #[test]
+    fn stranded_reservation_releases_a_removed_vm_name_while_owner_is_alive() {
+        let (_d, api) = fixture();
+        let mut r = translate(&api, "b", &json!({"Image": "image"})).unwrap();
+        r.started = true;
+        r.reserved = true;
+        r.reservation_owner = Some(crate::host::Ident::me());
+        store(&api, &r, true).unwrap();
+        assert!(merge_with(&api, Vec::new).is_empty());
+        assert!(load(&api, "b").is_none());
+        let replacement = translate(&api, "b", &json!({"Image": "image"})).unwrap();
+        assert!(store(&api, &replacement, true).unwrap());
     }
 
     #[test]
@@ -451,7 +482,7 @@ pub(super) mod tests {
         };
         store(&api, &r, true).unwrap();
         let vm = json!({"name": "web", "state": "running"});
-        assert_eq!(merge(&api, vec![vm.clone()]), vec![vm]);
+        assert_eq!(merge_with(&api, || vec![vm.clone()]), vec![vm]);
         assert!(load(&api, "web").is_none());
     }
 
@@ -509,7 +540,7 @@ pub(super) mod tests {
         assert!(api.host.template_users().contains("aaaa1111"));
         assert!(crate::host::recorded_template_users(&api.host.state, "shared").contains("aaaa1111"));
         assert!(crate::template::prune(&api.paths, Some("aaaa1111"), &|| api.host.template_users(), false).unwrap().is_empty());
-        let v = merge(&api, vec![]).pop().unwrap();
+        let v = merge_with(&api, Vec::new).pop().unwrap();
         let d = super::super::containers::Detail::read(&api, &v);
         assert_eq!(d.image_id, "sha256:aaaa1111");
         assert_eq!(d.entrypoint, ["/bin/sh", "-c", ""]);
@@ -541,6 +572,28 @@ pub(super) mod tests {
             } else {
                 assert_eq!(expected, ["/bin/sh", "-c", "", "default"]);
             }
+        }
+    }
+
+    #[test]
+    fn clearing_an_unknown_image_entrypoint_does_not_run_the_whole_argv() {
+        let (_d, api) = fixture();
+        let path = api.paths.templates.join(".gen/aaaa1111/meta.json");
+        let original = std::fs::read(&path).unwrap();
+        let mut meta: Value = serde_json::from_slice(&original).unwrap();
+        meta["image"]["argv"] = json!(["custom-entrypoint", "custom-command"]);
+        std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        for missing in [false, true] {
+            if missing {
+                std::fs::write(&path, &original).unwrap();
+                std::fs::remove_dir_all(api.host.state.join("images/blobs")).unwrap();
+            }
+            let e = translate(&api, "web", &json!({"Image": "image", "Entrypoint": [], "Cmd": []})).unwrap_err();
+            assert_eq!(e.status, hyper::StatusCode::NOT_IMPLEMENTED);
+            assert!(e.message.contains("Entrypoint and Cmd are unavailable"));
+            let r = translate(&api, "web", &json!({"Image": "image", "Entrypoint": [], "Cmd": ["echo"]})).unwrap();
+            assert_eq!(&r.run[..2], ["--entrypoint", r#"["echo"]"#]);
+            assert!(translate(&api, "web", &json!({"Image": "image"})).is_ok());
         }
     }
 
