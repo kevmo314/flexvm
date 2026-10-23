@@ -78,6 +78,8 @@ pub fn state(v: &Value) -> State {
         // Stopped, but kept from starting (`quarantined`), failed or lost (a reboot): as `flexvm wait` says.
         "quarantined" | "failed" | "lost" | "unknown" => s("dead", false, false, true, crate::vmproc::DIED as i64),
         "created" => s("created", false, false, false, 0),
+        // Its process holds the name, its VM not registered yet: docker's restarting (a rerun, a start).
+        "starting" => s("restarting", false, false, false, 0),
         // Running, checkpointing, suspending, migrating: its process runs it.
         _ => s("running", true, false, false, 0),
     };
@@ -975,6 +977,7 @@ mod tests {
         assert_eq!((st("paused").status, st("paused").paused, st("paused").running), ("paused", true, true));
         assert_eq!((st("suspended").status, st("suspended").exit_code), ("exited", 143));
         assert_eq!((st("exited").status, st("exited").exit_code), ("exited", 3));
+        assert_eq!(st("starting").status, "restarting");
         let due = state(&json!({"name": "v", "state": "exited", "status": 1, "restart_due_ms": 5}));
         assert_eq!((due.status, due.exit_code, status_line(&due, None, None)), ("restarting", 1, "Restarting (1)".to_string()));
         assert_eq!((st("lost").status, st("lost").dead, st("failed").exit_code), ("dead", true, 124));
