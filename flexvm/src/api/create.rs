@@ -87,18 +87,29 @@ pub fn remove(api: &Api, name: &str) {
 }
 
 /// `vms` (`ps -a`'s) with each record: a VM's under `docker`, a container not started yet as one `created`.
-pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
-    let renames = api.renames.lock().unwrap();
+pub fn merge(api: &Api) -> Vec<Value> {
+    merge_with(api, || crate::vms(&api.host))
+}
+
+pub(super) fn merge_with(api: &Api, list: impl FnOnce() -> Vec<Value>) -> Vec<Value> {
+    let renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+    let mut vms = list();
     for mut r in load_all(api) {
         if r.reserved {
             let live = r.reservation_owner.as_ref().is_some_and(|id| {
                 if *id == crate::host::Ident::me() {
-                    renames.contains(&r.name)
+                    renames.contains_key(&r.name)
                 } else {
                     id.liveness() != crate::host::Liveness::Gone
                 }
             });
             if live {
+                // Only attach the destination's overlay once the source VM has actually moved.
+                if !r.image.is_empty() && renames.get(&r.name).is_some_and(|source| !vms.iter().any(|v| v["name"] == source.as_str())) {
+                    if let Some(v) = vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
+                        v["docker"] = json!(r);
+                    }
+                }
                 continue;
             }
             let listed = vms.iter().any(|v| v["name"] == r.name.as_str());
@@ -113,7 +124,7 @@ pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
         }
         match vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
             Some(v) => v["docker"] = json!(r),
-            None if renames.contains(&r.name) => continue,
+            None if r.started && renames.contains_key(&r.name) => continue,
             None if !r.started => {
                 let created = json!({"name": r.name, "state": "created", "template": r.template, "created": r.created, "docker": r});
                 vms.insert(0, created);
@@ -321,12 +332,8 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     let meta = tpl.image.as_ref();
     let image_config = images::config(api, &tpl);
     let argv: Vec<String> = meta.map(|i| i.argv.clone()).unwrap_or_default();
-    let (image_entrypoint, image_cmd) = images::app(&argv, image_config.as_ref());
-    if config["Entrypoint"].as_array().is_some_and(|e| e.is_empty())
-        && config["Cmd"].as_array().is_none_or(|c| c.is_empty())
-        && !argv.is_empty()
-        && !image_config.as_ref().is_some_and(|c| images::strings(&c["Entrypoint"]).into_iter().chain(images::strings(&c["Cmd"])).eq(argv.iter().cloned()))
-    {
+    let (image_entrypoint, image_cmd, matched) = images::app(&argv, image_config.as_ref());
+    if config["Entrypoint"].as_array().is_some_and(|e| e.is_empty()) && config["Cmd"].as_array().is_none_or(|c| c.is_empty()) && !argv.is_empty() && !matched {
         return Err(Error::unsupported("clearing the entrypoint without a command: the image's Entrypoint and Cmd are unavailable"));
     }
     for (key, flag) in [("WorkingDir", "a working directory"), ("User", "a user")] {
@@ -441,10 +448,10 @@ pub(super) mod tests {
         r.reserved = true;
         r.reservation_owner = Some(crate::host::Ident { boot: "old".into(), ..Default::default() });
         store(&api, &r, true).unwrap();
-        assert!(merge(&api, vec![]).is_empty());
+        assert!(merge_with(&api, Vec::new).is_empty());
         assert!(load(&api, "web").is_none());
         store(&api, &r, true).unwrap();
-        let rows = merge(&api, vec![json!({"name": "web", "state": "running"})]);
+        let rows = merge_with(&api, || vec![json!({"name": "web", "state": "running"})]);
         assert_eq!(rows[0]["docker"]["config"], r.config);
         assert!(!load(&api, "web").unwrap().reserved);
     }
@@ -457,7 +464,7 @@ pub(super) mod tests {
         r.reserved = true;
         r.reservation_owner = Some(crate::host::Ident::me());
         store(&api, &r, true).unwrap();
-        assert!(merge(&api, vec![]).is_empty());
+        assert!(merge_with(&api, Vec::new).is_empty());
         assert!(load(&api, "b").is_none());
         let replacement = translate(&api, "b", &json!({"Image": "image"})).unwrap();
         assert!(store(&api, &replacement, true).unwrap());
@@ -475,7 +482,7 @@ pub(super) mod tests {
         };
         store(&api, &r, true).unwrap();
         let vm = json!({"name": "web", "state": "running"});
-        assert_eq!(merge(&api, vec![vm.clone()]), vec![vm]);
+        assert_eq!(merge_with(&api, || vec![vm.clone()]), vec![vm]);
         assert!(load(&api, "web").is_none());
     }
 
@@ -533,7 +540,7 @@ pub(super) mod tests {
         assert!(api.host.template_users().contains("aaaa1111"));
         assert!(crate::host::recorded_template_users(&api.host.state, "shared").contains("aaaa1111"));
         assert!(crate::template::prune(&api.paths, Some("aaaa1111"), &|| api.host.template_users(), false).unwrap().is_empty());
-        let v = merge(&api, vec![]).pop().unwrap();
+        let v = merge_with(&api, Vec::new).pop().unwrap();
         let d = super::super::containers::Detail::read(&api, &v);
         assert_eq!(d.image_id, "sha256:aaaa1111");
         assert_eq!(d.entrypoint, ["/bin/sh", "-c", ""]);

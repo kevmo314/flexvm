@@ -33,15 +33,15 @@ pub fn strings(v: &Value) -> Vec<String> {
 
 /// The app's argv as docker's `Entrypoint` and `Cmd`: the config's, when they are what the template runs
 /// (a pull's `--entrypoint` or `--cmd` changed it otherwise); else it is all `Cmd`, as an image without an
-/// entrypoint's.
-pub fn app(argv: &[String], config: Option<&Value>) -> (Vec<String>, Vec<String>) {
+/// entrypoint's. The boolean reports whether the config matched the argv.
+pub fn app(argv: &[String], config: Option<&Value>) -> (Vec<String>, Vec<String>, bool) {
     if let Some(c) = config {
         let (entrypoint, cmd) = (strings(&c["Entrypoint"]), strings(&c["Cmd"]));
         if entrypoint.iter().chain(&cmd).eq(argv) {
-            return (entrypoint, cmd);
+            return (entrypoint, cmd, true);
         }
     }
-    (Vec::new(), argv.to_vec())
+    (Vec::new(), argv.to_vec(), false)
 }
 
 #[cfg(test)]
@@ -53,12 +53,14 @@ mod tests {
     fn the_app_splits_as_its_config_does() {
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let c = json!({"Entrypoint": ["/docker-entrypoint.sh"], "Cmd": ["nginx", "-g", "daemon off;"]});
-        let (e, cmd) = app(&argv(&["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]), Some(&c));
+        let (e, cmd, matched) = app(&argv(&["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]), Some(&c));
+        assert!(matched);
         assert_eq!((e, cmd), (argv(&["/docker-entrypoint.sh"]), argv(&["nginx", "-g", "daemon off;"])));
         // A pull's --cmd: no longer the config's.
-        let (e, cmd) = app(&argv(&["/docker-entrypoint.sh", "sh"]), Some(&c));
+        let (e, cmd, matched) = app(&argv(&["/docker-entrypoint.sh", "sh"]), Some(&c));
+        assert!(!matched);
         assert_eq!((e, cmd), (vec![], argv(&["/docker-entrypoint.sh", "sh"])));
-        assert_eq!(app(&argv(&["sh"]), None), (vec![], argv(&["sh"])));
-        assert_eq!(app(&[], Some(&json!({"Entrypoint": null, "Cmd": null}))), (vec![], vec![]));
+        assert_eq!(app(&argv(&["sh"]), None), (vec![], argv(&["sh"]), false));
+        assert_eq!(app(&[], Some(&json!({"Entrypoint": null, "Cmd": null}))), (vec![], vec![], true));
     }
 }

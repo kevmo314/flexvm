@@ -36,7 +36,7 @@ pub async fn create(api: &Arc<Api>, q: Query, body: Value) -> Reply {
                     Some(n) => n.clone(),
                     None => crate::host::generated_name(&api.host)?,
                 };
-                let taken = api.host.alive(&name) || create::merge(api, crate::vms(&api.host)).iter().any(|v| v["name"] == name.as_str());
+                let taken = api.host.alive(&name) || create::merge(api).iter().any(|v| v["name"] == name.as_str());
                 if !taken {
                     let r = match create::translate(api, &name, &body) {
                         Ok(r) => r,
@@ -170,9 +170,21 @@ struct Rename<'a> {
     names: [String; 2],
 }
 
+impl<'a> Rename<'a> {
+    fn begin(api: &'a Api, name: &str, to: &str) -> Result<Self, Error> {
+        let mut renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+        if renames.contains_key(name) || renames.contains_key(to) {
+            return Err(Error::conflict("a rename is already in progress"));
+        }
+        renames.insert(name.to_string(), to.to_string());
+        renames.insert(to.to_string(), name.to_string());
+        Ok(Self { api, names: [name.to_string(), to.to_string()] })
+    }
+}
+
 impl Drop for Rename<'_> {
     fn drop(&mut self) {
-        let mut renames = self.api.renames.lock().unwrap();
+        let mut renames = self.api.renames.lock().unwrap_or_else(|e| e.into_inner());
         for name in &self.names {
             renames.remove(name);
         }
@@ -184,14 +196,7 @@ where
     F: Fn(String, String) -> Fut + Send,
     Fut: std::future::Future<Output = Result<(), Error>> + Send,
 {
-    let _rename = {
-        let mut renames = api.renames.lock().unwrap();
-        if renames.contains(&name) || renames.contains(&to) {
-            return Err(Error::conflict("a rename is already in progress"));
-        }
-        renames.extend([name.clone(), to.clone()]);
-        Rename { api, names: [name.clone(), to.clone()] }
-    };
+    let _rename = Rename::begin(api, &name, &to)?;
     // Reserve before touching the VM, including for VMs that have no Docker record.
     let record: Option<Record> = serde_json::from_value(v["docker"].clone()).ok();
     let mut reserved = record.clone().unwrap_or(Record { started: true, ..Record::default() });
@@ -200,7 +205,7 @@ where
     reserved.reservation_owner = Some(crate::host::Ident::me());
     let reservation = reserved.clone();
     api.blocking(move |api| {
-        let vms = create::merge(api, crate::vms(&api.host));
+        let vms = create::merge(api);
         let taken = api.host.alive(&reservation.name) || vms.iter().any(|v| v["name"] == reservation.name);
         if taken || !create::store(api, &reservation, true)? {
             return Ok(Err(Error::conflict(format!("Conflict. The container name \"/{}\" is already in use", reservation.name))));
@@ -318,6 +323,83 @@ pub async fn prune(api: &Arc<Api>, q: Query) -> Reply {
 mod tests {
     use super::*;
     use create::tests::fixture;
+    use http_body_util::BodyExt;
+
+    #[test]
+    fn merge_lists_and_loads_records_under_the_rename_lock() {
+        for success in [false, true] {
+            let (_d, api) = fixture();
+            let mut a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+            a.started = true;
+            create::store(&api, &a, true).unwrap();
+            let rename = Rename::begin(&api, "a", "b").unwrap();
+            let mut lock = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+            let listing = Arc::new(std::sync::Mutex::new(vec![json!({"name": if success { "a" } else { "b" }, "state": "stopped"})]));
+            let current_listing = listing.clone();
+            let (ready, waiting) = std::sync::mpsc::channel();
+            let reader = api.clone();
+            let thread = std::thread::spawn(move || {
+                ready.send(()).unwrap();
+                create::merge_with(&reader, || {
+                    assert!(reader.renames.try_lock().is_err(), "listing must hold the rename lock");
+                    current_listing.lock().unwrap().clone()
+                })
+            });
+            waiting.recv().unwrap();
+            let name = if success { "b" } else { "a" };
+            if success {
+                a.name = name.into();
+                create::store(&api, &a, true).unwrap();
+                create::remove(&api, "a");
+            }
+            *listing.lock().unwrap() = vec![json!({"name": name, "state": "stopped"})];
+            // Finish the rename before the waiting merge can take its snapshot.
+            lock.clear();
+            drop(lock);
+            drop(rename);
+            let rows = thread.join().unwrap();
+            assert_eq!(rows[0]["docker"], json!(a));
+            assert_eq!(create::load(&api, name), Some(a));
+        }
+    }
+
+    #[tokio::test]
+    async fn created_container_stays_visible_during_rename() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        let _rename = Rename::begin(&api, "a", "b").unwrap();
+        let mut b = a.clone();
+        b.name = "b".into();
+        b.reserved = true;
+        b.reservation_owner = Some(crate::host::Ident::me());
+        create::store(&api, &b, true).unwrap();
+        let rows = create::merge(&api);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["docker"], json!(a));
+        let response = super::super::containers::list(&api, Query::parse("all=true")).await.unwrap();
+        let body: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        super::super::containers::inspect(&api, "a").await.unwrap();
+    }
+
+    #[test]
+    fn poisoned_rename_lock_supports_begin_merge_and_drop() {
+        let (_d, api) = fixture();
+        let poisoned = api.clone();
+        assert!(std::thread::spawn(move || {
+            let _lock = poisoned.renames.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("poison the rename lock");
+        })
+        .join()
+        .is_err());
+        let rename = Rename::begin(&api, "a", "b").unwrap();
+        assert!(Rename::begin(&api, "b", "c").is_err());
+        assert!(create::merge(&api).is_empty());
+        drop(rename);
+        assert!(api.renames.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(Rename::begin(&api, "b", "c").is_ok());
+    }
 
     #[tokio::test]
     async fn rename_does_not_attach_config_to_an_external_destination() {
@@ -328,7 +410,7 @@ mod tests {
         let v = json!({"name": "a", "state": "running", "docker": a});
         let e = rename_to(&api, "a".into(), &v, "b".into(), |_, _| async {
             let b = json!({"name": "b", "state": "running"});
-            let rows = create::merge(&api, vec![json!({"name": "a", "state": "running"}), b.clone()]);
+            let rows = create::merge_with(&api, || vec![json!({"name": "a", "state": "running"}), b.clone()]);
             assert_eq!(rows[1], b);
             assert_eq!(rows[0]["docker"], json!(a));
             Err(Error::conflict("destination exists"))
@@ -352,7 +434,10 @@ mod tests {
             let (api, path) = (&api, &path);
             async move {
                 if from == "a" {
-                    create::merge(api, vec![json!({"name": "b", "state": "running"})]);
+                    let rows = create::merge_with(api, || vec![json!({"name": "b", "state": "running"})]);
+                    assert_eq!(rows[0]["docker"]["config"]["Labels"]["keep"], "config");
+                    let detail = super::super::containers::Detail::read(api, &rows[0]);
+                    assert_eq!(detail.labels.get("keep"), Some(&json!("config")));
                     std::fs::remove_file(path).unwrap();
                     std::fs::create_dir(path).unwrap();
                 } else {
@@ -364,7 +449,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(create::load(&api, "a"), Some(a.clone()));
-        assert_eq!(create::merge(&api, vec![json!({"name": "a", "state": "running"})])[0]["docker"], json!(a));
+        assert_eq!(create::merge_with(&api, || vec![json!({"name": "a", "state": "running"})])[0]["docker"], json!(a));
         assert!(create::load(&api, "b").is_none());
     }
 
@@ -392,7 +477,7 @@ mod tests {
         let v = json!({"name": "a", "state": "running", "docker": a});
         let e = rename_to(&api, "a".into(), &v, "b".into(), |_, _| async {
             assert!(create::load(&api, "b").unwrap().reserved);
-            assert!(create::merge(&api, vec![]).iter().all(|v| v["name"] != "b"));
+            assert!(create::merge_with(&api, Vec::new).iter().all(|v| v["name"] != "b"));
             assert!(create::load(&api, "b").is_some(), "listing must not remove the reservation");
             Err(Error::bad("CLI failed"))
         })
@@ -481,7 +566,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(e.message, "rollback failed");
         assert!(create::load(&api, "b").unwrap().reserved);
-        let rows = create::merge(&api, vec![json!({"name": "b", "state": "running"})]);
+        let rows = create::merge_with(&api, || vec![json!({"name": "b", "state": "running"})]);
         let mut b = a;
         b.name = "b".into();
         assert_eq!(rows[0]["docker"], json!(b));
@@ -490,7 +575,7 @@ mod tests {
         assert_eq!(reserved.reservation_owner, None);
         assert_eq!(reserved.config, b.config);
         assert!(create::load(&api, "a").is_none());
-        assert_eq!(create::merge(&api, vec![json!({"name": "b", "state": "running"})])[0]["docker"], json!(b));
+        assert_eq!(create::merge_with(&api, || vec![json!({"name": "b", "state": "running"})])[0]["docker"], json!(b));
     }
 
     #[tokio::test]

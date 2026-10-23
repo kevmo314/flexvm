@@ -88,7 +88,8 @@ pub struct Api {
     pub paths: Paths,
     /// `--state`, `--run` (and `--verbose`) as this process was given them: a command it runs gets them first.
     pub globals: Vec<String>,
-    pub renames: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Both names of each active rename, mapped to their counterpart.
+    pub renames: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Api {
