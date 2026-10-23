@@ -986,7 +986,7 @@ fn host_template_users_keep_every_generation_for_unreadable_records() {
     let keep_all = |why: &str| {
         let users = host.template_users();
         let all: Vec<&str> = users.iter().filter_map(|u| u.strip_prefix(crate::template::KEEP_ALL)).collect();
-        assert!(all.len() == 1 && all[0].starts_with("a checkpoint here cannot be read") && all[0].contains(why), "{users:?} for {why:?}");
+        assert!(all.len() == 1 && all[0].starts_with("a container or checkpoint record here cannot be read") && all[0].contains(why), "{users:?} for {why:?}");
     };
     for dir in [host.suspended("bad").unwrap(), host.state.join("checkpoints/0123456789abcdef")] {
         fs::create_dir_all(&dir).unwrap();

@@ -1019,7 +1019,7 @@ fn run(args: &Args, image: &str) -> Result<()> {
     // Parsed once (its `-p` ports included), before a pull: a bad one is refused at once.
     let spec = run_spec(args, ip)?;
     // Pulled the first time, as docker does (a detached run's VM process finds it there).
-    if std::fs::symlink_metadata(paths.templates.join(&template)).is_err() {
+    if template::Template::generation(&paths, &template).is_none() && std::fs::symlink_metadata(paths.templates.join(&template)).is_err() {
         pull_missing(args, &template)?;
     }
     let interactive = args.has("interactive") || args.has("tty");

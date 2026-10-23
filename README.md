@@ -1054,6 +1054,10 @@ so, and a setting that cannot be honoured is refused, never ignored.
 | `GET /containers/json`, `/containers/{id}/json` | `ps -a` and `inspect`, in docker's shapes |
 | `GET /containers/{id}/logs` | `logs [-f] [--tail N]` |
 | `POST /containers/{id}/wait` | `wait` |
+| `POST /containers/create`, `/containers/{id}/start` | a record of the `run` to come; then `run -d` (`start`, once it ran) |
+| `POST /containers/{id}/stop`, `restart`, `pause`, `unpause`, `rename` | `stop`, `restart`, `pause`, `unpause`, `rename` |
+| `POST /containers/{id}/kill` | `kill` for SIGKILL (its default), else `kill -s SIGNAL` |
+| `DELETE /containers/{id}`, `POST /containers/prune` | `rm [-f]` |
 
 A container is a VM, under its name; its id is the name's SHA-256, so it
 needs no record of its own (and a rename makes it another). Docker's states
@@ -1067,6 +1071,22 @@ one flat routed network, listed as docker's `bridge`, with its address as
 gives all of it as stdout, and refuses `--since`, `--until` and
 `--timestamps`. `ps --filter` takes `id`, `name`, `status`, `exited`,
 `label`, `ancestor` and `network`.
+
+Docker's create and start are flexvm's one `run -d`: a created container
+is a record in `STATE/api/containers` of the `run` it starts with,
+translated from docker's settings as it is created, and of those settings as
+given (its labels, which `inspect` and `--filter label=` show while its VM is
+there). `Cmd` and `Entrypoint` become `--entrypoint` (the app's argv, as
+docker's make it from the image's); `Env`, `-p` (a free port for docker's
+any), `--memory`, `--cpus`, `--rm`, `--restart` (docker's restart policies), `-i`, `-t` and an `--ip` given for the
+`bridge` network carry over. A setting with nothing under it is refused,
+not ignored: bind mounts and volumes, other networks, DNS settings, health
+checks, a working directory or user other than the image's (they are
+`pull` options), and limits flexvm does not keep. A VM waiting out its
+restart policy's backoff is docker's `restarting`, and `docker stop` ends
+its restarts. `docker stop` suspends
+the VM to disk, so `docker start` resumes it where it was; `docker kill`
+(SIGKILL) destroys it, leaving no record, as `flexvm kill` does.
 
 ## Paths and knobs
 
