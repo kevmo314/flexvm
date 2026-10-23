@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::host::{self, Host, Ident};
 use crate::util::Result;
 use crate::vm::State;
-use crate::vmproc::{Proc, Suspend};
+use crate::vmproc::{Op, Proc, Suspend};
 use crate::{bail, template};
 
 /// `RUN/vms/NAME.exit`: how the last process that ran `name` ended, written as it lets the name
@@ -613,26 +613,42 @@ pub fn renamed(name: &str) -> String {
     }
 }
 
-/// How long a running VM's rename waits for `op`.
+/// How long a running VM's rename waits for `op` and incoming pages to settle.
 const RENAME_WAIT: Duration = Duration::from_secs(2);
 
 impl Proc {
-    /// `rename` of this running VM, holding `op` (refused at once while a checkpoint, migration
-    /// or suspend has it). Not while a migration's outcome or an arrival's pages are pending,
-    /// nor once it is ending: their records name the VM. The new name is taken first, so its
-    /// claim on the address (read by the name, `Host::held`) is the VM's under either name.
+    /// Acquire `op` only once the checkpoint and migration completion workers have settled.
+    /// Both workers need `op` to clear their flag, so release it and all flag guards before
+    /// sleeping. Re-check under `op` on every attempt so a new operation cannot race the rename.
+    fn rename_op(&self, deadline: Instant) -> Result<Op<'_>> {
+        loop {
+            let pending = match self.op_now() {
+                Some(op) => {
+                    if self.consumed.lock().unwrap().is_some() {
+                        "is still paging in its checkpoint (it was started from it): try again once it is all here"
+                    } else if self.arrived.lock().unwrap().is_some() {
+                        "is still arriving by migration (its memory is still coming): try again once it is all here"
+                    } else {
+                        return Ok(op);
+                    }
+                }
+                None => "is busy (a checkpoint, migration or suspend is under way): try again once it is done",
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("vm {} {pending}", self.name());
+            }
+            std::thread::sleep(left.min(Duration::from_millis(20)));
+        }
+    }
+
+    /// `rename` of this running VM, holding `op` after any incoming pages have settled.
+    /// Not while a migration's outcome is pending, nor once it is ending: their records name
+    /// the VM. The new name is taken first, so its claim on the address (read by the name,
+    /// `Host::held`) is the VM's under either name.
     pub fn rename(&self, to: &str) -> Result<Value> {
         let vm = self.vm();
-        // A moment's holder (a start finishing, a resize) is waited out; a checkpoint, migration or
-        // suspend is refused, not waited for.
-        let deadline = Instant::now() + RENAME_WAIT;
-        let _op = loop {
-            match self.op_now() {
-                Some(op) => break op,
-                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-                None => bail!("vm {} is busy (a checkpoint, migration or suspend is under way): try again once it is done", vm.name),
-            }
-        };
+        let _op = self.rename_op(Instant::now() + RENAME_WAIT)?;
         self.not_destroyed()?;
         let from = self.name();
         host::check_new_name(to)?;
@@ -645,12 +661,6 @@ impl Proc {
         }
         if *self.suspending.lock().unwrap() != Suspend::Idle {
             bail!("vm {from} is being stopped: not renaming it");
-        }
-        if self.consumed.lock().unwrap().is_some() {
-            bail!("vm {from} is still paging in its checkpoint (it was started from it): try again once it is all here");
-        }
-        if self.arrived.lock().unwrap().is_some() {
-            bail!("vm {from} is still arriving by migration (its memory is still coming): try again once it is all here");
         }
         if self.reconciling.lock().unwrap().is_some() || self.is_leaving() {
             bail!("vm {from} is the source of a migration whose outcome is pending: not renaming it");
@@ -926,6 +936,41 @@ pub fn stale_exit(host: &Host, name: &str, path: &Path, ttl: Duration) -> bool {
 mod tests {
     use super::*;
     use crate::test_util::TempDir;
+
+    #[test]
+    fn rename_waits_without_blocking_page_completion() {
+        for migration in [false, true] {
+            let root = TempDir::new("rename-paging");
+            let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+            let p = Proc::new(host, template::Paths::new(&root)).unwrap();
+            p.set_name(p.host.take_name("paging", false).unwrap());
+            let pending = if migration {
+                *p.arrived.lock().unwrap() = Some(p.host.mig_begin(1, "", None, None).unwrap());
+                "still arriving by migration"
+            } else {
+                *p.consumed.lock().unwrap() = Some(root.join("checkpoint"));
+                "still paging in its checkpoint"
+            };
+            // An expired deadline preserves the specific refusal and releases the op.
+            let e = p.rename_op(Instant::now()).unwrap_err();
+            assert!(e.to_string().contains(pending), "{e}");
+            assert!(p.op_now().is_some());
+            let worker = p.clone();
+            let done = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                // As both real completion workers do: take op before clearing the flag.
+                let _op = worker.op();
+                worker.consumed.lock().unwrap().take();
+                worker.arrived.lock().unwrap().take();
+            });
+            let op = p.rename_op(Instant::now() + RENAME_WAIT).unwrap();
+            assert!(p.consumed.lock().unwrap().is_none());
+            assert!(p.arrived.lock().unwrap().is_none());
+            assert!(p.op_now().is_none(), "rename keeps op once the pages have settled");
+            drop(op);
+            done.join().unwrap();
+        }
+    }
 
     fn row(name: &str, state: &str, ip: &str, template: &str) -> Value {
         json!({"name": name, "state": state, "ip": ip, "template": template, "vcpus": 2, "pid": 42, "rss_mib": 10, "max_mib": 512, "starved": false})
