@@ -88,6 +88,7 @@ pub struct Api {
     pub paths: Paths,
     /// `--state`, `--run` (and `--verbose`) as this process was given them: a command it runs gets them first.
     pub globals: Vec<String>,
+    pub renames: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Api {
@@ -114,7 +115,7 @@ pub fn main(host: Host, paths: Paths, globals: Vec<String>, socket: Option<&str>
         crate::log!("flexvm api: serving the Docker Engine API (v{API_VERSION}) on unix://{}", at.display());
     }
     listener.set_nonblocking(true)?;
-    let api = Arc::new(Api { host, paths, globals });
+    let api = Arc::new(Api { host, paths, globals, renames: Default::default() });
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).max_blocking_threads(64).enable_all().build()?;
     rt.block_on(async { serve(tokio::net::UnixListener::from_std(listener)?, api).await })
 }

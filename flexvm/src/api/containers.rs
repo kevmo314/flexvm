@@ -757,7 +757,7 @@ mod tests {
     fn fixture() -> (crate::test_util::TempDir, Arc<Api>) {
         let d = crate::test_util::TempDir::new("api-containers");
         let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
-        let api = Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![] });
+        let api = Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![], renames: Default::default() });
         (d, api)
     }
 

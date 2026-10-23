@@ -165,11 +165,33 @@ pub async fn rename(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     .map_err(|e| Error::from(crate::util::Error::from(e.to_string())))?
 }
 
+struct Rename<'a> {
+    api: &'a Api,
+    names: [String; 2],
+}
+
+impl Drop for Rename<'_> {
+    fn drop(&mut self) {
+        let mut renames = self.api.renames.lock().unwrap();
+        for name in &self.names {
+            renames.remove(name);
+        }
+    }
+}
+
 async fn rename_to<F, Fut>(api: &Arc<Api>, name: String, v: &Value, to: String, move_vm: F) -> Reply
 where
     F: Fn(String, String) -> Fut + Send,
     Fut: std::future::Future<Output = Result<(), Error>> + Send,
 {
+    let _rename = {
+        let mut renames = api.renames.lock().unwrap();
+        if renames.contains(&name) || renames.contains(&to) {
+            return Err(Error::conflict("a rename is already in progress"));
+        }
+        renames.extend([name.clone(), to.clone()]);
+        Rename { api, names: [name.clone(), to.clone()] }
+    };
     // Reserve before touching the VM, including for VMs that have no Docker record.
     let record: Option<Record> = serde_json::from_value(v["docker"].clone()).ok();
     let mut reserved = record.clone().unwrap_or(Record { started: true, ..Record::default() });
@@ -298,6 +320,55 @@ mod tests {
     use create::tests::fixture;
 
     #[tokio::test]
+    async fn rename_does_not_attach_config_to_an_external_destination() {
+        let (_d, api) = fixture();
+        let mut a = create::translate(&api, "a", &json!({"Image": "image", "Labels": {"owner": "a"}})).unwrap();
+        a.started = true;
+        create::store(&api, &a, true).unwrap();
+        let v = json!({"name": "a", "state": "running", "docker": a});
+        let e = rename_to(&api, "a".into(), &v, "b".into(), |_, _| async {
+            let b = json!({"name": "b", "state": "running"});
+            let rows = create::merge(&api, vec![json!({"name": "a", "state": "running"}), b.clone()]);
+            assert_eq!(rows[1], b);
+            assert_eq!(rows[0]["docker"], json!(a));
+            Err(Error::conflict("destination exists"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(create::load(&api, "a"), Some(a));
+        assert!(create::load(&api, "b").is_none());
+    }
+
+    #[tokio::test]
+    async fn merge_during_rename_preserves_the_source_for_rollback() {
+        let (_d, api) = fixture();
+        let mut a = create::translate(&api, "a", &json!({"Image": "image", "Labels": {"keep": "config"}})).unwrap();
+        a.started = true;
+        create::store(&api, &a, true).unwrap();
+        let v = json!({"name": "a", "state": "running", "docker": a});
+        let path = api.host.state.join("api/containers/b.json");
+        rename_to(&api, "a".into(), &v, "b".into(), |from, _| {
+            let (api, path) = (&api, &path);
+            async move {
+                if from == "a" {
+                    create::merge(api, vec![json!({"name": "b", "state": "running"})]);
+                    std::fs::remove_file(path).unwrap();
+                    std::fs::create_dir(path).unwrap();
+                } else {
+                    std::fs::remove_dir(path).unwrap();
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(create::load(&api, "a"), Some(a.clone()));
+        assert_eq!(create::merge(&api, vec![json!({"name": "a", "state": "running"})])[0]["docker"], json!(a));
+        assert!(create::load(&api, "b").is_none());
+    }
+
+    #[tokio::test]
     async fn rename_reserves_created_names_before_moving_any_vm() {
         let (_d, api) = fixture();
         let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
@@ -409,13 +480,14 @@ mod tests {
         .unwrap_err();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(e.message, "rollback failed");
+        assert!(create::load(&api, "b").unwrap().reserved);
         let rows = create::merge(&api, vec![json!({"name": "b", "state": "running"})]);
         let mut b = a;
         b.name = "b".into();
         assert_eq!(rows[0]["docker"], json!(b));
         let reserved = create::load(&api, "b").unwrap();
-        assert!(reserved.reserved);
-        assert_eq!(reserved.reservation_owner, Some(crate::host::Ident::me()));
+        assert!(!reserved.reserved);
+        assert_eq!(reserved.reservation_owner, None);
         assert_eq!(reserved.config, b.config);
         assert!(create::load(&api, "a").is_none());
         assert_eq!(create::merge(&api, vec![json!({"name": "b", "state": "running"})])[0]["docker"], json!(b));
