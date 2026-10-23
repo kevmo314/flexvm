@@ -693,7 +693,8 @@ pub async fn wait(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     tokio::spawn(async move {
         let Some(result) = connected(&tx, async {
             if condition == "removed" {
-                let code = if created || pinned.is_some() { wait_next(&api, &name, before, pinned).await? } else { initial_code };
+                // `rm -f` deletes the exit record it races us for, and a killed VM leaves none; docker reports 137.
+                let code = if created || pinned.is_some() { wait_next(&api, &name, before, pinned).await.unwrap_or(137) } else { initial_code };
                 wait_removed(&api, &name, code).await
             } else if condition == "next-exit" {
                 wait_next(&api, &name, before, pinned).await
