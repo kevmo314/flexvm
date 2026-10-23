@@ -165,24 +165,34 @@ pub async fn rename(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     .map_err(|e| Error::from(crate::util::Error::from(e.to_string())))?
 }
 
-struct Rename<'a> {
-    api: &'a Api,
+struct Rename {
+    api: Arc<Api>,
     names: [String; 2],
 }
 
-impl<'a> Rename<'a> {
-    fn begin(api: &'a Api, name: &str, to: &str) -> Result<Self, Error> {
+impl Rename {
+    async fn finish(self) -> Result<(), Error> {
+        self.api
+            .clone()
+            .blocking(move |_| {
+                drop(self);
+                Ok(())
+            })
+            .await
+    }
+
+    fn begin(api: &Arc<Api>, name: &str, to: &str) -> Result<Self, Error> {
         let mut renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
         if renames.contains_key(name) || renames.contains_key(to) {
             return Err(Error::conflict("a rename is already in progress"));
         }
         renames.insert(name.to_string(), to.to_string());
         renames.insert(to.to_string(), name.to_string());
-        Ok(Self { api, names: [name.to_string(), to.to_string()] })
+        Ok(Self { api: api.clone(), names: [name.to_string(), to.to_string()] })
     }
 }
 
-impl Drop for Rename<'_> {
+impl Drop for Rename {
     fn drop(&mut self) {
         let mut renames = self.api.renames.lock().unwrap_or_else(|e| e.into_inner());
         for name in &self.names {
@@ -196,7 +206,18 @@ where
     F: Fn(String, String) -> Fut + Send,
     Fut: std::future::Future<Output = Result<(), Error>> + Send,
 {
-    let _rename = Rename::begin(api, &name, &to)?;
+    let (owner, from, dest) = (api.clone(), name.clone(), to.clone());
+    let rename = api.blocking(move |_| Ok(Rename::begin(&owner, &from, &dest))).await??;
+    let result = rename_reserved(api, name, v, to, move_vm).await;
+    rename.finish().await?;
+    result
+}
+
+async fn rename_reserved<F, Fut>(api: &Arc<Api>, name: String, v: &Value, to: String, move_vm: F) -> Reply
+where
+    F: Fn(String, String) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<(), Error>> + Send,
+{
     // Reserve before touching the VM, including for VMs that have no Docker record.
     let record: Option<Record> = serde_json::from_value(v["docker"].clone()).ok();
     let mut reserved = record.clone().unwrap_or(Record { started: true, ..Record::default() });
@@ -204,7 +225,12 @@ where
     reserved.reserved = true;
     reserved.reservation_owner = Some(crate::host::Ident::me());
     let reservation = reserved.clone();
+    let source = name.clone();
+    let moved = v["state"] != "created";
     api.blocking(move |api| {
+        if !moved && create::load(api, &source).is_none() {
+            return Ok(Err(Error::missing(format!("No such container: {source}"))));
+        }
         let vms = create::merge(api);
         let taken = api.host.alive(&reservation.name) || vms.iter().any(|v| v["name"] == reservation.name);
         if taken || !create::store(api, &reservation, true)? {
@@ -213,7 +239,6 @@ where
         Ok(Ok(()))
     })
     .await??;
-    let moved = v["state"] != "created";
     let mut stranded = false;
     let result = async {
         if moved {
@@ -222,8 +247,9 @@ where
         reserved.reserved = false;
         reserved.reservation_owner = None;
         let published = reserved.clone();
+        let source = name.clone();
         if record.is_some() {
-            if let Err(e) = api.blocking(move |api| create::store(api, &published, false).map(drop)).await {
+            if let Err(e) = api.blocking(move |api| create::publish_rename(api, &source, &published)).await {
                 if moved {
                     if let Err(rollback) = move_vm(to.clone(), name.clone()).await {
                         stranded = true;
@@ -244,7 +270,7 @@ where
         if (!success && !stranded) || record.is_none() {
             create::remove(api, &to);
         }
-        if success {
+        if success && record.is_none() {
             create::remove(api, &name);
         }
         Ok(())
@@ -324,6 +350,78 @@ mod tests {
     use super::*;
     use create::tests::fixture;
     use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn stale_created_rename_cannot_duplicate_the_record() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        let (_, stale) = found(&api, "a").await.unwrap();
+        rename(&api, "a", Query::parse("name=b")).await.unwrap();
+        let e = rename_to(&api, "a".into(), &stale, "c".into(), |_, _| async { panic!("created VM") }).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::NOT_FOUND);
+        assert!(create::load(&api, "c").is_none());
+        assert_eq!(create::load(&api, "b").unwrap().config, a.config);
+        assert!(api.renames.lock().unwrap().is_empty());
+        assert_eq!(create::merge(&api).len(), 1);
+    }
+
+    #[test]
+    fn created_publication_and_retirement_share_merges_lock() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        let rename = Rename::begin(&api, "a", "b").unwrap();
+        let mut b = a;
+        b.name = "b".into();
+        let lock = api.renames.lock().unwrap();
+        let writer = api.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            sent.send(()).unwrap();
+            create::publish_rename(&writer, "a", &b).unwrap();
+            sent.send(()).unwrap();
+        });
+        received.recv().unwrap();
+        assert!(received.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        assert!(create::load(&api, "a").is_some());
+        assert!(create::load(&api, "b").is_none());
+        drop(lock);
+        thread.join().unwrap();
+        let rows = create::merge(&api);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "b");
+        drop(rename);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contended_rename_begin_and_finish_leave_the_worker_free() {
+        for finishing in [false, true] {
+            let (_d, api) = fixture();
+            let rename = finishing.then(|| Rename::begin(&api, "a", "b").unwrap());
+            let holder = api.clone();
+            let (ready, waiting) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let _lock = holder.renames.lock().unwrap();
+                ready.send(()).unwrap();
+                released.recv_timeout(std::time::Duration::from_secs(2)).is_ok()
+            });
+            waiting.recv().unwrap();
+            let task = tokio::spawn(async move {
+                if let Some(rename) = rename {
+                    rename.finish().await.unwrap();
+                } else {
+                    let v = json!({"state": "created"});
+                    assert!(rename_to(&api, "a".into(), &v, "b".into(), |_, _| async { unreachable!() }).await.is_err());
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = release.send(());
+            task.await.unwrap();
+            assert!(thread.join().unwrap(), "rename blocked the Tokio worker");
+        }
+    }
 
     #[test]
     fn merge_lists_and_loads_records_under_the_rename_lock() {

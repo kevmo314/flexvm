@@ -103,6 +103,7 @@ impl Api {
 /// `flexvm api [SOCKET]`: serves on SOCKET (default `RUN/docker.sock`), or on the socket systemd passed
 /// (`LISTEN_FDS`), until killed.
 pub fn main(host: Host, paths: Paths, globals: Vec<String>, socket: Option<&str>) -> Result<()> {
+    let _state_lock = state_lock(&host.state)?;
     let activated = activated();
     let (listener, at, _lock) = match activated {
         Some(l) => (l, None, None),
@@ -119,6 +120,18 @@ pub fn main(host: Host, paths: Paths, globals: Vec<String>, socket: Option<&str>
     let api = Arc::new(Api { host, paths, globals, renames: Default::default() });
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).max_blocking_threads(64).enable_all().build()?;
     rt.block_on(async { serve(tokio::net::UnixListener::from_std(listener)?, api).await })
+}
+
+/// Rename tracking is process-local: even different sockets must share one API server per state.
+fn state_lock(state: &Path) -> Result<crate::host::Flock> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = state.join("api");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let file = std::fs::File::open(&dir)?;
+    Ok(crate::host::Flock::new(file, libc::LOCK_EX | libc::LOCK_NB).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock => format!("another flexvm api is already serving state directory {}", state.display()),
+        _ => format!("{}: locking API state: {e}", dir.display()),
+    })?)
 }
 
 /// The Unix socket systemd passed as fd 3, if it passed one.
@@ -452,6 +465,18 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn one_api_per_state_directory() {
+        let d = crate::test_util::TempDir::new("api-state-lock");
+        let lock = super::state_lock(&d).unwrap();
+        let error = super::state_lock(&d).err().unwrap();
+        assert!(error.to_string().contains("another flexvm api is already serving state directory"));
+        let other = crate::test_util::TempDir::new("api-other-state-lock");
+        let _other = super::state_lock(&other).unwrap();
+        drop(lock);
+        super::state_lock(&d).unwrap();
+    }
 
     fn fixture() -> crate::test_util::TempDir {
         let target = Path::new("../target");

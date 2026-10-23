@@ -80,6 +80,14 @@ pub fn store(api: &Api, r: &Record, new: bool) -> crate::util::Result<bool> {
     Ok(placed?)
 }
 
+/// Publish and retire under merge's lock so a created container is listed exactly once.
+pub(super) fn publish_rename(api: &Api, source: &str, record: &Record) -> crate::util::Result<()> {
+    let _renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+    store(api, record, false)?;
+    remove(api, source);
+    Ok(())
+}
+
 pub fn remove(api: &Api, name: &str) {
     if crate::host::check_name(name).is_ok() {
         let _ = std::fs::remove_file(dir(api).join(format!("{name}.json")));
