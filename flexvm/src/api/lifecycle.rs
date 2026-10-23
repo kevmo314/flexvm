@@ -211,10 +211,13 @@ where
             if record.is_none() && (had_record || !moved) {
                 return Ok(Err(Error::missing(format!("No such container: {source}"))));
             }
-            if record.as_ref().is_some_and(|r| r.started != moved) {
-                return Ok(Err(Error::conflict(format!("Container {source} changed state during rename"))));
+            // Started since found() saw it created. (A listed VM whose record still says created was started by a
+            // run_created that never re-stored it: it is started.)
+            if record.as_ref().is_some_and(|r| r.started && !moved) {
+                return Ok(Err(Error::conflict(format!("Container {source} was started during the rename: try again"))));
             }
-            let mut reserved = record.clone().unwrap_or(Record { started: true, ..Record::default() });
+            let mut reserved = record.clone().unwrap_or_default();
+            reserved.started |= moved;
             reserved.name = destination;
             reserved.reserved = true;
             reserved.reservation_owner = Some(crate::host::Ident::me());
