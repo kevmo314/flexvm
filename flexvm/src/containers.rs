@@ -444,7 +444,7 @@ pub fn rename(host: &Host, from: &str, to: &str) -> Result<()> {
         bail!("vm {from} is named {to} already");
     }
     if host.alive(from) {
-        crate::vmproc::call(host, from, json!({"op": "rename", "to": to}), Some(Instant::now() + Duration::from_secs(30)))?;
+        crate::vmproc::call(host, from, json!({"op": "rename", "to": to}), Some(Instant::now() + Duration::from_secs(45)))?;
         return crate::output(format_args!("{to}\n"));
     }
     rename_stopped(host, from, to)?;
@@ -640,7 +640,7 @@ impl Proc {
         }
     }
 
-    /// `rename` of this running VM, holding `op` after any incoming pages have settled.
+    /// `rename` of this running VM, holding `op` once a checkpoint's pages are in and an arrival has settled.
     /// Not while a migration's outcome is pending, nor once it is ending: their records name
     /// the VM. The new name is taken first, so its claim on the address (read by the name,
     /// `Host::held`) is the VM's under either name.
@@ -657,14 +657,14 @@ impl Proc {
             State::Running | State::Paused => {}
             s => bail!("vm {from} is {}: not renaming it", s.name()),
         }
+        // The pager progresses without op: settle an arrival here, before the checks a stop meanwhile would change.
+        self.settle_arrival(&op, crate::migrate::ARRIVAL_WAIT)?;
         if *self.suspending.lock().unwrap() != Suspend::Idle {
             bail!("vm {from} is being stopped: not renaming it");
         }
         if self.reconciling.lock().unwrap().is_some() || self.is_leaving() {
             bail!("vm {from} is the source of a migration whose outcome is pending: not renaming it");
         }
-        // The pager progresses without op; settle here rather than waiting for the arrival worker to take op.
-        self.settle_arrival(&op, crate::migrate::ARRIVAL_WAIT)?;
         // Nor while its arrival hands its held packets over: the hand-off's ownership checks go by the name, and one
         // between the address's new holder and this process's new name would read as the address gone (#1028).
         self.settle_handoff(false)?;
