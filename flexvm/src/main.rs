@@ -1,5 +1,6 @@
 #![deny(clippy::print_stderr)]
 
+mod api;
 mod app;
 mod artifacts;
 mod attach;
@@ -141,6 +142,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      verify and save registry credentials in STATE/auth.json
   flexvm logout [REGISTRY]           remove saved credentials (default registry: Docker Hub)
   flexvm rmi IMAGE|ID                remove an image no VM here uses
+  flexvm api [SOCKET]                serve the Docker Engine API on SOCKET (default RUN/docker.sock, or the
+                                     socket-activated one): docker's CLI and SDKs drive the VMs as containers
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
   flexvm info                        this host's settings (STATE/host.json, edited by hand) and what is
                                      derived for those unset
@@ -517,6 +520,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
+    ("api", 2, &[]),
     ("info", 1, &[]),
     ("pull", 2, &["tag", "vcpus", "mem", "max", "plug", "standby"]),
     ("images", 1, &["json", "quiet", "filter"]),
@@ -818,6 +822,7 @@ fn real_main(args: &Args) -> Result<()> {
             listen::main(host, listeners, validated)
         }
         Some("info") => print(info(&open_host(args)?)),
+        Some("api") => api::main(open_host(args)?, paths(args)?, pos.get(1).copied()),
         Some("bench") => bench::run(args),
         // Test hooks: arm a fault for MS ms (0 disarms), hash a checkpoint, or ask a VM.
         Some("debug") => match name {
