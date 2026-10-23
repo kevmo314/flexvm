@@ -105,7 +105,7 @@ pub(super) fn merge_with(api: &Api, list: impl FnOnce() -> Vec<Value>) -> Vec<Va
             });
             if live {
                 // Only attach the destination's overlay once the source VM has actually moved.
-                if !r.image.is_empty() && renames.get(&r.name).is_some_and(|source| !vms.iter().any(|v| v["name"] == source.as_str())) {
+                if r.started && !r.image.is_empty() && renames.get(&r.name).is_some_and(|source| !vms.iter().any(|v| v["name"] == source.as_str())) {
                     if let Some(v) = vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
                         v["docker"] = json!(r);
                     }
