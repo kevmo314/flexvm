@@ -1125,7 +1125,7 @@ impl Proc {
     /// The one place an arrival settles, under `op`: once every page is here
     /// its record is released durably, then a home loan taken back. Every
     /// operation that changes who owns the VM (suspend, migrating on,
-    /// checkpoint --stop) settles first, waiting up to `wait`, and is refused
+    /// checkpoint --stop, rename) settles first, waiting up to `wait`, and is refused
     /// while the VM is still arriving.
     /// Recording the release is bounded too (`RELEASE_WAIT`): on a failure
     /// the arrival stays unsettled, for the pull's worker to retry.
