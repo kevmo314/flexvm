@@ -8,7 +8,7 @@
 
 mod cli;
 mod containers;
-mod create;
+pub(crate) mod create;
 mod images;
 mod lifecycle;
 mod streams;

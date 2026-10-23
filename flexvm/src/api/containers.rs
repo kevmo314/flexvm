@@ -47,12 +47,6 @@ pub async fn all(api: &Arc<Api>) -> Result<Vec<Value>, Error> {
     api.blocking(|api| Ok(super::create::merge(api, crate::vms(&api.host)))).await
 }
 
-/// The name of the VM `key` names.
-pub async fn resolve(api: &Arc<Api>, key: &str) -> Result<String, Error> {
-    let vms = all(api).await?;
-    Ok(find(&vms, key)?["name"].as_str().unwrap_or_default().to_string())
-}
-
 /// A VM's state as docker's.
 #[derive(Debug, PartialEq)]
 pub struct State {
@@ -162,6 +156,7 @@ pub struct Detail {
     pub labels: Map<String, Value>,
     pub workdir: String,
     pub user: String,
+    /// When docker's create made it, or else its log directory, start or finish.
     pub created: Option<u64>,
     pub started: Option<u64>,
     pub finished: Option<u64>,
@@ -178,7 +173,7 @@ impl Detail {
         let described = match (&record, created) {
             (Some(r), true) => {
                 let ports: Vec<crate::ports::Port> = r.run.windows(2).filter(|w| w[0] == "--publish").filter_map(|w| w[1].parse().ok()).collect();
-                let id = images::linked(api, &r.template);
+                let id = if r.generation.is_empty() { images::linked(api, &r.template) } else { Some(r.generation.clone()) };
                 json!({"name": name, "state": "created", "config": {"image": r.image, "template": r.template, "template_id": id, "ports": ports, "run": {}}})
             }
             _ => crate::containers::described(&api.host, &api.paths, &name, vm.clone()),
@@ -191,41 +186,35 @@ impl Detail {
         let run = &config["run"];
         let (mut entrypoint, mut cmd) = images::app(&argv, image_config.as_ref());
         // `--entrypoint` is the app's whole argv; `run IMAGE CMD`'s command is a shell's.
-        if let Some(e) = run["entrypoint"].as_array() {
-            (entrypoint, cmd) = (images::strings(&json!(e)), Vec::new());
+        if run["entrypoint"].is_array() {
+            (entrypoint, cmd) = (images::strings(&run["entrypoint"]), Vec::new());
         } else if let Some(c) = config["cmd"].as_str() {
             (entrypoint, cmd) = (Vec::new(), vec!["sh".into(), "-c".into(), c.into()]);
         }
         let ic = image_config.unwrap_or(Value::Null);
         let mut env = images::strings(&ic["Env"]);
-        for kv in images::strings(&run["env"]) {
-            let key = kv.split('=').next().unwrap_or_default().to_string();
-            env.retain(|e| e.split('=').next() != Some(&key));
+        let overrides = record.as_ref().filter(|_| created).map(|r| &r.config);
+        for kv in images::strings(&run["env"]).into_iter().chain(overrides.into_iter().flat_map(|c| images::strings(&c["Env"])).filter(|kv| kv.contains('='))) {
+            let key = kv.split('=').next().unwrap_or_default();
+            env.retain(|e| e.split('=').next() != Some(key));
             env.push(kv);
         }
         let mut labels = ic["Labels"].as_object().cloned().unwrap_or_default();
         if let Some(r) = &record {
             labels.extend(r.config["Labels"].as_object().cloned().unwrap_or_default());
-            if created {
-                for kv in images::strings(&r.config["Env"]).into_iter().filter(|kv| kv.contains('=')) {
-                    let key = kv.split('=').next().unwrap_or_default().to_string();
-                    env.retain(|e| e.split('=').next() != Some(&key));
-                    env.push(kv);
-                }
-                let (e, c) =
-                    (r.config["Entrypoint"].as_array().map(|e| images::strings(&json!(e))), r.config["Cmd"].as_array().map(|c| images::strings(&json!(c))));
-                if e.is_some() || c.is_some() {
-                    cmd = c.unwrap_or(if e.is_some() { Vec::new() } else { cmd });
-                    entrypoint = e.unwrap_or(entrypoint);
-                }
-            }
+        }
+        if let Some(config) = overrides {
+            (entrypoint, cmd) = super::create::app(config, entrypoint, cmd);
         }
         let template = config["template"].as_str().or(vm["template"].as_str()).unwrap_or_default();
         let started = started(vm);
         let finished = finished(api, vm);
         Detail {
             state: state(&described),
-            image: config["image"].as_str().map_or_else(|| crate::template::image_of(template), String::from),
+            image: record
+                .as_ref()
+                .map(|r| r.image.clone())
+                .unwrap_or_else(|| config["image"].as_str().map_or_else(|| crate::template::image_of(template), String::from)),
             image_id: if image_id.is_empty() { String::new() } else { format!("sha256:{image_id}") },
             entrypoint,
             cmd,
@@ -645,7 +634,10 @@ async fn wait_next(api: &Arc<Api>, name: &str, before: Option<crate::host::Ident
         let (holder, code) = api
             .blocking(move |api| {
                 let holder = live_holder(&api.host, &name);
-                Ok((holder, next_exit(&api.host, &name, before.as_ref(), None)?))
+                let code = next_exit(&api.host, &name, before.as_ref(), None)?;
+                let gone = removed(api, &name);
+                let code = code.or_else(|| (gone && holder.is_none()).then_some(0));
+                Ok((holder, code))
             })
             .await?;
         if let Some(code) = code {
@@ -658,6 +650,22 @@ async fn wait_next(api: &Arc<Api>, name: &str, before: Option<crate::host::Ident
     }
 }
 
+/// Read only this container, without collecting stale Docker records as listing does.
+fn removed(api: &Api, name: &str) -> bool {
+    let created = super::create::load(api, name).is_some_and(|r| !r.started);
+    !created && !api.host.alive(name) && api.host.entry(name).is_err() && !crate::host::Records::read(&api.host, name).recorded()
+}
+
+async fn wait_removed(api: &Arc<Api>, name: &str, code: i64) -> Result<i64, Error> {
+    loop {
+        let name = name.to_string();
+        if api.blocking(move |api| Ok(removed(api, &name))).await? {
+            return Ok(code);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// `POST /containers/{id}/wait?condition=not-running|next-exit|removed`: `flexvm wait`. The reply's head
 /// goes at once and its body once the VM's process ends (`next-exit`: one that runs or starts later;
 /// `removed`: then until nothing is left of it).
@@ -666,7 +674,11 @@ pub async fn wait(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     if !matches!(condition.as_str(), "not-running" | "next-exit" | "removed") {
         return Err(Error::bad(format!("invalid condition {condition:?}")));
     }
-    let name = resolve(api, key).await?;
+    let vms = all(api).await?;
+    let vm = find(&vms, key)?;
+    let created = vm["state"] == "created";
+    let initial_code = state(vm).exit_code;
+    let name = vm["name"].as_str().unwrap_or_default().to_string();
     // Register before returning the head, not when the spawned task first runs.
     let registered_name = name.clone();
     let (before, pinned) = api
@@ -680,8 +692,14 @@ pub async fn wait(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     let api = api.clone();
     tokio::spawn(async move {
         let Some(result) = connected(&tx, async {
-            if condition == "next-exit" {
+            if condition == "removed" {
+                // `rm -f` deletes the exit record it races us for, and a killed VM leaves none; docker reports 137.
+                let code = if created || pinned.is_some() { wait_next(&api, &name, before, pinned).await.unwrap_or(137) } else { initial_code };
+                wait_removed(&api, &name, code).await
+            } else if condition == "next-exit" {
                 wait_next(&api, &name, before, pinned).await
+            } else if created {
+                Ok(0)
             } else {
                 api.run(&["wait", "--", &name]).await.map(|out| String::from_utf8_lossy(&out.stdout).trim().parse::<i64>().unwrap_or(-1))
             }
@@ -694,18 +712,6 @@ pub async fn wait(api: &Arc<Api>, key: &str, q: Query) -> Reply {
             Ok(code) => json!({"StatusCode": code, "Error": null}),
             Err(e) => json!({"StatusCode": -1, "Error": {"Message": e.message}}),
         };
-        if condition == "removed" {
-            loop {
-                let name = name.clone();
-                let gone = api.blocking(move |api| Ok(!crate::vms(&api.host).iter().any(|v| v["name"] == name.as_str()))).await.unwrap_or(true);
-                if gone {
-                    break;
-                }
-                if connected(&tx, tokio::time::sleep(Duration::from_millis(200))).await.is_none() {
-                    return;
-                }
-            }
-        }
         let _ = tx.send(serde_json::to_vec(&reply).unwrap_or_default().into()).await;
     });
     let mut res = Response::new(body);
@@ -759,6 +765,59 @@ mod tests {
         let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
         let api = Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![], streams: Default::default() });
         (d, api)
+    }
+
+    #[tokio::test]
+    async fn created_wait_conditions_follow_docker_state_wait() {
+        use super::super::create;
+        use http_body_util::BodyExt;
+        let (_d, api) = create::tests::fixture();
+        for condition in ["", "not-running", "next-exit", "removed"] {
+            let r = create::translate(&api, "web", &json!({"Image": "image"})).unwrap();
+            create::store(&api, &r, false).unwrap();
+            let response = wait(&api, "web", Query::parse(&format!("condition={condition}"))).await.unwrap();
+            let body = response.into_body().collect();
+            tokio::pin!(body);
+            if matches!(condition, "next-exit" | "removed") {
+                assert!(tokio::time::timeout(Duration::from_millis(50), &mut body).await.is_err());
+                create::remove(&api, "web");
+            }
+            let bytes = tokio::time::timeout(Duration::from_secs(2), body).await.unwrap().unwrap().to_bytes();
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), json!({"StatusCode": 0, "Error": null}));
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_wait_keeps_the_status_of_a_created_container_that_later_exits() {
+        use super::super::create;
+        let (_d, api) = create::tests::fixture();
+        let r = create::translate(&api, "web", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &r, true).unwrap();
+        let id = crate::host::Ident { pid: 999_999_999, start: 1, boot: "old".into(), ns: None };
+        crate::containers::record_exit(&api.host, "web", &id, 7, true);
+        // Complete the exit phase before erasing its record; no timing window between polls.
+        let code = wait_next(&api, "web", None, None).await.unwrap();
+        assert_eq!(code, 7);
+        std::fs::remove_file(api.host.vms("web", "exit").unwrap()).unwrap();
+        create::remove(&api, "web");
+        assert_eq!(wait_removed(&api, "web", code).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn next_exit_on_created_observes_a_whole_run_between_polls() {
+        use super::super::create;
+        use http_body_util::BodyExt;
+        let (_d, api) = create::tests::fixture();
+        let r = create::translate(&api, "web", &json!({"Image": "image"})).unwrap();
+        create::store(&api, &r, true).unwrap();
+        let response = wait(&api, "web", Query::parse("condition=next-exit")).await.unwrap();
+        let body = response.into_body().collect();
+        tokio::pin!(body);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut body).await.is_err());
+        let id = crate::host::Ident { pid: 999_999_999, start: 1, boot: "old".into(), ns: None };
+        crate::containers::record_exit(&api.host, "web", &id, 7, true);
+        let bytes = tokio::time::timeout(Duration::from_secs(2), body).await.unwrap().unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), json!({"StatusCode": 7, "Error": null}));
     }
 
     #[tokio::test]
