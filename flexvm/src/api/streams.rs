@@ -362,7 +362,8 @@ pub async fn attach(api: &Arc<Api>, key: &str, mut req: Request<Incoming>) -> Re
 /// `POST /containers/{id}/resize?h&w`: its attaches' ptys, and the next one's.
 pub async fn resize_container(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     let size = size_of(&q)?;
-    let name = super::containers::resolve(api, key).await?;
+    let vms = super::containers::all(api).await?;
+    let name = find(&vms, key)?["name"].as_str().unwrap_or_default().to_string();
     api.streams.sizes.lock().unwrap().insert(name.clone(), size);
     api.resize(&format!("container {name}"), size);
     empty(StatusCode::OK)

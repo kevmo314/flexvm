@@ -394,7 +394,7 @@ pub(super) mod tests {
     pub fn fixture() -> (crate::test_util::TempDir, std::sync::Arc<Api>) {
         let d = crate::test_util::TempDir::new("api-create");
         let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
-        let api = std::sync::Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![] });
+        let api = std::sync::Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![], streams: Default::default() });
         image(&api, "aaaa1111", json!({"Entrypoint": ["/bin/sh", "-c", ""], "Cmd": ["default"], "Labels": {"keep": "image"}, "Env": ["A=image", "B=image"]}));
         std::os::unix::fs::symlink(".gen/aaaa1111", api.paths.templates.join("image")).unwrap();
         (d, api)
