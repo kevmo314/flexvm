@@ -45,8 +45,8 @@ pub(crate) const HELD_STREAM: Duration = Duration::from_secs(2).saturating_add(c
 /// How long a same-host target's hold, let go, watches for a packet sent along the old route
 /// (the VM runs meanwhile: no downtime).
 const STRAGGLERS: Duration = Duration::from_millis(5);
-/// How long migrating on waits for an arrival still pulling.
-const ARRIVAL_WAIT: Duration = Duration::from_secs(10);
+/// How long migrating on or renaming waits for an arrival still pulling.
+pub(crate) const ARRIVAL_WAIT: Duration = Duration::from_secs(10);
 
 /// What the source sends once paused, as one JSON line: the page states, then the vmstate's and the preloaded pages'
 /// lengths (their bytes follow the line).
