@@ -6,6 +6,9 @@
 //!
 //! An endpoint is served only where flexvm has the machinery under it: the rest answer 501, saying so.
 
+mod cli;
+mod containers;
+mod images;
 mod system;
 
 use std::convert::Infallible;
@@ -74,6 +77,8 @@ pub type Reply = std::result::Result<Response<Body>, Error>;
 pub struct Api {
     pub host: Host,
     pub paths: Paths,
+    /// `--state`, `--run` (and `--verbose`) as this process was given them: a command it runs gets them first.
+    pub globals: Vec<String>,
 }
 
 impl Api {
@@ -86,7 +91,7 @@ impl Api {
 
 /// `flexvm api [SOCKET]`: serves on SOCKET (default `RUN/docker.sock`), or on the socket systemd passed
 /// (`LISTEN_FDS`), until killed.
-pub fn main(host: Host, paths: Paths, socket: Option<&str>) -> Result<()> {
+pub fn main(host: Host, paths: Paths, globals: Vec<String>, socket: Option<&str>) -> Result<()> {
     let activated = activated();
     let (listener, at, _lock) = match activated {
         Some(l) => (l, None, None),
@@ -100,7 +105,7 @@ pub fn main(host: Host, paths: Paths, socket: Option<&str>) -> Result<()> {
         crate::log!("flexvm api: serving the Docker Engine API (v{API_VERSION}) on unix://{}", at.display());
     }
     listener.set_nonblocking(true)?;
-    let api = Arc::new(Api { host, paths });
+    let api = Arc::new(Api { host, paths, globals });
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).max_blocking_threads(64).enable_all().build()?;
     rt.block_on(async { serve(tokio::net::UnixListener::from_std(listener)?, api).await })
 }
@@ -243,6 +248,10 @@ async fn route(api: &Arc<Api>, req: Request<Incoming>) -> Reply {
         (&Method::GET | &Method::HEAD, ["_ping"]) => system::ping(&method),
         (&Method::GET, ["version"]) => system::version(api).await,
         (&Method::GET, ["info"]) => system::info(api).await,
+        (_, ["containers", rest @ ..]) => match containers::route(api, req, rest).await {
+            Some(r) => r,
+            None => Err(unrouted(&method, path)),
+        },
         _ => Err(unrouted(&method, path)),
     }
 }
@@ -295,6 +304,71 @@ pub fn full(data: impl Into<Bytes>) -> Body {
     Full::new(data.into()).map_err(|e: Infallible| match e {}).boxed()
 }
 
+/// A body written as it goes (a stream's output, an answer that waits): what is sent on the sender, until
+/// it is dropped. A sender whose send fails knows its client is gone.
+pub fn channel() -> (tokio::sync::mpsc::Sender<Bytes>, Body) {
+    struct Channel(tokio::sync::mpsc::Receiver<Bytes>);
+    impl hyper::body::Body for Channel {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+            self.0.poll_recv(cx).map(|b| b.map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    (tx, Channel(rx).boxed())
+}
+
+/// A request's query parameters, decoded, in order.
+pub struct Query(Vec<(String, String)>);
+
+impl Query {
+    pub fn of<B>(req: &Request<B>) -> Query {
+        Query::parse(req.uri().query().unwrap_or(""))
+    }
+
+    pub fn parse(q: &str) -> Query {
+        Query(q.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).map(|(k, v)| (decode(k), decode(v))).collect())
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// Docker's booleans: `1`, `true` or `True` (any case); absent, `default`.
+    pub fn flag(&self, key: &str, default: bool) -> std::result::Result<bool, Error> {
+        match self.get(key).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") => Ok(default),
+            Some("1" | "true" | "yes") => Ok(true),
+            Some("0" | "false" | "no") => Ok(false),
+            Some(v) => Err(Error::bad(format!("bad boolean {key}={v}"))),
+        }
+    }
+
+    pub fn number<T: std::str::FromStr>(&self, key: &str) -> std::result::Result<Option<T>, Error> {
+        self.get(key).filter(|v| !v.is_empty()).map(|v| v.parse().map_err(|_| Error::bad(format!("bad number {key}={v}")))).transpose()
+    }
+
+    /// `filters`: docker's JSON map of a key to its values (`{"name": ["web"]}`, or an older client's
+    /// `{"name": {"web": true}}`).
+    pub fn filters(&self) -> std::result::Result<Vec<(String, String)>, Error> {
+        let Some(raw) = self.get("filters").filter(|f| !f.is_empty()) else { return Ok(Vec::new()) };
+        let v: Value = serde_json::from_str(raw).map_err(|e| Error::bad(format!("bad filters {raw}: {e}")))?;
+        let mut out = Vec::new();
+        for (key, values) in v.as_object().ok_or_else(|| Error::bad(format!("bad filters {raw}: not an object")))? {
+            match values {
+                Value::Array(a) => out.extend(a.iter().filter_map(Value::as_str).map(|s| (key.clone(), s.to_string()))),
+                Value::Object(o) => out.extend(o.iter().filter(|(_, on)| on.as_bool() == Some(true)).map(|(s, _)| (key.clone(), s.clone()))),
+                _ => return Err(Error::bad(format!("bad filters {raw}: {key}'s values"))),
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// `t` in UTC as docker writes times (RFC 3339, nanoseconds); the epoch for a time before it.
 pub fn rfc3339(t: std::time::SystemTime) -> String {
     let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
@@ -310,6 +384,38 @@ pub fn rfc3339(t: std::time::SystemTime) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:09}Z", secs / 3600, secs / 60 % 60, secs % 60, d.subsec_nanos())
+}
+
+/// Seconds since the epoch, as `rfc3339`.
+pub fn rfc3339_secs(secs: u64) -> String {
+    rfc3339(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+/// Percent-decoding, `+` as a space (form encoding, as Go's query parser).
+fn decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            // Two hex digits (from_str_radix alone would take a sign).
+            b'%' => match b
+                .get(i + 1..i + 3)
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
+            {
+                Some(v) => {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+                None => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -410,6 +516,24 @@ mod tests {
         assert!(new.status == StatusCode::BAD_REQUEST && new.message.contains("too new"), "{new:?}");
         assert!(versioned("/v1.12/info").unwrap_err().message.contains("too old"));
         assert!(cmp_version("1.9", "1.10").is_lt(), "by number, not as text");
+    }
+
+    #[test]
+    fn queries_decode_as_go_does() {
+        let q = Query::parse("all=1&filters=%7B%22name%22%3A%5B%22web%22%5D%7D&x=a+b&bad=%zz&t=True&f=0&e=");
+        assert_eq!(q.get("x"), Some("a b"));
+        assert_eq!(q.get("bad"), Some("%zz"));
+        assert_eq!((q.flag("all", false).unwrap(), q.flag("t", false).unwrap(), q.flag("f", true).unwrap()), (true, true, false));
+        assert_eq!((q.flag("e", true).unwrap(), q.flag("none", true).unwrap()), (true, true));
+        assert!(q.flag("x", false).is_err());
+        assert_eq!(q.filters().unwrap(), [("name".to_string(), "web".to_string())]);
+        let old = Query::parse("filters=%7B%22status%22%3A%7B%22running%22%3Atrue%2C%22paused%22%3Afalse%7D%7D");
+        assert_eq!(old.filters().unwrap(), [("status".to_string(), "running".to_string())]);
+        assert!(Query::parse("filters=%5B%5D").filters().is_err());
+        assert_eq!(decode("%41%4a%4B"), "AJK");
+        assert_eq!(decode("100%"), "100%");
+        assert_eq!(decode("%4"), "%4");
+        assert_eq!(decode("%-1"), "%-1", "two hex digits, not a sign");
     }
 
     #[test]

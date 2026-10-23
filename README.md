@@ -1051,6 +1051,22 @@ so, and a setting that cannot be honoured is refused, never ignored.
 | endpoints | served from |
 |---|---|
 | `GET /_ping`, `/version`, `/info` | `flexvm version`, `info` and `ps -a`'s counts |
+| `GET /containers/json`, `/containers/{id}/json` | `ps -a` and `inspect`, in docker's shapes |
+| `GET /containers/{id}/logs` | `logs [-f] [--tail N]` |
+| `POST /containers/{id}/wait` | `wait` |
+
+A container is a VM, under its name; its id is the name's SHA-256, so it
+needs no record of its own (and a rename makes it another). Docker's states
+are flexvm's: a stopped (suspended) VM is `exited` with status 143, as
+`flexvm wait` says, but `docker start` resumes it where it was; a failed,
+lost or quarantined one is `dead`. Its `Entrypoint` and `Cmd` are its
+image config's while the layer cache keeps that (`system prune` drops it),
+else its app is all `Cmd`; `Config.Labels` are its image's. Every VM is on
+one flat routed network, listed as docker's `bridge`, with its address as
+`IPAddress`. A VM's log keeps neither its streams apart nor times: `logs`
+gives all of it as stdout, and refuses `--since`, `--until` and
+`--timestamps`. `ps --filter` takes `id`, `name`, `status`, `exited`,
+`label`, `ancestor` and `network`.
 
 ## Paths and knobs
 

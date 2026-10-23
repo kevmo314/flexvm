@@ -822,7 +822,7 @@ fn real_main(args: &Args) -> Result<()> {
             listen::main(host, listeners, validated)
         }
         Some("info") => print(info(&open_host(args)?)),
-        Some("api") => api::main(open_host(args)?, paths(args)?, pos.get(1).copied()),
+        Some("api") => api::main(open_host(args)?, paths(args)?, child_args(args, &[]), pos.get(1).copied()),
         Some("bench") => bench::run(args),
         // Test hooks: arm a fault for MS ms (0 disarms), hash a checkpoint, or ask a VM.
         Some("debug") => match name {

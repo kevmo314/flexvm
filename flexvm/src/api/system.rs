@@ -149,7 +149,7 @@ mod tests {
     async fn warnings_follow_host_config() {
         let root = crate::test_util::TempDir::new("api-info");
         let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let api = Arc::new(Api { paths: crate::template::Paths::new(&host.state), host });
+        let api = Arc::new(Api { paths: crate::template::Paths::new(&host.state), host, globals: Vec::new() });
         let warnings = |host: &crate::host::Host| crate::info(host)["warnings"].clone();
         let before = warnings(&api.host);
         let body = info(&api).await.unwrap().into_body().collect().await.unwrap().to_bytes();
