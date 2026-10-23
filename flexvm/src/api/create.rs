@@ -111,7 +111,8 @@ pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
             }
             // Its VM is gone, or one holds the name and is not listed yet (starting): gone only if not that.
             None if !api.host.alive(&r.name) => remove(api, &r.name),
-            None => {}
+            // Starting under its name, not registered yet (a restart policy's rerun, a start): still the container.
+            None => vms.push(json!({"name": r.name, "state": "starting", "template": r.template, "docker": r})),
         }
     }
     vms

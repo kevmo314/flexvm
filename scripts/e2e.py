@@ -2609,8 +2609,14 @@ def docker_lifecycle(d):
     A.vms.add(flaky)
     d("run", "-d", "--name", flaky, "--restart", "on-failure:1", t, "sh", "-c", "exit 5")
     fmt = "{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}} {{.HostConfig.RestartPolicy.Name}}"
-    check("--restart on-failure:1: restarted once, then exited", wait_for(lambda: d("inspect", "-f", fmt, flaky).stdout.split() == ["exited", "5", "1", "on-failure"], 60),
-          d("inspect", "-f", fmt, flaky).stdout)
+    # Listed throughout, as restarting while its rerun starts.
+    seen = []
+    def settled():
+        r = d("inspect", "-f", fmt, flaky, check=False)
+        seen.append((r.stdout.strip(), r.stderr.strip()))
+        return r.stdout.split() == ["exited", "5", "1", "on-failure"]
+    check("--restart on-failure:1: restarted once, then exited", wait_for(settled, 60), seen[-3:])
+    check("--restart: never missing as it restarts", not any("No such" in e for _, e in seen), [x for x in seen if x[1]])
     d("rm", flaky)
 
 
