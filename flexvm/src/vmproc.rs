@@ -701,6 +701,8 @@ pub struct Runtime {
     pub spec: Mutex<crate::app::RunSpec>,
     /// What it keeps for its restart policy after a reboot (`restart::keep`), under which name, as last written.
     restart_kept: Mutex<Option<(String, Vec<u8>)>>,
+    /// A SIGTERM (`flexvm stop`) came: an app's exit as it lands is never restarted (a stop ends a restart loop).
+    stop_asked: AtomicBool,
     /// Its `run`'s stdin is a terminal: no hint when its app exits at once.
     pub tty: AtomicBool,
     /// In the foreground (a `run` or `start -a` follows it): it leaves no exited record.
@@ -1474,7 +1476,7 @@ impl Proc {
         let mut rec = crate::app::Exited::new(code, vm.template.name.clone(), cmd, vm.resources(), spec, at);
         // How long its app ran: a resumed VM's, started by another process, ran at least that long.
         let ran = self.app_started.lock().unwrap().map_or(crate::app::RAN_LONG, |t| t.elapsed());
-        let again = crate::restart::on_exit(&mut rec, ran);
+        let again = !self.stop_asked.load(Ordering::SeqCst) && crate::restart::on_exit(&mut rec, ran);
         if let Err(e) = crate::host::store_private(&path, &rec, true) {
             crate::log!("vm {}: its exited record {}: {e}", vm.name, path.display());
             return false;
@@ -1947,6 +1949,9 @@ impl Proc {
     }
 
     fn dispatch(self: &Arc<Self>, sig: i32) {
+        if sig == libc::SIGTERM {
+            self.stop_asked.store(true, Ordering::SeqCst);
+        }
         if !matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
             let _ = self.handle(sig);
             return;

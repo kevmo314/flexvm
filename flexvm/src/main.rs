@@ -1582,6 +1582,10 @@ fn stop(host: &Host, name: &str) -> Result<String> {
         }
     }
     let (Ended { last, exit, shown, records: r }, ident) = (vm.ended(host), &vm.ident);
+    // Its app exited as the stop came: a restart that instance scheduled (before it took the SIGTERM) is not run.
+    if r.exited && exit.as_ref().is_some_and(|e| e.ident == *ident) {
+        restart::cancel(host, &last)?;
+    }
     // Suspended by the instance signalled, as its checkpoint's OWNER says (never debris, a checkpoint consumed by a
     // resume that then died, or another instance's), or its app exited first (the VM, ending, took no suspend).
     if matches!(&r.checkpoint, Some(host::Checkpoint::Resumable { owner: Some(o) }) if o == ident) || r.exited {
