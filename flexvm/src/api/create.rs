@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use super::{images, Api, Error};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub name: String,
     /// Seconds since the epoch.
@@ -27,6 +27,8 @@ pub struct Record {
     /// A rename holds this destination until the VM and record have moved.
     #[serde(default)]
     pub reserved: bool,
+    #[serde(default)]
+    pub reservation_owner: Option<crate::host::Ident>,
     /// Docker's `Config` and `HostConfig`, as given.
     pub config: Value,
     pub host_config: Value,
@@ -86,9 +88,20 @@ pub fn remove(api: &Api, name: &str) {
 
 /// `vms` (`ps -a`'s) with each record: a VM's under `docker`, a container not started yet as one `created`.
 pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
-    for r in load_all(api) {
+    for mut r in load_all(api) {
         if r.reserved {
-            continue;
+            if r.reservation_owner.as_ref().is_some_and(|id| id.liveness() != crate::host::Liveness::Gone) {
+                continue;
+            }
+            if !vms.iter().any(|v| v["name"] == r.name.as_str()) && !api.host.alive(&r.name) {
+                remove(api, &r.name);
+                continue;
+            }
+            // The owner died after moving the VM: retain its Docker settings at the destination.
+            r.reserved = false;
+            r.reservation_owner = None;
+            r.started = true;
+            let _ = store(api, &r, false);
         }
         match vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
             Some(v) => v["docker"] = json!(r),
@@ -104,16 +117,12 @@ pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
     vms
 }
 
-fn strings(v: &Value) -> Option<Vec<String>> {
-    v.as_array().map(|_| images::strings(v))
-}
-
-/// Resolve Docker's optional app overrides, preserving empty argv words. Only `[""]` clears
-/// an entrypoint; an explicitly supplied entrypoint also drops the image's default command.
+/// Resolve Docker's optional app overrides, preserving empty argv words. `[]` and `[""]` clear
+/// an entrypoint; a nonempty supplied entrypoint also drops the image's default command.
 pub fn app(config: &Value, entrypoint: Vec<String>, cmd: Vec<String>) -> (Vec<String>, Vec<String>) {
-    let e = strings(&config["Entrypoint"]);
-    let c = strings(&config["Cmd"]);
-    let cmd = c.unwrap_or(if e.is_some() { Vec::new() } else { cmd });
+    let e = config["Entrypoint"].as_array().map(|_| images::strings(&config["Entrypoint"]));
+    let c = config["Cmd"].as_array().map(|_| images::strings(&config["Cmd"]));
+    let cmd = c.unwrap_or(if e.as_ref().is_some_and(|e| !e.is_empty()) { Vec::new() } else { cmd });
     let entrypoint = e.map(|e| if e == [""] { Vec::new() } else { e }).unwrap_or(entrypoint);
     (entrypoint, cmd)
 }
@@ -259,7 +268,7 @@ fn refuse_unsupported(config: &Value, host_config: &Value, name: &str) -> Result
     {
         let v = &config[key];
         // A health check of NONE is none.
-        let none = key == "Healthcheck" && strings(&v["Test"]).is_some_and(|t| t.first().map(String::as_str) == Some("NONE"));
+        let none = key == "Healthcheck" && v["Test"].as_array().is_some_and(|t| t.first().and_then(Value::as_str) == Some("NONE"));
         if !unset(v) && !none {
             return Err(Error::unsupported(format!("{what} ({key})")));
         }
@@ -285,10 +294,16 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     let image = config["Image"].as_str().filter(|i| !i.is_empty()).ok_or_else(|| Error::bad("config has no Image"))?.to_string();
     let template = crate::template::name_of(&image).ok();
     let linked = template.as_ref().and_then(|name| images::linked(api, name));
-    let generation = linked
-        .clone()
-        .or_else(|| crate::template::generation_by_prefix(&api.paths, image.strip_prefix("sha256:").unwrap_or(&image)).ok())
-        .ok_or_else(|| Error::missing(format!("No such image: {image}")))?;
+    let generation = match linked.clone() {
+        Some(id) => id,
+        None => crate::template::generation_by_prefix(&api.paths, image.strip_prefix("sha256:").unwrap_or(&image)).map_err(|e| {
+            if e.to_string().contains("is the start of") {
+                Error::bad(format!("ambiguous reference: multiple IDs found with provided prefix: {image}"))
+            } else {
+                Error::missing(format!("No such image: {image}"))
+            }
+        })?,
+    };
     let template = if linked.is_some() { template.unwrap() } else { generation.clone() };
     let tpl = images::meta(api, &generation).ok_or_else(|| Error::missing(format!("No such image: {image}")))?;
     refuse_unsupported(&config, &host_config, name)?;
@@ -368,7 +383,7 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
         run.extend(cmd_words);
     }
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    Ok(Record { name: name.to_string(), created, run, image, template, generation, reserved: false, config, host_config, started: false })
+    Ok(Record { name: name.to_string(), created, run, image, template, generation, config, host_config, ..Record::default() })
 }
 
 #[cfg(test)]
@@ -402,12 +417,28 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn abandoned_reservations_release_names_and_preserve_moved_configs() {
+        let (_d, api) = fixture();
+        let mut r = translate(&api, "web", &json!({"Image": "image"})).unwrap();
+        r.reserved = true;
+        r.reservation_owner = Some(crate::host::Ident { boot: "old".into(), ..Default::default() });
+        store(&api, &r, true).unwrap();
+        assert!(merge(&api, vec![]).is_empty());
+        assert!(load(&api, "web").is_none());
+        store(&api, &r, true).unwrap();
+        let rows = merge(&api, vec![json!({"name": "web", "state": "running"})]);
+        assert_eq!(rows[0]["docker"]["config"], r.config);
+        assert!(!load(&api, "web").unwrap().reserved);
+    }
+
+    #[test]
     fn app_overrides_distinguish_null_empty_arrays_and_the_clearing_sentinel() {
         let entrypoint = vec!["sh".into(), "-c".into(), "".into()];
         let cmd = vec!["default".into()];
         for config in [json!({}), json!({"Entrypoint": null, "Cmd": null})] {
             assert_eq!(app(&config, entrypoint.clone(), cmd.clone()), (entrypoint.clone(), cmd.clone()));
         }
+        assert_eq!(app(&json!({"Entrypoint": []}), entrypoint.clone(), cmd.clone()), (vec![], cmd.clone()));
         for e in [json!([]), json!([""])] {
             assert_eq!(app(&json!({"Entrypoint": e, "Cmd": ["echo", ""]}), entrypoint.clone(), cmd.clone()), (vec![], vec!["echo".into(), "".into()]));
         }
@@ -425,7 +456,12 @@ pub(super) mod tests {
             assert_eq!(crate::template::name_of(r.run.last().unwrap()).unwrap(), "aaaa1111");
         }
         image(&api, "aaaa2222", json!({"Cmd": ["other"]}));
-        for image in ["aaaa", "sha256:aaaa", "bbbb", "missing"] {
+        for image in ["aaaa", "sha256:aaaa"] {
+            let e = translate(&api, "web", &json!({"Image": image})).unwrap_err();
+            assert_eq!(e.status, hyper::StatusCode::BAD_REQUEST);
+            assert_eq!(e.message, format!("ambiguous reference: multiple IDs found with provided prefix: {image}"));
+        }
+        for image in ["bbbb", "missing"] {
             assert_eq!(translate(&api, "web", &json!({"Image": image})).unwrap_err().status, hyper::StatusCode::NOT_FOUND);
         }
     }

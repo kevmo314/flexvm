@@ -153,11 +153,16 @@ pub async fn rename(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     if name == to {
         return empty(StatusCode::NO_CONTENT);
     }
-    rename_to(api, name, &v, to, |from, to| {
-        let api = api.clone();
-        async move { api.run(&["rename", "--", &from, &to]).await.map(drop) }
+    let api = api.clone();
+    tokio::spawn(async move {
+        rename_to(&api, name, &v, to, |from, to| {
+            let api = api.clone();
+            async move { api.run(&["rename", "--", &from, &to]).await.map(drop) }
+        })
+        .await
     })
     .await
+    .map_err(|e| Error::from(crate::util::Error::from(e.to_string())))?
 }
 
 async fn rename_to<F, Fut>(api: &Arc<Api>, name: String, v: &Value, to: String, move_vm: F) -> Reply
@@ -167,23 +172,14 @@ where
 {
     // Reserve before touching the VM, including for VMs that have no Docker record.
     let record: Option<Record> = serde_json::from_value(v["docker"].clone()).ok();
-    let mut reserved = record.clone().unwrap_or(Record {
-        name: name.clone(),
-        created: 0,
-        run: Vec::new(),
-        image: String::new(),
-        template: String::new(),
-        generation: String::new(),
-        reserved: false,
-        config: Value::Null,
-        host_config: Value::Null,
-        started: true,
-    });
+    let mut reserved = record.clone().unwrap_or(Record { started: true, ..Record::default() });
     reserved.name = to.clone();
     reserved.reserved = true;
+    reserved.reservation_owner = Some(crate::host::Ident::me());
     let reservation = reserved.clone();
     api.blocking(move |api| {
-        let taken = api.host.alive(&reservation.name) || crate::vms(&api.host).iter().any(|v| v["name"] == reservation.name);
+        let vms = create::merge(api, crate::vms(&api.host));
+        let taken = api.host.alive(&reservation.name) || vms.iter().any(|v| v["name"] == reservation.name);
         if taken || !create::store(api, &reservation, true)? {
             return Ok(Err(Error::conflict(format!("Conflict. The container name \"/{}\" is already in use", reservation.name))));
         }
@@ -191,15 +187,23 @@ where
     })
     .await??;
     let moved = v["state"] != "created";
+    let mut stranded = false;
     let result = async {
         if moved {
             move_vm(name.clone(), to.clone()).await?;
         }
         reserved.reserved = false;
+        reserved.reservation_owner = None;
+        let published = reserved.clone();
         if record.is_some() {
-            if let Err(e) = api.blocking(move |api| create::store(api, &reserved, false).map(drop)).await {
+            if let Err(e) = api.blocking(move |api| create::store(api, &published, false).map(drop)).await {
                 if moved {
-                    move_vm(to.clone(), name.clone()).await?;
+                    if let Err(rollback) = move_vm(to.clone(), name.clone()).await {
+                        stranded = true;
+                        // Keep the destination config even if publication is still unavailable.
+                        api.blocking(move |api| create::store(api, &reserved, false).map(drop)).await?;
+                        return Err(rollback);
+                    }
                 }
                 return Err(e);
             }
@@ -209,7 +213,7 @@ where
     .await;
     let success = result.is_ok();
     api.blocking(move |api| {
-        if !success || record.is_none() {
+        if (!success && !stranded) || record.is_none() {
             create::remove(api, &to);
         }
         if success {
@@ -258,10 +262,20 @@ pub async fn prune(api: &Arc<Api>, q: Query) -> Reply {
         return Err(Error::unsupported(format!("prune filter {k:?}")));
     }
     let vms = all(api).await?;
+    let candidates = api
+        .blocking(move |api| {
+            Ok(vms
+                .into_iter()
+                .filter(|v| !state(v).running)
+                .map(|v| {
+                    let labels = super::containers::Detail::read(api, &v).labels;
+                    (v, labels)
+                })
+                .collect::<Vec<_>>())
+        })
+        .await?;
     let mut deleted = Vec::new();
-    for v in vms.iter().filter(|v| !state(v).running) {
-        let vm = v.clone();
-        let labels = api.blocking(move |api| Ok(super::containers::Detail::read(api, &vm).labels)).await?;
+    for (v, labels) in candidates {
         let has = |l: &str| match l.split_once('=') {
             Some((k, val)) => labels.get(k).and_then(Value::as_str) == Some(val),
             None => labels.contains_key(l),
@@ -336,6 +350,34 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), [("a".into(), "b".into()), ("b".into(), "a".into())]);
         assert_eq!(create::load(&api, "a"), Some(a));
         assert!(create::load(&api, "b").is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_rename_rollback_keeps_the_destination_config() {
+        let (_d, api) = fixture();
+        let a = create::translate(&api, "a", &json!({"Image": "image", "Labels": {"keep": "config"}})).unwrap();
+        create::store(&api, &a, true).unwrap();
+        let v = json!({"name": "a", "state": "running", "docker": a});
+        let path = api.host.state.join("api/containers/b.json");
+        let e = rename_to(&api, "a".into(), &v, "b".into(), |from, _| {
+            let path = &path;
+            async move {
+                if from == "a" {
+                    std::fs::remove_file(path).unwrap();
+                    std::fs::create_dir(path).unwrap();
+                    Ok(())
+                } else {
+                    std::fs::remove_dir(path).unwrap();
+                    Err(Error::bad("rollback failed"))
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(e.message, "rollback failed");
+        let b = create::load(&api, "b").unwrap();
+        assert_eq!(b.config, a.config);
+        assert!(!b.reserved);
     }
 
     #[tokio::test]

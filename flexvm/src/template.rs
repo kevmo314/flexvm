@@ -565,10 +565,6 @@ pub(crate) fn valid_id(id: &str) -> bool {
 impl Template {
     pub fn resolve(paths: &Paths, name: &str) -> Result<PathBuf> {
         check_name(name)?;
-        // API-created containers run their retained generation, even after its tag moves.
-        if let Some(dir) = Self::generation(paths, name) {
-            return Ok(dir);
-        }
         let link = paths.templates.join(name);
         match std::fs::read_link(&link) {
             Ok(target) => Ok(paths.templates.join(target)),
@@ -576,6 +572,9 @@ impl Template {
                 bail!("template {name:?} is not a symlink; remove {} and pull it again: flexvm pull {}", link.display(), image_of(name))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(dir) = Self::generation(paths, name) {
+                    return Ok(dir);
+                }
                 bail!("no image {} in {} (pull it: flexvm pull {0})", image_of(name), paths.templates.display())
             }
             Err(e) => bail!("template {name:?}: {e}"),
@@ -3197,6 +3196,14 @@ pub(crate) mod tests {
         let error = f.open().err().unwrap().to_string();
         assert!(error.contains(&f.dir.display().to_string()) && error.contains("pull it again"), "{error}");
         assert!(!error.contains("/proc/"), "{error}");
+    }
+
+    #[test]
+    fn resolve_prefers_a_tag_over_a_generation_with_the_same_name() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.paths.templates.join(".gen/aaaa1111")).unwrap();
+        std::os::unix::fs::symlink(".gen/bbbb2222", f.paths.templates.join("aaaa1111")).unwrap();
+        assert_eq!(Template::resolve(&f.paths, "aaaa1111").unwrap(), f.paths.templates.join(".gen/bbbb2222"));
     }
 
     #[test]

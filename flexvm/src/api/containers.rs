@@ -636,7 +636,7 @@ async fn wait_next(api: &Arc<Api>, name: &str, before: Option<crate::host::Ident
             .blocking(move |api| {
                 let holder = live_holder(&api.host, &name);
                 let code = next_exit(&api.host, &name, before.as_ref(), None)?;
-                let gone = !super::create::merge(api, crate::vms(&api.host)).iter().any(|v| v["name"] == name.as_str());
+                let gone = removed(api, &name);
                 let code = code.or_else(|| (gone && holder.is_none()).then_some(0));
                 Ok((holder, code))
             })
@@ -651,27 +651,17 @@ async fn wait_next(api: &Arc<Api>, name: &str, before: Option<crate::host::Ident
     }
 }
 
-/// A created container may be removed before it ever runs. Keep observing its record as well as VMs,
-/// and remember any exit status observed before removal erases it.
-/// Its last status once nothing is left of it: a stopped row's, or a run's exit record that is newer
-/// than `before` (one recorded since the wait began, whose row may be gone with it).
-async fn wait_removed(api: &Arc<Api>, name: &str, before: Option<crate::host::Ident>) -> Result<i64, Error> {
-    let mut code = 0;
+/// Read only this container, without collecting stale Docker records as listing does.
+fn removed(api: &Api, name: &str) -> bool {
+    let created = super::create::load(api, name).is_some_and(|r| !r.started);
+    !created && !api.host.alive(name) && api.host.entry(name).is_err() && !crate::host::Records::read(&api.host, name).recorded()
+}
+
+async fn wait_removed(api: &Arc<Api>, name: &str, code: i64) -> Result<i64, Error> {
     loop {
-        let (name, before) = (name.to_string(), before.clone());
-        let (current, exit) = api
-            .blocking(move |api| {
-                let exit = crate::containers::exit_record(&api.host, &name).filter(|e| Some(&e.ident) != before.as_ref()).map(|e| i64::from(e.code));
-                Ok((super::create::merge(api, crate::vms(&api.host)).iter().find(|v| v["name"] == name.as_str()).map(state), exit))
-            })
-            .await?;
-        if let Some(c) = exit {
-            code = c;
-        }
-        match current {
-            None => return Ok(code),
-            Some(st) if !st.running && exit.is_none() => code = st.exit_code,
-            Some(_) => {}
+        let name = name.to_string();
+        if api.blocking(move |api| Ok(removed(api, &name))).await? {
+            return Ok(code);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -688,6 +678,7 @@ pub async fn wait(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     let vms = all(api).await?;
     let vm = find(&vms, key)?;
     let created = vm["state"] == "created";
+    let initial_code = state(vm).exit_code;
     let name = vm["name"].as_str().unwrap_or_default().to_string();
     // Register before returning the head, not when the spawned task first runs.
     let registered_name = name.clone();
@@ -703,7 +694,8 @@ pub async fn wait(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     tokio::spawn(async move {
         let Some(result) = connected(&tx, async {
             if condition == "removed" {
-                wait_removed(&api, &name, before).await
+                let code = if created || pinned.is_some() { wait_next(&api, &name, before, pinned).await? } else { initial_code };
+                wait_removed(&api, &name, code).await
             } else if condition == "next-exit" {
                 wait_next(&api, &name, before, pinned).await
             } else if created {
@@ -792,21 +784,17 @@ mod tests {
     #[tokio::test]
     async fn removed_wait_keeps_the_status_of_a_created_container_that_later_exits() {
         use super::super::create;
-        use http_body_util::BodyExt;
         let (_d, api) = create::tests::fixture();
         let r = create::translate(&api, "web", &json!({"Image": "image"})).unwrap();
         create::store(&api, &r, true).unwrap();
-        let response = wait(&api, "web", Query::parse("condition=removed")).await.unwrap();
-        let body = response.into_body().collect();
-        tokio::pin!(body);
-        assert!(tokio::time::timeout(Duration::from_millis(50), &mut body).await.is_err());
         let id = crate::host::Ident { pid: 999_999_999, start: 1, boot: "old".into(), ns: None };
         crate::containers::record_exit(&api.host, "web", &id, 7, true);
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut body).await.is_err());
+        // Complete the exit phase before erasing its record; no timing window between polls.
+        let code = wait_next(&api, "web", None, None).await.unwrap();
+        assert_eq!(code, 7);
         std::fs::remove_file(api.host.vms("web", "exit").unwrap()).unwrap();
         create::remove(&api, "web");
-        let bytes = tokio::time::timeout(Duration::from_secs(2), body).await.unwrap().unwrap().to_bytes();
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), json!({"StatusCode": 7, "Error": null}));
+        assert_eq!(wait_removed(&api, "web", code).await.unwrap(), 7);
     }
 
     #[tokio::test]
