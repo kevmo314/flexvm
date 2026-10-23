@@ -3,7 +3,7 @@
 
 pub mod auth;
 mod reference;
-mod registry;
+pub(crate) mod registry;
 mod source;
 mod unpack;
 #[path = "../../../guest/src/user.rs"]

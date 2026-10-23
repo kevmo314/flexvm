@@ -1,7 +1,7 @@
 //! Images as docker sees them: a template is an image, its generation's content id the image's id.
 
+use crate::image::registry::{blob_path, sha256_hex};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use super::Api;
 use crate::template::{Meta, Template};
@@ -16,10 +16,8 @@ pub fn meta(api: &Api, id: &str) -> Option<Meta> {
 /// config blob while the layer cache keeps it (`system prune` removes it) and it is the one pulled.
 pub fn config(api: &Api, meta: &Meta) -> Option<Value> {
     let digest = &meta.image.as_ref()?.config_digest;
-    let hex = digest.strip_prefix("sha256:").filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))?;
-    let blob = std::fs::read(api.host.state.join("images/blobs/sha256").join(hex)).ok()?;
-    let sum: String = Sha256::digest(&blob).iter().map(|b| format!("{b:02x}")).collect();
-    let config: Value = serde_json::from_slice(&blob).ok().filter(|_| sum == hex)?;
+    let blob = std::fs::read(blob_path(&api.host.state.join("images/blobs"), digest).ok()?).ok()?;
+    let config: Value = serde_json::from_slice(&blob).ok().filter(|_| sha256_hex(&blob) == *digest)?;
     Some(config["config"].clone())
 }
 

@@ -396,15 +396,6 @@ pub(crate) fn described(host: &Host, paths: &template::Paths, name: &str, mut v:
         "socket": if running { json!(path("sock")) } else { Value::Null },
         "checkpoint": host.is_suspended(name).then(|| host.suspended(name).ok()).flatten(),
     });
-    if let Some(id) = v["template_id"].as_str() {
-        if let Some(i) = template::describe_id(paths, id) {
-            for k in ["source", "digest", "app", "warm", "mem_mib"] {
-                if !i[k].is_null() {
-                    config[k] = i[k].clone();
-                }
-            }
-        }
-    }
     // Its ports and run settings: a running VM's registry entry has them, a stopped one's
     // checkpoint, an exited one's record (with what it ran, as `start` runs it again).
     config["ports"] = v.get("ports").cloned().unwrap_or_else(|| json!([]));
@@ -415,9 +406,21 @@ pub(crate) fn described(host: &Host, paths: &template::Paths, name: &str, mut v:
     if let Some(e) = host.vms(name, "exited").ok().filter(|_| v["state"] == "exited").and_then(|p| crate::app::Exited::read(&p).ok()) {
         config["image"] = json!(template::image_of(&e.template));
         config["template"] = json!(e.template);
+        if let Some(id) = &e.template_id {
+            config["template_id"] = json!(id);
+        }
         (config["run"], config["cmd"]) = (json!(e.spec), json!(e.cmd));
         config["cpus"] = json!(e.resources.cpus);
         v["exit_code"] = json!(e.status);
+    }
+    if let Some(id) = config["template_id"].as_str() {
+        if let Some(i) = template::describe_id(paths, id) {
+            for k in ["source", "digest", "app", "warm", "mem_mib"] {
+                if !i[k].is_null() {
+                    config[k] = i[k].clone();
+                }
+            }
+        }
     }
     // Its `-p` ports as its run settings keep them (`RunSpec`), else those bound now.
     if let Some(ports) = config["run"].get("ports").filter(|p| p.as_array().is_some_and(|a| !a.is_empty())).cloned() {

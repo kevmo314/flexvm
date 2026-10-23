@@ -153,6 +153,7 @@ pub struct Detail {
     pub labels: Map<String, Value>,
     pub workdir: String,
     pub user: String,
+    pub created: Option<u64>,
     pub started: Option<u64>,
     pub finished: Option<u64>,
 }
@@ -183,6 +184,8 @@ impl Detail {
         }
         let labels = ic["Labels"].as_object().cloned().unwrap_or_default();
         let template = config["template"].as_str().or(vm["template"].as_str()).unwrap_or_default();
+        let started = started(vm);
+        let finished = finished(api, vm);
         Detail {
             state: state(&described),
             image: config["image"].as_str().map_or_else(|| crate::template::image_of(template), String::from),
@@ -193,8 +196,19 @@ impl Detail {
             labels,
             workdir: ic["WorkingDir"].as_str().unwrap_or_default().into(),
             user: ic["User"].as_str().unwrap_or_default().into(),
-            started: started(vm),
-            finished: finished(api, vm),
+            // The log directory survives stop/start and exit; rotation only replaces its files.
+            created: api
+                .host
+                .vms(&name, "logs")
+                .ok()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.created().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .or(started)
+                .or(finished),
+            started,
+            finished,
             name,
             vm: described,
             config,
@@ -209,15 +223,22 @@ impl Detail {
         serde_json::from_value(self.config["ports"].clone()).unwrap_or_default()
     }
 
+    fn bindings(&self) -> Vec<(crate::ports::Port, &'static str, String)> {
+        self.ports()
+            .into_iter()
+            .flat_map(|p| {
+                let proto = if p.protocol == crate::ports::Protocol::Udp { "udp" } else { "tcp" };
+                let ips = p.ip.map_or_else(|| vec!["0.0.0.0".to_string(), "::".to_string()], |ip| vec![ip.to_string()]);
+                ips.into_iter().map(move |ip| (p.clone(), proto, ip))
+            })
+            .collect()
+    }
+
     /// The listing's `Ports`: a forward per address it binds (both families for one given none, as docker's).
     fn port_list(&self) -> Vec<Value> {
         let mut out = Vec::new();
-        for p in self.ports() {
-            let proto = if p.protocol == crate::ports::Protocol::Udp { "udp" } else { "tcp" };
-            let ips = p.ip.map_or_else(|| vec!["0.0.0.0".to_string(), "::".to_string()], |ip| vec![ip.to_string()]);
-            for ip in ips {
-                out.push(json!({"IP": ip, "PrivatePort": p.vm_port, "PublicPort": p.host_port, "Type": proto}));
-            }
+        for (p, proto, ip) in self.bindings() {
+            out.push(json!({"IP": ip, "PrivatePort": p.vm_port, "PublicPort": p.host_port, "Type": proto}));
         }
         out
     }
@@ -225,13 +246,9 @@ impl Detail {
     /// `NetworkSettings.Ports` and `HostConfig.PortBindings`: `"80/tcp": [{"HostIp", "HostPort"}]`.
     fn port_map(&self) -> Map<String, Value> {
         let mut out = Map::new();
-        for p in self.ports() {
-            let proto = if p.protocol == crate::ports::Protocol::Udp { "udp" } else { "tcp" };
-            let ips = p.ip.map_or_else(|| vec!["0.0.0.0".to_string(), "::".to_string()], |ip| vec![ip.to_string()]);
+        for (p, proto, ip) in self.bindings() {
             let entry = out.entry(format!("{}/{proto}", p.vm_port)).or_insert_with(|| json!([]));
-            for ip in ips {
-                entry.as_array_mut().unwrap().push(json!({"HostIp": ip, "HostPort": p.host_port.to_string()}));
-            }
+            entry.as_array_mut().unwrap().push(json!({"HostIp": ip, "HostPort": p.host_port.to_string()}));
         }
         out
     }
@@ -258,7 +275,7 @@ impl Detail {
             "Image": self.image,
             "ImageID": self.image_id,
             "Command": shell_words(&self.argv()),
-            "Created": self.started.or(self.finished).unwrap_or(0),
+            "Created": self.created.unwrap_or(0),
             "Ports": self.port_list(),
             "Labels": self.labels,
             "State": self.state.status,
@@ -272,6 +289,7 @@ impl Detail {
     /// `GET /containers/{id}/json`.
     pub fn inspect(&self) -> Value {
         let argv = self.argv();
+        let ports = self.port_map();
         let st = &self.state;
         let run = &self.config["run"];
         let cpus = self.config["cpus"].as_f64();
@@ -281,7 +299,7 @@ impl Detail {
         let stdin = run["stdin"] == true;
         json!({
             "Id": self.id(),
-            "Created": time(self.started.or(self.finished)),
+            "Created": time(self.created),
             "Path": argv.first().cloned().unwrap_or_default(),
             "Args": argv.get(1..).unwrap_or_default(),
             "State": {
@@ -304,7 +322,7 @@ impl Detail {
             "ExecIDs": null,
             "HostConfig": {
                 "NetworkMode": "bridge",
-                "PortBindings": self.port_map(),
+                "PortBindings": ports,
                 "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
                 "AutoRemove": run["rm"] == true,
                 "NanoCpus": cpus.map_or(0, |c| (c * 1e9) as u64),
@@ -324,7 +342,7 @@ impl Detail {
                 "AttachStdin": false,
                 "AttachStdout": false,
                 "AttachStderr": false,
-                "ExposedPorts": self.port_map().keys().map(|k| (k.clone(), json!({}))).collect::<Map<_, _>>(),
+                "ExposedPorts": ports.keys().map(|k| (k.clone(), json!({}))).collect::<Map<_, _>>(),
                 "Tty": tty,
                 "OpenStdin": stdin,
                 "StdinOnce": false,
@@ -341,7 +359,7 @@ impl Detail {
                 "Bridge": "",
                 "SandboxID": "",
                 "SandboxKey": "",
-                "Ports": self.port_map(),
+                "Ports": ports,
                 "IPAddress": self.vm["ip"].as_str().unwrap_or_default(),
                 "IPPrefixLen": if self.vm["ip"].is_string() { 32 } else { 0 },
                 "Gateway": "",
@@ -362,22 +380,30 @@ fn shell_words(argv: &[String]) -> String {
     argv.iter().map(word).collect::<Vec<_>>().join(" ")
 }
 
+fn validate_name(value: &str) -> Result<(), Error> {
+    let part = value.strip_prefix('^').unwrap_or(value);
+    let part = part.strip_suffix('$').unwrap_or(part);
+    if part.contains(['*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '\\', '^', '$']) {
+        return Err(Error::bad("name filters support literal text, dots and ^/$ anchors only"));
+    }
+    Ok(())
+}
+
 /// A `filters` key and value against a container, as docker matches them.
 fn matches(d: &Detail, key: &str, value: &str) -> Result<bool, Error> {
     Ok(match key {
         "id" => d.id().starts_with(value),
-        // Docker's is a regular expression: a part of the name, `^` and `$` anchoring it (with or without its `/`).
+        // Docker matches against the name including its leading `/`.
         "name" => {
             let (start, rest) = value.strip_prefix('^').map_or((false, value), |r| (true, r));
             let (end, part) = rest.strip_suffix('$').map_or((false, rest), |r| (true, r));
-            let part = if start { part.strip_prefix('/').unwrap_or(part) } else { part };
-            let name = d.name.as_str();
-            match (start, end) {
-                (true, true) => name == part,
-                (true, false) => name.starts_with(part),
-                (false, true) => name.ends_with(part),
-                (false, false) => format!("/{name}").contains(part),
-            }
+            let name: Vec<char> = format!("/{}", d.name).chars().collect();
+            let part: Vec<char> = part.chars().collect();
+            (0..=name.len()).any(|offset| {
+                (!start || offset == 0)
+                    && (!end || offset + part.len() == name.len())
+                    && name.get(offset..offset + part.len()).is_some_and(|text| part.iter().zip(text).all(|(&p, &c)| p == '.' || p == c))
+            })
         }
         "status" => match value {
             "created" | "restarting" | "running" | "removing" | "paused" | "exited" | "dead" => d.state.status == value,
@@ -405,6 +431,9 @@ fn matches(d: &Detail, key: &str, value: &str) -> Result<bool, Error> {
 /// `GET /containers/json?all&limit&filters`.
 pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
     let (all, limit, filters) = (q.flag("all", false)?, q.number::<i64>("limit")?, q.filters()?);
+    for (_, value) in filters.iter().filter(|(k, _)| k == "name") {
+        validate_name(value)?;
+    }
     let details = api.blocking(|api| Ok(crate::vms(&api.host).iter().map(|v| Detail::read(api, v)).collect::<Vec<_>>())).await?;
     let mut out = Vec::new();
     for d in &details {
@@ -423,6 +452,7 @@ pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
             out.push(d.summary());
         }
     }
+    out.sort_by(|a, b| b["Created"].as_u64().cmp(&a["Created"].as_u64()).then_with(|| a["Id"].as_str().cmp(&b["Id"].as_str())));
     if let Some(n) = limit.filter(|&n| n > 0) {
         out.truncate(n as usize);
     }
@@ -450,6 +480,15 @@ pub fn stream_type(tty: bool) -> HeaderValue {
     HeaderValue::from_static(if tty { "application/vnd.docker.raw-stream" } else { "application/vnd.docker.multiplexed-stream" })
 }
 
+/// Dropping the body cancels even an idle child operation.
+async fn connected<T>(tx: &tokio::sync::mpsc::Sender<bytes::Bytes>, work: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = tx.closed() => None,
+        result = work => Some(result),
+    }
+}
+
 /// `GET /containers/{id}/logs?follow&tail&stdout&stderr`: `flexvm logs`. Its log keeps no streams apart nor
 /// times, so it all comes as stdout, and `since`, `until` and `timestamps` are refused.
 pub async fn logs(api: &Arc<Api>, key: &str, q: Query) -> Reply {
@@ -472,7 +511,9 @@ pub async fn logs(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     let vms = all(api).await?;
     let vm = find(&vms, key)?;
     let name = vm["name"].as_str().unwrap_or_default().to_string();
-    let tty = vm["spec"]["tty"] == true;
+    let vm = vm.clone();
+    let log_name = name.clone();
+    let tty = api.blocking(move |api| Ok(crate::containers::described(&api.host, &api.paths, &log_name, vm)["config"]["run"]["tty"] == true)).await?;
     let mut words = vec!["logs".to_string()];
     if q.flag("follow", false)? {
         words.push("--follow".into());
@@ -487,7 +528,8 @@ pub async fn logs(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     tokio::spawn(async move {
         let mut buf = vec![0; 32 << 10];
         loop {
-            match out.read(&mut buf).await {
+            let Some(read) = connected(&tx, out.read(&mut buf)).await else { break };
+            match read {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = match (tty, stdout) {
@@ -510,6 +552,65 @@ pub async fn logs(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     Ok(res)
 }
 
+/// An exit after registration, even if its whole run happened between observations.
+fn next_exit(
+    host: &crate::host::Host,
+    name: &str,
+    before: Option<&crate::host::Ident>,
+    pinned: Option<&crate::host::Ident>,
+) -> crate::util::Result<Option<i64>> {
+    if let Some(id) = pinned {
+        if let Some((_, e)) = crate::containers::last_name(host, name, id) {
+            return Ok(Some(e.code as i64));
+        }
+        if id.liveness() == crate::host::Liveness::Gone {
+            return Err("container process ended without an exit status".into());
+        }
+    } else if let Some(e) = crate::containers::exit_record(host, name).filter(|e| Some(&e.ident) != before) {
+        return Ok(Some(e.code as i64));
+    }
+    Ok(None)
+}
+
+/// A lock record can be incomplete while a concurrent start writes it.
+fn live_holder(host: &crate::host::Host, name: &str) -> Option<crate::host::Ident> {
+    host.name_holder(name).ok().flatten().filter(|id| id.liveness() == crate::host::Liveness::Alive)
+}
+
+async fn wait_next(api: &Arc<Api>, name: &str, before: Option<crate::host::Ident>, mut pinned: Option<crate::host::Ident>) -> Result<i64, Error> {
+    loop {
+        if let Some(id) = pinned {
+            let ident = id.clone();
+            let fd = api.blocking(move |_| crate::host::PidFd::open(&ident)).await?;
+            if let Some(fd) = fd {
+                // SAFETY: PidFd owns its descriptor and keeps it unchanged until dropped.
+                let fd = unsafe { tokio::io::unix::AsyncFd::register(fd) }.map_err(std::io::Error::from)?;
+                let _ = fd.readable().await?;
+            }
+            let name = name.to_string();
+            return api
+                .blocking(move |api| next_exit(&api.host, &name, None, Some(&id))?.ok_or_else(|| "container process ended without an exit status".into()))
+                .await;
+        }
+        let name = name.to_string();
+        let before = before.clone();
+        // The holder first: a run that ends and is followed between the two reads is still seen by its record.
+        let (holder, code) = api
+            .blocking(move |api| {
+                let holder = live_holder(&api.host, &name);
+                Ok((holder, next_exit(&api.host, &name, before.as_ref(), None)?))
+            })
+            .await?;
+        if let Some(code) = code {
+            return Ok(code);
+        }
+        pinned = holder;
+        if pinned.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 /// `POST /containers/{id}/wait?condition=not-running|next-exit|removed`: `flexvm wait`. The reply's head
 /// goes at once and its body once the VM's process ends (`next-exit`: one that runs or starts later;
 /// `removed`: then until nothing is left of it).
@@ -519,30 +620,43 @@ pub async fn wait(api: &Arc<Api>, key: &str, q: Query) -> Reply {
         return Err(Error::bad(format!("invalid condition {condition:?}")));
     }
     let name = resolve(api, key).await?;
+    // Register before returning the head, not when the spawned task first runs.
+    let registered_name = name.clone();
+    let (before, pinned) = api
+        .blocking(move |api| {
+            let before = crate::containers::exit_record(&api.host, &registered_name).map(|e| e.ident);
+            let pinned = live_holder(&api.host, &registered_name);
+            Ok((before, pinned))
+        })
+        .await?;
     let (tx, body) = channel();
     let api = api.clone();
     tokio::spawn(async move {
-        let host = api.host.clone();
-        if condition == "next-exit" {
-            while !host.alive(&name) && !tx.is_closed() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+        let Some(result) = connected(&tx, async {
+            if condition == "next-exit" {
+                wait_next(&api, &name, before, pinned).await
+            } else {
+                api.run(&["wait", "--", &name]).await.map(|out| String::from_utf8_lossy(&out.stdout).trim().parse::<i64>().unwrap_or(-1))
             }
-        }
-        let reply = match api.run(&["wait", "--", &name]).await {
-            Ok(out) => {
-                let code = String::from_utf8_lossy(&out.stdout).trim().parse::<i64>().unwrap_or(-1);
-                json!({"StatusCode": code, "Error": null})
-            }
+        })
+        .await
+        else {
+            return;
+        };
+        let reply = match result {
+            Ok(code) => json!({"StatusCode": code, "Error": null}),
             Err(e) => json!({"StatusCode": -1, "Error": {"Message": e.message}}),
         };
         if condition == "removed" {
             loop {
                 let name = name.clone();
                 let gone = api.blocking(move |api| Ok(!crate::vms(&api.host).iter().any(|v| v["name"] == name.as_str()))).await.unwrap_or(true);
-                if gone || tx.is_closed() {
+                if gone {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                if connected(&tx, tokio::time::sleep(Duration::from_millis(200))).await.is_none() {
+                    return;
+                }
             }
         }
         let _ = tx.send(serde_json::to_vec(&reply).unwrap_or_default().into()).await;
@@ -572,6 +686,206 @@ mod tests {
 
     fn vm(name: &str, state: &str) -> Value {
         json!({"name": name, "state": state, "status": 3})
+    }
+
+    fn fixture() -> (crate::test_util::TempDir, Arc<Api>) {
+        let d = crate::test_util::TempDir::new("api-containers");
+        let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let api = Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![] });
+        (d, api)
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_idle_reads_and_waits() {
+        for read in [true, false] {
+            let (tx, body) = channel();
+            let mut child = tokio::process::Command::new("sleep").arg("60").stdout(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            let id = crate::host::Ident::of(child.id().unwrap()).unwrap();
+            let task = tokio::spawn(async move {
+                if read {
+                    let mut out = child.stdout.take().unwrap();
+                    let mut buf = [0; 1];
+                    assert!(connected(&tx, out.read(&mut buf)).await.is_none());
+                } else {
+                    assert!(connected(&tx, child.wait()).await.is_none());
+                }
+            });
+            tokio::task::yield_now().await;
+            drop(body);
+            tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while id.liveness() != crate::host::Liveness::Gone {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn name_filters_reject_unsupported_regexes() {
+        for name in ["web.*", "web[12]", "(web|db)", "web+", "web?", "a\\b", "a^b", "a$b"] {
+            assert_eq!(validate_name(name).unwrap_err().status, StatusCode::BAD_REQUEST);
+        }
+        for name in ["web", "^/web$", "^web", "web$", "api.v2"] {
+            validate_name(name).unwrap();
+        }
+    }
+
+    #[test]
+    fn name_filters_match_dots_and_the_leading_slash() {
+        let (_d, api) = fixture();
+        let web = Detail::read(&api, &vm("web", "running"));
+        for pattern in ["web", "/web$", "^/web$", "^/w.b$", "web$", "", "^", "$"] {
+            assert!(matches(&web, "name", pattern).unwrap(), "{pattern}");
+        }
+        for pattern in ["^web", "^web$", "^/we$", "^/web.$", "/web/$"] {
+            assert!(!matches(&web, "name", pattern).unwrap(), "{pattern}");
+        }
+        for name in ["api.v2", "api-v2"] {
+            let d = Detail::read(&api, &vm(name, "running"));
+            assert!(matches(&d, "name", "api.v2").unwrap());
+        }
+    }
+
+    #[test]
+    fn creation_without_logs_falls_back_to_start_then_finish() {
+        let (_d, api) = fixture();
+        let mut v = vm("web", "exited");
+        v["exited_at"] = json!(100);
+        let d = Detail::read(&api, &v);
+        assert_eq!(d.created, Some(100));
+        assert_eq!(d.summary()["Created"], 100);
+        v["start"] = json!(1);
+        let d = Detail::read(&api, &v);
+        assert!(d.started.is_some());
+        assert_eq!(d.created, d.started);
+    }
+
+    #[tokio::test]
+    async fn pinned_wait_reads_the_renamed_exit_after_process_death() {
+        let (_d, api) = fixture();
+        let mut child = tokio::process::Command::new("sleep").arg("60").kill_on_drop(true).spawn().unwrap();
+        let id = crate::host::Ident::of(child.id().unwrap()).unwrap();
+        let waiter = wait_next(&api, "web", None, Some(id.clone()));
+        tokio::pin!(waiter);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiter).await.is_err());
+        crate::containers::record_exit(&api.host, "renamed", &id, 7, true);
+        // A record alone must not finish a wait while the pinned process still runs.
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiter).await.is_err());
+        child.kill().await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), waiter).await.unwrap().unwrap(), 7);
+    }
+
+    #[test]
+    fn incomplete_and_stale_holders_are_not_pinned() {
+        let (_d, api) = fixture();
+        let path = api.host.vms("web", "lock").unwrap();
+        std::fs::write(&path, b"{").unwrap();
+        assert!(live_holder(&api.host, "web").is_none());
+        let id = crate::host::Ident { pid: 999_999_999, start: 1, boot: "old".into(), ns: None };
+        std::fs::write(path, serde_json::to_vec(&id).unwrap()).unwrap();
+        assert!(live_holder(&api.host, "web").is_none());
+    }
+
+    #[test]
+    fn next_exit_sees_short_runs_and_never_attaches_to_a_later_run() {
+        let (_d, api) = fixture();
+        let id = |start| crate::host::Ident { pid: 999_999_999, start, boot: "old".into(), ns: None };
+        crate::containers::record_exit(&api.host, "web", &id(1), 1, true);
+        assert_eq!(next_exit(&api.host, "web", Some(&id(1)), None).unwrap(), None);
+        crate::containers::record_exit(&api.host, "web", &id(2), 7, true);
+        assert_eq!(next_exit(&api.host, "web", Some(&id(1)), None).unwrap(), Some(7));
+        assert_eq!(next_exit(&api.host, "web", Some(&id(1)), Some(&id(2))).unwrap(), Some(7));
+        crate::containers::record_exit(&api.host, "web", &id(3), 9, true);
+        assert!(next_exit(&api.host, "web", Some(&id(1)), Some(&id(2))).is_err());
+    }
+
+    #[test]
+    fn suspended_tty_uses_the_checkpoint_spec() {
+        let (_d, api) = fixture();
+        let dir = api.host.suspended("web").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), b"").unwrap();
+        std::fs::write(dir.join("SPEC"), br#"{"tty":true}"#).unwrap();
+        let d = Detail::read(&api, &vm("web", "suspended"));
+        assert_eq!(d.config["run"]["tty"], true);
+        assert_eq!(d.inspect()["Config"]["Tty"], true);
+        assert_eq!(stream_type(d.config["run"]["tty"] == true), "application/vnd.docker.raw-stream");
+    }
+
+    #[test]
+    fn exited_settings_and_port_shapes_are_restored() {
+        let (_d, api) = fixture();
+        let spec = serde_json::from_value(json!({"tty": true, "ports": ["8080:80".parse::<crate::ports::Port>().unwrap(),
+            "127.0.0.1:5353:53/udp".parse::<crate::ports::Port>().unwrap()]}))
+        .unwrap();
+        let mut rec = crate::app::Exited::new(0, "image".into(), None, Default::default(), spec, 100);
+        rec.template_id = Some("abcd".into());
+        let blob = serde_json::to_vec(&json!({"config": {"Cmd": ["serve"], "Env": ["A=image"], "Labels": {"role": "web"},
+            "User": "app", "WorkingDir": "/srv"}}))
+        .unwrap();
+        let digest = crate::image::registry::sha256_hex(&blob);
+        let blob_path = crate::image::registry::blob_path(&api.host.state.join("images/blobs"), &digest).unwrap();
+        std::fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        std::fs::write(&blob_path, blob).unwrap();
+        let generation = api.paths.templates.join(crate::template::GENERATIONS).join("abcd");
+        std::fs::create_dir_all(&generation).unwrap();
+        let meta = json!({
+            "compatibility": {"cpu": "", "tsc_khz": 0, "tsc_control": false, "msrs": [], "firecracker": "", "features": {}, "xsave": {}},
+            "vcpus": 1, "mem_mib": 1, "max_mib": 1, "plugged_mib": 0, "kernel": "", "rootfs": "", "id": "abcd", "components": {},
+            "image": {"source": "image", "digest": "sha256:source", "config_digest": digest, "app_conf": "", "argv": ["serve"], "warm": false}
+        });
+        std::fs::write(generation.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let path = api.host.vms("web", "exited").unwrap();
+        std::fs::write(&path, serde_json::to_vec(&rec).unwrap()).unwrap();
+        let d = Detail::read(&api, &vm("web", "exited"));
+        assert_eq!(d.image_id, "sha256:abcd");
+        assert_eq!(d.config["source"], "image");
+        assert_eq!(d.config["digest"], "sha256:source");
+        assert!(!d.config["app"].is_null());
+        assert!(matches(&d, "name", "^/web$").unwrap());
+        assert!(!matches(&d, "name", "^db$").unwrap());
+        assert!(matches(&d, "ancestor", "abcd").unwrap());
+        assert_eq!(stream_type(d.config["run"]["tty"] == true), stream_type(true));
+        let inspect = d.inspect();
+        assert_eq!(inspect["Config"]["Tty"], true);
+        assert_eq!(inspect["Config"]["Cmd"], json!(["serve"]));
+        assert_eq!(inspect["Config"]["Env"], json!(["A=image"]));
+        assert_eq!(inspect["Config"]["User"], "app");
+        assert_eq!(inspect["Config"]["WorkingDir"], "/srv");
+        assert!(matches(&d, "label", "role=web").unwrap());
+        std::fs::write(&blob_path, b"corrupt").unwrap();
+        assert!(images::config(&api, &images::meta(&api, "abcd").unwrap()).is_none());
+        assert_eq!(d.port_list().len(), 3);
+        assert_eq!(inspect["HostConfig"]["PortBindings"], inspect["NetworkSettings"]["Ports"]);
+        assert_eq!(inspect["NetworkSettings"]["Ports"]["80/tcp"].as_array().unwrap().len(), 2);
+        let mut old = serde_json::to_value(rec).unwrap();
+        old.as_object_mut().unwrap().remove("template_id");
+        assert!(serde_json::from_value::<crate::app::Exited>(old).unwrap().template_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_limits_newest_first() {
+        use http_body_util::BodyExt;
+        let (_d, api) = fixture();
+        let req = Request::builder().uri("/containers/json?filters=%7B%22name%22:%5B%22web.*%22%5D%7D").body(()).unwrap();
+        assert_eq!(list(&api, Query::of(&req)).await.unwrap_err().status, StatusCode::BAD_REQUEST);
+        for name in ["older", "newer"] {
+            std::fs::create_dir_all(api.host.vms(name, "logs").unwrap()).unwrap();
+            let rec = crate::app::Exited::new(0, "image".into(), None, Default::default(), Default::default(), 1);
+            std::fs::write(api.host.vms(name, "exited").unwrap(), serde_json::to_vec(&rec).unwrap()).unwrap();
+            if name == "older" {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        let req = Request::builder().uri("/containers/json?all=1&limit=1").body(()).unwrap();
+        let response = list(&api, Query::of(&req)).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows[0]["Names"][0], "/newer");
+        assert_eq!(rows.as_array().unwrap().len(), 1);
     }
 
     #[test]
