@@ -1002,6 +1002,56 @@ Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K[=V]`
 with the same userland state (RNG seeds, keys), so use it only for apps that
 hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 
+## Docker API
+
+`flexvm api` serves the Docker Engine API (v1.47; clients negotiate down to
+it) on a Unix socket, so docker's CLI, Compose and the SDKs drive flexvm's
+VMs as containers:
+
+```sh
+sudo flexvm api &                                 # on /run/flexvm/docker.sock (another --state: its run directory's)
+export DOCKER_HOST=unix:///run/flexvm/docker.sock # or: docker context create flexvm --docker host=unix:///run/flexvm/docker.sock
+docker version && docker info
+```
+
+It is no daemon in docker's sense: it keeps nothing a restart would lose.
+What it answers comes from the records the commands read (`ps -a`,
+`inspect`, `images`), and what it changes it changes by running the commands,
+this binary with its own `--state` and `--run`; VMs it starts are VM
+processes like any other, which outlive it. `flexvm api SOCKET` serves
+elsewhere; a socket another server answers on is refused, a stale one
+replaced. The socket is root's alone (0600), as anyone who can use it can do
+what root can; to open it to a group, socket-activate it:
+
+```ini
+# /etc/systemd/system/flexvm-api.socket
+[Socket]
+ListenStream=/run/flexvm/docker.sock
+SocketMode=0660
+SocketGroup=docker
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# /etc/systemd/system/flexvm-api.service
+[Unit]
+Requires=flexvm-api.socket
+After=flexvm-api.socket
+
+[Service]
+ExecStart=/usr/local/bin/flexvm api
+```
+
+An endpoint is served where flexvm has the machinery under it. Docker's
+others (swarm, plugins, builds, volumes, networks, ...) answer 501, saying
+so, and a setting that cannot be honoured is refused, never ignored.
+
+| endpoints | served from |
+|---|---|
+| `GET /_ping`, `/version`, `/info` | `flexvm version`, `info` and `ps -a`'s counts |
+
 ## Paths and knobs
 
 | flag | default | what |
