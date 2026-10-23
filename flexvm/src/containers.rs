@@ -380,7 +380,7 @@ pub fn inspect(host: &Host, paths: &template::Paths, names: &[String]) -> Result
     }
 }
 
-fn described(host: &Host, paths: &template::Paths, name: &str, mut v: Value) -> Value {
+pub(crate) fn described(host: &Host, paths: &template::Paths, name: &str, mut v: Value) -> Value {
     let running = !crate::stopped(&v);
     let path = |ext: &str| host.vms(name, ext).ok().map(|p| p.display().to_string());
     let mut config = json!({

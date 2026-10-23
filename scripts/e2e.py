@@ -2493,6 +2493,76 @@ def pull_standby():
             h.cli("pull", name, "--standby", "0", check=False, timeout=300)
 
 
+class Docker:
+    """`flexvm api` serving host's state on a socket of its own, and the docker CLI against it."""
+
+    def __init__(self, host):
+        if not shutil.which("docker"):
+            raise Skip("no docker CLI")
+        self.host = host
+        self.sock = os.path.join(host.run_dir, "e2e-docker.sock")
+        self.config = os.path.join(WORK, f"docker-config-{host.label}")
+        os.makedirs(self.config, exist_ok=True)
+        self.log = os.path.join(args.log_dir, f"api-{host.label}.log")
+        self.proc = subprocess.Popen([BIN, "--state", host.state_dir, "--run", host.run_dir, "api", self.sock], stdout=open(self.log, "a"),
+                                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=ENV, start_new_session=True)
+        if not wait_for(lambda: self.proc.poll() is not None or self("version", "--format", "{{.Server.Version}}", check=False).returncode == 0, 30) \
+                or self.proc.poll() is not None:
+            raise AssertionError(f"flexvm api did not come up; see {self.log}")
+
+    def __call__(self, *argv, check=True, timeout=120, input=None):
+        env = {**os.environ, "DOCKER_HOST": f"unix://{self.sock}", "DOCKER_CONFIG": self.config}
+        r = subprocess.run(["docker", *argv], capture_output=True, text=True, timeout=timeout, env=env, input=input)
+        if check and r.returncode != 0:
+            raise AssertionError(f"docker {' '.join(argv)} exited {r.returncode}: {r.stderr.strip()}")
+        return r
+
+    def close(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
+
+@case
+def docker_api():
+    """flexvm api: the docker CLI against it, containers as flexvm's VMs."""
+    d = Docker(A)
+    try:
+        docker_api_with(d)
+    finally:
+        d.close()
+
+
+def docker_api_with(d):
+    vm, job = "e2e-dk", "e2e-dk-job"
+    version = d("version", "--format", "{{.Server.Version}} {{.Server.APIVersion}}").stdout.split()
+    check("version: flexvm's, at the API version it serves", version[0] == A.info()["version"] and version[1] == "1.47", version)
+    unsupported = d("volume", "ls", check=False)
+    check("an endpoint flexvm has no machinery for: refused, saying so", unsupported.returncode != 0 and "not supported by flexvm" in unsupported.stderr,
+          unsupported.stderr)
+    ip = A.run(vm)
+    rows = dict(l.split(" ", 1) for l in d("ps", "--format", "{{.Names}} {{.State}}").stdout.splitlines())
+    check("ps: the running vm", rows.get(vm) == "running", rows)
+    got = d("inspect", "-f", "{{.Id}} {{.NetworkSettings.IPAddress}} {{.State.Running}}", vm).stdout.split()
+    check("inspect: its address, running", got[1:] == [ip, "true"] and len(got[0]) == 64, got)
+    check("inspect: by an id prefix", d("inspect", "-f", "{{.Name}}", got[0][:12]).stdout.strip() == f"/{vm}")
+    A.vms.add(job)
+    A.cli("run", "--name", job, "-d", args.template, "--", "echo to-out; echo to-err >&2; exit 3")
+    check("wait: its status", d("wait", job, timeout=120).stdout.strip() == "3")
+    logs = d("logs", job)
+    check("logs: its output", "to-out" in logs.stdout and "to-err" in logs.stdout, (logs.stdout, logs.stderr))
+    last = d("logs", "--tail", "1", job).stdout
+    check("logs --tail 1: the last line", last.count("\n") == 1 and logs.stdout.endswith(last), (last, logs.stdout))
+    exited = d("ps", "-a", "--filter", "status=exited", "--format", "{{.Names}} {{.Status}}").stdout
+    check("ps -a --filter status=exited: the exited vm, with its status", f"{job} Exited (3)" in exited, exited)
+    check("ps: not the exited one", job not in d("ps", "--format", "{{.Names}}").stdout)
+    A.kill(vm)
+    A.rm(job)
+
+
 @case
 def faults():
     """The selected scripts/faults.py scenarios against the same two hosts."""
@@ -2695,7 +2765,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "docker_api": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
