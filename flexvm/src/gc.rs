@@ -80,6 +80,8 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
         let forwarding = crate::net::ip_forward();
         let proxy_arp = host.config_now().announce_dev().map_or(Ok(()), |dev| crate::net::proxy_arp(&dev));
         recover(host);
+        // Before the pass is marked done (it runs again until it is): those it lost that their policies run again.
+        crate::restart::after_boot(host);
         forwarding?;
         proxy_arp?;
         if std::fs::read_to_string(host.run.join(".boot")).is_ok_and(|b| b == boot_id()) {

@@ -2494,6 +2494,40 @@ def pull_standby():
 
 
 @case
+def restart_policy():
+    """run -d --restart: on-failure:N's restarts and their count, always until a stop, and what is refused."""
+    t, flaky, steady = args.template, "e2e-rs-flaky", "e2e-rs-always"
+    A.vms.update([flaky, steady])
+    record = lambda vm: json.loads(A.cli("inspect", vm).stdout)[0]
+    A.cli("run", "-d", "--restart", "on-failure:2", "--name", flaky, t, "--", "echo e2e-ran; exit 3")
+    done = lambda: (lambda v: v.get("state") == "exited" and "restart_due_ms" not in v)(A.ps().get(flaky, {}))
+    # Its first run and two restarts (100 ms, then 200 ms of backoff), then it stays exited.
+    check("on-failure:2: run twice more, then left exited", wait_for(lambda: A.logs(flaky).count("e2e-ran") == 3 and done(), 60), (A.logs(flaky), A.ps().get(flaky)))
+    got = record(flaky)
+    check("on-failure:2: its status, its count", got.get("exit_code") == 3 and {k: v for k, v in got["config"]["run"].get("restart", {}).items() if k != "delay_ms"} == {"policy": "on-failure", "max": 2, "count": 2},
+          got)
+    time.sleep(1)
+    check("on-failure:2: no third", A.logs(flaky).count("e2e-ran") == 3, A.logs(flaky))
+    # A start by hand counts again: two more restarts.
+    A.cli("start", flaky)
+    check("start by hand: its count begun again", wait_for(lambda: A.logs(flaky).count("e2e-ran") == 6 and done(), 60), A.logs(flaky))
+    A.cli("run", "-d", "--restart", "always", "--name", steady, t, "--", "echo e2e-up; exit 0")
+    check("always: run again after a success", wait_for(lambda: A.logs(steady).count("e2e-up") >= 3, 60), A.logs(steady))
+    A.cli("stop", steady, timeout=180)
+    time.sleep(0.5)
+    ups = A.logs(steady).count("e2e-up")
+    time.sleep(2)
+    # Stopped between its runs (exited) or in one (suspended): either way, not run again.
+    check("always: a stop ends its restarts", A.logs(steady).count("e2e-up") == ups and A.ps().get(steady, {}).get("state") in ("exited", "suspended")
+          and "restart_due_ms" not in A.ps()[steady], (ups, A.logs(steady), A.ps().get(steady)))
+    for extra, why in ((["--restart", "always"], "-d"), (["-d", "--rm", "--restart", "always"], "conflict"), (["-d", "--restart", "sometimes"], "bad --restart")):
+        r = A.cli("run", *extra, t, "--", "true", check=False)
+        check(f"run {' '.join(extra)}: refused ({why})", r.returncode != 0 and why in r.stderr, r.stderr)
+    A.rm(flaky)
+    A.rm(steady)
+
+
+@case
 def faults():
     """The selected scripts/faults.py scenarios against the same two hosts."""
     if not args.faults.split():
@@ -2695,7 +2729,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
