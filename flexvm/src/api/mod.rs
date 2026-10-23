@@ -9,7 +9,6 @@
 mod system;
 
 use std::convert::Infallible;
-use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -108,11 +107,7 @@ pub fn main(host: Host, paths: Paths, socket: Option<&str>) -> Result<()> {
 
 /// The Unix socket systemd passed as fd 3, if it passed one.
 fn activated() -> Option<std::os::unix::net::UnixListener> {
-    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
-    let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
-    // Close-on-exec: no command it runs inherits it.
-    (pid == std::process::id() && n >= 1 && unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) } == 0)
-        .then(|| unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) })
+    crate::socket::activated().map(Into::into)
 }
 
 /// Published at 0600 from a private directory. Only stale sockets are replaced; the path's lock
@@ -162,7 +157,9 @@ fn bind(path: &Path) -> Result<(std::os::unix::net::UnixListener, crate::host::F
 }
 
 async fn serve(listener: tokio::net::UnixListener, api: Arc<Api>) -> Result<()> {
+    let connections = Arc::new(tokio::sync::Semaphore::new(256));
     loop {
+        let permit = connections.clone().acquire_owned().await?;
         let stream = match listener.accept().await {
             Ok((s, _)) => s,
             // Out of fds, say: the next one may get through.
@@ -174,13 +171,19 @@ async fn serve(listener: tokio::net::UnixListener, api: Arc<Api>) -> Result<()> 
         };
         let api = api.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let service = hyper::service::service_fn(move |req| {
                 let api = api.clone();
                 async move { Ok::<_, Infallible>(respond(&api, req).await) }
             });
-            let conn = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service).with_upgrades();
-            if let Err(e) = conn.await {
-                crate::info!("flexvm api: connection: {e}");
+            // With a timer, hyper closes a connection idle 30 s between requests (its header timeout).
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades();
+            match conn.await {
+                Err(e) if !e.is_timeout() => crate::info!("flexvm api: connection: {e}"),
+                _ => {}
             }
         });
     }

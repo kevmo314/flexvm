@@ -63,23 +63,21 @@ pub async fn version(api: &Arc<Api>) -> Reply {
 
 /// Counts of containers by docker's states, from `ps -a`'s (`vms`).
 pub fn counts(vms: &[Value]) -> (usize, usize, usize) {
-    let state = |v: &Value| v["state"].as_str().unwrap_or("").to_string();
-    let paused = vms.iter().filter(|v| state(v) == "paused").count();
+    let paused = vms.iter().filter(|v| v["state"] == "paused").count();
     let stopped = vms.iter().filter(|v| crate::stopped(v)).count();
     (vms.len() - paused - stopped, paused, stopped)
 }
 
 /// `GET /info`: the host as `flexvm info` and `ps -a` see it.
 pub async fn info(api: &Arc<Api>) -> Reply {
-    let (vms, images, info) = api
+    let (vms, images, warnings) = api
         .blocking(|api| {
             let images = crate::template::images(&api.paths).map(|i| i.len()).unwrap_or(0);
-            Ok((crate::vms(&api.host), images, crate::info(&api.host)))
+            Ok((crate::vms(&api.host), images, api.host.config_now().warnings()))
         })
         .await?;
     let (running, paused, stopped) = counts(&vms);
     let mem = crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0);
-    let warnings: Vec<Value> = info["warnings"].as_array().cloned().unwrap_or_default();
     let mut v = json!({
         "ID": crate::host::boot_id(),
         "Containers": vms.len(),
@@ -140,4 +138,32 @@ pub async fn info(api: &Arc<Api>) -> Reply {
         v.extend(more);
     }
     ok(&v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn warnings_follow_host_config() {
+        let root = crate::test_util::TempDir::new("api-info");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let api = Arc::new(Api { paths: crate::template::Paths::new(&host.state), host });
+        let warnings = |host: &crate::host::Host| crate::info(host)["warnings"].clone();
+        let before = warnings(&api.host);
+        let body = info(&api).await.unwrap().into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["Warnings"], before);
+        let mut other = api.host.clone();
+        other
+            .configure(|c| {
+                c.peers = vec!["192.0.2.1:7070".into()];
+                Ok(())
+            })
+            .unwrap();
+        let after = warnings(&other);
+        assert_ne!(before, after);
+        let body = info(&api).await.unwrap().into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["Warnings"], after);
+    }
 }

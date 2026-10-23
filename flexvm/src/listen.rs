@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -656,10 +656,7 @@ pub fn refuse(conn: TcpStream, why: &str, wait: Option<Duration>) {
 }
 
 pub fn activated() -> Option<TcpListener> {
-    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
-    let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
-    // Close-on-exec: no child it starts inherits it (#386).
-    (pid == std::process::id() && n >= 1 && unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) } == 0).then(|| unsafe { TcpListener::from_raw_fd(3) })
+    crate::socket::activated().map(Into::into)
 }
 
 /// From a peer: they are authenticated by address only (`main`), the network between them is trusted.
@@ -1819,18 +1816,6 @@ mod tests {
         let e = lend(&host, &json!({"ip": ip}), &[ip.parse().unwrap()], &("borrower".into(), vec![]), "192.0.2.1".parse().unwrap()).unwrap_err();
         assert!(e.to_string().contains("not a vm's address"));
         assert!(!host.state.join("addrs").join(ip).exists());
-    }
-
-    /// In a child started with a descriptor on fd 3, as systemd would: none of this one's is touched.
-    #[test]
-    fn the_activated_socket_is_close_on_exec() {
-        if std::env::var_os("LISTEN_FDS").is_none() {
-            let script = r#"exec 3</dev/null; LISTEN_PID=$$ LISTEN_FDS=1 exec "$0" --exact listen::tests::the_activated_socket_is_close_on_exec --quiet"#;
-            let st = std::process::Command::new("sh").args(["-c", script]).arg(std::env::current_exe().unwrap()).status().unwrap();
-            return assert!(st.success());
-        }
-        std::mem::forget(activated().expect("fd 3 taken"));
-        assert_eq!(unsafe { libc::fcntl(3, libc::F_GETFD) } & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
     }
 
     #[test]
