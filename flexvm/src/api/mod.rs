@@ -89,11 +89,12 @@ impl Api {
 /// (`LISTEN_FDS`), until killed.
 pub fn main(host: Host, paths: Paths, socket: Option<&str>) -> Result<()> {
     let activated = activated();
-    let (listener, at) = match activated {
-        Some(l) => (l, None),
+    let (listener, at, _lock) = match activated {
+        Some(l) => (l, None, None),
         None => {
             let path = socket.map_or_else(|| host.run.join("docker.sock"), PathBuf::from);
-            (bind(&path)?, Some(path))
+            let (listener, lock) = bind(&path)?;
+            (listener, Some(path), Some(lock))
         }
     };
     if let Some(at) = &at {
@@ -114,34 +115,50 @@ fn activated() -> Option<std::os::unix::net::UnixListener> {
         .then(|| unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) })
 }
 
-/// Bound at a private name in a 0700 directory beside `path`, made 0600 there and moved to `path`: never
-/// reachable by another user (it is root's, as docker's socket is root's and its group's). A server that
-/// answers there already is never replaced; a socket nothing answers on is.
-fn bind(path: &Path) -> Result<std::os::unix::net::UnixListener> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+/// Published at 0600 from a private directory. Only stale sockets are replaced; the path's lock
+/// stays with the server so concurrent starts cannot publish over each other.
+fn bind(path: &Path) -> Result<(std::os::unix::net::UnixListener, crate::host::Flock)> {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
     crate::socket::check(path)?;
-    if std::os::unix::net::UnixStream::connect(path).is_ok() {
-        crate::bail!("{} is served already (another flexvm api, or docker?): give another SOCKET", path.display());
-    }
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let m = std::fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let uid = unsafe { libc::geteuid() };
+    if !m.is_dir() || (m.uid() != 0 && m.uid() != uid) || m.mode() & 0o022 != 0 {
+        crate::bail!("{} must be a directory owned by root or this user, not writable by group or others", dir.display());
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .map_err(|e| format!("{}: opening socket lock: {e}", path.display()))?;
+    let served = || format!("{} is served already (another flexvm api, or docker?): give another SOCKET", path.display());
+    let lock = crate::host::Flock::new(file, libc::LOCK_EX | libc::LOCK_NB).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock => served(),
+        _ => format!("{}: locking socket: {e}", path.display()),
+    })?;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.file_type().is_socket() => crate::bail!("{} is not a socket", path.display()),
+        Ok(_) => match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => return Err(served().into()),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ECONNREFUSED | libc::ENOENT)) => {}
+            Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+        },
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+        Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+    }
+    // bind_private checks the opened directory is this user's and closed to others.
     let private = dir.join(".api");
     match std::fs::DirBuilder::new().mode(0o700).create(&private) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(format!("{}: {e}", private.display()).into()),
         _ => {}
     }
-    let m = std::fs::symlink_metadata(&private)?;
-    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
-        crate::bail!("{} must be a directory of this user's, closed to others", private.display());
-    }
-    let short = private.join(format!(".{}.sock", std::process::id()));
-    let _ = std::fs::remove_file(&short);
-    let listener = std::os::unix::net::UnixListener::bind(&short)?;
-    let placed = std::fs::set_permissions(&short, std::fs::Permissions::from_mode(0o600)).and_then(|()| std::fs::rename(&short, path));
-    if let Err(e) = placed {
-        let _ = std::fs::remove_file(&short);
-        return Err(format!("{}: {e}", path.display()).into());
-    }
-    Ok(listener)
+    let listener = crate::socket::bind_private(&private.join(crate::socket::private_name()), path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((listener, lock))
 }
 
 async fn serve(listener: tokio::net::UnixListener, api: Arc<Api>) -> Result<()> {
@@ -295,6 +312,87 @@ pub fn rfc3339(t: std::time::SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    fn fixture() -> crate::test_util::TempDir {
+        let target = Path::new("../target");
+        fs::create_dir_all(target).unwrap();
+        crate::test_util::TempDir::new_in(target, "api")
+    }
+
+    fn refused(path: &Path, message: &str) {
+        let error = bind(path).err().expect("bind must fail").to_string();
+        assert!(error.contains(&path.display().to_string()) && error.contains(message), "{error}");
+    }
+
+    #[test]
+    fn non_sockets_are_left_intact() {
+        let t = fixture();
+        let path = t.join("docker.sock");
+        fs::write(&path, b"keep").unwrap();
+        refused(&path, "not a socket");
+        assert_eq!(fs::read(&path).unwrap(), b"keep");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        refused(&path, "not a socket");
+        fs::remove_dir(&path).unwrap();
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        refused(&path, "not a socket");
+        assert_eq!(fs::read_link(&path).unwrap(), Path::new("missing"));
+    }
+
+    #[test]
+    fn stale_socket_is_replaced() {
+        let t = fixture();
+        let path = t.join("docker.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let old = fs::metadata(&path).unwrap().ino();
+        let (_listener, _lock) = bind(&path).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), old);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        UnixStream::connect(&path).unwrap();
+    }
+
+    #[test]
+    fn live_server_is_refused() {
+        let t = fixture();
+        let path = t.join("docker.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let old = fs::metadata(&path).unwrap().ino();
+        refused(&path, "is served already");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), old);
+    }
+
+    #[test]
+    fn concurrent_bind_is_refused_while_lock_is_held() {
+        use crate::test_util::JoinWithin;
+        let t = fixture();
+        let path = t.join("docker.sock");
+        let (listener, lock) = bind(&path).unwrap();
+        let other = path.clone();
+        std::thread::spawn(move || refused(&other, "is served already")).join_within().unwrap();
+        // The lock also protects a server whose published name was removed.
+        fs::remove_file(&path).unwrap();
+        refused(&path, "is served already");
+        drop((listener, lock));
+        let (_listener, _lock) = bind(&path).unwrap();
+    }
+
+    #[test]
+    fn writable_parent_is_refused_even_when_sticky() {
+        let t = fixture();
+        let path = t.join("docker.sock");
+        for mode in [0o720, 0o702, 0o1777] {
+            fs::set_permissions(&t, fs::Permissions::from_mode(mode)).unwrap();
+            let error = bind(&path).err().expect("bind must fail").to_string();
+            assert!(error.contains(&t.display().to_string()) && error.contains("not writable"), "{error}");
+            assert!(!path.exists() && !t.join(".api").exists() && !t.join("docker.sock.lock").exists());
+        }
+        fs::set_permissions(&t, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     #[test]
     fn versions_are_stripped_and_bounded() {
