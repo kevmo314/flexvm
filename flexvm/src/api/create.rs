@@ -90,18 +90,24 @@ pub fn remove(api: &Api, name: &str) {
 pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
     for mut r in load_all(api) {
         if r.reserved {
-            if r.reservation_owner.as_ref().is_some_and(|id| id.liveness() != crate::host::Liveness::Gone) {
+            let live = r.reservation_owner.as_ref().is_some_and(|id| id.liveness() != crate::host::Liveness::Gone);
+            let listed = vms.iter().any(|v| v["name"] == r.name.as_str());
+            // A stub (a VM with no Docker record) has nothing to keep; a live owner's VM that has not
+            // moved yet is not this record's.
+            if r.image.is_empty() || !listed && (live || !api.host.alive(&r.name)) {
+                if !live {
+                    remove(api, &r.name);
+                }
                 continue;
             }
-            if !vms.iter().any(|v| v["name"] == r.name.as_str()) && !api.host.alive(&r.name) {
-                remove(api, &r.name);
-                continue;
-            }
-            // The owner died after moving the VM: retain its Docker settings at the destination.
+            // The VM moved: its Docker settings are at the destination even if publication (and
+            // rollback) failed. A dead owner's are kept; a live owner's reservation stays its own.
             r.reserved = false;
             r.reservation_owner = None;
             r.started = true;
-            let _ = store(api, &r, false);
+            if !live {
+                let _ = store(api, &r, false);
+            }
         }
         match vms.iter_mut().find(|v| v["name"] == r.name.as_str()) {
             Some(v) => v["docker"] = json!(r),
@@ -120,10 +126,11 @@ pub fn merge(api: &Api, mut vms: Vec<Value>) -> Vec<Value> {
 
 /// Resolve Docker's optional app overrides, preserving empty argv words. `[]` and `[""]` clear
 /// an entrypoint; a nonempty supplied entrypoint also drops the image's default command.
+/// An empty supplied command inherits the image's command when the supplied entrypoint is empty.
 pub fn app(config: &Value, entrypoint: Vec<String>, cmd: Vec<String>) -> (Vec<String>, Vec<String>) {
     let e = config["Entrypoint"].as_array().map(|_| images::strings(&config["Entrypoint"]));
     let c = config["Cmd"].as_array().map(|_| images::strings(&config["Cmd"]));
-    let cmd = c.unwrap_or(if e.as_ref().is_some_and(|e| !e.is_empty()) { Vec::new() } else { cmd });
+    let cmd = c.filter(|c| !c.is_empty()).unwrap_or(if e.as_ref().is_some_and(|e| !e.is_empty()) { Vec::new() } else { cmd });
     let entrypoint = e.map(|e| if e == [""] { Vec::new() } else { e }).unwrap_or(entrypoint);
     (entrypoint, cmd)
 }
@@ -433,6 +440,22 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn abandoned_reservation_without_docker_config_is_removed() {
+        let (_d, api) = fixture();
+        let r = Record {
+            name: "web".into(),
+            reserved: true,
+            started: true,
+            reservation_owner: Some(crate::host::Ident { boot: "old".into(), ..Default::default() }),
+            ..Record::default()
+        };
+        store(&api, &r, true).unwrap();
+        let vm = json!({"name": "web", "state": "running"});
+        assert_eq!(merge(&api, vec![vm.clone()]), vec![vm]);
+        assert!(load(&api, "web").is_none());
+    }
+
+    #[test]
     fn app_overrides_distinguish_null_empty_arrays_and_the_clearing_sentinel() {
         let entrypoint = vec!["sh".into(), "-c".into(), "".into()];
         let cmd = vec!["default".into()];
@@ -444,7 +467,12 @@ pub(super) mod tests {
             assert_eq!(app(&json!({"Entrypoint": e, "Cmd": ["echo", ""]}), entrypoint.clone(), cmd.clone()), (vec![], vec!["echo".into(), "".into()]));
         }
         assert_eq!(app(&json!({"Entrypoint": ["sh", "-c", ""]}), vec![], cmd.clone()), (entrypoint.clone(), vec![]));
-        assert_eq!(app(&json!({"Cmd": []}), entrypoint.clone(), cmd), (entrypoint, vec![]));
+        assert_eq!(app(&json!({"Cmd": []}), entrypoint.clone(), cmd.clone()), (entrypoint.clone(), cmd.clone()));
+        assert_eq!(app(&json!({"Entrypoint": [], "Cmd": []}), entrypoint.clone(), cmd.clone()), (vec![], cmd.clone()));
+        for e in [json!(["other"]), json!([""])] {
+            let expected = if e == json!([""]) { vec![] } else { vec!["other".into()] };
+            assert_eq!(app(&json!({"Entrypoint": e, "Cmd": []}), entrypoint.clone(), cmd.clone()), (expected, vec![]));
+        }
     }
 
     #[test]
@@ -498,7 +526,8 @@ pub(super) mod tests {
             (json!({"Entrypoint": [""], "Cmd": ["echo", ""]}), vec!["echo", ""]),
             (json!({"Entrypoint": [], "Cmd": ["echo"]}), vec!["echo"]),
             (json!({"Entrypoint": null, "Cmd": null}), vec!["/bin/sh", "-c", "", "default"]),
-            (json!({"Cmd": []}), vec!["/bin/sh", "-c", ""]),
+            (json!({"Cmd": []}), vec!["/bin/sh", "-c", "", "default"]),
+            (json!({"Entrypoint": [], "Cmd": []}), vec!["default"]),
         ] {
             let mut body = overrides;
             body["Image"] = json!("image");

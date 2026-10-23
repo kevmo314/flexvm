@@ -200,8 +200,9 @@ where
                 if moved {
                     if let Err(rollback) = move_vm(to.clone(), name.clone()).await {
                         stranded = true;
-                        // Keep the destination config even if publication is still unavailable.
-                        api.blocking(move |api| create::store(api, &reserved, false).map(drop)).await?;
+                        // Try to publish; merge also exposes the reservation's config if this fails.
+                        // Recovery must not mask the rollback error.
+                        let _ = api.blocking(move |api| create::store(api, &reserved, false).map(drop)).await;
                         return Err(rollback);
                     }
                 }
@@ -378,6 +379,46 @@ mod tests {
         let b = create::load(&api, "b").unwrap();
         assert_eq!(b.config, a.config);
         assert!(!b.reserved);
+    }
+
+    #[tokio::test]
+    async fn failed_rename_rollback_preserves_config_when_atomic_stores_keep_failing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, api) = fixture();
+        let mut a = create::translate(&api, "a", &json!({"Image": "image", "Labels": {"keep": "config"}})).unwrap();
+        a.started = true;
+        create::store(&api, &a, true).unwrap();
+        let v = json!({"name": "a", "state": "running", "docker": a});
+        let dir = api.host.state.join("api/containers");
+        let e = rename_to(&api, "a".into(), &v, "b".into(), |from, _| {
+            let (dir, api) = (&dir, &api);
+            async move {
+                if from == "a" {
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+                    Ok(())
+                } else {
+                    let r = create::load(api, "b").unwrap();
+                    assert!(r.reserved);
+                    assert!(create::store(api, &r, false).is_err());
+                    Err(Error::bad("rollback failed"))
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(e.message, "rollback failed");
+        let rows = create::merge(&api, vec![json!({"name": "b", "state": "running"})]);
+        let mut b = a;
+        b.name = "b".into();
+        assert_eq!(rows[0]["docker"], json!(b));
+        let reserved = create::load(&api, "b").unwrap();
+        assert!(reserved.reserved);
+        assert_eq!(reserved.reservation_owner, Some(crate::host::Ident::me()));
+        assert_eq!(reserved.config, b.config);
+        assert!(create::load(&api, "a").is_none());
+        assert_eq!(create::merge(&api, vec![json!({"name": "b", "state": "running"})])[0]["docker"], json!(b));
     }
 
     #[tokio::test]
