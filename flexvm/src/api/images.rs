@@ -12,6 +12,12 @@ pub fn meta(api: &Api, id: &str) -> Option<Meta> {
     serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()
 }
 
+/// The generation the template `name` links to now.
+pub fn linked(api: &Api, name: &str) -> Option<String> {
+    let link = std::fs::read_link(api.paths.templates.join(name)).ok()?;
+    Some(link.file_name()?.to_string_lossy().into_owned())
+}
+
 /// What the image's config says of its app (`Env`, `Entrypoint`, `Cmd`, `WorkingDir`, `Labels`, ...), from its
 /// config blob while the layer cache keeps it (`system prune` removes it) and it is the one pulled.
 pub fn config(api: &Api, meta: &Meta) -> Option<Value> {

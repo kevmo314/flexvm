@@ -8,7 +8,9 @@
 
 mod cli;
 mod containers;
+mod create;
 mod images;
+mod lifecycle;
 mod system;
 
 use std::convert::Infallible;
@@ -18,7 +20,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
@@ -32,6 +34,9 @@ use crate::util::Result;
 pub const API_VERSION: &str = "1.47";
 /// The oldest one a client may ask for.
 pub const MIN_API_VERSION: &str = "1.24";
+/// The most a JSON request body may hold.
+const MAX_JSON: usize = 4 << 20;
+
 pub type Body = BoxBody<Bytes, std::io::Error>;
 
 /// What a request failed with: docker's `{"message": ...}` under `status`.
@@ -52,6 +57,10 @@ impl Error {
 
     pub fn missing(message: impl Into<String>) -> Error {
         Error::new(StatusCode::NOT_FOUND, message)
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Error {
+        Error::new(StatusCode::CONFLICT, message)
     }
 
     /// An endpoint (or a setting) flexvm has no machinery for.
@@ -284,6 +293,13 @@ pub fn ok(v: &Value) -> Reply {
     Ok(json(StatusCode::OK, v))
 }
 
+/// A reply with no body (204, or 304 for "already so").
+pub fn empty(status: StatusCode) -> Reply {
+    let mut res = Response::new(full(Vec::new()));
+    *res.status_mut() = status;
+    Ok(res)
+}
+
 pub fn full(data: impl Into<Bytes>) -> Body {
     Full::new(data.into()).map_err(|e: Infallible| match e {}).boxed()
 }
@@ -304,6 +320,15 @@ pub fn channel() -> (tokio::sync::mpsc::Sender<Bytes>, Body) {
     }
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     (tx, Channel(rx).boxed())
+}
+
+/// A request's JSON body (none, or an empty one: `null`).
+pub async fn body_json(req: Request<Incoming>) -> std::result::Result<Value, Error> {
+    let bytes = Limited::new(req.into_body(), MAX_JSON).collect().await.map_err(|e| Error::bad(format!("reading the request: {e}")))?.to_bytes();
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(&bytes).map_err(|e| Error::bad(format!("bad JSON in the request: {e}")))
 }
 
 /// A request's query parameters, decoded, in order.

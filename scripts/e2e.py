@@ -2561,6 +2561,49 @@ def docker_api_with(d):
     check("ps: not the exited one", job not in d("ps", "--format", "{{.Names}}").stdout)
     A.kill(vm)
     A.rm(job)
+    docker_lifecycle(d)
+
+
+def docker_lifecycle(d):
+    """create, start, stop, restart, pause, kill, rename, rm and prune through the API."""
+    t, run, job, gone = args.template, "e2e-dk-run", "e2e-dk-created", "e2e-dk-gone"
+    A.vms.update([run, job, gone])
+    cid = d("run", "-d", "--name", run, t, "sh", "-c", "echo started; sleep 600").stdout.strip()
+    check("run -d: the container's id", re.fullmatch(r"[0-9a-f]{64}", cid) is not None, cid)
+    status = lambda n: d("inspect", "-f", "{{.State.Status}}", n).stdout.strip()
+    check("run -d: running, as a vm", status(run) == "running" and A.ps().get(run, {}).get("state") == "running", A.ps().get(run))
+    d("stop", run, timeout=300)
+    check("stop: exited (143), suspended", (status(run), d("inspect", "-f", "{{.State.ExitCode}}", run).stdout.strip()) == ("exited", "143")
+          and A.ps().get(run, {}).get("state") == "suspended", A.ps().get(run))
+    d("start", run, timeout=300)
+    check("start: running again, resumed", status(run) == "running" and "started" in d("logs", run).stdout)
+    d("pause", run)
+    check("pause: paused", status(run) == "paused" and A.ps()[run]["state"] == "paused")
+    refused = d("start", run, check=False)
+    check("start of a paused one: refused, as docker's", refused.returncode != 0 and "unpause" in refused.stderr, refused.stderr)
+    d("unpause", run)
+    check("unpause: running", status(run) == "running")
+    d("restart", run, timeout=300)
+    check("restart: running", status(run) == "running")
+    d("rename", run, run + "-2")
+    check("rename: under its new name", status(run + "-2") == "running" and run + "-2" in A.ps())
+    busy = d("rm", run + "-2", check=False)
+    check("rm of a running one: refused", busy.returncode != 0 and "running" in busy.stderr, busy.stderr)
+    d("kill", run + "-2")
+    check("kill: the vm destroyed", wait_for(lambda: run + "-2" not in A.ps(), 30), A.ps())
+    # Created (a record, no vm), then started: its command's status.
+    d("create", "--name", job, "-l", "e2e=1", t, "sh", "-c", "exit 4")
+    check("create: listed created, with its labels", d("ps", "-a", "--filter", "label=e2e=1", "--format", "{{.Names}} {{.State}}").stdout.split() == [job, "created"]
+          and job not in A.ps())
+    d("start", job)
+    check("start of a created one: its status", d("wait", job, timeout=120).stdout.strip() == "4")
+    check("its labels stay with its vm", d("inspect", "-f", "{{index .Config.Labels \"e2e\"}}", job).stdout.strip() == "1")
+    d("create", "--name", gone, t, "true")
+    pruned = d("container", "prune", "-f").stdout
+    left = d("ps", "-a", "--format", "{{.Names}}").stdout.split()
+    check("container prune: none of them left", job not in left and gone not in left, (pruned, left))
+    refused = d("run", "-d", "-v", "/tmp:/data", t, "true", check=False)
+    check("a bind mount: refused, saying so", refused.returncode != 0 and "not supported by flexvm" in refused.stderr, refused.stderr)
 
 
 @case

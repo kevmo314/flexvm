@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
-use super::{channel, images, ok, rfc3339_secs, Api, Error, Query, Reply};
+use super::{channel, images, lifecycle, ok, rfc3339_secs, Api, Error, Query, Reply};
 
 /// Docker's zero time, for a time not known.
 const NEVER: &str = "0001-01-01T00:00:00Z";
@@ -42,9 +42,9 @@ pub fn find<'a>(vms: &'a [Value], key: &str) -> Result<&'a Value, Error> {
     }
 }
 
-/// The VMs, as `ps -a` lists them.
+/// The VMs, as `ps -a` lists them, and the containers created and not started yet (`create::merge`).
 pub async fn all(api: &Arc<Api>) -> Result<Vec<Value>, Error> {
-    api.blocking(|api| Ok(crate::vms(&api.host))).await
+    api.blocking(|api| Ok(super::create::merge(api, crate::vms(&api.host)))).await
 }
 
 /// The name of the VM `key` names.
@@ -75,6 +75,7 @@ pub fn state(v: &Value) -> State {
         "exited" => s("exited", false, false, false, v["status"].as_i64().unwrap_or(0)),
         // Stopped, but kept from starting (`quarantined`), failed or lost (a reboot): as `flexvm wait` says.
         "quarantined" | "failed" | "lost" | "unknown" => s("dead", false, false, true, crate::vmproc::DIED as i64),
+        "created" => s("created", false, false, false, 0),
         // Running, checkpointing, suspending, migrating: its process runs it.
         _ => s("running", true, false, false, 0),
     };
@@ -155,12 +156,26 @@ pub struct Detail {
     pub user: String,
     pub started: Option<u64>,
     pub finished: Option<u64>,
+    /// When docker's create made it, if it did.
+    pub created: Option<u64>,
+    /// Docker's settings, if it was created through the API.
+    pub record: Option<super::create::Record>,
 }
 
 impl Detail {
     pub fn read(api: &Api, vm: &Value) -> Detail {
         let name = vm["name"].as_str().unwrap_or_default().to_string();
-        let described = crate::containers::described(&api.host, &api.paths, &name, vm.clone());
+        let record: Option<super::create::Record> = serde_json::from_value(vm["docker"].clone()).ok();
+        let created = vm["state"] == "created";
+        // A created container has no VM yet: what it will run is its record's.
+        let described = match (&record, created) {
+            (Some(r), true) => {
+                let ports: Vec<crate::ports::Port> = r.run.windows(2).filter(|w| w[0] == "--publish").filter_map(|w| w[1].parse().ok()).collect();
+                let id = images::linked(api, &r.template);
+                json!({"name": name, "state": "created", "config": {"image": r.image, "template": r.template, "template_id": id, "ports": ports, "run": {}}})
+            }
+            _ => crate::containers::described(&api.host, &api.paths, &name, vm.clone()),
+        };
         let config = described["config"].clone();
         let image_id = config["template_id"].as_str().or(vm["template_id"].as_str()).unwrap_or_default().to_string();
         let meta = images::meta(api, &image_id);
@@ -181,7 +196,23 @@ impl Detail {
             env.retain(|e| e.split('=').next() != Some(&key));
             env.push(kv);
         }
-        let labels = ic["Labels"].as_object().cloned().unwrap_or_default();
+        let mut labels = ic["Labels"].as_object().cloned().unwrap_or_default();
+        if let Some(r) = &record {
+            labels.extend(r.config["Labels"].as_object().cloned().unwrap_or_default());
+            if created {
+                for kv in images::strings(&r.config["Env"]).into_iter().filter(|kv| kv.contains('=')) {
+                    let key = kv.split('=').next().unwrap_or_default().to_string();
+                    env.retain(|e| e.split('=').next() != Some(&key));
+                    env.push(kv);
+                }
+                let (e, c) =
+                    (r.config["Entrypoint"].as_array().map(|e| images::strings(&json!(e))), r.config["Cmd"].as_array().map(|c| images::strings(&json!(c))));
+                if e.is_some() || c.is_some() {
+                    cmd = c.unwrap_or(if e.is_some() { Vec::new() } else { cmd });
+                    entrypoint = e.unwrap_or(entrypoint);
+                }
+            }
+        }
         let template = config["template"].as_str().or(vm["template"].as_str()).unwrap_or_default();
         Detail {
             state: state(&described),
@@ -195,6 +226,8 @@ impl Detail {
             user: ic["User"].as_str().unwrap_or_default().into(),
             started: started(vm),
             finished: finished(api, vm),
+            created: record.as_ref().map(|r| r.created),
+            record,
             name,
             vm: described,
             config,
@@ -258,7 +291,7 @@ impl Detail {
             "Image": self.image,
             "ImageID": self.image_id,
             "Command": shell_words(&self.argv()),
-            "Created": self.started.or(self.finished).unwrap_or(0),
+            "Created": self.created.or(self.started).or(self.finished).unwrap_or(0),
             "Ports": self.port_list(),
             "Labels": self.labels,
             "State": self.state.status,
@@ -277,11 +310,12 @@ impl Detail {
         let cpus = self.config["cpus"].as_f64();
         let time = |t: Option<u64>| t.map_or_else(|| NEVER.to_string(), rfc3339_secs);
         let pid = if st.running { self.vm["pid"].as_u64().unwrap_or(0) } else { 0 };
-        let tty = run["tty"] == true;
-        let stdin = run["stdin"] == true;
-        json!({
+        let given = self.record.as_ref().map(|r| &r.config);
+        let tty = run["tty"] == true || given.is_some_and(|c| c["Tty"] == true);
+        let stdin = run["stdin"] == true || given.is_some_and(|c| c["OpenStdin"] == true);
+        let mut v = json!({
             "Id": self.id(),
-            "Created": time(self.started.or(self.finished)),
+            "Created": time(self.created.or(self.started).or(self.finished)),
             "Path": argv.first().cloned().unwrap_or_default(),
             "Args": argv.get(1..).unwrap_or_default(),
             "State": {
@@ -349,12 +383,19 @@ impl Detail {
                 "Networks": self.networks(),
             },
             "Flexvm": self.vm,
-        })
+        });
+        // Docker's settings as given, under what flexvm says.
+        if let Some(given) = self.record.as_ref().and_then(|r| r.host_config.as_object()) {
+            let mut host_config = given.clone();
+            host_config.extend(v["HostConfig"].as_object().cloned().unwrap_or_default());
+            v["HostConfig"] = Value::Object(host_config);
+        }
+        v
     }
 }
 
 /// An argv as one line, quoting words a shell would split (docker's listing shows a command so).
-fn shell_words(argv: &[String]) -> String {
+pub(crate) fn shell_words(argv: &[String]) -> String {
     let word = |w: &String| match !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:,@%+".contains(&b)) {
         true => w.clone(),
         false => format!("'{}'", w.replace('\'', "'\\''")),
@@ -405,7 +446,7 @@ fn matches(d: &Detail, key: &str, value: &str) -> Result<bool, Error> {
 /// `GET /containers/json?all&limit&filters`.
 pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
     let (all, limit, filters) = (q.flag("all", false)?, q.number::<i64>("limit")?, q.filters()?);
-    let details = api.blocking(|api| Ok(crate::vms(&api.host).iter().map(|v| Detail::read(api, v)).collect::<Vec<_>>())).await?;
+    let details = api.blocking(|api| Ok(super::create::merge(api, crate::vms(&api.host)).iter().map(|v| Detail::read(api, v)).collect::<Vec<_>>())).await?;
     let mut out = Vec::new();
     for d in &details {
         let mut keep = all || d.state.running || filters.iter().any(|(k, _)| k == "status" || k == "exited");
@@ -432,7 +473,7 @@ pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
 /// `GET /containers/{id}/json`.
 pub async fn inspect(api: &Arc<Api>, key: &str) -> Reply {
     let key = key.to_string();
-    let d = api.blocking(move |api| Ok(find(&crate::vms(&api.host), &key).map(|v| Detail::read(api, v)))).await??;
+    let d = api.blocking(move |api| Ok(find(&super::create::merge(api, crate::vms(&api.host)), &key).map(|v| Detail::read(api, v)))).await??;
     ok(&d.inspect())
 }
 
@@ -562,6 +603,19 @@ pub async fn route(api: &Arc<Api>, req: Request<Incoming>, words: &[&str]) -> Op
         (hyper::Method::GET, [id, "json"]) => inspect(api, id).await,
         (hyper::Method::GET, [id, "logs"]) => logs(api, id, q).await,
         (hyper::Method::POST, [id, "wait"]) => wait(api, id, q).await,
+        (hyper::Method::POST, ["create"]) => match super::body_json(req).await {
+            Ok(body) => lifecycle::create(api, q, body).await,
+            Err(e) => Err(e),
+        },
+        (hyper::Method::POST, ["prune"]) => lifecycle::prune(api, q).await,
+        (hyper::Method::POST, [id, "start"]) => lifecycle::start(api, id, q).await,
+        (hyper::Method::POST, [id, "stop"]) => lifecycle::stop(api, id, q).await,
+        (hyper::Method::POST, [id, "restart"]) => lifecycle::restart(api, id).await,
+        (hyper::Method::POST, [id, "kill"]) => lifecycle::kill(api, id, q).await,
+        (hyper::Method::POST, [id, "pause"]) => lifecycle::pause(api, id, true).await,
+        (hyper::Method::POST, [id, "unpause"]) => lifecycle::pause(api, id, false).await,
+        (hyper::Method::POST, [id, "rename"]) => lifecycle::rename(api, id, q).await,
+        (hyper::Method::DELETE, [id]) => lifecycle::remove(api, id, q).await,
         _ => return None,
     })
 }
