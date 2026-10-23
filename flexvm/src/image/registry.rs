@@ -919,7 +919,7 @@ pub(super) fn sweep_parts(dir: &Path) {
     }
 }
 
-pub fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(data))
 }
 
@@ -930,7 +930,7 @@ pub(super) fn verified_stamp(path: &Path) -> PathBuf {
 }
 
 /// `blobs/sha256/<hex>`, refusing anything that is not a sha256 digest.
-pub fn blob_path(blobs: &Path, digest: &str) -> Result<PathBuf> {
+pub(crate) fn blob_path(blobs: &Path, digest: &str) -> Result<PathBuf> {
     match digest.strip_prefix("sha256:") {
         Some(hex) if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(blobs.join("sha256").join(hex)),
         _ => bail!("unsupported digest {digest:?}"),
