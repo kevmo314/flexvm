@@ -26,7 +26,7 @@ a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
 """
 from contextlib import ExitStack, contextmanager, suppress
 
-import argparse, base64, fcntl, glob, ipaddress, json, multiprocessing, shlex, shutil, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, base64, fcntl, glob, ipaddress, json, multiprocessing, shlex, shutil, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback, types
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -2873,14 +2873,24 @@ def udp_received(host, n, sent, timeout=10):
     return wait_for(lambda: got() >= sent, timeout)
 
 
+# A sendto that took this long was stalled (they take tens of microseconds): `udp_stream`.
+SEND_STALL_NS = 1_000_000
+# The stalled sends `udp_stream` records; past them it only counts.
+SEND_STALLS = 256
+
+
 @contextmanager
 def udp_stream(ip, burst=1):
     """A UDP sequence stream to `ip`'s port 9000 (`burst` datagrams every millisecond), from a process of
     its own, real-time where it may be: a thread of this one, sharing its GIL and scheduled as any other,
     went quiet for as long as a migration's hold on a loaded host, which then held nothing (#1046).
-    Yields how many it sent (`.value`), which is final once the block ends it."""
+    Yields how many it sent (`.value`) and its sendto calls that took `SEND_STALL_NS` or more, as
+    `.sends` (number, start and end on the monotonic clock, in ns: the first `SEND_STALLS`) and `.total`
+    (all of them), final once the block ends it."""
     ctx = multiprocessing.get_context("fork")
     sent, stop, parent = ctx.Value("q", 0, lock=False), ctx.Event(), os.getpid()
+    slow, nslow = ctx.Array("q", 3 * SEND_STALLS, lock=False), ctx.Value("q", 0, lock=False)
+    stalled = types.SimpleNamespace(sends=[], total=0)
 
     def stream():
         # Exits at once, never flushing what other threads of the parent left buffered.
@@ -2897,7 +2907,15 @@ def udp_stream(ip, burst=1):
             s, i = socket.socket(socket.AF_INET, socket.SOCK_DGRAM), 0
             while not stop.is_set() and os.getppid() == parent:
                 for _ in range(burst):
-                    s.sendto(b"%08d\n" % i, (ip, 9000))
+                    datagram, to = b"%08d\n" % i, (ip, 9000)
+                    start = time.monotonic_ns()
+                    s.sendto(datagram, to)
+                    end = time.monotonic_ns()
+                    if end - start >= SEND_STALL_NS:
+                        k = nslow.value
+                        if k < SEND_STALLS:
+                            slow[3 * k], slow[3 * k + 1], slow[3 * k + 2] = i, start, end
+                        nslow.value = k + 1
                     i += 1
                 sent.value = i
                 time.sleep(0.001)
@@ -2909,13 +2927,15 @@ def udp_stream(ip, burst=1):
     p = ctx.Process(target=stream, daemon=True)
     p.start()
     try:
-        yield sent
+        yield sent, stalled
     finally:
         stop.set()
         p.join(10)
         if p.is_alive():
             p.kill()
             p.join()
+        stalled.total = nslow.value
+        stalled.sends = [(slow[3 * k], slow[3 * k + 1], slow[3 * k + 2]) for k in range(min(nslow.value, SEND_STALLS))]
 
 
 def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=None, counted=False):
@@ -2932,15 +2952,16 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     ok(run(A, n))
     ip = vm_ip(A, n)
     udp_receiver(A, n)
-    held, at, took, logs, arrivals = [], [], [], [], []
+    held, at, took, logs, arrivals, windows = [], [], [], [], [], []
     hops = ((A, B), (B, A), (A, B))
-    with udp_stream(ip, burst) as sent:
+    with udp_stream(ip, burst) as (sent, stalled):
         time.sleep(0.5)
         for i, (src, dst) in enumerate(hops):
             with armed_fault(dst, target_faults, 60000):
                 if source_fault:
                     fault(src, source_fault, 60000)
                 at.append(sent.value)
+                began = time.monotonic_ns()
                 r = migrate(src, n, dst)
                 if source_fault:
                     fault(src, source_fault, 0)
@@ -2950,6 +2971,8 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
                 # before the VM arrives there again and starts a new one (each host's last log is
                 # read at the end). It arrived there by the hop before.
                 src_log = log(src, n)
+                # From before the source's hold to past its tap's end and the target's release.
+                windows.append((began, time.monotonic_ns()))
                 if any(d is src for _, d in hops[i + 1:]):
                     logs.append(src_log)
                 if i:
@@ -2997,11 +3020,27 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     # leaves it; the last one's is asked for.
     taps = list(dict.fromkeys(l for ls in dropped.values() for l in ls if "its tap dropped" in l))
     detail += f"; taps dropped: {taps}, the last one {vms(B).get(n, {}).get('tap_dropped')}"
+    # A host sender looks its route up, then builds and sends the datagram. Stalled in between (a
+    # sleep in an allocation, a vCPU its host does not run) across a source's hold, it still sends by
+    # the route to the source's tap, which goes down a few ms into the hold (a datagram reaching it
+    # then is dropped, at most the ARP request of its flushed neighbour entry counted); an RCU grace
+    # period after the hold's route change, the kernel tears that route down, and the datagram is
+    # freed at `dst_discard_out` before any device sees it, counted nowhere (#1247). Forwarded packets,
+    # from other hosts or the VMs, never meet either: each is routed and sent within one RCU read-side
+    # section, which the link-down and the route's teardown both wait out. So a datagram may be lost
+    # if its own sendto stalled during a migration (from its call to the source's end); no other may.
+    in_hop = {k: (end - start) // 1000 for k, start, end in stalled.sends if any(start < b and end > a for a, b in windows)}
+    excused = [(m, in_hop[m]) for m in missing if m in in_hop]
+    lost = [m for m in missing if m not in in_hop]
+    if stalled.total:
+        saturated = f" (only the first {SEND_STALLS} recorded)" if stalled.total > SEND_STALLS else ""
+        detail += (f"; {stalled.total} sends stalled{saturated}, {len(in_hop)} of them during a migration; "
+                   f"lost of those (number, us): {excused}")
     if burst == 1:
         late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
         check(f"{label}: none reordered", not late, late[:10])
     if burst == 1 and not counted:
-        check(f"{label}: no udp datagram lost", not missing, detail)
+        check(f"{label}: no udp datagram lost", not lost, detail)
         for h in dropped:
             # A tap's own drops are no held packets; one of the stream's would be missing above.
             held_drops = [l for l in dropped[h] if "its tap dropped" not in l]
@@ -3014,10 +3053,11 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
         # packets: the VM logs it as it leaves a tap, so only the last one's is asked for here.
         said += vms(B).get(n, {}).get("tap_dropped") or 0
         diag = {}
-        if len(missing) > said:
+        if len(missing) > max(said, len(excused)):
             diag = rx_state(B, n)
             diag["lines"] = sh(B, n, "wc -l < /tmp/udp; cat /proc/net/softnet_stat")[1]
-        check(f"{label}: nothing lost that was not counted", len(missing) <= said, (detail, dropped, diag))
+        # A stalled send's datagram may also be among those counted: excused or counted, never both.
+        check(f"{label}: nothing lost that was not counted", len(missing) <= max(said, len(excused)), (detail, dropped, diag))
     if burst > 1:
         if source_fault:
             check(f"{label}: each source paused with a queue on its tap, which its guest took first", all(len(t) == 1 for t in took), took)
