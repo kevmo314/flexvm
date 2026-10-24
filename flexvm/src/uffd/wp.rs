@@ -81,10 +81,10 @@ impl Pager {
     /// Then unprotects the pages of its block (`wp_block`) around it that need not stay
     /// protected for the copy, and marks them dirty. Unless it must wait for a writer to save the page first
     /// (`Served::Writer`).
-    pub(super) fn wp_fault(&self, page: usize, m: &Mapping, first: bool) -> io::Result<Served> {
+    pub(super) fn wp_fault(&self, page: usize, m: &Mapping, first_try: bool) -> io::Result<Served> {
         let cow = self.cow();
-        // On its `first` try only: a fault is retried after errors, and on every pass of the event loop while it waits.
-        cow.iter().for_each(|c| _ = c.stats.faults.fetch_add(first as u64, Ordering::Relaxed));
+        // On its first try only: a fault is retried after errors, and on every pass of the event loop while it waits.
+        cow.iter().for_each(|c| _ = c.stats.faults.fetch_add(first_try as u64, Ordering::Relaxed));
         // Already unprotected: by the fault of another thread (each one that writes it queues one, and the first
         // unprotect wakes them all), or one on a page of the same block. Its thread may still wait, if it faulted after
         // that unprotect woke the others but before the page table changed: wake it, which costs nothing like an
@@ -105,7 +105,7 @@ impl Pager {
             self.wp_race(cow, page, &[PENDING]);
             let start = Instant::now();
             let least = || self.wp_block(page, m, false);
-            let Some((rescued, block)) = rescue_or_want(cow, page, over, (first, end), least, |f, e| self.rescue(cow, f, e))? else {
+            let Some((rescued, block)) = rescue_or_want(cow, page, over, (first, end), least, |f, e| self.rescue(cow, f, e, first_try))? else {
                 return Ok(Served::Writer(cow.clone()));
             };
             (first, end) = block;
@@ -198,18 +198,22 @@ impl Pager {
     /// Saves the pages of `first..end` (within one region) that the copy has yet to save out of the guest into `cow`.
     /// Returns how many, None if there is no memory for their copies now (`Room`). Never reads a page that may be
     /// missing, which would fault back to the event thread: only pages the pagemap shows populated are read (a missing
-    /// one was missing, so zero, at the pause).
-    fn rescue(&self, cow: &Cow, first: usize, end: usize) -> io::Result<Option<usize>> {
-        let map = |claimed: &[usize]| self.rescue_fail(cow, claimed).and_then(|()| self.pagemap(first, end - first));
+    /// one was missing, so zero, at the pause). `may_fail`: test fault `ckpt_rescue_fail` may fail it (not a fault's
+    /// retry).
+    fn rescue(&self, cow: &Cow, first: usize, end: usize, may_fail: bool) -> io::Result<Option<usize>> {
+        let map = |claimed: &[usize]| self.rescue_fail(cow, claimed, may_fail).and_then(|()| self.pagemap(first, end - first));
         rescue_block(cow, first, end, map, |p, local| self.read_at((p * PAGE_SIZE) as u64, local))
     }
 
-    /// Test fault `ckpt_rescue_fail`, once the writers run: every other rescue fails after its claim, with a writer
+    /// Test fault `ckpt_rescue_fail`, once the writers run: every other eligible rescue (`may_fail`: a fault's first
+    /// try, or the copy's own rescues; a fault's retries are not counted) fails after its claim, with a writer
     /// asked to take its first page meanwhile, so that the writer finds the page RESCUING and then given back. Until a
     /// writer has (in this copy), the failure waits for one to (up to 200 ms: `ckpt_slow` writers sleep 50 ms before
-    /// each unit, which a fixed 5 ms caught only by chance, never on a slow host); then 5 ms.
-    fn rescue_fail(&self, cow: &Cow, claimed: &[usize]) -> io::Result<()> {
-        if !self.rescue_fail.load(Ordering::Relaxed) || !cow.writing() || self.rescue_tries.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
+    /// each unit, which a fixed 5 ms caught only by chance, never on a slow host); then 5 ms. A fault's retry is never
+    /// failed here, though a real error may still fail it: were retries eligible, the counter (shared by every rescuer)
+    /// could fail one fault's every try, past `FAULT_TIMEOUT` on a loaded host, which kills the VM (#1266).
+    fn rescue_fail(&self, cow: &Cow, claimed: &[usize], may_fail: bool) -> io::Result<()> {
+        if !may_fail || !self.rescue_fail.load(Ordering::Relaxed) || !cow.writing() || self.rescue_tries.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
             return Ok(());
         }
         cow.want(claimed[0]);
@@ -263,7 +267,7 @@ impl Pager {
                     if cow.left() == 0 || !cow.active() {
                         return;
                     }
-                    if let Ok(Some(n)) = self.rescue(cow, first, end) {
+                    if let Ok(Some(n)) = self.rescue(cow, first, end, true) {
                         cow.stats.held_pages.fetch_add(n as u64, Ordering::Relaxed);
                     }
                 });
